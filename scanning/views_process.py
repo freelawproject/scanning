@@ -5,7 +5,9 @@ import json
 import logging
 import os
 import re
+from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
@@ -38,6 +40,7 @@ from scanning import (
     repairs,
     s3_sync,
     stats,
+    surya,
     yolo,
 )
 from scanning.models import (
@@ -276,17 +279,32 @@ FINAL_VOLUME_NOT_READY_MESSAGE = (
     "The corrected volume of this scan is not ready yet. Reload the "
     "page in a minute."
 )
-#: The 404 of ``scan_ocr_text_url`` for a volume nobody has read yet
-#: (#262): no dots.mocr run of this scan is glued.
+#: The 404 of ``scan_ocr_text_url`` for a volume this engine has not
+#: read yet (#262): no glued run of it. Every message of this endpoint
+#: names the engine since #381, because the dropdown offers three and a
+#: message that says "the OCR" would leave a reader guessing which one.
 NO_READ_TEXT_MESSAGE = (
-    "The OCR has not read this volume yet, so there is no text to show."
+    "{label} has not read this volume yet, so there is no text to show."
+)
+#: The 404 of ``scan_ocr_text_url`` in the final space, for an engine
+#: that read the original and not the corrected volume (#381).
+#: ``ApplyRun.is_complete`` counts neither ``extract_key`` nor
+#: ``surya_key``, so review 2 opens on a volume only dots.mocr read
+#: there (#245, #368).
+NO_READ_FINAL_TEXT_MESSAGE = (
+    "{label} has not read the corrected volume of this scan yet, so "
+    "there is no text to show over its pages."
 )
 #: The 404 of ``scan_ocr_text_url`` when the document was written and
 #: is not in the bucket any more (#262).
 OCR_TEXT_OBJECT_GONE_MESSAGE = (
-    "The OCR text of this volume is not in the bucket. Ask a staff "
-    "member to glue the run again."
+    "The text {label} read of this volume is not in the bucket. Ask a "
+    "staff member to glue the run again."
 )
+#: The 400 of ``scan_ocr_text_url`` for an engine nobody has (#381).
+#: A person never sees it: the dropdown offers the names of
+#: ``opinion_ocr.ENGINES`` and no other.
+UNKNOWN_OCR_ENGINE_MESSAGE = "Unknown OCR engine {engine!r}. Known: {known}."
 #: The 409 of ``serve_final_pdf`` when the run's bitonal copy is the
 #: original itself: a 1-bit upload skips the conversion, and the
 #: preview route never streams the original (#185).
@@ -296,14 +314,17 @@ FINAL_VOLUME_IS_ORIGINAL_MESSAGE = (
 )
 
 
-def dots_run_is_glued(summary: dict | None) -> bool:
-    """Say whether a scan's live dots.mocr run is glued (#262).
+def run_is_glued(summary: dict | None) -> bool:
+    """Say whether a scan's live run of one engine is glued (#262).
 
     Off the summary the process view reads already
-    (``dots_mocr.run_summary``), so the text overlay's button costs no
+    (``jobs.run_summary``), so the text overlay's dropdown costs no
     query. The glue writes the document and flips every row to
     ``CONSUMED`` in one pass, so "every row consumed" is the same test
-    :func:`dots_mocr.glued_volume_key` makes against the rows.
+    :func:`jobs.glued_volume_key` makes against the rows.
+
+    One function for the three engines, not three (#381): the test is
+    the shared one, and the summary is the shared shape.
 
     :param summary: The run summary, or None when the stage never ran.
     :returns: Whether a glued volume document exists for the live run.
@@ -345,6 +366,95 @@ def ocr_missing(scan, summary: dict | None) -> str | None:
     if manifest is None:
         return OCR_REFUSED_MESSAGE.format(reason=reason)
     return OCR_NOT_STARTED_MESSAGE
+
+
+def engine_label(name: str) -> str:
+    """Return what a person calls one OCR engine (#381).
+
+    ``JobEngine`` carries the name already, as the label of its own
+    choice ("dots.mocr", "Mistral OCR", "Surya"). The dropdown and
+    every refusal of :func:`scan_ocr_text_url` read it here, so the
+    words are not copied into a second table. ``ShardRead`` keeps its
+    own two: one of them is a message word ("OCR run started"), not
+    the engine's name.
+
+    :param name: A ``JobEngine`` value, which is a key of
+        ``opinion_ocr.ENGINES``.
+    :returns: The label of that choice.
+    :rtype: str
+    """
+    return JobEngine(name).label
+
+
+def ocr_run_summaries(scan) -> dict[str, dict | None]:
+    """Return one run summary per OCR engine, in the table's order.
+
+    One walk of ``opinion_ocr.ENGINES`` (#381), because every engine
+    has the same ``run_summary(scan)``. The process view reads the
+    three by name for the action bar and hands the whole dict to
+    :func:`ocr_text_engines`, so the summaries are read once.
+
+    :param scan: The scan to describe.
+    :returns: ``{engine name: summary or None}``.
+    :rtype: dict[str, dict | None]
+    """
+    from scanning import opinion_ocr
+
+    return {
+        name: spec.module.run_summary(scan)
+        for name, spec in opinion_ocr.ENGINES.items()
+    }
+
+
+def ocr_text_engines(
+    summaries: dict[str, dict | None], final_run, final_space: bool
+) -> list[dict]:
+    """Describe every OCR engine for the text overlay's dropdown (#381).
+
+    One entry per engine of ``opinion_ocr.ENGINES``, in that table's
+    order, so dots.mocr is first and is the default. ``available`` is
+    the same question :func:`scan_ocr_text_url` asks, in the space the
+    viewer draws: the ``ApplyRun`` field in the final space, a glued
+    volume run in the original one.
+
+    The dropdown offers an engine that did not read, disabled and
+    labelled: a viewer must not hide the state of a read, and a
+    chooser must not offer a selection the endpoint refuses.
+
+    ``selected`` marks the first engine that did read, because an HTML
+    select opens on its first option whether that option is disabled or
+    not. dots.mocr is first in the table, so it is the default wherever
+    it read.
+
+    :param summaries: ``{engine name: run summary or None}``, the
+        summaries the process view reads already.
+    :param final_run: The ``ApplyRun`` of the corrected volume, or
+        None.
+    :param final_space: Whether the viewer draws the corrected volume.
+    :returns: ``[{"name", "label", "available", "selected"}]``.
+    :rtype: list[dict]
+    """
+    from scanning import opinion_ocr
+
+    entries = []
+    for name, spec in opinion_ocr.ENGINES.items():
+        if final_space:
+            available = bool(final_run and spec.document_key(final_run))
+        else:
+            available = run_is_glued(summaries.get(name))
+        entries.append(
+            {
+                "name": name,
+                "label": engine_label(name),
+                "available": available,
+                "selected": False,
+            }
+        )
+    for entry in entries:
+        if entry["available"]:
+            entry["selected"] = True
+            break
+    return entries
 
 
 def detection_message(summary: dict | None) -> str:
@@ -457,9 +567,14 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
 
     # No external stage writes a scan status by design (#190, #195,
     # #191), so their rows are the only place their progress lives.
-    dots_run = dots_mocr.run_summary(scan)
+    # One walk of ``opinion_ocr.ENGINES`` for the OCR engines (#381):
+    # the action bar reads the three by name and the text overlay's
+    # dropdown reads them all, off the same summaries.
+    ocr_runs = ocr_run_summaries(scan)
+    dots_run = ocr_runs["dots_mocr"]
+    mistral_run = ocr_runs["mistral_ocr"]
+    surya_run = ocr_runs["surya"]
     yolo_run = yolo.run_summary(scan)
-    mistral_run = mistral_ocr.run_summary(scan)
 
     # The pages a reviewer asked a scanner to scan again, or the gaps
     # they asked a scanner to fill (#249). The waiting ones raise the
@@ -492,6 +607,15 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             else None
         ),
     )
+    # The preview shows the model's boxes and nothing else (#388). The
+    # findings, the boundaries and the redactions of a volume in it are
+    # either absent or left over from a superseded run (a reopen keeps
+    # the rows until the next import), and both answers are wrong on a
+    # page that judges today's detections. The read above is paid on
+    # this path alone, and the page renders no findings section.
+    preview = step >= 2 and flags["preview_available"]
+    if preview:
+        review_findings = {}
     final_space = step >= 2 and flags["final_space"]
     printed_warning = None
     if final_space:
@@ -502,6 +626,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         missing_pages = scan.missing_pages
         replaced_pages = {}
         deleted_pages: list[int] = []
+        moves: dict[int, int] = {}
         duplicate_indices: set[int] = set()
         flagged_indices: set[int] = set()
         idx_to_logical = {}
@@ -514,6 +639,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # remaining placeholder is stamped with the physical page it
         # follows, so an upload can send that address back (#214).
         page_map = page_edits.project_inserts(scan, scan.page_map)
+        # Every open missing-page request keeps a placeholder, whether
+        # or not the sequence still shows its gap (#393): the note, the
+        # Dismiss button and the insert form live on it.
+        page_map = repairs.project_requests(page_map, repair_requests)
         missing_pages = scan.missing_pages
 
         # The pages a curator replaced (#232). The viewer draws a note on
@@ -596,14 +725,33 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         for r in ocr_results:
             ocr_by_page[r["pdf_page"]] = r
 
+        # The sidebar lists the pages in the order the corrected volume
+        # holds them (#261): a page a curator moved sits at its new
+        # place, with a badge, and the ORDER divider it answered is
+        # gone. The entries are the cache's own, still addressed by
+        # ``pdf_page``.
+        moves = page_edits.moves_by_page(scan)
+        ocr_results = page_edits.order_by_moves(ocr_results, moves)
+
         # Annotate sequence issues for the sidebar page list. Duplicates are taken
         # from ``duplicate_indices`` (the same page_map data the viewer uses);
         # ``seq_issue`` only covers ordering anomalies (backward / gap).
-        prev_num = None
+        #
+        # Two adjacent pages whose printed numbers run backward by one
+        # are a transposed pair, the case of #261: the card for that
+        # printed number gets a button that moves the later page to
+        # before the earlier one. A backward step of more than one is
+        # a misread, so it gets no button. The card names a printed
+        # number and nothing else, so a number two pairs share, or two
+        # cards share, gets no button either: the wrong pair would move
+        # the wrong page.
+        swaps: dict[int, list[dict]] = {}
+        prev_num = prev_pdf = None
         for r in ocr_results:
             r["seq_issue"] = ""
             r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
             r["is_replaced"] = r["pdf_page"] in replaced_pages
+            r["is_moved"] = r["pdf_page"] in moves
             r["needs_repair"] = r["pdf_page"] in pages_needing_repair
             if r.get("type") == page_numbers.SUFFIXED:
                 # The book adds this page between two numbered ones, so
@@ -622,9 +770,26 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 diff = num - prev_num
                 if diff < 0:
                     r["seq_issue"] = "backward"
+                    if diff == -1 and prev_pdf == r["pdf_page"] - 1:
+                        swaps.setdefault(num, []).append(
+                            {
+                                "pdf_page": r["pdf_page"],
+                                "anchor_pdf_page": prev_pdf - 1,
+                            }
+                        )
                 elif diff > 2:
                     r["seq_issue"] = "gap"
             prev_num = num
+            prev_pdf = r["pdf_page"]
+        if scan.status not in LOCKED_STATUSES:
+            backward = [
+                i for i in issues if i.check_name == CheckName.BACKWARD_PAGE
+            ]
+            cards = Counter(i.page_number for i in backward)
+            for i in backward:
+                pairs = swaps.get(i.page_number, [])
+                if len(pairs) == 1 and cards[i.page_number] == 1:
+                    i.swap = pairs[0]
         deleted_pages = sorted(page_edits.deleted_pages(scan))
 
     has_detections = Detection.objects.filter(scan=scan).exists()
@@ -645,7 +810,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         for page, row in ocr_by_page.items()
         if (span := printed_page_span(row.get("detected"), row.get("type")))
     }
-    opinions = boundaries.viewer_payload(scan, page_spans)
+    # No boundary reaches the preview (#388), for the reason the
+    # findings do not: the pairing is the compute's own output, so a
+    # row here is a superseded run's, and its card carries a dismiss
+    # the endpoint refuses.
+    opinions = [] if preview else boundaries.viewer_payload(scan, page_spans)
     opinion_count = sum(1 for op in opinions if not op["dismissed"])
 
     # Build a set of page indices that contain IMAGE detections
@@ -688,6 +857,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # finding, so it stays a warning line.
     detect_warnings = []
 
+    # The text overlay's dropdown (#262, #381), off the summaries the
+    # page already read and the run the flags already found.
+    ocr_engines = ocr_text_engines(
+        ocr_runs, flags["final_run"], bool(final_space)
+    )
+
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
 
@@ -709,15 +884,25 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
+            "surya_run": surya_run,
             "detect_message": detection_message(yolo_run),
             **flags,
             "final_space": final_space,
-            # The text overlay's button (#262). The final space always
-            # has its OCR document (``ApplyRun.is_complete`` counts
-            # it), and every other page reads the volume document, so
-            # a legacy PaddleOCR volume gets no button.
-            "ocr_text_available": bool(final_space)
-            or dots_run_is_glued(dots_run),
+            # The step-scoped answer (#388): the rule is true of the
+            # volume, the banner and the locks are true of step 2
+            # alone. Step 1 of the same volume is an open page review.
+            "preview_only": preview,
+            # The text overlay's dropdown (#262, #381). One entry per
+            # engine, so the control says which reads exist and which
+            # do not; the template draws the pair when one is
+            # available, and a legacy PaddleOCR volume gets neither.
+            "ocr_text_engines": ocr_engines,
+            # The pair is drawn when one engine read this volume. Off
+            # the one list, so the control and its options never
+            # disagree.
+            "ocr_text_available": any(
+                engine["available"] for engine in ocr_engines
+            ),
             "opinions": opinions,
             "opinion_count": opinion_count,
             "opinions_json": json.dumps(opinions),
@@ -725,6 +910,9 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "detect_warnings": detect_warnings,
             **review_findings,
             "deleted_pages_json": json.dumps(deleted_pages),
+            "moved_pages_json": json.dumps(
+                {str(page): anchor for page, anchor in moves.items()}
+            ),
             # The rule of the step-1 bar (#151): the viewer must not
             # offer a control the endpoint refuses. Step 2 runs while
             # a new-pipeline volume is in DONE, which locks every page
@@ -732,8 +920,13 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             # locked and keeps its page-number control. The final space
             # is locked whatever the status (#269): a page number there
             # is a page of the corrected volume, not an address
-            # ``assign_page`` takes.
-            "page_edits_locked": final_space or scan.status in LOCKED_STATUSES,
+            # ``assign_page`` takes. The preview is locked too (#388),
+            # and only as a step-2 render: the same volume's step 1 is
+            # an open page review, whose edits this flag must not take
+            # away.
+            "page_edits_locked": (
+                final_space or preview or scan.status in LOCKED_STATUSES
+            ),
             "repair_requests": repair_requests,
             "waiting_repairs": waiting_repairs,
             "replaced_pages_json": json.dumps(
@@ -784,6 +977,9 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     mistral_run = mistral_ocr.run_summary(scan)
     if mistral_run:
         data["mistral_run"] = mistral_run
+    surya_run = surya.run_summary(scan)
+    if surya_run:
+        data["surya_run"] = surya_run
     return JsonResponse(data)
 
 
@@ -1025,27 +1221,67 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     the pages of the corrected volume would sit one page out from the
     first deletion onwards.
 
+    Which engine is the ``engine`` parameter (#381), a name of
+    ``opinion_ocr.ENGINES``, dots.mocr by default. The answer carries
+    that engine's ``fields`` as well, so the browser reads a document
+    whose shape it holds no copy of: a fourth engine is one more entry
+    of that table and no script change.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON with ``url``, ``space`` and ``size``; a 409 when the
-        final space has no document, a 404 when nothing was read, when
-        the object is gone, or when S3 is off.
+    :return: JSON with ``url``, ``space``, ``size``, ``engine``,
+        ``label`` and ``fields``; a 400 for an engine nobody has, a 409
+        when the corrected volume is not built, a 404 when this engine
+        read nothing, when the object is gone, or when S3 is off.
     """
+    from scanning import opinion_ocr
+
     scan = get_object_or_404(Scan, pk=pk)
+    name = request.GET.get("engine") or opinion_ocr.DEFAULT_ENGINE
+    spec = opinion_ocr.ENGINES.get(name)
+    if spec is None:
+        return JsonResponse(
+            {
+                "error": UNKNOWN_OCR_ENGINE_MESSAGE.format(
+                    engine=name, known=", ".join(opinion_ocr.ENGINES)
+                )
+            },
+            status=400,
+        )
     space = "original"
     if request.GET.get("space") == "final":
         from scanning import review_states
 
         run = review_states.final_run(scan)
-        if run is None or not run.ocr_key:
+        if run is None:
             return JsonResponse(
                 {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
             )
-        space, key = "final", run.ocr_key
-    else:
-        key = dots_mocr.glued_volume_key(scan)
+        # The corrected volume exists and this engine did not read it:
+        # that is a fact about the engine, not about the volume, and
+        # only dots.mocr is guaranteed (#245, #368).
+        key = spec.document_key(run)
         if not key:
-            return JsonResponse({"error": NO_READ_TEXT_MESSAGE}, status=404)
+            return JsonResponse(
+                {
+                    "error": NO_READ_FINAL_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
+                status=404,
+            )
+        space = "final"
+    else:
+        key = spec.module.glued_volume_key(scan)
+        if not key:
+            return JsonResponse(
+                {
+                    "error": NO_READ_TEXT_MESSAGE.format(
+                        label=engine_label(name)
+                    )
+                },
+                status=404,
+            )
 
     if not s3_sync.s3_active():
         return JsonResponse({"error": NO_S3_GLUED_OUTPUT_MESSAGE}, status=404)
@@ -1055,13 +1291,27 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     size = s3_sync.object_size(key)
     if size is None:
         return JsonResponse(
-            {"error": OCR_TEXT_OBJECT_GONE_MESSAGE}, status=404
+            {
+                "error": OCR_TEXT_OBJECT_GONE_MESSAGE.format(
+                    label=engine_label(name)
+                )
+            },
+            status=404,
         )
     # No ``content_disposition``: that header makes a browser save a
     # named file, which is what the routes of #243 want and the
     # opposite of what a ``fetch`` wants.
     url = s3_sync.presign_get(key, GLUED_OUTPUT_PRESIGN_TTL)
-    return JsonResponse({"url": url, "space": space, "size": size})
+    return JsonResponse(
+        {
+            "url": url,
+            "space": space,
+            "size": size,
+            "engine": spec.name,
+            "label": engine_label(name),
+            "fields": spec.fields,
+        }
+    )
 
 
 @login_required
@@ -1167,9 +1417,11 @@ def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
 #: hours and is the wrong size here.
 GLUED_OUTPUT_PRESIGN_TTL = 600
 
-#: Slug -> (stage, engine, glued key function): the two glued documents
-#: of issue #243. The outputs differ in nothing else, so a third engine
-#: is one more entry, not a view.
+#: Slug -> (stage, engine, glued key function): the glued documents of
+#: issue #243. The outputs differ in nothing else, so one more engine is
+#: one more entry, not a view. Surya is listed although no pass glues it
+#: yet (#364): the index reads the rows, and the volume route answers
+#: "not glued yet" for a key with no object, which is the true answer.
 GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
     "dots-mocr": (
         JobStage.ANALYZE,
@@ -1182,7 +1434,18 @@ GLUED_OUTPUTS: dict[str, tuple[str, str, Callable[[Scan, int], str]]] = {
         JobEngine.MISTRAL_OCR,
         mistral_ocr.glued_result_key,
     ),
+    "surya": (JobStage.EXTRACT, JobEngine.SURYA, surya.glued_result_key),
 }
+
+#: What a start button says when the committed manifest describes no
+#: shard at all. ``ensure_*`` then creates no row, and the "already
+#: read" line would address ``created[0]`` and raise. A manifest like
+#: that is a fault of the cut, not of the press, so the answer names
+#: it rather than claiming a read that never happened.
+NO_SHARDS_TO_READ_MESSAGE = (
+    "This volume's shard set lists no part to read. Re-cut it with the "
+    "admin re-queue before you start a read."
+)
 
 NO_S3_GLUED_OUTPUT_MESSAGE = (
     "No glued output exists without S3: the daemon glues into the "
@@ -1290,6 +1553,26 @@ def _redirect_to_object(
     return redirect(url)
 
 
+#: Which page lists one engine's summary carries, keyed by engine. Each
+#: engine reports its own faults and no other's, so an empty list of a
+#: name the engine does not report would read as "none" where the truth
+#: is "not a question here". One table, because the index is the triage
+#: tool and a second copy of a name would go stale in silence.
+SHARD_PAGE_LISTS: dict[str, tuple[str, ...]] = {
+    # The two holes, the pages a retry rung saved, and the pages whose
+    # layout JSON was repaired (#242).
+    JobEngine.DOTS_MOCR: jobs.PAGE_LIST_NAMES,
+    # One list: a batch line either answered or it did not (#245).
+    JobEngine.MISTRAL_OCR: ("failed_pages",),
+    # The worker's own lists (#320/#364/#368): the pages that raised,
+    # the pages that came back with no block twice, the pages surya
+    # re-read block by block, and the pages whose parse lost a block.
+    # Read off the glue's table, so a fifth list reaches the index with
+    # the glue that reports it.
+    JobEngine.SURYA: tuple(name for name, _member in surya.PAGE_LISTS),
+}
+
+
 def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
     """Describe one shard row for the glued-output index.
 
@@ -1323,15 +1606,11 @@ def _shard_entry(scan: Scan, output: str, row: ExternalJob) -> dict:
         "to_page": to_page + 1 if isinstance(to_page, int) else None,
         "page_count": manifest.get("page_count"),
     }
-    has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-    if row.engine == JobEngine.DOTS_MOCR and has_summary:
-        entry.update(jobs.page_lists(row))
-    elif row.engine == JobEngine.MISTRAL_OCR and has_summary:
-        # ``failed_pages`` alone (#245): the other three names of
-        # ``jobs.page_lists`` are dots.mocr faults, and an empty list
-        # would read as "none" where the truth is "not a question
-        # here".
-        entry["failed_pages"] = jobs.page_lists(row)["failed_pages"]
+    summary = (row.provider_meta or {}).get("output")
+    if isinstance(summary, dict):
+        for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+            value = summary.get(name)
+            entry[name] = list(value) if isinstance(value, list) else []
     if row.result_key:
         entry["url"] = reverse(
             "serve_glued_shard",
@@ -1461,6 +1740,173 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
     "writes one per tick after the redaction review is approved."
 )
 
+#: The 404 of ``opinion_ensemble_url`` before the pass has written the
+#: ensemble document at the live revision (#365).
+OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE = (
+    "The text of this opinion is not written yet. The daemon writes it "
+    "after the OCR glue, and the button reads the documents again."
+)
+#: The 404 of the two reader routes when the row says the object was
+#: written and the bucket does not hold it.
+OPINION_OBJECT_GONE_MESSAGE = (
+    "The row says this object was written, but it is not in the "
+    "bucket. Ask a staff member to write it again."
+)
+
+#: The objects of an opinion that are not one engine's document:
+#: ``opinion_ocr``'s manifest and the document of the ensemble (#365).
+#: One table, read by ``serve_opinion_ocr`` and by
+#: :func:`opinion_file_index`, so a name lives in one place.
+EXTRA_OPINION_OBJECTS = ("manifest", "ensemble")
+
+
+def _opinion_object_key(opinion: Opinion, name: str) -> str:
+    """Return the key of one object of an opinion's glue prefix.
+
+    Each module owns the key of its own object: ``opinion_ocr`` the
+    engine documents and the manifest, ``ensemble`` the document of the
+    ensemble. This function chooses between them and writes no key.
+
+    :param opinion: The row.
+    :param name: An engine, ``manifest`` or ``ensemble``.
+    :returns: The key.
+    :rtype: str
+    """
+    from scanning import ensemble, opinion_ocr
+
+    if name == "ensemble":
+        return ensemble.document_key(opinion)
+    return opinion_ocr.engine_key(opinion, name)
+
+
+@login_required
+def opinion_pdf_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read the redacted PDF from (#365).
+
+    The twin of :func:`scan_original_url`, for one opinion. The review
+    page draws the pages with pdf.js, which reads the file with range
+    requests straight from the bucket.
+
+    **The answer is JSON and not the 302 of** :func:`serve_opinion_pdf`.
+    A browser judges the CORS rules of a redirected request differently
+    from a direct one, the reason :func:`scan_ocr_text_url` gives, and
+    the direct presigned GET is the path the bucket rule is known to
+    serve. The 302 route keeps the download and the tab, where a
+    navigation needs no CORS rule at all.
+
+    ``opinion_pdf.is_written`` is the one rule for "the PDF exists", a
+    read of the row. One ``head_object`` follows it, so a row that is
+    stamped and an object that is gone do not send pdf.js to an S3
+    error page. The signature lives as long as the original's
+    (``ORIGINAL_VIEW_PRESIGN_TTL``), because the reader scrolls for
+    hours and every range is one more request.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, or a 404.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not opinion_pdf.is_written(opinion):
+        return _json_404(
+            OPINION_PDF_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _presigned_opinion_object(
+        opinion_pdf.key(opinion),
+        opinion.glue_revision,
+        opinion.pk,
+        # pdf.js holds this URL for the life of the page and asks for
+        # another range whenever the reviewer scrolls, so the signature
+        # must outlive the reading. ``GLUED_OUTPUT_PRESIGN_TTL`` is ten
+        # minutes, the size of one download, and a range after it would
+        # be a 403 on a page that shows no reason.
+        ttl=settings.ORIGINAL_VIEW_PRESIGN_TTL,
+    )
+
+
+@login_required
+def opinion_ensemble_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read the ensemble document from (#365).
+
+    The twin of :func:`scan_ocr_text_url`, for one opinion. The review
+    page reads the document with ``fetch`` and draws its boxes and its
+    text; the document of one opinion is small, and the pod still reads
+    no byte of it.
+
+    ``ensemble.is_written`` is the one rule for "the ensemble exists",
+    and it names the live revision of the OCR glue. The staff route
+    ``serve_opinion_ocr`` answers the same object with a redirect.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, or a 404.
+    """
+    from scanning import ensemble
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not ensemble.is_written(opinion):
+        return _json_404(
+            OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    return _presigned_opinion_object(
+        ensemble.document_key(opinion), opinion.glue_revision, opinion.pk
+    )
+
+
+def _presigned_opinion_object(
+    key: str,
+    revision: int | None,
+    opinion_pk: int,
+    *,
+    ttl: int = GLUED_OUTPUT_PRESIGN_TTL,
+) -> JsonResponse:
+    """Answer one object of an opinion as a URL the browser reads.
+
+    The body of the two routes above. No ``content_disposition``: that
+    header makes a browser save a named file, which is what the routes
+    of #243 want and the opposite of what a reader wants.
+
+    :param key: Object key inside the private bucket.
+    :param revision: The glue revision the row is stamped at.
+    :param opinion_pk: The row, for the body of a 404.
+    :param ttl: How long the signature lives. The default is one read
+        of one object; a file pdf.js keeps reading takes the long one.
+    :returns: JSON with ``url`` and ``revision``, or a 404.
+    :rtype: JsonResponse
+    """
+    if not s3_sync.s3_active():
+        return _json_404(
+            NO_S3_GLUED_OUTPUT_MESSAGE,
+            opinion=opinion_pk,
+            revision=revision,
+        )
+    # One ``head_object``, the rule of :func:`_redirect_to_object`:
+    # without it a row that is stamped and an object that is gone would
+    # send pdf.js to an S3 error page.
+    if not s3_sync.object_exists(key):
+        return _json_404(
+            OPINION_OBJECT_GONE_MESSAGE,
+            opinion=opinion_pk,
+            revision=revision,
+        )
+    return JsonResponse(
+        {
+            "url": s3_sync.presign_get(key, ttl),
+            "revision": revision,
+        }
+    )
+
 
 @login_required
 @xframe_options_sameorigin
@@ -1476,18 +1922,22 @@ def serve_opinion_pdf(
     an S3 HEAD. The review page of #334 reads the same key through the
     same rule.
 
-    ``?disposition=inline`` asks for the same object in a frame (#334).
-    The review page puts this route in an ``iframe``, which is a
-    navigation and needs no CORS rule, and the browser's own PDF viewer
-    shows the file. Every other caller gets the download name.
+    ``?disposition=inline`` asks for the same object to be shown and
+    not saved (#334). The review page opens this route in a tab of its
+    own, a navigation that needs no CORS rule, and the browser's own
+    PDF viewer shows the file. Every other caller gets the download
+    name. The page itself draws the pages from ``opinion_pdf_url``,
+    whose answer pdf.js reads directly (#365).
 
     The route answers ``SAMEORIGIN`` where the site answers ``DENY``,
-    because the site's own page frames it: a browser that reads the
-    header on the redirect would otherwise refuse the frame. It is the
-    narrower value, and the right one. An exemption would let any site
-    frame the route, and although the frame ends at the bucket, which
-    is cross-origin and gives its bytes to no page, a third party's
-    page would still make this pod sign a URL.
+    so a page of the site can frame it: a browser that reads the header
+    on the redirect would otherwise refuse the frame. The review page
+    frames it no longer (#365 draws the pages instead), and the header
+    stays at that narrower value for the next page that does. An
+    exemption would let any site frame the route, and although the
+    frame ends at the bucket, which is cross-origin and gives its bytes
+    to no page, a third party's page would still make this pod sign a
+    URL.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1529,24 +1979,32 @@ def serve_opinion_ocr(
     """Send the browser to one engine's OCR document of one opinion (#350).
 
     A developer's route, so it redirects (#243/#262). ``manifest``
-    names the manifest. A 404 before the glue is written
-    (``opinion_ocr.is_written``), for an engine this module does not
-    know, and for an opinion of another scan.
+    names the manifest, and ``ensemble`` the document of the OCR
+    ensemble (#365), which has a ledger of its own
+    (``ensemble.is_written``): the engine documents of a revision can
+    exist while nothing read them yet. A 404 before the glue is
+    written (``opinion_ocr.is_written``), for an engine this module
+    does not know, and for an opinion of another scan.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param opinion_pk: The ``Opinion`` primary key.
-    :param engine: A name of ``opinion_ocr.ENGINES``, or ``manifest``.
+    :param engine: A name of ``opinion_ocr.ENGINES``, ``manifest``, or
+        ``ensemble``.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
+    from scanning import ensemble as ensemble_module
     from scanning import opinion_ocr
 
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
-    if engine != "manifest" and engine not in opinion_ocr.ENGINES:
+    if (
+        engine not in EXTRA_OPINION_OBJECTS
+        and engine not in opinion_ocr.ENGINES
+    ):
         return _json_404(
-            f"Unknown engine {engine!r}. "
-            f"Known: manifest, {', '.join(opinion_ocr.ENGINES)}."
+            f"Unknown engine {engine!r}. Known: "
+            f"{', '.join((*EXTRA_OPINION_OBJECTS, *opinion_ocr.ENGINES))}."
         )
     revision = opinion.glue_revision
     if not opinion_ocr.is_written(opinion):
@@ -1556,10 +2014,17 @@ def serve_opinion_ocr(
             revision=revision,
             label=opinion.status,
         )
+    if engine == "ensemble" and not ensemble_module.is_written(opinion):
+        return _json_404(
+            OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE,
+            opinion=opinion.pk,
+            revision=revision,
+            label=opinion.status,
+        )
     return _redirect_to_object(
         scan,
         f"opinion-{engine}",
-        opinion_ocr.engine_key(opinion, engine),
+        _opinion_object_key(opinion, engine),
         filename=(
             f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
             f"{opinion.index_in_page}-r{revision}-{engine}.json"
@@ -1590,14 +2055,22 @@ def opinion_file_index(
     is written, the rule of :func:`_shard_entry`, where a link that
     cannot work is left out.
 
-    **The OCR ledger is one stamp over four files, and the glue writes
-    one file per engine the run has** (``opinion_ocr.write``). So an
-    engine document is written when the stamp is live **and** the run
-    carries that engine's key: a volume nobody read with Mistral is
-    glued from dots.mocr alone, and its ``mistral_ocr.json`` was never
-    put in the bucket. The manifest is written on every glue. A key
-    that lands on the run after the glue reads as written until the
-    next re-glue, the one error left here, and the rarer one.
+    **The OCR ledger is one stamp over every file of the revision, and
+    the glue writes one file per engine the run has**
+    (``opinion_ocr.write``). The count follows ``opinion_ocr.ENGINES``,
+    which #368 made three, plus :data:`EXTRA_OPINION_OBJECTS`, so no
+    reader counts. So an engine document is written when the stamp is
+    live **and** the run carries that engine's key: a volume nobody
+    read with Mistral is glued from dots.mocr alone, and its
+    ``mistral_ocr.json`` was never put in the bucket. The manifest is
+    written on every glue. A key that lands on the run after the glue
+    reads as written until the next re-glue, the one error left here,
+    and the rarer one.
+
+    **The ensemble has a ledger of its own** (``ensemble.is_written``,
+    #365). It is written after the engine documents of the same
+    revision, and a volume two engines read waits for the button, so
+    the OCR stamp does not answer for it.
 
     The keys are of the live revision (``Opinion.glue_prefix``). A
     re-glue raises the revision, so this index never names an object of
@@ -1609,7 +2082,7 @@ def opinion_file_index(
     :return: JSON with ``scan``, ``opinion``, ``label``, ``status``,
         ``glue_revision``, ``prefix`` and ``files``.
     """
-    from scanning import opinion_ocr
+    from scanning import ensemble, opinion_ocr
 
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
@@ -1627,17 +2100,25 @@ def opinion_file_index(
     ]
     ocr_written = opinion_ocr.is_written(opinion)
     run = opinion.apply_run
-    for engine in (*opinion_ocr.ENGINES, "manifest"):
-        key = opinion_ocr.engine_key(opinion, engine)
+    for engine in (*opinion_ocr.ENGINES, *EXTRA_OPINION_OBJECTS):
+        key = _opinion_object_key(opinion, engine)
         spec = opinion_ocr.ENGINES.get(engine)
         has_read = spec is None or bool(
             run is not None and spec.document_key(run)
+        )
+        # The ensemble has a ledger of its own: it is written after the
+        # engine documents of the same revision, and a two-engine
+        # volume waits for the button (#365).
+        written = (
+            ensemble.is_written(opinion)
+            if engine == "ensemble"
+            else ocr_written and has_read
         )
         files.append(
             {
                 "name": key.rsplit("/", 1)[-1],
                 "output": f"opinion-{engine}",
-                "written": ocr_written and has_read,
+                "written": written,
                 "key": key,
                 "url": reverse(
                     "serve_opinion_ocr",
@@ -1732,6 +2213,7 @@ APPLY_OUTPUTS: dict[str, tuple[str | None, str]] = {
     "printed-pages": ("printed_pages_key", "json"),
     "detections-volume": ("detections_key", "json"),
     "extract-volume": ("extract_key", "json"),
+    "surya-volume": ("surya_key", "json"),
     "page-map": (None, "json"),
 }
 
@@ -1787,9 +2269,11 @@ def _apply_run_entry(scan: Scan, run, rows: list, measured: bool) -> dict:
             "error_code": row.error_code,
             "page_count": manifest.get("page_count"),
         }
-        has_summary = isinstance((row.provider_meta or {}).get("output"), dict)
-        if row.engine == JobEngine.DOTS_MOCR and has_summary:
-            entry.update(jobs.page_lists(row))
+        summary = (row.provider_meta or {}).get("output")
+        if isinstance(summary, dict):
+            for name in SHARD_PAGE_LISTS.get(row.engine, ()):
+                value = summary.get(name)
+                entry[name] = list(value) if isinstance(value, list) else []
         if row.result_key:
             entry["url"] = reverse(
                 "serve_apply_shard",
@@ -2048,6 +2532,13 @@ def _review_flags(
     requests for the sidebar anyway -- and the flag is queried only for
     a caller that does not (the ``process_actions`` fragment).
 
+    ``preview_available`` is the detection preview of #388, and
+    ``preview_approved`` says which disclaimer it gets: a volume whose
+    page review is still open must approve it, and an approved one must
+    wait for the corrected volume. The rule is
+    ``review_states.preview_only``, and a render turns it into
+    ``preview_only``, which is that rule on a step-2 page.
+
     ``pages_without_number`` is the second gate of that approval
     (#342), and it is read in READY alone, which is the condition the
     view reads: a volume past review 1 pays no query for it, whichever
@@ -2062,7 +2553,8 @@ def _review_flags(
         :func:`findings.open_count`, past the review-1 approval.
     :returns: ``page_review_ready``, ``page_review_done``,
         ``redaction_review_ready``, ``redaction_review_done``,
-        ``legacy_review``, ``has_legacy_ocr``, ``repairs_waiting``,
+        ``preview_available``, ``preview_approved``, ``legacy_review``,
+        ``has_legacy_ocr``, ``repairs_waiting``,
         ``pages_without_number``, ``legacy_pipeline``,
         ``review3_opinions`` and the two pending-edit flags, for the
         template context.
@@ -2080,9 +2572,15 @@ def _review_flags(
     # rows measured on the original would put the final PDF under boxes
     # of another space, the one thing step 2 must never show.
     final = review_states.final_run(scan, run)
+    detect_rows = yolo.live_detect_jobs(scan) if final is not None else None
     final_space = final is not None and yolo.redactions_current(
-        yolo.live_detect_jobs(scan), final
+        detect_rows, final
     )
+    # The read-only step 2 of a volume with no measured geometry
+    # (#388). The run is the one read above, and the rows are read by
+    # the rule itself, past its status check: a volume no preview can
+    # reach pays no query for one.
+    preview_available = review_states.preview_only(scan, detect_rows, run)
     final_volume = None
     if final is not None:
         final_volume = {
@@ -2109,6 +2607,16 @@ def _review_flags(
             scan.status == Status.READY_FOR_REDACTION_REVIEW
         ),
         "redaction_review_done": (scan.status == Status.REDACTION_REVIEW_DONE),
+        # The detection preview (#388). ``preview_available`` is the
+        # rule, true of the volume whichever step is rendered, because
+        # step 1 links the preview and the step-2 tab marks it. The
+        # page turns it into ``preview_only``, the step-2 render, which
+        # is what the banner and the locks read: step 1 of the same
+        # volume is an open page review. ``preview_approved`` picks the
+        # disclaimer: a volume whose page review is still open must be
+        # approved, an approved one must wait for the corrected volume.
+        "preview_available": preview_available,
+        "preview_approved": preview_available and done,
         # The last word of the server on a volume parked in review 2
         # (#336). A failed opinion creation or a failed recompute parks
         # the scan here with the reason in ``progress_message``, and the
@@ -2281,6 +2789,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
 
     dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
+    flags = _review_flags(scan)
     context = {
         "scan": scan,
         "step": step,
@@ -2292,8 +2801,12 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "ocr_missing": ocr_missing(scan, dots_run),
         "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
+        "surya_run": surya.run_summary(scan),
         "detect_message": detection_message(yolo_run),
-        **_review_flags(scan),
+        **flags,
+        # Step-scoped, as the page renders it (#388): the bar of step 1
+        # belongs to the page review, whichever state step 2 is in.
+        "preview_only": step >= 2 and flags["preview_available"],
     }
     html = render_to_string(
         "scanning/_process_actions.html", context, request=request
@@ -2388,32 +2901,125 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
-@login_required
-@require_POST
-def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start the dots.mocr stage over a scan's original shards (#190).
+@dataclass(frozen=True)
+class ShardRead:
+    """What one engine's start button says, asks and calls.
 
-    Staff only. Since #207 the pipeline enqueues this stage for every
-    new upload, so this button is the manual way in: a fresh run over
-    an edited volume, or a backfill for a scan uploaded while the
-    stage was button-only. Every press can start real graphics
-    processing unit (GPU) work on RunPod that costs money, which is
-    why it stays behind the staff gate.
+    The three buttons (#190, #191, #364) are one view: each writes one
+    ``ExternalJob`` row per original shard, behind the same four gates,
+    and each answers the same five messages. Only the words and the
+    three functions differ, so they are an entry here rather than a
+    copy of the view.
 
-    **This request makes no call to RunPod.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick sends them, and ``collect_external_jobs``
-    polls and retries them. That keeps a request thread off a slow HTTP
-    call, and it is what makes the run survive a redeployed web pod.
+    :ivar name: The view's name, for its log line.
+    :ivar label: What a message calls this read ("Mistral OCR").
+    :ivar off_label: What the "not switched on" line calls it. The
+        dots.mocr button says "OCR" everywhere else, but naming the
+        engine is what makes its two switches findable.
+    :ivar cost: What a press spends, in the staff refusal.
+    :ivar switches: The environment names an operator must set.
+    :ivar dispatch: What the daemon does next, in the success line.
+        Mistral renders the pages itself before it sends them.
+    :ivar is_enabled: Whether this stage may be dispatched at all.
+    :ivar run_summary: The live run of this engine, or ``None``.
+    :ivar create: The row creator. **This is what costs money**, which
+        is why the AST test of ``TestKnownEnqueuePaths`` pins the
+        modules that name one.
+    """
 
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, so this
-    view neither downloads a multi-gigabyte PDF nor reads ``shards/``
-    directly. A stale or missing set is refused, because re-cutting is
-    the pipeline's job.
+    name: str
+    label: str
+    off_label: str
+    cost: str
+    switches: str
+    dispatch: str
+    is_enabled: Callable[[], bool]
+    run_summary: Callable[[Scan], dict | None]
+    create: Callable[[Scan, dict], list[ExternalJob]]
+
+
+def _shard_reads() -> dict[str, ShardRead]:
+    """Return the three reads over a volume's original shards.
+
+    Rebuilt on each call, and deliberately not cached, for the reason
+    ``jobs._runpod_engines`` is: the entries read functions off the
+    stage modules at build time, so a test that patches
+    ``mistral_ocr.enabled`` reaches this table too.
+
+    :returns: The table, keyed by engine.
+    :rtype: dict[str, ShardRead]
+    """
+    return {
+        JobEngine.DOTS_MOCR: ShardRead(
+            name="start_dots_mocr",
+            label="OCR",
+            off_label="dots.mocr",
+            cost="GPU time",
+            switches="DOTS_MOCR_ENABLED and RUNPOD_DOTSMOCR_ENDPOINT_ID",
+            dispatch="sends them to RunPod",
+            is_enabled=dots_mocr.enabled,
+            run_summary=dots_mocr.run_summary,
+            create=dots_mocr.ensure_analyze_jobs,
+        ),
+        JobEngine.MISTRAL_OCR: ShardRead(
+            name="start_mistral_ocr",
+            label="Mistral OCR",
+            off_label="Mistral OCR",
+            cost="money",
+            switches="MISTRAL_API_KEY",
+            # The daemon renders every page of the shard before it
+            # uploads it, which is minutes rather than a POST (#191).
+            dispatch="renders and sends them",
+            is_enabled=mistral_ocr.enabled,
+            run_summary=mistral_ocr.run_summary,
+            create=mistral_ocr.ensure_extract_jobs,
+        ),
+        JobEngine.SURYA: ShardRead(
+            name="start_surya_ocr",
+            label="Surya OCR",
+            off_label="Surya OCR",
+            cost="money",
+            switches="RUNPOD_SURYA_ENDPOINT_ID",
+            dispatch="sends them to RunPod",
+            is_enabled=surya.enabled,
+            run_summary=surya.run_summary,
+            create=surya.ensure_extract_jobs,
+        ),
+    }
+
+
+def _start_shard_read(
+    request: HttpRequest, pk: int, spec: ShardRead
+) -> HttpResponse:
+    """Create one engine's rows over a scan's original shards.
+
+    The body of the three start buttons. Four gates, in this order:
+
+    1. **Staff only.** Every press can start real paid work.
+    2. **The stage must be switched on.** An environment that must not
+       spend leaves the engine's key or endpoint id unset.
+    3. **An open run is not restarted.** It means the daemon is still
+       working on the last press. A *finished* run is reused rather
+       than refused, which is what keeps the creator from paying twice
+       for shards already read.
+    4. **The shard set must be committed.**
+       ``sharding.committed_manifest`` verifies the stored set against
+       the original with one ``head_object``, and a stale or missing
+       set is refused, because re-cutting is the pipeline's job. So a
+       web pod never pulls the original.
+
+    **This request calls no provider.** It writes one ``ExternalJob``
+    row per shard and returns; the daemon's next ``submit_external_jobs``
+    tick sends them, and ``collect_external_jobs`` polls, harvests and
+    retries them. That keeps a request thread off a slow HTTP call, and
+    it is what makes a run survive a redeployed web pod.
+
+    The answer says what happened and never more: a dispatch that is
+    coming, a run that was reused, or a shard set with nothing in it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
+    :param spec: Which read to start.
     :return: Redirect to the scan processing page.
     """
     from scanning import sharding
@@ -2424,26 +3030,23 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     if not request.user.is_staff:
         messages.error(
             request,
-            "Only staff can start OCR: each run costs GPU time.",
+            f"Only staff can start {spec.label}: each run costs {spec.cost}.",
         )
         return back
 
-    if not dots_mocr.enabled():
+    if not spec.is_enabled():
         messages.warning(
             request,
-            "dots.mocr is not switched on in this environment. Set "
-            "DOTS_MOCR_ENABLED and RUNPOD_DOTSMOCR_ENDPOINT_ID first.",
+            f"{spec.off_label} is not switched on in this environment. "
+            f"Set {spec.switches} first.",
         )
         return back
 
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_analyze_jobs`` from paying twice for shards already read.
-    summary = dots_mocr.run_summary(scan)
+    summary = spec.run_summary(scan)
     if summary and summary["open"]:
         messages.info(
             request,
-            f"OCR run {summary['run']} is already going: "
+            f"{spec.label} run {summary['run']} is already going: "
             f"{summary['done']} of {summary['total']} part(s) done.",
         )
         return back
@@ -2453,10 +3056,11 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
         messages.warning(request, reason)
         return back
 
-    created = dots_mocr.ensure_analyze_jobs(scan, manifest)
+    created = spec.create(scan, manifest)
     queued = sum(1 for job in created if job.status == JobStatus.PENDING)
     logger.info(
-        "start_dots_mocr: scan=%s user=%s run=%s shards=%d queued=%d",
+        "%s: scan=%s user=%s run=%s shards=%d queued=%d",
+        spec.name,
         scan.pk,
         request.user.pk,
         created[0].run if created else "?",
@@ -2466,19 +3070,38 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     if queued:
         messages.success(
             request,
-            f"Queued OCR for {queued} part(s) of this volume. The "
-            "daemon sends them to RunPod within a few seconds.",
+            f"Queued {spec.label} for {queued} part(s) of this volume. "
+            f"The daemon {spec.dispatch} within a few seconds.",
         )
-    else:
-        # ``ensure_analyze_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent. Saying otherwise
-        # would have staff waiting on a dispatch that is not coming.
+    elif created:
+        # The creator reused a run that is already done, so nothing was
+        # queued and nothing will be sent. Saying otherwise would have
+        # staff waiting on a dispatch that is not coming.
         messages.info(
             request,
             f"This volume was already read: run {created[0].run} covers "
             f"all {len(created)} part(s). Nothing new was queued.",
         )
+    else:
+        messages.warning(request, NO_SHARDS_TO_READ_MESSAGE)
     return back
+
+
+@login_required
+@require_POST
+def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the dots.mocr stage over a scan's original shards (#190).
+
+    Since #207 the pipeline creates these rows for every new upload, so
+    this button is the manual way in: a fresh run over an edited
+    volume, or a backfill for a scan uploaded while the stage was
+    button-only.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: See :func:`_start_shard_read`.
+    """
+    return _start_shard_read(request, pk, _shard_reads()[JobEngine.DOTS_MOCR])
 
 
 @login_required
@@ -2486,93 +3109,35 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
 def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
     """Start the Mistral OCR read over a scan's shards (#191).
 
-    Staff only, and the only way into this stage until a daemon trigger
-    lands. Every press can start real paid work on Mistral's batch API.
-
-    The read is over the original shards, so the button waits on no
-    review state and on no redacted volume: the set exists from the
-    moment the pipeline cut it. ``MISTRAL_API_KEY`` is the switch an
-    environment holds, and an environment that must not spend leaves
-    the key unset.
-
-    **This request makes no call to Mistral.** It writes one
-    ``ExternalJob`` row per shard and returns; the daemon's next
-    ``submit_external_jobs`` tick renders, uploads and submits them,
-    and ``collect_external_jobs`` polls, harvests and retries them.
-    The render is the daemon's work, so a web pod never opens the
-    volume.
-
-    It also never cuts shards. ``sharding.committed_manifest`` verifies
-    the stored set against the original with one ``head_object``, and a
-    stale or missing set is refused, because re-cutting is the
-    pipeline's job.
+    The only way into this stage until a daemon trigger lands. The read
+    is over the original shards, so the button waits on no review state
+    and on no redacted volume: the set exists from the moment the
+    pipeline cut it.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: Redirect to the scan processing page.
+    :return: See :func:`_start_shard_read`.
     """
-    from scanning import sharding
-
-    scan = get_object_or_404(Scan, pk=pk)
-    back = redirect("scan_process", pk=scan.pk)
-
-    if not request.user.is_staff:
-        messages.error(
-            request,
-            "Only staff can start Mistral OCR: each run costs money.",
-        )
-        return back
-
-    if not mistral_ocr.enabled():
-        messages.warning(
-            request,
-            "Mistral OCR is not switched on in this environment. Set "
-            "MISTRAL_API_KEY first.",
-        )
-        return back
-
-    # An open run means the daemon is still working on the last press.
-    # A finished run is reused rather than refused, which is what keeps
-    # ``ensure_extract_jobs`` from paying twice for shards already read.
-    summary = mistral_ocr.run_summary(scan)
-    if summary and summary["open"]:
-        messages.info(
-            request,
-            f"Mistral OCR run {summary['run']} is already going: "
-            f"{summary['done']} of {summary['total']} part(s) done.",
-        )
-        return back
-
-    manifest, reason = sharding.committed_manifest(scan)
-    if manifest is None:
-        messages.warning(request, reason)
-        return back
-
-    created = mistral_ocr.ensure_extract_jobs(scan, manifest)
-    queued = sum(1 for job in created if job.status == JobStatus.PENDING)
-    logger.info(
-        "start_mistral_ocr: scan=%s user=%s run=%s shards=%d queued=%d",
-        scan.pk,
-        request.user.pk,
-        created[0].run if created else "?",
-        len(created),
-        queued,
+    return _start_shard_read(
+        request, pk, _shard_reads()[JobEngine.MISTRAL_OCR]
     )
-    if queued:
-        messages.success(
-            request,
-            f"Queued Mistral OCR for {queued} part(s) of this volume. The "
-            "daemon renders and sends them within a few seconds.",
-        )
-    else:
-        # ``ensure_extract_jobs`` reused a run that is already done, so
-        # nothing was queued and nothing will be sent.
-        messages.info(
-            request,
-            f"This volume was already read: run {created[0].run} covers "
-            f"all {len(created)} part(s). Nothing new was queued.",
-        )
-    return back
+
+
+@login_required
+@require_POST
+def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
+    """Start the Surya OCR read over a scan's shards (#364).
+
+    The only way into this stage: no tick and no pipeline arm creates a
+    Surya row. The read is over the original shards, so the button
+    waits on no review state, and the pages are unredacted, which is
+    what a reader of the headnote brackets needs (#303).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: See :func:`_start_shard_read`.
+    """
+    return _start_shard_read(request, pk, _shard_reads()[JobEngine.SURYA])
 
 
 @login_required
@@ -3300,6 +3865,100 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
             refresh_open=False,
         )
     return JsonResponse({"status": "ok", "pdf_pages": sorted(set(pages))})
+
+
+#: The refusal of a move whose anchor is its own page.
+MOVE_ONTO_ITSELF_MESSAGE = "A page cannot follow itself."
+
+
+@login_required
+@require_POST
+def move_page(request: HttpRequest, pk: int) -> HttpResponse:
+    """Move a page of the original to after another one (#261).
+
+    Two adjacent pages scanned in the wrong order, the case the
+    ``backward_page`` card finds: one ``PageEdit`` row, addressed by
+    the page that moves and the original page it lands after (0 for
+    before page 1), the insert's vocabulary. The apply (#224) writes
+    the page at its new place and pays no read for it; until then the
+    row is a saved decision, and the page map is rebuilt so the viewer
+    and the sidebar draw the corrected order at once.
+
+    Both addresses are checked before the row is written. A second
+    move of the same page refreshes the open row, as a page number
+    does; an applied row is superseded.
+
+    :param request: The HTTP request (JSON body with ``pdf_page`` and
+        ``anchor_pdf_page``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the move record.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
+    anchor = data.get("anchor_pdf_page")
+    if anchor == 0 or anchor == "0":
+        anchor = 0
+    else:
+        anchor = _pdf_page_of(scan, anchor)
+    if pdf_page is None or anchor is None:
+        return JsonResponse({"error": "Unknown PDF page."}, status=404)
+    if anchor == pdf_page:
+        return JsonResponse({"error": MOVE_ONTO_ITSELF_MESSAGE}, status=409)
+    from scanning import services
+
+    page_edits.supersede(
+        scan,
+        PageEdit.Kind.MOVE_PAGE,
+        {"pdf_page": pdf_page},
+        {
+            "anchor_pdf_page": anchor,
+            "source_fingerprint": scan.source_fingerprint,
+        },
+        request.user,
+    )
+    services.rebuild_page_map(scan)
+    return JsonResponse(
+        {"status": "ok", "pdf_page": pdf_page, "anchor_pdf_page": anchor}
+    )
+
+
+@login_required
+@require_POST
+def undo_move_page(request: HttpRequest, pk: int) -> HttpResponse:
+    """Take back a page move, leaving the page where it was scanned.
+
+    The row is stamped, not deleted (#232), like every decision a
+    curator takes back.
+
+    :param request: The HTTP request (JSON body with ``pdf_page``).
+    :param pk: Scan primary key.
+    :return: JSON response confirming the undo.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    locked = _refuse_locked_edits(scan)
+    if locked is not None:
+        return locked
+    try:
+        data = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    from scanning import services
+
+    page_edits.withdraw(
+        page_edits.standing_edits(scan, PageEdit.Kind.MOVE_PAGE).filter(
+            pdf_page=data.get("pdf_page")
+        ),
+        request.user,
+    )
+    services.rebuild_page_map(scan)
+    return JsonResponse({"status": "ok"})
 
 
 @login_required

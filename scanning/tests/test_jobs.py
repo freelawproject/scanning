@@ -916,23 +916,26 @@ class TestProviderTable(ScanningTestCase):
         job = jobs.ensure_convert_jobs(
             ScanFactory(), make_manifest(shard_count=1)
         )[0]
+        spec = jobs._provider(job)
+        assert spec.presigned_ttl is not None, "doctor is handed a URL"
         with override_settings(DOCTOR_MAX_ATTEMPTS=9, DOCTOR_PRESIGNED_TTL=7):
             self.assertEqual(jobs._max_attempts(job), 9)
-            self.assertEqual(jobs._presigned_ttl(job), 7)
-        self.assertEqual(jobs._result_suffix(job), ".pdf")
+            self.assertEqual(spec.presigned_ttl(job), 7)
+        self.assertEqual(spec.result_suffix, ".pdf")
         self.assertEqual(
-            jobs._result_content_type(job), doctor_client.RESULT_CONTENT_TYPE
+            spec.result_content_type, doctor_client.RESULT_CONTENT_TYPE
         )
 
-    def test_a_provider_handed_no_url_refuses_a_ttl(self):
+    def test_a_provider_handed_no_url_signs_none(self):
+        """``claim_for_wave`` reads the entry and signs nothing (#191)."""
         from scanning import mistral_ocr
 
         job = mistral_ocr.ensure_extract_jobs(
             ScanFactory(), make_manifest(shard_count=1)
         )[0]
-        with self.assertRaises(jobs.UnknownProvider):
-            jobs._presigned_ttl(job)
-        self.assertEqual(jobs._result_suffix(job), ".json")
+        spec = jobs._provider(job)
+        self.assertIsNone(spec.presigned_ttl)
+        self.assertEqual(spec.result_suffix, ".json")
 
 
 class _Outcome:

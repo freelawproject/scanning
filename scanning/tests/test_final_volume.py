@@ -118,6 +118,7 @@ class TestApplyReaders(TestCase):
                 "inserted": 1,
                 "replaced": 0,
                 "rotated": 0,
+                "moved": 0,
                 "identity": False,
             },
         )
@@ -529,8 +530,12 @@ class TestStepTwoShowsTheCorrectedVolume(ScanningTestCase):
         self.assertIn("being measured", html)
 
     def test_no_run_says_the_volume_is_not_built(self):
-        scan, _ = merged_scan(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
-        ApplyRun.objects.filter(scan=scan).delete()
+        """A volume with no detection run either: one whose run is
+        merged and whose corrected volume is not built is the preview
+        of #388, and its bar is the preview's own."""
+        scan = ScanFactory(
+            status=Status.PAGE_COMPLETENESS_REVIEW_DONE, page_count=2
+        )
 
         html = self._page(scan).content.decode()
 
@@ -635,6 +640,39 @@ class TestApplyOutputs(ScanningTestCase):
                 kwargs={"pk": scan.pk, "number": 1, "row_pk": row.pk},
             ),
         )
+
+    def test_a_shard_carries_its_own_engine_s_page_lists(self):
+        """The index reads one table of per-engine names (#364).
+
+        The apply creates EXTRACT/Mistral rows too (#245), and a
+        branch that named dots.mocr alone dropped their
+        ``failed_pages``.
+        """
+        scan, _ = applied_scan()
+        run = apply.current_run(scan)
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            status=JobStatus.CONSUMED,
+            apply_run=run,
+            run=6,
+            input_manifest={"edit_id": 9, "page_count": 1},
+            result_key="jobs/apply/a1/extract/mistral_ocr/r6-s0-a1.json",
+            provider_meta={"output": {"failed_pages": [0]}},
+        )
+
+        data = self.client.get(
+            reverse("apply_output_index", kwargs={"pk": scan.pk})
+        ).json()
+        shard = next(
+            entry
+            for entry in data["runs"][0]["shards"]
+            if entry["engine"] == JobEngine.MISTRAL_OCR
+        )
+        self.assertEqual(shard["failed_pages"], [0])
+        # dots.mocr's own names are not this engine's question.
+        self.assertNotIn("filtered_pages", shard)
 
     def test_the_mistral_document_is_listed_once_it_is_glued(self):
         """A run with no Mistral read offers no such file, and a read

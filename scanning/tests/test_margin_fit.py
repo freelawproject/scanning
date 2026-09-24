@@ -244,3 +244,297 @@ class TestBlackletterReadsIt(TestCase):
             (250.0, 100.0, 1450.0, 1900.0), detections=(column,)
         )
         self.assertAlmostEqual(bounds[3], 716.0, places=0)
+
+    def test_a_clipped_column_no_longer_pins_the_strip(self):
+        """The bug of #370, and the fix, in blackletter's own pull-back.
+
+        A column box drawn out to the page edge pins the left strip at
+        its edge, which drops it; the same page through
+        ``clipped_pages`` keeps the strip up to the text box.
+        """
+        from blackletter import margins
+
+        column = BLDetection(
+            bbox=BBox(x1=0.5, y1=130.0, x2=760.0, y2=2050.0),
+            label=Label.TEXT_COLUMN,
+            confidence=0.33,
+            page_index=0,
+        )
+        raw = page(detections=(column,))
+        raw.text_box = (240.0, 75.0, 1450.0, 2010.0)
+        # The content box the fit arrives at: text box plus the buffer.
+        bounds = (81.4, 22.0, 527.0, 728.6)
+
+        def strips(subject):
+            rects = margins._rects_for_bounds(
+                bounds, *POINTS, margins.DEFAULT_BUFFER
+            )
+            margins._shrink_rects_for_detections(subject, rects)
+            return [
+                r
+                for r in rects
+                if r["x1"] - r["x0"] > 1 and r["y1"] - r["y0"] > 1
+            ]
+
+        self.assertFalse(
+            [r for r in strips(raw) if r["x0"] == 0 and r["x1"] < 600]
+        )
+        (clipped,) = margin_fit.clipped_pages([raw])
+        left = [r for r in strips(clipped) if r["x0"] == 0 and r["x1"] < 600]
+        self.assertEqual(len(left), 1)
+        self.assertAlmostEqual(left[0]["x1"], 76.4, places=1)
+
+
+class TestClippedPages(TestCase):
+    """The column and image boxes the margin measure reads (#370)."""
+
+    #: The text of the fixture page, in render pixels.
+    TEXT_BOX = (240.0, 75.0, 1450.0, 2010.0)
+
+    @staticmethod
+    def _detection(label, *box, confidence=0.5):
+        return BLDetection(
+            bbox=BBox(x1=box[0], y1=box[1], x2=box[2], y2=box[3]),
+            label=label,
+            confidence=confidence,
+            page_index=0,
+        )
+
+    def _page(self, *detections, text_box=TEXT_BOX):
+        subject = page(detections=detections)
+        subject.text_box = text_box
+        return subject
+
+    def test_a_column_over_the_blot_is_held_at_the_text_box(self):
+        """The x-bounds move in to the text box plus the strips' buffer."""
+        from blackletter.margins import DEFAULT_BUFFER
+
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(column)])
+        box = clipped.detections[0].bbox
+        pad = DEFAULT_BUFFER / clipped.scale_x
+        self.assertAlmostEqual(box.x1, 240.0 - pad, places=3)
+        self.assertEqual(box.x2, 760.0)
+
+    def test_a_column_keeps_its_own_y_bounds(self):
+        """The y-bounds hold the fit off a last line the reader missed."""
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 60.0, 760.0, 2150.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(column)])
+        box = clipped.detections[0].bbox
+        self.assertEqual((box.y1, box.y2), (60.0, 2150.0))
+
+    def test_an_image_is_held_on_both_axes(self):
+        from blackletter.margins import DEFAULT_BUFFER
+
+        image = self._detection(Label.IMAGE, 17.0, 40.0, 1700.0, 2100.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(image)])
+        box = clipped.detections[0].bbox
+        pad_x = DEFAULT_BUFFER / clipped.scale_x
+        pad_y = DEFAULT_BUFFER / clipped.scale_y
+        self.assertAlmostEqual(box.x1, 240.0 - pad_x, places=3)
+        self.assertAlmostEqual(box.x2, 1450.0 + pad_x, places=3)
+        self.assertAlmostEqual(box.y1, 75.0 - pad_y, places=3)
+        self.assertAlmostEqual(box.y2, 2010.0 + pad_y, places=3)
+
+    def test_other_labels_are_untouched(self):
+        """A key icon at the edge keeps its pull-back."""
+        icon = self._detection(Label.KEY_ICON, 10.0, 2100.0, 60.0, 2150.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(icon)])
+        self.assertIs(clipped.detections[0], icon)
+
+    def test_a_page_with_no_text_box_is_the_same_object(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column, text_box=None)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_page_with_nothing_to_clip_is_the_same_object(self):
+        column = self._detection(
+            Label.TEXT_COLUMN, 250.0, 130.0, 760.0, 2000.0
+        )
+        subject = self._page(column)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_the_input_is_never_mutated(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIsNot(clipped, subject)
+        self.assertIsNot(clipped.detections, subject.detections)
+        self.assertEqual(subject.detections[0].bbox.x1, 0.5)
+        self.assertIs(subject.detections[0], column)
+
+    def test_the_copy_keeps_the_page(self):
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column)
+        subject.index = 7
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertEqual(clipped.index, 7)
+        self.assertEqual(clipped.text_box, self.TEXT_BOX)
+        self.assertEqual(clipped.scale_x, subject.scale_x)
+        self.assertEqual(clipped.midpoint, subject.midpoint)
+
+    def test_a_box_wholly_outside_is_kept(self):
+        """Dropping it would let a strip cover what it described."""
+        image = self._detection(Label.IMAGE, 1500.0, 100.0, 1690.0, 400.0)
+        subject = self._page(image)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_box_below_the_keep_ratio_is_kept(self):
+        """A picture the reader gave no cell keeps pinning the strip."""
+        # Two thirds of this image lies right of the text box.
+        image = self._detection(Label.IMAGE, 1300.0, 100.0, 1690.0, 400.0)
+        subject = self._page(image)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_a_narrow_text_box_clips_nothing(self):
+        """The one-column read of a two-column page."""
+        column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
+        subject = self._page(column, text_box=(860.0, 75.0, 1450.0, 2010.0))
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+
+    def test_no_pages(self):
+        self.assertEqual(margin_fit.clipped_pages([]), [])
+
+
+class TestEnsureStrips(TestCase):
+    """Every page gets its four strips (#370)."""
+
+    PW, PH = POINTS
+
+    def _entry(self, *rects):
+        return {
+            "page_index": 0,
+            "rects": [dict(r) for r in rects],
+            "page_width": self.PW,
+            "page_height": self.PH,
+        }
+
+    TOP = {"x0": 0, "y0": 0, "x1": 612.0, "y1": 22.4}
+    BOTTOM = {"x0": 0, "y0": 736.8, "x1": 612.0, "y1": 792.0}
+    LEFT = {"x0": 0, "y0": 22.4, "x1": 64.7, "y1": 736.8}
+    RIGHT = {"x0": 564.8, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+
+    def test_four_present_adds_nothing(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, self.RIGHT)
+        before = [dict(r) for r in entry["rects"]]
+        self.assertEqual(margin_fit.ensure_strips([entry]), 0)
+        self.assertEqual(entry["rects"], before)
+
+    def test_a_missing_side_gets_a_handle_between_the_rows(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry]), 1)
+        self.assertIn(
+            {"x0": 0, "y0": 22.4, "x1": margin_fit.MIN_STRIP_PT, "y1": 736.8},
+            entry["rects"],
+        )
+
+    def test_missing_rows_get_full_width_handles(self):
+        entry = self._entry(self.LEFT, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry]), 2)
+        self.assertIn(
+            {"x0": 0, "y0": 0, "x1": 612.0, "y1": 6.0}, entry["rects"]
+        )
+        self.assertIn(
+            {"x0": 0, "y0": 786.0, "x1": 612.0, "y1": 792.0}, entry["rects"]
+        )
+
+    def test_a_page_with_no_strips_gets_four(self):
+        """A plate page the measure left alone."""
+        entry = self._entry()
+        self.assertEqual(margin_fit.ensure_strips([entry]), 4)
+        self.assertEqual(
+            entry["rects"],
+            [
+                {"x0": 0, "y0": 0, "x1": 612.0, "y1": 6.0},
+                {"x0": 0, "y0": 786.0, "x1": 612.0, "y1": 792.0},
+                {"x0": 0, "y0": 6.0, "x1": 6.0, "y1": 786.0},
+                {"x0": 606.0, "y0": 6.0, "x1": 612.0, "y1": 786.0},
+            ],
+        )
+
+    def test_a_tiny_page_is_left_alone(self):
+        entry = {
+            "page_index": 0,
+            "rects": [],
+            "page_width": 10.0,
+            "page_height": 10.0,
+        }
+        self.assertEqual(margin_fit.ensure_strips([entry]), 0)
+        self.assertEqual(entry["rects"], [])
+
+    def test_the_width_is_the_callers(self):
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT)
+        margin_fit.ensure_strips([entry], min_pt=4.0)
+        self.assertIn(
+            {"x0": 608.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}, entry["rects"]
+        )
+
+    def test_rects_none_is_read_as_empty(self):
+        """The other readers of these entries read ``rects`` with ``or []``."""
+        entry = self._entry()
+        entry["rects"] = None
+        self.assertEqual(margin_fit.ensure_strips([entry]), 4)
+        self.assertEqual(len(entry["rects"]), 4)
+
+    @staticmethod
+    def _page_with(label, *box):
+        subject = page(
+            detections=(
+                BLDetection(
+                    bbox=BBox(x1=box[0], y1=box[1], x2=box[2], y2=box[3]),
+                    label=label,
+                    confidence=0.5,
+                    page_index=0,
+                ),
+            )
+        )
+        return subject
+
+    def test_a_handle_never_covers_a_detection(self):
+        """A scan cropped tight on the gutter side gets no left strip today."""
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 0)
+        self.assertIsNone(margin_fit._sides(entry)["left"])
+        self.assertEqual(len(entry["rects"]), 3)
+
+    def test_a_picture_at_the_top_edge_withholds_the_top_handle(self):
+        image = self._page_with(Label.IMAGE, 300.0, 0.0, 1400.0, 900.0)
+        entry = self._entry(self.LEFT, self.RIGHT, self.BOTTOM)
+        self.assertEqual(margin_fit.ensure_strips([entry], [image]), 0)
+        self.assertIsNone(margin_fit._sides(entry)["top"])
+
+    def test_a_detection_off_the_edge_does_not_block_the_handle(self):
+        column = self._page_with(
+            Label.TEXT_COLUMN, 250.0, 130.0, 760.0, 2050.0
+        )
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
+        self.assertIn(
+            {"x0": 0, "y0": 22.4, "x1": 6.0, "y1": 736.8}, entry["rects"]
+        )
+
+    def test_a_header_detection_holds_no_handle(self):
+        """blackletter's ``NO_PUSHBACK_LABELS``: a folio at the edge is bleed-through."""
+        number = self._page_with(Label.PAGE_NUMBER, 1400.0, 0.0, 1470.0, 40.0)
+        entry = self._entry(self.LEFT, self.RIGHT, self.BOTTOM)
+        self.assertEqual(margin_fit.ensure_strips([entry], [number]), 1)
+        self.assertIsNotNone(margin_fit._sides(entry)["top"])
+
+    def test_a_page_the_caller_did_not_pass_is_held_off_nothing(self):
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        column.index = 3
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
+
+    def test_a_page_of_another_frame_is_held_off_nothing(self):
+        """blackletter ignores the detections of such a page too."""
+        column = self._page_with(Label.TEXT_COLUMN, 0.0, 130.0, 760.0, 2050.0)
+        column.pdf_width = 500.0
+        entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
+        self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)

@@ -290,11 +290,12 @@ class TestOpinionReview(ScanningTestCase):
         self.assertContains(response, "dismissed")
 
     def test_the_page_offers_no_write_control(self):
-        """This stage has no write endpoint, so it offers no control.
+        """The re-run of the ensemble is the one control of the page.
 
-        The header's sign-out form is the only form of the page, so the
-        test looks for a form that posts to an opinion instead of for
-        any form at all.
+        The approval, the dismissal and the typing of a page come with
+        the review that closes an opinion. The header's sign-out form
+        is the only form of the page, so the test looks for a form that
+        posts to an opinion instead of for any form at all.
         """
         OpinionFindingFactory(opinion=self.opinion)
 
@@ -331,7 +332,7 @@ class TestOpinionReview(ScanningTestCase):
 
 
 class TestTheRedactedPdfPanel(ScanningTestCase):
-    """The frame of the redacted PDF on the review page (#334/#336)."""
+    """The left column of the review page (#334/#336/#365)."""
 
     def setUp(self):
         self.user = self.make_user()
@@ -353,16 +354,22 @@ class TestTheRedactedPdfPanel(ScanningTestCase):
             redacted_pdf_revision=self.opinion.glue_revision
         )
 
-    def test_a_written_pdf_is_shown_in_a_frame(self):
+    def test_a_written_pdf_gives_the_column_the_viewer_draws(self):
+        """The 302 route stays the download; pdf.js reads the JSON one.
+
+        A browser judges the CORS rules of a redirected request
+        differently from a direct one, so the viewer asks
+        ``opinion_pdf_url`` for a presigned GET (#365).
+        """
         self._write_the_pdf()
 
         response = self.client.get(self.url)
 
         self.assertEqual(response.context["redacted_pdf_url"], self.pdf_url)
-        self.assertContains(
-            response, f'src="{self.pdf_url}?disposition=inline'
-        )
+        self.assertContains(response, 'id="opinion-pages"')
+        self.assertContains(response, f'href="{self.pdf_url}"')
         self.assertContains(response, "Download")
+        self.assertNotContains(response, "<iframe")
 
     def test_a_pdf_of_an_older_revision_is_not_shown(self):
         """The stamp must name the live revision, the one rule of #336."""
@@ -375,14 +382,15 @@ class TestTheRedactedPdfPanel(ScanningTestCase):
         self.assertEqual(response.context["redacted_pdf_url"], "")
         self.assertContains(response, "The redacted PDF is not written yet.")
 
-    def test_an_unwritten_pdf_gets_no_frame(self):
+    def test_an_unwritten_pdf_gets_no_column(self):
         response = self.client.get(self.url)
 
         self.assertEqual(response.context["redacted_pdf_url"], "")
+        self.assertNotContains(response, 'id="opinion-pages"')
         self.assertNotContains(response, "<iframe")
 
     def test_the_page_still_makes_no_s3_call(self):
-        """The two ledgers are rows; the frame is a navigation."""
+        """The three ledgers are rows, and the browser reads the bucket."""
         self._write_the_pdf()
 
         with patch("scanning.s3_sync.s3_active") as active:
@@ -403,6 +411,150 @@ class TestTheRedactedPdfPanel(ScanningTestCase):
         self.client.force_login(self.make_staff_user())
         response = self.client.get(self.url)
         self.assertContains(response, files_url)
+
+
+class TestTheTextColumn(ScanningTestCase):
+    """The text of the OCR ensemble on the review page (#365)."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = ScanFactory()
+        self.opinion = OpinionFactory(
+            scan=self.scan,
+            page_count=3,
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+        )
+        self.url = reverse("opinion_review", kwargs={"pk": self.opinion.pk})
+
+    def _stamp(self, **fields):
+        """Write one ledger of the row, as a pass does."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(**fields)
+
+    def _glue_the_documents(self):
+        self._stamp(ocr_glue_revision=self.opinion.glue_revision)
+
+    def _write_the_text(self):
+        self._glue_the_documents()
+        self._stamp(ensemble_revision=self.opinion.glue_revision)
+
+    def test_the_page_carries_the_three_addresses(self):
+        response = self.client.get(self.url)
+
+        context = response.context
+        for name, key in (
+            ("opinion_pdf_url", "pdf_url_endpoint"),
+            ("opinion_ensemble_url", "ensemble_url_endpoint"),
+            ("rerun_opinion_ensemble", "rerun_url"),
+        ):
+            address = reverse(
+                name,
+                kwargs={
+                    "pk": self.scan.pk,
+                    "opinion_pk": self.opinion.pk,
+                },
+            )
+            self.assertEqual(context[key], address)
+            self.assertContains(response, address)
+
+    def test_the_viewer_is_loaded(self):
+        response = self.client.get(self.url)
+
+        self.assertContains(response, "viewer_step3.js")
+        self.assertContains(response, 'id="opinion-review"')
+
+    def test_a_written_ensemble_gives_the_column(self):
+        self._write_the_text()
+
+        response = self.client.get(self.url)
+
+        self.assertTrue(response.context["ensemble_written"])
+        self.assertContains(response, 'id="opinion-text"')
+
+    def test_an_unwritten_ensemble_says_the_daemon_writes_it(self):
+        self._glue_the_documents()
+
+        response = self.client.get(self.url)
+
+        self.assertFalse(response.context["ensemble_written"])
+        self.assertNotContains(response, 'id="opinion-text"')
+        self.assertContains(
+            response, "The text of this opinion is not written yet."
+        )
+
+    def test_an_ensemble_of_an_older_revision_is_not_the_text(self):
+        """Both stamps must name the live revision, the one rule."""
+        self._write_the_text()
+        self._stamp(glue_revision=1)
+
+        response = self.client.get(self.url)
+
+        self.assertFalse(response.context["ensemble_written"])
+
+    def test_no_ocr_document_says_so_instead(self):
+        response = self.client.get(self.url)
+
+        self.assertFalse(response.context["ocr_written"])
+        self.assertContains(
+            response,
+            "The OCR documents of this opinion are not written yet.",
+        )
+
+    def test_the_button_appears_once_the_documents_are_glued(self):
+        self._glue_the_documents()
+
+        response = self.client.get(self.url)
+
+        self.assertTrue(response.context["can_rerun"])
+        self.assertContains(response, 'id="rerun-ensemble"')
+
+    def test_the_button_waits_for_the_documents(self):
+        """A control the endpoint would refuse never appears (#151)."""
+        response = self.client.get(self.url)
+
+        self.assertFalse(response.context["can_rerun"])
+        self.assertNotContains(response, 'id="rerun-ensemble"')
+
+    def test_an_approved_opinion_gets_no_button(self):
+        self._glue_the_documents()
+        self._stamp(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+
+        response = self.client.get(self.url)
+
+        self.assertFalse(response.context["can_rerun"])
+        self.assertNotContains(response, 'id="rerun-ensemble"')
+
+    def test_a_finding_card_names_its_page(self):
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=2,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertContains(response, 'data-page="2"')
+
+    def test_a_finding_of_the_whole_opinion_names_no_page(self):
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertNotContains(response, "data-page=")
+
+    def test_the_page_makes_no_s3_call(self):
+        """The three ledgers are rows; the browser reads the bucket."""
+        self._write_the_text()
+
+        with patch("scanning.s3_sync.s3_active") as active:
+            response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        active.assert_not_called()
 
 
 class TestOpinionFileIndex(ScanningTestCase):
@@ -456,7 +608,9 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "redacted.pdf",
                 "dots_mocr.json",
                 "mistral_ocr.json",
+                "surya.json",
                 "manifest.json",
+                "ensemble.json",
             ],
         )
         for entry in body["files"]:
@@ -474,7 +628,7 @@ class TestOpinionFileIndex(ScanningTestCase):
             self.assertNotIn("url", entry)
 
     def test_an_engine_the_run_never_read_is_not_written(self):
-        """The stamp is one over four files, the glue writes what it has.
+        """The stamp is one over every file, the glue writes what it has.
 
         ``opinion_ocr.write`` writes one document per engine the run
         carries, so a stamped row of a volume nobody read with Mistral
@@ -489,6 +643,7 @@ class TestOpinionFileIndex(ScanningTestCase):
         self.assertTrue(files["manifest.json"]["written"])
         self.assertFalse(files["mistral_ocr.json"]["written"])
         self.assertNotIn("url", files["mistral_ocr.json"])
+        self.assertFalse(files["surya.json"]["written"])
 
     def test_an_engine_the_run_read_is_written(self):
         ApplyRun.objects.filter(pk=self.run.pk).update(

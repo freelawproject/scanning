@@ -323,12 +323,36 @@ document.addEventListener('DOMContentLoaded', function () {
         var heading = range
             ? 'Pages ' + escapeHtml(range[0] + '\u2013' + range[1])
             : 'Page ' + missingLabel;
+        // A placeholder that stands for a request and not for a gap
+        // (#393): the sequence no longer shows a page missing here,
+        // but a reviewer asked a scanner for one, and the request
+        // keeps its note, its Dismiss button and its form until a
+        // person closes it. Say so, or the card reads as a gap.
+        var fromRequest = !!entry.from_request;
+        var request = fromRequest ? findRepair('insert', entry.anchor_pdf_page) : null;
+        var answered = !!(request && request.fulfilled);
+        var found = range
+            ? 'These pages were not found in the document.'
+            : 'This page was not found in the document.';
+        var state = 'MISSING';
+        if (answered) {
+            // An upload answered the request, and the image or the
+            // rescan stands beside this card. The row is open until
+            // the reviewer judges the new page.
+            state = 'REQUESTED, ANSWERED';
+            found = 'A scanner answered this request. Check the new page, ' +
+                'then dismiss the request or ask again.';
+        } else if (fromRequest) {
+            state = 'REQUESTED';
+            found = 'The page sequence shows no gap here now, but a scanner was asked for ' +
+                (range ? 'these pages' : 'this page') + ' after PDF p.' +
+                escapeHtml(entry.anchor_pdf_page) +
+                '. If the request is answered or no longer applies, dismiss it.';
+        }
         pageDiv.innerHTML =
-            '<div class="page-label">' + heading + ' &mdash; MISSING</div>' +
+            '<div class="page-label">' + heading + ' &mdash; ' + state + '</div>' +
             '<div class="missing-placeholder">' +
-            '  <p>' + (range
-                ? 'These pages were not found in the document.'
-                : 'This page was not found in the document.') + '</p>' +
+            '  <p>' + found + '</p>' +
             (pageEditsLocked
                 ? '  <p title="' + lockedTitle + '">The page review is approved, so no page can be added here.</p>'
                 : '  <p>' + (range
@@ -352,7 +376,8 @@ document.addEventListener('DOMContentLoaded', function () {
         container.appendChild(pageDiv);
         pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
         if (range) { pageDiv.dataset.missingRange = '1'; }
-        drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
+        if (fromRequest) { pageDiv.dataset.fromRequest = '1'; }
+        drawRepairNote(pageDiv, request || findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
         if (!fileInput) { return; }
@@ -620,6 +645,10 @@ document.addEventListener('DOMContentLoaded', function () {
         if (replaced) {
             markPageAsReplaced(div, pdfPage, replaced);
         }
+        var movedTo = (SCAN_CONFIG.movedPages || {})[String(pdfPage)];
+        if (movedTo !== undefined) {
+            markPageAsMoved(div, pdfPage, movedTo);
+        }
         drawRepairNote(div, findRepair('replace', pdfPage));
 
         // If page is already marked for deletion, show the deleted state
@@ -662,6 +691,12 @@ document.addEventListener('DOMContentLoaded', function () {
             e.stopPropagation();
             undoPageReplacement(parseInt(undoBtn.dataset.pdfPage, 10),
                                 undoBtn.closest('.page-container'));
+            return;
+        }
+        var undoMove = e.target.closest('.undo-move-btn');
+        if (undoMove) {
+            e.stopPropagation();
+            undoPageMove(parseInt(undoMove.dataset.pdfPage, 10));
         }
     });
 
@@ -898,6 +933,9 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             dropRepair(requestId);
             drawRepairNote(pageDiv, null);
+            // A placeholder that stood for this request alone (#393)
+            // has nothing left to show; a real gap keeps its card.
+            if (pageDiv && pageDiv.dataset.fromRequest) { pageDiv.remove(); }
             renderRepairsSection();
             showToast('Dismissed.', 'success');
         })
@@ -923,10 +961,21 @@ document.addEventListener('DOMContentLoaded', function () {
             var note = document.createElement('span');
             note.className = 'repair-note' + (row.fulfilled ? ' fulfilled' : '');
             var pages = pageDiv.dataset.missingRange ? 'these pages' : 'this page';
-            var text = row.fulfilled
-                ? 'A scanner was asked for ' + pages + ', and a new scan is saved. '
-                : (row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
-                                           : 'A scanner was asked to scan this page again. ');
+            // A missing-page request answered by a replacement beside
+            // its gap (#393) is the one case the reviewer must check:
+            // the new page should be the page asked for, and not a
+            // leaf put over its neighbour. The server says which shape
+            // answered (``fulfilled_by``); the browser derives nothing.
+            var text;
+            if (row.fulfilled && row.action === 'insert' && row.fulfilled_by === 'replace') {
+                text = 'A scanner was asked for ' + pages + ', and a page beside this gap ' +
+                    'was scanned again. Check that the new page is the one asked for. ';
+            } else if (row.fulfilled) {
+                text = 'A scanner was asked for ' + pages + ', and a new scan is saved. ';
+            } else {
+                text = row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
+                                               : 'A scanner was asked to scan this page again. ';
+            }
             // A fulfilled request keeps its Dismiss: the row is still
             // open and holds the address, so a reviewer who finds the
             // new scan bad too dismisses it and asks again.
@@ -1393,6 +1442,170 @@ document.addEventListener('DOMContentLoaded', function () {
             setTimeout(function () { el.classList.remove('highlight'); }, 2000);
         }
     };
+
+    // --- Move a page (issue #261) ---
+    // Two adjacent pages scanned in the wrong order. The card of the
+    // ``backward_page`` warning carries the pair, the row is a saved
+    // decision the apply builds, and the viewer draws the page at its
+    // new place at once: the server renders the corrected order after
+    // a reload (the page map and the sidebar follow the moves), so the
+    // DOM is moved here to match without one.
+    function movedNoteText(anchor) {
+        return anchor === 0
+            ? 'Moved: now before PDF p.1.'
+            : 'Moved: now after PDF p.' + anchor + '.';
+    }
+
+    // The note that says this page sits at another place. On the label
+    // itself, like the replacement note, and refreshed into the saved
+    // copy so a later deletion's undo keeps it.
+    function markPageAsMoved(pageDiv, pdfPage, anchor) {
+        var label = pageDiv.querySelector('.page-label');
+        if (!label) { return; }
+        var old = label.querySelector('.moved-note');
+        if (old) { old.remove(); }
+        var note = document.createElement('span');
+        note.className = 'moved-note';
+        // No Undo on a locked volume (#224): the endpoint refuses it.
+        note.innerHTML =
+            escapeHtml(movedNoteText(anchor)) +
+            (pageEditsLocked ? '' :
+            ' <button class="undo-move-btn" data-pdf-page="' + pdfPage + '" ' +
+            'title="Put this page back where it was scanned">Undo</button>');
+        label.appendChild(note);
+        refreshSavedLabel(label);
+    }
+
+    // Put one element right after the slot of an original page: the
+    // page container in the viewer, the row in the sidebar. Anchor 0
+    // goes first.
+    function placeAfterAnchor(el, anchorEl, parent) {
+        if (!el || !parent) { return; }
+        if (anchorEl) {
+            anchorEl.insertAdjacentElement('afterend', el);
+        } else {
+            parent.insertBefore(el, parent.firstChild);
+        }
+    }
+
+    function sidebarRow(pdfPage) {
+        return document.querySelector(
+            '#pages-list [data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+    }
+
+    // The container of an original page. The ``page-*`` ids are not one
+    // address space: a PDF page takes its own number, a placeholder and
+    // an inserted page take the printed one, so ``getElementById`` can
+    // answer with the placeholder of another page and the move lands
+    // beside it. Only a PDF page carries ``data-pdf-index``.
+    function pageContainer(pdfPage) {
+        return container.querySelector(
+            '.page-container[data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+    }
+
+    function markSidebarMoved(pdfPage, on) {
+        var row = sidebarRow(pdfPage);
+        if (!row) { return; }
+        var badge = row.querySelector('.page-moved-badge');
+        if (on && !badge) {
+            badge = document.createElement('span');
+            badge.className =
+                'page-moved-badge text-[9px] font-bold text-blue-600 ' +
+                'dark:text-blue-400 ml-1';
+            badge.title = 'A curator moved this page here';
+            badge.textContent = 'MOVED';
+            var holder = row.querySelector('span') || row;
+            holder.appendChild(badge);
+        } else if (!on && badge) {
+            badge.remove();
+        }
+    }
+
+    window.swapPages = function (btn) {
+        var pdfPage = parseInt(btn.dataset.pdfPage, 10);
+        var anchor = parseInt(btn.dataset.anchor, 10);
+        if (isNaN(pdfPage) || isNaN(anchor)) { return; }
+        if (!confirm('Move PDF page ' + pdfPage + ' to before PDF page ' +
+                     (anchor + 1) + '?')) {
+            return;
+        }
+        fetch('/scans/' + documentId + '/move-page/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify({ pdf_page: pdfPage, anchor_pdf_page: anchor }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== 'ok') {
+                showToast(data.error || 'Could not move this page.');
+                return;
+            }
+            if (!SCAN_CONFIG.movedPages) { SCAN_CONFIG.movedPages = {}; }
+            SCAN_CONFIG.movedPages[String(pdfPage)] = anchor;
+            var pageDiv = pageContainer(pdfPage);
+            if (pageDiv) {
+                placeAfterAnchor(
+                    pageDiv,
+                    anchor === 0 ? null : pageContainer(anchor),
+                    container
+                );
+                markPageAsMoved(pageDiv, pdfPage, anchor);
+            }
+            var row = sidebarRow(pdfPage);
+            if (row) {
+                // The ORDER divider the server drew above this row
+                // answers to the old order.
+                var divider = row.previousElementSibling;
+                if (divider && divider.textContent.trim() === 'ORDER') {
+                    divider.remove();
+                }
+                placeAfterAnchor(
+                    row,
+                    anchor === 0 ? null : sidebarRow(anchor),
+                    document.getElementById('pages-list')
+                );
+                markSidebarMoved(pdfPage, true);
+            }
+            btn.textContent = 'Moved';
+            btn.disabled = true;
+            var card = btn.closest('.issue-card');
+            if (card) { card.style.opacity = '0.3'; }
+            if (typeof window.refreshProcessActionBar === 'function') {
+                window.refreshProcessActionBar();
+            }
+            window.onPageEditSaved();
+        })
+        .catch(function () {
+            showToast('Could not move this page. Try again.');
+        });
+    };
+
+    // The undo reloads: the page goes back to where it was scanned, and
+    // the server's order is the one place that cannot disagree.
+    function undoPageMove(pdfPage) {
+        if (!confirm('Put PDF page ' + pdfPage + ' back where it was scanned?')) {
+            return;
+        }
+        fetch('/scans/' + documentId + '/move-page/undo/', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+            body: JSON.stringify({ pdf_page: pdfPage }),
+        })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (data.status !== 'ok') {
+                showToast(data.error || 'Could not put this page back.');
+                return;
+            }
+            showSavedAfterReload({ message: SAVED_MESSAGE });
+            window.location.reload();
+        })
+        .catch(function () {
+            showToast('Could not put this page back. Try again.');
+        });
+    }
 
     // --- Dismiss an issue ---
     window.dismissIssue = function (btn, issueId) {

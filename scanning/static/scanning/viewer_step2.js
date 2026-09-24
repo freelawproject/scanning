@@ -24,6 +24,30 @@ document.addEventListener('DOMContentLoaded', function () {
     // and keeps the control.
     var pageEditsLocked = typeof SCAN_CONFIG !== 'undefined'
         && SCAN_CONFIG.pageEditsLocked === true;
+    // The detection preview (#388): the boxes are the merged run's,
+    // over the volume as uploaded, and no row of the database is
+    // behind them. Every write of step 2 refuses under it, so the page
+    // offers no control that writes: no Draw, no Redact, no Whiteout,
+    // and no box selection, which is the handles and the Dismiss. The
+    // read-only controls stay, because looking at the boxes is what
+    // the page is for: the Detections toggle, the overlay modes and
+    // the text overlay.
+    //
+    // Not pageEditsLocked, which is about the page edits of review 1
+    // and is false while that review is open: the same volume's step 1
+    // still takes every one of them.
+    var previewOnly = typeof SCAN_CONFIG !== 'undefined'
+        && SCAN_CONFIG.previewOnly === true;
+    // The pages a reviewer marked for deletion in review 1 (#388).
+    // They are still in the volume the preview draws -- nothing is
+    // built until the apply -- so the page is shown, with a badge that
+    // says what will become of it and no undo, which is step 1's.
+    var previewDeleted = {};
+    if (previewOnly && typeof SCAN_CONFIG !== 'undefined') {
+        (SCAN_CONFIG.deletedPages || []).forEach(function (p) {
+            previewDeleted[p] = true;
+        });
+    }
     // The page shows the corrected volume of the standing apply run
     // (#269): the original load and the crops address its pages, so
     // both routes are told which space the index is in.
@@ -379,26 +403,55 @@ document.addEventListener('DOMContentLoaded', function () {
             }
         }
 
+        // The tools of the page label. The preview keeps the one
+        // control that shows the boxes and drops the three that write
+        // (#388); a view-only render has none at all.
+        var pageTools = '';
+        if (previewOnly) {
+            pageTools =
+                '  <span class="page-tools">' +
+                '    <button class="detect-btn" title="Show/hide detections">Detections</button>' +
+                '  </span>';
+        } else if (!viewOnly) {
+            pageTools =
+                '  <span class="page-tools">' +
+                (opinionEditMode ? '' :
+                '    <button class="detect-btn" title="Show/hide detections">Detections</button>' +
+                '    <button class="draw-det-btn" title="Draw a detection box">Draw</button>') +
+                '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
+                '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
+                '  </span>';
+        }
+        var deletedBadge = previewDeleted[pdfPage]
+            ? ' <span class="deleted-badge" title="A reviewer marked this page for deletion in the page review. It is still in the volume the preview draws: the page edits are built in after the approval.">MARKED FOR DELETION</span>'
+            : '';
+
         div.innerHTML =
             '<div class="page-label">' +
             '  <span>PDF p.' + pdfPage + (ocrLabel ? ' &rarr; ' + ocrLabel : '') +
-                 (entry.duplicate ? ' <span class="dupe-badge">DUPLICATE</span>' : '') + '</span>' +
-            (viewOnly ? '' :
-            '  <span class="page-tools">' +
-            (opinionEditMode ? '' :
-            '    <button class="detect-btn" title="Show/hide detections">Detections</button>' +
-            '    <button class="draw-det-btn" title="Draw a detection box">Draw</button>') +
-            '    <button class="redact-btn" data-fill="black" title="Draw a black redaction">Redact</button>' +
-            '    <button class="whiteout-btn" data-fill="white" title="Draw a white redaction">Whiteout</button>' +
-            // '    <button class="delete-page-btn" title="Delete this page">Delete</button>' +
-            '  </span>') +
+                 (entry.duplicate ? ' <span class="dupe-badge">DUPLICATE</span>' : '') +
+                 deletedBadge + '</span>' +
+            pageTools +
             '</div>' +
             '<div class="canvas-wrapper" style="width:' + defaultPageWidth + 'px;height:' + PLACEHOLDER_HEIGHT + 'px;background:#f0f0f0">' +
             '  <canvas class="pdf-canvas"></canvas>' +
             (viewOnly ? '' : '  <canvas class="redaction-overlay"></canvas>') +
             '</div>';
 
-        if (!viewOnly) {
+        if (previewOnly) {
+            // The toggle alone, and it reads: every other control of
+            // the page is absent (#388). It starts pressed, because
+            // the boxes start drawn.
+            var previewDetectBtn = div.querySelector('.detect-btn');
+            if (previewDetectBtn) {
+                if (_globalDetections) previewDetectBtn.classList.add('active');
+                (function (pageDiv, pIdx) {
+                    previewDetectBtn.addEventListener('click', function () {
+                        toggleDetections(pageDiv, pIdx);
+                    });
+                })(div, entry.pdf_index);
+            }
+        } else if (!viewOnly) {
             // Editable page number
             var editBtn = div.querySelector('.editable-page');
             if (editBtn) {
@@ -920,7 +973,12 @@ document.addEventListener('DOMContentLoaded', function () {
             });
     }
 
-    var _globalDetections = false;
+    // The preview opens with the boxes on (#388): they are what the
+    // page is for, and a reviewer who had to press a button first
+    // would read the first screen of it as "the model found nothing".
+    // The lazy render draws them on each page as it comes, and the
+    // toggle still turns them off.
+    var _globalDetections = previewOnly;
 
     function toggleDetections(pageDiv, pdfIndex) {
         _globalDetections = !_globalDetections;
@@ -1025,8 +1083,11 @@ document.addEventListener('DOMContentLoaded', function () {
             label.textContent = d.label + (d.manual ? ' (manual)' : ' ' + d.confidence);
             box.appendChild(label);
 
-            // Double-click to select (shows the handles and Dismiss)
-            (function(det, detBox) {
+            // Double-click to select (shows the handles and Dismiss).
+            // The preview binds neither: the handles move a row that
+            // does not exist, and the sidebar it picks for has no
+            // boundary card on it (#388).
+            if (!previewOnly) (function(det, detBox) {
                 detBox.addEventListener('dblclick', function(e) {
                     e.stopPropagation();
                     _selectDetectionBox(detBox, det);

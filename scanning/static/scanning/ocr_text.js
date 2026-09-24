@@ -1,27 +1,35 @@
 /**
- * The text overlay of the process viewer (issue #262).
+ * The text overlay of the process viewer (issues #262, #381).
  *
  * A reviewer of review 1 finds a page with bleedthrough or a blurry
  * page, and cannot tell what it cost the reading. This module draws
- * the text dots.mocr read on the page itself: one box per cell of the
- * layout JSON, at the cell's own position.
+ * the text one OCR engine read on the page itself: one box per unit of
+ * that engine's document, at the unit's own position.
+ *
+ * **This file names no engine.** The select beside the button carries
+ * the names, which the view writes from ``opinion_ocr.ENGINES``, and
+ * the endpoint answers the three field names of the document it points
+ * at (``fields``). So a fourth engine is one more entry of that table
+ * and no line here. The rule is pinned by a test.
  *
  * Three rules the issue asks for, and where each one lives:
  *
- * - **The data loads one time.** The first enable asks
+ * - **Each engine loads one time.** The first draw of an engine asks
  *   ``scan_ocr_text_url`` for a presigned GET, reads the document
- *   straight from the bucket, and keeps one index of it. A later
- *   enable paints from that index: only the DOM nodes go on a disable.
+ *   straight from the bucket, and keeps one index of it. A later draw
+ *   of the same engine paints from that index: only the DOM nodes go
+ *   on a disable, so a reviewer can compare two engines on one page
+ *   and pay for each read once.
  * - **The viewport only.** Each viewer calls ``ocrTextPaint`` at the
  *   end of a page render, and a page renders only when the lazy
  *   observer brings it near the viewport. So the zoom re-render and
  *   every jump to a page follow with no other hook.
  * - **Nothing draws by itself.** The reviewer presses the button.
  *
- * The cells are in the render space of the page at 200 dpi, so a box
+ * The units are in the render space of the page at 200 dpi, so a box
  * scales by ``canvas.width / page.width`` -- the rule the detection
- * boxes of step 2 follow. The text is the model's, so it enters the
- * DOM with ``textContent``.
+ * boxes of step 2 follow. US Letter is 1700x2200 in all three reads.
+ * The text is the model's, so it enters the DOM with ``textContent``.
  *
  * **A box shows its text under the pointer, and not before.** The
  * reviewer came to judge a blurry page against the ink, so a panel
@@ -43,31 +51,69 @@
 (function () {
     'use strict';
 
-    // One entry per page of the space the viewer draws, keyed by the
-    // 1-based page. Null until the first load; kept for the life of
-    // the page after it.
-    var index = null;
+    // One index per engine that was read, keyed by the engine name.
+    // Each entry is ``{1-based page: page entry}``, kept for the life
+    // of the page: a reviewer who compares two engines on one page
+    // must not pay for the second read twice (#381).
+    //
+    // Every engine at once, and no cap. Measured on the documents of
+    // scan 2845: about 4.6 KB of index per page, near enough 9 KB of
+    // heap, so a 1300-page volume is about 11 MB per engine and the
+    // three are about 34 MB. The viewer holds rendered page canvases
+    // of a few MB each beside it, so a cap would add state and a way
+    // to be wrong for a small part of the tab. The big object is the
+    // document the read parses, and it is dropped here.
+    var indexes = {};
+    // The engine the select holds. The view writes the options and
+    // marks the first one that read, so this is never a name the
+    // endpoint refuses.
+    var engine = null;
+    // What a person calls each engine, as the endpoint said it. The
+    // chip on every box carries it, so a reviewer reads which engine
+    // wrote the words in front of them.
+    var labels = {};
     var loading = false;
     var enabled = false;
 
     // The box under the pointer, so a move closes the one before it.
     var openBox = null;
 
-    // The border colour of a box, by the category dots.mocr gives the
-    // cell. Everything the layout model does not name is grey.
+    // The border colour of a box, by the kind the engine gives the
+    // unit. One table for the three engines (#381): the key is the
+    // name with its case and its punctuation dropped, because the same
+    // kind is "Page-header", "page_header" and "PageHeader" in the
+    // three documents. Everything no engine names is grey, which is
+    // what an engine this table has never seen draws.
     var CATEGORY_COLORS = {
-        'Page-header': '#2563eb',
-        'Page-footer': '#2563eb',
-        'Title': '#7c3aed',
-        'Section-header': '#7c3aed',
-        'Text': '#059669',
-        'List-item': '#059669',
-        'Caption': '#d97706',
-        'Footnote': '#d97706',
-        'Table': '#db2777',
-        'Formula': '#db2777',
-        'Picture': '#6b7280',
+        'pageheader': '#2563eb',
+        'pagefooter': '#2563eb',
+        'header': '#2563eb',
+        'footer': '#2563eb',
+        'title': '#7c3aed',
+        'sectionheader': '#7c3aed',
+        'text': '#059669',
+        'listitem': '#059669',
+        'list': '#059669',
+        'caption': '#d97706',
+        'footnote': '#d97706',
+        'table': '#db2777',
+        'formula': '#db2777',
+        'equation': '#db2777',
+        'picture': '#6b7280',
+        'figure': '#6b7280',
+        'image': '#6b7280',
     };
+
+    /**
+     * The colour of one unit's kind, or grey.
+     *
+     * @param {string} kind - The engine's own name for the unit.
+     * @returns {string} A CSS colour.
+     */
+    function colorOf(kind) {
+        var key = String(kind || '').toLowerCase().replace(/[^a-z]/g, '');
+        return CATEGORY_COLORS[key] || '#6b7280';
+    }
 
     function config() {
         return typeof SCAN_CONFIG !== 'undefined' ? SCAN_CONFIG : {};
@@ -87,23 +133,55 @@
     }
 
     /**
-     * Bind the toolbar button. Safe to call on a page with no button:
-     * the view renders one only when a document exists.
+     * Bind the toolbar button and the engine select. Safe to call on a
+     * page with neither: the view renders them only when one engine
+     * read this volume.
      */
     window.ocrTextInit = function () {
         var button = document.getElementById('ocr-text-toggle');
         if (!button) return;
+        var select = document.getElementById('ocr-text-engine');
+        engine = select ? select.value : null;
         button.addEventListener('click', function () {
             if (loading) return;
             if (enabled) {
                 setEnabled(button, false);
-            } else if (index) {
-                setEnabled(button, true);
             } else {
-                load(button);
+                show(button);
             }
         });
+        if (!select) return;
+        select.addEventListener('change', function () {
+            // The engine that is drawn, before the name moves. A read
+            // that fails puts the reviewer back on it, with its boxes:
+            // they were comparing it against the one they just picked,
+            // and a refusal must cost them neither.
+            var drawn = enabled ? engine : null;
+            engine = select.value;
+            if (!enabled) return;
+            // The boxes on the page are the other engine's. Clear them
+            // before the read, so the page never carries two reads.
+            setEnabled(button, false);
+            show(button, select, drawn);
+        });
     };
+
+    /**
+     * Draw the engine the select holds, reading it first if need be.
+     *
+     * @param {HTMLElement} button - The toolbar button.
+     * @param {HTMLElement} [select] - The engine select, to put back
+     *     on a refusal.
+     * @param {string|null} [drawn] - The engine whose boxes the page
+     *     held before this switch, to give back on a refusal.
+     */
+    function show(button, select, drawn) {
+        if (engine && indexes[engine]) {
+            setEnabled(button, true);
+        } else {
+            load(button, select, drawn);
+        }
+    }
 
     /**
      * Draw one page's overlay, if the overlay is on and the page was
@@ -113,8 +191,9 @@
      * @param {number} pdfIndex - The 0-based page of the drawn space.
      */
     window.ocrTextPaint = function (pageDiv, pdfIndex) {
-        if (!enabled || !index || !pageDiv || !drawsTheVolume()) return;
-        var page = index[pdfIndex + 1];
+        var read = engine ? indexes[engine] : null;
+        if (!enabled || !read || !pageDiv || !drawsTheVolume()) return;
+        var page = read[pdfIndex + 1];
         if (!page) return;
         window.ocrTextClear(pageDiv);
         paintPage(pageDiv, page);
@@ -144,14 +223,19 @@
 
     // --- The load, in two fetches ---
 
-    function load(button) {
+    function load(button, select, drawn) {
         var cfg = config();
-        if (!cfg.ocrTextUrlApi) return;
+        if (!cfg.ocrTextUrlApi || !engine) return;
+        // The button and the select are both dead until this answers,
+        // so the name cannot move under the read.
         loading = true;
+        var wanted = engine;
         var label = button.textContent;
         startWaiting(button, 'Reading…');
-        var api = cfg.ocrTextUrlApi + (cfg.finalSpace ? '?space=final' : '');
+        var api = cfg.ocrTextUrlApi + '?engine=' + encodeURIComponent(engine) +
+            (cfg.finalSpace ? '&space=final' : '');
         var documentUrl = null;
+        var fields = null;
         fetch(api)
             .then(function (r) {
                 return r.json().then(function (d) {
@@ -161,17 +245,19 @@
             })
             .then(function (answer) {
                 documentUrl = answer.url;
+                fields = answer.fields;
+                labels[wanted] = answer.label || wanted;
                 if (answer.size) {
                     // The second read is the slow one, and its size is
                     // why. The number goes in a toast and not on the
                     // button: a label that grows moves every other
                     // button of the toolbar on each press.
                     var mb = Math.max(1, Math.round(answer.size / 1048576));
-                    button.title = 'Reading the OCR text of this volume, ' +
-                        mb + ' MB.';
+                    var said = 'Reading the text ' + answer.label +
+                        ' read of this volume, ' + mb + ' MB.';
+                    button.title = said;
                     if (typeof showToast === 'function') {
-                        showToast('Reading the OCR text of this volume, ' +
-                            mb + ' MB. This takes a moment.', 'info');
+                        showToast(said + ' This takes a moment.', 'info');
                     }
                 }
                 // Straight from the bucket: the web pod reads no byte
@@ -183,12 +269,22 @@
                 return r.json();
             })
             .then(function (doc) {
-                index = buildIndex(doc);
+                indexes[wanted] = buildIndex(doc, fields);
                 stopWaiting(button, label);
                 setEnabled(button, true);
             })
             .catch(function (err) {
                 stopWaiting(button, label);
+                // A switch that failed gives the page back exactly as
+                // it was: the engine that was drawn, its name in the
+                // select and its boxes on the pages. The read is in
+                // hand already, so this costs no second fetch. A
+                // failure of the button's own press leaves the overlay
+                // off, which is where the reviewer left it.
+                if (select && drawn) {
+                    engine = select.value = drawn;
+                    setEnabled(button, true);
+                }
                 failed(err, documentUrl);
             });
     }
@@ -210,6 +306,10 @@
         button.classList.add('loading');
         button.textContent = text;
         button.title = 'Reading the OCR text of this volume…';
+        // The select goes with it. One read at a time, and a control
+        // that answers a press by snapping back reads as broken.
+        var select = document.getElementById('ocr-text-engine');
+        if (select) select.disabled = true;
     }
 
     /**
@@ -224,6 +324,17 @@
         button.classList.remove('loading');
         button.textContent = label;
         button.title = 'Show the text the OCR read on each page';
+        var select = document.getElementById('ocr-text-engine');
+        if (select) select.disabled = false;
+    }
+
+    /**
+     * Say which engine a message is about.
+     *
+     * @returns {string} The engine's name for a reader.
+     */
+    function engineLabel() {
+        return labels[engine] || 'The OCR';
     }
 
     /**
@@ -243,7 +354,10 @@
         if (documentUrl) {
             console.error('The OCR text did not load from', documentUrl, err);
         }
-        var message = 'The OCR text did not load (' + reason +
+        // The server's own refusal names the engine, so it is the
+        // whole message. Only a fault of the network arrives without
+        // one, and the sentence still reads.
+        var message = 'The text did not load (' + reason +
             '). Press the button again to try once more.';
         if (typeof showToast === 'function') {
             showToast(message, 'error');
@@ -255,43 +369,86 @@
     /**
      * Keep what the overlay draws, and drop the rest of the document.
      *
-     * The document holds the ``md`` of every page as well, which is
-     * the same text again. It is kept for a page with no cell only:
-     * that page is the one the reviewer hunts, and its ``md`` is the
-     * only text left for it.
+     * The document holds the whole text of every page as well, which
+     * is the same words again. It is kept for a page with no unit
+     * only: that page is the one the reviewer hunts, and that text is
+     * the only one left for it. dots.mocr and Mistral call the field
+     * ``md`` and Surya calls it ``text``, so both are read.
+     *
+     * The page frame is the render the boxes were measured in:
+     * ``origin_width``/``origin_height`` on the page for the engines
+     * whose worker renders it, and the document's ``render`` for the
+     * engine that is given a picture. That is the pair of rules
+     * ``opinion_ocr._page_frame`` and ``_mistral_frame`` hold, and no
+     * third rule exists.
+     *
+     * A unit with no box is dropped: the overlay has nowhere to draw
+     * it. A Mistral document glued before #350 carries no box at all,
+     * and that page then reads as a page with no unit, with a note
+     * that says so.
      *
      * @param {Object} doc - The glued document.
-     * @returns {Object} ``{1-based page: {width, height, cells, note, md}}``.
+     * @param {Object} fields - ``{units, text, type}`` of this engine.
+     * @returns {Object} ``{1-based page: {width, height, cells, note,
+     *     md}}``.
      */
-    function buildIndex(doc) {
+    function buildIndex(doc, fields) {
         var out = {};
         var pages = (doc && doc.pages) || [];
+        var render = (doc && doc.render) || {};
         pages.forEach(function (page) {
             var number = page.pdf_page;
             if (!number) return;
-            var cells = (page.cells || []).filter(function (cell) {
-                return cell && cell.bbox && (cell.text || '').trim();
-            }).map(function (cell) {
+            // ``bbox`` is not in ``fields``: every engine's unit
+            // names its box that, and the glue reads it that way for
+            // all three (``opinion_ocr``). It is the unit shape, not
+            // an engine's own word for a thing.
+            var units = page[fields.units] || [];
+            var boxed = 0;
+            var cells = units.filter(function (unit) {
+                // The box first, and counted before the text: a read
+                // whose units carry no box at all is the one fault
+                // the note below can name (#350), and a unit with a
+                // box and no words is an ordinary empty unit.
+                if (!unit || !unit.bbox) return false;
+                boxed += 1;
+                return (unit[fields.text] || '').trim() !== '';
+            }).map(function (unit) {
                 return {
-                    bbox: cell.bbox,
-                    category: cell.category || '',
-                    text: String(cell.text).trim(),
+                    bbox: unit.bbox,
+                    category: unit[fields.type] || '',
+                    text: String(unit[fields.text]).trim(),
                 };
             });
             var entry = {
-                width: page.origin_width || 0,
-                height: page.origin_height || 0,
+                width: page.origin_width || render.width || 0,
+                height: page.origin_height || render.height || 0,
                 cells: cells,
             };
             if (!cells.length) {
-                entry.note = page.error ||
-                    (page.filtered ? 'the layout of this page did not parse'
-                                   : 'the OCR found no text on this page');
-                entry.md = (page.md || '').trim();
+                entry.note = page.error || noteFor(page, units, boxed);
+                entry.md = (page.md || page.text || '').trim();
             }
             out[number] = entry;
         });
         return out;
+    }
+
+    /**
+     * Why a page draws no box, in words a reviewer can act on.
+     *
+     * @param {Object} page - The page of the document.
+     * @param {Array} units - Its units, whatever the engine calls them.
+     * @param {number} boxed - How many of them carry a box.
+     * @returns {string} The note.
+     */
+    function noteFor(page, units, boxed) {
+        if (units.length && !boxed) {
+            return 'this read holds no boxes to draw. Ask a staff ' +
+                'member to glue the run again';
+        }
+        if (page.filtered) return 'the layout of this page did not parse';
+        return 'the OCR found no text on this page';
     }
 
     // --- The paint ---
@@ -365,19 +522,21 @@
         box.style.top = (cell.bbox[1] * sy) + 'px';
         box.style.width = ((cell.bbox[2] - cell.bbox[0]) * sx) + 'px';
         box.style.height = ((cell.bbox[3] - cell.bbox[1]) * sy) + 'px';
-        box.style.borderColor = CATEGORY_COLORS[cell.category] || '#6b7280';
+        box.style.borderColor = colorOf(cell.category);
         var panel = document.createElement('div');
         panel.className = 'ocr-cell-text';
-        if (cell.category) {
-            // The border colour says the category and a colour alone
-            // names nothing, so the panel says it in words. It used to
-            // ride on the box's ``title``, which a box that takes no
-            // pointer never shows.
-            var kind = document.createElement('span');
-            kind.className = 'ocr-cell-cat';
-            kind.textContent = cell.category;
-            panel.appendChild(kind);
-        }
+        // The border colour says the kind and a colour alone names
+        // nothing, so the panel says it in words. It used to ride on
+        // the box's ``title``, which a box that takes no pointer never
+        // shows. The engine goes in front of it (#381): three reads
+        // draw the same page differently, and a reviewer comparing
+        // them must never have to remember which one is on.
+        var kind = document.createElement('span');
+        kind.className = 'ocr-cell-cat';
+        kind.textContent = cell.category
+            ? engineLabel() + ' - ' + cell.category
+            : engineLabel();
+        panel.appendChild(kind);
         var words = document.createElement('span');
         // The model wrote this text: textContent, never innerHTML.
         words.textContent = cell.text;

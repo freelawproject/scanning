@@ -3055,11 +3055,16 @@ class TestServeDetections(ScanningTestCase):
         Until this flag came from here, a hand-added box lost both on
         the next page load (PR #167)."""
         self._detection(model_name=Detection.ModelName.BL_WARM)
+        # Lower on the page than the first row: the view orders by
+        # ``page_index`` and ``y0``, so two rows at one height leave the
+        # order to the database and the assertion below to chance.
         self._detection(
             page_index=0,
             label="KEY_ICON",
             label_id=1,
             confidence=1.0,
+            y0=20,
+            y1=40,
             model_name=Detection.ModelName.MANUAL,
         )
 
@@ -3953,7 +3958,9 @@ class TestGluedOutputs(ScanningTestCase):
         response = self._index("paddle")
 
         self.assertEqual(response.status_code, 404)
-        self.assertIn("dots-mocr, mistral, yolo", response.json()["error"])
+        self.assertIn(
+            "dots-mocr, mistral, surya, yolo", response.json()["error"]
+        )
 
     def test_index_of_a_scan_nothing_read_is_empty_not_an_error(self):
         response = self._index()

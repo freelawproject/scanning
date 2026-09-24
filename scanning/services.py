@@ -6,11 +6,8 @@ daemon process.  They must NOT import Django HTTP machinery
 """
 
 import contextlib
-import json
 import logging
-import os
 import re
-import shutil
 import time
 import traceback
 from collections import Counter
@@ -18,9 +15,6 @@ from pathlib import Path
 
 import django
 import fitz
-from blackletter.api import (
-    build_redactions as bl_build_redactions,
-)
 from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.margins import compute_margin_rects
 from blackletter.models import (
@@ -61,20 +55,15 @@ from scanning.models import (
     Issue,
     JobStage,
     JobStatus,
-    OpinionScan,
-    OpinionStatus,
     PageEdit,
     QueuedAction,
     QueueStatus,
     Scan,
-    Stage,
     Status,
     Volume,
 )
 from scanning.utils import (
     ensure_output_dir,
-    find_processing_pdf,
-    has_s3_credentials,
     processing_pdf_path,
 )
 
@@ -767,20 +756,6 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     return det_data
 
 
-def _build_document_from_detections(
-    scan: "Scan", det_data: list, pdf_path: str
-) -> "BLDoc":
-    """Build a blackletter Document from detection data and a PDF.
-
-    :param scan: The Scan instance for reporter/volume metadata.
-    :param det_data: List of detection dicts (:func:`detection_entries`).
-    :param pdf_path: Path to the PDF to read page dimensions from.
-    :return: The constructed Document.
-    """
-    document, _ids = _build_document_with_ids(scan, det_data, pdf_path)
-    return document
-
-
 def _build_document_with_ids(
     scan: "Scan", det_data: list, pdf_path: str
 ) -> tuple["BLDoc", dict[int, int]]:
@@ -941,71 +916,35 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
     also uses the detections to tighten the content box. Nothing is
     written.
 
+    The measure reads copies of the pages (``margin_fit.clipped_pages``,
+    #370) whose ``TEXT_COLUMN`` and ``IMAGE`` boxes are held inside the
+    page's text box: the model draws both out onto a blot along the
+    page edge, and the pull-back then pins the strip at the box's edge
+    or drops it. The document's own boxes stay as they are, because the
+    headnote rects and the outside-opinion masks read them. Every page
+    then gets its four strips (``margin_fit.ensure_strips``): a strip
+    the measure gave no page is a thin handle at the edge for the
+    curator to widen, held off the detections like every strip, so a
+    page whose content box blackletter could not establish gets four
+    handles too.
+
     :param pdf_path: Path to the PDF to compute margins for.
     :param document: The snapped document the rects were measured from.
-    :return: blackletter's strips, in points; empty for a document with
-        no pages, because without detections the bounds would come from
-        the page's marks alone, and bleed-through at a page edge would
-        suppress that page's top strip: a worse answer than none.
+    :return: One entry per page, in points, each with its strips; empty
+        for a document with no pages, because without detections the
+        bounds would come from the page's marks alone, and bleed-through
+        at a page edge would suppress that page's top strip: a worse
+        answer than none.
     """
+    from scanning import margin_fit
+
     if not document.pages:
         return []
     with _log_stage("Margin rects"):
-        return compute_margin_rects(str(pdf_path), pages=document.pages)
-
-
-def _build_combined_redactions(scan_pk: int) -> Path:
-    """Write ``redactions.json`` from the rows, for blackletter's ``generate``.
-
-    All coordinates in the output are in PDF points. The opinion
-    filenames come from :func:`blackletter.api.build_redactions`, which
-    used to convert the pixel rects too; since #240 the rects are
-    ``Redaction`` rows in points (``redactions.visible_by_page``), so the
-    pages of the payload are written from them and the conversion is
-    gone with the blob. blackletter gets no pages: it read them only to
-    scale pixel rects, and both rect lists are empty.
-
-    :param scan_pk: Primary key of the scan.
-    :return: Path to the generated redactions.json.
-    """
-    from scanning import redactions
-
-    scan = Scan.objects.get(pk=scan_pk)
-    output_dir = Path(scan.output_dir)
-
-    combined = bl_build_redactions(
-        [],
-        [],
-        [],
-        boundaries.viewer_payload(scan, live_only=True),
-        reporter=scan.reporter.short_name or "",
-        volume=str(scan.volume) or "",
-    )
-    combined["pages"] = {
-        str(entry["page_index"]): [
-            {
-                "x0": r["x0"],
-                "y0": r["y0"],
-                "x1": r["x1"],
-                "y1": r["y1"],
-                "fill": r["fill"],
-                "type": r["rect_type"],
-            }
-            for r in entry["rects"]
-        ]
-        for entry in redactions.visible_by_page(scan)
-    }
-
-    out_path = output_dir / "redactions.json"
-    out_path.write_text(json.dumps(combined))
-    n_rects = sum(len(v) for v in combined["pages"].values())
-    logger.info(
-        "Combined redactions: %s pages, %s rects, %s opinions",
-        len(combined["pages"]),
-        n_rects,
-        len(combined["opinions"]),
-    )
-    return out_path
+        pages = margin_fit.clipped_pages(document.pages)
+        entries = compute_margin_rects(str(pdf_path), pages=pages)
+        margin_fit.ensure_strips(entries, pages)
+        return entries
 
 
 # ---------------------------------------------------------------------------
@@ -1352,7 +1291,12 @@ def rebuild_page_map(scan: "Scan") -> None:
     # what makes the viewer show a number the moment it is typed.
     ocr_results, _stale = page_edits.overlay_page_numbers(scan, ocr_results)
     exp_start, exp_end = _expected_range(scan)
-    analysis = build_analysis(ocr_results, exp_start, exp_end)
+    # A moved page is judged at its new place (#261), so the analysis
+    # reads the corrected order; the cache keeps the original's.
+    ordered = page_edits.order_by_moves(
+        ocr_results, page_edits.moves_by_page(scan)
+    )
+    analysis = build_analysis(ordered, exp_start, exp_end)
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
     )
@@ -1447,7 +1391,14 @@ def recalculate_issues(scan: "Scan") -> None:
                 ocr_results = new_results
                 scan.ocr_results = ocr_results
 
-    analysis = build_analysis(ocr_results, exp_start, exp_end)
+    # A moved page is judged at its new place (#261): the sequence
+    # analysis reads the corrected order, so the ``backward_page`` card
+    # a move answers is not built again. The cache keeps the original's
+    # order, since every entry is addressed by its ``pdf_page``.
+    ordered = page_edits.order_by_moves(
+        ocr_results, page_edits.moves_by_page(scan)
+    )
+    analysis = build_analysis(ordered, exp_start, exp_end)
 
     result = build_issues(
         analysis, scan.page_count, exp_start=exp_start, exp_end=exp_end
@@ -2047,6 +1998,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         # The rows are the store (#240 PR B): the computed rows are
         # written again, the standing dismissals land on them, and the
         # human rows follow the page space the geometry was measured in.
+        # The writer holds every text rect inside the strips it writes
+        # for the same page (#371): blackletter's footer bound is the
+        # page height on a page with no bottom-margin detection, and its
+        # ink clamp follows a blot to the page edge.
         _update_progress(scan_pk, "Writing the redactions...")
         with _log_stage("Redaction rows"):
             written = redactions.write_computed(
@@ -2612,312 +2567,3 @@ def _advance_scan(
             status,
         )
     return bool(updated)
-
-
-# ---------------------------------------------------------------------------
-# Generate (split into redacted/unredacted opinions)
-# ---------------------------------------------------------------------------
-
-
-def _stamp_original_images(scan: "Scan", base_pdf_path: str) -> str:
-    """Overlay original-quality image regions onto a *copy* of the base PDF.
-
-    For each active IMAGE detection, renders the bounding box from the
-    original scan PDF and inserts it into a copy of the processing PDF
-    (normally ``bitonal.pdf``) at the same position. This preserves
-    full-quality photographs/illustrations that would otherwise be
-    degraded by bitonal conversion.
-
-    :param scan: The Scan instance with the original PDF path.
-    :param base_pdf_path: Path to the processing PDF to stamp onto.
-    :return: Path to the stamped copy. Always a copy, so the processing
-        PDF is never modified by downstream steps.
-    """
-
-    stamped_path = os.path.join(os.path.dirname(base_pdf_path), "stamped.pdf")
-
-    image_dets = list(
-        Detection.objects.filter(scan=scan, label="IMAGE", active=True)
-        .order_by("page_index")
-        .values(
-            "page_index", "x0", "y0", "x1", "y1", "img_width", "img_height"
-        )
-    )
-    if not image_dets:
-        # Always copy so the processing PDF is never modified downstream
-        shutil.copy2(base_pdf_path, stamped_path)
-        return stamped_path
-
-    # Save extracted images to images/ directory
-    images_dir = Path(os.path.dirname(base_pdf_path)) / "images"
-    images_dir.mkdir(exist_ok=True)
-    page_numbers = _page_number_lookup(scan)
-    img_count_by_page: dict[int, int] = {}
-
-    with (
-        fitz.open(scan.pdf_path) as original_doc,
-        fitz.open(base_pdf_path) as base_doc,
-    ):
-        for det in image_dets:
-            page_idx = det["page_index"]
-            if (
-                page_idx >= original_doc.page_count
-                or page_idx >= base_doc.page_count
-            ):
-                continue
-
-            orig_page = original_doc[page_idx]
-            base_page = base_doc[page_idx]
-
-            # Convert image-pixel bbox to PDF points
-            page_rect = orig_page.rect
-            img_w = det["img_width"] or 1
-            img_h = det["img_height"] or 1
-            sx = page_rect.width / img_w
-            sy = page_rect.height / img_h
-
-            pdf_rect = fitz.Rect(
-                det["x0"] * sx,
-                det["y0"] * sy,
-                det["x1"] * sx,
-                det["y1"] * sy,
-            )
-
-            # Render the region from the original (non-bitonal) PDF
-            pix = orig_page.get_pixmap(clip=pdf_rect, dpi=150)
-            png_bytes = pix.tobytes("png")
-
-            # Stamp onto the processing PDF copy
-            base_page.insert_image(pdf_rect, stream=png_bytes)
-
-            # Save image to images/ directory
-            pn = page_numbers.get(page_idx)
-            page_num = pn[0] if pn else page_idx + (scan.start_page or 1)
-            img_count_by_page[page_idx] = (
-                img_count_by_page.get(page_idx, 0) + 1
-            )
-            img_name = f"{page_num}-{img_count_by_page[page_idx]:03d}.png"
-            (images_dir / img_name).write_bytes(png_bytes)
-
-        base_doc.save(stamped_path, garbage=3, deflate=True)
-    return stamped_path
-
-
-def run_generate_files(scan_pk: int) -> None:
-    """Generate redacted/split opinion files from existing detections.
-
-    Designed to run in the daemon process. Nothing queues it since #173;
-    #206 brings it back over the redacted volume, and it is left as it
-    was until then (#269 moved review 2 and the redaction compute to
-    the corrected volume, not this).
-
-    :param scan_pk: Primary key of the scan to generate files for.
-    """
-    django.db.connections.close_all()
-    _pull_processing_files_from_s3(scan_pk)
-
-    scan = Scan.objects.get(pk=scan_pk)
-
-    try:
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_message="Generating files...", progress_log=""
-        )
-
-        output = Path(scan.output_dir)
-        base_pdf = find_processing_pdf(str(output))
-        if not base_pdf:
-            raise ValueError(
-                "No processing PDF (bitonal.pdf) found in output directory"
-            )
-
-        # Stamp original-quality images into a copy, leaves base PDF untouched
-        gen_pdf = _stamp_original_images(scan, str(base_pdf))
-
-        # Correct the TEXT_COLUMN boxes against the page ink before anything
-        # reads them. The upload path used to do this so that step 2 showed
-        # corrected boxes, but review 1 has no detection overlay to show them
-        # in, so it was a full-volume render nobody was waiting on. Here it
-        # runs before the detections are written out, which is what the
-        # geometry below and the pairing are measured from.
-        _update_progress(scan_pk, "Correcting column boxes...")
-        _snap_text_columns_to_ink(scan_pk, str(base_pdf))
-
-        # The live detections, with the page numbers beside each box.
-        det_data = detection_entries(scan_pk)
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_message=f"Generating files ({len(det_data or [])} detections)..."
-        )
-
-        # The redaction rows are what the compute wrote and the curator
-        # edited (#240, PR B); nothing is measured here.
-        # Build combined redactions.json (margins + redaction rects + opinions)
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_message="Building combined redactions...",
-        )
-        redactions_path = _build_combined_redactions(scan_pk)
-
-        Scan.objects.filter(pk=scan_pk).update(
-            progress_message="Generating files...",
-        )
-
-        from blackletter.api import generate as bl_generate
-
-        result = bl_generate(
-            pdf_path=str(gen_pdf),
-            redactions=str(redactions_path),
-            output_dir=output,
-            reporter=scan.reporter.short_name or "",
-            volume=str(scan.volume) or "",
-            unredacted=True,
-            llm=True,
-        )
-
-        opinion_count = result.get("opinion_count", 0)
-        full_redacted = result.get("full_redacted", "")
-        redacted_dir = Path(result.get("redacted_dir", output / "redacted"))
-
-        unredacted_dir = output / "unredacted"
-
-        redacted_files = (
-            sorted(redacted_dir.glob("*.pdf")) if redacted_dir.is_dir() else []
-        )
-
-        scan.refresh_from_db()
-        # The boundaries are rows since #240 PR C; the file names land
-        # on the dicts in reading order, as ``build_redactions`` names
-        # them.
-        existing_opinions = boundaries.viewer_payload(scan, live_only=True)
-
-        if existing_opinions:
-            for i, op in enumerate(existing_opinions):
-                if i < len(redacted_files):
-                    op["filename"] = redacted_files[i].name
-        else:
-            for f in redacted_files:
-                existing_opinions.append(
-                    {"filename": f.name, "first_page": 0, "last_page": 0}
-                )
-
-        scan.redacted_pdf_path = str(full_redacted) if full_redacted else ""
-        scan.progress_message = "Saving opinion records..."
-        scan.save()
-
-        OpinionScan.objects.filter(scan=scan).delete()
-        for i, op in enumerate(existing_opinions):
-            page_start = op.get("first_page_number", 1)
-            page_end = op.get("last_page_number", page_start)
-            fname = op.get("filename", "")
-            opinion = OpinionScan.objects.create(
-                scan=scan,
-                reporter=scan.reporter,
-                volume=scan.volume,
-                opinion_order=i,
-                page_start=page_start or 1,
-                page_end=page_end or page_start or 1,
-                caption_page_index=op.get("caption_page"),
-                key_page_index=op.get("key_page"),
-                has_image=op.get("has_image", False),
-                boundary_id=op.get("id"),
-                status=OpinionStatus.OK,
-                uploaded_by=scan.uploaded_by,
-            )
-            if fname:
-                media_root = Path(settings.MEDIA_ROOT).resolve()
-                scan_output = Path(scan.output_dir).resolve()
-
-                def _field_name(path: Path) -> str:
-                    """Prefer a MEDIA_ROOT-relative name so Django storage
-                    can resolve the file in DEV. When the file lives
-                    outside MEDIA_ROOT (prod /tmp/ case), fall back to a
-                    path relative to the scan's output_dir, which
-                    ``serve_opinionscan_pdf`` resolves at request time.
-                    """
-                    resolved = path.resolve()
-                    try:
-                        return str(resolved.relative_to(media_root))
-                    except ValueError:
-                        return str(resolved.relative_to(scan_output))
-
-                rp = redacted_dir / fname
-                if rp.exists():
-                    opinion.redacted_pdf.name = _field_name(rp)
-                up = (
-                    unredacted_dir / fname if unredacted_dir.exists() else None
-                )
-                if up and up.exists():
-                    opinion.original_pdf.name = _field_name(up)
-                opinion.save()
-
-        _update_progress(scan_pk, "Finalizing files...")
-        _push_processing_files_to_s3(scan_pk)
-
-        # Flip status only after OpinionScan rows and S3 push are done,
-        # so the frontend's poll-and-reload lands on a fully-ready step 3
-        # (avoids a 404 window where rows or files aren't yet available).
-        scan.refresh_from_db()
-        scan.stage = Stage.APPROVED
-        scan.status = Status.PENDING_REVIEW
-        scan.s3_uploaded = False
-        scan.progress_message = f"Generated {opinion_count} opinions"
-        scan.progress_log = ""
-        scan.save()
-        refresh_volume_queue_status_for_scan(scan)
-
-    except Exception as exc:
-        _handle_pipeline_exception(scan_pk, exc, context="generate_files")
-
-
-# ---------------------------------------------------------------------------
-# S3 upload of approved files
-# ---------------------------------------------------------------------------
-
-
-def upload_approved_files(scan_pk: int) -> str:
-    """Copy approved deliverables from processing/ to approved/ on S3.
-
-    The generate-files step already pushed every file under the scan's
-    output dir to ``processing/{pk}/...`` on S3, so this function issues
-    a server-side ``copy_object`` for each deliverable (redacted opinion
-    PDFs, original and redacted full PDFs) rather than re-uploading from
-    local disk.
-
-    Skips the copy (with a message) if the scan was already approved or
-    if no AWS credentials are configured.
-
-    :param scan_pk: Primary key of the scan to approve.
-    :return: A user-facing message describing the result.
-    :rtype: str
-    """
-    from scanning import s3_sync
-
-    scan = Scan.objects.get(pk=scan_pk)
-
-    if scan.s3_uploaded and scan.s3_path:
-        return f"Files were already uploaded to S3 ({scan.s3_path})."
-
-    if scan.stage != Stage.APPROVED:
-        return "Before approving you need to generate the files."
-
-    s3_prefix = s3_sync.approved_prefix(scan)
-
-    if not has_s3_credentials():
-        Scan.objects.filter(pk=scan_pk).update(s3_path=s3_prefix)
-        return (
-            "No AWS credentials configured, skipping S3 upload. "
-            "Path would be: " + s3_prefix
-        )
-
-    _, count = s3_sync.copy_processing_to_approved(scan)
-
-    Scan.objects.filter(pk=scan_pk).update(
-        s3_uploaded=True,
-        s3_path=s3_prefix,
-    )
-
-    msg = f"Files copied on S3 from processing/ to approved/ ({count} files)."
-    if settings.DEVELOPMENT:
-        msg += (
-            " (DEVELOPMENT=True: no real S3 calls are made; set AWS "
-            "credentials and DEVELOPMENT=False to exercise the flow.)"
-        )
-    return msg

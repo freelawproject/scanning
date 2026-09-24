@@ -35,15 +35,87 @@ it. That is the same split as ``ocr_applied``.
 The cells are the measurement ``text_fit`` reads (#279) and
 ``columns`` reads (#308), and ``text_fit.load_document`` stays the one
 rule for which OCR document they come from (#328).
+
+**The boxes the margin measure reads are held inside that text box
+too** (#370). The fit above arrives at the right content box on a
+blotted page, and two model boxes then undo it: blackletter pulls every
+strip back off any detection it would cover
+(``margins._shrink_rects_for_detections``), and lets a ``TEXT_COLUMN``
+hold the fit (``HOLD_LABELS``). On scan 1841 of this app (147 pages)
+the model drew an ``IMAGE`` box over the whole text body of 93 pages,
+and on some pages the ``TEXT_COLUMN`` box itself, out onto the blot and
+up to the page edge; the strip on that side was then pinned at the
+box's edge or dropped: 16 pages with no left strip, 14 with no right,
+55 of 73 edge blots uncovered.
+
+**The rule**, in :func:`clipped_pages`:
+
+    A ``TEXT_COLUMN`` box (its x-bounds) and an ``IMAGE`` box (both
+    axes) are read inside the page's text box, padded by the buffer the
+    strips leave, on a copy of the page. A real picture is a cell, so it
+    is inside the box; a text column is inside it by definition; the
+    part of either box outside it is over dirt.
+
+The column's y-bounds stay the model's own: they are what holds the fit
+off a last line the reader missed. Two guards, the refusals visible from
+this side of blackletter: a page whose text box is narrower than
+``MIN_TEXT_WIDTH_FRACTION`` of the render (the one-column read of a
+two-column page, where blackletter refuses the fit and the clip would be
+the only effect) is left alone, and a box the clip would cut below
+``CLIP_MIN_KEEP_RATIO`` of itself (a partial read, a plate with no cell)
+is kept as it is, never dropped: a dropped box lets a strip cover what
+it described. Under that rule scan 1841 lost no side strip, covered every
+blot, and put no strip over a cell. The copies are for the margin
+measure alone: the headnote rects and the outside-opinion masks read
+the document's own column boxes, and must not change. When blackletter
+takes the rule, :func:`clipped_pages` is a deletion.
+
+**Every page gets its four strips** (:func:`ensure_strips`, #370). A
+curator widens a strip by dragging it and draws one from nothing with
+more work, so a strip the measure did not give a page is a
+``MIN_STRIP_PT`` handle at its page edge. It is the same strip at every
+compute, so a dismissal of it lands on the next. A handle is a strip
+like the others: it is held off the detections by blackletter's own
+pull-back, and one a detection at the page edge collapses is not added,
+because a strip never covers a detection.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
+
+from blackletter.margins import (
+    DEFAULT_BUFFER,
+    MIN_TEXT_WIDTH_FRACTION,
+    _page_size_agrees,
+    _shrink_rects_for_detections,
+)
+from blackletter.models import BBox, Label
 
 from scanning.text_fit import PageCells
 
 logger = logging.getLogger(__name__)
+
+#: The labels whose boxes are read inside the text box (#370): the two
+#: the model draws out onto a blot along the page edge.
+CLIPPED_LABELS = frozenset({Label.TEXT_COLUMN, Label.IMAGE})
+
+#: Of those, the labels clipped on the x axis alone. A column's y-bounds
+#: are the one thing holding the fit off a last line the reader missed.
+X_ONLY_LABELS = frozenset({Label.TEXT_COLUMN})
+
+#: The least of itself a box may keep for the clip to stand. A blot
+#: overrun is a sliver (the most any box of scan 1841 lost was a third);
+#: a box that would lose more disagrees with the reader grossly, which
+#: is a partial read or a picture the reader gave no cell, and it keeps
+#: pinning the strip as it does today.
+CLIP_MIN_KEEP_RATIO = 0.5
+
+#: The width, in PDF points, of a strip :func:`ensure_strips` adds where
+#: the measure gave none. About 2 mm: invisible on a trimmed reporter
+#: page, and one resize handle wide in the step-2 viewer.
+MIN_STRIP_PT = 6.0
 
 
 def _held(value: float, limit: float) -> float:
@@ -157,3 +229,228 @@ def fit_pages(document, cells: dict[int, PageCells]) -> int:
             pages - fitted,
         )
     return fitted
+
+
+def _clipped_box(bbox: BBox, frame: BBox, x_only: bool) -> BBox | None:
+    """Return ``bbox`` held inside ``frame``, or None when the clip is refused.
+
+    :param bbox: The detection's box, in the page's pixels.
+    :param frame: The padded text box, in the same pixels.
+    :param x_only: Whether to leave the y-bounds as they are.
+    :returns: The clipped box, or None when it would be empty or keep
+        less than :data:`CLIP_MIN_KEEP_RATIO` of the box's area.
+    :rtype: BBox | None
+    """
+    x1 = max(bbox.x1, frame.x1)
+    x2 = min(bbox.x2, frame.x2)
+    y1, y2 = (
+        (bbox.y1, bbox.y2)
+        if x_only
+        else (max(bbox.y1, frame.y1), min(bbox.y2, frame.y2))
+    )
+    if x2 <= x1 or y2 <= y1:
+        return None
+    area = (bbox.x2 - bbox.x1) * (bbox.y2 - bbox.y1)
+    if area <= 0:
+        return None
+    if (x2 - x1) * (y2 - y1) / area < CLIP_MIN_KEEP_RATIO:
+        return None
+    return BBox(x1=x1, y1=y1, x2=x2, y2=y2)
+
+
+def clipped_pages(pages) -> list:
+    """Return the pages with their column and image boxes held inside the text box.
+
+    A page is returned as the same object when nothing is clipped: it
+    has no text box, its text box is narrower than
+    ``MIN_TEXT_WIDTH_FRACTION`` of the render, or no box of
+    :data:`CLIPPED_LABELS` reaches past the frame. Otherwise a copy is
+    returned whose changed detections are copies too; the page given and
+    its detections are never mutated.
+
+    The frame is the text box padded by ``margins.DEFAULT_BUFFER`` on
+    every side, the buffer ``compute_margin_rects`` defaults to and the
+    one ``services._measure_margin_rects`` lets it default to. The two
+    move together: a strip stands that buffer off the content box, so a
+    box held at the same distance pins nothing the fit did not already
+    leave.
+
+    :param pages: The blackletter pages of the document.
+    :returns: The pages, in order, for the margin measure.
+    :rtype: list
+    """
+    out = []
+    read = clipped = kept = gated = 0
+    for page in pages:
+        box = page.text_box
+        if box is None:
+            out.append(page)
+            continue
+        read += 1
+        tx1, ty1, tx2, ty2 = (float(v) for v in box)
+        if tx2 - tx1 < MIN_TEXT_WIDTH_FRACTION * float(page.img_width):
+            gated += 1
+            out.append(page)
+            continue
+        pad_x = DEFAULT_BUFFER / page.scale_x
+        pad_y = DEFAULT_BUFFER / page.scale_y
+        frame = BBox(
+            x1=tx1 - pad_x, y1=ty1 - pad_y, x2=tx2 + pad_x, y2=ty2 + pad_y
+        )
+        detections = []
+        changed = False
+        for det in page.detections:
+            if det.label not in CLIPPED_LABELS:
+                detections.append(det)
+                continue
+            held = _clipped_box(det.bbox, frame, det.label in X_ONLY_LABELS)
+            if held is None:
+                kept += 1
+                detections.append(det)
+                continue
+            if held == det.bbox:
+                detections.append(det)
+                continue
+            clipped += 1
+            changed = True
+            detections.append(replace(det, bbox=held))
+        out.append(replace(page, detections=detections) if changed else page)
+    if read:
+        logger.info(
+            "Margin boxes: %d page(s) with a text box, %d column/image box(es) "
+            "held inside it, %d kept whole below the keep ratio, %d page(s) "
+            "skipped for a narrow text box",
+            read,
+            clipped,
+            kept,
+            gated,
+        )
+    return out
+
+
+def _sides(entry: dict) -> dict:
+    """Name the strips of one page as ``margins._rects_for_bounds`` lays them out.
+
+    A full-width strip at the top edge is the top, one at the bottom
+    edge the bottom; a strip at the left edge is the left, one at the
+    right edge the right.
+
+    :param entry: One ``compute_margin_rects`` entry.
+    :returns: ``{"top", "bottom", "left", "right"}``, each a rect or None.
+    :rtype: dict
+    """
+    pw = float(entry["page_width"])
+    ph = float(entry["page_height"])
+    sides = {"top": None, "bottom": None, "left": None, "right": None}
+    for rect in entry.get("rects") or []:
+        full_width = rect["x0"] <= 1 and rect["x1"] >= pw - 1
+        if full_width and rect["y0"] <= 1:
+            sides["top"] = rect
+        elif full_width and rect["y1"] >= ph - 1:
+            sides["bottom"] = rect
+        elif rect["x0"] <= 1:
+            sides["left"] = rect
+        elif rect["x1"] >= pw - 1:
+            sides["right"] = rect
+    return sides
+
+
+def ensure_strips(
+    entries: list, pages=None, min_pt: float = MIN_STRIP_PT
+) -> int:
+    """Give every page the four strips, adding a thin one where the measure gave none.
+
+    The top and bottom are added first, full width and ``min_pt`` tall;
+    a side is added ``min_pt`` wide, spanning the rows between the top
+    and bottom strips, as blackletter lays the sides out. Coordinates
+    are rounded to a tenth of a point, as blackletter's are. A page too
+    small to hold two strips is left alone.
+
+    A handle is held off the detections of its page by the rule every
+    strip obeys, blackletter's ``_shrink_rects_for_detections`` (every
+    label outside ``NO_PUSHBACK_LABELS``, boxes wider than a pixel), and
+    one that collapses is not added: a scan cropped tight on the gutter
+    side gets no left strip today, on purpose, and a handle there would
+    be white over the type. ``pages`` are the pages the measure read
+    (the clipped copies), matched by index; a page the caller did not
+    pass, or one whose frame is not the entry's, gets its handles held
+    off nothing, as blackletter reads such a page's detections.
+
+    :param entries: The ``compute_margin_rects`` entries, mutated in place.
+    :param pages: The blackletter pages the entries were measured on.
+    :param min_pt: The width of an added strip, in PDF points.
+    :returns: How many strips were added.
+    :rtype: int
+    """
+    by_index = {page.index: page for page in pages or []}
+    added = 0
+    held = 0
+    for entry in entries:
+        pw = float(entry.get("page_width") or 0)
+        ph = float(entry.get("page_height") or 0)
+        if pw <= 2 * min_pt or ph <= 2 * min_pt:
+            continue
+        # ``or []`` because the other readers of these entries read
+        # ``rects`` that way, and an explicit None must not crash here.
+        rects = entry.get("rects") or []
+        entry["rects"] = rects
+        sides = _sides(entry)
+        handles = []
+        if sides["top"] is None:
+            sides["top"] = {
+                "x0": 0,
+                "y0": 0,
+                "x1": round(pw, 1),
+                "y1": round(min_pt, 1),
+            }
+            handles.append(sides["top"])
+        if sides["bottom"] is None:
+            sides["bottom"] = {
+                "x0": 0,
+                "y0": round(ph - min_pt, 1),
+                "x1": round(pw, 1),
+                "y1": round(ph, 1),
+            }
+            handles.append(sides["bottom"])
+        y0 = sides["top"]["y1"]
+        y1 = sides["bottom"]["y0"]
+        if sides["left"] is None:
+            handles.append(
+                {
+                    "x0": 0,
+                    "y0": round(y0, 1),
+                    "x1": round(min_pt, 1),
+                    "y1": round(y1, 1),
+                }
+            )
+        if sides["right"] is None:
+            handles.append(
+                {
+                    "x0": round(pw - min_pt, 1),
+                    "y0": round(y0, 1),
+                    "x1": round(pw, 1),
+                    "y1": round(y1, 1),
+                }
+            )
+        if not handles:
+            continue
+        page = by_index.get(entry.get("page_index"))
+        if page is not None and _page_size_agrees(page, pw, ph):
+            _shrink_rects_for_detections(page, handles)
+            kept = [
+                h
+                for h in handles
+                if h["x1"] - h["x0"] > 1 and h["y1"] - h["y0"] > 1
+            ]
+            held += len(handles) - len(kept)
+            handles = kept
+        rects.extend(handles)
+        added += len(handles)
+    if added or held:
+        logger.info(
+            "Margin strips: %d thin strip(s) added where the measure gave "
+            "none, %d withheld for a detection at the page edge",
+            added,
+            held,
+        )
+    return added

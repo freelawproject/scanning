@@ -2,7 +2,8 @@
 
 Every engine reads the whole volume, and its read is glued into one
 document per corrected volume (``ApplyRun.ocr_key`` for dots.mocr,
-``ApplyRun.extract_key`` for Mistral). The third review (#334) and the
+``ApplyRun.extract_key`` for Mistral, ``ApplyRun.surya_key`` for
+Surya). The third review (#334) and the
 OCR ensemble (#317) work on one opinion at a time, and they must never
 see the text under a redaction or the text of the neighbour opinion on
 a shared page. This module cuts each engine's document to the pages of
@@ -19,6 +20,25 @@ any of whose units carries an exclusion; :func:`kept_units` is the one
 reader for a consumer that wants the clean text alone. The excluded
 text stays under ``jobs/``, which nothing serves without a login.
 
+**A printed page number is not opinion text either** (#396). It is
+approved by review 1 and frozen by the apply in the printed-page map
+(``apply.printed_pages``), which holds the value of every final page
+and no position: every engine reads the number inside a larger unit,
+with the running head. So the glue reads the approved value and finds
+it in each engine's own text: a unit in the head or the foot zone --
+by its band (``page_numbers.band_of``) or by the engine's own label
+(``page_numbers.is_head_or_foot_label``), the two signals review 1
+takes a candidate by -- one of whose lines ends in that value
+(``page_numbers.carries_number``) carries the exclusion
+``page_number``, and the running head goes with it. Both conditions
+are required. The zone alone takes every head cell, number or not;
+the value alone takes a body line that ends in the same digits, which
+is opinion text. Nothing is read off a dots.mocr box, so a page
+dots.mocr failed still loses the headers of the other engines. A page
+whose approved number the engines did not write keeps every unit: a
+header the model misread and a curator corrected, a curator's label
+on an inserted page, or no number at all.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -32,6 +52,17 @@ glued), ``box_pt`` (the same box in PDF points, the space every
 review-2 row and the viewer use), ``exclusion`` and ``share``. The
 page ``md`` is not copied: it is the whole page, redacted text
 included, and it cannot carry a verdict.
+
+**The footnote zone is a fact of the page, frozen here (#399).** The
+``FOOTNOTES`` detections of the run, in points, go on every engine's
+page as ``zones.footnotes``, the twin of ``frame``. The ensemble puts
+an aligned group in the footnotes when the zone covers it, and it
+reads no ``Detection`` row for that: the zone is written here, beside
+the verdicts the redaction rows give, and a box a curator moves after
+the glue is answered by ``reglue_opinion_ocr`` like every other late
+fact. The engines' own footnote labels (``EngineSpec.footnote_types``)
+are exact and rare, so they decide nothing and the ensemble reads them
+for one card alone.
 
 **The path is the invariant key.** ``Opinion.glue_prefix`` is
 ``jobs/opinions/{first_printed_page}.{index_in_page}/r{glue_revision}/``,
@@ -67,12 +98,14 @@ for a late key.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from blackletter.models import Label
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -81,9 +114,11 @@ from scanning import (
     boundaries,
     dots_mocr,
     mistral_ocr,
+    page_numbers,
     redactions,
     review_states,
     s3_sync,
+    surya,
     yolo,
 )
 from scanning.models import (
@@ -97,8 +132,12 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: Version of the documents this module writes.
-SCHEMA_VERSION = 1
+#: Version of the documents this module writes. 2 puts the footnote
+#: zone on every page (#399).
+SCHEMA_VERSION = 2
+
+#: The detection label of the footnote band of a page (#399).
+FOOTNOTE_LABEL = Label.FOOTNOTES.name
 
 #: The file that says a revision is glued, written last.
 MANIFEST = "manifest.json"
@@ -125,6 +164,11 @@ MAX_ATTEMPTS = 3
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
 UNJUDGED = "unjudged"
+
+#: The verdict of the unit that holds the printed page number (#396):
+#: in the head or the foot band, and one of its lines ends in the
+#: approved number of its page. Taken whole, running head included.
+PAGE_NUMBER = "page_number"
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's: the field is
@@ -159,16 +203,29 @@ class ScanHeld(Exception):
 class EngineSpec:
     """How one engine's corrected-volume document is read.
 
-    :param name: The ``JobEngine`` value, and the file name.
+    :param name: The ``JobEngine`` value, and the file name. What a
+        person calls the engine is that choice's own label
+        (``JobEngine(name).label``) and is not copied here (#381).
     :param key_field: The ``ApplyRun`` field that names the document.
     :param units_key: The page field that holds the units.
     :param text_key: The unit field that holds the text.
     :param type_key: The unit field that holds the engine's label.
     :param frame: Returns the render size ``(width, height)`` a page's
         boxes are measured in, or None.
+    :param module: The stage's module (``dots_mocr``, ``mistral_ocr``,
+        ``surya``), for the two functions all three share:
+        ``glued_volume_key(scan)`` and ``run_summary(scan)``. The
+        volume document is what the text overlay reads (#381), and the
+        corrected volume's is what this module reads.
     :param owed_rows: Returns the rows that say a read of this engine
         is on its way for a scan and run: a live volume run, or the
         rows of the run's own edited pages.
+    :param footnote_types: The values of ``type_key`` this engine
+        writes on a footnote (#399), in the engine's own spelling.
+        Measured on the corpus, they are exact and rare: a footnote
+        label is almost never wrong and misses most footnotes. So they
+        never decide a section; the ensemble reads them for the
+        ``FOOTNOTE_UNSURE`` card alone.
     """
 
     name: str
@@ -177,15 +234,41 @@ class EngineSpec:
     text_key: str
     type_key: str
     frame: Callable[[dict, dict], tuple[float, float] | None]
+    module: object
     owed_rows: Callable[[Scan, object], list]
+    footnote_types: frozenset[str] = frozenset()
 
     def document_key(self, run) -> str:
         """The S3 key of this engine's document for ``run``."""
         return getattr(run, self.key_field) or ""
 
+    @property
+    def fields(self) -> dict[str, str]:
+        """The field names a reader of this engine's pages needs.
 
-def _dots_frame(page: dict, document: dict) -> tuple[float, float] | None:
-    """The render size of a dots.mocr page, off the page itself."""
+        The three names that differ between the engines, in one dict.
+        The text overlay's endpoint answers it beside the presigned URL
+        (#381), so the browser reads a document it knows nothing about
+        and a fourth engine is one more entry of :data:`ENGINES`.
+
+        :returns: ``{"units", "text", "type"}``.
+        :rtype: dict[str, str]
+        """
+        return {
+            "units": self.units_key,
+            "text": self.text_key,
+            "type": self.type_key,
+        }
+
+
+def _page_frame(page: dict, document: dict) -> tuple[float, float] | None:
+    """The render size of one page, off the page itself.
+
+    The rule of the two engines whose worker renders each page and
+    reports that render's size: dots.mocr and Surya both write
+    ``origin_width`` and ``origin_height``, and every box of the page
+    is in that pixel space.
+    """
     width, height = page.get("origin_width"), page.get("origin_height")
     if _positive(width) and _positive(height):
         return float(width), float(height)
@@ -202,30 +285,39 @@ def _mistral_frame(page: dict, document: dict) -> tuple[float, float] | None:
     return None
 
 
-def _mistral_owed_rows(scan: Scan, run) -> list:
-    """The rows that say a Mistral read is on its way, last step first.
+def _extract_owed_rows(stage, scan: Scan, run) -> list:
+    """The rows that say one ``EXTRACT`` read is on its way, last step
+    first.
 
-    The read has two steps: the volume rows, then the rows of the
-    pages a curator changed, which the tick creates once the volume is
-    glued. **The later step decides**, because the earlier one is
-    already done when it exists: a consumed volume run with a dead
-    apply row is a read nothing will finish, and asking the volume
-    first would call it owed for good. A scan with no apply row yet
-    falls back to the volume rows, which is the window before the tick
-    creates them.
+    The rule of both engines a person starts (#245, #368), which read
+    in two steps: the volume rows, then the rows of the pages a curator
+    changed, which the tick creates once the volume is glued. **The
+    later step decides**, because the earlier one is already done when
+    it exists: a consumed volume run with a dead apply row is a read
+    nothing will finish, and asking the volume first would call it owed
+    for good. A scan with no apply row yet falls back to the volume
+    rows, which is the window before the tick creates them.
 
+    :param stage: The engine's module (``mistral_ocr`` or ``surya``).
     :param scan: The scan.
     :param run: The final apply run.
     :returns: The rows of the last step that exists.
     :rtype: list
     """
-    return mistral_ocr.apply_jobs(scan, run) or mistral_ocr.live_extract_jobs(
-        scan
-    )
+    return stage.apply_jobs(scan, run) or stage.live_extract_jobs(scan)
 
 
-#: The engines, in the order the ensemble votes. Surya (#301) is one
-#: entry more, and no other code.
+#: The engines, in the order the ensemble votes (#365). Surya is last
+#: (#368): nobody has measured it against the other two on this
+#: corpus, so it takes the rank that moves neither of them. A
+#: measurement is what moves it.
+#:
+#: A third engine is one entry here and no other code. Every reader
+#: walks this table: the glue, the files index, the file route,
+#: ``engines_owed``, and the text overlay of the viewer (#381).
+#:
+#: What a person calls an engine is not here: ``JobEngine`` carries
+#: that already, as the label of its own choice.
 ENGINES: dict[str, EngineSpec] = {
     "dots_mocr": EngineSpec(
         name="dots_mocr",
@@ -233,8 +325,10 @@ ENGINES: dict[str, EngineSpec] = {
         units_key="cells",
         text_key="text",
         type_key="category",
-        frame=_dots_frame,
+        frame=_page_frame,
+        module=dots_mocr,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
+        footnote_types=frozenset({"Footnote"}),
     ),
     "mistral_ocr": EngineSpec(
         name="mistral_ocr",
@@ -243,9 +337,33 @@ ENGINES: dict[str, EngineSpec] = {
         text_key=mistral_ocr.BLOCK_TEXT_KEY,
         type_key="type",
         frame=_mistral_frame,
-        owed_rows=_mistral_owed_rows,
+        module=mistral_ocr,
+        owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
+        # Lowercase, as the harvest stores them. ``footer`` holds
+        # footnote text on these pages; the running foot is ``header``.
+        footnote_types=frozenset({"references", "footer", "aside_text"}),
+    ),
+    "surya": EngineSpec(
+        name="surya",
+        key_field="surya_key",
+        units_key="blocks",
+        # The block's flattened text, not its ``html``: the unit shape
+        # is one shape for every engine, and the markup stays in the
+        # volume document for a reader of the tables.
+        text_key="text",
+        type_key="label",
+        frame=_page_frame,
+        module=surya,
+        owed_rows=functools.partial(_extract_owed_rows, surya),
+        # ``ListGroup`` is not here: it names a real list as often.
+        footnote_types=frozenset({"Footnote", "Bibliography"}),
     ),
 }
+
+#: The engine a reader gets when nobody named one (#381): the first
+#: entry of :data:`ENGINES`. dots.mocr is the read the pipeline pays
+#: for on every volume, so it is the one that is there.
+DEFAULT_ENGINE = next(iter(ENGINES))
 
 
 # ---------------------------------------------------------------------------
@@ -345,12 +463,20 @@ class ScanInputs:
         reader paints.
     :param renders: ``{page_index: (img_width, img_height)}`` of the
         live detections, for the page size in points.
+    :param printed: ``{page_index: value}``, the approved page number
+        of every final page that has one, off the run's printed-page
+        map (#396).
+    :param footnotes: ``{page_index: [Detection]}``, the live
+        ``FOOTNOTES`` rows of the run (#399), in render pixels. They
+        become the page's zone in points once the page size is known.
     """
 
     run: object
     documents: dict[str, dict] = field(default_factory=dict)
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
+    printed: dict[int, str] = field(default_factory=dict)
+    footnotes: dict[int, list] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -366,7 +492,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
     :rtype: ScanInputs
     :raises ScanHeld: When the corrected volume is not built, the
         redactions are not measured against it, an engine is owed, or
-        a document does not pull.
+        a document does not pull, the printed-page map included.
     """
     run = review_states.final_run(scan)
     if run is None:
@@ -394,6 +520,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
         raise ScanHeld("the run has no engine document")
 
     inputs = ScanInputs(run=run, documents=documents)
+    inputs.printed = _printed_numbers(scan, run)
     for entry in redactions.visible_by_page(scan):
         inputs.redactions[entry["page_index"]] = entry["rects"]
     # The run's space alone: a human row ``detections.relocate_rows``
@@ -405,7 +532,49 @@ def load_inputs(scan: Scan) -> ScanInputs:
         .distinct()
     ):
         inputs.renders.setdefault(page_index, (width, height))
+    # The footnote band of every page, the run's space alone again
+    # (#399). A hand-drawn row counts like a model row: a curator who
+    # drew the band said where the footnotes are.
+    for row in (
+        Detection.objects.live()
+        .filter(scan=scan, apply_run=run, label=FOOTNOTE_LABEL)
+        .order_by("page_index", "y0", "x0")
+    ):
+        inputs.footnotes.setdefault(row.page_index, []).append(row)
     return inputs
+
+
+def _printed_numbers(scan: Scan, run) -> dict[int, str]:
+    """Read the approved page number of every final page (#396).
+
+    The run's printed-page map, through ``apply.local_copy`` like the
+    engine documents, so a second tick over the scan pulls nothing.
+    The map is the one review 1 approved: the model's reading with the
+    curator's own numbers over it (``apply.printed_pages``). A page
+    with no number is absent, so a reader's ``get`` answers None.
+
+    :param scan: The scan.
+    :param run: The final apply run.
+    :returns: ``{page_index: value}``.
+    :rtype: dict[int, str]
+    :raises ScanHeld: When the map does not load, a fact about the
+        scan.
+    """
+    key = run.printed_pages_key
+    try:
+        document = json.loads(apply.local_copy(scan, key).read_text())
+    except (apply.ApplyError, OSError, ValueError) as exc:
+        raise ScanHeld(f"the printed-page map did not load: {exc}")
+    if not isinstance(document, dict) or "pages" not in document:
+        raise ScanHeld(f"the object at {key} is not a printed-page map")
+    printed: dict[int, str] = {}
+    for page in document["pages"] or []:
+        if not isinstance(page, dict) or not page.get("printed"):
+            continue
+        final = page.get("final_page")
+        if isinstance(final, int) and final > 0:
+            printed[final - 1] = str(page["printed"])
+    return printed
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +603,7 @@ def page_size_pt(
     if render:
         width, height = render
         return boundaries.to_points(width, height, width, height)
-    frame = _dots_frame(dots_page or {}, {})
+    frame = _page_frame(dots_page or {}, {})
     if frame is None:
         return None
     dpi = 72.0 if (dots_page or {}).get("render_fallback") else dots_mocr.DPI
@@ -442,8 +611,38 @@ def page_size_pt(
     return frame[0] * scale, frame[1] * scale
 
 
-def _box(value) -> list[float] | None:
-    """Return a four-number box with area, or None."""
+def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
+    """Return the footnote zone of one page, in points (#399).
+
+    One box per ``FOOTNOTES`` row, off the row's own render size, the
+    rule of ``opinion_pdf._image_rects``: the fields as they are, so a
+    zero render size falls back to the render density.
+
+    :param rows: The page's ``FOOTNOTES`` detections.
+    :param size: The page size in points.
+    :returns: ``[[x0, y0, x1, y1], ...]``, rounded like every box.
+    :rtype: list[list[float]]
+    """
+    zones = []
+    for row in rows:
+        x0, y0 = boundaries.to_points(
+            row.x0, row.y0, row.img_width, row.img_height, *size
+        )
+        x1, y1 = boundaries.to_points(
+            row.x1, row.y1, row.img_width, row.img_height, *size
+        )
+        box = as_box([x0, y0, x1, y1])
+        if box is not None:
+            zones.append([round(v, 2) for v in box])
+    return zones
+
+
+def as_box(value) -> list[float] | None:
+    """Return a four-number box with area, or None.
+
+    Public, because the ensemble (#365) reads the same boxes out of
+    the documents this module writes. One copy of the box rules.
+    """
     if not isinstance(value, (list, tuple)) or len(value) != 4:
         return None
     if not all(_number(v) for v in value):
@@ -464,8 +663,11 @@ def _positive(value) -> bool:
     return _number(value) and value > 0
 
 
-def _intersection(a: list[float], b: list[float]) -> float:
-    """Return the area two boxes share."""
+def intersection(a: list[float], b: list[float]) -> float:
+    """Return the area two boxes share.
+
+    Public, for the ensemble's own geometry (#365).
+    """
     width = min(a[2], b[2]) - max(a[0], b[0])
     height = min(a[3], b[3]) - max(a[1], b[1])
     if width <= 0 or height <= 0:
@@ -492,10 +694,10 @@ def covered_share(
         return 0.0, None
     best, hit = 0.0, None
     for rect in rects:
-        other = _box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
         if other is None:
             continue
-        share = _intersection(box, other) / area
+        share = intersection(box, other) / area
         if share > best:
             best, hit = share, rect
     return best, hit
@@ -505,13 +707,20 @@ def verdict(
     box_pt: list[float] | None,
     rects: list[dict],
     masks: list[dict],
+    text: str = "",
+    printed: str | None = None,
+    height_pt: float | None = None,
+    label: str = "",
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
-    names itself; else a neighbour's mask that does; else nothing. The
-    share is the larger of the two, so a partial verdict is read off
-    the file as ``share < FULL_SHARE``.
+    names itself; else a neighbour's mask that does; else the printed
+    page number, when the unit sits in the head or the foot zone and
+    one of its lines ends in the approved number of its page (#396);
+    else nothing. The share is the larger of the two boxes' shares,
+    so a partial verdict is read off the file as ``share <
+    FULL_SHARE``; a page-number unit is taken whole and carries 1.0.
 
     A unit with no box, or on a page with no size, cannot be judged.
     It carries the third verdict, :data:`UNJUDGED`, so a reader tells
@@ -523,6 +732,12 @@ def verdict(
         no box or on a page with no size.
     :param rects: The redaction boxes of the page, in points.
     :param masks: The outside masks of the page, in points.
+    :param text: The unit's text, as the engine wrote it.
+    :param printed: The approved page number of the page, or None for
+        a page with none.
+    :param height_pt: The page's height in points, the space of
+        ``box_pt``; None leaves the band unread.
+    :param label: The unit's label, as the engine wrote it.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
@@ -544,9 +759,45 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
+    elif is_page_number(box_pt, text, printed, height_pt, label):
+        exclusion = {"reason": PAGE_NUMBER, "printed": printed}
+        share = 1.0
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def is_page_number(
+    box_pt: list[float],
+    text: str,
+    printed: str | None,
+    height_pt: float | None,
+    label: str = "",
+) -> bool:
+    """Say whether a unit is the printed page number of its page (#396).
+
+    Both conditions, and the one rule for them: the unit is in the head
+    or the foot zone, by its band (``page_numbers.band_of``) or by the
+    engine's label (``page_numbers.is_head_or_foot_label``), the two
+    signals review 1 takes a candidate by; and a line of the text ends
+    in the approved value (``page_numbers.carries_number``).
+
+    :param box_pt: The unit's box in points.
+    :param text: The unit's text.
+    :param printed: The approved number of the page, or None.
+    :param height_pt: The page's height in points, or None.
+    :param label: The unit's label, as the engine wrote it.
+    :returns: Whether the unit is the page number.
+    :rtype: bool
+    """
+    if not printed:
+        return False
+    in_zone = page_numbers.is_head_or_foot_label(label) or (
+        bool(height_pt) and page_numbers.band_of(box_pt, height_pt) is not None
+    )
+    if not in_zone:
+        return False
+    return page_numbers.carries_number(text, printed)
 
 
 def kept_units(page: dict) -> list[dict]:
@@ -604,7 +855,14 @@ def build_document(
     }
     pages: list[dict] = []
     failed: list[int] = []
-    counts = {"units": 0, "excluded": 0, "partial": 0, "unjudged": 0}
+    counts = {
+        "units": 0,
+        "excluded": 0,
+        "partial": 0,
+        "unjudged": 0,
+        "page_number": 0,
+        "footnote_zones": 0,
+    }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
         page = by_index.get(page_index)
@@ -621,6 +879,11 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
+            # The footnote band of the page, in points (#399). The same
+            # value on every engine's page, because it is a fact of the
+            # page and not of the engine. Empty when no detection drew
+            # it, or when no size puts it in points.
+            "zones": {"footnotes": []},
             "units": [],
         }
         if size and frame:
@@ -630,6 +893,11 @@ def build_document(
                 "render_width": frame[0],
                 "render_height": frame[1],
             }
+        if size:
+            entry["zones"]["footnotes"] = zones_pt(
+                inputs.footnotes.get(page_index, []), size
+            )
+            counts["footnote_zones"] += len(entry["zones"]["footnotes"])
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
@@ -637,10 +905,11 @@ def build_document(
             continue
         rects = inputs.redactions.get(page_index, [])
         page_masks = masks.get(page_index, [])
+        printed = inputs.printed.get(page_index)
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
-            box = _box(unit.get("bbox"))
+            box = as_box(unit.get("bbox"))
             box_pt = None
             if box and size and frame:
                 sx, sy = size[0] / frame[0], size[1] / frame[1]
@@ -650,20 +919,33 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
-            exclusion, share = verdict(box_pt, rects, page_masks)
+            text = unit.get(spec.text_key)
+            if not isinstance(text, str):
+                text = ""
+            label = unit.get(spec.type_key) or ""
+            exclusion, share = verdict(
+                box_pt,
+                rects,
+                page_masks,
+                text,
+                printed,
+                size[1] if size else None,
+                label,
+            )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1
             elif exclusion is not None:
                 counts["excluded"] += 1
+                if exclusion["reason"] == PAGE_NUMBER:
+                    counts["page_number"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
-            text = unit.get(spec.text_key)
             entry["units"].append(
                 {
                     "id": index,
-                    "type": unit.get(spec.type_key) or "",
-                    "text": text if isinstance(text, str) else "",
+                    "type": label,
+                    "text": text,
                     "bbox": unit.get("bbox"),
                     "box_pt": box_pt,
                     "exclusion": exclusion,
@@ -769,7 +1051,14 @@ def write(opinion: Opinion, inputs: ScanInputs) -> list[str]:
         )
     stamped = Opinion.objects.filter(
         pk=opinion.pk, glue_revision=opinion.glue_revision
-    ).update(ocr_glue_revision=opinion.glue_revision, ocr_glue_attempts=0)
+    ).update(
+        ocr_glue_revision=opinion.glue_revision,
+        ocr_glue_attempts=0,
+        # How many engines this revision holds (#365). The ensemble
+        # gate is a query over it, so it is written with the stamp it
+        # describes and never read back off the manifest.
+        ocr_engine_count=len(written),
+    )
     if stamped:
         # This module's own message alone: another work's failure on
         # the same row is not answered by this success.

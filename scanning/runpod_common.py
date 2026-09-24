@@ -9,16 +9,16 @@ PyMuPDF (imported lazily), and the stdlib.
 
 Extracted from the previously byte-for-byte duplicated copies in the
 worker handlers so a fix to the shared logic lands in every worker at
-once. Three workers build on it: ``scanning/runpod-dotsmocr/`` (#190),
-the bl_warm detection worker under ``scanning/runpod/`` (#194), and the
-case-law block tagger under ``scanning/runpod-caselaw-tagger/``. The
-next engine image (#147) starts from this module too. It carries the
+once. Four workers build on it: ``scanning/runpod-dotsmocr/`` (#190),
+the bl_warm detection worker under ``scanning/runpod/`` (#194), the
+case-law block tagger under ``scanning/runpod-caselaw-tagger/``, and the
+Surya OCR 2 worker under ``scanning/runpod-surya/`` (#320). It carries the
 transfer and validation code, and also the worker scaffold: the Sentry
 setup, the boot clock, the worker-meta fields, the result envelope, and
 the action runner whose error codes the daemon (``runpod_client.py``)
 classifies. One daemon reads the output of every worker, so these
 blocks are one contract and must not fork per image. Tested in
-``scanning/tests/test_runpod_common.py`` and through the three handler
+``scanning/tests/test_runpod_common.py`` and through the four handler
 test modules.
 """
 

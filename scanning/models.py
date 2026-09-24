@@ -2411,8 +2411,8 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first five are the warnings the review shows on a page. The last
-    three are facts about the opinion row itself.
+    The first seven are the warnings the review shows on a page. The
+    last three are facts about the opinion row itself.
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
@@ -2422,6 +2422,11 @@ class OpinionCheck(models.TextChoices):
     PARTIAL_REDACTION = (
         "partial_redaction",
         "A redaction covers part of a cell",
+    )
+    PAGE_NOT_READ = "page_not_read", "This page has no text"
+    FOOTNOTE_UNSURE = (
+        "footnote_unsure",
+        "An engine read a footnote no detection covers",
     )
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
@@ -2623,6 +2628,31 @@ class Opinion(AbstractDateTimeModel):
         help_text=(
             "Failed OCR glue ticks on this row at the live revision "
             "(#350). At opinion_ocr.MAX_ATTEMPTS the row goes to ERROR."
+        ),
+    )
+    ocr_engine_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "How many engine documents the OCR glue wrote at "
+            "ocr_glue_revision (#365). The ensemble gate reads it, so a "
+            "two-engine volume waits for the third engine."
+        ),
+    )
+    ensemble_revision = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The ocr_glue_revision the ensemble ran at (#365). Equal to "
+            "ocr_glue_revision: the text of the rows describes the OCR "
+            "documents that exist now, the one rule "
+            "ensemble.is_written reads."
+        ),
+    )
+    ensemble_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed ensemble ticks on this row at the live revision "
+            "(#365). At ensemble.MAX_ATTEMPTS the row goes to ERROR."
         ),
     )
     approved_text_key = models.CharField(
@@ -2855,13 +2885,24 @@ class OpinionText(AbstractDateTimeModel):
             "rebuilt from the glued runs plus the human rows."
         ),
     )
+    footnotes = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "The resolved text of the page's footnotes, in reading order "
+            "(#399). A cache like ``text``, and never a part of it: the "
+            "tagger reads ``text`` alone. The ``footnotes`` entries of "
+            "``disagreements`` point into this field."
+        ),
+    )
     disagreements = models.JSONField(
         default=list,
         blank=True,
         help_text=(
             "One entry per place the engines differ: "
-            "``{'start': int, 'end': int, 'variants': {engine: text}}``, "
-            "with the offsets against ``text``. Empty when they agree."
+            "``{'start': int, 'end': int, 'section': 'text' | 'footnotes', "
+            "'variants': {engine: text}}``, with the offsets against the "
+            "field ``section`` names. Empty when they agree."
         ),
     )
     human_text = models.TextField(
@@ -3064,6 +3105,15 @@ class PageEdit(AbstractDateTimeModel):
       only. A printed number cannot be an address: front matter has
       none, and two pages can both print 1074 -- which is one of the
       defects review 1 exists to find.
+    - **A move is addressed by the page that moves and the gap it
+      lands in** (#261). ``pdf_page`` is the page, ``anchor_pdf_page``
+      the original page it follows in the corrected volume, with 0
+      for "before page 1", the insert's vocabulary. Two adjacent pages
+      scanned in the wrong order, the case the ``backward_page`` card
+      finds, are one row: the later page moved to after the page
+      before the pair. The moved page keeps its own content and its
+      own rows; the apply (#224) writes it at its new place and pays
+      no read for it, because every stage read the page where it was.
     - **A decision stands until it is withdrawn, and it is never
       rewritten or deleted.** A curator who takes the decision back
       stamps ``withdrawn_at`` and ``withdrawn_by`` (#232), and that is
@@ -3103,6 +3153,7 @@ class PageEdit(AbstractDateTimeModel):
         INSERT_PAGE = "insert_page", "Insert a page image"
         REPLACE_PAGE = "replace_page", "Replace a page with an image"
         ROTATE_PAGE = "rotate_page", "Rotate a page"
+        MOVE_PAGE = "move_page", "Move a page to another place"
         DISMISS_ISSUE = "dismiss_issue", "Dismiss an issue"
 
     #: Kinds that change what the volume is, so the apply (#206) must
@@ -3114,6 +3165,7 @@ class PageEdit(AbstractDateTimeModel):
         Kind.INSERT_PAGE,
         Kind.REPLACE_PAGE,
         Kind.ROTATE_PAGE,
+        Kind.MOVE_PAGE,
     )
 
     scan = models.ForeignKey(
@@ -3152,8 +3204,8 @@ class PageEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "Inserts only: the 1-based original page the image "
-            "follows. 0 puts the image before page 1."
+            "Inserts and moves: the 1-based original page the image, "
+            "or the moved page, follows. 0 puts it before page 1."
         ),
     )
     ordinal = models.PositiveSmallIntegerField(
@@ -3263,13 +3315,19 @@ class PageEdit(AbstractDateTimeModel):
         ]
         constraints = [
             # One address column per kind, so a null is never a second
-            # meaning of a column. An insert lives in a gap; every
+            # meaning of a column. An insert lives in a gap; a move
+            # names its page and the gap it lands in (#261); every
             # other kind lives on a page.
             models.CheckConstraint(
                 condition=(
                     models.Q(
                         kind="insert_page",
                         pdf_page__isnull=True,
+                        anchor_pdf_page__isnull=False,
+                    )
+                    | models.Q(
+                        kind="move_page",
+                        pdf_page__isnull=False,
                         anchor_pdf_page__isnull=False,
                     )
                     | models.Q(
@@ -3304,6 +3362,16 @@ class PageEdit(AbstractDateTimeModel):
                     | models.Q(value__in=PAGE_EDIT_ROTATIONS)
                 ),
                 name="page_edit_rotation_is_a_quarter_turn",
+            ),
+            # A page cannot follow itself. A move to the gap before its
+            # own page is allowed, as it changes nothing: the plan
+            # reads it as the page in its place.
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(kind="move_page")
+                    | ~models.Q(anchor_pdf_page=models.F("pdf_page"))
+                ),
+                name="page_edit_move_leaves_its_page",
             ),
             # The unique keys are partial over the standing rows: one
             # decision per address. A row leaves that set in one way
@@ -3354,11 +3422,12 @@ class PageEdit(AbstractDateTimeModel):
         ]
 
     def __str__(self):
-        where = (
-            f"after p.{self.anchor_pdf_page}"
-            if self.kind == self.Kind.INSERT_PAGE
-            else f"p.{self.pdf_page}"
-        )
+        if self.kind == self.Kind.INSERT_PAGE:
+            where = f"after p.{self.anchor_pdf_page}"
+        elif self.kind == self.Kind.MOVE_PAGE:
+            where = f"p.{self.pdf_page} to after p.{self.anchor_pdf_page}"
+        else:
+            where = f"p.{self.pdf_page}"
         value = f" = {self.value!r}" if self.value else ""
         state = ""
         if self.withdrawn_at is not None:
@@ -3502,6 +3571,26 @@ class ApplyRun(AbstractDateTimeModel):
             "that is what makes the glue due again."
         ),
     )
+    surya_key = models.CharField(
+        max_length=1024,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the final Surya OCR volume JSON (#368). The twin "
+            "of extract_key: blank until glued, which waits for a Surya "
+            "volume run, and a volume nobody read with Surya never has "
+            "one. No review state reads it."
+        ),
+    )
+    surya_run = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The Surya volume run surya_key was glued from. A second "
+            "read of the volume gets a later run number, and that is "
+            "what makes the glue due again."
+        ),
+    )
     built_at = models.DateTimeField(
         null=True,
         blank=True,
@@ -3585,10 +3674,11 @@ class ApplyRun(AbstractDateTimeModel):
         the redactions of the corrected volume, so every output of the
         corrected volume must exist before the review opens.
 
-        ``extract_key`` is deliberately **not** part of it (#245). The
-        Mistral read is started by a person, and after the reviews
-        rather than before them, so a volume nobody read with Mistral
-        would never open review 2 if this waited for it.
+        ``extract_key`` and ``surya_key`` are deliberately **not** part
+        of it (#245, #368). A person starts those two reads, and after
+        the reviews rather than before them, so a volume nobody read
+        with Mistral or with Surya would never open review 2 if this
+        waited for them.
         """
         return self.is_glued and bool(self.detections_key)
 
@@ -3621,10 +3711,12 @@ class PageRepairRequest(AbstractDateTimeModel):
       reviewer asked for and who judged it unnecessary.
     - **Fulfilled is derived, not stamped.** A request is fulfilled
       when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
-      at its address (``repairs._fulfilling_edits``), and made after
-      the request. No writer stamps
-      it, so the upload cannot race a stamp, and an undo of the upload
-      (#232) reopens the request with no second writer.
+      at its address (``repairs._edits_at_the_address``), and made
+      after the request; a one-page INSERT request is fulfilled too by
+      a replacement of either page beside its gap
+      (``repairs._replacements_beside_the_gap``, #393). No writer
+      stamps it, so the upload cannot race a stamp, and an undo of the
+      upload (#232) reopens the request with no second writer.
     - **One open request per address.** The unique key is partial over
       the rows with no dismissal. A second request for the same page
       answers the first row. A dismissed row frees the address.

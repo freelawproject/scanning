@@ -53,7 +53,7 @@ from scanning.tests.test_boundaries import (
 from scanning.tests.test_detections import model_row
 from scanning.tests.test_opinions import make_run
 from scanning.tests.test_views import ScanningTestCase
-from scanning.tests.test_yolo_apply import identity_map
+from scanning.tests.test_yolo_apply import identity_map, moved_map
 
 PAGES = 6
 
@@ -399,6 +399,30 @@ class TestPartOneBumpsTheRevision(TestCase):
         self.assertEqual(second.glue_revision, 0)
         self.assertEqual(second.pdf_attempts, 2)
         self.assertEqual(second.status, OpinionReviewStatus.TEXT_REVIEW_DONE)
+
+
+class TestSourceOfAMovedPage(TestCase):
+    """The picture of a page comes from the page the map names (#383).
+
+    The PDF pulls the colour of a page out of the original's shard, so
+    a volume with a moved page (#261) must read the map and never the
+    final index: the picture would otherwise be another page's.
+    """
+
+    def test_each_final_page_names_its_own_original(self):
+        scan = ScanFactory(page_count=3)
+        run = make_run(scan)
+        run.page_map = moved_map(3, page=3, anchor=1)
+        run.save(update_fields=["page_map"])
+
+        self.assertEqual(
+            [opinion_pdf._source_of(run, index) for index in range(3)],
+            [
+                {"kind": "original", "pdf_page": 1},
+                {"kind": "original", "pdf_page": 3},
+                {"kind": "original", "pdf_page": 2},
+            ],
+        )
 
 
 class TestPayload(OpinionPdfCase):
@@ -889,6 +913,29 @@ class TestTick(OpinionPdfCase):
         self.assertEqual(broken.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
         self.assertEqual(broken.status, OpinionReviewStatus.ERROR)
 
+    def test_an_approved_row_keeps_its_status_at_the_cap(self):
+        """A person read that text; a failed PDF does not take it away."""
+        row = self.opinion(start=1, end=2)
+        Opinion.objects.filter(pk=row.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        for _ in range(opinion_pdf.MAX_ATTEMPTS):
+            Opinion.objects.filter(pk=row.pk).update(
+                pdf_attempted_at=timezone.now()
+                - opinion_pdf.retry_after()
+                - timedelta(seconds=1)
+            )
+            with (
+                patch(
+                    "blackletter.api.generate",
+                    side_effect=ValueError("bad payload"),
+                ),
+                self.assertLogs("scanning.opinion_pdf", level="ERROR"),
+            ):
+                opinion_pdf.run_tick()
+        row.refresh_from_db()
+        self.assertEqual(row.status, OpinionReviewStatus.TEXT_REVIEW_DONE)
+
     def test_an_unknown_exception_counts(self):
         """A bug in the write path must reach ERROR rather than repeat."""
         row = self.opinion(start=1, end=2)
@@ -978,7 +1025,17 @@ class TestTick(OpinionPdfCase):
 
         self.assertEqual(picked, on_disk)
 
-    def test_a_reviewed_row_at_the_cap_keeps_its_status(self):
+    def test_a_reviewed_row_at_the_cap_ends_at_error(self):
+        """A row in the review is not an approved row (#365).
+
+        #336 wrote this row off and kept its status, at a time when
+        nothing wrote ``READY_FOR_TEXT_REVIEW`` at all. A re-glue now
+        raises the revision of a row a curator was reading, and the PDF
+        is owed again; at the cap the row also leaves :func:`owed`, so
+        a row that kept the status would wait for ever with no alarm
+        and no PDF to show. The two failure paths agree: an approved
+        row keeps its status, and every other row ends at ERROR.
+        """
         row = self.opinion(
             start=1,
             end=2,
@@ -989,7 +1046,7 @@ class TestTick(OpinionPdfCase):
         with self.assertLogs("scanning.opinion_pdf", level="ERROR"):
             opinion_pdf.run_tick()
         row.refresh_from_db()
-        self.assertEqual(row.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+        self.assertEqual(row.status, OpinionReviewStatus.ERROR)
         self.assertEqual(row.pdf_attempts, opinion_pdf.MAX_ATTEMPTS)
         self.assertEqual(list(opinion_pdf.due()), [])
 

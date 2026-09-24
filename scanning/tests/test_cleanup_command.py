@@ -145,6 +145,7 @@ class TestLeakedStageDirSweep(TestCase):
         self.leaked_merge = scratch_dir("bitonal-12-abc123", old=True)
         self.leaked_glue = scratch_dir("dotsmocr-9-xyz789", old=True)
         self.leaked_render = scratch_dir("mistralocr-k2j3h4", old=True)
+        self.leaked_surya = scratch_dir("suryaocr-9-abc123", old=True)
         self.live_merge = scratch_dir("bitonal-13-def456", old=False)
         self.unrelated = scratch_dir("someother-1-ghi", old=True)
 
@@ -169,6 +170,9 @@ class TestLeakedStageDirSweep(TestCase):
         self.assertFalse(self.leaked_glue.exists())
         # The Mistral render dir (#191) is reclaimed like the others.
         self.assertFalse(self.leaked_render.exists())
+        # And the Surya glue's own scratch dir (#368), which holds the
+        # biggest shard results this daemon reads.
+        self.assertFalse(self.leaked_surya.exists())
         # A live stage's scratch dir is fresh and stays.
         self.assertTrue(self.live_merge.exists())
         # A directory that is not ours stays, however old.

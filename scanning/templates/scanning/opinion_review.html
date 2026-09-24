@@ -1,17 +1,31 @@
 {% extends "base.html" %}
+{% load static %}
 
 {% comment %}
-  One opinion of the third review (issue #334), stage 1.
+  One opinion of the third review (#334), with the text of the OCR
+  ensemble beside its redacted PDF (#365).
 
-  The page shows what the rows hold, and the redacted PDF of the
-  opinion in a frame when the row says the file exists. It carries no
-  write control: the approval, the dismissal and the typing of a page
-  arrive with the text review itself, which needs OpinionText. A button
-  the endpoint would refuse is the one thing a viewer must never offer
-  (the rule of the step-1 bar, #151).
+  Two columns. The left one holds the pages of the redacted PDF, drawn
+  with pdf.js. The right one holds the text of the same pages, one node
+  per group of the ensemble. A pointer in one column highlights the
+  other, because the reviewer's question is always "what does the page
+  say here".
+
+  The browser reads both objects from the bucket: the container carries
+  the address of the two routes that mint a presigned GET, and
+  `viewer_step3.js` spells no path of its own (#334).
+
+  The one write control is the re-run of the ensemble. The approval,
+  the dismissal and the typing of a page come with the review that
+  closes an opinion. A button the endpoint would refuse is the one
+  thing a viewer must never offer (the rule of the step-1 bar, #151).
 {% endcomment %}
 
 {% block title %}{{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
 
 {% block content %}
 <a href="{% url 'opinion_list' %}{% if list_query %}?{{ list_query }}{% endif %}"
@@ -19,7 +33,7 @@
   <i class="fa-solid fa-arrow-left"></i> Back to the opinions
 </a>
 
-<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-6 gap-4">
+<div class="flex flex-col sm:flex-row sm:items-center sm:justify-between mb-4 gap-4">
   <div class="flex items-center gap-3 flex-wrap">
     <h1 class="text-2xl font-bold">
       {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}
@@ -27,131 +41,167 @@
     </h1>
     <span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span>
   </div>
-  <a href="{% url 'scan_process' pk=opinion.scan.pk %}?step=2" class="btn-outline text-sm">
-    <i class="fa-solid fa-book"></i> Open the volume
-  </a>
+  <div class="flex items-center gap-2 flex-wrap">
+    {% if redacted_pdf_url %}
+    <a href="{{ redacted_pdf_url }}" class="btn-outline text-sm">
+      <i class="fa-solid fa-download"></i> Download
+    </a>
+    {% comment %}
+      The whole file at full size, in a tab of its own: a navigation to
+      our own route, which answers a 302 to the bucket and needs no
+      CORS rule (#336).
+    {% endcomment %}
+    <a href="{{ redacted_pdf_url }}?disposition=inline" target="_blank"
+       rel="noopener" class="btn-outline text-sm">
+      <i class="fa-solid fa-up-right-from-square"></i> Open the PDF
+    </a>
+    {% endif %}
+    {% if can_rerun %}
+    <button type="button" id="rerun-ensemble" class="btn-outline text-sm"
+            title="Read the OCR documents of this opinion again and write its text">
+      <i class="fa-solid fa-rotate"></i> Read the OCR documents again
+    </button>
+    {% endif %}
+    <a href="{% url 'scan_process' pk=opinion.scan.pk %}?step=2" class="btn-outline text-sm">
+      <i class="fa-solid fa-book"></i> Open the volume
+    </a>
+  </div>
 </div>
 
 {% if opinion.status == 'error' and opinion.error_message %}
 <div class="alert-danger mb-6">{{ opinion.error_message }}</div>
 {% endif %}
 
-<div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
-
-  {# The facts of the row #}
-  <div class="card lg:col-span-1">
-    <h2 class="text-sm font-bold mb-3">The opinion</h2>
-    <table class="min-w-full text-sm">
-      <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Printed pages</th>
-          <td class="py-2">{{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %} &ndash; {{ opinion.last_printed_page }}{% endif %}</td>
-        </tr>
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Physical pages</th>
-          <td class="py-2">{{ opinion.page_count }}</td>
-        </tr>
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Volume</th>
-          <td class="py-2">
-            <a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline">
-              {% if opinion.scan.reporter %}{{ opinion.scan.reporter.short_name|upper }} vol. {{ opinion.scan.volume }}{% else %}Scan #{{ opinion.scan.pk }}{% endif %}
-            </a>
-          </td>
-        </tr>
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Pages of the volume</th>
-          <td class="py-2">{{ opinion.start_page_index|add:1 }} &ndash; {{ opinion.end_page_index|add:1 }}{% if opinion.apply_run %} of {{ opinion.apply_run.label }}{% else %} of the original{% endif %}</td>
-        </tr>
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Boundary</th>
-          <td class="py-2">{% if opinion.boundary %}#{{ opinion.boundary.pk }}{% else %}<span class="text-gray-400">none</span>{% endif %}</td>
-        </tr>
-        {% if opinion.approved_at %}
-        <tr>
-          <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Approved</th>
-          <td class="py-2">{{ opinion.approved_at|date:"M j, Y g:i A" }}{% if opinion.approved_by %} by {{ opinion.approved_by.username }}{% endif %}</td>
-        </tr>
-        {% endif %}
-      </tbody>
-    </table>
-    {% if opinion.notes %}
-    <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mt-4 mb-1">Notes</h3>
-    <p class="text-sm whitespace-pre-line">{{ opinion.notes }}</p>
+{# The facts of the row. A disclosure: the reviewer came for the text. #}
+<details class="card mb-6">
+  <summary class="text-sm font-bold cursor-pointer">
+    The facts of this opinion
+    <span class="text-xs font-normal text-gray-500 dark:text-gray-400">
+      &mdash; printed {{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %}&ndash;{{ opinion.last_printed_page }}{% endif %},
+      {{ opinion.page_count }} page{{ opinion.page_count|pluralize }}, revision r{{ opinion.glue_revision }}
+    </span>
+    {% if user.is_staff %}
+    <a href="{{ files_url }}"
+       class="text-xs font-normal text-gray-500 dark:text-gray-400 underline hover:text-blue-600 dark:hover:text-blue-400 ml-2"
+       title="The glued objects of this opinion: the redacted PDF, the OCR documents and the ensemble">files</a>
     {% endif %}
-  </div>
-
-  {# The findings #}
-  <div class="card lg:col-span-2">
-    <h2 class="text-sm font-bold mb-3 flex items-center gap-2">
-      Findings
-      <span class="text-xs font-normal text-gray-600 dark:text-gray-300">({{ open_findings }} open)</span>
-    </h2>
-    {% if not findings %}
-    <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-3 py-2 text-xs text-green-700 dark:text-green-300 font-medium">
-      No findings.
-    </div>
-    {% endif %}
-    {% for finding in findings %}
-    {% comment %}
-      A stale card is a fact about a row, not a judgement, so it carries
-      no dismiss control anywhere in the portal. Here no card carries
-      one: this stage has no write endpoint at all.
-    {% endcomment %}
-    <div class="rounded border px-3 py-2 mb-2 text-sm
-         {% if finding.dismissal %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif finding.is_stale %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% else %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% endif %}"
-         data-check="{{ finding.check_name }}">
-      <div class="flex items-center gap-2 flex-wrap">
-        <span class="font-semibold">{{ finding.get_check_name_display }}</span>
-        <span class="text-xs text-gray-500 dark:text-gray-400">{{ finding.page_label }}</span>
-        {% if finding.is_stale %}<span class="text-[10px] font-bold uppercase text-red-700 dark:text-red-300">not applied</span>{% endif %}
-        {% if finding.dismissal %}<span class="text-[10px] font-bold uppercase text-gray-500">dismissed</span>{% endif %}
-      </div>
-      {% if finding.message %}<p class="mt-1 text-xs text-gray-700 dark:text-gray-300">{{ finding.message }}</p>{% endif %}
-    </div>
-    {% endfor %}
-
-    {% comment %}
-      The redacted PDF (#336) in a frame. The source is our own route,
-      which answers a 302 to a presigned GET: a navigation, so the
-      bucket needs no CORS rule, and the browser's own PDF viewer shows
-      the file. "disposition=inline" asks for that; the Download button
-      is the same route without it, and it saves the file under the
-      printed range (#165).
-    {% endcomment %}
-    <h2 class="text-sm font-bold mt-6 mb-3 flex items-center gap-2">
-      The redacted PDF
-      {% if user.is_staff %}
-      <a href="{{ files_url }}"
-         class="text-xs font-normal text-gray-500 dark:text-gray-400 underline hover:text-blue-600 dark:hover:text-blue-400"
-         title="The glued objects of this opinion: the redacted PDF and the OCR documents">files</a>
+  </summary>
+  <table class="min-w-full text-sm mt-3">
+    <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Printed pages</th>
+        <td class="py-2">{{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %} &ndash; {{ opinion.last_printed_page }}{% endif %}</td>
+      </tr>
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Physical pages</th>
+        <td class="py-2">{{ opinion.page_count }}</td>
+      </tr>
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Volume</th>
+        <td class="py-2">
+          <a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline">
+            {% if opinion.scan.reporter %}{{ opinion.scan.reporter.short_name|upper }} vol. {{ opinion.scan.volume }}{% else %}Scan #{{ opinion.scan.pk }}{% endif %}
+          </a>
+        </td>
+      </tr>
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Pages of the volume</th>
+        <td class="py-2">{{ opinion.start_page_index|add:1 }} &ndash; {{ opinion.end_page_index|add:1 }}{% if opinion.apply_run %} of {{ opinion.apply_run.label }}{% else %} of the original{% endif %}</td>
+      </tr>
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Boundary</th>
+        <td class="py-2">{% if opinion.boundary %}#{{ opinion.boundary.pk }}{% else %}<span class="text-gray-400">none</span>{% endif %}</td>
+      </tr>
+      {% if opinion.approved_at %}
+      <tr>
+        <th class="py-2 pr-4 text-left font-medium text-gray-500 dark:text-gray-400">Approved</th>
+        <td class="py-2">{{ opinion.approved_at|date:"M j, Y g:i A" }}{% if opinion.approved_by %} by {{ opinion.approved_by.username }}{% endif %}</td>
+      </tr>
       {% endif %}
-    </h2>
-    {% if redacted_pdf_url %}
-    <div class="flex items-center gap-3 mb-2">
-      <a href="{{ redacted_pdf_url }}" class="btn-outline text-xs px-2 py-1">
-        <i class="fa-solid fa-download"></i> Download
-      </a>
-      <span class="text-xs text-gray-500 dark:text-gray-400">
-        {{ opinion.page_count }} page{{ opinion.page_count|pluralize }}, revision r{{ opinion.glue_revision }}.
-      </span>
+    </tbody>
+  </table>
+  {% if opinion.notes %}
+  <h3 class="text-xs font-semibold uppercase tracking-wide text-gray-500 dark:text-gray-400 mt-4 mb-1">Notes</h3>
+  <p class="text-sm whitespace-pre-line">{{ opinion.notes }}</p>
+  {% endif %}
+</details>
+
+{% include "scanning/_opinion_findings.html" %}
+
+
+{% endblock %}
+
+{% comment %}
+  The two columns, over the whole width of the window (#365). The
+  reviewer reads a page of a book beside its text, and the container of
+  the site took a third of the room. Every address is an attribute
+  here, and the script reads them: a path a script spells by hand goes
+  stale in silence, because no test reverses it (#334).
+{% endcomment %}
+{% block full_width_content %}
+<div id="opinion-review"
+     class="opinion-review grid grid-cols-1 lg:grid-cols-2 gap-2 px-2 pb-4"
+     data-pdf-url-endpoint="{{ pdf_url_endpoint }}"
+     data-ensemble-url-endpoint="{{ ensemble_url_endpoint }}"
+     data-rerun-url="{{ rerun_url }}"
+     data-page-count="{{ opinion.page_count }}">
+
+  <div class="card p-2">
+    <div class="flex items-center gap-2 mb-1">
+      <h2 class="text-xs font-bold">The redacted PDF</h2>
+      {% if redacted_pdf_url %}
+      {% comment %}
+        The zoom of the pages column. The page fits the width of the
+        column to start with, and these change it; the label is the
+        scale of the render.
+      {% endcomment %}
+      <div class="ml-auto flex items-center gap-1">
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="out" title="Smaller pages">&minus;</button>
+        <span id="zoom-level"
+              class="text-xs text-gray-500 dark:text-gray-400 w-12 text-center"></span>
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="in" title="Bigger pages">+</button>
+        <button type="button" class="btn-ghost text-xs px-2 py-0.5"
+                data-zoom="fit" title="Fit the page to the column">Fit</button>
+      </div>
+      {% endif %}
     </div>
-    <iframe src="{{ redacted_pdf_url }}?disposition=inline"
-            title="The redacted PDF of the opinion"
-            class="w-full rounded border border-gray-200 dark:border-gray-700 bg-gray-100 dark:bg-gray-800"
-            style="height: 800px;"></iframe>
+    {% if redacted_pdf_url %}
+    <div id="opinion-pages" class="opinion-pages"></div>
     {% else %}
     <div class="border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
       <p class="text-sm text-gray-500 dark:text-gray-400">The redacted PDF is not written yet.</p>
       <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The daemon writes one PDF of each opinion, one per tick. This opinion is at revision r{{ opinion.glue_revision }}.</p>
     </div>
     {% endif %}
+  </div>
 
-    <div class="mt-6 border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
-      <p class="text-sm text-gray-500 dark:text-gray-400">The text review is not built yet.</p>
-      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The text of the OCR ensemble goes here.</p>
+  <div class="card p-2">
+    <h2 class="text-xs font-bold mb-1">
+      The text
+      <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
+    </h2>
+    {% if ensemble_written %}
+    <div id="opinion-text" class="opinion-text"></div>
+    {% elif ocr_written %}
+    <div class="border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
+      <p class="text-sm text-gray-500 dark:text-gray-400">The text of this opinion is not written yet.</p>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The daemon reads the OCR documents of a volume that three engines read. Press "Read the OCR documents again" to read this one now.</p>
     </div>
+    {% else %}
+    <div class="border border-dashed border-gray-300 dark:border-gray-700 rounded px-4 py-10 text-center">
+      <p class="text-sm text-gray-500 dark:text-gray-400">The OCR documents of this opinion are not written yet.</p>
+      <p class="text-xs text-gray-400 dark:text-gray-500 mt-1">The daemon writes them after the redaction review, one opinion per tick. This opinion is at revision r{{ opinion.glue_revision }}.</p>
+    </div>
+    {% endif %}
   </div>
 
 </div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
+<script src="{% static 'scanning/viewer_step3.js' %}"></script>
 {% endblock %}

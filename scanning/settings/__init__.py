@@ -9,6 +9,7 @@ from .project.processing_storage import *
 from .project.runpod import *
 from .project.security import *
 from .project.sharding import *
+from .project.surya import *
 from .project.testing import *
 from .project.yolo import *
 from .third_party.aws import *

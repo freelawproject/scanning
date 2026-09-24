@@ -326,6 +326,25 @@ a.doc-name:hover { text-decoration: underline; }
     cursor: progress;
 }
 .zoom-toolbar .zoom-btn:disabled:hover { background: #3f4347; }
+/* The engine of the text overlay (#381). It sits beside the "Text"
+   button and carries its colours, because the pair is one control. An
+   engine that read nothing stays in the list, greyed. */
+.zoom-toolbar .zoom-select {
+    background: #3f4347;
+    color: #f3f4f6;
+    border: 1px solid #585c61;
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 12px;
+    line-height: 1.2;
+    cursor: pointer;
+}
+.zoom-toolbar .zoom-select:hover { background: #4b5056; }
+.zoom-toolbar .zoom-select:disabled {
+    opacity: 0.6;
+    cursor: progress;
+}
+.zoom-toolbar .zoom-select option:disabled { color: #9ca3af; }
 .zoom-toolbar .zoom-pct {
     color: #f3f4f6;
     font-size: 12px;
@@ -361,6 +380,19 @@ a.doc-name:hover { text-decoration: underline; }
 }
 .dupe-badge {
     background: #f59e0b;
+    color: white;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+}
+/* A page marked for deletion, in the detection preview (#388). The
+   page review has not been built into the volume yet, so the page is
+   still there and still shows its boxes; the badge says what the
+   volume will lose, and the preview offers no undo, which is step 1's
+   own control. */
+.deleted-badge {
+    background: #dc2626;
     color: white;
     padding: 1px 6px;
     border-radius: 3px;
@@ -1165,4 +1197,214 @@ a.doc-name:hover { text-decoration: underline; }
     margin: 4px 0 0;
     padding-left: 4px;
     color: #cbd5e1;
+}
+
+/* ------------------------------------------------------------------ */
+/* The text review of one opinion (#365)                               */
+/* ------------------------------------------------------------------ */
+
+/* Each column is its own scroll box, so a jump inside one column
+   leaves the other one where the reviewer put it. The pages column
+   scrolls sideways as well, because a zoomed page is wider than it. */
+.opinion-pages,
+.opinion-text {
+    max-height: 86vh;
+    overflow-y: auto;
+    position: relative;
+}
+.opinion-pages { overflow-x: auto; }
+
+.opinion-page {
+    margin: 0 auto 16px;
+}
+
+/* A box takes no pointer: one hit test on the wrapper opens the box
+   under it, the rule of the OCR text overlay (#262). */
+.ensemble-box {
+    position: absolute;
+    border: 1px solid rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.05);
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ensemble-box[data-agreement="majority"],
+.ensemble-box[data-agreement="voted"] {
+    border-color: rgba(217, 119, 6, 0.75);
+    background: rgba(217, 119, 6, 0.08);
+}
+.ensemble-box[data-agreement="single"] {
+    border-color: rgba(107, 114, 128, 0.7);
+    background: rgba(107, 114, 128, 0.06);
+}
+.ensemble-box.weak {
+    border-style: dashed;
+}
+.ensemble-box.ensemble-selected {
+    border-color: #dc2626;
+    border-width: 2px;
+    background: rgba(220, 38, 38, 0.12);
+}
+
+.opinion-text-page {
+    border-bottom: 1px solid rgba(107, 114, 128, 0.3);
+    padding-bottom: 12px;
+    margin-bottom: 12px;
+}
+.opinion-text-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6b7280;
+    margin-bottom: 6px;
+}
+.opinion-text-error {
+    font-size: 13px;
+    font-style: italic;
+    color: #b45309;
+}
+
+.ensemble-group {
+    font-size: 13px;
+    line-height: 1.5;
+    margin: 0 0 10px;
+    padding: 2px 4px;
+    border-left: 2px solid transparent;
+    white-space: pre-wrap;
+    cursor: default;
+}
+.ensemble-group[data-agreement="majority"],
+.ensemble-group[data-agreement="voted"] {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-group[data-agreement="single"] {
+    border-left-color: rgba(107, 114, 128, 0.7);
+}
+.ensemble-group.ensemble-selected {
+    background: rgba(220, 38, 38, 0.10);
+    border-left-color: #dc2626;
+}
+.ensemble-low {
+    background: rgba(217, 119, 6, 0.25);
+    border-bottom: 1px dotted #b45309;
+}
+.ensemble-note {
+    font-size: 11px;
+    color: #6b7280;
+}
+
+.finding-card-live {
+    cursor: pointer;
+}
+
+/* The readings of the engines, under the group that differs (#365). */
+/* Not on a selected group: the two rules have the same weight, and
+   this one comes later, so the red of the selection would go. */
+.ensemble-group.differs:not(.ensemble-selected) {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-compare {
+    font-size: 10px;
+    padding: 0 5px;
+    border: 1px solid rgba(217, 119, 6, 0.6);
+    border-radius: 9999px;
+    color: #b45309;
+    background: rgba(217, 119, 6, 0.10);
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ensemble-compare:hover,
+.ensemble-compare.open {
+    background: rgba(217, 119, 6, 0.25);
+}
+.ensemble-variants {
+    margin: -4px 0 10px 6px;
+    padding: 6px 8px;
+    border-left: 2px solid rgba(217, 119, 6, 0.75);
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-variant {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
+.ensemble-engine {
+    flex: 0 0 90px;
+    color: #6b7280;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+}
+.ensemble-engine.winner {
+    color: #059669;
+    font-weight: 700;
+}
+.ensemble-engine.winner::after {
+    content: " \2713";
+}
+.ensemble-reading {
+    flex: 1;
+    white-space: pre-wrap;
+}
+.ensemble-reading.absent {
+    color: #9ca3af;
+    font-style: italic;
+}
+/* The words of one reading that the shown reading does not hold
+   (#380). A solid rule and a stronger ground than ``.ensemble-low``,
+   which marks a word the vote left open: the two say different
+   things. */
+.ensemble-diff {
+    background: rgba(217, 119, 6, 0.30);
+    border-bottom: 2px solid #b45309;
+    border-radius: 2px;
+}
+/* The line that says why the text shows one engine's reading (#380). */
+.ensemble-why {
+    margin: 0 0 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: #6b7280;
+}
+/* The button that opens the rules of the vote (#380). */
+.ensemble-ask {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    line-height: 12px;
+    padding: 0;
+    border: 1px solid #9ca3af;
+    border-radius: 9999px;
+    font-size: 10px;
+    color: #6b7280;
+    background: transparent;
+    cursor: pointer;
+}
+.ensemble-ask:hover,
+.ensemble-ask.open {
+    color: #1f2937;
+    border-color: #6b7280;
+    background: rgba(107, 114, 128, 0.15);
+}
+.ensemble-help {
+    margin: 0 0 8px;
+    padding: 6px 8px;
+    border-left: 2px solid rgba(107, 114, 128, 0.5);
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #4b5563;
+}
+.ensemble-help p {
+    margin: 0 0 2px;
+}
+.ensemble-help-name {
+    font-weight: 700;
+}
+/* A word of a voted group that a majority chose, beside
+   ``.ensemble-low``, which marks a word no majority settled (#380). */
+.ensemble-voted {
+    background: rgba(217, 119, 6, 0.12);
 }

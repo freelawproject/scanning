@@ -1,8 +1,12 @@
 import logging
 
+from blackletter.models import Label
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
+from django.core.paginator import Paginator
+from django.db import connection
 from django.urls import NoReverseMatch, reverse
+from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
@@ -155,6 +159,72 @@ class InterruptedFilter(admin.SimpleListFilter):
         if self.value() == "1":
             return queryset.filter(status=Status.ERROR_INTERRUPTED)
         return queryset
+
+
+class LabelFilter(admin.SimpleListFilter):
+    """Filter the rows by label without a query (issue #359).
+
+    Django's default filter on a free text column lists its choices
+    with ``SELECT DISTINCT label`` over the whole table, on every load
+    of the changelist. The set of labels is blackletter's ``Label``
+    enum, which is known without asking the table.
+    """
+
+    title = "label"
+    parameter_name = "label"
+
+    def lookups(self, request, model_admin):
+        """Return the filter choices.
+
+        :param request: The admin HTTP request.
+        :param model_admin: The ModelAdmin instance.
+        :returns: One ``(name, name)`` pair per ``Label``.
+        :rtype: list[tuple]
+        """
+        return [(label.name, label.name) for label in Label]
+
+    def queryset(self, request, queryset):
+        """Apply the filter to the queryset.
+
+        :param request: The admin HTTP request.
+        :param queryset: The base queryset.
+        :returns: The rows of the chosen label, or every row.
+        """
+        if self.value():
+            return queryset.filter(label=self.value())
+        return queryset
+
+
+class EstimatingPaginator(Paginator):
+    """Count an unfiltered changelist from the planner's statistics.
+
+    ``COUNT(*)`` reads every row of the table, and the detection table
+    holds millions (issue #359). When nothing narrows the list, the
+    count is only the page-number strip, so ``pg_class.reltuples``, the
+    figure autovacuum keeps for the planner, is close enough. A
+    filtered list, or a table nothing has analyzed yet (``-1``), gets
+    the real count.
+    """
+
+    @cached_property
+    def count(self):
+        """Return the number of rows, estimated when nothing filters.
+
+        :returns: The row count.
+        :rtype: int
+        """
+        if self.object_list.query.where:
+            return super().count
+        table = self.object_list.model._meta.db_table
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
+                [table],
+            )
+            row = cursor.fetchone()
+        if row is None or row[0] < 0:
+            return super().count
+        return row[0]
 
 
 @admin.register(Reporter)
@@ -745,6 +815,21 @@ class ReviewDismissalAdmin(admin.ModelAdmin):
 
 @admin.register(Detection)
 class DetectionAdmin(admin.ModelAdmin):
+    """One detection row, of a table that holds millions (issue #359).
+
+    Every default of the changelist that reads the whole table is
+    turned off: the second ``COUNT(*)`` of ``show_full_result_count``,
+    the ``SELECT DISTINCT label`` of the default label filter, the
+    substring search over ``label``, and the model's ``Meta.ordering``
+    (``page_index, y0, x0``), which no index serves. The list walks
+    the primary key instead, and an unfiltered page takes its count
+    from the planner's statistics (``EstimatingPaginator``).
+    """
+
+    ordering = ["-pk"]
+    show_full_result_count = False
+    paginator = EstimatingPaginator
+    list_select_related = ["scan__reporter"]
     list_display = [
         "scan",
         "page_index",
@@ -756,8 +841,7 @@ class DetectionAdmin(admin.ModelAdmin):
         "decision",
         "withdrawn_at",
     ]
-    list_filter = ["label", "active", "model_name"]
-    search_fields = ["label"]
+    list_filter = [LabelFilter, "active", "model_name"]
     raw_id_fields = [
         "scan",
         "source_edit",
@@ -815,7 +899,7 @@ class DetectionDecisionAdmin(admin.ModelAdmin):
         "withdrawn_at",
         "date_created",
     ]
-    list_filter = ["kind", "withdrawn_at", "label"]
+    list_filter = ["kind", "withdrawn_at", LabelFilter]
     raw_id_fields = ["scan", "source_edit", "author", "withdrawn_by"]
     readonly_fields = [f.name for f in DetectionDecision._meta.fields]
 
@@ -950,6 +1034,8 @@ class ApplyRunAdmin(admin.ModelAdmin):
         "detections_key",
         "extract_key",
         "extract_run",
+        "surya_key",
+        "surya_run",
         "built_at",
         "superseded_at",
         "attempts",

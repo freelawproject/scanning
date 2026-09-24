@@ -21,18 +21,34 @@ and sets the computed row's ``decision``, which hides it.
 
 Nothing in this module reads a file or renders a page: the compute
 hands it what blackletter returned and the document it measured with.
+
+**A text redaction is written inside the margin strips of its page**
+(issue #371). blackletter bounds a headnote rect below by the page's
+footer detections, and a page with none has the page height for a
+footer; its one other bottom bound is the ink, and a blot down the page
+edge carries the ink to the edge (#323, #370). The strips of the same
+page come from the read text and say where it ends, so the writer holds
+every text rect inside the box they leave (:func:`strip_content_box`),
+smaller only, on all four sides. Every page has its four strips (#370),
+and a strip the measure gave no page is a thin handle at the page edge,
+pushed off every ``TEXT_COLUMN``: a headnote rect snapped to its column
+loses nothing to it, and one grown onto edge ink loses the blot. A rect
+the clip would empty is written as it is: a dropped box hides what it
+described from the curator.
 """
 
 from __future__ import annotations
 
 import logging
+from statistics import median
 
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import detections
+from scanning import detections, margin_fit
 from scanning.detections import IOU_THRESHOLD, iou
 from scanning.models import ApplyRun, Redaction, Scan
+from scanning.text_fit import TEXT_RECT_TYPES
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +79,51 @@ def _round(value: float) -> float:
 # ---------------------------------------------------------------------------
 
 
+def strip_content_box(entry: dict) -> tuple[float, float, float, float]:
+    """Return the box the margin strips of one page leave, in points.
+
+    The strips are named by the page edge each lies on
+    (``margin_fit._sides``, the one rule), and the box is what the four
+    leave between them. Every page has its four strips
+    (``margin_fit.ensure_strips``, #370); a side the entry still lacks
+    is the page edge.
+
+    :param entry: One ``compute_margin_rects`` entry, with its
+        ``page_width``, ``page_height`` and ``rects`` in points.
+    :returns: ``(x0, y0, x1, y1)``, in points.
+    """
+    sides = margin_fit._sides(entry)
+    x0, y0 = 0.0, 0.0
+    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
+    if sides["top"] is not None:
+        y0 = float(sides["top"]["y1"])
+    if sides["bottom"] is not None:
+        y1 = float(sides["bottom"]["y0"])
+    if sides["left"] is not None:
+        x0 = float(sides["left"]["x1"])
+    if sides["right"] is not None:
+        x1 = float(sides["right"]["x0"])
+    return x0, y0, x1, y1
+
+
+def clip_to_content(
+    box: tuple[float, float, float, float],
+    content: tuple[float, float, float, float],
+) -> tuple[float, float, float, float] | None:
+    """Hold a box inside a content box.
+
+    :param box: ``(x0, y0, x1, y1)``.
+    :param content: The box to hold it in, same shape.
+    :returns: The intersection, or None when it has no area, which the
+        caller reads as a refusal and keeps the box.
+    """
+    x0, y0 = max(box[0], content[0]), max(box[1], content[1])
+    x1, y1 = min(box[2], content[2]), min(box[3], content[3])
+    if x0 >= x1 or y0 >= y1:
+        return None
+    return x0, y0, x1, y1
+
+
 def write_computed(
     scan: Scan,
     run: ApplyRun | None,
@@ -81,6 +142,13 @@ def write_computed(
     strips come in points already (``{"page_index", "rects": [{x0, y0,
     x1, y1}]}``) and become white ``margin`` rows. Every row is
     addressed through ``run``'s map (the identity when ``run`` is None).
+
+    A text rect (``text_fit.TEXT_RECT_TYPES``) is written inside the box
+    its page's strips leave (#371): all four sides, smaller only, and a
+    rect the clip would empty is written as it is. The other types are
+    left alone: a white one sits in the margin by design, and the strips
+    are already pulled back off a key icon. An entry that names no page
+    size clips nothing on its page.
 
     One transaction: a reader between the delete and the writes would
     see no box at all.
@@ -114,6 +182,13 @@ def write_computed(
         "apply_run": run,
         "detect_run": detect_run,
     }
+    content_boxes = {
+        entry["page_index"]: strip_content_box(entry)
+        for entry in margins_pt
+        if entry.get("page_width") and entry.get("page_height")
+    }
+    text_rects = clipped = refused = 0
+    removed: list[float] = []
     for entry in rects_px:
         page_index = entry["page_index"]
         if page_index not in scales:
@@ -130,6 +205,21 @@ def write_computed(
             x1, y1 = _round(r["x1"] * sx), _round(r["y1"] * sy)
             if x0 >= x1 or y0 >= y1:
                 continue
+            content = content_boxes.get(page_index)
+            if content is not None and r.get("type") in TEXT_RECT_TYPES:
+                text_rects += 1
+                held = clip_to_content((x0, y0, x1, y1), content)
+                if held is None:
+                    refused += 1
+                elif held != (x0, y0, x1, y1):
+                    clipped += 1
+                    removed.append(
+                        (held[0] - x0)
+                        + (held[1] - y0)
+                        + (x1 - held[2])
+                        + (y1 - held[3])
+                    )
+                    x0, y0, x1, y1 = held
             rows.append(
                 Redaction(
                     rect_type=r.get("type") or "",
@@ -165,6 +255,16 @@ def write_computed(
                     **common,
                 )
             )
+    if clipped or refused:
+        logger.info(
+            "Text redactions: %d of %d held inside the strips (median %.1f pt, "
+            "max %.1f pt removed), %d refused",
+            clipped,
+            text_rects,
+            median(removed) if removed else 0.0,
+            max(removed) if removed else 0.0,
+            refused,
+        )
     with transaction.atomic():
         Redaction.objects.computed().filter(scan=scan).delete()
         Redaction.objects.bulk_create(rows, batch_size=1000)

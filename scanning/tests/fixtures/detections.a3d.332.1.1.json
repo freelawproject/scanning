@@ -1,0 +1,353 @@
+{
+ "detections": [
+  {
+   "bbox": [
+    443.3,
+    952.7,
+    667.0,
+    1037.9
+   ],
+   "confidence": 0.951,
+   "found_by": [
+    {
+     "confidence": 0.951,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "KEY_ICON",
+   "label_id": 0,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    1033.2,
+    1237.1,
+    1256.2,
+    1326.5
+   ],
+   "confidence": 0.953,
+   "found_by": [
+    {
+     "confidence": 0.953,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "KEY_ICON",
+   "label_id": 0,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    445.6,
+    1865.4,
+    664.9,
+    1944.2
+   ],
+   "confidence": 0.941,
+   "found_by": [
+    {
+     "confidence": 0.941,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "KEY_ICON",
+   "label_id": 0,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    619.0,
+    110.7,
+    1156.4,
+    168.4
+   ],
+   "confidence": 0.912,
+   "found_by": [
+    {
+     "confidence": 0.912,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "PAGE_HEADER",
+   "label_id": 2,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    303.4,
+    207.6,
+    824.9,
+    637.6
+   ],
+   "confidence": 0.917,
+   "found_by": [
+    {
+     "confidence": 0.917,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_CAPTION",
+   "label_id": 3,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    899.5,
+    256.3,
+    1420.3,
+    1064.1
+   ],
+   "confidence": 0.94,
+   "found_by": [
+    {
+     "confidence": 0.94,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_CAPTION",
+   "label_id": 3,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    268.6,
+    1097.5,
+    848.3,
+    1712.6
+   ],
+   "confidence": 0.871,
+   "found_by": [
+    {
+     "confidence": 0.871,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_CAPTION",
+   "label_id": 3,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    562.7,
+    183.4,
+    577.4,
+    204.4
+   ],
+   "confidence": 0.662,
+   "found_by": [
+    {
+     "confidence": 0.662,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_SEQUENCE",
+   "label_id": 7,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    1150.4,
+    197.6,
+    1170.3,
+    219.6
+   ],
+   "confidence": 0.58,
+   "found_by": [
+    {
+     "confidence": 0.58,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_SEQUENCE",
+   "label_id": 7,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    555.6,
+    1079.7,
+    572.7,
+    1100.1
+   ],
+   "confidence": 0.707,
+   "found_by": [
+    {
+     "confidence": 0.707,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "CASE_SEQUENCE",
+   "label_id": 7,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    1414.2,
+    105.3,
+    1435.6,
+    144.9
+   ],
+   "confidence": 0.498,
+   "found_by": [
+    {
+     "confidence": 0.372,
+     "model": "bl_warm"
+    },
+    {
+     "confidence": 0.498,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "PAGE_NUMBER",
+   "label_id": 8,
+   "model_count": 2,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    1327.1,
+    109.5,
+    1392.8,
+    139.9
+   ],
+   "confidence": 0.911,
+   "found_by": [
+    {
+     "confidence": 0.911,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "STATE_ABBREVIATION",
+   "label_id": 9,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    260.2,
+    193.0,
+    847.9,
+    1974.7
+   ],
+   "confidence": 0.937,
+   "found_by": [
+    {
+     "confidence": 0.937,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "TEXT_COLUMN",
+   "label_id": 16,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    847.9,
+    193.0,
+    1435.6,
+    1974.7
+   ],
+   "confidence": 0.937,
+   "found_by": [
+    {
+     "confidence": 0.937,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "TEXT_COLUMN",
+   "label_id": 16,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    503.0,
+    653.9,
+    628.6,
+    690.2
+   ],
+   "confidence": 0.736,
+   "found_by": [
+    {
+     "confidence": 0.736,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "HEADING",
+   "label_id": 21,
+   "model_count": 1,
+   "page_index": 0
+  },
+  {
+   "bbox": [
+    502.9,
+    1721.5,
+    624.0,
+    1759.9
+   ],
+   "confidence": 0.586,
+   "found_by": [
+    {
+     "confidence": 0.586,
+     "model": "bl_warm"
+    }
+   ],
+   "img_height": 2200,
+   "img_width": 1700,
+   "label": "HEADING",
+   "label_id": 21,
+   "model_count": 1,
+   "page_index": 0
+  }
+ ],
+ "meta": {
+  "blackletter": "0.4.2",
+  "how": "python -c \"import json;from blackletter.api import detect;print(json.dumps(detect('scanning/tests/fixtures/a3d.332.1.1.pdf', '/tmp/out', models=['bl_warm'])))\"",
+  "issue": 360,
+  "model": "bl_warm",
+  "recorded": "2026-09-17",
+  "source_pdf": "a3d.332.1.1.pdf",
+  "why": "The tests read this file instead of a detection run: the run cost the suite about 19 seconds and pulled in torch and ultralytics. Record it again after a checkpoint change."
+ }
+}

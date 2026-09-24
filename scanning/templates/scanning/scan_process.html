@@ -51,7 +51,14 @@ body.boundary-pick .opinion-nav.picking {
       <div class="w-6 h-0.5 {% if step > 1 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
       <a class="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium no-underline {% if step == 2 %}bg-blue-600 text-white{% elif step > 2 %}bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200{% else %}bg-gray-100 text-gray-500 dark:bg-gray-800 dark:text-gray-400{% endif %}" href="?step=2">
         <span class="inline-flex items-center justify-center w-5 h-5 rounded-full text-xs {% if step > 2 %}bg-green-600 text-white{% elif step == 2 %}bg-white text-blue-600{% else %}bg-gray-300 text-gray-600{% endif %}">2</span>
-        Review</a>
+        Review{% if preview_available %}
+        {% comment %}
+          The tab of a volume whose detections can be looked at but
+          whose review is not open (#388). The link is the same one; the
+          pill is what says the page behind it is read only.
+        {% endcomment %}
+        <span class="text-[10px] uppercase tracking-wide rounded px-1 py-0.5 bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-200" title="The detections can be previewed. The redaction review opens when the corrected volume is built.">preview</span>
+        {% endif %}</a>
       <div class="w-6 h-0.5 {% if step > 2 %}bg-green-500{% else %}bg-gray-300 dark:bg-gray-600{% endif %}"></div>
       {% comment %}
         Step 3 forks on the pipeline (#334). A volume with Opinion rows
@@ -211,6 +218,15 @@ body.boundary-pick .opinion-nav.picking {
           {% if issue.check_name == 'front_matter' and not page_edits_locked %}
           <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" onclick="event.stopPropagation(); deleteFrontMatter(this)" data-message="{{ issue.message }}">Mark all for deletion</button>
           {% endif %}
+          {% comment %}
+            Two adjacent pages scanned in the wrong order (#261). The view
+            sets ``swap`` on the card of a transposed pair alone: the
+            later page and the page it goes after. A backward step of
+            more than one is a misread and gets no button.
+          {% endcomment %}
+          {% if issue.swap and not page_edits_locked %}
+          <button class="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white" onclick="event.stopPropagation(); swapPages(this)" data-pdf-page="{{ issue.swap.pdf_page }}" data-anchor="{{ issue.swap.anchor_pdf_page }}" title="Move PDF page {{ issue.swap.pdf_page }} to before PDF page {{ issue.swap.anchor_pdf_page|add:1 }}">Swap PDF pages {{ issue.swap.anchor_pdf_page|add:1 }} and {{ issue.swap.pdf_page }}</button>
+          {% endif %}
           {% if issue.severity != 'error' %}
           <button class="text-[10px] px-2 py-0.5 rounded bg-green-600 text-white" onclick="event.stopPropagation(); dismissIssue(this, {{ issue.pk }})">Dismiss</button>
           {% endif %}
@@ -260,6 +276,7 @@ body.boundary-pick .opinion-nav.picking {
           {% endif %}
           {% if r.is_duplicate %}<span class="text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1">DUP</span>{% endif %}
           {% if r.is_replaced %}<span class="page-repl-badge text-[9px] font-bold text-purple-600 dark:text-purple-400 ml-1" title="A curator replaced this page">REPL</span>{% endif %}
+          {% if r.is_moved %}<span class="page-moved-badge text-[9px] font-bold text-blue-600 dark:text-blue-400 ml-1" title="A curator moved this page here">MOVED</span>{% endif %}
           {% if r.needs_repair %}<span class="page-need-badge text-[9px] font-bold text-orange-600 dark:text-orange-400 ml-1" title="A reviewer asked a scanner to scan this page again">NEED</span>{% endif %}
         </span>
         {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
@@ -311,9 +328,16 @@ body.boundary-pick .opinion-nav.picking {
         place by window.refreshFindings after every curator write, from
         the same template and context the page renders here.
       {% endcomment %}
+      {% comment %}
+        No findings in the preview (#388): they are the compute's own
+        output, and the section carries a Recompute button the endpoint
+        refuses.
+      {% endcomment %}
+      {% if not preview_only %}
       <div id="review-findings">
       {% include "scanning/_review_findings.html" %}
       </div>
+      {% endif %}
       {% if opinions %}
       <h2 class="text-sm font-bold mb-2">Opinions ({{ opinion_count }})</h2>
       {% comment %}
@@ -374,6 +398,35 @@ body.boundary-pick .opinion-nav.picking {
     <main class="flex-1 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded bg-white dark:bg-gray-900 viewer-panel">
       {% csrf_token %}
       {% comment %}
+        The disclaimer of the detection preview (#388). Rendered here
+        and not by a script, because it is the one thing on the page
+        that must be there before a box is: the boxes are the model's
+        own, over the volume as uploaded, and nothing on this page can
+        be changed. It says what the reviewer has to do to get the real
+        review, which is a different sentence for each of the two
+        review-1 states (`preview_approved`).
+      {% endcomment %}
+      {% if preview_only %}
+      <div id="detection-preview-banner"
+           class="flex items-start gap-2 text-xs px-3 py-2 border-b border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/30 text-amber-900 dark:text-amber-100">
+        <span class="font-bold uppercase tracking-wide shrink-0">Preview &mdash; read only</span>
+        <span>
+          These are the boxes the detection model found, drawn over the volume as uploaded.
+          They are not the measured redactions, and nothing here can be changed: no box can be
+          moved, drawn or dismissed, and the volume has no findings or opinion boundaries yet.
+          Pages marked for deletion are still shown, because the page review has not been
+          built into the volume.
+          {% if preview_approved %}
+          The corrected volume is built next; this page becomes the redaction review when the
+          redactions are measured against it.
+          {% else %}
+          To use this review, <a class="underline font-medium" href="?step=1">approve the page
+          completeness review</a> and wait for the corrected volume to be built.
+          {% endif %}
+        </span>
+      </div>
+      {% endif %}
+      {% comment %}
         Filled by renderPreviewBanner() for the bitonal preview (issue
         #185). Not sticky: the zoom toolbar already sticks at top 0
         (z-30), and a second sticky element at the same offset sits
@@ -388,15 +441,29 @@ body.boundary-pick .opinion-nav.picking {
         <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
         <button type="button" class="zoom-btn zoom-reset" data-zoom-action="reset" title="Reset zoom">Reset</button>
         {% comment %}
-          The text overlay (#262). It draws the text dots.mocr read on
-          each page of the viewport, so a reviewer can judge what a
-          blurry page or a page with bleedthrough cost the reading. The
-          button is here and not in the page label, which carries four
-          buttons already, and it holds for the whole document.
+          The text overlay (#262, #381). It draws the text one OCR
+          engine read on each page of the viewport, so a reviewer can
+          judge what a blurry page or a page with bleedthrough cost the
+          reading. The button is here and not in the page label, which
+          carries four buttons already, and it holds for the whole
+          document.
+
+          The select names the engine, and the view decides which ones
+          read this volume (``ocr_text_engines``). An engine that read
+          nothing is offered disabled rather than hidden: a viewer must
+          not hide the state of a read, and a chooser must not offer a
+          selection the endpoint refuses.
         {% endcomment %}
         {% if ocr_text_available %}
         <button type="button" class="zoom-btn ocr-text-btn" id="ocr-text-toggle"
                 title="Show the text the OCR read on each page">Text</button>
+        <select id="ocr-text-engine" class="zoom-select"
+                aria-label="Which OCR read the text overlay draws"
+                title="Which OCR read the text overlay draws">
+          {% for engine in ocr_text_engines %}
+          <option value="{{ engine.name }}"{% if engine.selected %} selected{% endif %}{% if not engine.available %} disabled{% endif %}>{{ engine.label }}{% if not engine.available %} (not read){% endif %}</option>
+          {% endfor %}
+        </select>
         {% endif %}
         {% comment %}
           The overlay cue and the guide (#299). The key "r" was the only
@@ -449,10 +516,17 @@ var SCAN_CONFIG = {
     docId: {{ scan.pk }},
     step: {{ step }},
     deletedPages: {{ deleted_pages_json|safe }},
+    // The pages a curator moved (#261), keyed by page, with the original
+    // page each one now follows (0 for before page 1).
+    movedPages: {{ moved_pages_json|safe }},
     pageEditsLocked: {{ page_edits_locked|yesno:'true,false' }},
     // Step 2 shows the corrected volume of the standing apply run
     // (#269): the original load and the crops then address its pages.
     finalSpace: {{ final_space|yesno:'true,false' }},
+    // The read-only step 2 of #388. It is not pageEditsLocked, which
+    // is false in an open page review: this says the whole page is a
+    // preview, so the viewer offers no control of any kind.
+    previewOnly: {{ preview_only|yesno:'true,false' }},
     replacedPages: {{ replaced_pages_json|safe }},
     // json_script, not |safe: the note is free text a person typed, and
     // a closing script tag inside it would end this block (#249). Do not

@@ -95,6 +95,18 @@ CORNER_BAND = 0.25
 HEADER_CATEGORY = "Page-header"
 FOOTER_CATEGORY = "Page-footer"
 
+#: The head and foot labels of the engines, folded to letters in lower
+#: case: dots.mocr writes ``Page-header`` and ``Page-footer``, Surya
+#: ``PageHeader`` and ``PageFooter``. Mistral labels no head, so its
+#: blocks are judged by the band alone (:func:`is_head_or_foot_label`,
+#: #396).
+HEAD_FOOT_LABELS = frozenset({"pageheader", "pagefooter"})
+_LETTERS_ONLY = re.compile(r"[^a-z]")
+
+#: The marks Surya sets before a list line. Not a markdown mark, so the
+#: fold of the vote (``ensemble.compare_text``) keeps it.
+_BULLETS = "•·"
+
 #: The three shapes a printed page number takes, as ``type`` in
 #: ``Scan.ocr_results`` and in the apply's printed-page map.
 SINGLE = "single"
@@ -335,6 +347,28 @@ def _corner_distance(bbox: list, width: int | float, side: str) -> float:
     return max(distance, 0) / width
 
 
+def band_of(bbox: list, height: int | float) -> str | None:
+    """Name the band a box sits in, if any.
+
+    The one rule for "this box is in the head or the foot of its page",
+    in whatever space the box and the height share: the dots.mocr
+    render for a cell of the volume document, PDF points for a unit of
+    an opinion's OCR document (``opinion_ocr.verdict``, #396).
+
+    :param bbox: The box, ``[x0, y0, x1, y1]``.
+    :param height: The page's height, the space the box lives in.
+    :returns: ``"header"``, ``"footer"``, or None for the body.
+    :rtype: str | None
+    """
+    if len(bbox) < 4 or not height:
+        return None
+    if bbox[3] < HEAD_BAND * height:
+        return "header"
+    if bbox[1] > FOOT_BAND * height:
+        return "footer"
+    return None
+
+
 def _band(cell: dict, origin_height: int | float) -> str | None:
     """Name the band a cell sits in, if any.
 
@@ -344,14 +378,73 @@ def _band(cell: dict, origin_height: int | float) -> str | None:
     :returns: ``"header"``, ``"footer"``, or None for the body.
     :rtype: str | None
     """
-    bbox = cell.get("bbox") or []
-    if len(bbox) < 4 or not origin_height:
-        return None
-    if bbox[3] < HEAD_BAND * origin_height:
-        return "header"
-    if bbox[1] > FOOT_BAND * origin_height:
-        return "footer"
-    return None
+    return band_of(cell.get("bbox") or [], origin_height)
+
+
+def is_head_or_foot_label(label: str | None) -> bool:
+    """Say whether an engine's label names the head or the foot (#396).
+
+    The label rule beside the band rule (:func:`band_of`), for the
+    glue's page-number verdict: review 1 takes a cell as a candidate by
+    its label **or** by its band, and the glue must not be stricter, or
+    a two-line head cell that ends below the band keeps the number
+    review 1 read through its label.
+
+    :param label: The unit's label, as the engine wrote it.
+    :returns: Whether it is one of :data:`HEAD_FOOT_LABELS`.
+    :rtype: bool
+    """
+    if not label:
+        return False
+    return _LETTERS_ONLY.sub("", str(label).lower()) in HEAD_FOOT_LABELS
+
+
+def carries_number(text: str, value: str | None) -> bool:
+    """Say whether one line of ``text`` ends in the page number ``value``.
+
+    The reader of the OCR glue's third verdict (#396): a unit in the
+    head or the foot band whose text carries the approved number of
+    its page is the printed page number, and the running head with it,
+    because every engine reads the two as one unit. The line is read
+    the way review 1 read it (:func:`_line_readings`), so the noise
+    rules hold here too: a superscript digit is dropped, the stray
+    ``L`` of the parallel-page icon is forgiven, and a number buried in
+    the middle of a line -- a year, a docket number, a citation -- is
+    no reading. So ``Cite as 218 A.3d 677 -- 679`` carries ``679`` and
+    not ``218``.
+
+    The engines write marks around the head: Mistral and dots.mocr set
+    heading and bold marks (``# 878 N. C.``, ``**679**``), Surya a
+    bullet. Every line is folded first, by the one rule the vote
+    folds with (``ensemble.compare_text``) plus the bullet, so
+    ``# 878 N. C.`` carries ``878`` as ``878 N. C.`` does. The
+    ensemble imports the glue, and the glue imports this module, so
+    the fold is imported at the call and not at the top.
+
+    A header the model misread and a curator corrected keeps its text:
+    the approved value is the curator's, and the engines did not write
+    it. That page keeps its running head in the ensemble text, and the
+    reviewer of the text sees it there.
+
+    :param text: The unit's text, as the engine wrote it.
+    :param value: The approved number of the page, as
+        ``apply.printed_pages`` stores it (``"679"``, ``"913-925"``,
+        ``"2094a"``), or None for a page with no number.
+    :returns: Whether a line of the text offers that value at one of
+        its ends.
+    :rtype: bool
+    """
+    from scanning.ensemble import compare_text
+
+    if not value or not text:
+        return False
+    wanted = str(value)
+    for line in _clean(text).splitlines():
+        folded = compare_text(line).lstrip(_BULLETS).strip()
+        for detected, _type, _side in _line_readings(folded):
+            if detected == wanted:
+                return True
+    return False
 
 
 def _score(

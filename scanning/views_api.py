@@ -34,6 +34,7 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     Issue,
+    Opinion,
     OpinionBoundary,
     OpinionScan,
     Redaction,
@@ -63,6 +64,63 @@ def _rebuild_findings(scan: Scan) -> None:
     from scanning import findings
 
     findings.rebuild(scan)
+
+
+#: The 409 of every write of review 2 before that review is open
+#: (#388). One sentence, because the viewer shows it as it comes, and
+#: one for every volume it refuses: a preview and a volume with no
+#: detection run are the same state to a curator, which is "the review
+#: is not open yet".
+REVIEW_NOT_OPEN_MESSAGE = (
+    "The redaction review of this volume is not open yet, so nothing "
+    "here can be changed. Approve the page completeness review and wait "
+    "for the corrected volume to be built."
+)
+
+
+def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
+    """Refuse a write of review 2 while the volume is still in review 1.
+
+    The first thing every write of the redaction review does, the twin
+    of ``views_process._refuse_locked_edits``, and the gate the preview
+    of #388 needed: a curator reading a preview must change nothing.
+
+    **The rule is the status, not the preview.** A row written in
+    review 1 is built into nothing and survives nothing: it addresses
+    the volume as uploaded, which the apply has not rebuilt yet, and
+    the first compute under the new run imports the model rows again
+    (``services._import_detections``) and measures the human ones
+    against a page space nobody approved. That is true of a volume with
+    a merged detection run, of one whose run is still in flight, and of
+    one that has no run at all -- so the gate reads
+    ``review_states.PREVIEW_STATUSES`` and not
+    ``review_states.preview_only``, which would leave the other two
+    open. ``add_redaction`` accepted such a box until this.
+
+    Out of it, deliberately: the legacy ``PENDING_REVIEW`` step 2,
+    whose rows the old pipeline wrote, and the two #263 statuses, which
+    are review 2 itself. Their own rules (the compare-and-swap of
+    ``approve_redaction_review``, ``REDACTION_COMPUTE_STATUSES``) stand
+    where they already did. So is every read: ``export_pdf`` builds the
+    corrected volume from the page edits and hands it over, which is
+    review 1's own work and not a write of review 2.
+
+    The gate is here and not in the template alone, for the reason the
+    review-1 gates are (#151): a template hides a button, and only a
+    view refuses a direct POST.
+
+    :param scan: The scan the write is about.
+    :returns: A 409 answer naming the reason, or None when the write
+        may proceed.
+    :rtype: JsonResponse | None
+    """
+    from scanning import review_states
+
+    if scan.status not in review_states.PREVIEW_STATUSES:
+        return None
+    return JsonResponse(
+        {"status": "error", "message": REVIEW_NOT_OPEN_MESSAGE}, status=409
+    )
 
 
 # The success lines of the review-2 writes (#322). Every write answers
@@ -130,6 +188,56 @@ WITHDRAWN_DECISION_MESSAGE = "The decision was withdrawn."
 STANDING_DECISION_MESSAGE = "The decision was withdrawn already."
 REBUILT_FINDINGS_MESSAGE = "The findings were written again from the rows."
 
+#: The answers of the "Re run OCR ensemble" button of review 3 (#365).
+#: The text lives here, the rule of the review-2 writes above.
+ENSEMBLE_RERUN_MESSAGE = (
+    "The text was written again from {engines}: {groups} block(s) read, "
+    "{dropped} left out, {low} word(s) with no majority."
+)
+ENSEMBLE_NOT_GLUED_MESSAGE = (
+    "The OCR documents of this opinion are not written at the live "
+    "revision, so there is nothing to read yet. The daemon writes them "
+    "after the redaction review."
+)
+#: An approved opinion is never written over: a person read its text
+#: and said it is right (#365).
+ENSEMBLE_APPROVED_MESSAGE = (
+    "The text review of this opinion is done, so its text is not "
+    "written again. Reopen it first."
+)
+#: A fault that passes. The detail goes to the log and not to the
+#: answer: it carries the words of a library, and a message of ours is
+#: what a curator can act on.
+ENSEMBLE_BUCKET_MESSAGE = (
+    "The file store did not answer, so nothing was written. Press the "
+    "button again."
+)
+#: The OCR glue wrote again while the text was written, so the write
+#: kept nothing (#365).
+ENSEMBLE_MOVED_MESSAGE = (
+    "The OCR documents of this opinion were written again while this "
+    "ran, so nothing was kept. Press the button again."
+)
+#: The line of each ``ensemble.EnsembleError`` code. The answer is
+#: built from this table and never from the error: the error names the
+#: object it read, and a key of the bucket belongs in the log and on
+#: the row, not in a browser.
+ENSEMBLE_ERROR_MESSAGES = {
+    "unreadable": (
+        "One of the OCR documents of this opinion is missing, or it is "
+        "not a document this portal can read. They must be written "
+        "again before the text can be."
+    ),
+    "no_engine": (
+        "The OCR glue of this opinion wrote no engine document, so "
+        "there is nothing to read."
+    ),
+    "short_document": (
+        "An OCR document of this opinion has fewer pages than the "
+        "opinion. They must be written again before the text can be."
+    ),
+}
+
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
 PAIRING_LABELS = ("CASE_CAPTION", "KEY_ICON")
@@ -153,11 +261,30 @@ def _parse_json_body(request: HttpRequest) -> dict | JsonResponse:
 def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     """Return active detections for a scan as JSON.
 
+    A volume shown as a preview (#388) answers the merged detection
+    document instead of the rows (``yolo.preview_entries``), in the
+    same shape: it has no rows, and the ones a reopened volume left
+    behind are measured in a page space the preview does not show. A
+    document that cannot be read answers an empty list, because the
+    page around it still renders.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: JSON response with a list of detection dicts.
     """
+    from scanning import review_states, yolo
+
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        try:
+            return JsonResponse(yolo.preview_entries(scan), safe=False)
+        except Exception:
+            logger.exception(
+                "serve_detections: the merged detections of scan %s did "
+                "not load",
+                scan.pk,
+            )
+            return JsonResponse([], safe=False)
     dets = (
         Detection.objects.live()
         .filter(scan=scan)
@@ -202,9 +329,13 @@ def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with a list of opinion dicts.
     """
-    from scanning import boundaries
+    from scanning import boundaries, review_states
 
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        # The pairing is the compute's own output (#388): a row here
+        # belongs to a run the preview does not show.
+        return JsonResponse([], safe=False)
     return JsonResponse(boundaries.viewer_payload(scan), safe=False)
 
 
@@ -255,6 +386,8 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -301,6 +434,8 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -382,6 +517,8 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import boundaries, detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -458,16 +595,21 @@ def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     The redaction rects and the margin strips in one list (#240, PR B),
     read off the ``Redaction`` rows the compute wrote and the curator
     edited. Nothing is computed here: a volume the compute has not
-    reached answers an empty list.
+    reached answers an empty list, and so does one shown as a preview
+    (#388).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: ``[{page_index, rects: [{id, x0, y0, x1, y1, fill,
         rect_type, origin}]}]``.
     """
-    from scanning import redactions
+    from scanning import redactions, review_states
 
     scan = get_object_or_404(Scan, pk=pk)
+    if review_states.preview_only(scan):
+        # A preview shows the model's boxes and no measured geometry
+        # (#388), including the rows a reopened volume left behind.
+        return JsonResponse([], safe=False)
     return JsonResponse(redactions.visible_by_page(scan), safe=False)
 
 
@@ -540,6 +682,8 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -584,6 +728,8 @@ def move_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -631,6 +777,8 @@ def dismiss_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     row = _redaction_of(scan, redaction_id)
     if row is None or row.bbox is None:
         return _redaction_error("Redaction not found", 404)
@@ -664,6 +812,8 @@ def restore_redaction(
     from scanning import redactions
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     row = _redaction_of(scan, redaction_id)
     if row is None:
         return _redaction_error("Redaction not found", 404)
@@ -763,13 +913,123 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
 
 @login_required
 @require_POST
+def rerun_opinion_ensemble(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Read this opinion's OCR documents again and write its text (#365).
+
+    The "Re run OCR ensemble" button of review 3. The work is a few
+    small S3 reads and a geometry over the pages of one opinion, so it
+    runs here and not on the daemon: the rule of
+    :func:`rebuild_findings`, whose twin ``compute_redactions_api``
+    renders every page and therefore queues.
+
+    It **waives the engine gate**. The daemon pass waits for
+    ``OPINION_ENSEMBLE_MIN_ENGINES`` engine documents, which a volume
+    read by two engines never holds. The button of the review page
+    posts here, and the ``rerun_opinion_ensemble`` command runs the
+    same work over a whole volume.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: JSON with the message, 404 for an opinion of another scan,
+        or 409 when the OCR documents are not written or the row
+        refuses to read.
+    """
+    from scanning import ensemble, opinion_ocr, s3_sync
+    from scanning.models import OpinionReviewStatus
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE:
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_APPROVED_MESSAGE},
+            status=409,
+        )
+    if not opinion_ocr.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_NOT_GLUED_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        # The reads and the write are the bucket, the rule of
+        # ``ensemble.run_tick``, which asks the same question first.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.rerun(opinion)
+    except ensemble.RevisionMoved:
+        # The OCR documents were written again while this ran, so the
+        # rows went back. Nothing was kept, and the answer says so.
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_MOVED_MESSAGE},
+            status=409,
+        )
+    except ensemble.TransientFault as exc:
+        # A fault that passes: the curator presses the button again,
+        # and no attempt was spent. The detail is logged, never sent.
+        logger.warning(
+            "%s of scan %s: the ensemble did not reach the bucket: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
+        return JsonResponse(
+            {"status": "error", "message": ENSEMBLE_BUCKET_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError as exc:
+        # The line comes from the table above, by the code of the
+        # error: the error itself names the object it read.
+        logger.warning(
+            "%s of scan %s: the ensemble refused the row: %s",
+            opinion,
+            scan.pk,
+            exc,
+        )
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": ENSEMBLE_ERROR_MESSAGES.get(
+                    exc.code, ENSEMBLE_ERROR_MESSAGES["unreadable"]
+                ),
+            },
+            status=409,
+        )
+    logger.info(
+        "%s of scan %s: %s ran the OCR ensemble again",
+        opinion,
+        scan.pk,
+        request.user,
+    )
+    counts = document["counts"]
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": ENSEMBLE_RERUN_MESSAGE.format(
+                engines=", ".join(document["engines"]),
+                groups=counts["groups"],
+                dropped=counts["dropped"],
+                low=counts["low_confidence"],
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
 def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     """Refuse to generate opinion files while the pipeline is paused.
 
     File generation is post-review-1 processing, which issue #173
-    stops until the new OCR stack reaches that stage. The generation
-    code (``services.run_generate_files``) is kept, but nothing queues
-    it; this view fails with the unified pipeline-paused message.
+    stops until the new OCR stack reaches that stage. The old
+    volume-level generation code is deleted (#360), and #206 rebuilds
+    the step over the corrected volume and the ``Opinion`` rows, where
+    ``opinion_pdf`` already writes one redacted PDF per opinion
+    (#336). This view fails with the unified pipeline-paused message.
 
     The review-2 approval is the gate of step 3 (#263), and it is
     checked here first (#269), before the paused flash: a template gate
@@ -800,11 +1060,11 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
 def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     """Mark a scan as approved.
 
-    Generate Files already pushed every output file to
-    ``processing/<pk>/...`` on S3, so this view is a pure status flip:
-    it validates that file generation has run, then sets
-    ``status=APPROVED``. Phase 2 will wire Approve into the
-    LLM-extraction handoff.
+    A pure status flip: it asks for ``Stage.APPROVED`` from step 3,
+    then writes ``status=APPROVED``. No scan reaches that stage while
+    the step is paused (#173), and the S3 copy the approval once made
+    went with the old generation code (#360). What an approval means
+    over the ``Opinion`` rows is #206's question.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -973,6 +1233,8 @@ def apply_rect_to_opinion(
     :return: JSON response confirming the operation.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
@@ -1126,6 +1388,8 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1165,6 +1429,8 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1202,6 +1468,8 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1305,6 +1573,8 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     if scan.status in BUSY_STATUSES:
         return JsonResponse(
             {"status": "error", "message": FINDINGS_BUSY_MESSAGE}, status=409
@@ -1342,6 +1612,8 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1395,6 +1667,8 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1480,6 +1754,8 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     det = _parse_json_body(request)
     if isinstance(det, JsonResponse):
         return det
@@ -1588,6 +1864,8 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import detections
 
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
@@ -1626,6 +1904,8 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with the bake result.
     """
     scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
     if not Path(scan.output_dir).is_dir():
         return JsonResponse(
             {"status": "error", "message": "No output dir"}, status=400

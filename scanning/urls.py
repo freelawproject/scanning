@@ -7,6 +7,7 @@ from scanning.monitoring import health_check, heartbeat, sentry_fail
 from scanning.views import (
     claim_scan,
     confirm_scan_upload,
+    dismiss_repair_from_queue,
     legacy_opinion_detail,
     legacy_opinion_list,
     legacy_opinion_upload,
@@ -43,6 +44,7 @@ from scanning.views_api import (
     generate_files,
     move_redaction,
     rebuild_findings,
+    rerun_opinion_ensemble,
     restore_boundary,
     restore_finding,
     restore_redaction,
@@ -66,7 +68,10 @@ from scanning.views_process import (
     dismiss_issue,
     dismiss_page_repair,
     glued_output_index,
+    move_page,
+    opinion_ensemble_url,
     opinion_file_index,
+    opinion_pdf_url,
     page_edit_file,
     process_actions,
     progress_api,
@@ -93,8 +98,10 @@ from scanning.views_process import (
     start_detect,
     start_dots_mocr,
     start_mistral_ocr,
+    start_surya_ocr,
     start_validate,
     undo_delete_page,
+    undo_move_page,
     undo_replace_page,
 )
 
@@ -132,6 +139,11 @@ urlpatterns = [
     path("profile/password/", password_change, name="password_change"),
     path("queue/", queue_view, name="queue"),
     path("repairs/", repair_queue, name="repair_queue"),
+    path(
+        "repairs/<int:pk>/dismiss/",
+        dismiss_repair_from_queue,
+        name="dismiss_repair_from_queue",
+    ),
     path("stats/", stats_view, name="stats"),
     path(
         "queue/<str:reporter_slug>/<int:vol>/",
@@ -218,12 +230,32 @@ urlpatterns = [
         serve_opinion_ocr,
         name="serve_opinion_ocr",
     ),
+    # The OCR ensemble of one opinion (#365): the button that reads
+    # the OCR documents again and writes the text.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble/rerun/",
+        rerun_opinion_ensemble,
+        name="rerun_opinion_ensemble",
+    ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).
     path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/redacted-pdf/",
         serve_opinion_pdf,
         name="serve_opinion_pdf",
+    ),
+    # The two objects the review page reads (#365). The answer is a
+    # presigned GET in JSON, because pdf.js and ``fetch`` read a direct
+    # URL and a browser judges a redirect's CORS rules differently.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/pdf-url/",
+        opinion_pdf_url,
+        name="opinion_pdf_url",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
+        opinion_ensemble_url,
+        name="opinion_ensemble_url",
     ),
     # The glued objects of one opinion (#334), the twin of the volume's
     # own index: which object exists, and where it is.
@@ -263,6 +295,11 @@ urlpatterns = [
         start_mistral_ocr,
         name="start_mistral_ocr",
     ),
+    path(
+        "scans/<int:pk>/start-surya/",
+        start_surya_ocr,
+        name="start_surya_ocr",
+    ),
     path("scans/<int:pk>/recalculate/", recalculate, name="recalculate"),
     path(
         "scans/<int:pk>/approve-pages/",
@@ -286,6 +323,12 @@ urlpatterns = [
         "scans/<int:pk>/undo-delete-page/",
         undo_delete_page,
         name="undo_delete_page",
+    ),
+    path("scans/<int:pk>/move-page/", move_page, name="move_page"),
+    path(
+        "scans/<int:pk>/move-page/undo/",
+        undo_move_page,
+        name="undo_move_page",
     ),
     path("scans/<int:pk>/insert/", add_page_insert, name="add_page_insert"),
     path(

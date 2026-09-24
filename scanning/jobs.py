@@ -81,7 +81,7 @@ from datetime import datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Q
+from django.db.models import Max, Q
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync, sharding
@@ -185,7 +185,18 @@ class ProviderSpec:
         ``result_key``.
     :ivar result_content_type: Content type the result PUT is signed
         with, and stored under.
-    :ivar claim_deadline: The deadline fields a claim writes.
+    :ivar claim_deadline: The deadline fields a claim writes. Doctor
+        takes its flat answer budget straight away, because its
+        response *is* the completion: there is no queue to tell apart,
+        and the clock that matters starts when the request goes out. A
+        RunPod row takes the queue ceiling at the attempt's **first**
+        claim, the moment it leaves our queue for the provider's. A row
+        that already carries one is written **nothing**: the only way
+        back to a claim with a ceiling intact is a defer, and a second
+        stamp there would restart the wait on every tick, so an
+        endpoint paused for good would hold a scan forever. Only the
+        crossing into ``IN_PROGRESS`` (:func:`_record_progress`)
+        replaces the ceiling with a run budget.
     :ivar run_deadline: The budget written when a job crosses into
         ``IN_PROGRESS``, or ``None`` for a provider whose queue and run
         share one ceiling.
@@ -389,17 +400,17 @@ class RunpodEngine:
 def _runpod_engines() -> dict[str, RunpodEngine]:
     """Return every RunPod engine this deploy knows, keyed by engine.
 
-    Rebuilt on each call, and deliberately not cached: the two entries
+    Rebuilt on each call, and deliberately not cached: the entries
     read their functions off the engine modules at build time, so a test
     that patches ``dots_mocr.enabled`` reaches this table too.
 
-    The imports are inside the function because both engine modules
-    import this one.
+    The imports are inside the function because every engine module
+    imports this one.
 
     :returns: The engine table.
     :rtype: dict[str, RunpodEngine]
     """
-    from scanning import dots_mocr, yolo
+    from scanning import dots_mocr, surya, yolo
 
     return {
         JobEngine.DOTS_MOCR: RunpodEngine(
@@ -423,6 +434,17 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
             is_enabled=yolo.enabled,
             build_payload=yolo.build_payload,
             label="YOLO",
+        ),
+        JobEngine.SURYA: RunpodEngine(
+            engine=JobEngine.SURYA,
+            stage=JobStage.EXTRACT,
+            endpoint_setting="RUNPOD_SURYA_ENDPOINT_ID",
+            concurrency_setting="SURYA_MAX_CONCURRENCY",
+            attempts_setting="SURYA_MAX_ATTEMPTS",
+            seconds_per_page_setting="SURYA_SECONDS_PER_PAGE",
+            is_enabled=surya.enabled,
+            build_payload=surya.build_payload,
+            label="Surya",
         ),
     }
 
@@ -462,46 +484,6 @@ def _max_attempts(job: ExternalJob) -> int:
     :rtype: int
     """
     return _provider(job).max_attempts(job)
-
-
-def _presigned_ttl(job: ExternalJob) -> int:
-    """Return the lifetime of the URLs this row's worker is handed.
-
-    :param job: The row to look up.
-    :returns: Seconds.
-    :rtype: int
-    :raises UnknownProvider: If the row's provider signs no URL.
-    """
-    ttl = _provider(job).presigned_ttl
-    if ttl is None:
-        raise UnknownProvider(
-            f"job {job.pk}: provider {job.provider} is handed no URL"
-        )
-    return ttl(job)
-
-
-def _result_suffix(job: ExternalJob) -> str:
-    """Return the extension of the object written at ``result_key``.
-
-    :param job: The row to look up.
-    :returns: ``".pdf"`` for a conversion, ``".json"`` for a read.
-    :rtype: str
-    """
-    return _provider(job).result_suffix
-
-
-def _result_content_type(job: ExternalJob) -> str:
-    """Return the content type the result PUT must be signed with.
-
-    Signed into the presigned URL, so this and the header the worker
-    sends must agree exactly. A mismatch is a 403 the worker reports as
-    an expired signature.
-
-    :param job: The row to look up.
-    :returns: The content type.
-    :rtype: str
-    """
-    return _provider(job).result_content_type
 
 
 def _runpod_endpoint(job: ExternalJob) -> str:
@@ -597,8 +579,8 @@ def queue_deadline(waiting_since):
     (issue #218).
 
     Stamped **once per attempt**, at the attempt's first claim
-    (:func:`submit_deadline_fields`) -- the moment the row is handed to
-    the provider. Nothing after that first claim moves it. A re-claim
+    (``ProviderSpec.claim_deadline``) -- the moment the row is handed
+    to the provider. Nothing after that first claim moves it. A re-claim
     after a defer does not, and a defer does not, or an endpoint that
     is paused or saturated for good would push the ceiling out on every
     tick and hold a scan forever. A retry clears it, so the next
@@ -651,36 +633,13 @@ def runpod_execution_deadline(job: ExternalJob, started_at):
     )
 
 
-def submit_deadline_fields(job: ExternalJob, submitted_at) -> dict:
-    """Return the deadline field a claim should write, if any.
-
-    Doctor takes its flat answer budget straight away, because its
-    response *is* the completion: there is no queue to distinguish, and
-    the clock that matters starts when the request goes out.
-
-    A RunPod row takes the queue ceiling here, at the attempt's
-    **first** claim -- the moment it leaves our queue for the
-    provider's. A row that already carries one is written **nothing**:
-    the only way back to a claim with a ceiling intact is a defer, and
-    re-stamping there would restart the wait on every tick, so an
-    endpoint paused for good would hold a scan forever. Only the
-    crossing into ``IN_PROGRESS`` (:func:`_record_progress`) replaces
-    the ceiling with a run budget.
-
-    :param job: The row being submitted.
-    :param submitted_at: Submission timestamp.
-    :returns: Fields to merge into the claim's write.
-    :rtype: dict
-    """
-    return _provider(job).claim_deadline(job, submitted_at)
-
-
 def _queue_ceiling_once(job: ExternalJob, submitted_at) -> dict:
     """Return the queue ceiling for a first claim, and nothing after.
 
-    The RunPod rule described in :func:`submit_deadline_fields`: a row
-    that already carries a deadline is written nothing, so a re-claim
-    after a defer cannot restart the wait.
+    The RunPod entry of ``ProviderSpec.claim_deadline``, whose
+    docstring carries the rule: a row that already holds a deadline is
+    written nothing, so a re-claim after a defer cannot restart the
+    wait.
 
     :param job: The row being submitted.
     :param submitted_at: Submission timestamp.
@@ -1400,6 +1359,151 @@ def ready_volume_runs(
         if attempts(rows) >= max_attempts:
             continue
         yield scan, rows
+
+
+def glue_ledger_key(run=None) -> str:
+    """Return the ``provider_meta`` key one glue's ledger lives under.
+
+    A stage that reads a volume keeps two ledgers on the volume run's
+    rows: the volume document's, and one per corrected volume, because
+    a scan may have had more than one apply run and each is glued on
+    its own terms.
+
+    :param run: The ``ApplyRun``, or None for the volume document.
+    :returns: ``"glue"``, or ``"glue:a{n}"``.
+    :rtype: str
+    """
+    return "glue" if run is None else f"glue:{run.label}"
+
+
+@dataclass(frozen=True)
+class ApplyGlueTarget:
+    """Which engine's document of a corrected volume a pass writes.
+
+    :ivar stage: A :class:`~scanning.models.JobStage` value.
+    :ivar engine: A :class:`~scanning.models.JobEngine` value.
+    :ivar provider: A :class:`~scanning.models.JobProvider` value.
+    :ivar key_field: The ``ApplyRun`` field that names the document.
+    :ivar run_field: The ``ApplyRun`` field that holds the volume run
+        the document was glued from.
+    """
+
+    stage: str
+    engine: str
+    provider: str
+    key_field: str
+    run_field: str
+
+
+@dataclass
+class ApplyGlueCandidate:
+    """One corrected volume that may owe one engine's document.
+
+    :ivar scan: The scan.
+    :ivar run: Its standing, built ``ApplyRun``.
+    :ivar volume_run: The glued volume run's number.
+    :ivar volume_rows: That run's rows, in shard order.
+    :ivar ledger_key: Where this glue's retry state lives
+        (:func:`glue_ledger_key`).
+    """
+
+    scan: object
+    run: object
+    volume_run: int
+    volume_rows: list[ExternalJob]
+    ledger_key: str
+
+
+def ready_apply_runs(
+    target: ApplyGlueTarget,
+    live_rows: Callable[[object], list[ExternalJob]],
+    max_attempts: int,
+):
+    """Yield the corrected volumes that owe one engine's document.
+
+    The prologue both ``EXTRACT`` stages share (#245, #368), the twin
+    of :func:`ready_volume_runs` for an apply run. A candidate is a
+    scan whose live volume run of this engine is **glued** and whose
+    standing apply run is **built**, and whose document does not name
+    that volume run already.
+
+    The pre-check is three queries over the whole corpus rather than
+    two per scan: every volume ever read keeps a glued run for good, so
+    a per-scan check would grow with the corpus -- the fault
+    ``apply._candidate_scan_ids`` was written to avoid. Each question is
+    one query: the live volume run per scan, the runs that are not
+    glued yet, and the standing built apply runs. The exact test then
+    runs per candidate, on that scan's own rows.
+
+    **A volume nobody read with this engine is never a candidate**,
+    which is what keeps a pass over it from starting paid work of its
+    own: the candidate is a glued volume run, and only a person starts
+    one.
+
+    :param target: The engine and its two ``ApplyRun`` fields.
+    :param live_rows: The engine's own live-run reader, called per
+        scan.
+    :param max_attempts: How many failures stop a run's glue.
+    :returns: One :class:`ApplyGlueCandidate` per corrected volume.
+    :rtype: Iterator[ApplyGlueCandidate]
+    """
+    from scanning.models import ApplyRun, Scan
+
+    rows = ExternalJob.objects.filter(
+        stage=target.stage,
+        engine=target.engine,
+        provider=target.provider,
+        apply_run__isnull=True,
+    )
+    live = {
+        entry["scan_id"]: entry["run"]
+        for entry in rows.values("scan_id").annotate(run=Max("run"))
+    }
+    if not live:
+        return
+    # A run with a row of any other status is not glued: the glue
+    # writes the document and flips every row in one pass.
+    for scan_id, run in rows.exclude(status=JobStatus.CONSUMED).values_list(
+        "scan_id", "run"
+    ):
+        if live.get(scan_id) == run:
+            live.pop(scan_id, None)
+    if not live:
+        return
+    candidates = {}
+    for run in ApplyRun.objects.filter(
+        scan_id__in=list(live),
+        superseded_at__isnull=True,
+        built_at__isnull=False,
+    ):
+        volume_run = live[run.scan_id]
+        if (
+            getattr(run, target.key_field)
+            and getattr(run, target.run_field) == volume_run
+        ):
+            continue
+        candidates[run.scan_id] = run
+    if not candidates:
+        return
+    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
+        "reporter"
+    ):
+        volume_rows = live_rows(scan)
+        if not volume_rows or any(
+            row.status != JobStatus.CONSUMED for row in volume_rows
+        ):
+            continue
+        run = candidates[scan.pk]
+        key = glue_ledger_key(run)
+        if ledger_attempts(volume_rows, key) >= max_attempts:
+            continue
+        yield ApplyGlueCandidate(
+            scan=scan,
+            run=run,
+            volume_run=volume_rows[0].run,
+            volume_rows=volume_rows,
+            ledger_key=key,
+        )
 
 
 def consume_run(rows: list[ExternalJob]) -> int:
