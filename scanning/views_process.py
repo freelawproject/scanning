@@ -626,6 +626,17 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # from the real pages (issue #90), so they must be resolved through the
         # page_map rather than matched directly. The set is shared with the
         # dismissal, which keeps its address in the same two spaces (#214).
+        # A missing page's card goes to the page its placeholder follows,
+        # with the placeholder right below it. Its printed number is on
+        # no page, but an unnumbered page can hold that value as its
+        # display ``logical_number``, and the card then went to the
+        # front matter. That page is not at fault, so it gets no red
+        # border, as with the trailing range below.
+        gap_anchors = {
+            e["logical_number"]: e["anchor_pdf_page"]
+            for e in page_map
+            if e.get("type") == "missing" and "anchor_pdf_page" in e
+        }
         flagged_indices: set[int] = set()
         for i in issues:
             # Resolve each issue to PDF page indices (unique physical positions),
@@ -634,6 +645,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             # has no page (or points at a missing page absent from the page_map).
             i.nav_pdf_index = None
             if i.page_number is None:
+                continue
+            if (
+                i.check_name == CheckName.MISSING_PAGE
+                and i.page_number in gap_anchors
+            ):
+                i.nav_pdf_index = max(gap_anchors[i.page_number] - 1, 0)
                 continue
             if i.check_name in PHYSICAL_PAGE_CHECKS:
                 indices = [i.page_number - 1]
@@ -644,8 +661,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 i.nav_pdf_index = indices[0]
 
         # The card of a range missing at the end names the placeholder
-        # ("ask a scanner for them at the placeholder at the end of the
-        # volume", #256), so the card must reach it. Its own address is a
+        # ("ask a scanner for them at the placeholder after the last
+        # numbered page", #256), so the card must reach it. Its own address is a
         # printed number the volume does not show, which resolves to no
         # page above, and the placeholder carries the range as its label,
         # so neither of ``goToPage``'s lookups finds it. The physical

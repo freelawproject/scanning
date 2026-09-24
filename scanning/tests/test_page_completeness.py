@@ -723,6 +723,54 @@ class TestStepOneGoal(ScanningTestCase):
         self.assertContains(response, "missing, duplicated, mislabeled")
 
 
+class TestTheCardOfAMissingPageAfterFrontMatter(ScanningTestCase):
+    """The card of a missing page goes to its gap, not the front matter.
+
+    An unnumbered page carries its PDF page as its display number, so
+    with 13 pages of front matter, the card of printed page 10 went to
+    PDF page 10. Scan 3156 has this shape.
+    """
+
+    def _step_one(self):
+        """Render step 1 of a volume that skips printed pages 10 and 11.
+
+        :returns: The response.
+        """
+        user = self.make_user()
+        self.client.force_login(user)
+        results = [
+            {"pdf_page": p, "detected": "", "type": "single"}
+            for p in range(1, 14)
+        ]
+        numbers = list(range(1, 10)) + list(range(12, 21))
+        results += [
+            {"pdf_page": 14 + i, "detected": str(n), "type": "single"}
+            for i, n in enumerate(numbers)
+        ]
+        scan = ScanFactory(
+            status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            page_count=len(results),
+            start_page=1,
+            end_page=20,
+            ocr_results=results,
+        )
+        pathlib.Path(scan.original_pdf.path).unlink()
+        services.recalculate_issues(scan)
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+
+    def test_the_card_navigates_to_the_page_before_the_gap(self):
+        response = self._step_one()
+
+        cards = {
+            i.page_number: i.nav_pdf_index
+            for i in response.context["issues"]
+            if i.check_name == CheckName.MISSING_PAGE
+        }
+        self.assertEqual(cards, {10: 21, 11: 21})
+
+
 class TestTheCardOfARangeMissingAtTheEnd(ScanningTestCase):
     """The card of a trailing gap must reach its placeholder (#256).
 

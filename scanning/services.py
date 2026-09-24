@@ -1197,8 +1197,9 @@ def _project_trailing_gap(
     The collapse is right **inside** a volume, where the pages are
     almost always in the book with a number nobody read. It is wrong at
     the end, where the expected last page says the pages should be
-    there and the volume stops before them. So this appends one
-    placeholder for the trailing run, and only for that one.
+    there and the volume stops before them. So this adds one
+    placeholder for the trailing run, and only for that one, after the
+    last page that prints a number below the run.
 
     **One placeholder per gap, because the gap is the address.** An
     insert and an INSERT repair request are both addressed by
@@ -1238,12 +1239,34 @@ def _project_trailing_gap(
         # Not collapsed: blackletter drew one placeholder per page.
         return
 
-    result["page_map"].append(
+    # After the last copy of the greatest number printed below the run,
+    # the rule blackletter follows for a short gap past the last number
+    # (blackletter#83): an unnumbered tail after the last printed page
+    # stays after the placeholder, and an insert there follows that
+    # page. A page's own PDF page is its ``logical_number`` when it
+    # prints none, so only the pages of ``seen_nums`` can anchor.
+    seen_nums = analysis.get("seen_nums") or {}
+    below = [number for number in seen_nums if number < first]
+    page_map = result["page_map"]
+    at = len(page_map)
+    if below:
+        anchors = {pdf_page - 1 for pdf_page in seen_nums[max(below)]}
+        at = 1 + max(
+            (
+                position
+                for position, entry in enumerate(page_map)
+                if entry.get("type") == "pdf_page"
+                and entry.get("pdf_index") in anchors
+            ),
+            default=len(page_map) - 1,
+        )
+    page_map.insert(
+        at,
         {
             "type": "missing",
             "logical_number": f"{first}-{exp_end}",
             "missing_range": [first, exp_end],
-        }
+        },
     )
 
     # The card of that run, reworded: it reads "likely an OCR misread
@@ -1261,7 +1284,7 @@ def _project_trailing_gap(
                 f"({exp_end - first + 1} pages) are not in this volume. "
                 f"The last page number read is {max(all_nums)}. If the "
                 f"book has these pages, ask a scanner for them at the "
-                f"placeholder at the end of the volume. If the pages "
+                f"placeholder after the last numbered page. If the pages "
                 f"are there with a number nobody read, correct a page "
                 f"number and recompute."
             )

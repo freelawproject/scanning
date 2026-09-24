@@ -33,7 +33,7 @@ dependencies = [
   # validation and the ink geometry — no torch/paddle. The heavy in-process
   # inference stack lives in the `local-ml` extra so the web/daemon images stay
   # lean whenever detection is offloaded to RunPod (RUNPOD_ENABLED=True).
-  # 0.4.2 is the floor. 0.2.0 brought the ink geometry (blackletter #68/#69)
+  # 0.4.3 is the floor. 0.2.0 brought the ink geometry (blackletter #68/#69)
   # this app reads instead of measuring it here; 0.3.0 adds the bl_warm
   # adapter, its weight source and its confidence gates (blackletter #73),
   # which the generalized YOLO stage needs (#193 and its parts); 0.3.1 stops
@@ -45,10 +45,13 @@ dependencies = [
   # per-opinion PDF pass calls it with (blackletter #81, scanning #336):
   # `full_redacted`, `image_for`, the `files` and `failed` result keys, and
   # log records in place of prints, which is why LOGGING carries a
-  # `blackletter` logger. The worker image (#194) keeps its own floor,
+  # `blackletter` logger; 0.4.3 anchors a missing-page placeholder on the
+  # printed numbers alone (blackletter #83, scanning #403), so a gap after a
+  # long front matter gets its placeholder and its upload address at the gap.
+  # The worker image (#194) keeps its own floor,
   # 0.3.1: it runs detection and reads no margin, so it rebuilds only for a
   # release it uses.
-  "blackletter>=0.4.2",
+  "blackletter>=0.4.3",
   # Not called anywhere: the pipeline embeds no text layer, and issue #280
   # deleted the one switch (LLM_PAGE_TEXT_LAYER) that called blackletter's
   # add_text_layer. Declared because base blackletter requires it anyway.
@@ -98,7 +101,7 @@ dev = [
 # `blackletter.api.detect` since #360, and base blackletter imports torch and
 # ultralytics lazily.
 local-ml = [
-  "blackletter[detect,analyze]>=0.4.2",
+  "blackletter[detect,analyze]>=0.4.3",
   "torch",
   "torchvision",
   "ultralytics>=8.3",

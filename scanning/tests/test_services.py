@@ -1968,6 +1968,34 @@ class TestTrailingGapPlaceholder(TestCase):
         self.assertEqual(entry["type"], "missing")
         self.assertEqual(entry["anchor_pdf_page"], 10)
 
+    def test_an_unnumbered_tail_stays_after_the_placeholder(self):
+        """Two unnumbered pages after the last printed one (an index, a
+        blank leaf) do not carry the placeholder to the end: it follows
+        the page that prints 10, the rule blackletter#83 gives a short
+        gap past the last number."""
+        from scanning import page_edits, services
+
+        scan = self._read(range(1, 11), start_page=1, end_page=20)
+        scan.ocr_results = scan.ocr_results + [
+            {"pdf_page": 11, "detected": "", "type": "single"},
+            {"pdf_page": 12, "detected": "", "type": "single"},
+        ]
+        scan.page_count = 12
+        scan.save(update_fields=["ocr_results", "page_count"])
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        page_map = page_edits.project_inserts(scan, scan.page_map)
+        at = next(
+            i for i, e in enumerate(page_map) if e.get("type") == "missing"
+        )
+        self.assertEqual(page_map[at]["missing_range"], [11, 20])
+        self.assertEqual(page_map[at]["anchor_pdf_page"], 10)
+        self.assertEqual(
+            [e.get("pdf_index") for e in page_map[at + 1 :]], [10, 11]
+        )
+
     def test_a_short_run_keeps_the_placeholder_of_each_page(self):
         """Three missing pages are not collapsed, so blackletter draws
         one placeholder each and this pass adds none."""
@@ -2036,6 +2064,97 @@ class TestTrailingGapPlaceholder(TestCase):
         self.assertEqual(
             self._placeholders(scan)[0]["missing_range"], [11, 20]
         )
+
+
+class TestMissingPlaceholderAfterFrontMatter(TestCase):
+    """A missing page's placeholder stands at its gap.
+
+    ``build_issues`` placed it before the first entry whose
+    ``logical_number`` is above the missing number, and an unnumbered
+    page carries its PDF page there. So with 13 pages of front matter,
+    the placeholders of printed pages 10 and 11 went after PDF pages 10
+    and 11, and the gap between 9 and 12 had none. Scan 3156 has this
+    shape: its dots.mocr run reads no number on PDF pages 1-13, then
+    1-9 on PDF pages 14-22 and 12 on PDF page 23.
+    """
+
+    def _read(self):
+        """Create a scan with 13 unnumbered pages, then 1-9 and 12-20.
+
+        :returns: The scan.
+        """
+        results = [
+            {"pdf_page": p, "detected": "", "type": "single"}
+            for p in range(1, 14)
+        ]
+        numbers = list(range(1, 10)) + list(range(12, 21))
+        results += [
+            {"pdf_page": 14 + i, "detected": str(n), "type": "single"}
+            for i, n in enumerate(numbers)
+        ]
+        scan = ScanFactory(
+            status=Status.PENDING_REVIEW,
+            page_count=len(results),
+            start_page=1,
+            end_page=20,
+            ocr_results=results,
+        )
+        pathlib.Path(scan.original_pdf.path).unlink()
+        return scan
+
+    def _after(self, scan):
+        """Return each placeholder with the entry before it.
+
+        :param scan: The scan to read.
+        :returns: ``(logical_number, pdf_index before)`` pairs.
+        :rtype: list[tuple]
+        """
+        scan.refresh_from_db()
+        page_map = scan.page_map
+        return [
+            (entry["logical_number"], page_map[i - 1].get("pdf_index"))
+            for i, entry in enumerate(page_map)
+            if entry.get("type") == "missing"
+        ]
+
+    def test_the_placeholders_follow_the_last_page_before_the_gap(self):
+        """PDF page 22 carries 9, so index 21 is the page before."""
+        from scanning import services
+
+        scan = self._read()
+
+        services.recalculate_issues(scan)
+
+        self.assertEqual(self._after(scan), [(10, 21), (11, None)])
+        scan.refresh_from_db()
+        self.assertEqual(scan.missing_pages, [10, 11])
+
+    def test_a_page_number_edit_keeps_them_at_the_gap(self):
+        """``rebuild_page_map`` is the other builder of the page map."""
+        from scanning import services
+
+        scan = self._read()
+
+        services.rebuild_page_map(scan)
+
+        self.assertEqual(self._after(scan), [(10, 21), (11, None)])
+
+    def test_an_upload_from_the_placeholder_follows_pdf_page_22(self):
+        """The anchor the viewer stamps is the address an upload and a
+        repair request send (#214, #249)."""
+        from scanning import page_edits, services
+
+        scan = self._read()
+
+        services.recalculate_issues(scan)
+
+        scan.refresh_from_db()
+        anchors = [
+            e["anchor_pdf_page"]
+            for e in page_edits.project_inserts(scan, scan.page_map)
+            if e.get("type") == "missing"
+        ]
+        self.assertEqual(anchors, [22, 22])
 
 
 class TestRunComputeIssues(TestCase):
