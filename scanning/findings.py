@@ -1,7 +1,7 @@
 """The findings of review 2: one rebuild from the rows, and the dismissals.
 
 A finding of review 2 is an ``Issue`` row whose ``check_name`` is in
-``models.REVIEW2_CHECKS`` (issue #240, PR D). Eight checks, in three
+``models.REVIEW2_CHECKS`` (issue #240, PR D). Nine checks, in three
 groups:
 
 - **about detections**: a key icon or a caption no opinion boundary
@@ -9,8 +9,9 @@ groups:
   bracket the reader saw and the model did not
   (``missing_headnote_bracket``, ``brackets.missing``, #328);
 - **about redactions and pages**: a confident headnote box no black
-  redaction covers (``uncovered_headnote``), a run of pages no opinion
-  covers (``uncovered_pages``);
+  redaction covers (``uncovered_headnote``), a headnote bracket box
+  under blackletter's redaction gate (``low_confidence_headnote_bracket``,
+  #410), a run of pages no opinion covers (``uncovered_pages``);
 - **about the curator's own rows**: a decision the last compute could
   not land or place (``stale_detection_edit``, ``stale_redaction_edit``,
   ``stale_boundary_edit``).
@@ -50,6 +51,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from blackletter.models import Label
+from blackletter.scanner import label_confidence
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -148,6 +151,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_unmatched_findings(scan, rows))
         found.extend(_uncovered_pages_findings(scan, rows, run))
         found.extend(_uncovered_headnote_findings(scan))
+        found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
     resolve(scan, found)
     with transaction.atomic():
@@ -525,6 +529,47 @@ def _uncovered_headnote_findings(scan: Scan):
             det,
             f"A headnote box (confidence {det.confidence:.2f}) is not "
             "covered by a redaction.",
+        )
+
+
+def _low_confidence_bracket_findings(scan: Scan):
+    """Yield one finding per bracket box too weak for blackletter to redact.
+
+    YOLO keeps a box down to 0.20, and step 2 draws every live row, but
+    blackletter redacts a detection only at or above
+    ``label_confidence`` (0.30 for bl-warm, 0.50 for the others). A
+    bracket box between the two is drawn, answers
+    ``brackets.missing``, and leaves the bracket in the deliverable
+    (#410).
+
+    The gate is blackletter's own function, read with the model family
+    of each row (the import writes ``BL_WARM`` for a bl-warm run), and
+    never a copy of the number. A hand-drawn row is left out: it carries
+    no model confidence. The test is the confidence alone, not the
+    cover, so a black box a curator draws over the bracket does not
+    close the card; the dismissal does.
+    """
+    label = Label.HEADNOTE_BRACKET
+    gates = {
+        bl_warm: label_confidence(label, bl_warm) for bl_warm in (True, False)
+    }
+    for det in (
+        Detection.objects.live()
+        .filter(
+            scan=scan, label=label.name, confidence__lt=max(gates.values())
+        )
+        .exclude(model_name=Detection.ModelName.MANUAL)
+        .order_by("page_index", "y0")
+    ):
+        gate = gates[det.model_name == Detection.ModelName.BL_WARM]
+        if det.confidence >= gate:
+            continue
+        yield _detection_finding(
+            CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+            Issue.Target.REDACTION,
+            det,
+            f"A headnote bracket box (confidence {det.confidence:.2f}) is "
+            f"under the redaction gate ({gate:.2f}), so it is not redacted.",
         )
 
 

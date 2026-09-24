@@ -332,6 +332,83 @@ class TestRebuild(ScanningTestCase):
 
         self.assertNotIn(CheckName.UNCOVERED_HEADNOTE, checks_of(scan))
 
+    def _bracket_scan(self):
+        """A scan with one computed boundary, so the measured checks run."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        return scan
+
+    def _low_brackets(self, scan):
+        return scan.issues.filter(
+            check_name=CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET
+        )
+
+    def test_a_bracket_under_the_gate_is_a_finding(self):
+        """#410: bl-warm redacts a bracket at 0.30 and above, and YOLO
+        keeps a box down to 0.20, so a box at 0.25 is drawn and not
+        redacted."""
+        scan = self._bracket_scan()
+        low = make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.30)
+
+        findings.rebuild(scan)
+
+        rows = self._low_brackets(scan)
+        self.assertEqual([r.metadata["detection_id"] for r in rows], [low.pk])
+        self.assertEqual(rows[0].target, Issue.Target.REDACTION)
+        self.assertEqual(rows[0].page_number, 2)
+        self.assertIn("0.25", rows[0].message)
+        self.assertIn("0.30", rows[0].message)
+
+    def test_a_row_of_another_family_is_read_with_its_own_gate(self):
+        """A row that cannot say bl-warm found it is redacted at 0.50."""
+        scan = self._bracket_scan()
+        legacy = make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.40, model_name=""
+        )
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 2, confidence=0.50, model_name=""
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(
+            [r.metadata["detection_id"] for r in self._low_brackets(scan)],
+            [legacy.pk],
+        )
+
+    def test_a_hand_drawn_or_hidden_bracket_is_no_finding(self):
+        scan = self._bracket_scan()
+        make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            1,
+            confidence=0.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+        )
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 2, confidence=0.25, active=False
+        )
+        make_detection(scan, "HEADNOTE", 2, confidence=0.25)
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_low_confidence_bracket_can_be_dismissed(self):
+        scan = self._bracket_scan()
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        findings.rebuild(scan)
+        finding = self._low_brackets(scan).get()
+
+        findings.dismiss(scan, finding, self.make_user())
+        findings.rebuild(scan)
+
+        self.assertTrue(self._low_brackets(scan).get().is_dismissed)
+
     def test_the_rebuild_is_idempotent_and_leaves_review_1_alone(self):
         scan = make_scan()
         review1 = Issue.objects.create(
