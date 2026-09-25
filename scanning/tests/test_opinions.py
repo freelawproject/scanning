@@ -26,6 +26,7 @@ from scanning.factories import (
 from scanning.management.commands.process_next_scan import Command
 from scanning.models import (
     ApplyRun,
+    Issue,
     Opinion,
     OpinionBoundary,
     OpinionCheck,
@@ -817,9 +818,10 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (2, 0)})
+        self.assertEqual(counts, {self.opinion.pk: (2, 0, 0)})
 
-    def test_a_stale_finding_counts_twice(self):
+    def test_a_stale_finding_counts_three_times(self):
+        """Open, stale, and blocking: no dismissal answers it (#375)."""
         OpinionFindingFactory(
             opinion=self.opinion,
             page_in_opinion=None,
@@ -828,7 +830,7 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (1, 1)})
+        self.assertEqual(counts, {self.opinion.pk: (1, 1, 1)})
 
     def test_a_dismissed_finding_does_not_count(self):
         dismissal = OpinionFindingDismissal.objects.create(
@@ -845,7 +847,7 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (1, 0)})
+        self.assertEqual(counts, {self.opinion.pk: (1, 0, 0)})
 
     def test_two_opinions_take_one_query(self):
         other = OpinionFactory(scan=self.scan)
@@ -855,8 +857,33 @@ class TestFindingCounts(TestCase):
         with self.assertNumQueries(1):
             counts = opinions.finding_counts([self.opinion.pk, other.pk])
 
-        self.assertEqual(counts[self.opinion.pk], (1, 0))
-        self.assertEqual(counts[other.pk], (1, 0))
+        self.assertEqual(counts[self.opinion.pk], (1, 0, 0))
+        self.assertEqual(counts[other.pk], (1, 0, 0))
+
+    def test_an_open_error_card_blocks_and_a_dismissed_one_does_not(self):
+        """The badge counts the gate of the approval (#375)."""
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.NO_MAJORITY,
+            severity=Issue.Severity.ERROR,
+        )
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+        )
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+            severity=Issue.Severity.ERROR,
+            dismissal=dismissal,
+        )
+
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {self.opinion.pk: (1, 0, 1)})
 
 
 class TestTheTextReviewPromotion(TestCase):

@@ -16,9 +16,9 @@
   `viewer_step3.js` spells no path of its own (#334).
 
   The write controls are the re-run of the ensemble, the dismissal
-  of a finding (#419), and the human edits of the text (#376), which
-  show on a locked block alone. The approval comes with the review
-  that closes an opinion. A button the endpoint would refuse
+  of a finding (#419), the human edits of the text (#376), which
+  show on a locked block alone, and the approval of the text with its
+  staff reopen (#375). A button the endpoint would refuse
   is the one thing a viewer must never offer (the rule of the step-1
   bar, #151).
 {% endcomment %}
@@ -57,6 +57,27 @@
        rel="noopener" class="btn-outline text-sm">
       <i class="fa-solid fa-up-right-from-square"></i> Open the PDF
     </a>
+    {% endif %}
+    {% comment %}
+      The approval (#375). Held while a blocking card is open: the
+      endpoint refuses it then, and a button the endpoint would refuse
+      is the one thing a viewer must never offer. A warning card asks
+      for a confirm. The script sends the revisions of the text it
+      drew, so the curator approves the text they saw.
+    {% endcomment %}
+    {% if can_approve %}
+    <button type="button" id="approve-text" class="btn-primary text-sm"
+            data-open-warnings="{{ open_warnings }}"
+            {% if blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
+      <i class="fa-solid fa-check"></i>
+      {% if blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
+    </button>
+    {% endif %}
+    {% if can_reopen %}
+    <button type="button" id="reopen-text" class="btn-outline text-sm"
+            title="Take this opinion back to the text review">
+      <i class="fa-solid fa-lock-open"></i> Reopen the text review
+    </button>
     {% endif %}
     {% if can_rerun %}
     <button type="button" id="rerun-ensemble" class="btn-outline text-sm"
@@ -151,6 +172,8 @@
      data-edit-section-url="{{ edit_section_url }}"
      data-edit-move-url="{{ edit_move_url }}"
      data-edit-withdraw-url="{{ edit_withdraw_url }}"
+     data-approve-url="{{ approve_url }}"
+     data-reopen-url="{{ reopen_url }}"
      data-page-count="{{ opinion.page_count }}">
 
   <div class="card p-2">

@@ -757,14 +757,7 @@ def _printed_numbers(scan: Scan, run) -> dict[int, str]:
         raise ScanHeld(f"the printed-page map did not load: {exc}")
     if not isinstance(document, dict) or "pages" not in document:
         raise ScanHeld(f"the object at {key} is not a printed-page map")
-    printed: dict[int, str] = {}
-    for page in document["pages"] or []:
-        if not isinstance(page, dict) or not page.get("printed"):
-            continue
-        final = page.get("final_page")
-        if isinstance(final, int) and final > 0:
-            printed[final - 1] = str(page["printed"])
-    return printed
+    return apply.printed_numbers(document)
 
 
 # ---------------------------------------------------------------------------

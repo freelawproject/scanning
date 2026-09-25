@@ -61,7 +61,9 @@ WRITE_VIEWS = (
 #: holds every name of ``WRITE_VIEWS`` to the review-2 gate, and a
 #: review-3 write has a gate of its own: the opinion's status.
 REVIEW3_WRITE_VIEWS = (
+    "approve_opinion_text",
     "dismiss_opinion_finding",
+    "reopen_opinion_text",
     "restore_opinion_finding",
 )
 
@@ -79,6 +81,8 @@ REVIEW3_EDIT_VIEWS = (
 #: findings, or it writes a curator's dismissal of one.
 WRITE_CALLS = (
     "_rebuild_findings",
+    "approve_text",
+    "reopen_text",
     "dismiss",
     "restore",
     "withdraw_stale",

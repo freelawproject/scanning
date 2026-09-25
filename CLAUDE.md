@@ -41,6 +41,9 @@ docker exec scanning-daemon python manage.py refit_text_redactions --dry-run
 # Write the text of a volume's opinions again, after a transform change or for a two-engine volume (#365)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble 2845 --dry-run
 
+# Write the approved texts again after a change of the join rule (#375)
+docker exec scanning-daemon python manage.py rewrite_approved_text --all --dry-run
+
 # Write the text of every volume's opinions again, after a change of the ensemble document; --all skips a one-engine opinion (#419)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble --all --dry-run
 
@@ -281,6 +284,10 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The footnotes are ordered apart from the body by the same `reading_order` and the same column boundary (#399): `build_page` reads the boundary over every group of the page and passes it to `place` for the body and to `place_footnotes` for the footnotes, which splits no band, because the head and the foot bands are facts of the body and a short last footnote in the foot band would lose its column
 - The blockquote zone of a page is the `BLOCKQUOTE` detections of the run, written by the OCR glue as `zones.blockquotes` beside `zones.footnotes` from one table (`opinion_ocr.ZONES`), and a model box counts only at `BLOCKQUOTE_MIN_CONFIDENCE` (0.8) or above; a box a person drew or approved is 1.0 (#411). `ensemble.quoted` is the one rule for which group is in a blockquote, over the aligned group of the body and never a footnote; the flag is `blockquote` on the group and never a value of `kind`, because a quote holds paragraphs and list items
 - A blockquote is one `blockquote` mark of `OpinionText.marks` over one run of consecutive quoted groups of a page (`ensemble.blockquote_runs`), never a tag in `text` (#411). `markup.serialize` writes a mark of `BLOCK_MARKS` once, at its two edges, and cuts the inline marks there; a mark written per segment gives one quote per italic. The viewer draws the document's runs (`page.blockquotes`) and never finds its own. `BLOCKQUOTE_LIST` counts the engines that read a group as a list item (`ensemble.list_readers`, `LIST_READERS` = 2), never the majority `kind`, and it warns and changes nothing
+
+- `opinion_review.approve_text` is the one writer of `TEXT_REVIEW_DONE`, and `opinion_review.blocking_findings` the one rule of its gate: an ERROR card with no dismissal, or any card of `UNDISMISSABLE_OPINION_CHECKS`; a warning card never blocks (#375). The review page sorts its cards and the list badge counts them by that rule (`opinion_review.blocks`, `blocking_filter`), and the swap reads the cards again under the lock, because a dismissal is not a revision
+- The approved text is written once at `approved/r{g}.e{k}.j{v}.json`, outside the glue prefix, object first and row second, and nothing overwrites it (#375). It holds text alone and no geometry: a flow of paragraphs (`body`), the footnotes keyed by label, and the page table with the printed numbers (`apply.printed_numbers`, the one parse of the map). The approval reads an ensemble document of schema 8 or later, which places every drop in the reading order
+- `paragraphs.py` is the one transform of an approved text and imports no Django module (#375): it joins two groups only across a column or a page edge, with nothing dropped between them, the same kind and blockquote flag, and a text that says the sentence goes on, and it keeps every other break. A join writes `\n` and never removes a hyphen, so the tagger's dehyphenation reads a column edge as a line end. A better rule is a new `JOIN_RULE` and `rewrite_approved_text`, which keeps the approval, never a new approval
 
 ## Worker images
 

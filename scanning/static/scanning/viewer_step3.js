@@ -2443,6 +2443,57 @@
         });
     }
 
+    /**
+     * The approval of the text, and its staff reopen (#375).
+     *
+     * The approval sends the revisions of the text this page drew
+     * (``postEdit``), so the curator approves the text they saw, and a
+     * page older than the stamped text is refused. A warning card asks
+     * for a confirm; a blocking card holds the button, which the
+     * template writes disabled, and the server refuses it too. Both
+     * answers are Django messages, so the page reloads to show them.
+     */
+    function bindApproval() {
+        var approve = document.getElementById('approve-text');
+        if (approve) {
+            approve.addEventListener('click', function () {
+                if (approve.disabled) { return; }
+                if (!doc) {
+                    showToast('The text is not loaded yet. Wait, then '
+                        + 'approve.', 'error');
+                    return;
+                }
+                var warnings = Number(approve.dataset.openWarnings || 0);
+                var asked = warnings
+                    ? warnings + ' warning(s) of this opinion are open. '
+                        + 'Approve the text anyway?'
+                    : 'Approve the text of this opinion?';
+                if (!window.confirm(asked)) { return; }
+                postEdit(endpoint('approveUrl'), {}, approve);
+            });
+        }
+        var reopen = document.getElementById('reopen-text');
+        if (reopen) {
+            reopen.addEventListener('click', function () {
+                if (!window.confirm('Open the text review of this opinion '
+                    + 'again? The approved text stays until the next '
+                    + 'approval.')) { return; }
+                reopen.disabled = true;
+                fetch(endpoint('reopenUrl'), {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRFToken': csrfToken() }
+                })
+                    .then(function () { window.location.reload(); })
+                    .catch(function () {
+                        showToast('The request got no answer. Try again.',
+                            'error');
+                        reopen.disabled = false;
+                    });
+            });
+        }
+    }
+
     // -----------------------------------------------------------------
     // The load
     // -----------------------------------------------------------------
@@ -2532,6 +2583,7 @@
         pagesColumn = document.getElementById('opinion-pages');
         textColumn = document.getElementById('opinion-text');
         bindRerun();
+        bindApproval();
         bindFindings();
         bindZoom();
         bindQuiet();

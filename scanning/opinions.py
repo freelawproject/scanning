@@ -502,8 +502,8 @@ def run(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
-    """Return the open findings, and the stale ones, per opinion (#334).
+def finding_counts(opinion_ids) -> dict[int, tuple[int, int, int]]:
+    """Return the open findings, the stale ones and the blocking ones (#334).
 
     The warning badge of the opinions list, the twin of
     ``findings.open_count`` for one scan and of
@@ -518,10 +518,16 @@ def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
 
     :param opinion_ids: The opinions to count, usually one page of the
         list.
-    :returns: ``{opinion id: (open, stale)}``. An opinion with no open
-        finding is absent.
-    :rtype: dict[int, tuple[int, int]]
+    The blocking count is the gate of the approval
+    (``opinion_review.blocking_filter``, #375), so the badge says what
+    the button waits on and holds no copy of the rule.
+
+    :returns: ``{opinion id: (open, stale, blocking)}``. An opinion with
+        no open finding is absent.
+    :rtype: dict[int, tuple[int, int, int]]
     """
+    from scanning.opinion_review import blocking_filter
+
     rows = (
         OpinionFinding.objects.filter(
             opinion_id__in=opinion_ids, dismissal__isnull=True
@@ -531,9 +537,13 @@ def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
         .annotate(
             open=Count("pk"),
             stale=Count("pk", filter=Q(check_name__in=STALE_OPINION_CHECKS)),
+            blocking=Count("pk", filter=blocking_filter()),
         )
     )
-    return {row["opinion_id"]: (row["open"], row["stale"]) for row in rows}
+    return {
+        row["opinion_id"]: (row["open"], row["stale"], row["blocking"])
+        for row in rows
+    }
 
 
 # ---------------------------------------------------------------------------

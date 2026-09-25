@@ -329,6 +329,49 @@ EDIT_EDGE_MESSAGE = (
 )
 EDIT_NO_EDIT_MESSAGE = "That edit is not an edit of this opinion."
 
+#: The approval of the text of an opinion (#375). Each refusal of
+#: ``opinion_review`` is one line here; the module gives the reason and
+#: the view the words.
+APPROVED_TEXT_MESSAGE = (
+    "The text of this opinion is approved. The approved text is written "
+    "for the final XML and the tagger."
+)
+APPROVE_REFUSED_MESSAGES = {
+    "closed": (
+        "This opinion is not ready for the text review, so its text "
+        "takes no approval now."
+    ),
+    "not_written": (
+        "The text of this opinion is not written, so there is nothing to "
+        "approve yet."
+    ),
+    "not_built": EDIT_NOT_BUILT_YET_MESSAGE,
+    "stale_page": EDIT_STALE_PAGE_MESSAGE,
+    "blocked": (
+        "{count} blocking finding(s) of this opinion are open. Dismiss "
+        "each one, or edit its block, and approve again."
+    ),
+    "old_document": (
+        "The text of this opinion was written by an older version. Press "
+        '"Read the OCR documents again", then approve.'
+    ),
+    "no_page_numbers": (
+        "The page numbers of this volume could not be read, so the "
+        "approved text was not written."
+    ),
+    "bucket": ENSEMBLE_BUCKET_MESSAGE,
+    "moved": (
+        "The text or the findings of this opinion changed during the "
+        "approval. The page was loaded again: look and approve again."
+    ),
+}
+REOPENED_TEXT_MESSAGE = (
+    "The text review of this opinion is open again. The approved text "
+    "stays until the next approval."
+)
+REOPEN_REFUSED_MESSAGE = "This opinion is not approved, so it does not reopen."
+REOPEN_STAFF_MESSAGE = "Only a staff member reopens an approved opinion."
+
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
 PAIRING_LABELS = ("CASE_CAPTION", "KEY_ICON")
@@ -1677,6 +1720,110 @@ def withdraw_opinion_edit(
         edit.page_in_opinion,
     )
     return _build_after_edit(request, opinion, EDIT_WITHDRAWN_MESSAGE)
+
+
+# ---------------------------------------------------------------------------
+# The approval of review 3 (#375)
+# ---------------------------------------------------------------------------
+
+
+@login_required
+@require_POST
+def approve_opinion_text(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Approve the text of one opinion, and write the approved text.
+
+    Any logged-in user approves, the rule of review 1 and review 2. The
+    gate is ``opinion_review.check_gate``: the status, a text that holds
+    every edit, the revisions the page was drawn at, and no open
+    blocking card (``opinion_review.blocking_findings``). A warning
+    card does not block; the button asks for a confirm.
+
+    Every answer is a Django message too, and the viewer reloads the
+    page to show it (#376).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404 for an opinion of another scan,
+        400 for a body the page does not send, 409 for a refusal.
+    """
+    from scanning import opinion_review, s3_sync
+
+    opinion = (
+        Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
+        .select_related("scan", "apply_run")
+        .first()
+    )
+    if opinion is None:
+        return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
+    try:
+        body = json.loads(request.body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if not isinstance(body, dict):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if not s3_sync.s3_active():
+        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
+    try:
+        key = opinion_review.approve_text(
+            opinion,
+            request.user,
+            glue_revision=body.get("glue_revision"),
+            edit_revision=body.get("edit_revision"),
+        )
+    except opinion_review.ApprovalRefused as refusal:
+        if refusal.code in (
+            opinion_review.BUCKET,
+            opinion_review.NO_PAGE_NUMBERS,
+        ):
+            logger.warning(
+                "%s of scan %s: the approval by %s did not write: %s",
+                opinion,
+                pk,
+                request.user,
+                refusal,
+            )
+        message = APPROVE_REFUSED_MESSAGES[refusal.code].format(
+            count=refusal.count
+        )
+        return _edit_refusal(request, message)
+    messages.success(request, APPROVED_TEXT_MESSAGE)
+    return JsonResponse(
+        {"status": "ok", "message": APPROVED_TEXT_MESSAGE, "key": key}
+    )
+
+
+@login_required
+@require_POST
+def reopen_opinion_text(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Take an approved opinion back to the text review (#375).
+
+    A staff button, the review-1 reopen: the way back when a curator
+    approves by mistake. The approved text stays until the next
+    approval writes another.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 403 for a reader who is not staff,
+        404 for an opinion of another scan, 409 for a row that is not
+        approved.
+    """
+    from scanning import opinion_review
+
+    if not request.user.is_staff:
+        return _edit_refusal(request, REOPEN_STAFF_MESSAGE, 403)
+    opinion = Opinion.objects.filter(pk=opinion_pk, scan_id=pk).first()
+    if opinion is None:
+        return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
+    if not opinion_review.reopen_text(opinion, request.user):
+        return _edit_refusal(request, REOPEN_REFUSED_MESSAGE)
+    messages.success(request, REOPENED_TEXT_MESSAGE)
+    return JsonResponse({"status": "ok", "message": REOPENED_TEXT_MESSAGE})
 
 
 @login_required

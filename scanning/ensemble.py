@@ -164,8 +164,10 @@ logger = logging.getLogger(__name__)
 #: ``order_edits`` and the ``unresolved_edits`` of a page, and the
 #: ``edit_revision`` of the document. 8 gives every body group the
 #: blocks ``below`` it, which a push of "Put in the footnotes" takes
-#: too (#419).
-SCHEMA_VERSION = 8
+#: too (#419). 9 gives every drop its place in the reading order
+#: (``after``, ``section``, ``band``, ``column``), so the approval can
+#: tell a redaction between two blocks from a column break (#375).
+SCHEMA_VERSION = 9
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -2352,6 +2354,16 @@ def build_page(
             )
             entry["dropped"].append(
                 {
+                    # The place of the drop in the reading order (#375):
+                    # it sits after the kept group of this id, or first
+                    # on the page when None. The approval reads it to
+                    # keep two blocks apart when text went between them.
+                    "after": (
+                        entry["groups"][-1]["id"] if entry["groups"] else None
+                    ),
+                    "section": group["section"],
+                    "band": group["band"],
+                    "column": group["column"],
                     "engines": {
                         name: unit["ids"]
                         for name, unit in group["engines"].items()
