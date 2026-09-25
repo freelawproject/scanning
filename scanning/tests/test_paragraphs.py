@@ -4,7 +4,7 @@ The approval turns the groups of the ensemble document into a flow of
 paragraphs and a list of footnotes. A paragraph the layout cut at a
 column or a page edge is put together again; every break the text
 makes stays. The documents here are built by hand, in the shape of
-``ensemble.build_page`` (schema 8).
+``ensemble.build_page`` (schema 9).
 """
 
 import ast

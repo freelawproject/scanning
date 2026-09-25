@@ -45,10 +45,11 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: The least version of the ensemble document the approval reads: 8
+#: The least version of the ensemble document the approval reads: 9
 #: gives every drop its place in the reading order, which the join rule
 #: needs to keep two blocks apart when a redaction went between them.
-MIN_DOCUMENT_SCHEMA = 8
+#: A document of 8 (#419, the ``below`` blocks) has no such place.
+MIN_DOCUMENT_SCHEMA = 9
 
 #: Why an approval or a rewrite is refused. The view owns the words.
 CLOSED = "closed"

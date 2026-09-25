@@ -145,14 +145,26 @@ class TestTheGate(ApprovalTestCase):
 
         self.assertEqual(caught.exception.code, opinion_review.CLOSED)
 
-    def test_a_document_older_than_schema_8_refuses(self):
+    def test_a_document_older_than_schema_9_refuses(self):
+        """Schema 8 (#419) places no drop in the reading order."""
         self.dismiss_blocking()
-        self.stored()["schema_version"] = 7
+        self.stored()["schema_version"] = 8
 
         with self.assertRaises(opinion_review.ApprovalRefused) as caught:
             self.approve()
 
         self.assertEqual(caught.exception.code, opinion_review.OLD_DOCUMENT)
+
+    def test_the_least_schema_is_one_the_ensemble_writes(self):
+        """A bump of the ensemble before this gate is a schema no
+        document reaches, and every approval would refuse."""
+        self.assertLessEqual(
+            opinion_review.MIN_DOCUMENT_SCHEMA, ensemble.SCHEMA_VERSION
+        )
+        self.assertGreaterEqual(
+            self.stored()["schema_version"],
+            opinion_review.MIN_DOCUMENT_SCHEMA,
+        )
 
     def test_an_edited_block_leaves_no_card(self):
         """A text edit is the other answer to a blocking card (#376)."""
@@ -215,7 +227,7 @@ class TestTheWrite(ApprovalTestCase):
         self.assertNotIn("box_pt", str(text))
 
     def test_the_document_names_the_place_of_every_drop(self):
-        """Schema 8: the join rule reads ``after`` and ``band``."""
+        """Schema 9: the join rule reads ``after`` and ``band``."""
         document = self.stored()
 
         drops = [d for page in document["pages"] for d in page["dropped"]]
