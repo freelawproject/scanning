@@ -2910,6 +2910,17 @@ class OpinionText(AbstractDateTimeModel):
             "field ``section`` names. Empty when they agree."
         ),
     )
+    marks = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The formatting the engines read (#404): "
+            "``{'start': int, 'end': int, 'kind': 'em' | 'strong' | 'sup', "
+            "'section': 'text' | 'footnotes'}``, with the offsets against "
+            "the field ``section`` names. A cache like ``text``, and of "
+            "``text``: an edit of ``human_text`` moves every offset."
+        ),
+    )
     human_text = models.TextField(
         blank=True,
         default="",

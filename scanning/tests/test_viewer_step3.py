@@ -141,3 +141,34 @@ class TestTheZonesGoWithTheBoxes(SimpleTestCase):
             r"\.forEach\(function \(el\) \{\s*el\.remove",
         )
         self.assertIn("'.ensemble-box, .ensemble-zone'", source)
+
+
+class TestTheMarksAreNodes(SimpleTestCase):
+    """The formatting is standoff marks, and the viewer builds nodes
+    from them (#404); no string of the document becomes HTML."""
+
+    def test_the_viewer_builds_the_marks_and_never_sets_html(self):
+        source = VIEWER.read_text()
+        self.assertIn("function markedNodes(", source)
+        block = source[
+            source.index("var KIND_ELEMENTS") : source.index(
+                "function differs("
+            )
+        ]
+        self.assertIn("createTextNode", block)
+        self.assertIn("textContent", block)
+        for name in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(name, block, f"{name} builds a group node")
+
+    def test_every_kind_of_the_ensemble_has_an_element(self):
+        source = VIEWER.read_text()
+        block = source[source.index("var KIND_ELEMENTS") :]
+        block = block[: block.index("};")]
+        from scanning import markup
+
+        for kind in markup.BLOCK_KINDS:
+            self.assertIn(f"{kind}:", block, f"{kind} has no element")
+
+    def test_a_table_with_no_rows_draws_its_text(self):
+        source = VIEWER.read_text()
+        self.assertIn("kind === 'table' && (group.table || []).length", source)

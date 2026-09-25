@@ -18,11 +18,13 @@
  *   so the render draws the boxes again. Nothing is positioned one
  *   time (#311). A page holds the scale it was drawn at, so it is
  *   drawn again only when that scale changes.
- * - **The document holds no markup.** A voted group holds tokens with
- *   a ``low_confidence`` flag, and this module builds the nodes. Every
- *   string enters the DOM with ``textContent``. The words that differ
- *   are measured here too (#380), over the text as it is shown and
- *   never over the key of ``ensemble.compare_text``.
+ * - **The document holds no markup.** A group holds a plain text,
+ *   standoff marks over it and a kind (#404), a voted group holds
+ *   tokens with a ``low_confidence`` flag, and this module builds the
+ *   nodes (:func:`markedNodes`). Every string enters the DOM with
+ *   ``textContent``. The words that differ are measured here too
+ *   (#380), over the text as it is shown and never over the key of
+ *   ``ensemble.compare_text``.
  * - **A box takes no pointer.** One hit test on the wrapper finds the
  *   box under the pointer, the rule of ``ocr_text.js``: a box that
  *   took the pointer would swallow the clicks of the page.
@@ -581,35 +583,144 @@
     }
 
     /**
+     * The element a group's kind draws (#404). A table is built from
+     * its rows and holds no text of its own.
+     */
+    var KIND_ELEMENTS = {
+        heading: 'h3',
+        list_item: 'li',
+        table: 'div',
+        paragraph: 'p'
+    };
+
+    /**
+     * Fill ``parent`` with ``text`` and its marks.
+     *
+     * The marks are standoff: ``{start, end, kind}`` over ``text``,
+     * with ``kind`` one of ``em``, ``strong`` and ``sup``. The text is
+     * cut at every mark edge, and each piece is a text node wrapped
+     * in one element per mark that covers it, the innermost first.
+     * Every string still enters the DOM with ``textContent``.
+     *
+     * @param {HTMLElement} parent - The node to fill.
+     * @param {string} text - The plain text.
+     * @param {Object[]} marks - Its marks, in its own offsets.
+     */
+    function markedNodes(parent, text, marks) {
+        var edges = {0: true};
+        edges[text.length] = true;
+        (marks || []).forEach(function (mark) {
+            edges[mark.start] = true;
+            edges[mark.end] = true;
+        });
+        var cuts = Object.keys(edges).map(Number).sort(function (a, b) {
+            return a - b;
+        });
+        for (var i = 0; i + 1 < cuts.length; i += 1) {
+            var start = cuts[i];
+            var end = cuts[i + 1];
+            var piece = document.createTextNode(text.slice(start, end));
+            var wrapped = piece;
+            ['sup', 'em', 'strong'].forEach(function (kind) {
+                var covers = (marks || []).some(function (mark) {
+                    return mark.kind === kind
+                        && mark.start <= start && end <= mark.end;
+                });
+                if (covers) {
+                    var element = document.createElement(kind);
+                    element.appendChild(wrapped);
+                    wrapped = element;
+                }
+            });
+            parent.appendChild(wrapped);
+        }
+    }
+
+    /**
+     * The marks of one token of a voted group, in the token's own
+     * offsets: the group's marks cut to ``[at, at + length)``.
+     *
+     * @param {Object[]} marks - The group's marks.
+     * @param {number} at - Where the token starts in the group text.
+     * @param {number} length - The token's length.
+     * @returns {Object[]} The clipped marks.
+     */
+    function clipMarks(marks, at, length) {
+        var out = [];
+        (marks || []).forEach(function (mark) {
+            var start = Math.max(mark.start, at) - at;
+            var end = Math.min(mark.end, at + length) - at;
+            if (end > start) {
+                out.push({start: start, end: end, kind: mark.kind});
+            }
+        });
+        return out;
+    }
+
+    /**
+     * Build the table of a group whose kind is a table.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The table.
+     */
+    function tableNode(group) {
+        var table = document.createElement('table');
+        table.className = 'ensemble-table';
+        var body = document.createElement('tbody');
+        (group.table || []).forEach(function (row) {
+            var tr = document.createElement('tr');
+            row.forEach(function (cell) {
+                var td = document.createElement('td');
+                td.textContent = cell;
+                tr.appendChild(td);
+            });
+            body.appendChild(tr);
+        });
+        table.appendChild(body);
+        return table;
+    }
+
+    /**
      * Build the node of one group.
      *
      * A voted group is built token by token, so a word with no
      * majority carries its own mark. Every other group is one string.
      * The document holds no markup, and this is the one place that
-     * decides what a reading looks like.
+     * decides what a reading looks like: the element follows the
+     * group's ``kind`` and the text its ``marks`` (#404).
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @returns {HTMLElement} The node.
      */
     function groupNode(page, group) {
-        var node = document.createElement('p');
+        var kind = group.kind || 'paragraph';
+        var node = document.createElement(KIND_ELEMENTS[kind] || 'p');
         node.className = 'ensemble-group';
         node.dataset.page = String(page.page_in_opinion);
         node.dataset.group = String(group.id);
         node.dataset.agreement = group.agreement;
+        node.dataset.kind = kind;
         if (group.weak) { node.classList.add('weak'); }
         if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
 
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
         });
-        if (group.agreement === 'voted' && tokens.length) {
+        var at = 0;
+        if (kind === 'table' && (group.table || []).length) {
+            node.appendChild(tableNode(group));
+        } else if (group.agreement === 'voted' && tokens.length) {
             // The words join with one space, the rule the document's
-            // own ``text`` follows.
+            // own ``text`` follows, so ``at`` is where each token
+            // starts in the group text and the marks cut to it.
             tokens.forEach(function (token, position) {
                 var span = document.createElement('span');
-                span.textContent = token.text;
+                markedNodes(
+                    span, token.text,
+                    clipMarks(group.marks, at, token.text.length)
+                );
+                at += token.text.length + 1;
                 if (token.low_confidence && token.inserted) {
                     span.className = 'ensemble-low';
                     span.title = 'The first engine that read here did'
@@ -631,7 +742,7 @@
                 }
             });
         } else {
-            node.textContent = group.text || '';
+            markedNodes(node, group.text || '', group.marks || []);
         }
 
         var line = groupNote(page, group);

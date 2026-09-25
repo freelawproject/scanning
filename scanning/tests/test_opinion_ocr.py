@@ -29,7 +29,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import opinion_ocr, opinions, yolo
+from scanning import markup, opinion_ocr, opinions, yolo
 from scanning.factories import (
     ExternalJobFactory,
     OpinionBoundaryFactory,
@@ -952,6 +952,167 @@ class TestTheDocument(OpinionOcrTestCase):
         self.assertEqual(document["source"]["key"], self.apply_run.extract_key)
 
 
+# ── the parsed unit (#404) ───────────────────────────────────────────
+class TestTheParsedUnit(OpinionOcrTestCase):
+    """Every engine's markup becomes marks over a plain text."""
+
+    def set_body_a(self, page_index, dots=None, mistral=None, surya=None):
+        """Give ``BODY_A`` of one page a text per engine."""
+        if dots is not None:
+            cell = self.objects[self.apply_run.ocr_key]["pages"][page_index][
+                "cells"
+            ][1]
+            cell.update(dots)
+        if mistral is not None:
+            self.objects[self.apply_run.extract_key]["pages"][page_index][
+                "blocks"
+            ][1].update(mistral)
+        if surya is not None:
+            self.apply_run.surya_key = (
+                f"{self.prefix}jobs/apply/a1/surya-volume.json"
+            )
+            document = surya_document()
+            document["pages"][page_index]["blocks"][1].update(surya)
+            self.objects[self.apply_run.surya_key] = document
+            self.apply_run.save(update_fields=["surya_key"])
+
+    def document(self, engine):
+        return self.uploads[opinion_ocr.engine_key(self.opinion, engine)]
+
+    def test_a_dots_italic_is_an_em_mark(self):
+        self.set_body_a(2, dots={"text": "In *Castleman*, Justice Scalia"})
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "In Castleman, Justice Scalia")
+        self.assertEqual(
+            unit["marks"], [{"start": 3, "end": 12, "kind": "em"}]
+        )
+        self.assertEqual(unit["kind"], "paragraph")
+        self.assertNotIn("table", unit)
+        self.assertEqual(document["counts"]["marks"], 1)
+        self.assertEqual(document["schema_version"], 4)
+
+    def test_the_mistral_latex_superscript(self):
+        self.set_body_a(
+            2, mistral={"content": "(opinion of Scalia, J.).$^{4}$"}
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        unit = self.document("mistral_ocr")["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "(opinion of Scalia, J.).4")
+        self.assertEqual(
+            unit["marks"], [{"start": 24, "end": 25, "kind": "sup"}]
+        )
+
+    def test_the_surya_marks_come_from_the_html(self):
+        # The worker's flattened ``text`` lost the boundary already.
+        self.set_body_a(
+            2,
+            surya={
+                "html": "<p>See <i>Holt v. Hobbs</i>, x<sup>1</sup></p>",
+                "text": "See Holt v. Hobbs, x1",
+            },
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        unit = self.document("surya")["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "See Holt v. Hobbs, x1")
+        self.assertEqual(
+            unit["marks"],
+            [
+                {"start": 4, "end": 17, "kind": "em"},
+                {"start": 20, "end": 21, "kind": "sup"},
+            ],
+        )
+
+    def test_the_engine_s_label_names_the_kind(self):
+        self.set_body_a(
+            2,
+            dots={"text": "FACTS", "category": "Section-header"},
+            mistral={"content": "FACTS", "type": "title"},
+            surya={
+                "html": "<p>FACTS</p>",
+                "text": "FACTS",
+                "label": "SectionHeader",
+            },
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr", "surya"):
+            unit = self.document(engine)["pages"][1]["units"][1]
+            self.assertEqual(unit["kind"], "heading", engine)
+            self.assertEqual(unit["text"], "FACTS", engine)
+            self.assertEqual(
+                self.document(engine)["counts"]["headings"], 1, engine
+            )
+
+    def test_a_heading_mark_names_the_kind_and_leaves_the_text(self):
+        self.set_body_a(2, dots={"text": "## DISCUSSION"})
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(
+            (unit["kind"], unit["text"]), ("heading", "DISCUSSION")
+        )
+
+    def test_a_table_carries_its_rows(self):
+        self.set_body_a(
+            2,
+            dots={
+                "text": "<table><tr><td>Property Damage</td><td>$35,000.00</td></tr></table>",
+                "category": "Table",
+            },
+        )
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(unit["kind"], "table")
+        self.assertEqual(unit["table"], [["Property Damage", "$35,000.00"]])
+        self.assertEqual(unit["text"], "Property Damage $35,000.00")
+        self.assertEqual(document["counts"]["tables"], 1)
+
+    def test_the_bracket_strip_moves_the_marks(self):
+        self.set_body_a(
+            2,
+            dots={"text": "[3]\n*Held:* so"},
+            surya={
+                "html": "<p>[3] <i>Held:</i> so</p>",
+                "text": "[3] Held: so",
+            },
+        )
+        self.redact(2, to_pt(BRACKET), rect_type="HEADNOTE_BRACKET")
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "surya"):
+            unit = self.document(engine)["pages"][1]["units"][1]
+            self.assertEqual(unit["text"], "Held: so", engine)
+            self.assertEqual(unit["removed"], ["[3]"], engine)
+            self.assertEqual(
+                unit["marks"], [{"start": 0, "end": 5, "kind": "em"}], engine
+            )
+
+    def test_every_engine_has_a_dialect_and_a_kind_table(self):
+        """A fourth engine is one entry of ``ENGINES`` (#368, #404)."""
+        for name, spec in opinion_ocr.ENGINES.items():
+            with self.subTest(engine=name):
+                self.assertTrue(callable(spec.dialect))
+                self.assertIsInstance(spec.kind_types, dict)
+                self.assertTrue(
+                    set(spec.kind_types.values()) <= set(markup.BLOCK_KINDS)
+                )
+                parsed = spec.parse({spec.markup_key: "", spec.type_key: ""})
+                self.assertEqual(parsed, markup.Parsed(text=""))
+        self.assertEqual(opinion_ocr.ENGINES["surya"].markup_key, "html")
+
+
 # ── the third engine ─────────────────────────────────────────────────
 class TestTheSuryaEngine(OpinionOcrTestCase):
     """Surya is one entry of ``ENGINES`` and no other code (#368)."""
@@ -972,9 +1133,10 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
 
     def test_a_marked_header_is_the_page_number(self):
         """Mistral writes the running head as a heading, dots.mocr sets
-        bold marks, Surya a bullet. The reader folds them first, or the
-        group drops on the dots.mocr cell alone and the page gets a
-        partial card for the clean Mistral block beside it."""
+        bold marks, Surya a bullet. The parse takes the marks off the
+        text (#404) and the reader folds the bullet, or the group drops
+        on the dots.mocr cell alone and the page gets a partial card
+        for the clean Mistral block beside it."""
         mistral = mistral_document()
         mistral["pages"][2]["blocks"][0]["content"] = "# 878 N. C."
         self.objects[self.apply_run.extract_key] = mistral
@@ -982,14 +1144,15 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
         dots["pages"][2]["cells"][0]["text"] = "**878 N. C.**"
         self.objects[self.apply_run.ocr_key] = dots
         surya = surya_document()
+        surya["pages"][2]["blocks"][0]["html"] = "<p>• 878 N. C.</p>"
         surya["pages"][2]["blocks"][0]["text"] = "• 878 N. C."
         self.add_surya(surya)
 
         opinion_ocr.write(self.opinion, self.inputs())
 
         for engine, prefix in (
-            ("dots_mocr", "**878"),
-            ("mistral_ocr", "# 878"),
+            ("dots_mocr", "878"),
+            ("mistral_ocr", "878"),
             ("surya", "• 878"),
         ):
             document = self.uploads[
@@ -1929,7 +2092,7 @@ class TestTheBracketToken(OpinionOcrTestCase):
             self.assertIsNone(unit["exclusion"])
             self.assertEqual(unit["removed"], ["[1]"])
         self.assertEqual(document["counts"]["brackets_removed"], 1)
-        self.assertEqual(document["schema_version"], 3)
+        self.assertEqual(document["schema_version"], 4)
 
     def test_a_large_bracket_box_no_longer_drops_the_words(self):
         """A share of 0.3 excluded the unit before #373."""
