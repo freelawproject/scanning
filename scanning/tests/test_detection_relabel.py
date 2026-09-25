@@ -25,6 +25,7 @@ from scanning import apply, jobs, yolo
 from scanning.factories import OpinionFactory, ScanFactory
 from scanning.models import (
     ApplyRun,
+    DetectionDecision,
     ExternalJob,
     JobEngine,
     JobStage,
@@ -498,3 +499,129 @@ class TestReopenRedactionReview(TestCase):
     def test_an_unknown_scan_is_named(self):
         _, err = self._call("999999")
         self.assertIn("scan 999999: no such scan", err)
+
+
+class TestCompareDetectionRuns(TestCase):
+    """``compare_detection_runs``: two merged runs, read and never written."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory(page_count=2)
+        manifest = make_manifest(shard_count=1, pages_per_shard=2)
+        first = yolo.ensure_detect_jobs(self.scan, manifest)
+        finish(first)
+        with patch("scanning.s3_sync.s3_active", return_value=False):
+            second = yolo.ensure_detect_jobs(
+                self.scan, manifest, force_new_run=True
+            )
+        finish(second)
+        box = [100.0, 100.0, 300.0, 200.0]
+        self.documents = {
+            1: [
+                self._entry(1, "PAGE_HEADER", 2, box),
+                self._entry(2, "KEY_ICON", 0, box),
+            ],
+            2: [
+                self._entry(1, "PAGE_HEADER", 2, [102.0, 100.0, 302.0, 200.0]),
+                self._entry(1, "HEADING", 21, [50.0, 400.0, 500.0, 450.0]),
+            ],
+        }
+        load = patch(
+            "scanning.yolo.load_merged_document",
+            side_effect=lambda scan, run: {"detections": self.documents[run]},
+        )
+        self.load = load.start()
+        self.addCleanup(load.stop)
+
+    @staticmethod
+    def _entry(page, label, label_id, bbox):
+        return {
+            "pdf_page": page,
+            "page_index": page - 1,
+            "label": label,
+            "label_id": label_id,
+            "bbox": bbox,
+        }
+
+    def _decision(self, page, label, label_id, bbox, **values):
+        return DetectionDecision.objects.create(
+            scan=self.scan,
+            kind=DetectionDecision.Kind.DEACTIVATE,
+            source_page=page,
+            label=label,
+            label_id=label_id,
+            target_x0=bbox[0],
+            target_y0=bbox[1],
+            target_x1=bbox[2],
+            target_y1=bbox[3],
+            **values,
+        )
+
+    def _call(self, *args):
+        out = StringIO()
+        call_command(
+            "compare_detection_runs", str(self.scan.pk), *args, stdout=out
+        )
+        return out.getvalue()
+
+    def _line(self, out, label):
+        return next(
+            line.split() for line in out.splitlines() if line.startswith(label)
+        )
+
+    def test_the_live_run_is_compared_with_the_one_before(self):
+        out = self._call()
+        self.assertIn(f"scan {self.scan.pk}: run 1 against run 2", out)
+        # label, old, new, matched, mean IoU, lost, added
+        self.assertEqual(
+            self._line(out, "PAGE_HEADER"),
+            ["PAGE_HEADER", "1", "1", "1", "0.980", "0", "0"],
+        )
+        self.assertEqual(
+            self._line(out, "KEY_ICON"),
+            ["KEY_ICON", "1", "0", "0", "-", "1", "0"],
+        )
+        self.assertEqual(
+            self._line(out, "HEADING"),
+            ["HEADING", "0", "1", "0", "-", "0", "1"],
+        )
+
+    def test_the_standing_decisions_are_checked_against_the_new_run(self):
+        self._decision(1, "PAGE_HEADER", 2, [100.0, 100.0, 300.0, 200.0])
+        lost = self._decision(2, "KEY_ICON", 0, [100.0, 100.0, 300.0, 200.0])
+        out = self._call()
+        self.assertIn(
+            "standing decisions: 1 would land, 1 would be stale, 0 on "
+            "edited pages not checked",
+            out,
+        )
+        self.assertIn(f"#{lost.pk} deactivate KEY_ICON p.2", out)
+
+    def test_a_withdrawn_decision_is_not_counted(self):
+        self._decision(
+            2,
+            "KEY_ICON",
+            0,
+            [100.0, 100.0, 300.0, 200.0],
+            withdrawn_at=timezone.now(),
+        )
+        out = self._call()
+        self.assertIn("0 would land, 0 would be stale", out)
+
+    def test_a_run_that_is_not_merged_is_refused(self):
+        with self.assertRaises(CommandError):
+            self._call("--new", "5")
+
+    def test_it_writes_nothing(self):
+        before = list(
+            ExternalJob.objects.order_by("pk").values_list(
+                "status", "input_manifest"
+            )
+        )
+        self._call()
+        after = list(
+            ExternalJob.objects.order_by("pk").values_list(
+                "status", "input_manifest"
+            )
+        )
+        self.assertEqual(before, after)

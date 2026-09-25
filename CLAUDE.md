@@ -35,6 +35,9 @@ docker exec scanning-daemon python manage.py reglue_opinion_ocr --all --dry-run
 # Read the volumes again whose detection run lacks the current class set, leaving partner scans out (#338)
 docker exec scanning-daemon python manage.py enqueue_yolo_detect --stale-labels --read-since 2026-09-16T18:00Z --exclude 2561 --dry-run
 
+# Compare a volume's live detection run with the run before it, and count the decisions it would lose (#338)
+docker exec scanning-daemon python manage.py compare_detection_runs 2845
+
 # Take approved volumes back to review 2, so a new detection run is imported (#338)
 docker exec scanning-daemon python manage.py reopen_redaction_review 2845 --dry-run
 
