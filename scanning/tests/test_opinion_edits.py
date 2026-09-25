@@ -344,21 +344,21 @@ class TestTheTextEdit(TestCase):
         )
         self.assertEqual(edited["text"][italic[0]["end"] :], " here")
 
-    def test_an_edit_brings_back_no_superscript_of_other_characters(self):
-        """The edit carries the marks with the alignment of the
-        ensemble, so the #423 rule holds for the curator's text too."""
-        dots = [unit("dots_mocr", 0, BODY_A_PT, "This case is a companion")]
-        mistral = [
+    def test_a_corrected_footnote_mark_keeps_its_superscript(self):
+        """The curator corrects the character under the superscript
+        (#423): no edit kind adds a mark, so the edit must keep it."""
+        dots = [
             unit(
-                "mistral_ocr",
+                "dots_mocr",
                 0,
                 BODY_A_PT,
-                "1407This case is a companion",
-                marks=[sup(0, 4)],
+                'the acts."l The court',
+                marks=[sup(10, 11)],
             )
         ]
+        mistral = [unit("mistral_ocr", 0, BODY_A_PT, 'the acts."l The court')]
         group = group_at(page_with(dots, mistral), BODY_A_PT)
-        self.assertEqual(group["marks"], [])
+        self.assertEqual(group["marks"], [sup(10, 11)])
 
         page = page_with(
             dots,
@@ -368,12 +368,14 @@ class TestTheTextEdit(TestCase):
                     OpinionEdit.Kind.TEXT,
                     BODY_A_PT,
                     base_text=group["text"],
-                    text="This case is a companion case",
+                    text='the acts."1 The court',
                 )
             ],
         )
 
-        self.assertEqual(group_at(page, BODY_A_PT)["marks"], [])
+        edited = group_at(page, BODY_A_PT)
+        self.assertEqual(edited["text"], 'the acts."1 The court')
+        self.assertEqual(edited["marks"], [sup(10, 11)])
 
     def test_a_page_nobody_read_holds_no_edit(self):
         pages = {

@@ -2707,6 +2707,22 @@ class TestTheMarks(TestCase):
 
         self.assertEqual(marks, [])
 
+    def test_a_misread_footnote_mark_keeps_its_superscript(self):
+        """The engines differ inside the superscript alone."""
+        marks = ensemble.union_marks(
+            'acts."1 The', [('acts."l The', [sup(6, 7)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 7)])
+
+    def test_a_star_page_at_the_end_of_a_word_marks_no_letter(self):
+        """The range 5 to 9 of ``court1407`` would land on the ``s``."""
+        marks = ensemble.union_marks(
+            "the courts held", [("the court1407 held", [sup(9, 13)])]
+        )
+
+        self.assertEqual(marks, [])
+
     def test_an_italic_carries_onto_a_misread_word(self):
         """A whole-word mark is not a range: the #423 rule is the
         superscript's alone."""
