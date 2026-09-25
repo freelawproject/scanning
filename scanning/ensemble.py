@@ -645,9 +645,13 @@ def _table_of(engines: dict[str, dict], names: list[str]) -> list | None:
 
 
 def _formatting(
-    text: str, engines: dict[str, dict], present: list[str]
+    text: str, engines: dict[str, dict], present: list[str], source: str
 ) -> dict:
-    """Return the ``marks``, ``kind`` and ``table`` of one read."""
+    """Return the ``marks``, ``kind`` and ``table`` of one read.
+
+    The rows are the source's when it read a table, else the first
+    engine's in rank order that did: the reader sees the rows alone.
+    """
     kind = group_kind(engines, present)
     return {
         "marks": union_marks(
@@ -658,7 +662,11 @@ def _formatting(
             ],
         ),
         "kind": kind,
-        "table": _table_of(engines, present) if kind == markup.TABLE else None,
+        "table": (
+            _table_of(engines, [source, *present])
+            if kind == markup.TABLE
+            else None
+        ),
     }
 
 
@@ -1673,7 +1681,9 @@ def resolve(group: dict) -> dict:
                 "tokens": tokens,
                 "n_low_confidence": disputed,
             }
-    answer.update(_formatting(answer["text"], engines, present))
+    answer.update(
+        _formatting(answer["text"], engines, present, answer["source"])
+    )
     return answer
 
 

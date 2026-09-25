@@ -80,9 +80,13 @@ class Parsed:
 SUP_CHARS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
 _SUP_TRANS = str.maketrans(SUP_CHARS, "0123456789")
 _HEADING_MD = re.compile(r"^[ \t]*#{1,6}[ \t]+")
-#: A list item: an arabic enumerator or a bullet. A ``*`` that another
-#: ``*`` follows is an asterism (``* * *``), not a bullet.
-_LIST_MD = re.compile(r"^[ \t]*(?:\d{1,3}\.|[-•·]|\*(?![ \t]*\*))[ \t]+\S")
+#: A list item by its shape: a bullet. A ``*`` that another ``*``
+#: follows is an asterism (``* * *``), not a bullet. An enumerator
+#: (``5. ``) is not here: on the corpus it opens a footnote or a
+#: numbered paragraph far more often than a list, so a list of
+#: enumerated items is the engine's label (``kind``) and never the
+#: shape of the line.
+_LIST_MD = re.compile(r"^[ \t]*(?:[-•·]|\*(?![ \t]*\*))[ \t]+\S")
 _TABLE_START = re.compile(r"^\s*<table\b", re.I)
 #: A tag of either dialect: a name and attributes with values. Surya
 #: copies a literal angle bracket of the print unescaped (``"Untrue
@@ -96,7 +100,9 @@ _TAG_SHAPE = r"<(?P<close>/?)(?P<name>[a-zA-Z][a-zA-Z0-9]*)(?:\s+[a-zA-Z-]+=\"[^
 #: and a case name wraps) and no more: a star page (``at *5``) opens
 #: like an italic, and the closer must not be found lines away.
 _MD = re.compile(
-    r"(?P<strong>\*\*(?!\s)(?P<strong_in>.+?)(?<!\s)\*\*)"
+    r"(?P<escape>\\(?P<escaped>[*_#\\]))"
+    r"|(?P<both>\*\*\*(?!\s)(?P<both_in>[^*\n]+?)(?<!\s)\*\*\*)"
+    r"|(?P<strong>\*\*(?!\s)(?P<strong_in>.+?)(?<!\s)\*\*)"
     r"|(?P<em>(?<![\w*])\*(?![\s*])(?P<em_in>[^*\n]+?(?:\n[^*\n]+?)?)(?<![\s*])\*(?![\w*]))"
     r"|(?P<latex>\$\^\{(?P<latex_in>[^}]*)\}\$)"
     rf"|(?P<usup>[{SUP_CHARS}]+)"
@@ -186,7 +192,17 @@ def _scan_markdown(text: str, out: _Out) -> None:
         out.add(text[at : match.start()])
         at = match.end()
         group = match.lastgroup
-        if group == "strong":
+        if group == "escape":
+            # A markdown escape: ``\*`` is the character, as the print
+            # has it (Mistral writes an asterism as ``\* \* \*``).
+            out.add(match.group("escaped"))
+        elif group == "both":
+            out.begin(STRONG)
+            out.begin(EM)
+            _scan_markdown(match.group("both_in"), out)
+            out.end(EM)
+            out.end(STRONG)
+        elif group == "strong":
             out.begin(STRONG)
             _scan_markdown(match.group("strong_in"), out)
             out.end(STRONG)

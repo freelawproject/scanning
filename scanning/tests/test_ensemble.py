@@ -2960,3 +2960,18 @@ class TestTheContentStays(TestCase):
     def test_plain_folds_the_whitespace_and_nothing_else(self):
         self.assertEqual(ensemble.plain("a  <x>\nb"), "a <x> b")
         self.assertEqual(ensemble.plain("###"), "")
+
+    def test_the_rows_follow_the_source_of_the_text(self):
+        """A majority without dots.mocr shows Mistral's rows."""
+        group = three(
+            ("a b", [], "table"),
+            ("a b c", [], "table"),
+            ("a b c", [], "table"),
+        )
+        group["engines"]["dots_mocr"]["table"] = [["a", "b"]]
+        group["engines"]["mistral_ocr"]["table"] = [["a", "b", "c"]]
+        answer = ensemble.resolve(group)
+
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["source"], "mistral_ocr")
+        self.assertEqual(answer["table"], [["a", "b", "c"]])

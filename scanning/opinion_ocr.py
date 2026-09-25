@@ -435,9 +435,10 @@ ENGINES: dict[str, EngineSpec] = {
         band_labels={"Page-header": "header", "Page-footer": "footer"},
         zone_prefix="dots-",
         footnote_types=frozenset({"Footnote"}),
+        # ``Title`` is not here: dots writes it on two cells of a
+        # 1,293-page volume, and both are the caption's party names.
         kind_types={
             "Section-header": markup.HEADING,
-            "Title": markup.HEADING,
             "List-item": markup.LIST_ITEM,
             "Table": markup.TABLE,
         },
@@ -470,9 +471,8 @@ ENGINES: dict[str, EngineSpec] = {
         name="surya",
         key_field="surya_key",
         units_key="blocks",
-        # The block's flattened text, not its ``html``: the unit shape
-        # is one shape for every engine, and the markup stays in the
-        # volume document for a reader of the tables.
+        # The block's flattened text is what the overlay reads
+        # (``fields``); the glue parses the ``html`` (``markup_key``).
         text_key="text",
         type_key="label",
         frame=_page_frame,

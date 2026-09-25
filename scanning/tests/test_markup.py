@@ -59,10 +59,37 @@ class TestParseMarkdown(SimpleTestCase):
                     (parsed.kind, parsed.text), (markup.HEADING, "II.")
                 )
 
-    def test_an_enumerated_line_is_a_list_item_that_keeps_its_number(self):
-        parsed = markup.parse_markdown("1. The Second Circuit assumed that")
+    def test_an_enumerated_line_is_a_paragraph_unless_the_label_says_list(
+        self,
+    ):
+        # A footnote and a numbered paragraph open with ``5. `` too.
+        parsed = markup.parse_markdown("5. As discussed, supra note 1")
+        self.assertEqual(parsed.kind, markup.PARAGRAPH)
+        self.assertEqual(parsed.text, "5. As discussed, supra note 1")
+        parsed = markup.parse_markdown(
+            "1. The first item", kind=markup.LIST_ITEM
+        )
         self.assertEqual(parsed.kind, markup.LIST_ITEM)
-        self.assertEqual(parsed.text, "1. The Second Circuit assumed that")
+        self.assertEqual(parsed.text, "1. The first item")
+
+    def test_a_markdown_escape_is_the_character(self):
+        parsed = markup.parse_markdown(
+            "Rule 12(b)\\* and \\* \\* \\* and \\_x\\_ \\#"
+        )
+        self.assertEqual(parsed.text, "Rule 12(b)* and * * * and _x_ #")
+        self.assertEqual(parsed.marks, [])
+
+    def test_bold_italic_is_both_marks(self):
+        parsed = markup.parse_markdown("#### ***Loss of Access and Parking***")
+        self.assertEqual(parsed.text, "Loss of Access and Parking")
+        self.assertEqual(
+            marked(parsed),
+            [
+                (STRONG, "Loss of Access and Parking"),
+                (EM, "Loss of Access and Parking"),
+            ],
+        )
+        self.assertEqual(parsed.kind, markup.HEADING)
 
     def test_a_bullet_is_a_list_item_and_an_asterism_is_text(self):
         self.assertEqual(
