@@ -572,6 +572,15 @@ def union_marks(
     words of ``text`` that :func:`_aligned` pairs with its own, and the
     rest stay unmarked.
 
+    A ``sup`` carries only between two words of the same key (#423).
+    The alignment pairs a replaced word of the same count, and an
+    italic over the whole word belongs to it whatever character the
+    engine misread. A superscript is a range of characters inside the
+    word, and that range means nothing in a word of other characters:
+    Surya's ``1407This`` would put its star-page superscript over all
+    of ``This``. A lost superscript is the smaller error, because a
+    wrong one reads as a footnote the print does not have.
+
     :param text: The group's text, the one the marks are over.
     :param readings: ``[(an engine's text, its marks)]`` for every
         engine that read the group.
@@ -592,7 +601,10 @@ def union_marks(
             found = flags[there]
             merged[here][markup.EM] |= found[markup.EM]
             merged[here][markup.STRONG] |= found[markup.STRONG]
-            if found[markup.SUP] is not None:
+            if (
+                found[markup.SUP] is not None
+                and keys[here] == other_keys[there]
+            ):
                 held = merged[here][markup.SUP]
                 merged[here][markup.SUP] = (
                     found[markup.SUP]

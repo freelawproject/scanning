@@ -37,6 +37,7 @@ from scanning.tests.test_ensemble import (
     EnsembleTestCase,
     em,
     engine_page,
+    sup,
     unit,
 )
 from scanning.tests.test_views import ScanningTestCase
@@ -342,6 +343,37 @@ class TestTheTextEdit(TestCase):
             "Lewis v. Marcotte,",
         )
         self.assertEqual(edited["text"][italic[0]["end"] :], " here")
+
+    def test_an_edit_brings_back_no_superscript_of_other_characters(self):
+        """The edit carries the marks with the alignment of the
+        ensemble, so the #423 rule holds for the curator's text too."""
+        dots = [unit("dots_mocr", 0, BODY_A_PT, "This case is a companion")]
+        mistral = [
+            unit(
+                "mistral_ocr",
+                0,
+                BODY_A_PT,
+                "1407This case is a companion",
+                marks=[sup(0, 4)],
+            )
+        ]
+        group = group_at(page_with(dots, mistral), BODY_A_PT)
+        self.assertEqual(group["marks"], [])
+
+        page = page_with(
+            dots,
+            mistral,
+            [
+                entry(
+                    OpinionEdit.Kind.TEXT,
+                    BODY_A_PT,
+                    base_text=group["text"],
+                    text="This case is a companion case",
+                )
+            ],
+        )
+
+        self.assertEqual(group_at(page, BODY_A_PT)["marks"], [])
 
     def test_a_page_nobody_read_holds_no_edit(self):
         pages = {
