@@ -402,6 +402,78 @@ class TestTheOffsets(SimpleTestCase):
         )
 
 
+class TestTheBlockMark(SimpleTestCase):
+    """A blockquote is written once, at its edges (#411)."""
+
+    def test_a_blockquote_over_two_paragraphs_is_one_element(self):
+        text = "The quote one.\n\nThe quote two.\n\nThe body."
+        parsed = Parsed(text=text, marks=[Mark(0, 30, markup.BLOCKQUOTE)])
+
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<blockquote>The quote one.\n\nThe quote two.</blockquote>"
+            "\n\nThe body.",
+        )
+
+    def test_an_inline_mark_inside_is_its_own_element(self):
+        text = "In Lewis v. Marcotte the court"
+        parsed = Parsed(
+            text=text,
+            marks=[Mark(0, len(text), markup.BLOCKQUOTE), Mark(3, 20, EM)],
+        )
+
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<blockquote>In <em>Lewis v. Marcotte</em> the court</blockquote>",
+        )
+
+    def test_an_inline_mark_across_an_edge_is_cut_there(self):
+        text = "the body Lewis v. Marcotte"
+        parsed = Parsed(
+            text=text,
+            marks=[Mark(9, len(text), markup.BLOCKQUOTE), Mark(4, 14, EM)],
+        )
+
+        self.assertEqual(
+            markup.serialize(parsed),
+            "the <em>body </em><blockquote><em>Lewis</em> v. Marcotte"
+            "</blockquote>",
+        )
+
+    def test_two_blockquotes_are_two_elements(self):
+        text = "one\n\nbody\n\ntwo"
+        parsed = Parsed(
+            text=text,
+            marks=[
+                Mark(0, 3, markup.BLOCKQUOTE),
+                Mark(11, 14, markup.BLOCKQUOTE),
+            ],
+        )
+
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<blockquote>one</blockquote>\n\nbody\n\n"
+            "<blockquote>two</blockquote>",
+        )
+
+    def test_the_text_inside_is_escaped(self):
+        parsed = Parsed(text="A & B", marks=[Mark(0, 5, markup.BLOCKQUOTE)])
+
+        self.assertEqual(
+            markup.serialize(parsed), "<blockquote>A &amp; B</blockquote>"
+        )
+
+    def test_no_parser_writes_a_block_mark(self):
+        """The mark is the ensemble's, off the zone, never the text's."""
+        for parsed in (
+            markup.parse_markdown("> a quote"),
+            markup.parse_html("<blockquote>a quote</blockquote>"),
+        ):
+            self.assertEqual(
+                [m for m in parsed.marks if m.kind in markup.BLOCK_MARKS], []
+            )
+
+
 class TestShift(SimpleTestCase):
     def test_a_mark_after_a_deletion_moves_left(self):
         marks = [Mark(4, 9, EM)]
