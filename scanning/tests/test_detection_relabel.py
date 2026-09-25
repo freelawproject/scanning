@@ -271,6 +271,39 @@ class TestRefreshOnMerge(DetectJobsMixin, TestCase):
         )
         self.assertEqual(yolo._merge_attempts(second), 0)
 
+    def _edit_row(self, run, job_run, status):
+        return ExternalJob.objects.create(
+            scan=run.scan,
+            stage=JobStage.DETECT,
+            engine=JobEngine.BLACKLETTER,
+            run=job_run,
+            shard_index=0,
+            shard_count=1,
+            apply_run=run,
+            input_key="jobs/apply/pages/e1.pdf",
+            input_manifest={"edit_id": 1},
+            status=status,
+        )
+
+    def test_a_dead_re_read_of_the_edited_pages_holds_the_merge(self):
+        # It has no result to read, so a glue past it fails the same way
+        # on every tick and spends the merge ledger.
+        scan, run, second = self.build_with_run()
+        self._edit_row(run, 9, JobStatus.FAILED)
+        self.download.reset_mock()
+
+        self.assertEqual(yolo.finish_ready_runs(), 0)
+
+        self.download.assert_not_called()
+        self.assertEqual(yolo._merge_attempts(second), 0)
+
+    def test_a_dead_earlier_read_is_not_the_live_one(self):
+        scan, run, _ = self.build_with_run()
+        self._edit_row(run, 8, JobStatus.FAILED)
+        self._edit_row(run, 9, JobStatus.CONSUMED)
+
+        self.assertFalse(apply.detections_refresh_waits(scan))
+
     def test_a_failed_refresh_counts_on_the_merge_and_consumes_nothing(self):
         scan, _, second = self.build_with_run()
 
@@ -451,6 +484,28 @@ class TestStaleLabels(TestCase):
         self.assertEqual(volume[0].run, max(r.run for r in new_edits) + 1)
         self.assertEqual({r.status for r in volume}, {JobStatus.COMPLETED})
         self.assertIn("(edited pages)", out)
+
+    def test_a_dead_run_is_read_again_not_counted_current(self):
+        scan = self._scan(stale=False)
+        rows = yolo.live_detect_jobs(scan)
+        ExternalJob.objects.filter(pk=rows[0].pk).update(
+            status=JobStatus.FAILED
+        )
+        ExternalJob.objects.filter(pk=rows[1].pk).update(
+            status=JobStatus.COMPLETED
+        )
+
+        out, _ = self._call("--read-since", timezone.now().isoformat())
+
+        fresh = yolo.live_detect_jobs(scan)
+        self.assertEqual(fresh[0].run, 2)
+        # The dead shard is read again and the good one carried.
+        self.assertEqual(
+            [r.status for r in fresh],
+            [JobStatus.PENDING, JobStatus.COMPLETED],
+        )
+        self.assertIn("(volume, dead)", out)
+        self.assertIn("1 run(s) started, 0 adopted, 0 current", out)
 
     def test_it_goes_alone(self):
         with self.assertRaises(CommandError):
