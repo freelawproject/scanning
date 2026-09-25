@@ -2563,21 +2563,30 @@ def _detections_to_refresh(scan: Scan) -> ApplyRun | None:
 def detections_refresh_waits(scan: Scan) -> bool:
     """Return whether the re-glue of :func:`refresh_detections` must wait.
 
-    It waits while a detection row of the standing run's edited pages
-    is unstarted or in flight: a re-read of those pages (#338) is the
-    input the new glue reads for them.
+    It waits while a row of the live detection run of the standing
+    run's edited pages is unstarted, in flight or dead, the rule of
+    :func:`_stage_blocked`: a re-read of those pages (#338) is the
+    input the new glue reads for them, and a dead one has no result to
+    read, so gluing past it would spend the merge ledger on a failure
+    that repeats. The live run alone, because the rows of an earlier
+    read of the same pages stay on the apply run; a dead re-read goes
+    back through ``enqueue_yolo_detect --stale-labels``, whose new run
+    carries every page that was read.
 
     :param scan: The scan.
     :returns: Whether to leave the merge of the volume run for a later
         tick.
     :rtype: bool
     """
+    from scanning import jobs
+
     run = _detections_to_refresh(scan)
     if run is None:
         return False
-    return run.jobs.filter(
-        stage=JobStage.DETECT, status__in=UNSTARTED_JOB_STATUSES
-    ).exists()
+    rows = jobs.live_run(
+        scan, JobStage.DETECT, JobEngine.BLACKLETTER, apply_run=run
+    )
+    return any(row.status in BLOCKING_JOB_STATUSES for row in rows)
 
 
 def refresh_detections(scan: Scan, volume_rows: list[ExternalJob]) -> bool:

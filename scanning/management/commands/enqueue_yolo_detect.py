@@ -41,7 +41,9 @@ read of their own when their rows are stale too. A run that finished
 after the worker image carried the class set is adopted with
 ``--read-since`` (its rows are stamped, and nothing is paid). The
 approved volumes are in the selection; ``reopen_redaction_review``
-takes them back to review 2 so the new detections are imported.
+takes them back to review 2 so the new detections are imported. A run
+that holds a dead row is read again too, carrying what it read, so a
+dead re-read goes back through this same command.
 
     # Say which volumes a re-read would take, leaving partner scans out.
     docker exec scanning-daemon python manage.py enqueue_yolo_detect \\
@@ -288,8 +290,14 @@ class Command(BaseCommand):
                 if run is not None
                 else []
             )
+            # A completed row of a dead run waits for a merge that never
+            # comes, so it holds nothing; its result is carried.
             open_rows = [
-                r for r in rows + edit_rows if r.status in OPEN_STATUSES
+                r
+                for group in (rows, edit_rows)
+                for r in group
+                if r.status in OPEN_STATUSES
+                and not (r.status == JobStatus.COMPLETED and _dead(group))
             ]
             if open_rows:
                 skipped += 1
@@ -299,13 +307,18 @@ class Command(BaseCommand):
                 )
                 continue
 
+            # A run with a dead row is read again as well, whatever its
+            # class set: it never merged, and counted as current it
+            # would drop out of the report. The carry keeps what it read.
             stale = [
                 group
                 for group in (rows, edit_rows)
-                if group and not yolo.labels_current(group)
+                if group and (not yolo.labels_current(group) or _dead(group))
             ]
             took = [
-                g for g in stale if read_since and _read_after(g, read_since)
+                g
+                for g in stale
+                if read_since and not _dead(g) and _read_after(g, read_since)
             ]
             for group in took:
                 stale.remove(group)
@@ -381,8 +394,20 @@ def _names(stale, edit_rows) -> list[str]:
     :rtype: list[str]
     """
     return [
-        "edited pages" if group is edit_rows else "volume" for group in stale
+        ("edited pages" if group is edit_rows else "volume")
+        + (", dead" if _dead(group) else "")
+        for group in stale
     ]
+
+
+def _dead(rows) -> bool:
+    """Return whether a run holds a failed, cancelled or expired row.
+
+    :param rows: One run's rows.
+    :returns: Whether any row is dead.
+    :rtype: bool
+    """
+    return any(row.status in DEAD_JOB_STATUSES for row in rows)
 
 
 def _read_after(rows, since) -> bool:
