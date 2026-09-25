@@ -18,9 +18,12 @@ paragraph when all four are true:
    no edge.
 2. Nothing went between them: no group a redaction or a mask took is
    between A and B in the reading order (``after`` on the drop, schema
-   8 of the ensemble document).
+   9 of the ensemble document).
 3. The same kind of block: two paragraphs or two list items, with the
-   same blockquote flag.
+   same blockquote flag. A group a curator quoted in part
+   (``quote_span``, #419) is its parts: the text before the span, the
+   span, and the text after, each a paragraph of its own with its own
+   flag, and only the first part can join the group above it.
 4. The text says the sentence goes on (:func:`continues`).
 
 A column that ends at the end of a sentence, with a capital letter at
@@ -276,6 +279,59 @@ def _append(paragraph: dict, item: dict, edge: str) -> None:
     paragraph["human"] = paragraph["human"] or bool(group.get("human"))
 
 
+def _quote_parts(item: dict) -> list[dict]:
+    """Return the items of one group, cut at its quoted span (#419).
+
+    A group with no ``quote_span`` is one item. A group with one is up
+    to three: the text before the span, the span with the blockquote
+    flag, and the text after, each a copy of the group with its own
+    text and its own marks. The whitespace at the edge of a part is no
+    word of it, and a part with no word is left out.
+
+    :param item: One item of the flow with a ``group``.
+    :returns: The items.
+    :rtype: list[dict]
+    """
+    group = item["group"]
+    span = group.get("quote_span")
+    if not span:
+        return [item]
+    text = group.get("text") or ""
+    parts = []
+    for start, end, quoted in (
+        (0, span[0], False),
+        (span[0], span[1], True),
+        (span[1], len(text), False),
+    ):
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end <= start:
+            continue
+        marks = [
+            {
+                **mark,
+                "start": max(mark["start"], start) - start,
+                "end": min(mark["end"], end) - start,
+            }
+            for mark in group.get("marks") or []
+            if min(mark["end"], end) > max(mark["start"], start)
+        ]
+        parts.append(
+            {
+                **item,
+                "group": {
+                    **group,
+                    "text": text[start:end],
+                    "marks": marks,
+                    "blockquote": quoted,
+                },
+            }
+        )
+    return parts
+
+
 def body(document: dict) -> list[dict]:
     """Return the body text of an opinion, one entry per paragraph.
 
@@ -286,13 +342,16 @@ def body(document: dict) -> list[dict]:
     paragraphs: list[dict] = []
     before = None
     for item in _flow(document, BODY_SECTION):
-        if "group" in item:
-            edge = _joins(before, item)
+        if "group" not in item:
+            before = item
+            continue
+        for place, part in enumerate(_quote_parts(item)):
+            edge = _joins(before, part) if place == 0 else None
             if edge and paragraphs:
-                _append(paragraphs[-1], item, edge)
+                _append(paragraphs[-1], part, edge)
             else:
-                paragraphs.append(_paragraph(item))
-        before = item
+                paragraphs.append(_paragraph(part))
+            before = part
     return paragraphs
 
 

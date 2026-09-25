@@ -299,6 +299,60 @@ class TestTheBody(TestCase):
         )
         self.assertTrue(entries[2]["blockquote"])
 
+    def test_a_group_quoted_in_part_is_its_parts(self):
+        """A curator quoted the first paragraph of a box that holds a
+        quote and a paragraph of the body (#419): two paragraphs, each
+        with its flag, and each with its own marks."""
+        quote = '"(1) Dangerous weapon means any weapon."'
+        rest = "Defendant points to several statutes."
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        f"{quote} {rest}",
+                        quote_span=[0, len(quote)],
+                        marks=[{"start": 5, "end": 14, "kind": "em"}],
+                    )
+                ],
+            )
+        )
+
+        entries = paragraphs.body(doc)
+
+        self.assertEqual(texts(entries), [quote, rest])
+        self.assertEqual([e["blockquote"] for e in entries], [True, False])
+        self.assertEqual(
+            entries[0]["marks"], [{"start": 5, "end": 14, "kind": "em"}]
+        )
+        self.assertEqual(entries[1]["marks"], [])
+
+    def test_only_the_first_part_joins_the_group_above(self):
+        """A span that starts the text is a quote, so it joins a quote
+        above it at a column edge, and the text after it never joins."""
+        quote = "no person shall enter"
+        rest = "The court held so."
+        doc = document(
+            page(
+                0,
+                [
+                    group(0, "the statute says", blockquote=True),
+                    group(
+                        1,
+                        f"{quote} {rest}",
+                        column="R",
+                        quote_span=[0, len(quote)],
+                    ),
+                ],
+            )
+        )
+
+        entries = paragraphs.body(doc)
+
+        self.assertEqual(texts(entries), [f"the statute says\n{quote}", rest])
+        self.assertEqual([e["blockquote"] for e in entries], [True, False])
+
     def test_a_page_with_no_body_between_is_a_break(self):
         doc = document(
             page(0, [group(0, "the court")]),
