@@ -119,18 +119,72 @@
         spages.innerHTML = html;
     }
 
+    // A watched step 1 is editable (AWAITING_VALIDATION is not in
+    // LOCKED_STATUSES), so a reload waits until the page is quiet: no
+    // write in flight, no field with focus, no open modal. Every write
+    // of the viewers goes through fetch, so counting the non-GET
+    // requests counts them all.
+    var writesInFlight = 0;
+    if (cfg.progressWatch && typeof window.fetch === "function") {
+        var nativeFetch = window.fetch;
+        window.fetch = function (input, init) {
+            var method = ((init && init.method) || "GET").toUpperCase();
+            if (method === "GET") return nativeFetch.apply(this, arguments);
+            writesInFlight += 1;
+            var done = function () {
+                writesInFlight -= 1;
+            };
+            var request = nativeFetch.apply(this, arguments);
+            request.then(done, done);
+            return request;
+        };
+    }
+
+    function pageIsQuiet() {
+        if (writesInFlight > 0) return false;
+        if (document.querySelector(".dupe-modal-overlay")) return false;
+        var el = document.activeElement;
+        if (!el) return true;
+        var tag = el.tagName;
+        return !(
+            tag === "INPUT" ||
+            tag === "TEXTAREA" ||
+            tag === "SELECT" ||
+            el.isContentEditable
+        );
+    }
+
+    function reloadWhenQuiet() {
+        if (pageIsQuiet()) {
+            window.location.reload();
+            return;
+        }
+        var amsg = document.getElementById("awaiting-msg");
+        if (amsg)
+            amsg.textContent =
+                "Review 1 is open. This page reloads when you finish your edit.";
+        setTimeout(reloadWhenQuiet, 1000);
+    }
+
     function watch() {
         if (document.hidden) {
             setTimeout(watch, WATCH_INTERVAL_MS);
             return;
         }
-        fetch(apiUrl)
+        fetch(apiUrl + "?watch=1")
             .then(function (r) {
+                if (!r.ok) throw new Error("progress " + r.status);
                 return r.json();
             })
             .then(function (data) {
+                // Reload only on an answer that names a status: an
+                // error body without one must not reload every load.
+                if (typeof data.status !== "string") {
+                    setTimeout(watch, WATCH_INTERVAL_MS);
+                    return;
+                }
                 if (data.status !== cfg.progressWatch) {
-                    window.location.reload();
+                    reloadWhenQuiet();
                     return;
                 }
                 var amsg = document.getElementById("awaiting-msg");

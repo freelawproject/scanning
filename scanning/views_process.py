@@ -1036,12 +1036,16 @@ def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
         "current": scan.progress_current,
         "total": scan.progress_total,
         "message": scan.progress_message,
-        "log": scan.progress_log,
     }
-    # Include ocr_results when available so the frontend can render
-    # the pages sidebar live without a full page reload.
-    if scan.ocr_results:
-        data["ocr_results"] = scan.ocr_results
+    # The watch of a parked page (#332, ``?watch=1``) reads the status
+    # and the run summaries alone, every five seconds and maybe for a
+    # long park, so it gets neither the log nor the pages.
+    if request.GET.get("watch") != "1":
+        data["log"] = scan.progress_log
+        # Include ocr_results when available so the frontend can render
+        # the pages sidebar live without a full page reload.
+        if scan.ocr_results:
+            data["ocr_results"] = scan.ocr_results
     # Neither GPU stage moves a scan status, so a viewer polling this
     # would otherwise see nothing happen for a whole run (#190, #195).
     dots_run = dots_mocr.run_summary(scan)

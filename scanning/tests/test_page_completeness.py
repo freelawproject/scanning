@@ -1292,6 +1292,25 @@ class TestTheParkedPageWatches(ScanningTestCase):
         self.assertNotContains(response, self.POLLER)
         self.assertNotContains(response, "progressUrl")
 
+    def test_the_watch_poll_leaves_out_the_pages_and_the_log(self):
+        """The watch polls every five seconds for as long as the park
+        lasts, and reads the status and the run summaries alone."""
+        scan = ScanFactory(
+            status=Status.AWAITING_VALIDATION,
+            page_count=2,
+            ocr_results=dots_results(),
+        )
+        url = reverse("progress_api", kwargs={"pk": scan.pk})
+
+        watched = self.client.get(url + "?watch=1").json()
+        busy = self.client.get(url).json()
+
+        self.assertEqual(watched["status"], Status.AWAITING_VALIDATION)
+        self.assertNotIn("ocr_results", watched)
+        self.assertNotIn("log", watched)
+        self.assertIn("ocr_results", busy)
+        self.assertIn("log", busy)
+
     def test_a_watched_status_is_neither_busy_nor_a_review(self):
         """A watched status is the viewer's question alone: it must not
         join the stale sweep or the unpolled review states."""
