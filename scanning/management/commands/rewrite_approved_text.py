@@ -74,8 +74,10 @@ class Command(BaseCommand):
         """
         dry_run = options["dry_run"]
         pks = options["scan_pks"]
-        if options["all"] == bool(pks):
+        if options["all"] and pks:
             raise CommandError("name the scans or pass --all, not both")
+        if not options["all"] and not pks:
+            raise CommandError("name the scans, or pass --all")
         for pk in pks:
             if not Scan.objects.filter(pk=pk).exists():
                 raise CommandError(f"scan {pk} does not exist")
@@ -88,8 +90,15 @@ class Command(BaseCommand):
         for opinion in rows.order_by(
             "scan_id", "first_printed_page", "index_in_page"
         ):
+            if opinion.approved_at is None:
+                # An approval that names no time names no key.
+                failed += 1
+                self.stderr.write(
+                    f"{opinion} of scan {opinion.scan_id}: no approval time"
+                )
+                continue
             key = opinion_review.approved_key(
-                opinion, opinion.ensemble_edit_revision
+                opinion, opinion.ensemble_edit_revision, opinion.approved_at
             )
             if key == opinion.approved_text_key:
                 current += 1

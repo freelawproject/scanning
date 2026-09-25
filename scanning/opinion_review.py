@@ -15,12 +15,12 @@ and none of them writes a second copy.
 
 **The write** is the order of ``ensemble.write``: the object first,
 the row second. The object goes to a key of its own, outside the glue
-prefix (:func:`approved_key`), so no re-glue and no delete of a
-replaced ensemble document (#376) reaches it, and nothing overwrites
-it. The row moves by a compare-and-swap over the status and the three
-revisions the curator saw, under a lock, with the blocking cards read
-again inside it: a dismissal is not a revision, and a rebuild between
-the read and the swap can write a card.
+prefix (:func:`approved_key`), one key per approval, so no re-glue and
+no delete of a replaced ensemble document (#376) reaches it, and
+nothing overwrites it. The row moves by a compare-and-swap over the
+status and the three revisions the curator saw, under a lock, with the
+blocking cards read again inside it: a dismissal is not a revision, and
+a rebuild between the read and the swap can write a card.
 
 The gate of the status lives here and in the view alike, the rule of
 every refused write: :func:`approve_text` refuses on its own, so a
@@ -28,6 +28,7 @@ caller that is not the view cannot skip it.
 """
 
 import logging
+from datetime import UTC, datetime
 
 from django.db import transaction
 from django.db.models import Q
@@ -117,18 +118,27 @@ def blocking_findings(opinion: Opinion):
 def approved_key(
     opinion: Opinion,
     edit_revision: int,
+    approved_at: datetime,
     join_rule: int | None = None,
 ) -> str:
     """Return the S3 key of the approved text of one approval.
 
-    Outside the ``r{n}/`` glue prefix. The edit revision is in the key,
-    because a reopen plus one edit gives a second approval at the same
-    glue revision, and the join rule is in it, because
-    ``rewrite_approved_text`` writes the same approval again under a
-    new rule. So no two texts share a key.
+    Outside the ``r{n}/`` glue prefix. **Every approval has a key of its
+    own**: the time of the approval is in it. The revisions alone do not
+    tell two approvals apart, because a staff reopen moves none of them,
+    and a re-run after a reopen can write another text at the same
+    revisions. A key of the revisions would then give a second approval
+    the object of the first, with the first curator's name or a text
+    the second curator did not see. Two curators who approve at once
+    get two keys too, and the one whose swap loses deletes its own.
+
+    The row holds the time (``approved_at``), so the key is derived
+    from the row, and ``rewrite_approved_text`` writes the same approval
+    under a new join rule at a key that differs in the rule alone.
 
     :param opinion: The row, at the revision of the approval.
     :param edit_revision: The edit revision of the approved text.
+    :param approved_at: The time of the approval.
     :param join_rule: The rule of the text; None is the rule of this
         code, read at the call.
     :returns: The key.
@@ -136,11 +146,12 @@ def approved_key(
     """
     if join_rule is None:
         join_rule = paragraphs.JOIN_RULE
+    stamp = approved_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
     return (
         f"{prefix}jobs/opinions/{opinion.first_printed_page}."
         f"{opinion.index_in_page}/approved/r{opinion.glue_revision}."
-        f"e{edit_revision}.j{join_rule}.json"
+        f"e{edit_revision}.j{join_rule}.t{stamp}.json"
     )
 
 
@@ -186,9 +197,9 @@ def _document(opinion: Opinion) -> dict:
 def _put(key: str, text: dict) -> bool:
     """Write the approved text once, and say whether this call wrote it.
 
-    A key that holds an object already holds the same text: the same
-    revisions and the same rule give the same flow. That object is
-    kept, so nothing overwrites an approved text.
+    A key names one approval (:func:`approved_key`), so an object at it
+    is that approval's own, written by an earlier try of the same
+    write. It is kept, so nothing overwrites an approved text.
 
     :param key: :func:`approved_key`.
     :param text: The approved object.
@@ -271,7 +282,7 @@ def approve_text(
         getattr(user, "username", "") or "",
         now.isoformat(),
     )
-    key = approved_key(opinion, opinion.ensemble_edit_revision)
+    key = approved_key(opinion, opinion.ensemble_edit_revision, now)
     wrote = _put(key, text)
 
     try:
@@ -354,9 +365,14 @@ def rewrite_text(opinion: Opinion) -> str | None:
     :raises ApprovalRefused: When the row is not approved, when an input
         does not load, or when the row moved during the write.
     """
-    if opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE:
+    if (
+        opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
+        or opinion.approved_at is None
+    ):
         raise ApprovalRefused(CLOSED)
-    key = approved_key(opinion, opinion.ensemble_edit_revision)
+    key = approved_key(
+        opinion, opinion.ensemble_edit_revision, opinion.approved_at
+    )
     if key == opinion.approved_text_key:
         return None
     document = _document(opinion)

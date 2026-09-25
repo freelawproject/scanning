@@ -59,18 +59,21 @@
     </a>
     {% endif %}
     {% comment %}
-      The approval (#375). Held while a blocking card is open: the
-      endpoint refuses it then, and a button the endpoint would refuse
-      is the one thing a viewer must never offer. A warning card asks
+      The approval (#375). Held while a blocking card is open, and
+      while the last edit is not in the text: the endpoint refuses it
+      then, and a button the endpoint would refuse is the one thing a
+      viewer must never offer. The script holds it on a document older
+      than data-min-schema, a fact of the bucket this render never reads. A warning card asks
       for a confirm. The script sends the revisions of the text it
       drew, so the curator approves the text they saw.
     {% endcomment %}
     {% if can_approve %}
     <button type="button" id="approve-text" class="btn-primary text-sm"
             data-open-warnings="{{ open_warnings }}"
-            {% if blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
+            data-min-schema="{{ min_document_schema }}"
+            {% if approve_not_built %}disabled title="The last edit is not in the text yet: press Read the OCR documents again"{% elif blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
       <i class="fa-solid fa-check"></i>
-      {% if blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
+      {% if approve_not_built %}The last edit is not in the text yet{% elif blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
     </button>
     {% endif %}
     {% if can_reopen %}

@@ -2453,6 +2453,21 @@
      * template writes disabled, and the server refuses it too. Both
      * answers are Django messages, so the page reloads to show them.
      */
+    function holdOldApproval() {
+        // The approval reads a document of this schema or later (#375),
+        // and the endpoint refuses an older one. The render never reads
+        // the bucket, so the page holds the button once it has the
+        // document, and the template writes the least schema.
+        var approve = document.getElementById('approve-text');
+        if (!approve || !doc) { return; }
+        var least = Number(approve.dataset.minSchema || 0);
+        if ((doc.schema_version || 0) >= least) { return; }
+        approve.disabled = true;
+        approve.title = 'This text was written by an older version. Press '
+            + '"Read the OCR documents again", then approve.';
+        approve.textContent = 'Read the OCR documents again to approve';
+    }
+
     function bindApproval() {
         var approve = document.getElementById('approve-text');
         if (approve) {
@@ -2530,6 +2545,7 @@
                     );
                 }
                 bindUnresolvedCards();
+                holdOldApproval();
                 if (!hasLevels()) {
                     textColumn.insertBefore(note(
                         'opinion-text-error',

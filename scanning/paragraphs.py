@@ -81,8 +81,13 @@ LEFT = "L"
 RIGHT = "R"
 
 #: A text that ends a sentence: end punctuation, then any closing
-#: quotes or brackets, then space.
-_SENTENCE_END = re.compile(r"[.?!:;][\"'”’)\]]*\s*$")
+#: quotes or brackets, then a footnote mark an engine did not mark as
+#: ``sup`` (up to three digits, or superscript digits, with no space
+#: before them), then space. A citation puts a space before its number
+#: ("p. 12", "§ 12"), so the mark does not take one.
+_SENTENCE_END = re.compile(
+    r"[.?!:;][\"'”’)\]]*(?:\d{1,3}|[\u00b9\u00b2\u00b3\u2070-\u2079]{1,3})?\s*$"
+)
 
 #: A word cut by a hyphen at the end of the text.
 _HYPHEN_END = re.compile(r"[^\W\d_]-\s*$")
@@ -207,9 +212,28 @@ def _joins(before: dict | None, after: dict) -> str | None:
         return None
     if bool(above.get("blockquote")) != bool(below.get("blockquote")):
         return None
-    if not continues(above.get("text") or "", below.get("text") or ""):
+    if not continues(_before_mark(above), below.get("text") or ""):
         return None
     return edge
+
+
+def _before_mark(group: dict) -> str:
+    """Return the text of a group without a footnote mark at its end.
+
+    A sentence at the foot of a column often ends in a footnote mark,
+    "held so.12", with the number as a ``sup`` mark. The test of the
+    end reads the text before that mark, or the digit of the mark would
+    say the sentence goes on and join two paragraphs.
+
+    :param group: The group above the edge.
+    :returns: Its text, cut at the start of a ``sup`` mark that ends it.
+    """
+    text = group.get("text") or ""
+    end = len(text.rstrip())
+    for mark in group.get("marks") or []:
+        if mark.get("kind") == "sup" and mark["end"] >= end > mark["start"]:
+            return text[: mark["start"]]
+    return text
 
 
 def _paragraph(item: dict, text: str | None = None, marks=None) -> dict:

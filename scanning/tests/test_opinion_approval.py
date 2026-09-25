@@ -11,12 +11,13 @@ a compare-and-swap. Four groups here:
 - the staff reopen and the rewrite under a new join rule.
 """
 
+import pathlib
 from io import StringIO
 from unittest.mock import patch
 
 from django.contrib import messages
 from django.contrib.messages import get_messages
-from django.core.management import call_command
+from django.core.management import CommandError, call_command
 from django.test import override_settings
 from django.urls import reverse
 
@@ -186,7 +187,7 @@ class TestTheWrite(ApprovalTestCase):
         self.assertEqual(self.opinion.approved_by, user)
         self.assertIsNotNone(self.opinion.approved_at)
         self.assertIn("/approved/r", key)
-        self.assertTrue(key.endswith(f".j{paragraphs.JOIN_RULE}.json"))
+        self.assertIn(f".j{paragraphs.JOIN_RULE}.t", key)
         self.assertNotIn(self.opinion.glue_prefix, key)
         text = self.uploads[key]
         self.assertEqual(text["schema"], paragraphs.APPROVED_SCHEMA)
@@ -239,10 +240,10 @@ class TestTheWrite(ApprovalTestCase):
                 opinion_review.approve_text(self.opinion, None)
 
         self.assertEqual(caught.exception.code, opinion_review.MOVED)
-        key = opinion_review.approved_key(
-            self.opinion, self.opinion.ensemble_edit_revision
-        )
-        delete.assert_called_once_with([key])
+        (keys,), _ = delete.call_args
+        self.assertEqual(len(keys), 1)
+        self.assertIn(keys[0], self.uploads)
+        self.assertIn("/approved/", keys[0])
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.approved_text_key, "")
 
@@ -267,17 +268,81 @@ class TestTheWrite(ApprovalTestCase):
         self.assertEqual(caught.exception.code, opinion_review.BLOCKED)
         delete.assert_called_once()
 
-    def test_a_second_approval_at_the_same_key_writes_nothing(self):
+    def test_the_key_names_the_time_of_the_approval(self):
+        key = self.approve()
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            key,
+            opinion_review.approved_key(
+                self.opinion,
+                self.opinion.ensemble_edit_revision,
+                self.opinion.approved_at,
+            ),
+        )
+        stamp = self.opinion.approved_at.strftime("%Y%m%dT%H%M%S%fZ")
+        self.assertTrue(key.endswith(f".t{stamp}.json"))
+
+    def test_a_second_approval_after_a_reopen_writes_its_own_object(self):
+        """A reopen moves no revision, so the time tells them apart."""
+        first_user = ScanningTestCase.make_user(self)
+        first = self.approve(first_user)
+        self.opinion.refresh_from_db()
+        opinion_review.reopen_text(self.opinion, None)
+        second_user = ScanningTestCase.make_user(self)
+
+        second = self.approve(second_user)
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            self.objects[first]["approved_by"], first_user.username
+        )
+        self.assertEqual(
+            self.uploads[second]["approved_by"], second_user.username
+        )
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.approved_text_key, second)
+        self.assertEqual(self.opinion.approved_by, second_user)
+
+    def test_a_rerun_after_a_reopen_is_the_text_of_the_new_approval(self):
+        """A re-run can write another text at the same revisions: the
+        new approval holds that text, never the object of the first."""
+        first = self.approve()
+        self.opinion.refresh_from_db()
+        opinion_review.reopen_text(self.opinion, None)
+        document = self.stored()
+        body = next(
+            g
+            for g in document["pages"][0]["groups"]
+            if g["section"] == "text" and g["band"] == "body"
+        )
+        body["text"] = "A text the second curator saw"
+
+        second = self.approve()
+
+        flow = " ".join(
+            entry["text"] for entry in self.uploads[second]["body"]
+        )
+        self.assertIn("A text the second curator saw", flow)
+        self.assertNotIn(
+            "A text the second curator saw",
+            " ".join(entry["text"] for entry in self.objects[first]["body"]),
+        )
+
+    def test_an_object_at_the_key_is_kept(self):
+        """A retry of the same write finds its own object and keeps it."""
+        now = self.opinion.date_modified
         self.opinion.refresh_from_db()
         key = opinion_review.approved_key(
-            self.opinion, self.opinion.ensemble_edit_revision
+            self.opinion, self.opinion.ensemble_edit_revision, now
         )
-        self.objects[key] = {"schema": 1, "approved_by": "first"}
+        self.objects[key] = {"schema": 1, "approved_by": "the first try"}
 
-        self.assertEqual(self.approve(), key)
+        with patch("scanning.opinion_review.timezone.now", return_value=now):
+            self.assertEqual(self.approve(), key)
 
         self.assertNotIn(key, self.uploads)
-        self.assertEqual(self.objects[key]["approved_by"], "first")
+        self.assertEqual(self.objects[key]["approved_by"], "the first try")
 
     def test_a_failed_upload_refuses_and_moves_nothing(self):
         with patch("scanning.s3_sync.upload_json_object", return_value=False):
@@ -320,7 +385,10 @@ class TestTheRewrite(ApprovalTestCase):
 
         with patch.object(paragraphs, "JOIN_RULE", 2):
             key = opinion_review.approved_key(
-                self.opinion, self.opinion.ensemble_edit_revision, 2
+                self.opinion,
+                self.opinion.ensemble_edit_revision,
+                self.opinion.approved_at,
+                2,
             )
             call_command("rewrite_approved_text", "--all", stdout=StringIO())
 
@@ -484,3 +552,53 @@ class TestThePage(ApprovalTestCase, ScanningTestCase):
         self.assertTrue(response.context["can_reopen"])
         self.assertNotContains(response, 'id="approve-text"')
         self.assertContains(response, 'id="reopen-text"')
+
+    def test_an_edit_not_built_holds_the_button_with_the_reason(self):
+        """The endpoint refuses it (``NOT_BUILT``), so the page does."""
+        self.dismiss_blocking()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            edit_revision=self.opinion.edit_revision + 1
+        )
+
+        response = self.page_context()
+
+        self.assertTrue(response.context["approve_not_built"])
+        self.assertContains(response, 'disabled title="The last edit is not')
+        self.assertContains(response, "The last edit is not in the text yet")
+
+    def test_the_page_writes_the_least_schema_for_the_script(self):
+        response = self.page_context()
+
+        self.assertContains(
+            response,
+            f'data-min-schema="{opinion_review.MIN_DOCUMENT_SCHEMA}"',
+        )
+
+    def test_the_script_holds_the_button_on_an_old_document(self):
+        """The schema is a fact of the bucket: the script reads it."""
+        script = pathlib.Path(
+            "scanning/static/scanning/viewer_step3.js"
+        ).read_text()
+        body = script[script.index("function holdOldApproval") :]
+        body = body[: body.index("function bindApproval")]
+        self.assertIn("dataset.minSchema", body)
+        self.assertIn("doc.schema_version", body)
+        self.assertIn("approve.disabled = true", body)
+        self.assertIn("holdOldApproval();", script)
+
+
+class TestTheCommandArguments(ScanningTestCase):
+    """Each wrong call of the two commands has a message of its own."""
+
+    def test_neither_scans_nor_all_says_so(self):
+        for name in ("rewrite_approved_text", "rerun_opinion_ensemble"):
+            with self.assertRaisesMessage(
+                CommandError, "name the scans, or pass --all"
+            ):
+                call_command(name, stdout=StringIO())
+
+    def test_both_scans_and_all_says_so(self):
+        scan = ScanFactory()
+        for name in ("rewrite_approved_text", "rerun_opinion_ensemble"):
+            with self.assertRaisesMessage(CommandError, "not both"):
+                call_command(name, str(scan.pk), "--all", stdout=StringIO())

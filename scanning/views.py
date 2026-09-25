@@ -49,6 +49,7 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
+from scanning.opinion_review import MIN_DOCUMENT_SCHEMA
 from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
@@ -500,6 +501,15 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
                 for row, block in zip(findings, blocking)
                 if block and row.dismissal_id is None
             ),
+            # The two other refusals a render can know of (#375). An
+            # edit the text does not hold yet is a fact of the row, so
+            # the button says so here. The schema of the document is a
+            # fact of the bucket, which this view never reads: the
+            # script holds the button on a document older than this.
+            "approve_not_built": (
+                opinion.edit_revision != opinion.ensemble_edit_revision
+            ),
+            "min_document_schema": MIN_DOCUMENT_SCHEMA,
             "approve_url": address("approve_opinion_text"),
             "can_reopen": (
                 request.user.is_staff

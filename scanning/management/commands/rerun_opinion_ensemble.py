@@ -93,8 +93,10 @@ class Command(BaseCommand):
         """
         dry_run = options["dry_run"]
         pks = options["scan_pks"]
-        if options["all"] == bool(pks):
+        if options["all"] and pks:
             raise CommandError("name the scans or pass --all, not both")
+        if not options["all"] and not pks:
+            raise CommandError("name the scans, or pass --all")
         least = ALL_MIN_ENGINES if options["all"] else 0
         if options["all"]:
             pks = list(

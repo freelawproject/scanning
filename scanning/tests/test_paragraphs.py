@@ -79,6 +79,18 @@ class TestContinues(TestCase):
         self.assertFalse(paragraphs.continues('he said "no."', "The"))
         self.assertFalse(paragraphs.continues("(see id.)", "The"))
 
+    def test_a_footnote_mark_after_the_period_is_a_sentence_end(self):
+        """The engine did not mark the number: "so.12" still ends."""
+        self.assertFalse(paragraphs.continues("The Court held so.12", "The"))
+        self.assertFalse(paragraphs.continues("held so.\u00b9\u00b2", "The"))
+        self.assertFalse(paragraphs.continues('it "failed."3', "The"))
+
+    def test_a_number_after_a_space_is_no_sentence_end(self):
+        """A citation puts a space before its number."""
+        self.assertTrue(
+            paragraphs.continues("as held in 536 U.S., at p. 12", "The")
+        )
+
     def test_a_word_cut_by_a_hyphen_goes_on(self):
         self.assertTrue(paragraphs.continues("the defen-", "dant"))
 
@@ -172,6 +184,44 @@ class TestTheBody(TestCase):
         self.assertEqual(
             texts(paragraphs.body(doc)), ["It ended.", "The next"]
         )
+
+    def test_a_sup_mark_at_the_end_is_read_past(self):
+        """A footnote mark after the period ends the sentence (#375)."""
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        "The Court held so.12",
+                        marks=[{"start": 18, "end": 20, "kind": "sup"}],
+                    ),
+                    group(1, "The next paragraph starts here.", column="R"),
+                ],
+            )
+        )
+
+        self.assertEqual(
+            texts(paragraphs.body(doc)),
+            ["The Court held so.12", "The next paragraph starts here."],
+        )
+
+    def test_a_sup_mark_inside_a_sentence_still_joins(self):
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        "the rule12 of the",
+                        marks=[{"start": 8, "end": 10, "kind": "sup"}],
+                    ),
+                    group(1, "Court held.", column="R"),
+                ],
+            )
+        )
+
+        self.assertEqual(len(paragraphs.body(doc)), 1)
 
     def test_a_redaction_between_is_a_break(self):
         doc = document(
