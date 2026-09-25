@@ -257,6 +257,73 @@ ENSEMBLE_ERROR_MESSAGES = {
     ),
 }
 
+#: The answers of the human edits of review 3 (#376). Every answer is
+#: a Django message too, success or error, and the viewer reloads the
+#: page to show it: the text lives here, the rule of every write.
+EDIT_TEXT_SAVED_MESSAGE = "The text of the block was saved."
+EDIT_SECTION_SAVED_MESSAGE = {
+    "footnotes": "The block was put in the footnotes.",
+    "text": "The block was put in the body text.",
+}
+EDIT_MOVE_SAVED_MESSAGE = {
+    "up": "The block was moved up.",
+    "down": "The block was moved down.",
+}
+EDIT_WITHDRAWN_MESSAGE = (
+    "The edit was undone. The block reads as the engines read it."
+)
+EDIT_STANDING_MESSAGE = "This edit was undone already."
+#: A write the database kept, whose text the build did not write. The
+#: daemon builds it (``ensemble.due`` reads the edit revision).
+EDIT_NOT_BUILT_MESSAGE = (
+    "The edit was saved, but the text was not written again: {reason} "
+    'The daemon writes it on its next pass, or press "Read the OCR '
+    'documents again".'
+)
+EDIT_BAD_REQUEST_MESSAGE = "The request was not one this page sends."
+EDIT_NOT_FOUND_MESSAGE = "This opinion is not in this volume."
+EDIT_CLOSED_MESSAGE = (
+    "This opinion is not ready for the text review, so its text takes "
+    "no edit now."
+)
+EDIT_NOT_WRITTEN_MESSAGE = (
+    "The text of this opinion is not written at the live revision, so "
+    "there is nothing to edit yet."
+)
+EDIT_STALE_PAGE_MESSAGE = (
+    "The text of this opinion changed since this page was loaded. The "
+    "page was loaded again: look at the block and try again."
+)
+EDIT_NOT_BUILT_YET_MESSAGE = (
+    "The last edit of this opinion is not in its text yet. Press "
+    '"Read the OCR documents again" to write it, then edit again.'
+)
+EDIT_NO_BLOCK_MESSAGE = "That block is not in the text of this opinion."
+EDIT_NO_ADDRESS_MESSAGE = (
+    "This page of the opinion has no address in the volume, so an edit "
+    "of it would land nowhere."
+)
+EDIT_UNANIMOUS_MESSAGE = (
+    "Every engine read this block alike, so its text takes no edit."
+)
+EDIT_HUMAN_ALREADY_MESSAGE = (
+    "This block holds an edit already. Undo it first, then edit the block."
+)
+EDIT_TABLE_MESSAGE = (
+    "A table takes no text edit here: its rows are the engines' rows."
+)
+EDIT_EMPTY_MESSAGE = "Type the text of the block. An empty block is not saved."
+EDIT_TOO_LONG_MESSAGE = (
+    "The text is longer than {limit} characters, so it was not saved."
+)
+EDIT_UNCHANGED_MESSAGE = "The text did not change, so nothing was saved."
+EDIT_SAME_SECTION_MESSAGE = "The block is in that section already."
+EDIT_EDGE_MESSAGE = (
+    "The block is at the edge of its section on this page, so it does "
+    "not move."
+)
+EDIT_NO_EDIT_MESSAGE = "That edit is not an edit of this opinion."
+
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
 PAIRING_LABELS = ("CASE_CAPTION", "KEY_ICON")
@@ -1144,6 +1211,445 @@ def restore_opinion_finding(
             ),
         }
     )
+
+
+# ---------------------------------------------------------------------------
+# The human edits of review 3 (#376)
+# ---------------------------------------------------------------------------
+
+
+def _edit_refusal(
+    request: HttpRequest, message: str, status: int = 409
+) -> JsonResponse:
+    """Refuse one edit: an error message, and the JSON of the refusal.
+
+    Every trip of an edit to the database answers the curator with a
+    Django message (#376), and the viewer reloads the page to show it.
+
+    :param request: The HTTP request.
+    :param message: The line.
+    :param status: The HTTP status.
+    :returns: The answer.
+    """
+    messages.error(request, message)
+    return JsonResponse({"status": "error", "message": message}, status=status)
+
+
+def _edit_context(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> tuple[Opinion, dict, dict] | JsonResponse:
+    """Return ``(opinion, body, document)``, or the refusal of the edit.
+
+    The gates of every edit but the Undo, in order: the opinion of this
+    scan, the status (``READY_FOR_TEXT_REVIEW`` alone, the gate of
+    #419), a written ensemble, the bucket, the body, and the revisions
+    the page was drawn at. The page sends the ``glue_revision`` and the
+    ``edit_revision`` of the document it drew; a document that is not
+    the stamped one, or an edit the stamped one does not hold yet, is a
+    page the curator judged over another text.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :returns: The three, or the refusal.
+    """
+    from scanning import ensemble, s3_sync
+    from scanning.models import OpinionReviewStatus
+
+    opinion = (
+        Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
+        .select_related("scan", "apply_run")
+        .first()
+    )
+    if opinion is None:
+        return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
+    if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+        return _edit_refusal(request, EDIT_CLOSED_MESSAGE)
+    if not ensemble.is_written(opinion):
+        return _edit_refusal(request, EDIT_NOT_WRITTEN_MESSAGE)
+    if not s3_sync.s3_active():
+        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if not isinstance(body, dict):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if opinion.edit_revision != opinion.ensemble_edit_revision:
+        # An edit the text does not hold yet: its build failed. A new
+        # edit judged over the text before it would land on a block the
+        # curator cannot see as it will read.
+        return _edit_refusal(request, EDIT_NOT_BUILT_YET_MESSAGE)
+    if (
+        body.get("glue_revision") != opinion.glue_revision
+        or body.get("edit_revision") != opinion.ensemble_edit_revision
+    ):
+        return _edit_refusal(request, EDIT_STALE_PAGE_MESSAGE)
+    try:
+        document = ensemble.read_document(opinion)
+    except ensemble.TransientFault:
+        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
+    except ensemble.EnsembleError:
+        return _edit_refusal(request, EDIT_NOT_WRITTEN_MESSAGE)
+    return opinion, body, document
+
+
+def _edit_page(document: dict, body: dict) -> dict | None:
+    """Return the page of the document the body names, or None."""
+    wanted = body.get("page_in_opinion")
+    if not isinstance(wanted, int) or isinstance(wanted, bool):
+        return None
+    return next(
+        (
+            page
+            for page in document.get("pages") or []
+            if page.get("page_in_opinion") == wanted
+        ),
+        None,
+    )
+
+
+def _edit_group(page: dict, body: dict) -> dict | None:
+    """Return the group of the page the body names, or None."""
+    wanted = body.get("group_id")
+    if not isinstance(wanted, int) or isinstance(wanted, bool):
+        return None
+    return next(
+        (group for group in page.get("groups") or [] if group["id"] == wanted),
+        None,
+    )
+
+
+def _edit_target(
+    request: HttpRequest, document: dict, body: dict, with_group: bool = True
+) -> tuple[dict, dict | None, tuple] | JsonResponse:
+    """Return ``(page, group, address)`` of an edit, or the refusal.
+
+    :param request: The HTTP request.
+    :param document: The stamped ensemble document.
+    :param body: The request body.
+    :param with_group: Whether the body must name a group.
+    :returns: The three, or the refusal.
+    """
+    from scanning import ensemble
+
+    page = _edit_page(document, body)
+    if page is None:
+        return _edit_refusal(request, EDIT_NO_BLOCK_MESSAGE)
+    group = _edit_group(page, body) if with_group else None
+    if with_group and group is None:
+        return _edit_refusal(request, EDIT_NO_BLOCK_MESSAGE)
+    address = ensemble._address(page)
+    if address == (None, None):
+        return _edit_refusal(request, EDIT_NO_ADDRESS_MESSAGE)
+    return page, group, address
+
+
+def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
+    """Write the text again after an edit, and answer the curator.
+
+    The build runs here, the rule of the "Read the OCR documents again"
+    button: a few small reads and a geometry over one opinion. A build
+    another write overtook is tried once more. A build that fails keeps
+    the edit, which the database holds, and the daemon builds it
+    (``ensemble.due``), so the answer is a warning and not an error.
+
+    :param request: The HTTP request.
+    :param opinion: The opinion.
+    :param saved: The line of the success.
+    :returns: The answer.
+    """
+    from scanning import ensemble
+
+    reason = ""
+    for _attempt in range(2):
+        fresh = Opinion.objects.select_related("scan", "apply_run").get(
+            pk=opinion.pk
+        )
+        try:
+            ensemble.rerun(fresh)
+        except ensemble.RevisionMoved:
+            reason = ENSEMBLE_MOVED_MESSAGE
+            continue
+        except ensemble.TransientFault as exc:
+            logger.warning(
+                "%s of scan %s: the text after an edit did not reach the "
+                "bucket: %s",
+                opinion,
+                opinion.scan_id,
+                exc,
+            )
+            reason = ENSEMBLE_BUCKET_MESSAGE
+            break
+        except ensemble.EnsembleError as exc:
+            logger.warning(
+                "%s of scan %s: the text after an edit was refused: %s",
+                opinion,
+                opinion.scan_id,
+                exc,
+            )
+            reason = ENSEMBLE_ERROR_MESSAGES.get(
+                exc.code, ENSEMBLE_ERROR_MESSAGES["unreadable"]
+            )
+            break
+        else:
+            messages.success(request, saved)
+            return JsonResponse({"status": "ok", "message": saved})
+    warning = EDIT_NOT_BUILT_MESSAGE.format(reason=reason)
+    messages.warning(request, warning)
+    return JsonResponse({"status": "ok", "message": warning})
+
+
+@login_required
+@require_POST
+def edit_opinion_text(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Write the text of one block of an opinion (#376).
+
+    Only a block the engines did not read alike takes a text edit:
+    ``ensemble.disagreement_level`` is the rule, here and in the
+    viewer, which only hides the button. The server copies the box,
+    the section and the text the curator saw from the stamped document;
+    the page sends the group id, the new text and the two revisions.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404 for an opinion of another scan,
+        400 for a body the page does not send, 409 for a refusal.
+    """
+    from scanning import ensemble, markup, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    if group.get("human"):
+        return _edit_refusal(request, EDIT_HUMAN_ALREADY_MESSAGE)
+    if group.get("level") is None:
+        return _edit_refusal(request, EDIT_UNANIMOUS_MESSAGE)
+    if group.get("kind") == markup.TABLE:
+        return _edit_refusal(request, EDIT_TABLE_MESSAGE)
+    text = body.get("text")
+    if not isinstance(text, str):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    text = opinion_edits.fold(text)
+    if not text:
+        return _edit_refusal(request, EDIT_EMPTY_MESSAGE)
+    if len(text) > opinion_edits.MAX_TEXT_CHARS:
+        return _edit_refusal(
+            request,
+            EDIT_TOO_LONG_MESSAGE.format(limit=opinion_edits.MAX_TEXT_CHARS),
+        )
+    if text == group["text"]:
+        return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
+    opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.TEXT,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=group.get("section") or ensemble.BODY,
+        base_text=group["text"],
+        text=text,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s wrote the text of block %s of page %s",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+    )
+    return _build_after_edit(request, opinion, EDIT_TEXT_SAVED_MESSAGE)
+
+
+@login_required
+@require_POST
+def edit_opinion_section(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Put one block of an opinion in the body or in the footnotes (#376).
+
+    Every block takes it, a unanimous one too: the edit moves the
+    block and not its words.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    section = body.get("section")
+    if section not in (ensemble.BODY, ensemble.FOOTNOTES):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if (group.get("section") or ensemble.BODY) == section:
+        return _edit_refusal(request, EDIT_SAME_SECTION_MESSAGE)
+    opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.SECTION,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=section,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s put block %s of page %s in the %s",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        section,
+    )
+    return _build_after_edit(
+        request, opinion, EDIT_SECTION_SAVED_MESSAGE[section]
+    )
+
+
+@login_required
+@require_POST
+def move_opinion_block(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Move one block of an opinion one place up or down (#376).
+
+    The move is one ``ORDER`` edit of the block's section on its page:
+    the boxes of the section in the order the page shows, with the
+    block and its neighbour swapped. It supersedes the standing order
+    of that section, so the list is always the whole order the curator
+    saw.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    direction = body.get("direction")
+    if direction not in EDIT_MOVE_SAVED_MESSAGE:
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    section = group.get("section") or ensemble.BODY
+    same = [
+        other
+        for other in page.get("groups") or []
+        if (other.get("section") or ensemble.BODY) == section
+    ]
+    order = opinion_edits.swapped_order(
+        same, group["id"], -1 if direction == "up" else 1
+    )
+    if order is None:
+        return _edit_refusal(request, EDIT_EDGE_MESSAGE)
+    opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.ORDER,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        section=section,
+        order=order,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s moved block %s of page %s %s",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        direction,
+    )
+    return _build_after_edit(
+        request, opinion, EDIT_MOVE_SAVED_MESSAGE[direction]
+    )
+
+
+@login_required
+@require_POST
+def withdraw_opinion_edit(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Undo one human edit of an opinion's text (#376).
+
+    The row is withdrawn and never deleted, and the block goes back to
+    the engines' text. It takes no revision from the page: the edit is
+    named by its id, and an Undo of an edit that stands is the same
+    Undo whatever the text around it.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import opinion_edits, s3_sync
+    from scanning.models import OpinionEdit, OpinionReviewStatus
+
+    opinion = (
+        Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
+        .select_related("scan", "apply_run")
+        .first()
+    )
+    if opinion is None:
+        return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
+    if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+        return _edit_refusal(request, EDIT_CLOSED_MESSAGE)
+    if not s3_sync.s3_active():
+        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    edit_id = body.get("edit_id") if isinstance(body, dict) else None
+    if not isinstance(edit_id, int) or isinstance(edit_id, bool):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    edit = OpinionEdit.objects.filter(pk=edit_id, opinion=opinion).first()
+    if edit is None:
+        return _edit_refusal(request, EDIT_NO_EDIT_MESSAGE, 404)
+    if not opinion_edits.withdraw(opinion, edit, request.user):
+        return _edit_refusal(request, EDIT_STANDING_MESSAGE)
+    logger.info(
+        "%s of scan %s: %s undid the %s edit %s of page %s",
+        opinion,
+        pk,
+        request.user,
+        edit.kind,
+        edit.pk,
+        edit.page_in_opinion,
+    )
+    return _build_after_edit(request, opinion, EDIT_WITHDRAWN_MESSAGE)
 
 
 @login_required

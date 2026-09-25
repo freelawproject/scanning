@@ -260,8 +260,50 @@ class TestTheStorageIsAConvenience(SimpleTestCase):
 
     def test_every_storage_call_is_inside_a_try(self):
         source = VIEWER.read_text()
-        calls = [m.start() for m in re.finditer(r"localStorage\.", source)]
+        calls = [
+            m.start()
+            for m in re.finditer(r"(?:local|session)Storage\.", source)
+        ]
         self.assertTrue(calls, "the choice of the quiet boxes is gone")
+        self.assertIn("sessionStorage", source, "the place of an edit is gone")
         for at in calls:
             before = source[max(0, at - 80) : at]
             self.assertIn("try {", before, "a storage call outside a try")
+
+
+class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
+    """A write control exists on the locked block alone (#376)."""
+
+    def test_the_toolbar_is_built_by_the_lock_alone(self):
+        source = VIEWER.read_text()
+        calls = re.findall(r"editBar\(", source)
+        # The definition and the one call, in ``lock``.
+        self.assertEqual(len(calls), 2)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("editBar(", lock)
+        self.assertIn("canEdit()", lock)
+
+    def test_the_viewer_reads_the_routes_of_the_page(self):
+        source = VIEWER.read_text()
+        for name in (
+            "editTextUrl",
+            "editSectionUrl",
+            "editMoveUrl",
+            "editWithdrawUrl",
+        ):
+            self.assertIn(f"endpoint('{name}')", source)
+        self.assertNotIn("/edits/", source)
+
+    def test_the_viewer_knows_the_schema_that_holds_the_edits(self):
+        source = VIEWER.read_text()
+        match = re.search(r"var EDIT_SCHEMA = (\d+);", source)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_the_edit_reads_the_level_and_derives_none(self):
+        source = VIEWER.read_text()
+        bar = source[source.index("function fillBar(") :]
+        bar = bar[: bar.index("\n    }\n")]
+        self.assertIn("group.level", bar)
+        self.assertNotIn("agreement", bar)

@@ -21,6 +21,7 @@ from scanning.factories import (
 from scanning.models import (
     DISMISSABLE_OPINION_CHECKS,
     STALE_OPINION_CHECKS,
+    UNDISMISSABLE_OPINION_CHECKS,
     ExternalJob,
     JobEngine,
     JobStage,
@@ -186,8 +187,21 @@ class TestOpinionFinding(TestCase):
     def test_every_other_check_is_dismissable(self):
         self.assertEqual(
             DISMISSABLE_OPINION_CHECKS,
-            frozenset(OpinionCheck) - STALE_OPINION_CHECKS,
+            frozenset(OpinionCheck) - UNDISMISSABLE_OPINION_CHECKS,
         )
+
+    def test_an_edit_the_text_does_not_hold_takes_no_dismissal(self):
+        """The way out is its Undo or a new edit (#376)."""
+        self.assertEqual(
+            UNDISMISSABLE_OPINION_CHECKS,
+            STALE_OPINION_CHECKS | {OpinionCheck.UNRESOLVED_EDIT},
+        )
+        self.assertTrue(
+            OpinionFindingFactory(
+                check_name=OpinionCheck.UNRESOLVED_EDIT
+            ).is_undismissable
+        )
+        self.assertFalse(OpinionFindingFactory().is_undismissable)
 
     def test_is_stale_reads_the_check(self):
         self.assertFalse(OpinionFindingFactory().is_stale)

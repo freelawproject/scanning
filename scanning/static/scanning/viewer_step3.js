@@ -58,6 +58,16 @@
  * the selection, and the readings of the group open under it. A
  * single click outside the group, its readings and its box releases
  * the lock.
+ *
+ * The human edits of the text (#376) are the buttons of the locked
+ * group's toolbar, and a write control exists nowhere else, so a hover
+ * or a stray click never edits. The toolbar offers what the endpoints
+ * take: a text edit on a group with a ``level``, a move, a section,
+ * and the Undo of each standing edit, all read off the document. A
+ * text edit opens a modal with the old and the new text and their
+ * difference. Every answer is a Django message, so the page reloads to
+ * show it, and the locked group is found again by its box and locked
+ * again: a move gives the groups other ids.
  */
 
 (function () {
@@ -97,6 +107,20 @@
     // The key of the reviewer's choice to see every box, in this
     // browser alone. A convenience: the page works without it.
     var QUIET_KEY = 'opinion-review-show-quiet';
+
+    // The first schema of the ensemble document that holds the human
+    // edits (``ensemble.SCHEMA_VERSION``, #376). An older document has
+    // no ``edit_revision``, and every edit of it would be refused.
+    var EDIT_SCHEMA = 7;
+
+    // The key of the locked group over the reload of an edit (#376),
+    // in this tab alone. A convenience: the page works without it.
+    var PLACE_KEY = 'opinion-review-place';
+
+    // The least IoU of the stored box and a group's box that finds the
+    // locked group again after the reload: ``ensemble.OVERLAP``, the
+    // rule an edit lands by.
+    var PLACE_OVERLAP = 0.5;
 
     var root = null;
     var pagesColumn = null;
@@ -574,6 +598,9 @@
             var label = document.createElement('div');
             label.className = 'opinion-text-label';
             label.textContent = 'Page ' + (page.page_in_opinion + 1);
+            if (Object.keys(page.order_edits || {}).length) {
+                label.textContent += ' (order set by hand)';
+            }
             block.appendChild(label);
 
             if (page.error) {
@@ -794,6 +821,7 @@
         node.dataset.kind = kind;
         if (group.weak) { node.classList.add('weak'); }
         if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
+        if (group.human) { node.classList.add('ensemble-human'); }
         if (hasLevels() && group.level) { node.dataset.level = group.level; }
 
         var tokens = (group.tokens || []).filter(function (token) {
@@ -1060,6 +1088,14 @@
         var source = group.source;
         var agreeing = group.agreeing || [];
         var reason;
+        if (group.agreement === 'human') {
+            // A person wrote the text (#376); the readings below are
+            // the engines' own, and none of them won.
+            return 'A person wrote this text'
+                + (group.human && group.human.by
+                    ? ' (' + group.human.by + ')' : '')
+                + '. The readings of the engines are below.';
+        }
         if (group.agreement === 'single') {
             reason = source + ' alone read words here, so the text'
                 + ' shows its reading.';
@@ -1375,6 +1411,12 @@
             return names.indexOf(name) < 0;
         });
         var parts = [];
+        if (group.human) {
+            parts.push('edited by ' + (group.human.by || 'a person'));
+        }
+        if (group.section_edit) {
+            parts.push('section set by hand');
+        }
         if (group.agreement === 'single') {
             // The engine that read, and not every engine with a box
             // here: a silent engine has a box and no word in it, and
@@ -1503,7 +1545,12 @@
         var entry = groupOf(pageOf(page), group);
         var opened = !!(node && entry && !readingsOf(node));
         if (opened) { openReadings(pageOf(page), entry, node); }
-        locked = { page: page, group: group, opened: opened };
+        locked = { page: page, group: group, opened: opened, bar: null };
+        if (node && entry && canEdit()) {
+            locked.bar = editBar(pageOf(page), entry);
+            var after = readingsOf(node) || node;
+            after.parentNode.insertBefore(locked.bar, after.nextSibling);
+        }
         paintSelection();
     }
 
@@ -1515,6 +1562,7 @@
         if (!locked) { return; }
         var node = nodeFor(locked.page, locked.group);
         if (node && locked.opened) { closeReadings(node); }
+        if (locked.bar) { locked.bar.remove(); }
         root.querySelectorAll('.ensemble-locked').forEach(function (el) {
             el.classList.remove('ensemble-locked');
         });
@@ -1534,6 +1582,7 @@
         var panel = node ? readingsOf(node) : null;
         if (node && node.contains(event.target)) { return true; }
         if (panel && panel.contains(event.target)) { return true; }
+        if (locked.bar && locked.bar.contains(event.target)) { return true; }
         var wrapper = event.target.closest
             ? event.target.closest('.canvas-wrapper') : null;
         if (!wrapper) { return false; }
@@ -1708,6 +1757,10 @@
         document.addEventListener('click', function (event) {
             if (!locked || event.detail > 1) { return; }
             if (insideLock(event)) { return; }
+            // The modal of an edit belongs to the locked group (#376).
+            if (event.target.closest && event.target.closest('.edit-modal')) {
+                return;
+            }
             release();
         }, true);
     }
@@ -1815,6 +1868,356 @@
     }
 
     // -----------------------------------------------------------------
+    // The human edits of the text (#376)
+    // -----------------------------------------------------------------
+
+    /**
+     * Return whether the page offers the edits: the view says the
+     * opinion takes a write, and the document holds the edits.
+     *
+     * @returns {boolean} Whether it does.
+     */
+    function canEdit() {
+        return endpoint('canEdit') === '1'
+            && !!doc && (doc.schema_version || 0) >= EDIT_SCHEMA;
+    }
+
+    /**
+     * Return the groups of one section of one page, in the order of the
+     * document, which is the order the text column shows.
+     *
+     * @param {Object} page - The page entry.
+     * @param {string} section - ``text`` or ``footnotes``.
+     * @returns {Object[]} The groups.
+     */
+    function sectionGroups(page, section) {
+        return (page.groups || []).filter(function (group) {
+            return sectionOf(group) === section;
+        });
+    }
+
+    function barButton(label, title, onClick, disabled) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ensemble-edit-button';
+        button.textContent = label;
+        button.title = title;
+        button.disabled = !!disabled;
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            onClick(button);
+        });
+        return button;
+    }
+
+    /**
+     * Build the toolbar of the locked group: the one place a curator
+     * writes (#376). Each button is there only when the endpoint takes
+     * it, read off the document.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The toolbar.
+     */
+    function editBar(page, group) {
+        var bar = document.createElement('div');
+        bar.className = 'ensemble-edit-bar';
+        fillBar(bar, page, group);
+        return bar;
+    }
+
+    function fillBar(bar, page, group) {
+        bar.textContent = '';
+        var section = sectionOf(group);
+        var same = sectionGroups(page, section);
+        var place = same.indexOf(group);
+        var orderEdit = (page.order_edits || {})[section];
+
+        if (group.human) {
+            bar.appendChild(barButton(
+                'Undo the text edit',
+                'Give the block back the text the engines read',
+                function (button) {
+                    if (!window.confirm('Undo the text edit of this block?'
+                            + ' It goes back to the text the engines'
+                            + ' read.')) { return; }
+                    withdrawEdit(group.human.edit_id, button);
+                }
+            ));
+        } else if (group.level && group.kind !== 'table') {
+            bar.appendChild(barButton(
+                'Edit text',
+                'Write the text of this block. The engines did not read'
+                    + ' it alike.',
+                function () { openEditor(bar, page, group); }
+            ));
+        }
+        bar.appendChild(barButton(
+            'Move up',
+            'Put this block before the one above it',
+            function (button) { moveBlock(page, group, 'up', button); },
+            place <= 0
+        ));
+        bar.appendChild(barButton(
+            'Move down',
+            'Put this block after the one below it',
+            function (button) { moveBlock(page, group, 'down', button); },
+            place < 0 || place >= same.length - 1
+        ));
+        if (orderEdit) {
+            bar.appendChild(barButton(
+                'Undo the order',
+                'Give the blocks of this part of the page the order the'
+                    + ' geometry read',
+                function (button) {
+                    if (!window.confirm('Undo the order set by hand on this'
+                            + ' part of the page?')) { return; }
+                    withdrawEdit(orderEdit, button);
+                }
+            ));
+        }
+        var other = section === FOOTNOTES ? BODY : FOOTNOTES;
+        bar.appendChild(barButton(
+            other === FOOTNOTES ? 'Put in the footnotes' : 'Put in the body text',
+            other === FOOTNOTES
+                ? 'This block is a footnote'
+                : 'This block is body text, not a footnote',
+            function (button) {
+                var asked = other === FOOTNOTES
+                    ? 'Put this block in the footnotes of the page?'
+                    : 'Put this block in the body text of the page?';
+                if (!window.confirm(asked)) { return; }
+                postEdit(endpoint('editSectionUrl'), {
+                    page_in_opinion: page.page_in_opinion,
+                    group_id: group.id,
+                    section: other
+                }, button);
+            }
+        ));
+        if (group.section_edit) {
+            bar.appendChild(barButton(
+                'Undo the section',
+                'Give the block back the section the zones read',
+                function (button) {
+                    if (!window.confirm('Undo the section set by hand on'
+                            + ' this block?')) { return; }
+                    withdrawEdit(group.section_edit, button);
+                }
+            ));
+        }
+    }
+
+    /**
+     * Replace the toolbar with the editor of the block's text.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function openEditor(bar, page, group) {
+        bar.textContent = '';
+        bar.classList.add('ensemble-editor');
+        var area = document.createElement('textarea');
+        area.className = 'ensemble-edit-area';
+        area.value = group.text || '';
+        area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
+        bar.appendChild(area);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+        row.appendChild(barButton('Save', 'Compare the two texts, then save',
+            function (button) {
+                var text = area.value;
+                if (text.trim() === (group.text || '').trim()) {
+                    showToast('The text did not change.', 'error');
+                    return;
+                }
+                confirmText(group.text || '', text, function () {
+                    postEdit(endpoint('editTextUrl'), {
+                        page_in_opinion: page.page_in_opinion,
+                        group_id: group.id,
+                        text: text
+                    }, button);
+                });
+            }));
+        row.appendChild(barButton('Cancel', 'Keep the text as it is',
+            function () {
+                bar.classList.remove('ensemble-editor');
+                fillBar(bar, page, group);
+            }));
+        bar.appendChild(row);
+        area.focus();
+    }
+
+    /**
+     * Ask the curator to confirm a text edit: the old text and the new
+     * one side by side, each with the words the other does not hold
+     * marked, by the comparison of the readings panel (#380).
+     *
+     * @param {string} before - The text the block shows.
+     * @param {string} after - The text the curator wrote.
+     * @param {Function} onConfirm - What Save does.
+     */
+    function confirmText(before, after, onConfirm) {
+        var modal = document.createElement('div');
+        modal.className = 'edit-modal';
+        var box = document.createElement('div');
+        box.className = 'edit-modal-box';
+        box.setAttribute('role', 'dialog');
+        box.setAttribute('aria-modal', 'true');
+        var title = document.createElement('h3');
+        title.className = 'edit-modal-title';
+        title.textContent = 'Save this text?';
+        box.appendChild(title);
+        var columns = document.createElement('div');
+        columns.className = 'edit-modal-columns';
+        [
+            ['Before', before, diffSpans(after, before)],
+            ['After', after, diffSpans(before, after)]
+        ].forEach(function (side) {
+            var column = document.createElement('div');
+            var label = document.createElement('div');
+            label.className = 'edit-modal-label';
+            label.textContent = side[0];
+            column.appendChild(label);
+            var text = document.createElement('div');
+            text.className = 'edit-modal-text';
+            readingNodes(text, side[1], side[2]);
+            column.appendChild(text);
+            columns.appendChild(column);
+        });
+        box.appendChild(columns);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+
+        function close() {
+            document.removeEventListener('keydown', onKey);
+            modal.remove();
+        }
+        function onKey(event) {
+            if (event.key === 'Escape') { close(); }
+        }
+        row.appendChild(barButton('Save', 'Save the text on the right',
+            function (button) { button.disabled = true; onConfirm(); }));
+        row.appendChild(barButton('Cancel', 'Go back to the text',
+            function () { close(); }));
+        box.appendChild(row);
+        modal.appendChild(box);
+        modal.addEventListener('click', function (event) {
+            if (event.target === modal) { close(); }
+        });
+        document.addEventListener('keydown', onKey);
+        document.body.appendChild(modal);
+    }
+
+    function moveBlock(page, group, direction, button) {
+        postEdit(endpoint('editMoveUrl'), {
+            page_in_opinion: page.page_in_opinion,
+            group_id: group.id,
+            direction: direction
+        }, button);
+    }
+
+    function withdrawEdit(editId, button) {
+        postEdit(endpoint('editWithdrawUrl'), { edit_id: editId }, button);
+    }
+
+    /**
+     * Post one edit, and reload the page to show its answer.
+     *
+     * Every answer of an edit, a success or a refusal, is a Django
+     * message the page shows after the reload (#376), so the script
+     * writes no line of its own. The revisions of the document go with
+     * the edit, and the server refuses an edit of a page drawn over
+     * another text. A request that got no answer reached no database,
+     * and it is the one line this script shows.
+     *
+     * @param {string} address - The route.
+     * @param {Object} payload - The body, without the revisions.
+     * @param {HTMLButtonElement} button - The button that asked.
+     */
+    function postEdit(address, payload, button) {
+        if (button) { button.disabled = true; }
+        payload.glue_revision = (doc.opinion || {}).glue_revision;
+        payload.edit_revision = doc.edit_revision;
+        fetch(address, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'X-CSRFToken': csrfToken(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        })
+            .then(function (response) { return response.json(); })
+            .then(function () {
+                rememberPlace();
+                window.location.reload();
+            })
+            .catch(function () {
+                showToast('The request got no answer. Try again.', 'error');
+                if (button) { button.disabled = false; }
+            });
+    }
+
+    /**
+     * Keep the locked group over the reload of an edit: its page and
+     * its box, because a move gives the groups other ids.
+     */
+    function rememberPlace() {
+        if (!locked) { return; }
+        var entry = groupOf(pageOf(locked.page), locked.group);
+        if (!entry) { return; }
+        try {
+            window.sessionStorage.setItem(PLACE_KEY, JSON.stringify({
+                where: endpoint('ensembleUrlEndpoint'),
+                page: locked.page,
+                box: entry.box_pt
+            }));
+        } catch (error) { /* the page works without it */ }
+    }
+
+    function boxIou(a, b) {
+        var width = Math.min(a[2], b[2]) - Math.max(a[0], b[0]);
+        var height = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
+        if (width <= 0 || height <= 0) { return 0; }
+        var inter = width * height;
+        var union = (a[2] - a[0]) * (a[3] - a[1])
+            + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+        return union > 0 ? inter / union : 0;
+    }
+
+    /**
+     * Lock again the group an edit was made on, after the reload.
+     */
+    function restorePlace() {
+        var stored = null;
+        try {
+            stored = window.sessionStorage.getItem(PLACE_KEY);
+        } catch (error) { stored = null; }
+        try {
+            window.sessionStorage.removeItem(PLACE_KEY);
+        } catch (error) { /* the page works without it */ }
+        var place = null;
+        try {
+            place = JSON.parse(stored);
+        } catch (error) { place = null; }
+        if (!place || place.where !== endpoint('ensembleUrlEndpoint')) {
+            return;
+        }
+        var page = pageOf(place.page);
+        if (!page || !place.box) { return; }
+        var best = null;
+        var score = PLACE_OVERLAP;
+        (page.groups || []).forEach(function (group) {
+            var here = boxIou(place.box, group.box_pt || [0, 0, 0, 0]);
+            if (here >= score) { score = here; best = group; }
+        });
+        if (!best) { return; }
+        lock(place.page, best.id, 'text');
+        scrollWithin(textColumn, nodeFor(place.page, best.id));
+    }
+
+    // -----------------------------------------------------------------
     // The button
     // -----------------------------------------------------------------
 
@@ -1901,6 +2304,7 @@
                 summarise();
                 redrawBoxes();
                 if (pending !== null) { goToPage(pending); }
+                restorePlace();
             })
             .catch(function (error) {
                 textColumn.appendChild(note(

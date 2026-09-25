@@ -41,8 +41,11 @@ from scanning.views_api import (
     dismiss_finding,
     dismiss_opinion_finding,
     dismiss_redaction,
+    edit_opinion_section,
+    edit_opinion_text,
     export_pdf,
     generate_files,
+    move_opinion_block,
     move_redaction,
     rebuild_findings,
     rerun_opinion_ensemble,
@@ -58,6 +61,7 @@ from scanning.views_api import (
     serve_redacted_pdf,
     serve_redactions,
     update_detection,
+    withdraw_opinion_edit,
     withdraw_stale_edit,
 )
 from scanning.views_process import (
@@ -251,6 +255,27 @@ urlpatterns = [
         "<int:finding_pk>/restore/",
         restore_opinion_finding,
         name="restore_opinion_finding",
+    ),
+    # The human edits of an opinion's text (#376).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/text/",
+        edit_opinion_text,
+        name="edit_opinion_text",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/section/",
+        edit_opinion_section,
+        name="edit_opinion_section",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/move/",
+        move_opinion_block,
+        name="move_opinion_block",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/withdraw/",
+        withdraw_opinion_edit,
+        name="withdraw_opinion_edit",
     ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).

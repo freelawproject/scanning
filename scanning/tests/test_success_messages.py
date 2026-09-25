@@ -65,6 +65,16 @@ REVIEW3_WRITE_VIEWS = (
     "restore_opinion_finding",
 )
 
+#: The human edits of review 3 (#376). Each one answers through
+#: ``_build_after_edit``, which writes the Django message and the JSON
+#: of the success, so the pin reads the answers of that helper.
+REVIEW3_EDIT_VIEWS = (
+    "edit_opinion_section",
+    "edit_opinion_text",
+    "move_opinion_block",
+    "withdraw_opinion_edit",
+)
+
 #: The calls that make a function a write of review 2: it rebuilds the
 #: findings, or it writes a curator's dismissal of one.
 WRITE_CALLS = (
@@ -73,6 +83,8 @@ WRITE_CALLS = (
     "restore",
     "withdraw_stale",
     "rebuild",
+    "supersede",
+    "withdraw",
 )
 
 VIEWS_PATH = pathlib.Path("scanning/views_api.py")
@@ -105,6 +117,25 @@ def _write_functions():
                 found[node.name] = node
                 break
     return found
+
+
+def _function(name):
+    """Return one function of the view module, by name."""
+    tree = ast.parse(VIEWS_PATH.read_text())
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
+def _calls(node) -> set:
+    """Return the names every call inside one function calls."""
+    return {
+        getattr(call.func, "attr", getattr(call.func, "id", ""))
+        for call in ast.walk(node)
+        if isinstance(call, ast.Call)
+    }
 
 
 def _success_answers(node):
@@ -148,8 +179,25 @@ class TestEveryWriteAnswersAMessage(ScanningTestCase):
     def test_the_write_views_are_the_pinned_set(self):
         self.assertEqual(
             sorted(_write_functions()),
-            sorted(WRITE_VIEWS + REVIEW3_WRITE_VIEWS),
+            sorted(WRITE_VIEWS + REVIEW3_WRITE_VIEWS + REVIEW3_EDIT_VIEWS),
         )
+
+    def test_every_edit_answers_through_the_one_helper(self):
+        """An edit of review 3 answers a Django message, success or
+        error, and the page reloads to show it (#376)."""
+        functions = _write_functions()
+        for name in REVIEW3_EDIT_VIEWS:
+            calls = _calls(functions[name])
+            self.assertIn("_build_after_edit", calls, name)
+            self.assertNotIn("JsonResponse", calls, f"{name} answers alone")
+        helper = _function("_build_after_edit")
+        answers = _success_answers(helper)
+        self.assertTrue(answers)
+        for keys in answers:
+            self.assertIn("message", keys)
+        self.assertIn("success", _calls(helper))
+        self.assertIn("warning", _calls(helper))
+        self.assertIn("error", _calls(_function("_edit_refusal")))
 
     def test_every_success_answer_carries_a_message(self):
         functions = _write_functions()
