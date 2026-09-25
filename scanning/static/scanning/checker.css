@@ -1203,6 +1203,20 @@ a.doc-name:hover { text-decoration: underline; }
 /* The text review of one opinion (#365)                               */
 /* ------------------------------------------------------------------ */
 
+/* The guide of the text review (#419): the panel of review 2, hung
+   from the right edge of the "?", which is at the right of the card. */
+.text-review-help-panel {
+    left: auto;
+    right: 0;
+    z-index: 50;
+    max-height: calc(100vh - 160px);
+}
+.text-review-help-panel .viewer-help-swatch { margin-right: 4px; }
+.text-review-help-blocking { background: rgba(220, 38, 38, 0.8); }
+.text-review-help-warning { background: rgba(217, 119, 6, 0.75); }
+.text-review-help-zone { background: rgba(8, 145, 178, 0.6); }
+.text-review-help-quote { background: rgba(146, 64, 14, 0.7); }
+
 /* Each column is its own scroll box, so a jump inside one column
    leaves the other one where the reviewer put it. The pages column
    scrolls sideways as well, because a zoomed page is wider than it. */
@@ -1276,6 +1290,13 @@ a.doc-name:hover { text-decoration: underline; }
     box-sizing: border-box;
     border-top: 1px dashed rgba(8, 145, 178, 0.8);
     background: rgba(8, 145, 178, 0.07);
+}
+/* The band of the footnotes a person set (#419): the colour of the */
+/* footnote zone, and a dotted edge, because no detection drew it. */
+.ensemble-zone.ensemble-hand-zone {
+    border-top: 1px dotted rgba(8, 145, 178, 0.9);
+    border-bottom: 1px dotted rgba(8, 145, 178, 0.9);
+    background: rgba(8, 145, 178, 0.1);
 }
 /* The blockquote zone (#411): a band on the left edge, in the colour */
 /* the detection drawer gives BLOCKQUOTE, and a box in the quote. */

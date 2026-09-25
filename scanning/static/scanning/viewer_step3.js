@@ -39,7 +39,9 @@
  * A group says its section (#399), and the section is read off the
  * group and never off its place in the list: a page shows its body
  * text, then its footnotes in a block of their own, and the page
- * draws its footnote zones under the boxes.
+ * draws its footnote zones under the boxes. A footnote a person set
+ * gets a band of its own (:func:`handFootnoteBands`, #419), which is
+ * never a zone.
  *
  * A blockquote is a run the document writes (``page.blockquotes``,
  * #411), and the viewer never derives one: the groups of a run go in
@@ -457,6 +459,13 @@
             placeOver(zone, box, scale);
             wrapper.appendChild(zone);
         });
+        handFootnoteBands(page).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-hand-zone';
+            zone.title = 'Footnotes set by hand';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
         ((page.zones || {}).blockquotes || []).forEach(function (box) {
             var zone = document.createElement('div');
             zone.className = 'ensemble-zone ensemble-quote-zone';
@@ -486,6 +495,40 @@
             wrapper.appendChild(el);
         });
         if (selected && selected.page === index) { paintSelection(); }
+    }
+
+    /**
+     * Return the bands of the footnotes a person set on one page (#419).
+     *
+     * One band per column: the union of the boxes of the groups that a
+     * ``SECTION`` edit put in the footnotes. A union over both columns
+     * would cover the body text between them. The band is a view of
+     * the edits and never a zone: ``ensemble.section`` reads
+     * ``zones.footnotes`` alone, and so does the footnote doubt.
+     *
+     * @param {Object} page - The page entry.
+     * @returns {number[][]} The bands, in points.
+     */
+    function handFootnoteBands(page) {
+        var bands = {};
+        var order = [];
+        (page.groups || []).forEach(function (group) {
+            var box = group.box_pt;
+            if (!box || !group.section_edit) { return; }
+            if (sectionOf(group) !== FOOTNOTES) { return; }
+            var key = String(group.column);
+            var band = bands[key];
+            if (!band) {
+                bands[key] = box.slice();
+                order.push(key);
+                return;
+            }
+            band[0] = Math.min(band[0], box[0]);
+            band[1] = Math.min(band[1], box[1]);
+            band[2] = Math.max(band[2], box[2]);
+            band[3] = Math.max(band[3], box[3]);
+        });
+        return order.map(function (key) { return bands[key]; });
     }
 
     /**
@@ -1794,6 +1837,12 @@
             if (event.target.closest && event.target.closest('.edit-modal')) {
                 return;
             }
+            // The guide explains the lock, so a look at it keeps it.
+            if (event.target.closest && event.target.closest(
+                '#text-review-help-btn, #text-review-help-panel'
+            )) {
+                return;
+            }
             if (!release()) {
                 kept = true;
                 setTimeout(function () { kept = false; }, 600);
@@ -1859,6 +1908,28 @@
                 showToast('The request failed. Try again.', 'error');
                 button.disabled = false;
             });
+    }
+
+    /**
+     * The guide of the page (#419): the "?" opens it and closes it, and
+     * Escape closes it. It never opens by itself, and it keeps no key
+     * in the storage: the guide of review 2 opens once per session, and
+     * a reviewer of many opinions would meet this one on every page.
+     */
+    function bindHelp() {
+        var button = document.getElementById('text-review-help-btn');
+        var panel = document.getElementById('text-review-help-panel');
+        if (!button || !panel) { return; }
+        function setOpen(open) {
+            panel.hidden = !open;
+            button.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+        button.addEventListener('click', function () {
+            setOpen(panel.hidden);
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && !panel.hidden) { setOpen(false); }
+        });
     }
 
     /**
@@ -2013,14 +2084,26 @@
             ));
         }
         var other = section === FOOTNOTES ? BODY : FOOTNOTES;
+        // The body blocks below this one go to the footnotes with it
+        // (#419). The build names them (``ensemble.blocks_below``), and
+        // the endpoint reads the same list, so the count here is the
+        // count the server writes.
+        var below = other === FOOTNOTES ? (group.below || []).length : 0;
         bar.appendChild(barButton(
             other === FOOTNOTES ? 'Put in the footnotes' : 'Put in the body text',
             other === FOOTNOTES
-                ? 'This block is a footnote'
+                ? (below
+                    ? 'This block and the ' + below + ' block(s) below it'
+                        + ' are footnotes'
+                    : 'This block is a footnote')
                 : 'This block is body text, not a footnote',
             function (button) {
                 var asked = other === FOOTNOTES
-                    ? 'Put this block in the footnotes of the page?'
+                    ? (below
+                        ? 'Put this block and the ' + below + ' block(s)'
+                            + ' below it in the footnotes of the page? Each'
+                            + ' block gets its own Undo.'
+                        : 'Put this block in the footnotes of the page?')
                     : 'Put this block in the body text of the page?';
                 if (!window.confirm(asked)) { return; }
                 postEdit(endpoint('editSectionUrl'), {
@@ -2452,6 +2535,7 @@
         bindFindings();
         bindZoom();
         bindQuiet();
+        bindHelp();
         if (pagesColumn) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =
                 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/' +

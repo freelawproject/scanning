@@ -12,6 +12,7 @@ from typing import Any
 import fitz
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.db import transaction
 from django.db.models import Q
 from django.http import (
     FileResponse,
@@ -265,6 +266,10 @@ EDIT_SECTION_SAVED_MESSAGE = {
     "footnotes": "The block was put in the footnotes.",
     "text": "The block was put in the body text.",
 }
+#: A push of "Put in the footnotes" that took the blocks below (#419).
+EDIT_SECTION_BELOW_SAVED_MESSAGE = (
+    "The block and the {count} block(s) below it were put in the footnotes."
+)
 EDIT_MOVE_SAVED_MESSAGE = {
     "up": "The block was moved up.",
     "down": "The block was moved down.",
@@ -1481,7 +1486,11 @@ def edit_opinion_section(
     """Put one block of an opinion in the body or in the footnotes (#376).
 
     Every block takes it, a unanimous one too: the edit moves the
-    block and not its words.
+    block and not its words. A block put in the footnotes takes the
+    body blocks below it too (#419): the ids are the ``below`` of the
+    stamped document, ``ensemble.blocks_below``, and each block gets a
+    ``SECTION`` edit of its own, so each has its own Undo. The body
+    text direction moves one block.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -1504,29 +1513,42 @@ def edit_opinion_section(
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     if (group.get("section") or ensemble.BODY) == section:
         return _edit_refusal(request, EDIT_SAME_SECTION_MESSAGE)
-    opinion_edits.supersede(
-        opinion,
-        request.user,
-        kind=OpinionEdit.Kind.SECTION,
-        source_edit_id=address[0],
-        source_page=address[1],
-        page_in_opinion=page["page_in_opinion"],
-        box_pt=group["box_pt"],
-        section=section,
-        glue_revision=opinion.glue_revision,
-    )
+    moved = [group]
+    if section == ensemble.FOOTNOTES:
+        by_id = {other["id"]: other for other in page.get("groups") or []}
+        moved += [
+            by_id[there]
+            for there in group.get("below") or []
+            if there in by_id
+        ]
+    with transaction.atomic():
+        for block in moved:
+            opinion_edits.supersede(
+                opinion,
+                request.user,
+                kind=OpinionEdit.Kind.SECTION,
+                source_edit_id=address[0],
+                source_page=address[1],
+                page_in_opinion=page["page_in_opinion"],
+                box_pt=block["box_pt"],
+                section=section,
+                glue_revision=opinion.glue_revision,
+            )
     logger.info(
-        "%s of scan %s: %s put block %s of page %s in the %s",
+        "%s of scan %s: %s put block(s) %s of page %s in the %s",
         opinion,
         pk,
         request.user,
-        group["id"],
+        [block["id"] for block in moved],
         page["page_in_opinion"],
         section,
     )
-    return _build_after_edit(
-        request, opinion, EDIT_SECTION_SAVED_MESSAGE[section]
+    saved = (
+        EDIT_SECTION_BELOW_SAVED_MESSAGE.format(count=len(moved) - 1)
+        if len(moved) > 1
+        else EDIT_SECTION_SAVED_MESSAGE[section]
     )
+    return _build_after_edit(request, opinion, saved)
 
 
 @login_required

@@ -162,8 +162,10 @@ logger = logging.getLogger(__name__)
 #: every drop its ``bracket`` (#419). 7 applies the human edits of the
 #: text (#376): a ``human`` group, a ``section_edit``, the
 #: ``order_edits`` and the ``unresolved_edits`` of a page, and the
-#: ``edit_revision`` of the document.
-SCHEMA_VERSION = 7
+#: ``edit_revision`` of the document. 8 gives every body group the
+#: blocks ``below`` it, which a push of "Put in the footnotes" takes
+#: too (#419).
+SCHEMA_VERSION = 8
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -2086,6 +2088,43 @@ def _human_read(read_back: dict, edit: dict) -> dict:
     }
 
 
+def blocks_below(groups: list[dict], group: dict) -> list[int]:
+    """Return the body blocks a push of "Put in the footnotes" takes
+    with one block (#419).
+
+    **The one rule** of "the blocks below": the build writes its
+    answer on each body group as ``below``, the viewer counts it for
+    the confirm, and the endpoint reads it off the stamped document.
+    Below is a place on the page and not the reading order: in two
+    columns, the blocks after a left-column footnote in reading order
+    are the whole right column. A block is below when its top is at or
+    under the top of the pushed block and the two share a horizontal
+    range, so a full-width block under the footnote goes too and the
+    other column does not. A block a person put in the body text keeps
+    that section.
+
+    :param groups: The kept groups of one page, each with its
+        ``box_pt``, ``section`` and ``section_edit``.
+    :param group: The pushed group, a body group.
+    :returns: The ids of the other groups, in the order of the page.
+    :rtype: list[int]
+    """
+    box = group.get("box_pt")
+    if not box or (group.get("section") or BODY) != BODY:
+        return []
+    return [
+        other["id"]
+        for other in groups
+        if other["id"] != group["id"]
+        and (other.get("section") or BODY) == BODY
+        and not other.get("section_edit")
+        and other.get("box_pt")
+        and other["box_pt"][1] >= box[1]
+        and other["box_pt"][0] < box[2]
+        and box[0] < other["box_pt"][2]
+    ]
+
+
 def _unresolved(edit: dict, reason: str) -> dict:
     """Return the entry of one edit the build did not apply.
 
@@ -2356,6 +2395,9 @@ def build_page(
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
+    for group in entry["groups"]:
+        if group["section"] == BODY:
+            group["below"] = blocks_below(entry["groups"], group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
