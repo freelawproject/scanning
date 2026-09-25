@@ -480,13 +480,34 @@ def approve_model_row(scan: Scan, row: Detection, user) -> Detection:
     :data:`IOU_THRESHOLD`. That kind keeps its readers for the rows
     that carry one, and has no writer now.
 
+    A second approval of the same model row (a second tab, a stale
+    card) writes nothing: the standing dismiss names the hand-drawn row
+    through ``replaces``, and that row is the answer. Without this
+    read, ``decide`` answers the standing dismiss as a no-op and
+    ``add_manual`` writes a second row over it, and the Dismiss of
+    either then gives the model box back beside the other.
+
     :param scan: The scan.
     :param row: The model row (never a hand-drawn one; the view answers
         that case without a write).
     :param user: The curator.
     :returns: The hand-drawn row that now holds the box.
     """
-    return move_model_row(scan, row, [row.x0, row.y0, row.x1, row.y1], user)
+    with transaction.atomic():
+        # The same lock ``decide`` takes, so two clicks at once cannot
+        # both read no standing row and both write one.
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        current = standing_decision(row)
+        if (
+            current is not None
+            and current.kind == DetectionDecision.Kind.DEACTIVATE
+        ):
+            holder = Detection.objects.live().filter(replaces=current).first()
+            if holder is not None:
+                return holder
+        return move_model_row(
+            scan, row, [row.x0, row.y0, row.x1, row.y1], user
+        )
 
 
 # ---------------------------------------------------------------------------

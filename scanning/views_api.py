@@ -1744,18 +1744,22 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """Add a detection by hand, or approve the model box it lands on.
 
     A box drawn within ``BOOST_TOLERANCE_PX`` of a live model box with
-    the same label is that box, and the model box gets an ``approve``
-    decision (#240). Otherwise a hand-drawn row is written, addressed
-    by its source page. The rows are the only store; nothing here reads
-    or writes a file.
+    the same label is that box, and the model box is approved: a move
+    by zero (#414, ``detections.approve_model_row``), so the model row
+    gets a dismiss and a hand-drawn row at the same box holds it now.
+    Otherwise a hand-drawn row is written, addressed by its source
+    page. The rows are the only store; nothing here reads or writes a
+    file.
 
     :param request: The HTTP request (JSON body with page_index,
         label_id, bbox, img_width, and img_height).
     :param pk: Scan primary key.
     :return: JSON response with ``added=True`` and the new row's
-        ``detection_id`` if new, ``added=False`` and the approved row's
-        id if an existing detection was approved. Both carry the
-        ``message`` the viewer shows (#322).
+        ``detection_id`` if new; ``added=False``, the ``detection_id``
+        of the hand-drawn row that holds the box now and the
+        ``replaced_id`` of the row the drawing landed on if an existing
+        detection was approved. Both carry the ``message`` the viewer
+        shows (#322).
     """
     from blackletter.models import Label
 

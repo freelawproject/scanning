@@ -2803,6 +2803,40 @@ class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
             ).exists()
         )
 
+    def test_a_second_approval_of_the_model_row_writes_no_second_row(self):
+        """A second tab, or a stale card of the sidebar, sends the
+        model row's id again after the approval: the answer is the
+        hand-drawn row that stands, and no second row shares the
+        dismissal, or the Dismiss of either would give the model box
+        back beside the other (PR #415 review)."""
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection()
+        first = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )
+
+        second = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )
+
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["detection_id"], first["detection_id"])
+        self.assertEqual(second["replaced_id"], det.pk)
+        self.assertEqual(Detection.objects.live().filter(scan=scan).count(), 1)
+        self.assertEqual(
+            Detection.objects.filter(
+                scan=scan, model_name=Detection.ModelName.MANUAL
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 1
+        )
+
     def test_a_second_approval_of_the_box_writes_nothing(self):
         """The toolbar offers no button on a hand-drawn box, and the
         endpoint writes nothing for one, so a stale card or a second
