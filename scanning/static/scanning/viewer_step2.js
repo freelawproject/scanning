@@ -1333,13 +1333,10 @@ document.addEventListener('DOMContentLoaded', function () {
             if (!allDetections) allDetections = [];
             if (data.added === false) {
                 // The server approved a box that is in the list already:
-                // change that entry, and draw no second box over it.
-                for (var ai = 0; ai < allDetections.length; ai++) {
-                    if (allDetections[ai].id === data.detection_id) {
-                        allDetections[ai].confidence = 1.0;
-                        break;
-                    }
-                }
+                // change that entry, and draw no second box over it. An
+                // approval is a move by zero (#414), so the entry takes
+                // the id of the hand-drawn row that holds the box now.
+                adoptDetection(data.replaced_id, data.detection_id);
             } else {
                 if (data.detection_id !== undefined) detData.id = data.detection_id;
                 detData.manual = true;
@@ -2071,6 +2068,27 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
+    // An approval answers the id of the hand-drawn row that holds the box
+    // now (#414), and every later edit of the box must address that
+    // row. One entry changes here, for the toolbar, the add path and
+    // the card of the sidebar alike.
+    function adoptDetection(replacedId, newId) {
+        if (!allDetections) return false;
+        for (var ai = 0; ai < allDetections.length; ai++) {
+            var entry = allDetections[ai];
+            if (entry.id === replacedId || entry.id === newId) {
+                entry.id = newId;
+                entry.manual = true;
+                entry.confidence = 1.0;
+                return true;
+            }
+        }
+        return false;
+    }
+    window.adoptDetection = function (replacedId, newId) {
+        if (adoptDetection(replacedId, newId)) refreshOverlays();
+    };
+
     function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;
@@ -2088,6 +2106,47 @@ document.addEventListener('DOMContentLoaded', function () {
         var toolbar = document.createElement('div');
         toolbar.className = 'det-resize-handle';
         toolbar.style.cssText = 'position:absolute;top:-30px;left:0;display:flex;gap:4px;z-index:23;white-space:nowrap;';
+
+        // Approve is a move by zero (#414): the endpoint dismisses the
+        // model row and draws the curator's own row at the same box,
+        // which a new import keeps. A hand-drawn box is the curator's
+        // already, so it gets no button.
+        if (!det.manual) {
+            var approveBtn = document.createElement('button');
+            approveBtn.textContent = 'Approve';
+            approveBtn.title = 'Keep this box as your own. It reads 1.0, ' +
+                'and a new import keeps it.';
+            approveBtn.style.cssText = 'background:#16a34a;color:white;border:none;padding:4px 10px;font-size:12px;font-weight:600;border-radius:4px;cursor:pointer;white-space:nowrap;flex-shrink:0;line-height:1;';
+            approveBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
+                approveBtn.disabled = true;
+                fetch('/scans/' + documentId + '/approve-detection/', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json', 'X-CSRFToken': csrfToken},
+                    body: JSON.stringify({detection_id: det.id}),
+                }).then(function(r) { return r.json(); }).then(function(data) {
+                    // A refusal (409, 404) must not read as work done (#240).
+                    if (!data || data.status !== 'ok') {
+                        approveBtn.disabled = false;
+                        showToast((data && data.message) || 'Could not approve the detection');
+                        return;
+                    }
+                    // The viewer addresses the hand-drawn row from now
+                    // on, as after a move; the redraw shows it dashed
+                    // and the toolbar loses this button.
+                    adoptDetection(data.replaced_id, data.detection_id);
+                    _selectedDetBox = null;
+                    refreshOverlays();
+                    showSaved(data);
+                    if (window.refreshFindings) window.refreshFindings();
+                }).catch(function() {
+                    approveBtn.disabled = false;
+                    console.error('Failed to approve detection');
+                    showToast('Could not approve the detection');
+                });
+            });
+            toolbar.appendChild(approveBtn);
+        }
 
         // "Delete" was a lie (#299): the endpoint writes a decision on a
         // model row, or withdraws a hand-drawn row. Nothing is deleted.
