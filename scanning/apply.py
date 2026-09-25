@@ -1842,6 +1842,10 @@ def _rows_by_edit(
 ) -> dict[int, ExternalJob]:
     """Return one stage's rows of a run, keyed by the edit they read.
 
+    The newest job run wins an edit: a re-read of the edited pages
+    (``enqueue_yolo_detect --stale-labels``, #338) leaves the first
+    read's rows on the apply run beside the new ones.
+
     :param rows: The run's rows.
     :param stage: A ``JobStage`` value.
     :returns: ``{edit pk: row}``.
@@ -1849,7 +1853,7 @@ def _rows_by_edit(
     """
     return {
         row.input_manifest["edit_id"]: row
-        for row in rows
+        for row in sorted(rows, key=lambda row: (row.run, row.attempt))
         if row.stage == stage and "edit_id" in (row.input_manifest or {})
     }
 
@@ -2343,7 +2347,10 @@ def printed_pages(
 
 
 def _glue_detections(
-    scan: Scan, run: ApplyRun, rows: list[ExternalJob]
+    scan: Scan,
+    run: ApplyRun,
+    rows: list[ExternalJob],
+    volume_rows: list[ExternalJob] | None = None,
 ) -> str:
     """Write the final detections volume, in the final page space.
 
@@ -2356,12 +2363,16 @@ def _glue_detections(
     :param scan: The scan.
     :param run: The built run.
     :param rows: The run's rows.
+    :param volume_rows: The merged volume run to read, when the caller
+        holds one that is not consumed yet (:func:`refresh_detections`);
+        the live consumed run otherwise.
     :returns: The key of the final detections document.
     :rtype: str
     """
     from scanning import yolo
 
-    volume_rows = _volume_detect_run(scan)
+    if volume_rows is None:
+        volume_rows = _volume_detect_run(scan)
     if not volume_rows:
         raise ApplyError(f"scan {scan.pk} has no merged detection run to read")
     volume_key = yolo.merged_result_key(scan, volume_rows[0].run)
@@ -2523,6 +2534,88 @@ def glue_run(scan: Scan) -> ApplyRun:
         time.monotonic() - started,
     )
     return run
+
+
+def _detections_to_refresh(scan: Scan) -> ApplyRun | None:
+    """Return the standing run whose detections glue a new volume run
+    must write again, or None.
+
+    :param scan: The scan.
+    :returns: The standing built run when its detections are glued;
+        a run that has not glued them yet reads the live volume run
+        when it does. A run built over another original is None: the
+        new volume run describes a re-upload, and that run is replaced,
+        never glued again.
+    :rtype: ApplyRun | None
+    """
+    run = current_run(scan)
+    if run is None or not run.is_built or not run.detections_key:
+        return None
+    if (
+        run.source_fingerprint
+        and scan.source_fingerprint
+        and run.source_fingerprint != scan.source_fingerprint
+    ):
+        return None
+    return run
+
+
+def detections_refresh_waits(scan: Scan) -> bool:
+    """Return whether the re-glue of :func:`refresh_detections` must wait.
+
+    It waits while a detection row of the standing run's edited pages
+    is unstarted or in flight: a re-read of those pages (#338) is the
+    input the new glue reads for them.
+
+    :param scan: The scan.
+    :returns: Whether to leave the merge of the volume run for a later
+        tick.
+    :rtype: bool
+    """
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    return run.jobs.filter(
+        stage=JobStage.DETECT, status__in=UNSTARTED_JOB_STATUSES
+    ).exists()
+
+
+def refresh_detections(scan: Scan, volume_rows: list[ExternalJob]) -> bool:
+    """Write the standing run's detections again from a new volume run.
+
+    ``detections_key`` is written once by :func:`_glue`, and the
+    compute reads that document and never the merged one, so a second
+    volume detection run (#338) merged over a corrected volume would
+    import the first run's detections again and stamp them as
+    measured against the second. The merge calls this before it
+    consumes the new run: an identity run's key is the new merged key,
+    and any other run's document is written again over the same key,
+    from the new merge plus the newest read of each edited page. JSON
+    work, so it runs on the collect tick like the glue it repeats.
+
+    :param scan: The scan.
+    :param volume_rows: The new volume run, merged and not consumed.
+    :returns: Whether a document was written.
+    :rtype: bool
+    :raises ApplyError: If the glue refuses its inputs.
+    """
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    rows = list(run.jobs.all())
+    key = _glue_detections(scan, run, rows, volume_rows=volume_rows)
+    ApplyRun.objects.filter(pk=run.pk).update(detections_key=key)
+    ExternalJob.objects.filter(
+        apply_run=run, stage=JobStage.DETECT, status=JobStatus.COMPLETED
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+    logger.info(
+        "apply: scan %s: run %s detections written again from detection "
+        "run %s",
+        scan.pk,
+        run.label,
+        volume_rows[0].run,
+    )
+    return True
 
 
 def reglue_ocr(scan: Scan, run: ApplyRun | None = None) -> bool:

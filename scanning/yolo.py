@@ -82,6 +82,18 @@ MODELS = ["bl_warm"]
 #: off the ``found_by`` provenance each row carries.
 CONFIDENCE = 0.20
 
+#: The class set this stage's results hold, stamped on every row's
+#: identity as ``label_set`` (#338). bl-warm emits 18 classes, and
+#: until blackletter 0.4.1 the adapter dropped ``heading`` and
+#: ``blockquote``, so a result read before then lacks two of them and
+#: no glue can recover them: the checkpoint is the same, the output is
+#: not. A row without the stamp still describes its shard
+#: (``jobs.LENIENT_IDENTITY_KEYS``), so no tick re-pays it, but its
+#: result is never carried into a run that has the stamp. Raise it
+#: when the adapter carries a new class set, and re-run with
+#: ``enqueue_yolo_detect --stale-labels``.
+LABEL_SET = 18
+
 #: Per-row tuning keys this stage reads off ``input_manifest``, so an
 #: experiment can override them without a deploy. Everything else there
 #: describes the shard and must not be treated as a knob.
@@ -212,7 +224,7 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
 
 
 def ensure_detect_jobs(
-    scan, manifest: dict, *, apply_run=None
+    scan, manifest: dict, *, apply_run=None, force_new_run: bool = False
 ) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
@@ -232,8 +244,14 @@ def ensure_detect_jobs(
 
     :param scan: The scan to detect over.
     :param manifest: The committed shard manifest.
+    Every row carries :data:`LABEL_SET` in its identity, so the carry
+    takes only a result read with today's class set.
+
     :param apply_run: The apply run (#224) whose one-page shards the
         manifest describes, or None for the volume.
+    :param force_new_run: Start a new run even when the live one is
+        whole: the re-read of a run read with another class set (#338),
+        which only ``enqueue_yolo_detect --stale-labels`` passes.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -244,7 +262,23 @@ def ensure_detect_jobs(
         engine=JobEngine.BLACKLETTER,
         provider=JobProvider.RUNPOD,
         reuse_results=True,
+        force_new_run=force_new_run,
         apply_run=apply_run,
+        identity_extra={"label_set": LABEL_SET},
+    )
+
+
+def labels_current(rows: list[ExternalJob]) -> bool:
+    """Return whether every row of a run was read with :data:`LABEL_SET`.
+
+    :param rows: One run's rows.
+    :returns: Whether the run's results hold today's class set. An
+        empty run holds nothing, so it is not current.
+    :rtype: bool
+    """
+    return bool(rows) and all(
+        (row.input_manifest or {}).get("label_set") == LABEL_SET
+        for row in rows
     )
 
 
@@ -799,9 +833,18 @@ def finish_ready_runs() -> int:
     them. The bitonal merge deletes its results, and this stage must
     not copy that.
 
+    **A second run writes the corrected volume's detections again**
+    (``apply.refresh_detections``, #338) before it is consumed, or the
+    compute would read the first run's document under the second run's
+    stamp. A failure there counts on the merge ledger like a failed
+    merge, and the run waits, without an attempt, while a re-read of
+    the edited pages is still out.
+
     :returns: How many runs were merged and consumed.
     :rtype: int
     """
+    from scanning import apply
+
     if not s3_sync.s3_active():
         return 0
 
@@ -814,8 +857,11 @@ def finish_ready_runs() -> int:
         _merge_attempts,
         MERGE_MAX_ATTEMPTS,
     ):
+        if apply.detections_refresh_waits(scan):
+            continue
         try:
             merge_detect_results(scan, rows)
+            apply.refresh_detections(scan, rows)
         except Exception as exc:
             _record_merge_failure(scan, rows, exc)
             continue

@@ -1106,7 +1106,9 @@ def _retry_or_fail(
 
 
 # ── creating the work ───────────────────────────────────────────────
-def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
+def _shard_specs(
+    scan, manifest: dict, identity_extra: dict | None = None
+) -> list[tuple[str, dict]]:
     """Describe the work today's shard set asks for, in page order.
 
     One ``(input_key, identity)`` pair per shard. The identity is what
@@ -1125,9 +1127,16 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     built from: that is what keeps two edits' shards apart when both
     hold one page of the same size.
 
+    ``identity_extra`` is what an engine adds about its own output
+    rather than about the shard: detection's ``label_set`` (#338),
+    which says that the result holds every class the adapter carries.
+    Two reads of one shard under different values are different work,
+    so the carry refuses a result read under another value.
+
     :param scan: The scan the shards belong to.
     :param manifest: The shard manifest from :mod:`scanning.sharding`,
         or the apply's (:func:`scanning.apply.shard_manifest`).
+    :param identity_extra: Fields to add to every shard's identity.
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
@@ -1147,21 +1156,29 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
         }
         if "edit_id" in entry:
             identity["edit_id"] = entry["edit_id"]
+        identity.update(identity_extra or {})
         specs.append(
             (entry.get("key") or f"{prefix}{entry['name']}", identity)
         )
     return specs
 
 
+#: Identity fields a row written before them may lack and still
+#: describe today's shard (:func:`_identity_matches`).
+LENIENT_IDENTITY_KEYS = ("size_bytes", "label_set")
+
+
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """Return whether a row's stored identity describes today's spec.
 
-    Exact equality, with one lenient case: a row written before
-    ``size_bytes`` joined the identity has every other field, and
-    demanding the missing field would read every pre-deploy run as
-    stale -- a re-queue would then re-pay work that is plainly the
-    same. The carry path (:func:`_reusable_results`) does **not** get
-    this leniency, because there the missing field is the proof.
+    Exact equality, with one lenient case: a row written before a field
+    of :data:`LENIENT_IDENTITY_KEYS` joined the identity has every other
+    field, and demanding the missing one would read every pre-deploy
+    run as stale -- a re-queue would then re-pay work that is plainly
+    the same, and a detection run read before ``label_set`` (#338)
+    would be re-paid by any tick that asks for it. The carry path
+    (:func:`_reusable_results`) does **not** get this leniency, because
+    there the missing field is the proof.
 
     :param stored: The row's ``input_manifest``.
     :param identity: Today's identity for the same shard position.
@@ -1170,7 +1187,13 @@ def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """
     if stored == identity:
         return True
-    legacy = {k: v for k, v in identity.items() if k != "size_bytes"}
+    if stored is None:
+        return False
+    legacy = {
+        k: v
+        for k, v in identity.items()
+        if k in stored or k not in LENIENT_IDENTITY_KEYS
+    }
     return stored == legacy
 
 
@@ -2060,6 +2083,7 @@ def ensure_shard_jobs(
     force_new_run: bool = False,
     carry_stable_holes: bool = True,
     apply_run=None,
+    identity_extra: dict | None = None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -2110,10 +2134,11 @@ def ensure_shard_jobs(
         scoped by it, and the run number still comes from the one
         sequence of :meth:`ExternalJob.next_run`, so the unique key
         holds unchanged.
+    :param identity_extra: See :func:`_shard_specs`.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
-    specs = _shard_specs(scan, manifest)
+    specs = _shard_specs(scan, manifest, identity_extra)
 
     existing = list(
         ExternalJob.objects.filter(
