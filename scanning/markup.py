@@ -317,10 +317,12 @@ def parse_markdown(text: str, kind: str | None = None) -> Parsed:
     if match:
         out.set_kind(HEADING)
         text = text[match.end() :]
-    if kind:
+    if kind and kind != TABLE:
         # The engine's layout label, before the shape of the first
         # line: a ``Section-header`` that reads ``1. Standard of
-        # Review`` is a heading and not a list item.
+        # Review`` is a heading and not a list item. A ``Table`` label
+        # over a text that is no ``<table>`` names no table: the rows
+        # are the table, and a kind with no rows would show no text.
         out.set_kind(kind)
     if _LIST_MD.match(text):
         out.set_kind(LIST_ITEM)
@@ -342,7 +344,7 @@ def parse_html(html: str, kind: str | None = None) -> Parsed:
         return parse_table(html)
     out = _Out()
     _scan_html(html, out)
-    if kind:
+    if kind and kind != TABLE:
         out.set_kind(kind)
     return _finish(out)
 

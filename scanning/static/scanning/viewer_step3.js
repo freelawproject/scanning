@@ -708,7 +708,7 @@
             return token.text;
         });
         var at = 0;
-        if (kind === 'table') {
+        if (kind === 'table' && (group.table || []).length) {
             node.appendChild(tableNode(group));
         } else if (group.agreement === 'voted' && tokens.length) {
             // The words join with one space, the rule the document's

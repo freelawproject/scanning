@@ -168,3 +168,7 @@ class TestTheMarksAreNodes(SimpleTestCase):
 
         for kind in markup.BLOCK_KINDS:
             self.assertIn(f"{kind}:", block, f"{kind} has no element")
+
+    def test_a_table_with_no_rows_draws_its_text(self):
+        source = VIEWER.read_text()
+        self.assertIn("kind === 'table' && (group.table || []).length", source)

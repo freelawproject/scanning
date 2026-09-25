@@ -295,18 +295,16 @@ class TestTheAlignment(TestCase):
             "left one left two right one right two",
         )
 
-    def test_an_image_placeholder_links_nothing(self):
-        """Mistral writes a picture box as an image placeholder, so a
-        box that reads nothing is not an empty string."""
+    def test_a_picture_box_links_nothing(self):
+        """Mistral writes a picture box as an image placeholder, and
+        the parse of the OCR glue leaves it an empty text (#404)."""
         cells = [
             unit("dots_mocr", 0, (50, 100, 290, 300), "left one"),
             unit("dots_mocr", 1, (50, 320, 290, 700), "left two"),
             unit("dots_mocr", 2, (320, 100, 560, 300), "right one"),
             unit("dots_mocr", 3, (320, 320, 560, 700), "right two"),
         ]
-        picture = unit(
-            "mistral_ocr", 4, (50, 100, 560, 700), "![img-0.jpeg](img-0.jpeg)"
-        )
+        picture = unit("mistral_ocr", 4, (50, 100, 560, 700), "")
 
         groups = ensemble.align_page([*cells, picture], WIDTH, HEIGHT)
 
@@ -317,9 +315,10 @@ class TestTheAlignment(TestCase):
             ensemble.resolve(silent[0])["silent"], ["mistral_ocr"]
         )
 
-    def test_a_line_break_tag_links_nothing(self):
+    def test_a_unit_of_whitespace_links_nothing(self):
+        """A break is a line break after the parse, and nothing else."""
         cells = [unit("dots_mocr", 0, (50, 100, 290, 300), "left one")]
-        tag = unit("mistral_ocr", 1, (50, 100, 560, 700), "<br>")
+        tag = unit("mistral_ocr", 1, (50, 100, 560, 700), " \n ")
 
         groups = ensemble.align_page([*cells, tag], WIDTH, HEIGHT)
 
@@ -2921,3 +2920,43 @@ class TestTheMarksOfARow(EnsembleTestCase):
 
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
         self.assertEqual(row.marks, [])
+
+
+class TestTheContentStays(TestCase):
+    """The fold changes no character of a parsed unit (#404)."""
+
+    def test_a_literal_angle_bracket_of_the_print_stays_with_its_marks(self):
+        # Black's sets an example in angle brackets, and Surya copies it.
+        text = '("Untrue <a false statement>"); id., at 721'
+        groups = ensemble.align_page(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, text, marks=[em(32, 35)]),
+                unit("mistral_ocr", 0, BODY_A_PT, text),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(merged["text"], text)
+        self.assertEqual(merged["marks"], [em(32, 35)])
+        self.assertEqual(ensemble.resolve(groups[0])["text"], text)
+
+    def test_a_unit_of_the_glue_before_the_parse_loses_its_tags_once(self):
+        page = engine_page(
+            [unit("dots_mocr", 0, BODY_A_PT, "<b>Held</b> ![img](x) so")]
+        )
+        for u in page["units"]:
+            del u["marks"], u["kind"], u["table"]
+        other = engine_page([unit("mistral_ocr", 0, BODY_A_PT, "Held so")])
+
+        entry = ensemble.build_page(
+            {"dots_mocr": page, "mistral_ocr": other}, 0
+        )
+
+        self.assertEqual(entry["groups"][0]["text"], "Held so")
+        self.assertEqual(entry["groups"][0]["agreement"], ensemble.UNANIMOUS)
+
+    def test_plain_folds_the_whitespace_and_nothing_else(self):
+        self.assertEqual(ensemble.plain("a  <x>\nb"), "a <x> b")
+        self.assertEqual(ensemble.plain("###"), "")

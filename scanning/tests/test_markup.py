@@ -397,3 +397,18 @@ class TestShift(SimpleTestCase):
     def test_no_deletion_is_the_identity(self):
         marks = [Mark(0, 2, EM)]
         self.assertEqual(markup.shift(marks, []), marks)
+
+
+class TestTheTableLabel(SimpleTestCase):
+    def test_a_table_label_over_no_table_keeps_the_text_s_own_kind(self):
+        parsed = markup.parse_markdown("| a | b |", kind=markup.TABLE)
+        self.assertEqual((parsed.kind, parsed.table), (markup.PARAGRAPH, None))
+        self.assertEqual(parsed.text, "| a | b |")
+        parsed = markup.parse_html("<p>a b</p>", kind=markup.TABLE)
+        self.assertEqual(parsed.kind, markup.PARAGRAPH)
+
+    def test_a_table_label_over_a_table_is_a_table(self):
+        parsed = markup.parse_markdown(
+            "<table><tr><td>a</td></tr></table>", kind=markup.TABLE
+        )
+        self.assertEqual((parsed.kind, parsed.table), (markup.TABLE, [["a"]]))

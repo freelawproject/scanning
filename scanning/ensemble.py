@@ -342,7 +342,7 @@ class RevisionMoved(TransientFault):
 
 
 def plain(fragment: str | None) -> str:
-    """Return one unit's content with none of its markup.
+    """Return one unit's content, its whitespace folded.
 
     A fragment that carries no reading is empty here, whatever its
     marks: a lone ``###`` is a heading mark with no heading, and a
@@ -350,16 +350,28 @@ def plain(fragment: str | None) -> str:
     :func:`compare_text` is the one rule for "this fragment reads
     nothing", and :func:`align_page` reads it too.
 
-    :param fragment: The engine's text.
-    :returns: The text, with the tags and the image placeholders gone
-        and the whitespace collapsed; empty when it reads nothing.
+    **No character of the content goes** (#404). The unit's text is
+    the parse of the OCR glue, which took the engine's markup off and
+    left every word; a literal ``<…>`` of the print (Black's sets an
+    example in angle brackets) is content, and stays. The one text
+    that still holds the engine's own tags is a unit of a document
+    older than the parse, and :func:`_units_of` strips those once.
+
+    :param fragment: The unit's text.
+    :returns: The text with the whitespace collapsed; empty when it
+        reads nothing.
     :rtype: str
     """
     if not fragment:
         return ""
-    stripped = _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
-    shown = _WS.sub(" ", stripped).strip()
+    shown = _WS.sub(" ", fragment).strip()
     return shown if compare_text(shown) else ""
+
+
+def _strip_markup(fragment: str) -> str:
+    """Take the engine's own tags and image placeholders off a text of
+    a document older than the parse (#404)."""
+    return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
 def compare_text(text: str) -> str:
@@ -928,8 +940,9 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     or the page is written twice. So the rule reads the presence of a
     reading and never its content: what the engines wrote still
     decides nothing about what merges. :func:`plain` is the one rule
-    for "this unit reads nothing", because a picture box of Mistral
-    carries an image placeholder and not an empty string.
+    for "this unit reads nothing": the parse of the OCR glue leaves a
+    picture box of Mistral an empty text (#404), and a document older
+    than the parse had its placeholder taken off in :func:`_units_of`.
 
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
@@ -949,10 +962,10 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     boundary = column_boundary(units, width, height)
     speaking, quiet = [], []
     for unit in units:
-        # :func:`plain` and never ``compare_text``: Mistral writes a
-        # picture box as an image placeholder and a break as a tag,
-        # and both are text to a comparison. A box that reads nothing
-        # must not link, whatever it wrote in place of the reading.
+        # :func:`plain` and never ``compare_text``: a lone heading
+        # mark is text to a comparison and no reading. A box that
+        # reads nothing must not link, whatever it wrote in place of
+        # the reading.
         (speaking if plain(unit["text"]) else quiet).append(unit)
 
     union = _Union(len(speaking))
@@ -1685,11 +1698,18 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
         if not isinstance(unit, dict):
             continue
         box = opinion_ocr.as_box(unit.get("box_pt"))
+        text = unit.get("text") or ""
+        if "marks" not in unit:
+            # A document of the glue before #404: the engine's raw
+            # text, with its tags and image placeholders still in it.
+            # They go here, once; a parsed unit is content alone, and
+            # a literal ``<…>`` of the print stays.
+            text = _strip_markup(text)
         entry = {
             "engine": engine,
             "id": unit.get("id"),
             "box_pt": box,
-            "text": unit.get("text") or "",
+            "text": text,
             "type": unit.get("type") or "",
             "exclusion": unit.get("exclusion"),
             "share": unit.get("share") or 0.0,
