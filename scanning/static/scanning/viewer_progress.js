@@ -4,7 +4,14 @@
  * Shows progress bar, status messages, and live OCR results in the
  * sidebar while a scan is being processed by the daemon.
  *
- * Expects SCAN_CONFIG global: { docId, progressUrl }
+ * Expects SCAN_CONFIG global: { docId, progressUrl, progressWatch }
+ *
+ * ``progressWatch`` is the status the page was rendered in, set only
+ * for a status of ``views_process.WATCHED_STATUSES`` (#332). The scan
+ * is parked, not busy: the bitonal copy is merged and the GPU runs are
+ * still out. The collect tick moves the status, so the poll is slower,
+ * refreshes the run lines of the action bar in place when a run moves,
+ * and reloads once the status leaves the one it was rendered in.
  */
 
 (function () {
@@ -13,6 +20,8 @@
 
     var apiUrl = cfg.progressUrl;
     var lastPageCount = 0;
+    var WATCH_INTERVAL_MS = 5000;
+    var lastRuns = null;
 
     function renderPages(results) {
         var spages = document.getElementById("sidebar-pages");
@@ -110,6 +119,98 @@
         spages.innerHTML = html;
     }
 
+    // A watched step 1 is editable (AWAITING_VALIDATION is not in
+    // LOCKED_STATUSES), so a reload waits until the page is quiet: no
+    // write in flight, no field with focus, no open modal. Every write
+    // of the viewers goes through fetch, so counting the non-GET
+    // requests counts them all.
+    var writesInFlight = 0;
+    if (cfg.progressWatch && typeof window.fetch === "function") {
+        var nativeFetch = window.fetch;
+        window.fetch = function (input, init) {
+            var method = ((init && init.method) || "GET").toUpperCase();
+            if (method === "GET") return nativeFetch.apply(this, arguments);
+            writesInFlight += 1;
+            var done = function () {
+                writesInFlight -= 1;
+            };
+            var request = nativeFetch.apply(this, arguments);
+            request.then(done, done);
+            return request;
+        };
+    }
+
+    function pageIsQuiet() {
+        if (writesInFlight > 0) return false;
+        if (document.querySelector(".dupe-modal-overlay")) return false;
+        var el = document.activeElement;
+        if (!el) return true;
+        var tag = el.tagName;
+        return !(
+            tag === "INPUT" ||
+            tag === "TEXTAREA" ||
+            tag === "SELECT" ||
+            el.isContentEditable
+        );
+    }
+
+    function reloadWhenQuiet() {
+        if (pageIsQuiet()) {
+            window.location.reload();
+            return;
+        }
+        var amsg = document.getElementById("awaiting-msg");
+        if (amsg)
+            amsg.textContent =
+                "Review 1 is open. This page reloads when you finish your edit.";
+        setTimeout(reloadWhenQuiet, 1000);
+    }
+
+    function watch() {
+        if (document.hidden) {
+            setTimeout(watch, WATCH_INTERVAL_MS);
+            return;
+        }
+        fetch(apiUrl + "?watch=1")
+            .then(function (r) {
+                if (!r.ok) throw new Error("progress " + r.status);
+                return r.json();
+            })
+            .then(function (data) {
+                // Reload only on an answer that names a status: an
+                // error body without one must not reload every load.
+                if (typeof data.status !== "string") {
+                    setTimeout(watch, WATCH_INTERVAL_MS);
+                    return;
+                }
+                if (data.status !== cfg.progressWatch) {
+                    reloadWhenQuiet();
+                    return;
+                }
+                var amsg = document.getElementById("awaiting-msg");
+                if (amsg && data.message) amsg.textContent = data.message;
+                var runs = JSON.stringify([
+                    data.dots_run || null,
+                    data.yolo_run || null,
+                    data.mistral_run || null,
+                    data.surya_run || null,
+                ]);
+                // The first answer refreshes too: a run may have moved
+                // between the render and the first poll.
+                if (
+                    runs !== lastRuns &&
+                    typeof window.refreshProcessActionBar === "function"
+                ) {
+                    window.refreshProcessActionBar();
+                }
+                lastRuns = runs;
+                setTimeout(watch, WATCH_INTERVAL_MS);
+            })
+            .catch(function () {
+                setTimeout(watch, WATCH_INTERVAL_MS);
+            });
+    }
+
     function poll() {
         fetch(apiUrl)
             .then(function (r) {
@@ -151,5 +252,6 @@
                 setTimeout(poll, 2000);
             });
     }
-    poll();
+    if (cfg.progressWatch) watch();
+    else poll();
 })();
