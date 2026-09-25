@@ -2416,12 +2416,13 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first eight are the warnings the review shows on a page. The
+    The first nine are the warnings the review shows on a page. The
     last three are facts about the opinion row itself.
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
-    NO_MAJORITY = "no_majority", "No two engines agree"
+    NO_MAJORITY = "no_majority", "No two engines agree on a block"
+    SINGLE_ENGINE = "single_engine", "One engine alone read a block"
     READING_ORDER = "reading_order", "The reading order needs a check"
     COLUMN_EDGE = "column_edge", "A column starts or ends here"
     PARTIAL_REDACTION = (

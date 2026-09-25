@@ -20,6 +20,7 @@ from scanning.factories import (
 )
 from scanning.models import (
     ApplyRun,
+    Issue,
     Opinion,
     OpinionCheck,
     OpinionFindingDismissal,
@@ -289,23 +290,124 @@ class TestOpinionReview(ScanningTestCase):
         self.assertEqual(response.context["open_findings"], 0)
         self.assertContains(response, "dismissed")
 
-    def test_the_page_offers_no_write_control(self):
-        """The re-run of the ensemble is the one control of the page.
+    def dismiss_url(self, finding):
+        return reverse(
+            "dismiss_opinion_finding",
+            kwargs={
+                "pk": self.scan.pk,
+                "opinion_pk": self.opinion.pk,
+                "finding_pk": finding.pk,
+            },
+        )
 
-        The approval, the dismissal and the typing of a page come with
-        the review that closes an opinion. The header's sign-out form
-        is the only form of the page, so the test looks for a form that
-        posts to an opinion instead of for any form at all.
-        """
-        OpinionFindingFactory(opinion=self.opinion)
+    def test_an_open_card_offers_the_dismissal(self):
+        """The template writes the address the script posts (#419)."""
+        finding = OpinionFindingFactory(opinion=self.opinion)
 
         response = self.client.get(self.url)
 
-        body = response.content.decode()
-        self.assertNotIn('action="/opinions/', body)
-        self.assertNotIn("Dismiss", body)
-        self.assertNotIn("Undo", body)
-        self.assertNotIn("The opinion text is correct", body)
+        self.assertContains(
+            response, f'data-dismiss-url="{self.dismiss_url(finding)}"'
+        )
+        self.assertNotContains(response, "data-restore-url=")
+
+    def test_a_dismissed_card_offers_the_undo(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+        finding = OpinionFindingFactory(
+            opinion=self.opinion, dismissal=dismissal
+        )
+
+        response = self.client.get(self.url)
+
+        restore = reverse(
+            "restore_opinion_finding",
+            kwargs={
+                "pk": self.scan.pk,
+                "opinion_pk": self.opinion.pk,
+                "finding_pk": finding.pk,
+            },
+        )
+        self.assertContains(response, f'data-restore-url="{restore}"')
+        self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_a_stale_card_offers_no_dismissal(self):
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_an_opinion_not_ready_offers_no_dismissal(self):
+        """The endpoint refuses it, so the page offers no button (the
+        rule of the step-1 bar, #151)."""
+        for status in (
+            OpinionReviewStatus.PROCESSING,
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+            OpinionReviewStatus.ERROR,
+        ):
+            with self.subTest(status=status):
+                Opinion.objects.filter(pk=self.opinion.pk).update(
+                    status=status
+                )
+                OpinionFindingFactory(opinion=self.opinion)
+
+                response = self.client.get(self.url)
+
+                self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_the_page_offers_no_approval(self):
+        """The approval comes with the review that closes an opinion
+        (#334)."""
+        response = self.client.get(self.url)
+
+        self.assertNotContains(response, "The opinion text is correct")
+
+    def test_the_cards_the_approval_waits_on_come_first(self):
+        """Two lists (#419): the ERROR and stale cards, then the
+        warnings, and a dismissed card at the end of its list."""
+        warning = OpinionFindingFactory(opinion=self.opinion)
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.NO_MAJORITY,
+        )
+        muted = OpinionFindingFactory(
+            opinion=self.opinion,
+            check_name=OpinionCheck.NO_MAJORITY,
+            severity=Issue.Severity.ERROR,
+            dismissal=dismissal,
+        )
+        error = OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+            severity=Issue.Severity.ERROR,
+        )
+        stale = OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        response = self.client.get(self.url)
+
+        to_check = [row.pk for row in response.context["to_check"]]
+        self.assertEqual(to_check[-1], muted.pk)
+        self.assertEqual(set(to_check), {muted.pk, error.pk, stale.pk})
+        self.assertEqual(
+            [row.pk for row in response.context["warnings"]], [warning.pk]
+        )
+        self.assertEqual(response.context["open_to_check"], 2)
+        self.assertEqual(response.context["open_warnings"], 1)
+        self.assertContains(response, "Check these before the approval")
 
     def test_the_back_link_keeps_the_filters(self):
         response = self.client.get(self.url, {"scan": self.scan.pk})

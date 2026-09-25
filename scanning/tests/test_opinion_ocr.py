@@ -992,7 +992,7 @@ class TestTheParsedUnit(OpinionOcrTestCase):
         self.assertEqual(unit["kind"], "paragraph")
         self.assertNotIn("table", unit)
         self.assertEqual(document["counts"]["marks"], 1)
-        self.assertEqual(document["schema_version"], 5)
+        self.assertEqual(document["schema_version"], 6)
 
     def test_the_mistral_latex_superscript(self):
         self.set_body_a(
@@ -2203,7 +2203,7 @@ class TestTheBracketToken(OpinionOcrTestCase):
             self.assertIsNone(unit["exclusion"])
             self.assertEqual(unit["removed"], ["[1]"])
         self.assertEqual(document["counts"]["brackets_removed"], 1)
-        self.assertEqual(document["schema_version"], 5)
+        self.assertEqual(document["schema_version"], 6)
 
     def test_a_large_bracket_box_no_longer_drops_the_words(self):
         """A share of 0.3 excluded the unit before #373."""
@@ -2240,6 +2240,75 @@ class TestTheBracketToken(OpinionOcrTestCase):
 
         self.assertEqual(unit["text"], "The court held.")
         self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_bracket_box_leaves_a_short_line_in_the_text(self):
+        """The box covers an eighth of a one-line unit, which excluded
+        the whole line before #419. The deleted token is the proof that
+        the box is the bracket."""
+        self.body_a(2, "[1] Negligence.", bbox=(100, 300, 300, 335))
+        self.bracket(2, rect_type=Redaction.MANUAL_TYPE)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "Negligence.")
+        self.assertEqual(unit["removed"], ["[1]"])
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_small_box_that_deleted_nothing_excludes(self):
+        """The same box over a name at the start of a short line: no
+        token went, so the box is a redaction and takes the unit."""
+        self.body_a(2, "Smith v. Jones.", bbox=(100, 300, 300, 335))
+        self.bracket(2, rect_type=Redaction.MANUAL_TYPE)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "Smith v. Jones.")
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertEqual(unit["exclusion"]["rect_type"], "manual")
+
+    def test_a_name_box_beside_the_bracket_still_excludes(self):
+        """Two curator boxes on one short line, one over "[1]" and one
+        over the name after it. Both have the size and the place of a
+        bracket; only the leftmost is the token (#419)."""
+        self.body_a(2, "[1] Smith.", bbox=(100, 300, 300, 335))
+        self.bracket(2, rect_type=Redaction.MANUAL_TYPE)
+        self.bracket(
+            2, box=(150, 305, 230, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["removed"], ["[1]"])
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertEqual(unit["exclusion"]["rect_type"], "manual")
+
+    def test_one_box_over_the_bracket_and_a_name_still_excludes(self):
+        """The box deleted the bracket, and it is wider than the token:
+        it is the redaction of the name after it (#419)."""
+        self.body_a(2, "[1] Smith.", bbox=(100, 300, 300, 335))
+        self.bracket(
+            2, box=(105, 305, 245, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["removed"], ["[1]"])
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+
+    def test_a_curator_s_box_beside_a_model_bracket_still_excludes(self):
+        """The model's box is the token, so a curator's small box on the
+        same line deleted nothing and stays in the verdict (#419)."""
+        self.body_a(2, "[1] Smith.", bbox=(100, 300, 300, 335))
+        self.bracket(2)
+        self.bracket(
+            2, box=(150, 305, 230, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "Smith.")
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertEqual(unit["exclusion"]["rect_type"], "manual")
 
     def test_a_curator_s_large_box_still_excludes(self):
         self.body_a(2, "[1] The court held.")

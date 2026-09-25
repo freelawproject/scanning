@@ -1236,6 +1236,28 @@ a.doc-name:hover { text-decoration: underline; }
     border-color: rgba(107, 114, 128, 0.7);
     background: rgba(107, 114, 128, 0.06);
 }
+/* The risk of a group (#419), after the agreement, which it replaces
+   in a document that writes it: yellow where a majority of the engines
+   read alike, red where the approval waits for a person. */
+.ensemble-box[data-level="warning"] {
+    border-color: rgba(217, 119, 6, 0.75);
+    background: rgba(217, 119, 6, 0.08);
+}
+.ensemble-box[data-level="blocking"] {
+    border-color: rgba(220, 38, 38, 0.8);
+    background: rgba(220, 38, 38, 0.08);
+}
+/* A box every engine read alike is quiet (#419): drawn while its
+   group is selected, or while the reviewer asks for every box. It
+   stays in the page, so the hit test still finds it. */
+.ensemble-box.ensemble-quiet:not(.ensemble-selected) {
+    border-color: transparent;
+    background: transparent;
+}
+.opinion-pages.show-quiet .ensemble-box.ensemble-quiet:not(.ensemble-selected) {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.05);
+}
 /* The section of a box (#399). The colour is the agreement, so the */
 /* section takes the border style, and the zone band shows the rule. */
 .ensemble-box[data-section="footnotes"] {
@@ -1269,10 +1291,17 @@ a.doc-name:hover { text-decoration: underline; }
     outline: 1px dashed #b45309;
     outline-offset: 2px;
 }
+/* The selection is blue, because red is the colour of a group the
+   approval waits on (#419). */
 .ensemble-box.ensemble-selected {
-    border-color: #dc2626;
+    border-color: #1d4ed8;
     border-width: 2px;
-    background: rgba(220, 38, 38, 0.12);
+    background: rgba(29, 78, 216, 0.12);
+}
+.ensemble-box.ensemble-locked,
+.ensemble-group.ensemble-locked {
+    outline: 2px solid #1d4ed8;
+    outline-offset: 2px;
 }
 /* A double border under 3px draws as one solid line. */
 .ensemble-box[data-section="footnotes"].ensemble-selected {
@@ -1336,9 +1365,16 @@ li.ensemble-group {
 .ensemble-group[data-agreement="single"] {
     border-left-color: rgba(107, 114, 128, 0.7);
 }
-.ensemble-group.ensemble-selected {
-    background: rgba(220, 38, 38, 0.10);
+.ensemble-group[data-level="warning"] {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-group[data-level="blocking"] {
     border-left-color: #dc2626;
+    background: rgba(220, 38, 38, 0.05);
+}
+.ensemble-group.ensemble-selected {
+    background: rgba(29, 78, 216, 0.10);
+    border-left-color: #1d4ed8;
 }
 .ensemble-group.ensemble-doubt:not(.ensemble-selected) {
     border-left-style: dashed;
@@ -1381,12 +1417,15 @@ li.ensemble-group {
     cursor: pointer;
 }
 
-/* The readings of the engines, under the group that differs (#365). */
-/* Not on a selected group: the two rules have the same weight, and
-   this one comes later, so the red of the selection would go. */
-.ensemble-group.differs:not(.ensemble-selected) {
-    border-left-color: rgba(217, 119, 6, 0.75);
+/* The findings of one opinion scroll inside a fixed height (#419), so
+   the strip never pushes the two columns off the first screen. */
+.opinion-findings {
+    max-height: 16rem;
+    overflow-y: auto;
 }
+
+/* The badge of a group fewer engines read than the page holds, and
+   the readings under a group (#365, #419). */
 .ensemble-compare {
     font-size: 10px;
     padding: 0 5px;

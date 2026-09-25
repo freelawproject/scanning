@@ -15,10 +15,11 @@
   the address of the two routes that mint a presigned GET, and
   `viewer_step3.js` spells no path of its own (#334).
 
-  The one write control is the re-run of the ensemble. The approval,
-  the dismissal and the typing of a page come with the review that
-  closes an opinion. A button the endpoint would refuse is the one
-  thing a viewer must never offer (the rule of the step-1 bar, #151).
+  The write controls are the re-run of the ensemble and the dismissal
+  of a finding (#419). The approval and the typing of a page come with
+  the review that closes an opinion. A button the endpoint would refuse
+  is the one thing a viewer must never offer (the rule of the step-1
+  bar, #151).
 {% endcomment %}
 
 {% block title %}{{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
@@ -155,7 +156,17 @@
         column to start with, and these change it; the label is the
         scale of the render.
       {% endcomment %}
-      <div class="ml-auto flex items-center gap-1">
+      {% comment %}
+        The boxes every engine read alike are quiet by default (#419):
+        nothing there asks for the reviewer's eye. The script keeps the
+        choice in this browser.
+      {% endcomment %}
+      <label class="ml-auto flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 cursor-pointer"
+             title="Draw the boxes of the blocks every engine read alike. A box shows anyway while its block is selected.">
+        <input type="checkbox" id="show-quiet" class="h-3 w-3">
+        Show the blocks all engines agree on
+      </label>
+      <div class="flex items-center gap-1">
         <button type="button" class="btn-ghost text-xs px-2 py-0.5"
                 data-zoom="out" title="Smaller pages">&minus;</button>
         <span id="zoom-level"
