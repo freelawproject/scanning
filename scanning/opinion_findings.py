@@ -63,7 +63,15 @@ def dismiss(
                 check_name=finding.check_name,
                 dismissed_by=user,
             )
-        OpinionFinding.objects.filter(pk=finding.pk).update(dismissal=row)
+        # By the address and not by the pk the view read: a rebuild of
+        # the ensemble holds the same lock, deletes the cards and writes
+        # them again, and a pk read before the lock can name a card
+        # that is gone (#419).
+        OpinionFinding.objects.filter(
+            opinion=opinion,
+            page_in_opinion=finding.page_in_opinion,
+            check_name=finding.check_name,
+        ).update(dismissal=row)
     return row
 
 

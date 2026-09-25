@@ -189,10 +189,10 @@ SCHEMA_VERSION = 6
 #:   ``manual``, is the type of every box a curator draws, over a name
 #:   or over anything, so it counts only with the size and the place of
 #:   a bracket (:func:`is_bracket_box`). :func:`verdict` still measures
-#:   it, except for a unit whose bracket token it deleted (#419): the
-#:   deleted token is the proof that the box is a bracket, so a short
-#:   line under it is not dropped whole. A box that deleted nothing,
-#:   over a name at the start of a line, still excludes its unit.
+#:   it, except for the box that is the bracket token a unit lost
+#:   (:func:`token_boxes`, #419), so a short line under it is not
+#:   dropped whole. Every other box stays: a name beside the bracket,
+#:   a box over the bracket and a name, a box beside a model bracket.
 #:
 #: A ``HEADNOTE_BRACKET`` box never excludes a unit, whatever its size.
 #: So a bracket box the model draws over a whole paragraph blacks out
@@ -923,6 +923,68 @@ def is_bracket_box(rect: dict, box: list[float]) -> bool:
     )
 
 
+#: How much wider than its share of the line a curator's box may be
+#: and still be the bracket token the unit lost (#419). A curator draws
+#: loosely; a box over the bracket and the next word is wider than this.
+TOKEN_WIDTH_SLACK = 1.5
+
+
+def token_boxes(
+    rects: list[dict], box: list[float], text: str, removed: list[str]
+) -> list[dict]:
+    """Return the ``manual`` boxes that are the bracket tokens a unit lost.
+
+    :func:`verdict` leaves these out, and measures every other box
+    (#419). ``removed`` says that a token went, not which box took it,
+    so a box counts only when the geometry names it the token:
+
+    - it is the **leftmost** bracket box of its line, among every rect
+      of :data:`TOKEN_RECT_TYPES`: the token starts the line, so a box
+      right of another is a word beside the bracket, and a line whose
+      leftmost box is a model ``HEADNOTE_BRACKET`` has no ``manual``
+      token box at all;
+    - it is **no wider** than the widest deleted token, measured as its
+      share of the characters of the longest line of the unit, times
+      :data:`TOKEN_WIDTH_SLACK`: a box over the bracket and a name is
+      the redaction of a name.
+
+    :param rects: The page's rects of :data:`TOKEN_RECT_TYPES`.
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :param text: The unit's text before the deletion.
+    :param removed: The tokens the deletion took.
+    :returns: The ``manual`` rects to leave out of the verdict, at most
+        one per deleted token.
+    :rtype: list[dict]
+    """
+    if not removed:
+        return []
+    candidates = sorted(
+        (r for r in rects if is_bracket_box(r, box)),
+        key=lambda r: (r["x0"], r["y0"]),
+    )
+    leftmost: list[dict] = []
+    for rect in candidates:
+        if any(
+            min(rect["y1"], kept["y1"]) > max(rect["y0"], kept["y0"])
+            for kept in leftmost
+        ):
+            continue
+        leftmost.append(rect)
+    longest = max((len(line) for line in text.split("\n")), default=0)
+    if not longest:
+        return []
+    char_width = (box[2] - box[0]) / longest
+    widest = max(len(token) + 1 for token in removed) * char_width
+    limit = widest * TOKEN_WIDTH_SLACK
+    tokens = [
+        rect
+        for rect in leftmost
+        if rect.get("rect_type") == Redaction.MANUAL_TYPE
+        and rect["x1"] - rect["x0"] <= limit
+    ]
+    return sorted(tokens, key=lambda r: r["y0"])[: len(removed)]
+
+
 def touches(box: list[float], rects: list[dict]) -> bool:
     """Return whether one of ``rects`` is a bracket box of ``box``.
 
@@ -1170,6 +1232,7 @@ def build_document(
             parsed = spec.parse(unit)
             text, marks = parsed.text, parsed.marks
             removed: list[str] = []
+            before = text
             if box_pt is not None and touches(box_pt, token_rects):
                 text, removed, spans = brackets.strip_line_token_spans(text)
                 marks = markup.shift(marks, spans)
@@ -1182,13 +1245,10 @@ def build_document(
             elif parsed.kind == markup.TABLE:
                 counts["tables"] += 1
             label = unit.get(spec.type_key) or ""
-            # A ``manual`` bracket box that deleted a token of this unit
-            # is the bracket, and it does not take the unit (#419).
-            unit_rects = (
-                [r for r in rects if not is_bracket_box(r, box_pt)]
-                if removed
-                else rects
-            )
+            # The ``manual`` box that is the bracket token this unit
+            # lost does not take the unit (#419); every other box does.
+            tokens = token_boxes(token_rects, box_pt, before, removed)
+            unit_rects = [r for r in rects if not any(r is t for t in tokens)]
             exclusion, share = verdict(
                 box_pt,
                 unit_rects,

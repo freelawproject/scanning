@@ -2682,7 +2682,9 @@ def _partial_message(page: dict) -> str:
         {
             _REASON_WORDS.get(drop["reason"], drop["reason"])
             for drop in page["dropped"]
-            if drop["partial"]
+            # The drops the count holds (#419): a bracket drop is in
+            # ``partial_bracket``, and its reason is not this card's.
+            if drop["partial"] and not drop.get("bracket")
         }
     )
     said = " or ".join(reasons) or "a box"

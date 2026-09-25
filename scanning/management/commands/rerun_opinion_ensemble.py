@@ -16,7 +16,11 @@ this command is how such a volume is read.
 Two reasons to run it: a change of the transform in ``ensemble`` after
 a deploy, and a volume the daemon pass will not take. After a change
 of the document itself, such as the risk levels of #419, run it over
-every volume: ``--all``.
+every volume: ``--all``. That set holds the opinions read by
+:data:`ALL_MIN_ENGINES` engines or more: every group of a one-engine
+document is ``SINGLE`` and holds every engine of the document, so it
+gets no level and no card, and its text review would open with no
+warning. A named scan keeps the waiver of every engine count.
 
 A ``TEXT_REVIEW_DONE`` row is left alone: a human approved its text,
 and nothing derived overwrites that. An ``ERROR`` row is read again and
@@ -43,6 +47,9 @@ from django.core.management.base import BaseCommand, CommandError
 
 from scanning import ensemble, opinion_ocr
 from scanning.models import Opinion, OpinionReviewStatus, Scan
+
+#: The least ``ocr_engine_count`` of an opinion ``--all`` reads (#419).
+ALL_MIN_ENGINES = 2
 
 
 class Command(BaseCommand):
@@ -88,9 +95,11 @@ class Command(BaseCommand):
         pks = options["scan_pks"]
         if options["all"] == bool(pks):
             raise CommandError("name the scans or pass --all, not both")
+        least = ALL_MIN_ENGINES if options["all"] else 0
         if options["all"]:
             pks = list(
-                Opinion.objects.order_by("scan_id")
+                Opinion.objects.filter(ocr_engine_count__gte=least)
+                .order_by("scan_id")
                 .values_list("scan_id", flat=True)
                 .distinct()
             )
@@ -101,15 +110,19 @@ class Command(BaseCommand):
                 raise CommandError(f"scan {pk} does not exist")
             rows = [
                 opinion
-                for opinion in Opinion.objects.filter(scan=scan)
+                for opinion in Opinion.objects.filter(
+                    scan=scan, ocr_engine_count__gte=least
+                )
                 .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
                 .select_related("scan", "apply_run")
                 .order_by("first_printed_page", "index_in_page")
                 if opinion_ocr.is_written(opinion)
             ]
             if dry_run:
+                engines = sorted({row.ocr_engine_count for row in rows})
                 self.stdout.write(
-                    f"scan {pk}: would read {len(rows)} opinion(s)"
+                    f"scan {pk}: would read {len(rows)} opinion(s), "
+                    f"engines {', '.join(map(str, engines)) or 'none'}"
                 )
                 written += len(rows)
                 continue

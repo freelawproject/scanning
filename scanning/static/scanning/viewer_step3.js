@@ -1701,12 +1701,15 @@
         });
         // The clicks of a double click are one and two; the first one
         // on another group releases the lock, and the double click
-        // then sets the new one.
+        // then sets the new one. A click of the keyboard has a detail
+        // of 0 and releases it too. The listener runs in the capture
+        // phase, so a button that stops the click (a readings badge)
+        // releases the lock as well.
         document.addEventListener('click', function (event) {
-            if (!locked || event.detail !== 1) { return; }
+            if (!locked || event.detail > 1) { return; }
             if (insideLock(event)) { return; }
             release();
-        });
+        }, true);
     }
 
     /**

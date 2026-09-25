@@ -121,6 +121,25 @@ class TestTheDismissal(OpinionFindingTestCase):
         self.assertEqual(card.check_name, OpinionCheck.SINGLE_ENGINE)
         self.assertIsNotNone(card.dismissal_id)
 
+    def test_a_rebuild_between_the_read_and_the_write_is_answered(self):
+        """The view read the card, then the ensemble wrote the cards
+        again under a new pk. The dismissal lands on the card of the
+        same address (#419)."""
+        from scanning import opinion_findings
+
+        read = OpinionFinding.objects.get(pk=self.finding.pk)
+        OpinionFinding.objects.filter(pk=self.finding.pk).delete()
+        fresh = OpinionFindingFactory(
+            opinion=self.opinion,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+            severity=Issue.Severity.ERROR,
+        )
+
+        row = opinion_findings.dismiss(self.opinion, read, self.user)
+
+        fresh.refresh_from_db()
+        self.assertEqual(fresh.dismissal, row)
+
     def test_a_stale_card_is_refused(self):
         stale = OpinionFindingFactory(
             opinion=self.opinion,

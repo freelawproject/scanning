@@ -1396,6 +1396,35 @@ class TestTheFindings(EnsembleTestCase):
         self.assertIn("The mask of the opinion before", card.message)
         self.assertNotIn("redaction covers", card.message)
 
+    def test_the_partial_card_names_no_reason_of_a_bracket_drop(self):
+        """The count leaves the bracket drops out, and so do the
+        reasons (#419)."""
+        page = page_of(partial=1, partial_bracket=1)
+        page["dropped"] = [
+            {
+                "engines": {},
+                "box_pt": None,
+                "reason": "redaction",
+                "partial": True,
+                "bracket": False,
+            },
+            {
+                "engines": {},
+                "box_pt": None,
+                "reason": opinion_ocr.PAGE_NUMBER,
+                "partial": True,
+                "bracket": True,
+            },
+        ]
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.PARTIAL_REDACTION
+        )
+        self.assertIn("A redaction covers part of 1 block(s)", card.message)
+        self.assertNotIn("page number", card.message)
+
     def test_the_partial_card_names_the_page_number(self):
         """One engine glued the head to the first paragraph, and the
         group went whole (#396). The card must not call that a
@@ -2080,6 +2109,34 @@ class TestTheCommand(EnsembleTestCase):
         self.assertEqual(
             OpinionText.objects.filter(opinion=self.opinion).count(), 3
         )
+
+    def test_all_leaves_out_an_opinion_one_engine_read(self):
+        """Every group of a one-engine document holds every engine of
+        it, so it would get no level and no card (#419)."""
+        self.glue()
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_engine_count=1)
+
+        output = self.run_command("--all")
+
+        self.assertIn("Wrote 0 opinion(s)", output)
+        self.assertFalse(
+            OpinionText.objects.filter(opinion=self.opinion).exists()
+        )
+
+    def test_a_named_scan_keeps_the_waiver_of_every_count(self):
+        self.glue()
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_engine_count=1)
+
+        output = self.run_command(self.scan.pk)
+
+        self.assertIn("Wrote 1 opinion(s)", output)
+
+    def test_the_dry_run_names_the_engine_counts(self):
+        self.glue()
+
+        output = self.run_command("--all", "--dry-run")
+
+        self.assertIn("would read 1 opinion(s), engines 2", output)
 
     def test_all_and_a_scan_together_is_an_error(self):
         with self.assertRaises(CommandError):

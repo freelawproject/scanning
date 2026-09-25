@@ -236,6 +236,25 @@ class TestTheRiskIsTheDocuments(SimpleTestCase):
         self.assertIn(".ensemble-locked", styles)
 
 
+class TestTheLockIsReleased(SimpleTestCase):
+    """Every single click outside releases the lock (#419)."""
+
+    def listener(self) -> str:
+        source = VIEWER.read_text()
+        start = source.index("document.addEventListener('click'")
+        return source[start : source.index("true);", start) + 6]
+
+    def test_a_keyboard_click_releases_it(self):
+        """A click of the keyboard has a detail of 0."""
+        self.assertIn("event.detail > 1", self.listener())
+        self.assertNotIn("event.detail !== 1", self.listener())
+
+    def test_a_button_that_stops_the_click_releases_it(self):
+        """The listener runs in the capture phase, before a badge
+        stops the click."""
+        self.assertIn("}, true);", self.listener())
+
+
 class TestTheStorageIsAConvenience(SimpleTestCase):
     """The page works when the browser refuses the storage (#419)."""
 
