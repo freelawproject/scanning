@@ -51,6 +51,17 @@ in ``removed``. The redactions decide the text as they decide the PDF:
 a bracket the model did not box stays in both until a curator boxes
 it, one of the two ways :data:`TOKEN_RECT_TYPES` names.
 
+**The engine's markup becomes marks** (#404). Each engine writes its
+formatting in its own dialect, and each unit is parsed once here into
+the one shape of :mod:`scanning.markup`: a plain ``text``, standoff
+``marks`` over it (``em``, ``strong``, ``sup``) and a block ``kind``
+(``paragraph``, ``heading``, ``list_item``, ``table``). The parse is
+the engine's own ``EngineSpec.dialect`` over its ``markup_key``, with
+the label the engine gave the unit (``kind_types``); the bracket strip
+runs on the parsed text and its deletions move the marks. The volume
+documents stay as the engines wrote them, so a better parse is a
+re-glue (``reglue_opinion_ocr``) and never a corpus re-glue.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -126,6 +137,7 @@ from scanning import (
     boundaries,
     brackets,
     dots_mocr,
+    markup,
     mistral_ocr,
     page_numbers,
     redactions,
@@ -148,8 +160,9 @@ logger = logging.getLogger(__name__)
 
 #: Version of the documents this module writes. 2 puts the footnote
 #: zone on every page (#399); 3 deletes the headnote bracket from the
-#: unit text (#373).
-SCHEMA_VERSION = 3
+#: unit text (#373); 4 parses the engine's markup into ``marks`` and
+#: ``kind`` beside a plain ``text`` (#404).
+SCHEMA_VERSION = 4
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -284,6 +297,18 @@ class EngineSpec:
         label is almost never wrong and misses most footnotes. So they
         never decide a section; the ensemble reads them for the
         ``FOOTNOTE_UNSURE`` card alone.
+    :param dialect: The parser of this engine's markup (#404):
+        ``markup.parse_markdown`` for the two that write markdown in
+        the unit text, ``markup.parse_html`` for Surya.
+    :param markup_key: The unit field the dialect reads. Surya's is
+        ``html`` and not its ``text_key``: the worker's flattened
+        ``text`` has already lost the superscript boundaries
+        (``x<sup>1</sup>`` is ``x1`` there).
+    :param kind_types: The values of ``type_key`` that name a block
+        kind (a ``Section-header`` is a heading whether or not the
+        engine wrote ``##``), each mapped to a ``markup.BLOCK_KINDS``
+        value. Mistral's ``title`` names the caption's party names
+        too; the ensemble's majority answers that, not this table.
     """
 
     name: str
@@ -297,10 +322,29 @@ class EngineSpec:
     band_labels: dict[str, str]
     zone_prefix: str
     footnote_types: frozenset[str] = frozenset()
+    dialect: Callable[..., markup.Parsed] = markup.parse_markdown
+    markup_key: str = "text"
+    kind_types: dict[str, str] = field(default_factory=dict)
 
     def document_key(self, run) -> str:
         """The S3 key of this engine's document for ``run``."""
         return getattr(run, self.key_field) or ""
+
+    def parse(self, unit: dict) -> markup.Parsed:
+        """Parse one unit's markup into the one shape (#404).
+
+        :param unit: The unit as the engine's volume document holds it.
+        :returns: The plain text, its marks and its kind.
+        :rtype: markup.Parsed
+        """
+        source = unit.get(self.markup_key)
+        if not isinstance(source, str):
+            source = unit.get(self.text_key)
+        label = unit.get(self.type_key) or ""
+        return self.dialect(
+            source if isinstance(source, str) else "",
+            kind=self.kind_types.get(label),
+        )
 
     @property
     def fields(self) -> dict[str, str]:
@@ -391,6 +435,12 @@ ENGINES: dict[str, EngineSpec] = {
         band_labels={"Page-header": "header", "Page-footer": "footer"},
         zone_prefix="dots-",
         footnote_types=frozenset({"Footnote"}),
+        kind_types={
+            "Section-header": markup.HEADING,
+            "Title": markup.HEADING,
+            "List-item": markup.LIST_ITEM,
+            "Table": markup.TABLE,
+        },
     ),
     "mistral_ocr": EngineSpec(
         name="mistral_ocr",
@@ -409,6 +459,12 @@ ENGINES: dict[str, EngineSpec] = {
         # Lowercase, as the harvest stores them. ``footer`` holds
         # footnote text on these pages; the running foot is ``header``.
         footnote_types=frozenset({"references", "footer", "aside_text"}),
+        markup_key=mistral_ocr.BLOCK_TEXT_KEY,
+        kind_types={
+            "title": markup.HEADING,
+            "list": markup.LIST_ITEM,
+            "table": markup.TABLE,
+        },
     ),
     "surya": EngineSpec(
         name="surya",
@@ -426,6 +482,15 @@ ENGINES: dict[str, EngineSpec] = {
         zone_prefix="surya-",
         # ``ListGroup`` is not here: it names a real list as often.
         footnote_types=frozenset({"Footnote", "Bibliography"}),
+        # The markup is in ``html``: the worker's flattened ``text``
+        # has already lost the superscript boundaries (#404).
+        dialect=markup.parse_html,
+        markup_key="html",
+        kind_types={
+            "SectionHeader": markup.HEADING,
+            "ListGroup": markup.LIST_ITEM,
+            "Table": markup.TABLE,
+        },
     ),
 }
 
@@ -973,6 +1038,10 @@ def build_document(
         "page_number": 0,
         "footnote_zones": 0,
         "brackets_removed": 0,
+        "marks": 0,
+        "headings": 0,
+        "list_items": 0,
+        "tables": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -1037,13 +1106,24 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
-            text = unit.get(spec.text_key)
-            if not isinstance(text, str):
-                text = ""
+            # The engine's markup becomes marks over a plain text
+            # (#404), and the bracket strip runs on that text: Surya's
+            # markup is in its ``html``, where the token sits behind a
+            # ``<p>``. The deletions move the marks.
+            parsed = spec.parse(unit)
+            text, marks = parsed.text, parsed.marks
             removed: list[str] = []
             if box_pt is not None and touches(box_pt, token_rects):
-                text, removed = brackets.strip_line_tokens(text)
+                text, removed, spans = brackets.strip_line_token_spans(text)
+                marks = markup.shift(marks, spans)
                 counts["brackets_removed"] += len(removed)
+            counts["marks"] += len(marks)
+            if parsed.kind == markup.HEADING:
+                counts["headings"] += 1
+            elif parsed.kind == markup.LIST_ITEM:
+                counts["list_items"] += 1
+            elif parsed.kind == markup.TABLE:
+                counts["tables"] += 1
             label = unit.get(spec.type_key) or ""
             exclusion, share = verdict(
                 box_pt,
@@ -1067,11 +1147,15 @@ def build_document(
                 "id": index,
                 "type": label,
                 "text": text,
+                "marks": [mark.as_dict() for mark in marks],
+                "kind": parsed.kind,
                 "bbox": unit.get("bbox"),
                 "box_pt": box_pt,
                 "exclusion": exclusion,
                 "share": share,
             }
+            if parsed.kind == markup.TABLE:
+                out["table"] = parsed.table or []
             if removed:
                 out["removed"] = removed
             entry["units"].append(out)

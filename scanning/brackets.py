@@ -169,8 +169,25 @@ def strip_line_tokens(text: str) -> tuple[str, list[str]]:
         line starts with a token.
     :rtype: tuple[str, list[str]]
     """
+    stripped, removed, _ = strip_line_token_spans(text)
+    return stripped, removed
+
+
+def strip_line_token_spans(
+    text: str,
+) -> tuple[str, list[str], list[tuple[int, int]]]:
+    """:func:`strip_line_tokens`, plus where each deletion was.
+
+    :param text: One unit's text.
+    :returns: ``(the text, the tokens deleted, the spans deleted)``,
+        each span ``(start, end)`` in the offsets of ``text`` before the
+        deletions, so a caller moves its standoff marks over them
+        (``markup.shift``, #404).
+    :rtype: tuple[str, list[str], list[tuple[int, int]]]
+    """
     parts: list[str] = []
     removed: list[str] = []
+    spans: list[tuple[int, int]] = []
     kept = 0
     for match in LINE_TOKEN.finditer(text):
         if not expand(match):
@@ -186,11 +203,12 @@ def strip_line_tokens(text: str) -> tuple[str, list[str]]:
                 start -= 1
         parts.append(text[kept:start])
         removed.append(whole.strip(" \t"))
+        spans.append((start, end))
         kept = end
     if not removed:
-        return text, []
+        return text, [], []
     parts.append(text[kept:])
-    return "".join(parts), removed
+    return "".join(parts), removed, spans
 
 
 def read_document(document: dict | None) -> dict[int, list[Reading]]:

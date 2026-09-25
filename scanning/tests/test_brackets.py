@@ -512,3 +512,21 @@ class TestTheLineTokens(ScanningTestCase):
 
     def test_a_bracket_on_the_last_line_takes_the_newline_before(self):
         self.assertEqual(self.strip("Text\n[3]"), ("Text", ["[3]"]))
+
+    def test_the_spans_say_where_each_deletion_was(self):
+        """The offsets the marks of #404 move over."""
+        self.assertEqual(
+            brackets.strip_line_token_spans("[1] The court held."),
+            ("The court held.", ["[1]"], [(0, 4)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("II\n[4, 5] The Second.\n[6] X"),
+            ("II\nThe Second.\nX", ["[4, 5]", "[6]"], [(3, 10), (22, 26)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("[3]\nText"),
+            ("Text", ["[3]"], [(0, 4)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("plain"), ("plain", [], [])
+        )
