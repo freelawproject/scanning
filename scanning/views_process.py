@@ -438,6 +438,27 @@ def detection_message(summary: dict | None) -> str:
     )
 
 
+def _prints(reading: str | None, entry: dict) -> bool:
+    """Return whether a page map entry's number is the one its page prints.
+
+    ``build_issues`` gives a page the number it reads, and a page that
+    reads none, a range or a number outside the volume its PDF page, a
+    display value (#403). The two agree only on a page that prints its
+    ``logical_number``.
+
+    :param reading: The page's ``detected`` value, for a single number.
+    :param entry: A ``pdf_page`` entry of the page map.
+    :returns: Whether the entry's ``logical_number`` is a printed number.
+    :rtype: bool
+    """
+    if reading is None or "range_label" in entry:
+        return False
+    try:
+        return int(reading) == entry["logical_number"]
+    except (TypeError, ValueError):
+        return False
+
+
 @login_required
 def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """Unified scan processing page with 3-step workflow.
@@ -597,15 +618,27 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # each one, with a link that opens the file the curator uploaded.
         replaced_pages = page_edits.replacements_by_page(scan)
 
-        # Map pdf_index → logical page number for navigation
+        # Map pdf_index → logical page number for navigation. A card
+        # names a printed number, so only a page that prints it resolves
+        # the card: an unnumbered page, a range page and an out-of-range
+        # reading carry their PDF page as ``logical_number``, a display
+        # value (#403), and a card of printed page 12 went to PDF page
+        # 12 of the front matter too. The page map was built from the
+        # stored readings, the curator's numbers included.
+        printed = {
+            r["pdf_page"] - 1: r.get("detected")
+            for r in scan.ocr_results or []
+            if r.get("type") == "single" and r.get("detected")
+        }
         idx_to_logical = {}
         logical_to_indices: dict[int, list[int]] = {}
         for entry in page_map:
             if entry.get("type") == "pdf_page":
                 idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
-                logical_to_indices.setdefault(
-                    entry["logical_number"], []
-                ).append(entry["pdf_index"])
+                if _prints(printed.get(entry["pdf_index"]), entry):
+                    logical_to_indices.setdefault(
+                        entry["logical_number"], []
+                    ).append(entry["pdf_index"])
 
         # PDF page indices the page_map flags as duplicates (a detected page
         # number that already appeared on an earlier page). The PDF viewer marks
@@ -627,15 +660,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # page_map rather than matched directly. The set is shared with the
         # dismissal, which keeps its address in the same two spaces (#214).
         # A missing page's card goes to the page its placeholder follows,
-        # with the placeholder right below it. Its printed number is on
-        # no page, but an unnumbered page can hold that value as its
-        # display ``logical_number``, and the card then went to the
-        # front matter. That page is not at fault, so it gets no red
-        # border, as with the trailing range below.
+        # with the placeholder right below it. That page is not at fault,
+        # so it gets no red border, as with the trailing range below. An
+        # upload into the gap takes the placeholder's entry and keeps
+        # its anchor (``page_edits._inserted_entry``), and the card
+        # stands until a recheck, so the inserted entry answers too.
         gap_anchors = {
             e["logical_number"]: e["anchor_pdf_page"]
             for e in page_map
-            if e.get("type") == "missing" and "anchor_pdf_page" in e
+            if e.get("type") in ("missing", "inserted")
+            and "anchor_pdf_page" in e
         }
         flagged_indices: set[int] = set()
         for i in issues:

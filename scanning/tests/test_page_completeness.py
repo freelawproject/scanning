@@ -724,25 +724,28 @@ class TestStepOneGoal(ScanningTestCase):
 
 
 class TestTheCardOfAMissingPageAfterFrontMatter(ScanningTestCase):
-    """The card of a missing page goes to its gap, not the front matter.
+    """A card of a printed number goes to that number, not the front matter.
 
     An unnumbered page carries its PDF page as its display number, so
     with 13 pages of front matter, the card of printed page 10 went to
-    PDF page 10. Scan 3156 has this shape.
+    PDF page 10, and a card of printed page 12 to PDF page 12 as well as
+    to the page that prints 12. Scan 3156 has this shape (#403).
     """
 
-    def _step_one(self):
-        """Render step 1 of a volume that skips printed pages 10 and 11.
+    def _scan(self, numbers=None):
+        """Create a volume with 13 unnumbered pages, then ``numbers``.
 
-        :returns: The response.
+        :param numbers: The printed numbers after the front matter. By
+            default 1-9 and 12-20, so printed pages 10 and 11 are
+            missing after PDF page 22.
+        :returns: The scan, with its issues computed.
         """
-        user = self.make_user()
-        self.client.force_login(user)
+        if numbers is None:
+            numbers = list(range(1, 10)) + list(range(12, 21))
         results = [
             {"pdf_page": p, "detected": "", "type": "single"}
             for p in range(1, 14)
         ]
-        numbers = list(range(1, 10)) + list(range(12, 21))
         results += [
             {"pdf_page": 14 + i, "detected": str(n), "type": "single"}
             for i, n in enumerate(numbers)
@@ -756,19 +759,74 @@ class TestTheCardOfAMissingPageAfterFrontMatter(ScanningTestCase):
         )
         pathlib.Path(scan.original_pdf.path).unlink()
         services.recalculate_issues(scan)
+        return scan
+
+    def _step_one(self, scan):
+        """Render step 1 of the scan.
+
+        :param scan: The scan.
+        :returns: The response.
+        """
+        self.client.force_login(self.make_user())
         return self.client.get(
             reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
         )
 
-    def test_the_card_navigates_to_the_page_before_the_gap(self):
-        response = self._step_one()
+    def _cards(self, response, check):
+        """Return each card of one check with the index it navigates to.
 
-        cards = {
+        :param response: The step-1 response.
+        :param check: A ``CheckName`` value.
+        :returns: ``{page_number: nav_pdf_index}``.
+        :rtype: dict
+        """
+        return {
             i.page_number: i.nav_pdf_index
             for i in response.context["issues"]
-            if i.check_name == CheckName.MISSING_PAGE
+            if i.check_name == check
         }
-        self.assertEqual(cards, {10: 21, 11: 21})
+
+    def test_the_card_navigates_to_the_page_before_the_gap(self):
+        response = self._step_one(self._scan())
+
+        self.assertEqual(
+            self._cards(response, CheckName.MISSING_PAGE), {10: 21, 11: 21}
+        )
+
+    def test_the_card_stays_at_the_gap_after_an_upload_into_it(self):
+        """An upload takes the placeholder's entry, and the card stands
+        until a recheck: it must not fall back to the front matter."""
+        scan = self._scan()
+        PageEditFactory(
+            scan=scan,
+            kind=PageEdit.Kind.INSERT_PAGE,
+            pdf_page=None,
+            anchor_pdf_page=22,
+            logical_page="10",
+            value="",
+            source_fingerprint=scan.source_fingerprint,
+        )
+
+        response = self._step_one(scan)
+
+        self.assertEqual(
+            self._cards(response, CheckName.MISSING_PAGE), {10: 21, 11: 21}
+        )
+
+    def test_a_duplicate_card_names_only_the_pages_that_print_it(self):
+        """Printed page 12 on PDF pages 23 and 24: the card goes to 23,
+        and PDF page 12 of the front matter gets no red border from it."""
+        numbers = list(range(1, 10)) + [12, 12] + list(range(13, 21))
+        scan = self._scan(numbers)
+        scan.issues.exclude(check_name=CheckName.DUPLICATE_PAGE).delete()
+
+        response = self._step_one(scan)
+
+        self.assertEqual(
+            self._cards(response, CheckName.DUPLICATE_PAGE), {12: 22}
+        )
+        flagged = json.loads(response.context["flagged_indices_json"])
+        self.assertEqual(sorted(flagged), [22, 23])
 
 
 class TestTheCardOfARangeMissingAtTheEnd(ScanningTestCase):
