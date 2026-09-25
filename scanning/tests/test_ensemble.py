@@ -2745,6 +2745,28 @@ class TestTheMarks(TestCase):
 
         self.assertEqual(marks, [sup(6, 8)])
 
+    def test_a_star_page_word_marks_no_word_of_one_character(self):
+        marks = ensemble.union_marks(
+            "a case is", [("1407 case is", [sup(0, 4)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_footnote_word_gives_no_half_superscript(self):
+        marks = ensemble.union_marks(
+            "held. 1 The", [("held. 12 The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_footnote_word_of_superscript_digits_carries(self):
+        """The key folds ``¹²`` to ``12``."""
+        marks = ensemble.union_marks(
+            "held. 12 The", [("held. ¹² The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 8)])
+
     def test_an_italic_carries_onto_a_misread_word(self):
         """A whole-word mark is not a range: the #423 rule is the
         superscript's alone."""
