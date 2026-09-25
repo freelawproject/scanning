@@ -412,7 +412,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     # is a fact about the row and takes none.
     can_dismiss = opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
     for row in findings:
-        if can_dismiss and not row.is_stale:
+        if can_dismiss and not row.is_undismissable:
             kwargs = {
                 "pk": opinion.scan_id,
                 "opinion_pk": opinion.pk,
@@ -473,6 +473,17 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
                 ocr_written
                 and opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
             ),
+            # The human edits (#376): the toolbar of a locked block,
+            # offered where the endpoints take a write, the gate of
+            # ``views_api._edit_context``.
+            "can_edit": (
+                opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+                and ensemble.is_written(opinion)
+            ),
+            "edit_text_url": address("edit_opinion_text"),
+            "edit_section_url": address("edit_opinion_section"),
+            "edit_move_url": address("move_opinion_block"),
+            "edit_withdraw_url": address("withdraw_opinion_edit"),
             # Absent when the PDF pass has not written the file at
             # the live revision: the template shows the reason instead
             # of the two links and the column of the pages.

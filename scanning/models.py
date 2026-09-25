@@ -2417,7 +2417,8 @@ class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
     The first nine are the warnings the review shows on a page. The
-    last three are facts about the opinion row itself.
+    last three are facts about the opinion row itself. The last one is
+    a human edit the text no longer holds (#376).
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
@@ -2438,6 +2439,10 @@ class OpinionCheck(models.TextChoices):
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
+    UNRESOLVED_EDIT = (
+        "unresolved_edit",
+        "A human edit no longer fits the text",
+    )
 
 
 #: The checks a curator may dismiss. The two stale checks are facts
@@ -2446,7 +2451,16 @@ class OpinionCheck(models.TextChoices):
 STALE_OPINION_CHECKS = frozenset(
     {OpinionCheck.STALE_PAGE_NUMBER, OpinionCheck.ORPHANED_OPINION}
 )
-DISMISSABLE_OPINION_CHECKS = frozenset(OpinionCheck) - STALE_OPINION_CHECKS
+#: The checks no dismissal answers: the two stale checks, and a human
+#: edit the text no longer holds (#376), whose way out is its Undo or a
+#: new edit. A dismissal would hide a decision of a person that is not
+#: in the text.
+UNDISMISSABLE_OPINION_CHECKS = STALE_OPINION_CHECKS | frozenset(
+    {OpinionCheck.UNRESOLVED_EDIT}
+)
+DISMISSABLE_OPINION_CHECKS = (
+    frozenset(OpinionCheck) - UNDISMISSABLE_OPINION_CHECKS
+)
 
 
 class Opinion(AbstractDateTimeModel):
@@ -2660,6 +2674,23 @@ class Opinion(AbstractDateTimeModel):
         help_text=(
             "Failed ensemble ticks on this row at the live revision "
             "(#365). At ensemble.MAX_ATTEMPTS the row goes to ERROR."
+        ),
+    )
+    edit_revision = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "Raised by every write of an OpinionEdit row (#376), in the "
+            "transaction of the write. The ensemble reads it before it "
+            "reads the edits."
+        ),
+    )
+    ensemble_edit_revision = models.PositiveIntegerField(
+        default=0,
+        help_text=(
+            "The edit_revision the ensemble document was built at "
+            "(#376). It names the document's key, so no two builds "
+            "write one key, and a reader presigns the key of this "
+            "number."
         ),
     )
     approved_text_key = models.CharField(
@@ -3090,8 +3121,141 @@ class OpinionFinding(AbstractDateTimeModel):
         """Whether this check is a fact about a row, not a judgement."""
         return self.check_name in STALE_OPINION_CHECKS
 
+    @property
+    def is_undismissable(self) -> bool:
+        """Whether no dismissal answers this check (#376)."""
+        return self.check_name in UNDISMISSABLE_OPINION_CHECKS
+
     def __str__(self):
         return f"{self.check_name} on {self.opinion}"
+
+
+class OpinionEdit(AbstractDateTimeModel):
+    """One human edit of the text of one opinion (#376).
+
+    Three kinds: the text of one block (``TEXT``), the section of one
+    block (``SECTION``: the body or the footnotes), and the order of the
+    blocks of one section of one page (``ORDER``).
+
+    **The address plus a copy of the box, never the group id.** The id
+    of a group in the ensemble document is its place on the page, and
+    a re-glue or a re-run gives the same block another one. So an edit
+    names its page by the durable address of ``OpinionText`` and its
+    block by a copy of the block's box, and ``ensemble.land_edits``
+    lands it on the group of each new build, the rule of review 2's
+    decisions.
+
+    **The ensemble applies it** (``ensemble.build_page``), so the
+    ``OpinionText`` rows, the document and the cards all hold it, and
+    the browser derives nothing. An edit that fits no kept group of the
+    build, or a text edit whose block the engines now read with other
+    words, is not applied and is an ``UNRESOLVED_EDIT`` card: a human
+    edit never puts back text that a redaction took out.
+
+    Withdrawn, never deleted. One standing row per target:
+    ``opinion_edits.supersede`` withdraws the row it replaces, under a
+    lock on the opinion, because a box copy takes no unique key.
+    """
+
+    class Kind(models.TextChoices):
+        TEXT = "text", "Text of a block"
+        SECTION = "section", "Section of a block"
+        ORDER = "order", "Order of the blocks of a page"
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="edits",
+    )
+    kind = models.CharField(max_length=10, choices=Kind.choices)
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="opinion_edits",
+        help_text="The durable address of the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField(
+        help_text="A copy for the display. The address decides.",
+    )
+    box_pt = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "TEXT and SECTION: a copy of the block's box, in the points "
+            "of the volume page."
+        ),
+    )
+    section = models.CharField(
+        max_length=10,
+        blank=True,
+        default="",
+        help_text=(
+            "TEXT: the section the block was in. SECTION: the new "
+            "section. ORDER: the section the order is of."
+        ),
+    )
+    base_text = models.TextField(
+        blank=True,
+        default="",
+        help_text="TEXT: the text the curator saw.",
+    )
+    text = models.TextField(
+        blank=True,
+        default="",
+        help_text="TEXT: the new text, folded like an engine's.",
+    )
+    order = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="ORDER: the box copies of the section, in the new order.",
+    )
+    glue_revision = models.PositiveSmallIntegerField(
+        help_text="The glue revision the curator saw.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="opinion_edits",
+    )
+    replaces = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="replaced_by",
+        help_text="The standing row this row superseded.",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="withdrawn_opinion_edits",
+    )
+
+    class Meta:
+        ordering = ["pk"]
+        indexes = [
+            models.Index(
+                fields=["opinion", "withdrawn_at"],
+                name="idx_opinion_edit_standing",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.kind} edit on {self.opinion} page {self.page_in_opinion}"
+        )
 
 
 class PageEdit(AbstractDateTimeModel):

@@ -143,6 +143,7 @@ from scanning.models import (
     Issue,
     Opinion,
     OpinionCheck,
+    OpinionEdit,
     OpinionFinding,
     OpinionFindingDismissal,
     OpinionReviewStatus,
@@ -158,10 +159,15 @@ logger = logging.getLogger(__name__)
 #: group its ``kind`` and its ``marks``, the formatting the engines
 #: read (#404). 5 flags the quoted groups and writes the blockquote
 #: runs of a page (#411). 6 gives every group its ``level``, and
-#: every drop its ``bracket`` (#419).
-SCHEMA_VERSION = 6
+#: every drop its ``bracket`` (#419). 7 applies the human edits of the
+#: text (#376): a ``human`` group, a ``section_edit``, the
+#: ``order_edits`` and the ``unresolved_edits`` of a page, and the
+#: ``edit_revision`` of the document.
+SCHEMA_VERSION = 7
 
-#: The file, beside the ``{engine}.json`` files of the OCR glue.
+#: The file, beside the ``{engine}.json`` files of the OCR glue. A
+#: build over human edits writes ``ensemble.e{n}.json`` instead, with
+#: ``n`` its edit revision (#376), so no two builds write one key.
 DOCUMENT = "ensemble.json"
 
 #: The least share of the smaller box two units must share to link.
@@ -246,6 +252,18 @@ UNANIMOUS = "unanimous"
 MAJORITY = "majority"
 VOTED = "voted"
 SINGLE = "single"
+#: A group whose text a person wrote (#376). The engines' readings stay
+#: on the group, and it is no place the engines differ: a person read
+#: it against the page.
+HUMAN = "human"
+
+#: Why a human edit is not in the text (#376). ``opinion_edits`` owns
+#: the edits; these are the answers of the build.
+EDIT_NO_PAGE = "no_page"
+EDIT_NO_GROUP = "no_group"
+EDIT_DROPPED = "dropped"
+EDIT_EMPTY = "empty"
+EDIT_BASE_CHANGED = "base_changed"
 
 #: The risk of a group the engines did not read alike (#419). A
 #: ``BLOCKING`` group is a place no majority of the engines read, or a
@@ -275,6 +293,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
+        OpinionCheck.UNRESOLVED_EDIT,
     }
 )
 
@@ -1912,6 +1931,7 @@ def _counts() -> dict:
         MAJORITY: 0,
         VOTED: 0,
         SINGLE: 0,
+        HUMAN: 0,
         "silent": 0,
         "differing": 0,
         WARNING: 0,
@@ -1924,17 +1944,181 @@ def _counts() -> dict:
         "footnote_doubt": 0,
         "blockquotes": 0,
         "blockquote_lists": 0,
+        "unresolved_edits": 0,
     }
 
 
-def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
+# ---------------------------------------------------------------------------
+# The human edits (#376)
+# ---------------------------------------------------------------------------
+
+
+def edit_entries(opinion: Opinion) -> list[dict]:
+    """Return the standing human edits of one opinion, as plain entries.
+
+    The build reads these entries and no row, so :func:`build_document`
+    stays a function of its inputs. The order is the order of the
+    writes, which breaks a tie of :func:`land_edits`.
+
+    :param opinion: The row.
+    :returns: One entry per standing ``OpinionEdit``.
+    :rtype: list[dict]
+    """
+    rows = (
+        OpinionEdit.objects.filter(opinion=opinion, withdrawn_at__isnull=True)
+        .select_related("created_by")
+        .order_by("pk")
+    )
+    return [
+        {
+            "id": row.pk,
+            "kind": row.kind,
+            "source_edit_id": row.source_edit_id,
+            "source_page": row.source_page,
+            "page_in_opinion": row.page_in_opinion,
+            "box_pt": row.box_pt,
+            "section": row.section,
+            "base_text": row.base_text,
+            "text": row.text,
+            "order": row.order or [],
+            "by": row.created_by.username if row.created_by else "",
+            "at": row.date_created.isoformat() if row.date_created else "",
+        }
+        for row in rows
+    ]
+
+
+def land_edits(
+    boxes: list[list[float] | None], groups: list[dict]
+) -> dict[int, int]:
+    """Land each box copy on one group, by IoU.
+
+    **The one rule** of where a human edit of the text lands (#376).
+    A pair must reach :data:`OVERLAP`, each box takes one group and
+    each group one box, and the greatest IoU is taken first; a tie goes
+    to the box that comes first, which is the older write. This is the
+    rule of review 2's decisions (``detections.resolve``), over the
+    boxes of the ensemble.
+
+    :param boxes: The box copies, in points; None lands nowhere.
+    :param groups: The groups, each with its ``box_pt``.
+    :returns: ``{index into boxes: index into groups}``.
+    :rtype: dict[int, int]
+    """
+    pairs = []
+    for here, box in enumerate(boxes):
+        if not box:
+            continue
+        for there, group in enumerate(groups):
+            score = iou(box, group["box_pt"])
+            if score >= OVERLAP:
+                pairs.append((-score, here, there))
+    pairs.sort()
+    landed: dict[int, int] = {}
+    taken: set[int] = set()
+    for _score, here, there in pairs:
+        if here in landed or there in taken:
+            continue
+        landed[here] = there
+        taken.add(there)
+    return landed
+
+
+def _apply_order(ordered: list[dict], edit: dict) -> int:
+    """Put the groups one ``ORDER`` edit lists in the listed order.
+
+    The listed groups fill the slots the listed groups hold, so a group
+    the list does not name keeps its slot: a block a later build found
+    stays where the geometry put it, and a dropped group still parts
+    the blockquote runs where it did. A box that lands on a group of
+    the other section is not counted: a ``SECTION`` edit moved it, and
+    it is no longer in this list's text.
+
+    :param ordered: The groups of the page in reading order. Changed
+        in place.
+    :param edit: The entry of the edit.
+    :returns: How many listed boxes landed on no group.
+    :rtype: int
+    """
+    boxes = edit.get("order") or []
+    landed = land_edits(boxes, ordered)
+    ranked = sorted(
+        (rank, there)
+        for rank, there in landed.items()
+        if ordered[there]["section"] == edit["section"]
+    )
+    slots = sorted(there for _rank, there in ranked)
+    moved = [ordered[there] for _rank, there in ranked]
+    for slot, group in zip(slots, moved, strict=True):
+        ordered[slot] = group
+    return len(boxes) - len(landed)
+
+
+def _human_read(read_back: dict, edit: dict) -> dict:
+    """Return the read of a group whose text a person wrote.
+
+    The marks of the engines' text carry to the words of the new text
+    that :func:`union_marks` aligns with them, so an italic case name
+    the curator did not touch keeps its italic. A table becomes a
+    paragraph: its rows are the engines', and the text is not.
+
+    :param read_back: :func:`resolve` of the group.
+    :param edit: The entry of the ``TEXT`` edit.
+    :returns: The read, in the shape of :func:`resolve`.
+    :rtype: dict
+    """
+    text = edit["text"]
+    kind = read_back["kind"]
+    return {
+        **read_back,
+        "agreement": HUMAN,
+        "source": HUMAN,
+        "agreeing": [],
+        "silent": [],
+        "text": text,
+        "tokens": [],
+        "n_low_confidence": 0,
+        "marks": union_marks(
+            text, [(read_back["text"], read_back.get("marks") or [])]
+        ),
+        "kind": markup.PARAGRAPH if kind == markup.TABLE else kind,
+        "table": None,
+    }
+
+
+def _unresolved(edit: dict, reason: str) -> dict:
+    """Return the entry of one edit the build did not apply.
+
+    ``said`` is the line the viewer shows beside the Undo of the edit,
+    written here so the browser spells no reason of its own.
+    """
+    entry = {
+        "edit_id": edit["id"],
+        "kind": edit["kind"],
+        "reason": reason,
+        "by": edit.get("by", ""),
+        "base_text": edit.get("base_text", ""),
+    }
+    line = _unresolved_line(entry)
+    entry["said"] = line[0].upper() + line[1:]
+    return entry
+
+
+def build_page(
+    pages: dict[str, dict],
+    page_in_opinion: int,
+    edits: list[dict] | None = None,
+) -> dict:
     """Return the ensemble of one page of one opinion.
 
     :param pages: ``{engine: the page of that engine's document}``.
     :param page_in_opinion: The 0-based page of the opinion.
+    :param edits: The standing human edits of this page's address
+        (:func:`edit_entries`, #376).
     :returns: The page entry of the document.
     :rtype: dict
     """
+    edits = edits or []
     first = next(iter(pages.values()))
     read = {
         engine: page for engine, page in pages.items() if "error" not in page
@@ -1959,10 +2143,15 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "missing": [engine for engine in pages if engine not in read],
         "groups": [],
         "dropped": [],
+        # The human edits (#376): the standing ``ORDER`` edit of each
+        # section, and the edits this build did not apply.
+        "order_edits": {},
+        "unresolved_edits": [],
         "counts": _counts(),
     }
     if not read:
         entry["error"] = first.get("error") or "no engine read this page"
+        _no_group(entry, edits)
         return entry
 
     size = _frame(read)
@@ -1989,6 +2178,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         # page with no text and no card is a page lost in silence.
         entry["error"] = UNMEASURED
         entry["counts"]["dropped"] = len(entry["dropped"])
+        _no_group(entry, edits)
         return entry
 
     width, height = size
@@ -2005,14 +2195,41 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     # too, and a page with two footnotes has too few boxes of its own
     # to find its gutter.
     boundary = column_boundary(groups, width, height)
+    # The human edits land on the aligned groups, before any of them is
+    # dropped (#376), so an edit whose block a redaction now takes says
+    # so and never lands on a neighbour.
+    unresolved: list[dict] = []
+    for kind, key in (
+        (OpinionEdit.Kind.SECTION, "_section_edit"),
+        (OpinionEdit.Kind.TEXT, "_text_edit"),
+    ):
+        wanted = [edit for edit in edits if edit["kind"] == kind]
+        landed = land_edits([edit["box_pt"] for edit in wanted], groups)
+        for here, edit in enumerate(wanted):
+            if here in landed:
+                groups[landed[here]][key] = edit
+            else:
+                unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
         group["section"], group["footnote_doubt"] = section(group, zones)
+        placed = group.get("_section_edit")
+        if placed and placed["section"] in by_section:
+            # A person put the block in its section, so the zone does
+            # not decide and the engines' label raises no doubt.
+            group["section"] = placed["section"]
+            group["footnote_doubt"] = False
         group["blockquote"] = quoted(group, quotes)
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
     ) + place_footnotes(by_section[FOOTNOTES], width, height, boundary)
+    for edit in edits:
+        if edit["kind"] != OpinionEdit.Kind.ORDER:
+            continue
+        entry["order_edits"][edit["section"]] = edit["id"]
+        if _apply_order(ordered, edit):
+            unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
 
     parts: dict[str, list[str]] = {BODY: [], FOOTNOTES: []}
     offsets: dict[str, int] = {BODY: 0, FOOTNOTES: 0}
@@ -2023,6 +2240,12 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     for group in ordered:
         read_back = resolve(group)
         if group["excluded"] or not read_back["text"]:
+            # A redaction or a mask took the block, or no engine reads
+            # a word there now: two causes, and the card names the one.
+            gone = EDIT_DROPPED if group["excluded"] else EDIT_EMPTY
+            for key in ("_section_edit", "_text_edit"):
+                if group.get(key):
+                    unresolved.append(_unresolved(group[key], gone))
             sequence.append(
                 {
                     "dropped": True,
@@ -2050,6 +2273,24 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 }
             )
             continue
+        human = None
+        written = group.get("_text_edit")
+        if written:
+            # The curator judged the text they saw. When the engines
+            # now read other words, that judgement is of a text that is
+            # not there, and the edit waits for a person.
+            if compare_text(written["base_text"]) != compare_text(
+                read_back["text"]
+            ):
+                unresolved.append(_unresolved(written, EDIT_BASE_CHANGED))
+            else:
+                read_back = _human_read(read_back, written)
+                human = {
+                    "edit_id": written["id"],
+                    "by": written["by"],
+                    "at": written["at"],
+                    "base_text": written["base_text"],
+                }
         name = group["section"]
         start = offsets[name]
         end = start + len(read_back["text"])
@@ -2077,6 +2318,8 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 "silent": read_back["silent"],
                 "n_low_confidence": read_back["n_low_confidence"],
                 "level": None,
+                "human": human,
+                "section_edit": (group.get("_section_edit") or {}).get("id"),
                 "tokens": read_back["tokens"],
                 "text": read_back["text"],
                 # The formatting (#404): the marks are offsets into
@@ -2133,7 +2376,17 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     entry["counts"]["partial_bracket"] = sum(
         1 for drop in entry["dropped"] if drop["partial"] and drop["bracket"]
     )
+    entry["unresolved_edits"] = unresolved
+    entry["counts"]["unresolved_edits"] = len(unresolved)
     return entry
+
+
+def _no_group(entry: dict, edits: list[dict]) -> None:
+    """Say that no edit of a page with no group landed (#376)."""
+    entry["unresolved_edits"] = [
+        _unresolved(edit, EDIT_NO_GROUP) for edit in edits
+    ]
+    entry["counts"]["unresolved_edits"] = len(entry["unresolved_edits"])
 
 
 def _differs(group: dict, engines: int) -> bool:
@@ -2152,6 +2405,9 @@ def _differs(group: dict, engines: int) -> bool:
     :returns: Whether it is a disagreement.
     :rtype: bool
     """
+    if group["agreement"] == HUMAN:
+        # A person wrote this text against the page (#376).
+        return False
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True
     return len(group.get("engines") or {}) < engines
@@ -2183,11 +2439,24 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     return WARNING
 
 
-def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
+def build_document(
+    opinion: Opinion,
+    documents: dict[str, dict],
+    edits: list[dict] | None = None,
+    edit_revision: int = 0,
+) -> dict:
     """Return the ensemble document of one opinion.
+
+    An edit lands on the page of its address (#376), whatever the page
+    of the opinion is now: a moved boundary moves ``page_in_opinion``
+    and not the address. An edit whose address is no page of the
+    opinion is in the document's own ``unresolved_edits``.
 
     :param opinion: The row.
     :param documents: ``{engine: the opinion document of that engine}``.
+    :param edits: :func:`edit_entries`.
+    :param edit_revision: The ``Opinion.edit_revision`` the edits were
+        read at.
     :returns: The document.
     :rtype: dict
     :raises EnsembleError: When an engine document lacks a page of the
@@ -2204,6 +2473,11 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
             if isinstance(page, dict)
         }
 
+    by_address: dict[tuple, list[dict]] = {}
+    for edit in edits or []:
+        address = (edit["source_edit_id"], edit["source_page"])
+        by_address.setdefault(address, []).append(edit)
+
     pages = []
     counts = _counts()
     for page_in_opinion in range(opinion.page_count):
@@ -2217,10 +2491,19 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
                     SHORT_DOCUMENT,
                 )
             of_page[engine] = page
-        entry = build_page(of_page, page_in_opinion)
+        address = detections.source_of_entry(of_page[engines[0]])
+        entry = build_page(
+            of_page, page_in_opinion, by_address.pop(address, [])
+        )
         for key, value in entry["counts"].items():
             counts[key] += value
         pages.append(entry)
+    homeless = [
+        _unresolved(edit, EDIT_NO_PAGE)
+        for page_edits in by_address.values()
+        for edit in page_edits
+    ]
+    counts["unresolved_edits"] += len(homeless)
 
     return {
         "schema_version": SCHEMA_VERSION,
@@ -2240,6 +2523,8 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
             "weak_iou": WEAK_IOU,
         },
         "generated_at": timezone.now().isoformat(),
+        "edit_revision": edit_revision,
+        "unresolved_edits": homeless,
         "pages": pages,
         "counts": counts,
     }
@@ -2250,15 +2535,25 @@ def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def document_key(opinion: Opinion) -> str:
+def document_key(opinion: Opinion, edit_revision: int | None = None) -> str:
     """Return the S3 key of one opinion's ensemble document.
 
+    The key carries the edit revision the document was built at (#376):
+    two builds a second apart over two edits must not write one key,
+    or the last upload and the last stamp can name two documents. A
+    reader passes nothing and reads the stamped build.
+
     :param opinion: The row.
+    :param edit_revision: The build's revision; None reads the stamp,
+        ``Opinion.ensemble_edit_revision``.
     :returns: The key.
     :rtype: str
     """
+    if edit_revision is None:
+        edit_revision = opinion.ensemble_edit_revision
+    name = DOCUMENT if not edit_revision else f"ensemble.e{edit_revision}.json"
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
-    return f"{prefix}{opinion.glue_prefix}{DOCUMENT}"
+    return f"{prefix}{opinion.glue_prefix}{name}"
 
 
 def is_written(opinion: Opinion) -> bool:
@@ -2294,7 +2589,8 @@ def due(limit: int | None = None):
     A row whose OCR glue is written at the live revision, that holds
     at least :func:`min_engines` engine documents, that is neither
     ``ERROR`` nor ``TEXT_REVIEW_DONE``, that has attempts left, and
-    whose ensemble stamp is not the OCR glue's. The scan must be in
+    whose ensemble stamp is not the OCR glue's, or whose edit stamp is
+    not the edit revision (#376). The scan must be in
     ``REDACTION_REVIEW_DONE``: a volume an admin sent back writes no
     text while it is back.
 
@@ -2322,6 +2618,10 @@ def due(limit: int | None = None):
         .filter(
             Q(ensemble_revision__isnull=True)
             | ~Q(ensemble_revision=F("ocr_glue_revision"))
+            # A human edit the text does not hold yet (#376): the
+            # request that wrote it builds the text, and a build that
+            # failed there is built here.
+            | ~Q(ensemble_edit_revision=F("edit_revision"))
         )
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
@@ -2542,9 +2842,34 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
         )
     }
     cards = []
+    if document.get("unresolved_edits"):
+        cards.append(
+            _card(
+                opinion,
+                None,
+                OpinionCheck.UNRESOLVED_EDIT,
+                Issue.Severity.ERROR,
+                _unresolved_message(document["unresolved_edits"]),
+                standing,
+            )
+        )
     for page in document["pages"]:
         page_number = page["page_in_opinion"]
         counts = page["counts"]
+        # A human edit the text does not hold (#376). Before the
+        # unread page, whose ``continue`` writes no other card: an edit
+        # on a page nobody read is still a decision nobody sees.
+        if page.get("unresolved_edits"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.UNRESOLVED_EDIT,
+                    Issue.Severity.ERROR,
+                    _unresolved_message(page["unresolved_edits"]),
+                    standing,
+                )
+            )
         # Every group the engines did not read alike (``_differs``) is
         # on one card of its level (``disagreement_level``, #419): a
         # place a majority read is a warning, a place no majority read
@@ -2823,9 +3148,48 @@ def _disagree_message(differing: int, missing: list[str]) -> str:
     return count
 
 
+#: What stopped a human edit, in words (#376).
+_EDIT_REASON_WORDS = {
+    EDIT_NO_PAGE: "its page is no longer in this opinion",
+    EDIT_NO_GROUP: "no block of the text is where it was",
+    EDIT_DROPPED: "a redaction or a mask now takes its block out",
+    EDIT_EMPTY: "no engine reads a word in its block now",
+    EDIT_BASE_CHANGED: "the engines now read other words there",
+}
+
+#: What an edit is, in words.
+_EDIT_KIND_WORDS = {
+    OpinionEdit.Kind.TEXT: "the text of a block",
+    OpinionEdit.Kind.SECTION: "the section of a block",
+    OpinionEdit.Kind.ORDER: "the order of the blocks",
+}
+
+
+def _unresolved_line(entry: dict) -> str:
+    """Return what one unresolved edit is and why it is out (#376)."""
+    kind = _EDIT_KIND_WORDS.get(entry["kind"], entry["kind"])
+    who = f" by {entry['by']}" if entry.get("by") else ""
+    why = _EDIT_REASON_WORDS.get(entry["reason"], entry["reason"])
+    return f"{kind}{who}: {why}"
+
+
+def _unresolved_message(entries: list[dict]) -> str:
+    """Return the line of one ``UNRESOLVED_EDIT`` card (#376).
+
+    :param entries: The ``unresolved_edits`` of a page or a document.
+    :returns: The message.
+    :rtype: str
+    """
+    said = "; ".join(_unresolved_line(entry) for entry in entries)
+    return (
+        f"{len(entries)} human edit(s) are not in the text ({said}). Press "
+        "Undo on this card to take an edit back, or edit the block again."
+    )
+
+
 def _card(
     opinion: Opinion,
-    page_in_opinion: int,
+    page_in_opinion: int | None,
     check: str,
     severity: str,
     message: str,
@@ -2892,6 +3256,21 @@ def _read(key: str, code: str = UNREADABLE) -> dict:
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
 
+def read_document(opinion: Opinion) -> dict:
+    """Read the stamped ensemble document of one opinion off S3.
+
+    The document the review page draws, so an edit is judged over the
+    text the curator saw (#376).
+
+    :param opinion: The row.
+    :returns: The document.
+    :rtype: dict
+    :raises EnsembleError: When the object is missing or is not JSON.
+    :raises TransientFault: When the read failed.
+    """
+    return _read(document_key(opinion))
+
+
 def load_documents(opinion: Opinion) -> dict[str, dict]:
     """Read one opinion's engine documents off S3.
 
@@ -2946,8 +3325,19 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :raises RevisionMoved: When the OCR glue wrote again during this
         write, which keeps nothing.
     """
-    document = build_document(opinion, documents)
-    key = document_key(opinion)
+    # The revision first and the edits second (#376): an edit written
+    # between the two reads is in the build and raises the revision, so
+    # the swap below fails and the next build holds both.
+    edit_revision = (
+        Opinion.objects.filter(pk=opinion.pk)
+        .values_list("edit_revision", flat=True)
+        .first()
+        or 0
+    )
+    document = build_document(
+        opinion, documents, edit_entries(opinion), edit_revision
+    )
+    key = document_key(opinion, edit_revision)
     if not s3_sync.upload_json_object(key, document):
         raise TransientFault(f"the upload to {key} failed")
 
@@ -2958,22 +3348,34 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             # and ``update_or_create`` between two of them is a lost
             # select and an ``IntegrityError``. The lock is held over
             # row writes alone: no HTTP call is inside it.
-            Opinion.objects.select_for_update().filter(pk=opinion.pk).exists()
+            before = (
+                Opinion.objects.select_for_update()
+                .filter(pk=opinion.pk)
+                .values_list("ensemble_revision", "ensemble_edit_revision")
+                .first()
+            )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
             stamped = Opinion.objects.filter(
-                pk=opinion.pk, ocr_glue_revision=opinion.ocr_glue_revision
+                pk=opinion.pk,
+                ocr_glue_revision=opinion.ocr_glue_revision,
+                edit_revision=edit_revision,
             ).update(
                 ensemble_revision=opinion.ocr_glue_revision,
+                ensemble_edit_revision=edit_revision,
                 ensemble_attempts=0,
             )
             if not stamped:
-                # The glue wrote the documents again while this ran, so
-                # the rows and the cards above describe documents that
-                # are gone. Take them back and leave the ensemble due.
+                # The glue wrote the documents again while this ran, or
+                # a person wrote an edit (#376), so the rows and the
+                # cards above describe inputs that are gone. Take them
+                # back and leave the ensemble due.
                 raise RevisionMoved(
-                    "the OCR glue wrote again while the text was written"
+                    "the OCR glue or a human edit wrote again while the "
+                    "text was written"
                 )
+            opinion.ensemble_revision = opinion.ocr_glue_revision
+            opinion.ensemble_edit_revision = edit_revision
             # An ERROR this module wrote is answered by this success:
             # the row is readable again, and the operator who pressed
             # the button or ran the command is the one who decided
@@ -2994,8 +3396,56 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             opinion,
             opinion.scan_id,
         )
+        _drop_unstamped(opinion, key, edit_revision)
         raise
+    _drop_superseded(opinion, before, edit_revision)
     return document
+
+
+def _drop_superseded(
+    opinion: Opinion, before: tuple | None, edit_revision: int
+) -> None:
+    """Delete the document the new stamp replaced, best effort (#376).
+
+    Each build over a new edit revision writes a key of its own, so the
+    document of the stamp before it is read by nothing once the row
+    names the new one: the stamps only rise, and no build stamps an old
+    revision again. Only a document under the same glue prefix is this
+    function's; a re-glue leaves the old prefix whole, as before #376.
+
+    :param opinion: The row, with the new stamp.
+    :param before: ``(ensemble_revision, ensemble_edit_revision)`` read
+        under the lock, before the stamp.
+    :param edit_revision: The edit revision of the new stamp.
+    """
+    if not before:
+        return
+    old_revision, old_edit = before
+    if old_revision != opinion.ocr_glue_revision or old_edit == edit_revision:
+        return
+    s3_sync.delete_objects([document_key(opinion, old_edit)])
+
+
+def _drop_unstamped(opinion: Opinion, key: str, edit_revision: int) -> None:
+    """Delete the document of a build that lost the swap, best effort.
+
+    The stamp the build did not write is behind the row's revisions, and
+    they only rise, so no later build stamps that key. The one case to
+    spare is a key the row names now: a build of the same revisions that
+    won before this one lost, which wrote the same key.
+
+    :param opinion: The row, as the build read it.
+    :param key: The key this build uploaded.
+    :param edit_revision: The edit revision the build read.
+    """
+    stamp = (
+        Opinion.objects.filter(pk=opinion.pk)
+        .values_list("ensemble_revision", "ensemble_edit_revision")
+        .first()
+    )
+    if stamp == (opinion.ocr_glue_revision, edit_revision):
+        return
+    s3_sync.delete_objects([key])
 
 
 def rerun(opinion: Opinion) -> dict:

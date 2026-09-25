@@ -9,7 +9,9 @@ so the page shows the answer with no rebuild.
 
 Nothing deletes a dismissal. A curator takes one back with
 ``withdrawn_at``. A card of ``STALE_OPINION_CHECKS`` is a fact about the
-row, not a judgement, so it takes no dismissal.
+row, not a judgement, and an ``UNRESOLVED_EDIT`` card is a decision of
+a person the text does not hold (#376), so neither takes a dismissal
+(``UNDISMISSABLE_OPINION_CHECKS``).
 
 The gate of the status lives in the view, the rule of every refused
 write: this module answers for the rows alone.
@@ -19,7 +21,7 @@ from django.db import transaction
 from django.utils import timezone
 
 from scanning.models import (
-    STALE_OPINION_CHECKS,
+    UNDISMISSABLE_OPINION_CHECKS,
     Opinion,
     OpinionFinding,
     OpinionFindingDismissal,
@@ -46,7 +48,7 @@ def dismiss(
     :returns: The standing dismissal.
     :raises UndismissableOpinionFinding: for a stale finding.
     """
-    if finding.check_name in STALE_OPINION_CHECKS:
+    if finding.check_name in UNDISMISSABLE_OPINION_CHECKS:
         raise UndismissableOpinionFinding(finding.check_name)
     with transaction.atomic():
         Opinion.objects.select_for_update().filter(pk=opinion.pk).first()

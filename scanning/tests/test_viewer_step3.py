@@ -260,8 +260,80 @@ class TestTheStorageIsAConvenience(SimpleTestCase):
 
     def test_every_storage_call_is_inside_a_try(self):
         source = VIEWER.read_text()
-        calls = [m.start() for m in re.finditer(r"localStorage\.", source)]
+        calls = [
+            m.start()
+            for m in re.finditer(r"(?:local|session)Storage\.", source)
+        ]
         self.assertTrue(calls, "the choice of the quiet boxes is gone")
+        self.assertIn("sessionStorage", source, "the place of an edit is gone")
         for at in calls:
             before = source[max(0, at - 80) : at]
             self.assertIn("try {", before, "a storage call outside a try")
+
+
+class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
+    """A write control exists on the locked block alone (#376)."""
+
+    def test_the_toolbar_is_built_by_the_lock_alone(self):
+        source = VIEWER.read_text()
+        calls = re.findall(r"editBar\(", source)
+        # The definition and the one call, in ``lock``.
+        self.assertEqual(len(calls), 2)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("editBar(", lock)
+        self.assertIn("canEdit()", lock)
+
+    def test_the_viewer_reads_the_routes_of_the_page(self):
+        source = VIEWER.read_text()
+        for name in (
+            "editTextUrl",
+            "editSectionUrl",
+            "editMoveUrl",
+            "editWithdrawUrl",
+        ):
+            self.assertIn(f"endpoint('{name}')", source)
+        self.assertNotIn("/edits/", source)
+
+    def test_the_viewer_knows_the_schema_that_holds_the_edits(self):
+        source = VIEWER.read_text()
+        match = re.search(r"var EDIT_SCHEMA = (\d+);", source)
+        self.assertIsNotNone(match)
+        # A floor, the pin of ``LEVEL_SCHEMA``: a later schema still
+        # holds the edits, and its document keeps the toolbar.
+        self.assertLessEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_an_unresolved_edit_has_its_undo(self):
+        """An edit with no block to lock is undone from its line (#376)."""
+        source = VIEWER.read_text()
+        lines = source[source.index("function unresolvedList(") :]
+        lines = lines[: lines.index("\n    }\n")]
+        self.assertIn("withdrawEdit(entry.edit_id", lines)
+        self.assertIn("entry.said", lines)
+        for reader in (
+            "page.unresolved_edits",
+            "doc.unresolved_edits",
+            'data-check="unresolved_edit"',
+        ):
+            self.assertIn(reader, source)
+
+    def test_the_edit_reads_the_level_and_derives_none(self):
+        source = VIEWER.read_text()
+        bar = source[source.index("function fillBar(") :]
+        bar = bar[: bar.index("\n    }\n")]
+        self.assertIn("group.level", bar)
+        self.assertNotIn("agreement", bar)
+
+    def test_the_release_asks_before_it_drops_typed_text(self):
+        """A stray click must not throw a curator's text away (#376)."""
+        source = VIEWER.read_text()
+        release = source[source.index("function release(") :]
+        release = release[: release.index("\n    }\n")]
+        self.assertIn("hasUnsavedText()", release)
+        self.assertIn("window.confirm(", release)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("!release()", lock)
+        editor = source[source.index("function openEditor(") :]
+        editor = editor[: editor.index("\n    }\n")]
+        self.assertIn("locked.editor = { area: area", editor)

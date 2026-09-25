@@ -21,6 +21,7 @@ from scanning.models import (
     JobStage,
     Opinion,
     OpinionBoundary,
+    OpinionEdit,
     OpinionFinding,
     OpinionFindingDismissal,
     OpinionScan,
@@ -362,6 +363,7 @@ class ScanAdmin(admin.ModelAdmin):
             (OpinionText, "opinion__scan_id"),
             (OpinionFinding, "opinion__scan_id"),
             (OpinionFindingDismissal, "opinion__scan_id"),
+            (OpinionEdit, "opinion__scan_id"),
             (PendingUpload, "scan_id"),
             (ExternalJob, "scan_id"),
         ):
