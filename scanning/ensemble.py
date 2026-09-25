@@ -554,6 +554,35 @@ def _aligned(base: list[str], other: list[str]) -> dict[int, int]:
     return out
 
 
+def _same_but_for(word: str, other: str, span: tuple[int, int]) -> bool:
+    """Return whether two words differ inside ``span`` of ``other``
+    alone: the same length, and the same key before and after it.
+
+    The length keeps a range on the characters it covered. A star page
+    number glued to a word (``court1407``) is longer than the word the
+    other engines read (``courts``), and its range would land on the
+    last letter.
+
+    A range over the whole word leaves nothing before or after it to
+    compare, so it carries only onto the same key or between two words
+    of one character (``l`` for a footnote ``1``). A star page number
+    an engine read as its own word (``1407``) would otherwise land on
+    any word the alignment pairs with it, ``a`` and ``I`` included, and
+    a footnote ``12`` would give half its superscript to a ``1``.
+    """
+    low, high = span
+    if low == 0 and high >= len(other):
+        return (
+            compare_word(word) == compare_word(other)
+            or len(word) == len(other) == 1
+        )
+    return (
+        len(word) == len(other)
+        and compare_word(word[:low]) == compare_word(other[:low])
+        and compare_word(word[high:]) == compare_word(other[high:])
+    )
+
+
 def union_marks(
     text: str, readings: list[tuple[str, list[dict]]]
 ) -> list[dict]:
@@ -572,6 +601,17 @@ def union_marks(
     words of ``text`` that :func:`_aligned` pairs with its own, and the
     rest stay unmarked.
 
+    A ``sup`` carries only onto a word that differs from the engine's
+    inside the superscript alone (:func:`_same_but_for`, #423). The
+    alignment pairs a replaced word of the same count, and an italic
+    over the whole word belongs to it whatever character the engine
+    misread. A superscript is a range of characters inside the word:
+    Surya's ``1407This`` would put its star-page superscript over all
+    of ``This``. A misread footnote mark (``acts."l`` for ``acts."1``)
+    still carries, because the misread is inside the range. A lost
+    superscript is the smaller error, because a wrong one reads as a
+    footnote the print does not have.
+
     :param text: The group's text, the one the marks are over.
     :param readings: ``[(an engine's text, its marks)]`` for every
         engine that read the group.
@@ -581,18 +621,22 @@ def union_marks(
     spans = word_spans(text)
     if not spans:
         return []
-    keys = [compare_word(text[start:end]) for start, end in spans]
+    words = [text[start:end] for start, end in spans]
+    keys = [compare_word(word) for word in words]
     merged = [_no_flags() for _ in spans]
     for other_text, other_marks in readings:
         if not other_marks:
             continue
         flags = word_flags(other_text, other_marks)
-        other_keys = [compare_word(word) for word in other_text.split()]
+        other_words = other_text.split()
+        other_keys = [compare_word(word) for word in other_words]
         for here, there in _aligned(keys, other_keys).items():
             found = flags[there]
             merged[here][markup.EM] |= found[markup.EM]
             merged[here][markup.STRONG] |= found[markup.STRONG]
-            if found[markup.SUP] is not None:
+            if found[markup.SUP] is not None and _same_but_for(
+                words[here], other_words[there], found[markup.SUP]
+            ):
                 held = merged[here][markup.SUP]
                 merged[here][markup.SUP] = (
                     found[markup.SUP]

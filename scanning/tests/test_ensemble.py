@@ -2688,6 +2688,106 @@ class TestTheMarks(TestCase):
 
         self.assertEqual(answer["marks"], [sup(6, 7)])
 
+    def test_a_superscript_carries_onto_the_same_word(self):
+        marks = ensemble.union_marks(
+            "of ketoacidosis.1 The",
+            [("of ketoacidosis.1 The", [sup(16, 17)])],
+        )
+
+        self.assertEqual(marks, [sup(16, 17)])
+
+    def test_a_superscript_does_not_carry_onto_other_characters(self):
+        """Surya glued the star page to the word (#423): ``1407This``
+        pairs with ``This`` as a replaced word of the same count, and
+        its range 0 to 4 would cover the whole of ``This``."""
+        marks = ensemble.union_marks(
+            "This case is a companion",
+            [("1407This case is a companion", [sup(0, 4)])],
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_misread_footnote_mark_keeps_its_superscript(self):
+        """The engines differ inside the superscript alone."""
+        marks = ensemble.union_marks(
+            'acts."1 The', [('acts."l The', [sup(6, 7)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 7)])
+
+    def test_a_star_page_at_the_end_of_a_word_marks_no_letter(self):
+        """The range 5 to 9 of ``court1407`` would land on the ``s``."""
+        marks = ensemble.union_marks(
+            "the courts held", [("the court1407 held", [sup(9, 13)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_star_page_read_as_its_own_word_marks_no_word(self):
+        """The engine missed ``This`` and read the star page there."""
+        marks = ensemble.union_marks(
+            "This case is", [("1407 case is", [sup(0, 4)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_misread_footnote_word_of_one_character_carries(self):
+        marks = ensemble.union_marks(
+            "held. 1 The", [("held. l The", [sup(6, 7)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 7)])
+
+    def test_a_footnote_word_of_the_same_key_carries(self):
+        marks = ensemble.union_marks(
+            "held. 12 The", [("held. 12 The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 8)])
+
+    def test_a_star_page_word_marks_no_word_of_one_character(self):
+        marks = ensemble.union_marks(
+            "a case is", [("1407 case is", [sup(0, 4)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_footnote_word_gives_no_half_superscript(self):
+        marks = ensemble.union_marks(
+            "held. 1 The", [("held. 12 The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_footnote_word_of_superscript_digits_carries(self):
+        """The key folds ``¹²`` to ``12``."""
+        marks = ensemble.union_marks(
+            "held. 12 The", [("held. ¹² The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 8)])
+
+    def test_an_italic_carries_onto_a_misread_word(self):
+        """A whole-word mark is not a range: the #423 rule is the
+        superscript's alone."""
+        marks = ensemble.union_marks(
+            "see Marcotte here", [("see Marcotle here", [em(4, 12)])]
+        )
+
+        self.assertEqual(marks, [em(4, 12)])
+
+    def test_a_star_page_glued_to_the_first_word_marks_nothing(self):
+        answer = ensemble.resolve(
+            three(
+                ("This case is a companion", []),
+                ("This case is a companion", []),
+                ("1407This case is a companion", [sup(0, 4)]),
+            )
+        )
+
+        self.assertEqual(answer["text"], "This case is a companion")
+        self.assertEqual(answer["marks"], [])
+
     def test_the_marks_of_every_engine_join(self):
         answer = ensemble.resolve(
             three(

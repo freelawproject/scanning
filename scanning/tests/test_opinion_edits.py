@@ -37,6 +37,7 @@ from scanning.tests.test_ensemble import (
     EnsembleTestCase,
     em,
     engine_page,
+    sup,
     unit,
 )
 from scanning.tests.test_views import ScanningTestCase
@@ -342,6 +343,39 @@ class TestTheTextEdit(TestCase):
             "Lewis v. Marcotte,",
         )
         self.assertEqual(edited["text"][italic[0]["end"] :], " here")
+
+    def test_a_corrected_footnote_mark_keeps_its_superscript(self):
+        """The curator corrects the character under the superscript
+        (#423): no edit kind adds a mark, so the edit must keep it."""
+        dots = [
+            unit(
+                "dots_mocr",
+                0,
+                BODY_A_PT,
+                'the acts."l The court',
+                marks=[sup(10, 11)],
+            )
+        ]
+        mistral = [unit("mistral_ocr", 0, BODY_A_PT, 'the acts."l The court')]
+        group = group_at(page_with(dots, mistral), BODY_A_PT)
+        self.assertEqual(group["marks"], [sup(10, 11)])
+
+        page = page_with(
+            dots,
+            mistral,
+            [
+                entry(
+                    OpinionEdit.Kind.TEXT,
+                    BODY_A_PT,
+                    base_text=group["text"],
+                    text='the acts."1 The court',
+                )
+            ],
+        )
+
+        edited = group_at(page, BODY_A_PT)
+        self.assertEqual(edited["text"], 'the acts."1 The court')
+        self.assertEqual(edited["marks"], [sup(10, 11)])
 
     def test_a_page_nobody_read_holds_no_edit(self):
         pages = {
