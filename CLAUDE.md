@@ -81,6 +81,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 - All authenticated users see all scans. Staff-only is the review form on the detail page, the "files" links and the reopen button
 - A gate lives in the view, not only in the template: `start_detect`, `approve_page_completeness`, `generate_files` refuse a direct POST
 - A refused request answers `{status: "error", message}` (409 for a rule, 404 for an address outside the volume), and the viewer shows the message and changes nothing
+- The step action bar is two rows, a status row over a button row (`data-row`), and both wrappers are in `_process_actions.html`, never in the page: `refreshProcessActionBar` replaces the bar's innerHTML with the fragment (#333)
 
 ## Pipeline
 

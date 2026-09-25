@@ -5,14 +5,23 @@ Rendered both inline by scan_process.html and standalone by the
 process_actions view (fetched by the step-1/step-2 viewers to refresh the
 buttons in place after a page is marked for or restored from deletion).
 
+The bar is two rows (#333): a status row, with the run states, their
+staff "files" links, the apply run message, the badges and the step-2
+volume note, and a button row under it. The two wrappers live here and
+not in scan_process.html, because `refreshProcessActionBar` replaces the
+bar's innerHTML with this fragment, and a wrapper left on the page would
+not survive that. Every condition is written twice, once per row, so a
+row never holds the other's kind: a test pins that no button renders in
+the status row.
+
 The OCR (dots.mocr), detection (YOLO), Mistral OCR and Surya OCR
 controls are staff-only and move no scan status, so their state comes
 from `dots_run`, `yolo_run`, `mistral_run` and `surya_run` --
 summaries of the ExternalJob rows (issues #190, #195, #191 and #364)
 -- rather than from `is_processing`. The Mistral control and the Surya
-control are one file, _ocr_engine_actions.html, included once each by
-the step-1 bar beside the dots.mocr state: all three read the original
-shards.
+control are one file, _ocr_engine_actions.html, included twice each by
+the step-1 bar beside the dots.mocr state, once per row with a `part`
+flag: all three read the original shards.
 
 There is no detection button (#250). The daemon starts the run by
 itself once per shard set, right after the upload, and this bar only
@@ -38,8 +47,14 @@ reach step 2.
 {% if is_processing %}
 
 {% elif step == 1 %}
+{% comment %}
+  Each row is `spaceless` and `empty:hidden`: a state that renders no
+  status (or no button) leaves an empty element, and without the two
+  it would still cost the column its gap.
+{% endcomment %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-x-3 gap-y-2 empty:hidden" data-row="status">
   {% if dots_run %}
-  <span class="text-sm text-gray-600 mr-2" title="OCR run {{ dots_run.run }}: {{ dots_run.label }}">
+  <span class="text-sm text-gray-600" title="OCR run {{ dots_run.run }}: {{ dots_run.label }}">
     {% if dots_run.failed %}
     OCR failed on {{ dots_run.failed }} of {{ dots_run.total }} part(s): {{ dots_run.error_code }}
     {% elif dots_run.open %}
@@ -59,18 +74,10 @@ reach step 2.
   {% endcomment %}
   <span class="text-sm text-orange-800 dark:text-orange-200 mr-2" title="The OCR read is what the page review is built on.">{{ ocr_missing }}</span>
   {% endif %}
-  {% comment %}
-  The "Run OCR" / "Re-run OCR" button is gone (#224). The pipeline
-  starts the read at upload (#207), and a re-read over an edited volume
-  is the apply's job: it re-reads the edited pages alone, as one-page
-  shards, and keeps every paid page. A whole-volume re-run from the
-  viewer paid RunPod for every page again. The endpoint
-  (``start_dots_mocr``) stays for a staff POST.
-  {% endcomment %}
-  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" %}
-  {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" %}
+  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" part="status" %}
+  {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" part="status" %}
   {% if yolo_run %}
-  <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
+  <span class="text-sm text-gray-600" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">
     {% if yolo_run.failed %}
     Detection failed on {{ yolo_run.failed }} of {{ yolo_run.total }} part(s): {{ yolo_run.error_code }}
     {% elif yolo_run.open %}
@@ -83,6 +90,49 @@ reach step 2.
     {% endif %}
   </span>
   {% endif %}
+  {% if scan.page_count %}
+  {% if page_review_ready %}
+  {% comment %}
+    Two rules refuse the approval, and each shows its own note (#266,
+    #342). Neither hides the other: they are different work for
+    different people, and a reviewer who answers one must see the
+    other without a second press. A bar that only hid the button would
+    be the dead end #232 removed, so every note says the ways out.
+    `approve_page_completeness` reads both rules as well, because a
+    gate in a template cannot answer a direct POST.
+  {% endcomment %}
+  {% if repairs_waiting %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200" title="Wait for the new scan, or dismiss the request on the page if it no longer applies.">Waiting for a scanner &mdash; see Repairs requested</span>
+  {% endif %}
+  {% if pages_without_number %}
+  {% comment %}
+    The note carries the first page, and `goToPage` reads
+    `data-pdf-index`, so a click moves the viewer to it. That function
+    is global on every step: `viewer_sidebar.js` declares it outside
+    its IIFE, and the page loads that file whichever step it renders.
+    The repair cards call it the same way.
+  {% endcomment %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200 cursor-pointer" data-pdf-index="{{ pages_without_number.0|add:"-1" }}" onclick="goToPage(this)" title="Type the number on the page, or dismiss its &ldquo;No page number detected&rdquo; card when the page carries no printed number.">{{ pages_without_number|length }} page{{ pages_without_number|length|pluralize }} with no number &mdash; click to open the first</span>
+  {% endif %}
+  {% elif page_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete. Its pages are locked{% if page_review_reopenable %}; a staff member can reopen the review{% else %}; the way back is the admin re-queue{% endif %}.">&#10003; Page review done</span>
+  {% if apply_run %}
+  <span class="text-sm text-gray-600" title="Apply run {{ apply_run.label }}: {{ apply_run.summary }}">{{ apply_run.message }}</span>
+  {% endif %}
+  {% endif %}
+  {% endif %}
+</div>{% endspaceless %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-2 empty:hidden" data-row="buttons">
+  {% comment %}
+  The "Run OCR" / "Re-run OCR" button is gone (#224). The pipeline
+  starts the read at upload (#207), and a re-read over an edited volume
+  is the apply's job: it re-reads the edited pages alone, as one-page
+  shards, and keeps every paid page. A whole-volume re-run from the
+  viewer paid RunPod for every page again. The endpoint
+  (``start_dots_mocr``) stays for a staff POST.
+  {% endcomment %}
+  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" part="button" %}
+  {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" part="button" %}
   {% comment %}
     There is no "Rebuild & Validate" branch here any more (#232). It
     showed whenever a structural page edit was open, and it hid the
@@ -109,27 +159,9 @@ reach step 2.
   </form>
   {% if page_review_ready %}
   {% comment %}
-    Two rules refuse the approval, and each shows its own note (#266,
-    #342). Neither hides the other: they are different work for
-    different people, and a reviewer who answers one must see the
-    other without a second press. A bar that only hid the button would
-    be the dead end #232 removed, so every note says the ways out.
-    `approve_page_completeness` reads both rules as well, because a
-    gate in a template cannot answer a direct POST.
+    The two refusals of the approval (#266, #342) are the notes of the
+    status row above; the button goes with them.
   {% endcomment %}
-  {% if repairs_waiting %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200" title="Wait for the new scan, or dismiss the request on the page if it no longer applies.">Waiting for a scanner &mdash; see Repairs requested</span>
-  {% endif %}
-  {% if pages_without_number %}
-  {% comment %}
-    The note carries the first page, and `goToPage` reads
-    `data-pdf-index`, so a click moves the viewer to it. That function
-    is global on every step: `viewer_sidebar.js` declares it outside
-    its IIFE, and the page loads that file whichever step it renders.
-    The repair cards call it the same way.
-  {% endcomment %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-orange-100 text-orange-800 dark:bg-orange-900/40 dark:text-orange-200 cursor-pointer" data-pdf-index="{{ pages_without_number.0|add:"-1" }}" onclick="goToPage(this)" title="Type the number on the page, or dismiss its &ldquo;No page number detected&rdquo; card when the page carries no printed number.">{{ pages_without_number|length }} page{{ pages_without_number|length|pluralize }} with no number &mdash; click to open the first</span>
-  {% endif %}
   {% if not repairs_waiting and not pages_without_number %}
   <form method="post" action="{% url 'approve_page_completeness' scan.pk %}" class="inline">
     {% csrf_token %}
@@ -137,10 +169,6 @@ reach step 2.
   </form>
   {% endif %}
   {% elif page_review_done %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed this volume is page complete. Its pages are locked{% if page_review_reopenable %}; a staff member can reopen the review{% else %}; the way back is the admin re-queue{% endif %}.">&#10003; Page review done</span>
-  {% if apply_run %}
-  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ apply_run.label }}: {{ apply_run.summary }}">{{ apply_run.message }}</span>
-  {% endif %}
   {% comment %}
     Staff only (#224): the reopen throws away a paid build, and the
     curators' own step is the approval, not its reversal. Only while
@@ -197,6 +225,7 @@ reach step 2.
   <a href="?step=2" class="btn-outline text-sm no-underline" title="Look at the boxes the detection model found, over the volume as uploaded. Read only: the redaction review opens when the corrected volume is built.">Preview detections &rarr;</a>
   {% endif %}
   {% endif %}
+</div>{% endspaceless %}
 
 {% elif step == 2 %}
 {% comment %}
@@ -226,7 +255,8 @@ reach step 2.
   the real review, and the disclaimer over the pages says the rest.
 {% endcomment %}
   {% if preview_only %}
-  <span class="text-sm text-amber-800 dark:text-amber-200 mr-2">
+{% spaceless %}<div class="flex flex-wrap items-center gap-x-3 gap-y-2 empty:hidden" data-row="status">
+  <span class="text-sm text-amber-800 dark:text-amber-200">
     Preview of the detections, read only.
     {% if preview_approved %}
     The corrected volume is built next; the redaction review opens when its redactions are measured.
@@ -234,9 +264,11 @@ reach step 2.
     The redaction review opens after the page completeness approval.
     {% endif %}
   </span>
+</div>{% endspaceless %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-2 empty:hidden" data-row="buttons">
   <a href="?step=1" class="btn-outline text-sm no-underline" title="Back to the page completeness review">&larr; Back to the page review</a>
-
-{% else %}
+</div>{% endspaceless %}
+  {% else %}
 {% comment %}
   Which volume the reviewer sees (#269). Step 2 shows the corrected
   volume of the standing apply run once the redactions are measured
@@ -245,8 +277,9 @@ reach step 2.
   which pages are in front of them cannot judge the redactions. The
   staff "files" link opens the run's outputs, the #243 shape.
 {% endcomment %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-x-3 gap-y-2 empty:hidden" data-row="status">
   {% if final_volume %}
-  <span class="text-sm text-gray-600 mr-2" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated, {{ final_volume.moved }} moved">
+  <span class="text-sm text-gray-600" title="Apply run {{ final_volume.label }}: {{ final_volume.final_page_count }} page(s), {{ final_volume.deleted }} deleted, {{ final_volume.inserted }} inserted, {{ final_volume.replaced }} replaced, {{ final_volume.rotated }} rotated, {{ final_volume.moved }} moved">
     {% if final_volume.measured and final_volume.identity %}
     Showing the volume as uploaded: the page review made no page edits.
     {% elif final_volume.measured %}
@@ -259,10 +292,38 @@ reach step 2.
     {% endif %}
   </span>
   {% elif not legacy_review %}
-  <span class="text-sm text-gray-600 mr-2">
+  <span class="text-sm text-gray-600">
     The corrected volume is not built yet. This is the volume as uploaded, before the page edits.{% if apply_run %} {{ apply_run.message }}{% endif %}
   </span>
   {% endif %}
+  {% comment %}
+    The open findings of review 2 (#240 PR D). The button obeys: the
+    curator judges a finding as they judge a page-completeness
+    suspicion (#151), so an open count asks for a confirm and blocks
+    nothing. A finding that says one of the curator's own decisions is
+    not applied ("not applied") is named apart, because approving over
+    it approves the model's answer in its place.
+  {% endcomment %}
+  {% if redaction_review_ready %}
+  {% if review2_open %}
+  <span class="inline-flex items-center rounded px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" title="Open findings of the redaction review, listed in the sidebar">{{ review2_open }} finding{{ review2_open|pluralize }} open{% if review2_stale %}, {{ review2_stale }} decision{{ review2_stale|pluralize }} not applied{% endif %}</span>
+  {% endif %}
+  {% comment %}
+    The server's last word on this volume (#336). The approval sends
+    the scan to the daemon, and a failure parks it back here with the
+    reason in ``progress_message``; the poll then reloads the page,
+    so this line is the only place the reviewer reads why the button
+    seemed to do nothing. A successful park writes a ready message,
+    which reads as a plain note.
+  {% endcomment %}
+  {% if redaction_review_note %}
+  <span class="inline-flex items-center rounded px-2 py-1 text-xs text-slate-700 bg-slate-100 dark:bg-slate-800 dark:text-slate-200" id="review2-note" title="The last message of the server about this volume">{{ redaction_review_note }}</span>
+  {% endif %}
+  {% elif redaction_review_done %}
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
+  {% endif %}
+</div>{% endspaceless %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-2 empty:hidden" data-row="buttons">
   {% comment %}
     The recompute of review 2 (#305). A curator who draws or dismisses
     a detection changes what the pairing would say, and nothing but
@@ -293,35 +354,11 @@ reach step 2.
   {% if redaction_review_ready or legacy_review %}
   <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept, but a text box you dismissed can come back when the new reading makes it much narrower." onclick="return recomputeRedactions();">Recompute redactions</button>
   {% endif %}
-  {% comment %}
-    The open findings of review 2 (#240 PR D). The button obeys: the
-    curator judges a finding as they judge a page-completeness
-    suspicion (#151), so an open count asks for a confirm and blocks
-    nothing. A finding that says one of the curator's own decisions is
-    not applied ("not applied") is named apart, because approving over
-    it approves the model's answer in its place.
-  {% endcomment %}
   {% if redaction_review_ready %}
-  {% if review2_open %}
-  <span class="inline-flex items-center rounded px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" title="Open findings of the redaction review, listed in the sidebar">{{ review2_open }} finding{{ review2_open|pluralize }} open{% if review2_stale %}, {{ review2_stale }} decision{{ review2_stale|pluralize }} not applied{% endif %}</span>
-  {% endif %}
   <form method="post" action="{% url 'approve_redaction_review' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is."{% if review2_open %} onclick="return confirm('This volume still lists {{ review2_open }} open finding{{ review2_open|pluralize }}.{% if review2_stale %} {{ review2_stale }} of your decision{{ review2_stale|pluralize }} {{ review2_stale|pluralize:'is,are' }} not applied, so the volume shows the model\'s answer there.{% endif %} Approve the redactions anyway?');"{% endif %}>I reviewed the redactions and they are correct</button>
   </form>
-  {% comment %}
-    The server's last word on this volume (#336). The approval sends
-    the scan to the daemon, and a failure parks it back here with the
-    reason in ``progress_message``; the poll then reloads the page,
-    so this line is the only place the reviewer reads why the button
-    seemed to do nothing. A successful park writes a ready message,
-    which reads as a plain note.
-  {% endcomment %}
-  {% if redaction_review_note %}
-  <span class="inline-flex items-center rounded px-2 py-1 text-xs text-slate-700 bg-slate-100 dark:bg-slate-800 dark:text-slate-200" id="review2-note" title="The last message of the server about this volume">{{ redaction_review_note }}</span>
-  {% endif %}
-  {% elif redaction_review_done %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
   {% endif %}
   {% comment %}
     The button follows the step-3 tab (#334). A volume whose opinions
@@ -335,9 +372,15 @@ reach step 2.
   {% elif has_opinions and legacy_pipeline %}
   <a href="?step=3" class="btn-primary text-sm no-underline" style="background:#059669" title="Proceed to generate the final redacted and split opinion files">Next: Generate &rarr;</a>
   {% endif %}
+</div>{% endspaceless %}
   {% endif %}
 
 {% elif step == 3 %}
+{% comment %}
+  The legacy Generate pane has no status text, so step 3 renders the
+  button row alone.
+{% endcomment %}
+{% spaceless %}<div class="flex flex-wrap items-center gap-2 empty:hidden" data-row="buttons">
   <form method="post" action="{% url 'generate_files' scan.pk %}" class="inline">
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" style="background:#7c3aed" title="Create redacted and unredacted PDF files for each opinion">{% if opinion_scans %}Regenerate{% else %}Generate{% endif %} Files</button>
@@ -348,4 +391,5 @@ reach step 2.
     <button type="submit" class="btn-primary text-sm" title="Mark this scan as approved">Approve</button>
   </form>
   {% endif %}
+</div>{% endspaceless %}
 {% endif %}
