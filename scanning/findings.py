@@ -1,7 +1,7 @@
 """The findings of review 2: one rebuild from the rows, and the dismissals.
 
 A finding of review 2 is an ``Issue`` row whose ``check_name`` is in
-``models.REVIEW2_CHECKS`` (issue #240, PR D). Eight checks, in three
+``models.REVIEW2_CHECKS`` (issue #240, PR D). Nine checks, in three
 groups:
 
 - **about detections**: a key icon or a caption no opinion boundary
@@ -9,8 +9,9 @@ groups:
   bracket the reader saw and the model did not
   (``missing_headnote_bracket``, ``brackets.missing``, #328);
 - **about redactions and pages**: a confident headnote box no black
-  redaction covers (``uncovered_headnote``), a run of pages no opinion
-  covers (``uncovered_pages``);
+  redaction covers (``uncovered_headnote``), a headnote bracket box
+  under blackletter's redaction gate (``low_confidence_headnote_bracket``,
+  #410), a run of pages no opinion covers (``uncovered_pages``);
 - **about the curator's own rows**: a decision the last compute could
   not land or place (``stale_detection_edit``, ``stale_redaction_edit``,
   ``stale_boundary_edit``).
@@ -50,6 +51,9 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from blackletter.bl_warm import rows_are_bl_warm
+from blackletter.models import Label
+from blackletter.scanner import label_confidence
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -148,6 +152,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_unmatched_findings(scan, rows))
         found.extend(_uncovered_pages_findings(scan, rows, run))
         found.extend(_uncovered_headnote_findings(scan))
+        found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
     resolve(scan, found)
     with transaction.atomic():
@@ -331,8 +336,9 @@ def _detection_finding(
     """Build the dict of a finding about one detection box.
 
     The metadata is what ``_getDetectionData`` in ``viewer_sidebar.js``
-    reads off the card, so the Approve and Delete buttons of the card
-    work as they did on the unmatched cards, plus the source address
+    reads off the card, so the Approve and Delete buttons work on every
+    card ``_review_findings.html`` shows them on (the unmatched cards
+    and ``low_confidence_headnote_bracket``), plus the source address
     the dismissal is keyed by.
     """
     return {
@@ -525,6 +531,68 @@ def _uncovered_headnote_findings(scan: Scan):
             det,
             f"A headnote box (confidence {det.confidence:.2f}) is not "
             "covered by a redaction.",
+        )
+
+
+def _low_confidence_bracket_findings(scan: Scan):
+    """Yield one finding per bracket box too weak for blackletter to redact.
+
+    YOLO keeps a box down to 0.20, and step 2 draws every live row, but
+    blackletter redacts a detection only at or above
+    ``label_confidence`` (0.30 for bl-warm, 0.50 for the others). A
+    bracket box between the two is drawn, answers
+    ``brackets.missing``, and leaves the bracket in the deliverable
+    (#410).
+
+    The gate is blackletter's own function, and the model family is the
+    one the compute reads: ``rows_are_bl_warm`` over the ``found_by`` of
+    the live model rows, one flag for the volume, the list
+    ``services.detection_entries`` hands it. A hand-drawn row is left
+    out: it carries no model confidence and no provenance. The family
+    is read only when a box is under the higher gate, so a volume with
+    no weak bracket pays one query.
+
+    The card offers the two detection buttons: an approval writes 1.0
+    on the row, so the card goes and the next compute redacts the box;
+    a deletion takes out a wrong box, and ``brackets.missing`` then
+    judges the reading under it.
+    """
+    label = Label.HEADNOTE_BRACKET
+    gates = {
+        bl_warm: label_confidence(label, bl_warm) for bl_warm in (True, False)
+    }
+    model_rows = (
+        Detection.objects.live()
+        .filter(scan=scan)
+        .exclude(model_name=Detection.ModelName.MANUAL)
+    )
+    weak = list(
+        model_rows.filter(
+            label=label.name, confidence__lt=max(gates.values())
+        ).order_by("page_index", "y0")
+    )
+    if not weak:
+        return
+    bl_warm = rows_are_bl_warm(
+        [
+            {"found_by": found_by}
+            for found_by in model_rows.exclude(found_by=[]).values_list(
+                "found_by", flat=True
+            )
+        ]
+    )
+    gate = gates[bl_warm]
+    for det in weak:
+        if det.confidence >= gate:
+            continue
+        yield _detection_finding(
+            CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+            Issue.Target.REDACTION,
+            det,
+            f"A headnote bracket box (confidence {det.confidence:.2f}) is "
+            f"under the redaction gate ({gate:.2f}), so it is not redacted. "
+            "Approve it to redact it at the next compute, or delete it if "
+            "it is not a bracket.",
         )
 
 

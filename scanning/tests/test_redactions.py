@@ -51,6 +51,92 @@ def pages(*indexes, scale=0.5):
     ]
 
 
+#: The four strips of page 17 of scan 1841 (#371), in points.
+TOP = {"x0": 0.0, "y0": 0.0, "x1": 612.0, "y1": 19.7}
+LEFT = {"x0": 0.0, "y0": 19.7, "x1": 81.4, "y1": 734.3}
+BOTTOM = {"x0": 0.0, "y0": 734.3, "x1": 612.0, "y1": 792.0}
+RIGHT = {"x0": 535.2, "y0": 19.7, "x1": 612.0, "y1": 734.3}
+
+
+def strips(*rects, page_index=1, size=(612.0, 792.0)):
+    """One ``compute_margin_rects`` entry, in points.
+
+    :param rects: The strips.
+    :param page_index: The page.
+    :param size: The page size, ``(width, height)``.
+    :returns: The entry.
+    """
+    return {
+        "page_index": page_index,
+        "rects": [dict(r) for r in rects],
+        "page_width": size[0],
+        "page_height": size[1],
+    }
+
+
+def rect(x0, y0, x1, y1, type="headnote", fill="black"):
+    """One blackletter rect, in pixels of the render.
+
+    :param x0: Left.
+    :param y0: Top.
+    :param x1: Right.
+    :param y1: Bottom.
+    :param type: The rect type.
+    :param fill: The fill.
+    :returns: The dict.
+    """
+    return {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "fill": fill, "type": type}
+
+
+class TestStripContentBox(TestCase):
+    """The box a page's strips leave (#371)."""
+
+    def test_four_strips_give_the_box_between_them(self):
+        self.assertEqual(
+            redactions.strip_content_box(strips(TOP, LEFT, BOTTOM, RIGHT)),
+            (81.4, 19.7, 535.2, 734.3),
+        )
+
+    def test_a_side_with_no_strip_is_the_page_edge(self):
+        """The exception since #370 gave every page four strips."""
+        self.assertEqual(
+            redactions.strip_content_box(strips(BOTTOM)),
+            (0.0, 0.0, 612.0, 734.3),
+        )
+
+    def test_no_strips_give_the_page_frame(self):
+        self.assertEqual(
+            redactions.strip_content_box(strips()),
+            (0.0, 0.0, 612.0, 792.0),
+        )
+
+    def test_a_strip_off_every_edge_names_no_side(self):
+        """A curator's box in the middle of the page is not a margin."""
+        inner = {"x0": 100.0, "y0": 100.0, "x1": 200.0, "y1": 200.0}
+        self.assertEqual(
+            redactions.strip_content_box(strips(inner)),
+            (0.0, 0.0, 612.0, 792.0),
+        )
+
+    def test_clip_holds_a_box_inside(self):
+        content = (81.4, 19.7, 535.2, 734.3)
+        self.assertEqual(
+            redactions.clip_to_content((66.2, 636.5, 298.8, 792.0), content),
+            (81.4, 636.5, 298.8, 734.3),
+        )
+        self.assertEqual(
+            redactions.clip_to_content((100.0, 100.0, 200.0, 200.0), content),
+            (100.0, 100.0, 200.0, 200.0),
+        )
+
+    def test_clip_refuses_a_box_it_would_empty(self):
+        self.assertIsNone(
+            redactions.clip_to_content(
+                (100.0, 750.0, 200.0, 790.0), (81.4, 19.7, 535.2, 734.3)
+            )
+        )
+
+
 class TestWriteComputed(TestCase):
     def setUp(self):
         self.scan = ScanFactory(page_count=3, source_fingerprint="10:3")
@@ -103,6 +189,103 @@ class TestWriteComputed(TestCase):
         self.assertEqual(margin.fill, "white")
         self.assertEqual(margin.bbox, [0.0, 0.0, 20.0, 50.0])
         self.assertEqual((margin.source_page, margin.page_index), (3, 2))
+
+    def _write(self, rects, entry=None):
+        """Write one page of rects under the page-17 strips.
+
+        :param rects: The pixel rects of page index 1.
+        :param entry: The margin entry of that page, the four strips of
+            page 17 by default.
+        :returns: The written count.
+        """
+        return redactions.write_computed(
+            self.scan,
+            None,
+            3,
+            [{"page_index": 1, "rects": list(rects)}],
+            [entry or strips(TOP, LEFT, BOTTOM, RIGHT)],
+            pages(1),
+        )
+
+    def test_a_text_rect_is_held_inside_the_strips(self):
+        """Page 17 of scan 1841 (#371): the last headnote rect of the
+        left column ran to the page bottom, 792 pt, and the bottom strip
+        starts at 734.3 pt. The pixel rects are at half a point each."""
+        self._write(
+            [
+                rect(132.4, 1273.0, 597.6, 1584.0),
+                rect(0.0, 200.0, 400.0, 400.0, type="EDITORIAL"),
+                rect(200.0, 200.0, 400.0, 400.0),
+            ]
+        )
+
+        head = Redaction.objects.get(
+            scan=self.scan, rect_type="headnote", y0=636.5
+        )
+        self.assertEqual(head.bbox, [81.4, 636.5, 298.8, 734.3])
+        editorial = Redaction.objects.get(
+            scan=self.scan, rect_type="EDITORIAL"
+        )
+        self.assertEqual(editorial.bbox, [81.4, 100.0, 200.0, 200.0])
+        inside = Redaction.objects.get(
+            scan=self.scan, rect_type="headnote", y0=100.0
+        )
+        self.assertEqual(inside.bbox, [100.0, 100.0, 200.0, 200.0])
+
+    def test_the_other_types_and_the_strips_are_left_alone(self):
+        self._write(
+            [
+                rect(0.0, 1400.0, 400.0, 1584.0, type="KEY_ICON"),
+                rect(0.0, 0.0, 400.0, 60.0, type="PAGE_HEADER", fill="white"),
+            ]
+        )
+
+        icon = Redaction.objects.get(scan=self.scan, rect_type="KEY_ICON")
+        self.assertEqual(icon.bbox, [0.0, 700.0, 200.0, 792.0])
+        header = Redaction.objects.get(scan=self.scan, rect_type="PAGE_HEADER")
+        self.assertEqual(header.bbox, [0.0, 0.0, 200.0, 30.0])
+        bottom = Redaction.objects.get(
+            scan=self.scan, rect_type="margin", y0=734.3
+        )
+        self.assertEqual(bottom.bbox, [0.0, 734.3, 612.0, 792.0])
+
+    def test_a_rect_the_clip_would_empty_is_written_as_it_is(self):
+        with self.assertLogs("scanning.redactions", level="INFO") as logs:
+            self._write([rect(200.0, 1500.0, 400.0, 1580.0)])
+
+        row = Redaction.objects.get(scan=self.scan, rect_type="headnote")
+        self.assertEqual(row.bbox, [100.0, 750.0, 200.0, 790.0])
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("0 of 1 held", logs.output[0])
+        self.assertIn("1 refused", logs.output[0])
+
+    def test_a_side_with_no_strip_clips_nothing_on_that_side(self):
+        self._write([rect(132.4, 1273.0, 597.6, 1584.0)], strips(BOTTOM))
+
+        row = Redaction.objects.get(scan=self.scan, rect_type="headnote")
+        self.assertEqual(row.bbox, [66.2, 636.5, 298.8, 734.3])
+
+    def test_an_entry_with_no_page_size_clips_nothing(self):
+        written = self._write(
+            [rect(132.4, 1273.0, 597.6, 1584.0)],
+            {"page_index": 1, "rects": [dict(BOTTOM)]},
+        )
+
+        self.assertEqual(written, 2)
+        row = Redaction.objects.get(scan=self.scan, rect_type="headnote")
+        self.assertEqual(row.bbox, [66.2, 636.5, 298.8, 792.0])
+
+    def test_the_clip_is_logged_once(self):
+        with self.assertLogs("scanning.redactions", level="INFO") as logs:
+            self._write(
+                [
+                    rect(132.4, 1273.0, 597.6, 1584.0),
+                    rect(200.0, 200.0, 400.0, 400.0),
+                ]
+            )
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("1 of 2 held inside the strips", logs.output[0])
 
     def test_replaces_the_computed_rows_and_keeps_the_human_ones(self):
         old = computed(self.scan)

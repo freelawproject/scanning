@@ -1078,6 +1078,10 @@ class CheckName(models.TextChoices):
         "missing_headnote_bracket",
         "Headnote bracket the model did not find",
     )
+    LOW_CONFIDENCE_HEADNOTE_BRACKET = (
+        "low_confidence_headnote_bracket",
+        "Headnote bracket under the redaction gate",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1146,6 +1150,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_PAGES,
         CheckName.UNCOVERED_HEADNOTE,
         CheckName.MISSING_HEADNOTE_BRACKET,
+        CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
     }
 )
 
@@ -2411,8 +2416,8 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first six are the warnings the review shows on a page. The last
-    three are facts about the opinion row itself.
+    The first eight are the warnings the review shows on a page. The
+    last three are facts about the opinion row itself.
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
@@ -2424,6 +2429,11 @@ class OpinionCheck(models.TextChoices):
         "A redaction covers part of a cell",
     )
     PAGE_NOT_READ = "page_not_read", "This page has no text"
+    FOOTNOTE_UNSURE = (
+        "footnote_unsure",
+        "An engine read a footnote no detection covers",
+    )
+    BLOCKQUOTE_LIST = "blockquote_list", "A blockquote may be a list"
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
@@ -2881,13 +2891,37 @@ class OpinionText(AbstractDateTimeModel):
             "rebuilt from the glued runs plus the human rows."
         ),
     )
+    footnotes = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "The resolved text of the page's footnotes, in reading order "
+            "(#399). A cache like ``text``, and never a part of it: the "
+            "tagger reads ``text`` alone. The ``footnotes`` entries of "
+            "``disagreements`` point into this field."
+        ),
+    )
     disagreements = models.JSONField(
         default=list,
         blank=True,
         help_text=(
             "One entry per place the engines differ: "
-            "``{'start': int, 'end': int, 'variants': {engine: text}}``, "
-            "with the offsets against ``text``. Empty when they agree."
+            "``{'start': int, 'end': int, 'section': 'text' | 'footnotes', "
+            "'variants': {engine: text}}``, with the offsets against the "
+            "field ``section`` names. Empty when they agree."
+        ),
+    )
+    marks = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "The formatting the engines read (#404): "
+            "``{'start': int, 'end': int, 'kind': 'em' | 'strong' | 'sup' "
+            "| 'blockquote', 'section': 'text' | 'footnotes'}``, with the "
+            "offsets against the field ``section`` names. A ``blockquote`` "
+            "mark spans one run of quoted groups of the body (#411). A "
+            "cache like ``text``, and of ``text``: an edit of "
+            "``human_text`` moves every offset."
         ),
     )
     human_text = models.TextField(
@@ -3699,10 +3733,12 @@ class PageRepairRequest(AbstractDateTimeModel):
       reviewer asked for and who judged it unnecessary.
     - **Fulfilled is derived, not stamped.** A request is fulfilled
       when a standing ``INSERT_PAGE`` or ``REPLACE_PAGE`` edit exists
-      at its address (``repairs._fulfilling_edits``), and made after
-      the request. No writer stamps
-      it, so the upload cannot race a stamp, and an undo of the upload
-      (#232) reopens the request with no second writer.
+      at its address (``repairs._edits_at_the_address``), and made
+      after the request; a one-page INSERT request is fulfilled too by
+      a replacement of either page beside its gap
+      (``repairs._replacements_beside_the_gap``, #393). No writer
+      stamps it, so the upload cannot race a stamp, and an undo of the
+      upload (#232) reopens the request with no second writer.
     - **One open request per address.** The unique key is partial over
       the rows with no dismissal. A second request for the same page
       answers the first row. A dismissed row frees the address.

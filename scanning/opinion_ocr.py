@@ -20,6 +20,48 @@ any of whose units carries an exclusion; :func:`kept_units` is the one
 reader for a consumer that wants the clean text alone. The excluded
 text stays under ``jobs/``, which nothing serves without a login.
 
+**A printed page number is not opinion text either** (#396). It is
+approved by review 1 and frozen by the apply in the printed-page map
+(``apply.printed_pages``), which holds the value of every final page
+and no position: every engine reads the number inside a larger unit,
+with the running head. So the glue reads the approved value and finds
+it in each engine's own text: a unit in the head or the foot zone --
+by its band (``page_numbers.band_of``) or by the engine's own label
+(``page_numbers.is_head_or_foot_label``), the two signals review 1
+takes a candidate by -- one of whose lines ends in that value
+(``page_numbers.carries_number``) carries the exclusion
+``page_number``, and the running head goes with it. Both conditions
+are required. The zone alone takes every head cell, number or not;
+the value alone takes a body line that ends in the same digits, which
+is opinion text. Nothing is read off a dots.mocr box, so a page
+dots.mocr failed still loses the headers of the other engines. A page
+whose approved number the engines did not write keeps every unit: a
+header the model misread and a curator corrected, a curator's label
+on an inserted page, or no number at all.
+
+**A headnote bracket is the one deletion** (#373). Its box is a glyph
+inside a paragraph, so a share over it answers wrong both ways: about
+a hundredth of a paragraph, and the text keeps ``[1]``; a tenth of a
+short line, and the ensemble drops the words beside it. So a
+``HEADNOTE_BRACKET`` box never goes into :func:`verdict`, and a unit
+that a bracket box touches (:func:`is_bracket_box`) loses the bracket
+at the start of each of its lines (``brackets.strip_line_tokens``), in
+every engine and whatever its label. The unit names the tokens it lost
+in ``removed``. The redactions decide the text as they decide the PDF:
+a bracket the model did not box stays in both until a curator boxes
+it, one of the two ways :data:`TOKEN_RECT_TYPES` names.
+
+**The engine's markup becomes marks** (#404). Each engine writes its
+formatting in its own dialect, and each unit is parsed once here into
+the one shape of :mod:`scanning.markup`: a plain ``text``, standoff
+``marks`` over it (``em``, ``strong``, ``sup``) and a block ``kind``
+(``paragraph``, ``heading``, ``list_item``, ``table``). The parse is
+the engine's own ``EngineSpec.dialect`` over its ``markup_key``, with
+the label the engine gave the unit (``kind_types``); the bracket strip
+runs on the parsed text and its deletions move the marks. The volume
+documents stay as the engines wrote them, so a better parse is a
+re-glue (``reglue_opinion_ocr``) and never a corpus re-glue.
+
 **A unit nobody could measure is not clean text.** A unit with no box,
 or on a page whose size no detection and no render gives, carries the
 third verdict :data:`UNJUDGED`, counts in ``unjudged`` on the page and
@@ -33,6 +75,26 @@ glued), ``box_pt`` (the same box in PDF points, the space every
 review-2 row and the viewer use), ``exclusion`` and ``share``. The
 page ``md`` is not copied: it is the whole page, redacted text
 included, and it cannot carry a verdict.
+
+**The footnote zone is a fact of the page, frozen here (#399).** The
+``FOOTNOTES`` detections of the run, in points, go on every engine's
+page as ``zones.footnotes``, the twin of ``frame``. The ensemble puts
+an aligned group in the footnotes when the zone covers it, and it
+reads no ``Detection`` row for that: the zone is written here, beside
+the verdicts the redaction rows give, and a box a curator moves after
+the glue is answered by ``reglue_opinion_ocr`` like every other late
+fact. The engines' own footnote labels (``EngineSpec.footnote_types``)
+are exact and rare, so they decide nothing and the ensemble reads them
+for one card alone.
+
+**The blockquote zone is the second zone of a page (#411).** The
+``BLOCKQUOTE`` detections go on every engine's page as
+``zones.blockquotes``, from the same table of zones (:data:`ZONES`)
+and the same query. A model box counts only at
+``settings.BLOCKQUOTE_MIN_CONFIDENCE`` or more: the model also boxes
+lists as blockquotes (#211), and a wrong tag is a wrong input of the
+tagger. A box a person drew or approved has confidence 1.0 and always
+counts.
 
 **The path is the invariant key.** ``Opinion.glue_prefix`` is
 ``jobs/opinions/{first_printed_page}.{index_in_page}/r{glue_revision}/``,
@@ -75,14 +137,19 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from blackletter.models import Label
+from django.conf import settings
 from django.db.models import F, Q
 from django.utils import timezone
 
 from scanning import (
     apply,
     boundaries,
+    brackets,
     dots_mocr,
+    markup,
     mistral_ocr,
+    page_numbers,
     redactions,
     review_states,
     s3_sync,
@@ -94,14 +161,91 @@ from scanning.models import (
     Detection,
     Opinion,
     OpinionReviewStatus,
+    Redaction,
     Scan,
     Status,
 )
 
 logger = logging.getLogger(__name__)
 
-#: Version of the documents this module writes.
-SCHEMA_VERSION = 1
+#: Version of the documents this module writes. 2 puts the footnote
+#: zone on every page (#399); 3 deletes the headnote bracket from the
+#: unit text (#373); 4 parses the engine's markup into ``marks`` and
+#: ``kind`` beside a plain ``text`` (#404); 5 puts the blockquote zone
+#: beside the footnote zone (#411).
+SCHEMA_VERSION = 5
+
+#: The redaction types whose box can delete the bracket token of the
+#: unit it touches (#373). A curator fixes a bracket the model missed
+#: in one of two ways, and both count:
+#:
+#: - a ``HEADNOTE_BRACKET`` detection, then a recompute, which writes a
+#:   ``HEADNOTE_BRACKET`` redaction, the type of the model's own box.
+#:   It also closes the ``MISSING_HEADNOTE_BRACKET`` card of #328,
+#:   which reads the detections;
+#: - a plain redaction, which the card does not see. Its type,
+#:   ``manual``, is the type of every box a curator draws, over a name
+#:   or over anything, so it counts only with the size and the place of
+#:   a bracket (:func:`is_bracket_box`), and :func:`verdict` still
+#:   measures it.
+#:
+#: A ``HEADNOTE_BRACKET`` box never excludes a unit, whatever its size.
+#: So a bracket box the model draws over a whole paragraph blacks out
+#: the PDF, and the text keeps the words; the survey of #373 found
+#: none. A guard on the share would bring back the lost paragraph: one
+#: engine can read the bracket as a unit alone, and the ensemble drops
+#: the whole group when one engine excludes a unit.
+TOKEN_RECT_TYPES = frozenset({brackets.BRACKET_LABEL, Redaction.MANUAL_TYPE})
+
+#: The size and the place a plain curator redaction must have to count
+#: as a bracket box, in points. The model's 981 bracket boxes of scans
+#: 2845, 1828 and 1841 are 13 to 48 wide, 10 to 14 high, and start 0.7
+#: to 14.4 from the left edge of their cell, where the bracket opens
+#: the line. A curator draws by hand, so each limit is larger than the
+#: largest model box. The indent is a distance either way: a box that
+#: starts left of the unit also counts.
+MANUAL_BRACKET_MAX_WIDTH_PT = 60.0
+MANUAL_BRACKET_MAX_HEIGHT_PT = 20.0
+MANUAL_BRACKET_MAX_INDENT_PT = 20.0
+
+#: The detection label of the footnote band of a page (#399).
+FOOTNOTE_LABEL = Label.FOOTNOTES.name
+
+#: The detection label of a blockquote (#411).
+BLOCKQUOTE_LABEL = Label.BLOCKQUOTE.name
+
+
+@dataclass(frozen=True)
+class Zone:
+    """One kind of zone the glue freezes on every page.
+
+    :param label: The detection label whose rows are the zone.
+    :param count_key: The key of the manifest counts.
+    :param floor_setting: The name of the setting that holds the least
+        confidence of a row that counts, or empty for every row.
+    """
+
+    label: str
+    count_key: str
+    floor_setting: str = ""
+
+    def counts(self, row) -> bool:
+        """Return whether one live row of the label is part of the zone."""
+        if not self.floor_setting:
+            return True
+        return row.confidence >= getattr(settings, self.floor_setting)
+
+
+#: The zones of a page, by the name they take under ``zones`` (#399,
+#: #411). The ensemble reads them by these names. A hand-drawn row
+#: counts like a model row: a curator who drew the box said where the
+#: zone is.
+ZONES: dict[str, Zone] = {
+    "footnotes": Zone(FOOTNOTE_LABEL, "footnote_zones"),
+    "blockquotes": Zone(
+        BLOCKQUOTE_LABEL, "blockquote_zones", "BLOCKQUOTE_MIN_CONFIDENCE"
+    ),
+}
 
 #: The file that says a revision is glued, written last.
 MANIFEST = "manifest.json"
@@ -128,6 +272,11 @@ MAX_ATTEMPTS = 3
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
 UNJUDGED = "unjudged"
+
+#: The verdict of the unit that holds the printed page number (#396):
+#: in the head or the foot band, and one of its lines ends in the
+#: approved number of its page. Taken whole, running head included.
+PAGE_NUMBER = "page_number"
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's: the field is
@@ -179,6 +328,34 @@ class EngineSpec:
     :param owed_rows: Returns the rows that say a read of this engine
         is on its way for a scan and run: a live volume run, or the
         rows of the run's own edited pages.
+    :param band_labels: The engine's own names for a running head and
+        a footer, each mapped to ``"header"`` or ``"footer"``. The
+        page-number reader (``page_numbers``, #351) walks every
+        engine's document with them, so a label the engine spells
+        differently is one entry here and no code.
+    :param zone_prefix: What the reader stamps in front of the band on
+        the ``zone`` of an ``ocr_results`` entry it read off this
+        engine (``dots-header``), so a person sees which engine read
+        the number and ``services.has_legacy_ocr`` tells a model read
+        from a legacy one.
+    :param footnote_types: The values of ``type_key`` this engine
+        writes on a footnote (#399), in the engine's own spelling.
+        Measured on the corpus, they are exact and rare: a footnote
+        label is almost never wrong and misses most footnotes. So they
+        never decide a section; the ensemble reads them for the
+        ``FOOTNOTE_UNSURE`` card alone.
+    :param dialect: The parser of this engine's markup (#404):
+        ``markup.parse_markdown`` for the two that write markdown in
+        the unit text, ``markup.parse_html`` for Surya.
+    :param markup_key: The unit field the dialect reads. Surya's is
+        ``html`` and not its ``text_key``: the worker's flattened
+        ``text`` has already lost the superscript boundaries
+        (``x<sup>1</sup>`` is ``x1`` there).
+    :param kind_types: The values of ``type_key`` that name a block
+        kind (a ``Section-header`` is a heading whether or not the
+        engine wrote ``##``), each mapped to a ``markup.BLOCK_KINDS``
+        value. Mistral's ``title`` names the caption's party names
+        too; the ensemble's majority answers that, not this table.
     """
 
     name: str
@@ -189,10 +366,32 @@ class EngineSpec:
     frame: Callable[[dict, dict], tuple[float, float] | None]
     module: object
     owed_rows: Callable[[Scan, object], list]
+    band_labels: dict[str, str]
+    zone_prefix: str
+    footnote_types: frozenset[str] = frozenset()
+    dialect: Callable[..., markup.Parsed] = markup.parse_markdown
+    markup_key: str = "text"
+    kind_types: dict[str, str] = field(default_factory=dict)
 
     def document_key(self, run) -> str:
         """The S3 key of this engine's document for ``run``."""
         return getattr(run, self.key_field) or ""
+
+    def parse(self, unit: dict) -> markup.Parsed:
+        """Parse one unit's markup into the one shape (#404).
+
+        :param unit: The unit as the engine's volume document holds it.
+        :returns: The plain text, its marks and its kind.
+        :rtype: markup.Parsed
+        """
+        source = unit.get(self.markup_key)
+        if not isinstance(source, str):
+            source = unit.get(self.text_key)
+        label = unit.get(self.type_key) or ""
+        return self.dialect(
+            source if isinstance(source, str) else "",
+            kind=self.kind_types.get(label),
+        )
 
     @property
     def fields(self) -> dict[str, str]:
@@ -280,6 +479,16 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_page_frame,
         module=dots_mocr,
         owed_rows=lambda scan, run: dots_mocr.live_analyze_jobs(scan),
+        band_labels={"Page-header": "header", "Page-footer": "footer"},
+        zone_prefix="dots-",
+        footnote_types=frozenset({"Footnote"}),
+        # ``Title`` is not here: dots writes it on two cells of a
+        # 1,293-page volume, and both are the caption's party names.
+        kind_types={
+            "Section-header": markup.HEADING,
+            "List-item": markup.LIST_ITEM,
+            "Table": markup.TABLE,
+        },
     ),
     "mistral_ocr": EngineSpec(
         name="mistral_ocr",
@@ -290,19 +499,45 @@ ENGINES: dict[str, EngineSpec] = {
         frame=_mistral_frame,
         module=mistral_ocr,
         owed_rows=functools.partial(_extract_owed_rows, mistral_ocr),
+        # ``footer`` is not a band label: it holds footnote text on the
+        # pages measured (#399), so a block at the foot of a Mistral
+        # page is judged by its band alone (#351).
+        band_labels={"header": "header"},
+        zone_prefix="mistral-",
+        # Lowercase, as the harvest stores them. ``footer`` holds
+        # footnote text on these pages; the running foot is ``header``.
+        footnote_types=frozenset({"references", "footer", "aside_text"}),
+        markup_key=mistral_ocr.BLOCK_TEXT_KEY,
+        kind_types={
+            "title": markup.HEADING,
+            "list": markup.LIST_ITEM,
+            "table": markup.TABLE,
+        },
     ),
     "surya": EngineSpec(
         name="surya",
         key_field="surya_key",
         units_key="blocks",
-        # The block's flattened text, not its ``html``: the unit shape
-        # is one shape for every engine, and the markup stays in the
-        # volume document for a reader of the tables.
+        # The block's flattened text is what the overlay reads
+        # (``fields``); the glue parses the ``html`` (``markup_key``).
         text_key="text",
         type_key="label",
         frame=_page_frame,
         module=surya,
         owed_rows=functools.partial(_extract_owed_rows, surya),
+        band_labels={"PageHeader": "header", "PageFooter": "footer"},
+        zone_prefix="surya-",
+        # ``ListGroup`` is not here: it names a real list as often.
+        footnote_types=frozenset({"Footnote", "Bibliography"}),
+        # The markup is in ``html``: the worker's flattened ``text``
+        # has already lost the superscript boundaries (#404).
+        dialect=markup.parse_html,
+        markup_key="html",
+        kind_types={
+            "SectionHeader": markup.HEADING,
+            "ListGroup": markup.LIST_ITEM,
+            "Table": markup.TABLE,
+        },
     ),
 }
 
@@ -409,12 +644,21 @@ class ScanInputs:
         reader paints.
     :param renders: ``{page_index: (img_width, img_height)}`` of the
         live detections, for the page size in points.
+    :param printed: ``{page_index: value}``, the approved page number
+        of every final page that has one, off the run's printed-page
+        map (#396).
+    :param zones: ``{zone name: {page_index: [Detection]}}``, the live
+        rows of every :data:`ZONES` label in the run (#399, #411), in
+        render pixels. They become the page's zones in points once the
+        page size is known.
     """
 
     run: object
     documents: dict[str, dict] = field(default_factory=dict)
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
+    printed: dict[int, str] = field(default_factory=dict)
+    zones: dict[str, dict[int, list]] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -430,7 +674,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
     :rtype: ScanInputs
     :raises ScanHeld: When the corrected volume is not built, the
         redactions are not measured against it, an engine is owed, or
-        a document does not pull.
+        a document does not pull, the printed-page map included.
     """
     run = review_states.final_run(scan)
     if run is None:
@@ -458,6 +702,7 @@ def load_inputs(scan: Scan) -> ScanInputs:
         raise ScanHeld("the run has no engine document")
 
     inputs = ScanInputs(run=run, documents=documents)
+    inputs.printed = _printed_numbers(scan, run)
     for entry in redactions.visible_by_page(scan):
         inputs.redactions[entry["page_index"]] = entry["rects"]
     # The run's space alone: a human row ``detections.relocate_rows``
@@ -469,7 +714,52 @@ def load_inputs(scan: Scan) -> ScanInputs:
         .distinct()
     ):
         inputs.renders.setdefault(page_index, (width, height))
+    # The zones of every page, the run's space alone again (#399,
+    # #411), one query for every label of the table.
+    by_label = {zone.label: name for name, zone in ZONES.items()}
+    inputs.zones = {name: {} for name in ZONES}
+    for row in (
+        Detection.objects.live()
+        .filter(scan=scan, apply_run=run, label__in=list(by_label))
+        .order_by("page_index", "y0", "x0")
+    ):
+        name = by_label[row.label]
+        if ZONES[name].counts(row):
+            inputs.zones[name].setdefault(row.page_index, []).append(row)
     return inputs
+
+
+def _printed_numbers(scan: Scan, run) -> dict[int, str]:
+    """Read the approved page number of every final page (#396).
+
+    The run's printed-page map, through ``apply.local_copy`` like the
+    engine documents, so a second tick over the scan pulls nothing.
+    The map is the one review 1 approved: the model's reading with the
+    curator's own numbers over it (``apply.printed_pages``). A page
+    with no number is absent, so a reader's ``get`` answers None.
+
+    :param scan: The scan.
+    :param run: The final apply run.
+    :returns: ``{page_index: value}``.
+    :rtype: dict[int, str]
+    :raises ScanHeld: When the map does not load, a fact about the
+        scan.
+    """
+    key = run.printed_pages_key
+    try:
+        document = json.loads(apply.local_copy(scan, key).read_text())
+    except (apply.ApplyError, OSError, ValueError) as exc:
+        raise ScanHeld(f"the printed-page map did not load: {exc}")
+    if not isinstance(document, dict) or "pages" not in document:
+        raise ScanHeld(f"the object at {key} is not a printed-page map")
+    printed: dict[int, str] = {}
+    for page in document["pages"] or []:
+        if not isinstance(page, dict) or not page.get("printed"):
+            continue
+        final = page.get("final_page")
+        if isinstance(final, int) and final > 0:
+            printed[final - 1] = str(page["printed"])
+    return printed
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +794,32 @@ def page_size_pt(
     dpi = 72.0 if (dots_page or {}).get("render_fallback") else dots_mocr.DPI
     scale = POINTS_PER_INCH / dpi
     return frame[0] * scale, frame[1] * scale
+
+
+def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
+    """Return one zone of one page, in points (#399, #411).
+
+    One box per row, off the row's own render size, the rule of
+    ``opinion_pdf._image_rects``: the fields as they are, so a zero
+    render size falls back to the render density.
+
+    :param rows: The page's detections of one :data:`ZONES` label.
+    :param size: The page size in points.
+    :returns: ``[[x0, y0, x1, y1], ...]``, rounded like every box.
+    :rtype: list[list[float]]
+    """
+    zones = []
+    for row in rows:
+        x0, y0 = boundaries.to_points(
+            row.x0, row.y0, row.img_width, row.img_height, *size
+        )
+        x1, y1 = boundaries.to_points(
+            row.x1, row.y1, row.img_width, row.img_height, *size
+        )
+        box = as_box([x0, y0, x1, y1])
+        if box is not None:
+            zones.append([round(v, 2) for v in box])
+    return zones
 
 
 def as_box(value) -> list[float] | None:
@@ -572,17 +888,65 @@ def covered_share(
     return best, hit
 
 
+def is_bracket_box(rect: dict, box: list[float]) -> bool:
+    """Return whether ``rect`` is a bracket box of the unit ``box`` (#373).
+
+    A bracket box is a glyph, so the size of its share of the unit says
+    nothing: any overlap is the unit it sits in. A ``HEADNOTE_BRACKET``
+    rect needs the overlap alone. A ``manual`` rect also needs the size
+    and the place of a bracket (``MANUAL_BRACKET_MAX_*``), because a
+    curator draws that type over anything; see :data:`TOKEN_RECT_TYPES`.
+
+    :param rect: A dict with ``rect_type``, ``x0``, ``y0``, ``x1`` and
+        ``y1``, in points.
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :returns: Whether the rect deletes the unit's bracket tokens.
+    :rtype: bool
+    """
+    kind = rect.get("rect_type")
+    if kind not in TOKEN_RECT_TYPES:
+        return False
+    other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+    if other is None or intersection(box, other) <= 0:
+        return False
+    if kind == brackets.BRACKET_LABEL:
+        return True
+    return (
+        other[2] - other[0] <= MANUAL_BRACKET_MAX_WIDTH_PT
+        and other[3] - other[1] <= MANUAL_BRACKET_MAX_HEIGHT_PT
+        and abs(other[0] - box[0]) <= MANUAL_BRACKET_MAX_INDENT_PT
+    )
+
+
+def touches(box: list[float], rects: list[dict]) -> bool:
+    """Return whether one of ``rects`` is a bracket box of ``box``.
+
+    :param box: The unit's ``[x0, y0, x1, y1]`` in points.
+    :param rects: The page's rects of :data:`TOKEN_RECT_TYPES`.
+    :returns: Whether the unit loses its bracket tokens.
+    :rtype: bool
+    """
+    return any(is_bracket_box(rect, box) for rect in rects)
+
+
 def verdict(
     box_pt: list[float] | None,
     rects: list[dict],
     masks: list[dict],
+    text: str = "",
+    printed: str | None = None,
+    height_pt: float | None = None,
+    label: str = "",
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
-    names itself; else a neighbour's mask that does; else nothing. The
-    share is the larger of the two, so a partial verdict is read off
-    the file as ``share < FULL_SHARE``.
+    names itself; else a neighbour's mask that does; else the printed
+    page number, when the unit sits in the head or the foot zone and
+    one of its lines ends in the approved number of its page (#396);
+    else nothing. The share is the larger of the two boxes' shares,
+    so a partial verdict is read off the file as ``share <
+    FULL_SHARE``; a page-number unit is taken whole and carries 1.0.
 
     A unit with no box, or on a page with no size, cannot be judged.
     It carries the third verdict, :data:`UNJUDGED`, so a reader tells
@@ -594,6 +958,12 @@ def verdict(
         no box or on a page with no size.
     :param rects: The redaction boxes of the page, in points.
     :param masks: The outside masks of the page, in points.
+    :param text: The unit's text, as the engine wrote it.
+    :param printed: The approved page number of the page, or None for
+        a page with none.
+    :param height_pt: The page's height in points, the space of
+        ``box_pt``; None leaves the band unread.
+    :param label: The unit's label, as the engine wrote it.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
@@ -615,9 +985,45 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
+    elif is_page_number(box_pt, text, printed, height_pt, label):
+        exclusion = {"reason": PAGE_NUMBER, "printed": printed}
+        share = 1.0
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def is_page_number(
+    box_pt: list[float],
+    text: str,
+    printed: str | None,
+    height_pt: float | None,
+    label: str = "",
+) -> bool:
+    """Say whether a unit is the printed page number of its page (#396).
+
+    Both conditions, and the one rule for them: the unit is in the head
+    or the foot zone, by its band (``page_numbers.band_of``) or by the
+    engine's label (``page_numbers.is_head_or_foot_label``), the two
+    signals review 1 takes a candidate by; and a line of the text ends
+    in the approved value (``page_numbers.carries_number``).
+
+    :param box_pt: The unit's box in points.
+    :param text: The unit's text.
+    :param printed: The approved number of the page, or None.
+    :param height_pt: The page's height in points, or None.
+    :param label: The unit's label, as the engine wrote it.
+    :returns: Whether the unit is the page number.
+    :rtype: bool
+    """
+    if not printed:
+        return False
+    in_zone = page_numbers.is_head_or_foot_label(label) or (
+        bool(height_pt) and page_numbers.band_of(box_pt, height_pt) is not None
+    )
+    if not in_zone:
+        return False
+    return page_numbers.carries_number(text, printed)
 
 
 def kept_units(page: dict) -> list[dict]:
@@ -675,7 +1081,19 @@ def build_document(
     }
     pages: list[dict] = []
     failed: list[int] = []
-    counts = {"units": 0, "excluded": 0, "partial": 0, "unjudged": 0}
+    counts = {
+        "units": 0,
+        "excluded": 0,
+        "partial": 0,
+        "unjudged": 0,
+        "page_number": 0,
+        **{zone.count_key: 0 for zone in ZONES.values()},
+        "brackets_removed": 0,
+        "marks": 0,
+        "headings": 0,
+        "list_items": 0,
+        "tables": 0,
+    }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
         page = by_index.get(page_index)
@@ -692,6 +1110,11 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
+            # The zones of the page, in points (#399, #411). The same
+            # value on every engine's page, because they are a fact of
+            # the page and not of the engine. Empty when no detection
+            # drew one, or when no size puts it in points.
+            "zones": {name: [] for name in ZONES},
             "units": [],
         }
         if size and frame:
@@ -701,13 +1124,27 @@ def build_document(
                 "render_width": frame[0],
                 "render_height": frame[1],
             }
+        if size:
+            for name, zone in ZONES.items():
+                entry["zones"][name] = zones_pt(
+                    inputs.zones.get(name, {}).get(page_index, []), size
+                )
+                counts[zone.count_key] += len(entry["zones"][name])
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
             pages.append(entry)
             continue
         rects = inputs.redactions.get(page_index, [])
+        # A bracket box deletes its token and is not measured (#373).
+        token_rects = [
+            r for r in rects if r.get("rect_type") in TOKEN_RECT_TYPES
+        ]
+        rects = [
+            r for r in rects if r.get("rect_type") != brackets.BRACKET_LABEL
+        ]
         page_masks = masks.get(page_index, [])
+        printed = inputs.printed.get(page_index)
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -721,26 +1158,59 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
-            exclusion, share = verdict(box_pt, rects, page_masks)
+            # The engine's markup becomes marks over a plain text
+            # (#404), and the bracket strip runs on that text: Surya's
+            # markup is in its ``html``, where the token sits behind a
+            # ``<p>``. The deletions move the marks.
+            parsed = spec.parse(unit)
+            text, marks = parsed.text, parsed.marks
+            removed: list[str] = []
+            if box_pt is not None and touches(box_pt, token_rects):
+                text, removed, spans = brackets.strip_line_token_spans(text)
+                marks = markup.shift(marks, spans)
+                counts["brackets_removed"] += len(removed)
+            counts["marks"] += len(marks)
+            if parsed.kind == markup.HEADING:
+                counts["headings"] += 1
+            elif parsed.kind == markup.LIST_ITEM:
+                counts["list_items"] += 1
+            elif parsed.kind == markup.TABLE:
+                counts["tables"] += 1
+            label = unit.get(spec.type_key) or ""
+            exclusion, share = verdict(
+                box_pt,
+                rects,
+                page_masks,
+                text,
+                printed,
+                size[1] if size else None,
+                label,
+            )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1
             elif exclusion is not None:
                 counts["excluded"] += 1
+                if exclusion["reason"] == PAGE_NUMBER:
+                    counts["page_number"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
-            text = unit.get(spec.text_key)
-            entry["units"].append(
-                {
-                    "id": index,
-                    "type": unit.get(spec.type_key) or "",
-                    "text": text if isinstance(text, str) else "",
-                    "bbox": unit.get("bbox"),
-                    "box_pt": box_pt,
-                    "exclusion": exclusion,
-                    "share": share,
-                }
-            )
+            out = {
+                "id": index,
+                "type": label,
+                "text": text,
+                "marks": [mark.as_dict() for mark in marks],
+                "kind": parsed.kind,
+                "bbox": unit.get("bbox"),
+                "box_pt": box_pt,
+                "exclusion": exclusion,
+                "share": share,
+            }
+            if parsed.kind == markup.TABLE:
+                out["table"] = parsed.table or []
+            if removed:
+                out["removed"] = removed
+            entry["units"].append(out)
         pages.append(entry)
 
     return {

@@ -2736,9 +2736,12 @@ class TestDeleteDetection(DetectionEndpointMixin, ScanningTestCase):
 
 
 class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
-    """Tests for the approve_detection endpoint (#240)."""
+    """Tests for the approve_detection endpoint (#240, #414)."""
 
-    def test_a_model_row_gets_an_approval(self):
+    def test_a_model_row_becomes_the_curators_own(self):
+        """An approval is a move by zero (#414): the model row gets a
+        dismiss, and the answer names the hand-drawn row at the same
+        box, which the viewer addresses from then on."""
         user = self.make_staff_user()
         self.client.force_login(user)
         scan, det = self._make_scan_with_detection(
@@ -2753,27 +2756,109 @@ class TestApproveDetection(DetectionEndpointMixin, ScanningTestCase):
         body = json.loads(response.content)
         self.assertEqual(body["status"], "ok")
         self.assertEqual(body["updated"], 1)
-        det.refresh_from_db()
-        self.assertEqual(det.confidence, 1.0)
-        self.assertEqual(det.decision.kind, DetectionDecision.Kind.APPROVE)
-        self.assertEqual(det.decision.target_confidence, 0.7)
-
-    def test_a_deletion_after_an_approval_leaves_one_decision_standing(self):
-        self.client.force_login(self.make_staff_user())
-        scan, det = self._make_scan_with_detection(confidence=0.7)
-        self._post("approve_detection", scan, {"detection_id": det.pk})
-
-        self._post("delete_detection", scan, {"detection_id": det.pk})
-
+        self.assertEqual(body["replaced_id"], det.pk)
+        self.assertNotEqual(body["detection_id"], det.pk)
         det.refresh_from_db()
         self.assertFalse(det.active)
         self.assertEqual(det.decision.kind, DetectionDecision.Kind.DEACTIVATE)
-        standing = DetectionDecision.objects.filter(
-            scan=scan, withdrawn_at__isnull=True
-        )
-        self.assertEqual(standing.count(), 1)
+        self.assertEqual(det.decision.author, user)
+        holder = Detection.objects.get(pk=body["detection_id"])
+        self.assertEqual(holder.model_name, Detection.ModelName.MANUAL)
+        self.assertEqual(holder.confidence, 1.0)
+        self.assertEqual(holder.replaces, det.decision)
         self.assertEqual(
-            DetectionDecision.objects.filter(scan=scan).count(), 2
+            [holder.x0, holder.y0, holder.x1, holder.y1],
+            [det.x0, det.y0, det.x1, det.y1],
+        )
+        self.assertEqual(holder.label, "KEY_ICON")
+        self.assertFalse(
+            DetectionDecision.objects.filter(
+                kind=DetectionDecision.Kind.APPROVE
+            ).exists()
+        )
+
+    def test_a_dismissal_of_the_approved_box_gives_the_model_box_back(self):
+        """The undo of an approval is the Dismiss of the hand-drawn row,
+        which withdraws it and the dismissal it replaced (#414)."""
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection(confidence=0.7)
+        holder_id = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )["detection_id"]
+
+        self._post("delete_detection", scan, {"detection_id": holder_id})
+
+        det.refresh_from_db()
+        self.assertTrue(det.active)
+        self.assertIsNone(det.decision)
+        self.assertEqual(det.confidence, 0.7)
+        holder = Detection.objects.get(pk=holder_id)
+        self.assertFalse(holder.active)
+        self.assertIsNotNone(holder.withdrawn_at)
+        self.assertFalse(
+            DetectionDecision.objects.filter(
+                scan=scan, withdrawn_at__isnull=True
+            ).exists()
+        )
+
+    def test_a_second_approval_of_the_model_row_writes_no_second_row(self):
+        """A second tab, or a stale card of the sidebar, sends the
+        model row's id again after the approval: the answer is the
+        hand-drawn row that stands, and no second row shares the
+        dismissal, or the Dismiss of either would give the model box
+        back beside the other (PR #415 review)."""
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection()
+        first = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )
+
+        second = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )
+
+        self.assertEqual(second["status"], "ok")
+        self.assertEqual(second["detection_id"], first["detection_id"])
+        self.assertEqual(second["replaced_id"], det.pk)
+        self.assertEqual(Detection.objects.live().filter(scan=scan).count(), 1)
+        self.assertEqual(
+            Detection.objects.filter(
+                scan=scan, model_name=Detection.ModelName.MANUAL
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 1
+        )
+
+    def test_a_second_approval_of_the_box_writes_nothing(self):
+        """The toolbar offers no button on a hand-drawn box, and the
+        endpoint writes nothing for one, so a stale card or a second
+        tab cannot stack a dismissal on the curator's own row."""
+        self.client.force_login(self.make_staff_user())
+        scan, det = self._make_scan_with_detection()
+        holder_id = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )["detection_id"]
+
+        response = self._post(
+            "approve_detection", scan, {"detection_id": holder_id}
+        )
+
+        body = json.loads(response.content)
+        self.assertEqual(body["detection_id"], holder_id)
+        self.assertEqual(body["replaced_id"], holder_id)
+        self.assertEqual(Detection.objects.filter(scan=scan).count(), 2)
+        self.assertEqual(
+            DetectionDecision.objects.filter(scan=scan).count(), 1
         )
 
     def test_a_row_with_no_address_answers_409_on_every_endpoint(self):
@@ -2871,9 +2956,13 @@ class TestServeDetectionsCarriesTheDecision(
     """The viewer's list carries the standing decision (#240)."""
 
     def test_lists_live_rows_with_their_decision(self):
+        """A row with an ``approve`` decision was written before #414;
+        the list still carries the kind, and the row is not manual."""
+        from scanning import detections
+
         self.client.force_login(self.make_user())
         scan, det = self._make_scan_with_detection()
-        self._post("approve_detection", scan, {"detection_id": det.pk})
+        detections.decide(scan, det, DetectionDecision.Kind.APPROVE, None)
         _scan, gone = self._make_scan_with_detection(scan=scan, page_index=1)
         self._post("delete_detection", scan, {"detection_id": gone.pk})
 
@@ -2885,6 +2974,27 @@ class TestServeDetectionsCarriesTheDecision(
         self.assertEqual([r["id"] for r in rows], [det.pk])
         self.assertEqual(rows[0]["decision"], "approve")
         self.assertFalse(rows[0]["manual"])
+
+    def test_an_approved_box_lists_as_the_curators_own(self):
+        """After #414 the approved box is one hand-drawn row on the
+        list, with no decision of its own, and the model row is gone."""
+        self.client.force_login(self.make_user())
+        scan, det = self._make_scan_with_detection()
+        holder_id = json.loads(
+            self._post(
+                "approve_detection", scan, {"detection_id": det.pk}
+            ).content
+        )["detection_id"]
+
+        response = self.client.get(
+            reverse("serve_detections", kwargs={"pk": scan.pk})
+        )
+
+        rows = json.loads(response.content)
+        self.assertEqual([r["id"] for r in rows], [holder_id])
+        self.assertTrue(rows[0]["manual"])
+        self.assertIsNone(rows[0]["decision"])
+        self.assertEqual(rows[0]["confidence"], 1.0)
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
@@ -4445,3 +4555,38 @@ class TestOnePageNumberGate(TestCase):
         fragment = "trailing letter like 2094a"
         self.assertIn(fragment, views_process.PAGE_NUMBER_ERROR)
         self.assertIn(fragment, self._script("shared.js"))
+
+
+class TestApproveBehindTheDoubleClick(TestOnePageNumberGate):
+    """The toolbar of a selected detection box offers Approve (#414).
+
+    The button goes on a model box alone: a hand-drawn box is the
+    curator's own already, and the endpoint writes nothing for one. The
+    success branch follows the id the endpoint answers, as the move
+    does, through the one function the sidebar's card calls too.
+    """
+
+    def test_the_toolbar_offers_approve_on_a_model_box_alone(self):
+        script = self._script("viewer_step2.js")
+        toolbar = script.split("function _selectDetectionBox(", 1)[1]
+        toolbar = toolbar.split("// Resize handles", 1)[0]
+
+        self.assertIn("if (!det.manual) {", toolbar)
+        approve = toolbar.split("if (!det.manual) {", 1)[1]
+        self.assertIn("approveBtn.textContent = 'Approve';", approve)
+        self.assertIn("/approve-detection/", approve)
+        self.assertIn(
+            "adoptDetection(data.replaced_id, data.detection_id);", approve
+        )
+        self.assertIn("showSaved(data);", approve)
+
+    def test_one_function_follows_the_row_that_holds_the_box(self):
+        step2 = self._script("viewer_step2.js")
+        sidebar = self._script("viewer_sidebar.js")
+
+        self.assertEqual(step2.count("function adoptDetection("), 1)
+        self.assertIn("window.adoptDetection = function", step2)
+        self.assertIn(
+            "window.adoptDetection(data.replaced_id, data.detection_id);",
+            sidebar,
+        )

@@ -18,11 +18,13 @@
  *   so the render draws the boxes again. Nothing is positioned one
  *   time (#311). A page holds the scale it was drawn at, so it is
  *   drawn again only when that scale changes.
- * - **The document holds no markup.** A voted group holds tokens with
- *   a ``low_confidence`` flag, and this module builds the nodes. Every
- *   string enters the DOM with ``textContent``. The words that differ
- *   are measured here too (#380), over the text as it is shown and
- *   never over the key of ``ensemble.compare_text``.
+ * - **The document holds no markup.** A group holds a plain text,
+ *   standoff marks over it and a kind (#404), a voted group holds
+ *   tokens with a ``low_confidence`` flag, and this module builds the
+ *   nodes (:func:`markedNodes`). Every string enters the DOM with
+ *   ``textContent``. The words that differ are measured here too
+ *   (#380), over the text as it is shown and never over the key of
+ *   ``ensemble.compare_text``.
  * - **A box takes no pointer.** One hit test on the wrapper finds the
  *   box under the pointer, the rule of ``ocr_text.js``: a box that
  *   took the pointer would swallow the clicks of the page.
@@ -33,6 +35,16 @@
  *
  * The link between the columns is the group id. A text node carries
  * ``data-page`` and ``data-group``; so does its box.
+ *
+ * A group says its section (#399), and the section is read off the
+ * group and never off its place in the list: a page shows its body
+ * text, then its footnotes in a block of their own, and the page
+ * draws its footnote zones under the boxes.
+ *
+ * A blockquote is a run the document writes (``page.blockquotes``,
+ * #411), and the viewer never derives one: the groups of a run go in
+ * one ``<blockquote>`` element, and the page draws the blockquote
+ * zones beside the footnote zones.
  */
 
 (function () {
@@ -59,6 +71,11 @@
     // because a whole page in one group would otherwise hold the
     // browser.
     var MAX_DIFF_WORDS = 1000;
+
+    // The two sections of a page (#399), the values of
+    // ``ensemble.BODY`` and ``ensemble.FOOTNOTES``.
+    var BODY = 'text';
+    var FOOTNOTES = 'footnotes';
 
     var root = null;
     var pagesColumn = null;
@@ -291,9 +308,7 @@
         var canvas = pageDiv.querySelector('.pdf-canvas');
         canvas.width = 0;
         canvas.height = 0;
-        pageDiv.querySelector('.canvas-wrapper')
-            .querySelectorAll('.ensemble-box')
-            .forEach(function (el) { el.remove(); });
+        clearOverlays(pageDiv.querySelector('.canvas-wrapper'));
         pageDiv.dataset.rendered = '';
         pageDiv.dataset.renderedScale = '';
     }
@@ -364,11 +379,13 @@
     }
 
     /**
-     * Draw the box of every group of one page.
+     * Draw the footnote zones and the box of every group of one page.
      *
      * A box is in the points of the volume page, and the opinion PDF
      * keeps the page size, so the scale of the render is the only
-     * conversion.
+     * conversion. The zones go in first, so every box is drawn over
+     * them. A zone is not a box: :func:`boxUnder` reads the boxes
+     * alone, so a zone never takes the hit test (#399).
      *
      * @param {HTMLElement} pageDiv - The container of the page.
      * @param {number} index - The 0-based page of the opinion.
@@ -376,11 +393,21 @@
      */
     function drawBoxes(pageDiv, index, scale) {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
-        wrapper.querySelectorAll('.ensemble-box').forEach(function (el) {
-            el.remove();
-        });
+        clearOverlays(wrapper);
         var page = pageOf(index);
         if (!page) { return; }
+        ((page.zones || {}).footnotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
+        ((page.zones || {}).blockquotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-quote-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
         (page.groups || []).forEach(function (group) {
             var box = group.box_pt;
             if (!box) { return; }
@@ -389,14 +416,53 @@
             el.dataset.page = String(index);
             el.dataset.group = String(group.id);
             el.dataset.agreement = group.agreement;
+            el.dataset.section = sectionOf(group);
             if (group.weak) { el.classList.add('weak'); }
-            el.style.left = (box[0] * scale) + 'px';
-            el.style.top = (box[1] * scale) + 'px';
-            el.style.width = ((box[2] - box[0]) * scale) + 'px';
-            el.style.height = ((box[3] - box[1]) * scale) + 'px';
+            if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
+            if (group.blockquote) { el.dataset.blockquote = 'true'; }
+            placeOver(el, box, scale);
             wrapper.appendChild(el);
         });
         if (selected && selected.page === index) { paintSelection(); }
+    }
+
+    /**
+     * Remove every overlay of one page: the boxes and the zones.
+     *
+     * @param {HTMLElement} wrapper - The canvas wrapper of the page.
+     */
+    function clearOverlays(wrapper) {
+        wrapper.querySelectorAll('.ensemble-box, .ensemble-zone')
+            .forEach(function (el) { el.remove(); });
+    }
+
+    /**
+     * Put one element over a box of the page.
+     *
+     * @param {HTMLElement} el - The element.
+     * @param {number[]} box - ``[x0, y0, x1, y1]`` in points.
+     * @param {number} scale - The scale of the render.
+     */
+    function placeOver(el, box, scale) {
+        el.style.left = (box[0] * scale) + 'px';
+        el.style.top = (box[1] * scale) + 'px';
+        el.style.width = ((box[2] - box[0]) * scale) + 'px';
+        el.style.height = ((box[3] - box[1]) * scale) + 'px';
+    }
+
+    /**
+     * Return the section of one group: ``text`` or ``footnotes``.
+     *
+     * The group says it (``ensemble.section``, #399). The order of the
+     * groups is not the section, and a document written before the
+     * sections (schema 2) holds no ``section``, so its groups are body
+     * text, as they were.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {string} The section.
+     */
+    function sectionOf(group) {
+        return group.section === FOOTNOTES ? FOOTNOTES : BODY;
     }
 
     /**
@@ -457,6 +523,12 @@
 
     /**
      * Build the text column from the document.
+     *
+     * A page shows its body text, then its footnotes in a block of
+     * their own (#399). Each group says its section, and the order of
+     * the groups does not: the split reads :func:`sectionOf` and never
+     * the page's ``footnotes`` string, which is the text and not the
+     * groups. A page with no footnote group has no block.
      */
     function drawText() {
         textColumn.textContent = '';
@@ -478,12 +550,87 @@
                     'opinion-text-error', 'No block of this page holds text.'
                 ));
             } else {
+                var footnotes = [];
+                var runs = runOfGroup(page);
+                var quote = null;
+                var quoteRun = -1;
                 page.groups.forEach(function (group) {
-                    block.appendChild(groupNode(page, group));
+                    if (sectionOf(group) === FOOTNOTES) {
+                        footnotes.push(group);
+                        return;
+                    }
+                    var run = runs[group.id];
+                    if (run === undefined) {
+                        quote = null;
+                        block.appendChild(groupNode(page, group));
+                        return;
+                    }
+                    if (!quote || quoteRun !== run) {
+                        quote = blockquoteNode(page.blockquotes[run]);
+                        quoteRun = run;
+                        block.appendChild(quote);
+                    }
+                    quote.appendChild(groupNode(page, group));
                 });
+                if (footnotes.length) {
+                    block.appendChild(footnoteBlock(page, footnotes));
+                }
             }
             textColumn.appendChild(block);
         });
+    }
+
+    /**
+     * Return the blockquote run of every quoted group of one page.
+     *
+     * The runs are the document's (``ensemble.blockquote_runs``,
+     * #411): the viewer reads them and never finds its own, so the
+     * text column shows the quote the tagger reads.
+     *
+     * @param {Object} page - The page entry.
+     * @returns {Object} ``{group id: index into page.blockquotes}``.
+     */
+    function runOfGroup(page) {
+        var runs = {};
+        (page.blockquotes || []).forEach(function (run, index) {
+            (run.groups || []).forEach(function (id) { runs[id] = index; });
+        });
+        return runs;
+    }
+
+    /**
+     * Return whether a group is a list group of its blockquote (#411):
+     * the ensemble says so, off the engines that read it as a list.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {boolean} Whether it is.
+     */
+    function isQuotedList(page, group) {
+        return (page.blockquotes || []).some(function (run) {
+            return (run.list_groups || []).indexOf(group.id) >= 0;
+        });
+    }
+
+    /**
+     * Build the footnote block of one page.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object[]} groups - The footnote groups, in document order.
+     * @returns {HTMLElement} The block.
+     */
+    function footnoteBlock(page, groups) {
+        var block = document.createElement('div');
+        block.className = 'ensemble-footnotes';
+        var label = document.createElement('div');
+        label.className = 'ensemble-footnotes-label';
+        label.textContent = 'Footnotes';
+        label.title = 'The text under the footnote zone of this page.';
+        block.appendChild(label);
+        groups.forEach(function (group) {
+            block.appendChild(groupNode(page, group));
+        });
+        return block;
     }
 
     function note(className, text) {
@@ -494,34 +641,144 @@
     }
 
     /**
+     * The element a group's kind draws (#404). A table is built from
+     * its rows and holds no text of its own.
+     */
+    var KIND_ELEMENTS = {
+        heading: 'h3',
+        list_item: 'li',
+        table: 'div',
+        paragraph: 'p'
+    };
+
+    /**
+     * Fill ``parent`` with ``text`` and its marks.
+     *
+     * The marks are standoff: ``{start, end, kind}`` over ``text``,
+     * with ``kind`` one of ``em``, ``strong`` and ``sup``. The text is
+     * cut at every mark edge, and each piece is a text node wrapped
+     * in one element per mark that covers it, the innermost first.
+     * Every string still enters the DOM with ``textContent``.
+     *
+     * @param {HTMLElement} parent - The node to fill.
+     * @param {string} text - The plain text.
+     * @param {Object[]} marks - Its marks, in its own offsets.
+     */
+    function markedNodes(parent, text, marks) {
+        var edges = {0: true};
+        edges[text.length] = true;
+        (marks || []).forEach(function (mark) {
+            edges[mark.start] = true;
+            edges[mark.end] = true;
+        });
+        var cuts = Object.keys(edges).map(Number).sort(function (a, b) {
+            return a - b;
+        });
+        for (var i = 0; i + 1 < cuts.length; i += 1) {
+            var start = cuts[i];
+            var end = cuts[i + 1];
+            var piece = document.createTextNode(text.slice(start, end));
+            var wrapped = piece;
+            ['sup', 'em', 'strong'].forEach(function (kind) {
+                var covers = (marks || []).some(function (mark) {
+                    return mark.kind === kind
+                        && mark.start <= start && end <= mark.end;
+                });
+                if (covers) {
+                    var element = document.createElement(kind);
+                    element.appendChild(wrapped);
+                    wrapped = element;
+                }
+            });
+            parent.appendChild(wrapped);
+        }
+    }
+
+    /**
+     * The marks of one token of a voted group, in the token's own
+     * offsets: the group's marks cut to ``[at, at + length)``.
+     *
+     * @param {Object[]} marks - The group's marks.
+     * @param {number} at - Where the token starts in the group text.
+     * @param {number} length - The token's length.
+     * @returns {Object[]} The clipped marks.
+     */
+    function clipMarks(marks, at, length) {
+        var out = [];
+        (marks || []).forEach(function (mark) {
+            var start = Math.max(mark.start, at) - at;
+            var end = Math.min(mark.end, at + length) - at;
+            if (end > start) {
+                out.push({start: start, end: end, kind: mark.kind});
+            }
+        });
+        return out;
+    }
+
+    /**
+     * Build the table of a group whose kind is a table.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The table.
+     */
+    function tableNode(group) {
+        var table = document.createElement('table');
+        table.className = 'ensemble-table';
+        var body = document.createElement('tbody');
+        (group.table || []).forEach(function (row) {
+            var tr = document.createElement('tr');
+            row.forEach(function (cell) {
+                var td = document.createElement('td');
+                td.textContent = cell;
+                tr.appendChild(td);
+            });
+            body.appendChild(tr);
+        });
+        table.appendChild(body);
+        return table;
+    }
+
+    /**
      * Build the node of one group.
      *
      * A voted group is built token by token, so a word with no
      * majority carries its own mark. Every other group is one string.
      * The document holds no markup, and this is the one place that
-     * decides what a reading looks like.
+     * decides what a reading looks like: the element follows the
+     * group's ``kind`` and the text its ``marks`` (#404).
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @returns {HTMLElement} The node.
      */
     function groupNode(page, group) {
-        var node = document.createElement('p');
+        var kind = group.kind || 'paragraph';
+        var node = document.createElement(KIND_ELEMENTS[kind] || 'p');
         node.className = 'ensemble-group';
         node.dataset.page = String(page.page_in_opinion);
         node.dataset.group = String(group.id);
         node.dataset.agreement = group.agreement;
+        node.dataset.kind = kind;
         if (group.weak) { node.classList.add('weak'); }
+        if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
 
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
         });
-        if (group.agreement === 'voted' && tokens.length) {
+        var at = 0;
+        if (kind === 'table' && (group.table || []).length) {
+            node.appendChild(tableNode(group));
+        } else if (group.agreement === 'voted' && tokens.length) {
             // The words join with one space, the rule the document's
-            // own ``text`` follows.
+            // own ``text`` follows, so ``at`` is where each token
+            // starts in the group text and the marks cut to it.
             tokens.forEach(function (token, position) {
                 var span = document.createElement('span');
-                span.textContent = token.text;
+                markedNodes(
+                    span, token.text,
+                    clipMarks(group.marks, at, token.text.length)
+                );
+                at += token.text.length + 1;
                 if (token.low_confidence && token.inserted) {
                     span.className = 'ensemble-low';
                     span.title = 'The first engine that read here did'
@@ -543,7 +800,7 @@
                 }
             });
         } else {
-            node.textContent = group.text || '';
+            markedNodes(node, group.text || '', group.marks || []);
         }
 
         var line = groupNote(page, group);
@@ -562,6 +819,26 @@
             node.classList.add('differs');
         }
         return node;
+    }
+
+    /**
+     * Build the element of one blockquote run (#411). The groups go in
+     * it as the run lists them.
+     *
+     * @param {Object} run - The run entry of ``page.blockquotes``.
+     * @returns {HTMLElement} The element.
+     */
+    function blockquoteNode(run) {
+        var quote = document.createElement('blockquote');
+        quote.className = 'ensemble-blockquote';
+        quote.title = 'The text under a blockquote detection of this page.';
+        if ((run.list_groups || []).length) {
+            quote.classList.add('ensemble-quote-list');
+            quote.title = 'The text under a blockquote detection of this '
+                + 'page. Engines read part of it as a list, so it may be '
+                + 'a list and not a quote.';
+        }
+        return quote;
     }
 
     /**
@@ -1035,6 +1312,23 @@
         if (group.weak) {
             parts.push('the boxes hardly meet');
         }
+        if (group.footnote_doubt) {
+            // The group is in the body, because the zone alone decides
+            // (#399). The engines named here are the document's own.
+            var labellers = group.footnote_by || [];
+            parts.push(
+                labellers.join(', ')
+                + (labellers.length === 1 ? ' calls' : ' call')
+                + ' this a footnote; no footnote zone here'
+            );
+        }
+        if (isQuotedList(page, group)) {
+            // The tag stays: the card warns and changes nothing (#411).
+            parts.push(
+                (group.list_by || []).join(', ')
+                + ' read this as a list; the blockquote may be a list'
+            );
+        }
         return parts.length ? '[' + parts.join('; ') + ']' : '';
     }
 
@@ -1289,9 +1583,12 @@
         var summary = document.getElementById('ensemble-summary');
         if (!summary || !doc) { return; }
         var counts = doc.counts || {};
+        var footnotes = counts.footnote_groups
+            ? ', ' + counts.footnote_groups + ' of them footnotes'
+            : '';
         summary.textContent = (
             '— ' + (doc.engines || []).join(', ') + ', ' +
-            (counts.groups || 0) + ' block(s), ' +
+            (counts.groups || 0) + ' block(s)' + footnotes + ', ' +
             (counts.low_confidence || 0) + ' word(s) with no majority'
         );
     }

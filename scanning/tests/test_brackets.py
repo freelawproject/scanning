@@ -456,3 +456,77 @@ class TestTheCommand(ScanningTestCase):
             ).count(),
             1,
         )
+
+
+class TestTheLineTokens(ScanningTestCase):
+    """The bracket the OCR text of an opinion loses (#373)."""
+
+    def strip(self, text):
+        return brackets.strip_line_tokens(text)
+
+    def test_the_bracket_that_opens_a_line_goes_with_its_space(self):
+        self.assertEqual(
+            self.strip("[1] The court held."), ("The court held.", ["[1]"])
+        )
+
+    def test_a_pair_and_a_range_go_too(self):
+        self.assertEqual(self.strip("[1, 2] Double")[0], "Double")
+        self.assertEqual(self.strip("[3–5] Equitable")[0], "Equitable")
+
+    def test_every_line_of_a_joined_block_loses_its_bracket(self):
+        self.assertEqual(
+            self.strip("II\n[4, 5] The Second.\n[6] The third."),
+            ("II\nThe Second.\nThe third.", ["[4, 5]", "[6]"]),
+        )
+
+    def test_the_space_before_the_bracket_stays(self):
+        self.assertEqual(self.strip("  [7] Indented")[0], "  Indented")
+
+    def test_a_bracket_inside_a_line_stays(self):
+        """A footnote reference, or a bracket the page prints."""
+        for text in (
+            "the man inveigled[5] or kidnapped",
+            "297 U.S. [157], at 160",
+        ):
+            self.assertEqual(self.strip(text), (text, []))
+
+    def test_one_bracket_per_line(self):
+        """The second token of the line is a star-pagination mark."""
+        self.assertEqual(
+            self.strip("[10] [22] Next, Evans argues"),
+            ("[22] Next, Evans argues", ["[10]"]),
+        )
+
+    def test_a_number_that_is_no_headnote_stays(self):
+        self.assertEqual(self.strip("[120] Providing access")[1], [])
+        self.assertEqual(self.strip("[9-2] Nothing")[1], [])
+
+    def test_the_bracket_alone_leaves_an_empty_text(self):
+        self.assertEqual(self.strip("[3]"), ("", ["[3]"]))
+
+    def test_a_bracket_that_fills_its_line_takes_the_newline(self):
+        self.assertEqual(self.strip("[3]\nText"), ("Text", ["[3]"]))
+        self.assertEqual(
+            self.strip("II\n[4, 5]\nThe court"), ("II\nThe court", ["[4, 5]"])
+        )
+
+    def test_a_bracket_on_the_last_line_takes_the_newline_before(self):
+        self.assertEqual(self.strip("Text\n[3]"), ("Text", ["[3]"]))
+
+    def test_the_spans_say_where_each_deletion_was(self):
+        """The offsets the marks of #404 move over."""
+        self.assertEqual(
+            brackets.strip_line_token_spans("[1] The court held."),
+            ("The court held.", ["[1]"], [(0, 4)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("II\n[4, 5] The Second.\n[6] X"),
+            ("II\nThe Second.\nX", ["[4, 5]", "[6]"], [(3, 10), (22, 26)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("[3]\nText"),
+            ("Text", ["[3]"], [(0, 4)]),
+        )
+        self.assertEqual(
+            brackets.strip_line_token_spans("plain"), ("plain", [], [])
+        )

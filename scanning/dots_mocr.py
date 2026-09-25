@@ -25,12 +25,12 @@ Reading page numbers out of the glued JSON is issue #149.
 
 Who starts it: the upload pipeline (``services.run_full_pipeline``,
 issue #207) creates the rows for every new scan, next to the convert
-rows and gated the same way (``services._can_analyze``). The staff-only
-button (``views_process.start_dots_mocr``) remains as the manual way
-in: a re-run over an edited volume, or a backfill for scans uploaded
-while the stage was button-only (#190). Either way the web process and
-the pipeline only write rows; the daemon submits, polls and retries
-them.
+rows and gated the same way (``services._can_analyze``). The daemon's
+sweep (:func:`enqueue_missing_runs`, #327) catches up a parked volume
+the pipeline could not start, once per shard set, as detection's does
+(#250). The ``start_dots_mocr`` endpoint remains for a staff POST.
+Either way the web process and the pipeline only write rows; the
+daemon submits, polls and retries them.
 """
 
 from __future__ import annotations
@@ -213,6 +213,120 @@ def ensure_analyze_jobs(
         force_new_run=force_new_run,
         apply_run=apply_run,
     )
+
+
+#: ``scan pk -> (retry at, times refused)``: the scans whose shard set
+#: ``committed_manifest`` refused, left alone for
+#: ``yolo.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
+#: clear it.
+_REFUSED: dict[int, tuple[float, int]] = {}
+
+
+def enqueue_missing_runs() -> int:
+    """Start the OCR read over every shard set that has no run yet
+    (issue #327).
+
+    The twin of ``yolo.enqueue_missing_runs`` (#250), run on the submit
+    tick right after it and before the wave, under the same rule: a
+    scan whose current shard set (``Scan.source_fingerprint``) has no
+    ANALYZE row at all, alive or dead, gets exactly one run, and a
+    dead run under that fingerprint is a staff decision
+    (``start_dots_mocr``, ``reread_failed_pages``), not a tick. A run
+    from before the fingerprint column is blank, so it is a candidate;
+    the creator hands it back when it still describes today's set and
+    holds no dead row, and the sweep stamps it rather than count it. A
+    blank run with a dead row is replaced with a carry, so its dead
+    shards are re-paid once by a tick, and the new run carries the
+    fingerprint, so a second death waits for a person. On the corpus
+    of 2026-09-24 that was 6 parked volumes; the other 681 candidates
+    were adopted at no cost. The pipeline
+    (``services._can_analyze``) creates the rows for a new upload when
+    the stage is configured; this catches up the volume it could not
+    start. Without it a volume uploaded while the endpoint id or the
+    API key was blank parked in AWAITING_VALIDATION for good: no
+    pipeline re-run, no button, and an admin re-queue that does not
+    take that status. Once the run is glued, :func:`apply_ready_runs`
+    takes the volume to READY as for any other run.
+
+    Same cost bounds as detection's sweep, for the reasons written
+    there: at most ``DOTS_MOCR_MAX_CONCURRENCY`` volumes per tick, a
+    refused shard set memoised for an hour, no call to RunPod.
+
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    from django.db.models import Exists, OuterRef
+
+    from scanning import sharding, yolo
+
+    if not enabled() or not s3_sync.s3_active():
+        return 0
+
+    now = time.monotonic()
+    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
+
+    read = ExternalJob.objects.filter(
+        scan=OuterRef("pk"),
+        stage=JobStage.ANALYZE,
+        engine=JobEngine.DOTS_MOCR,
+        opinion=None,
+        # The volume run only: an apply run's one-page rows (#224)
+        # answer for no shard set.
+        apply_run__isnull=True,
+    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
+    candidates = (
+        Scan.objects.filter(status__in=yolo.SWEEP_STATUSES)
+        .exclude(source_fingerprint="")
+        .exclude(pk__in=skipped)
+        .annotate(read=Exists(read))
+        .filter(read=False)
+        .order_by("-pk")[: settings.DOTS_MOCR_MAX_CONCURRENCY]
+    )
+
+    started = 0
+    for scan in candidates:
+        manifest, reason = sharding.committed_manifest(scan)
+        if manifest is None:
+            _, times = _REFUSED.get(scan.pk, (0.0, 0))
+            _REFUSED[scan.pk] = (now + yolo.REFUSAL_RETRY_SECONDS, times + 1)
+            logger.log(
+                logging.INFO if times == 0 else logging.DEBUG,
+                "Scan %s is not swept for OCR (refusal %d, next look in "
+                "%ds): %s",
+                scan.pk,
+                times + 1,
+                yolo.REFUSAL_RETRY_SECONDS,
+                reason,
+            )
+            continue
+        _REFUSED.pop(scan.pk, None)
+        rows = ensure_analyze_jobs(scan, manifest)
+        blank = [row.pk for row in rows if not row.source_fingerprint]
+        if blank:
+            # A run from before the fingerprint column, handed back
+            # because it still describes today's set. Stamp it, so the
+            # next tick does not pay two S3 calls to learn the same
+            # thing, and does not count a run it did not start.
+            ExternalJob.objects.filter(pk__in=blank).update(
+                source_fingerprint=scan.source_fingerprint
+            )
+            logger.info(
+                "Adopted OCR run %s of scan %s (%d row(s) from before the "
+                "fingerprint column)",
+                rows[0].run,
+                scan.pk,
+                len(blank),
+            )
+            continue
+        logger.info(
+            "Started OCR run %s for scan %s over %d shard(s) (%d carried)",
+            rows[0].run,
+            scan.pk,
+            len(rows),
+            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
+        )
+        started += 1
+    return started
 
 
 def shards_with_holes(rows: list[ExternalJob]) -> list[ExternalJob]:
@@ -1024,4 +1138,39 @@ def reopen_apply(scan, dry_run: bool = False) -> bool:
         return False
     if not dry_run:
         _write_apply_state(rows, {})
+    return True
+
+
+def reopen_apply_after_read(scan, engine: str) -> bool:
+    """Read the page numbers again once another engine's volume is glued.
+
+    The hand-back of #351, called by the Mistral and the Surya volume
+    glues after they consume a run. The apply fills the pages dots.mocr
+    left blank from those documents (``page_numbers.fallback_documents``),
+    but it ran when the dots.mocr run was glued, and a person starts
+    the other engines later than that. So a volume in review 1 is
+    handed back to the pass, which reads the stored documents again on
+    the next tick: no GPU time, no new run, and the numbers a curator
+    typed survive (:func:`reopen_apply`).
+
+    A volume outside ``APPLY_STATUSES`` is left alone: its review 1 is
+    over, and nothing may rewrite the numbers a person approved. A
+    volume whose dots.mocr run has not applied yet needs no hand-back,
+    because the apply that is still to come reads the new document.
+
+    :param scan: The scan whose other engine's run was just glued.
+    :param engine: That engine's name, for the log line.
+    :returns: Whether an applied run was handed back.
+    :rtype: bool
+    """
+    if scan.status not in APPLY_STATUSES:
+        return False
+    if not reopen_apply(scan):
+        return False
+    logger.info(
+        "scan %s: the %s volume is glued; the page numbers are read "
+        "again on the next tick",
+        scan.pk,
+        engine,
+    )
     return True

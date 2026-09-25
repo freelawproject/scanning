@@ -323,12 +323,36 @@ document.addEventListener('DOMContentLoaded', function () {
         var heading = range
             ? 'Pages ' + escapeHtml(range[0] + '\u2013' + range[1])
             : 'Page ' + missingLabel;
+        // A placeholder that stands for a request and not for a gap
+        // (#393): the sequence no longer shows a page missing here,
+        // but a reviewer asked a scanner for one, and the request
+        // keeps its note, its Dismiss button and its form until a
+        // person closes it. Say so, or the card reads as a gap.
+        var fromRequest = !!entry.from_request;
+        var request = fromRequest ? findRepair('insert', entry.anchor_pdf_page) : null;
+        var answered = !!(request && request.fulfilled);
+        var found = range
+            ? 'These pages were not found in the document.'
+            : 'This page was not found in the document.';
+        var state = 'MISSING';
+        if (answered) {
+            // An upload answered the request, and the image or the
+            // rescan stands beside this card. The row is open until
+            // the reviewer judges the new page.
+            state = 'REQUESTED, ANSWERED';
+            found = 'A scanner answered this request. Check the new page, ' +
+                'then dismiss the request or ask again.';
+        } else if (fromRequest) {
+            state = 'REQUESTED';
+            found = 'The page sequence shows no gap here now, but a scanner was asked for ' +
+                (range ? 'these pages' : 'this page') + ' after PDF p.' +
+                escapeHtml(entry.anchor_pdf_page) +
+                '. If the request is answered or no longer applies, dismiss it.';
+        }
         pageDiv.innerHTML =
-            '<div class="page-label">' + heading + ' &mdash; MISSING</div>' +
+            '<div class="page-label">' + heading + ' &mdash; ' + state + '</div>' +
             '<div class="missing-placeholder">' +
-            '  <p>' + (range
-                ? 'These pages were not found in the document.'
-                : 'This page was not found in the document.') + '</p>' +
+            '  <p>' + found + '</p>' +
             (pageEditsLocked
                 ? '  <p title="' + lockedTitle + '">The page review is approved, so no page can be added here.</p>'
                 : '  <p>' + (range
@@ -352,7 +376,8 @@ document.addEventListener('DOMContentLoaded', function () {
         container.appendChild(pageDiv);
         pageDiv.dataset.anchorPdfPage = entry.anchor_pdf_page;
         if (range) { pageDiv.dataset.missingRange = '1'; }
-        drawRepairNote(pageDiv, findRepair('insert', entry.anchor_pdf_page));
+        if (fromRequest) { pageDiv.dataset.fromRequest = '1'; }
+        drawRepairNote(pageDiv, request || findRepair('insert', entry.anchor_pdf_page));
 
         var fileInput = pageDiv.querySelector('input[type="file"]');
         if (!fileInput) { return; }
@@ -908,6 +933,9 @@ document.addEventListener('DOMContentLoaded', function () {
             }
             dropRepair(requestId);
             drawRepairNote(pageDiv, null);
+            // A placeholder that stood for this request alone (#393)
+            // has nothing left to show; a real gap keeps its card.
+            if (pageDiv && pageDiv.dataset.fromRequest) { pageDiv.remove(); }
             renderRepairsSection();
             showToast('Dismissed.', 'success');
         })
@@ -933,10 +961,21 @@ document.addEventListener('DOMContentLoaded', function () {
             var note = document.createElement('span');
             note.className = 'repair-note' + (row.fulfilled ? ' fulfilled' : '');
             var pages = pageDiv.dataset.missingRange ? 'these pages' : 'this page';
-            var text = row.fulfilled
-                ? 'A scanner was asked for ' + pages + ', and a new scan is saved. '
-                : (row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
-                                           : 'A scanner was asked to scan this page again. ');
+            // A missing-page request answered by a replacement beside
+            // its gap (#393) is the one case the reviewer must check:
+            // the new page should be the page asked for, and not a
+            // leaf put over its neighbour. The server says which shape
+            // answered (``fulfilled_by``); the browser derives nothing.
+            var text;
+            if (row.fulfilled && row.action === 'insert' && row.fulfilled_by === 'replace') {
+                text = 'A scanner was asked for ' + pages + ', and a page beside this gap ' +
+                    'was scanned again. Check that the new page is the one asked for. ';
+            } else if (row.fulfilled) {
+                text = 'A scanner was asked for ' + pages + ', and a new scan is saved. ';
+            } else {
+                text = row.action === 'insert' ? 'A scanner was asked for ' + pages + '. '
+                                               : 'A scanner was asked to scan this page again. ';
+            }
             // A fulfilled request keeps its Dismiss: the row is still
             // open and holds the address, so a reviewer who finds the
             // new scan bad too dismisses it and asks again.

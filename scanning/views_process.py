@@ -248,6 +248,33 @@ NO_DETECTIONS_MESSAGE = (
     "finishes. If nothing shows after a few minutes, ask a staff "
     "member."
 )
+# What the step-1 bar says about a parked new-pipeline volume with no
+# OCR run at all (#327), in the spot the run's state takes once it
+# exists. Three texts, because the daemon's sweep starts the run when
+# the stage is configured and the shard set still describes the
+# original, and never otherwise, so the bar must not promise a run
+# that is not coming.
+OCR_NOT_STARTED_MESSAGE = (
+    "OCR missing: this volume has no OCR run yet. The server starts one "
+    "by itself within a few seconds."
+)
+OCR_UNAVAILABLE_MESSAGE = (
+    "OCR missing: OCR is not configured on this server, so the page "
+    "review cannot start. Ask a staff member."
+)
+OCR_REFUSED_MESSAGE = (
+    "OCR missing: the server cannot start the read of this volume. "
+    "{reason} Ask a staff member."
+)
+#: The reason of a volume with no ``source_fingerprint``: the sweep
+#: names a shard set by it, so a blank one is skipped for good, and
+#: only the pipeline (through an admin re-queue) stamps one.
+OCR_NO_FINGERPRINT_REASON = (
+    "This volume was sharded before the pipeline stamped fingerprints, "
+    "so the server cannot tell which shard set to read. Re-queue it so "
+    "the pipeline stamps one."
+)
+
 
 #: The step-2 warning when the run's printed pages could not be read
 #: (#269). The page renders with positional labels instead.
@@ -315,6 +342,44 @@ def run_is_glued(summary: dict | None) -> bool:
     if not summary:
         return False
     return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
+
+
+def ocr_missing(scan, summary: dict | None) -> str | None:
+    """Return the step-1 bar's line about a missing OCR run, if any (#327).
+
+    ``summary`` is ``dots_mocr.run_summary(scan)``: ``None`` when the
+    stage has never run for this scan. Only a volume the sweep would
+    look at (``yolo.SWEEP_STATUSES``) gets a line: a legacy volume holds
+    PENDING_REVIEW, a queued one is the pipeline's, and an errored one
+    has its own banner. Which line depends on whether this environment
+    can start the read (``services.analyze_stage_open``) and, when it
+    can, on whether the sweep would take this volume. The sweep names a
+    shard set by ``Scan.source_fingerprint`` and skips a blank one for
+    good, so that volume is told to ask for the admin re-queue, the
+    one path that stamps it. Otherwise it asks
+    ``sharding.committed_manifest`` before it creates a run, and a
+    refused set (a re-uploaded or missing original) is left alone until
+    an admin re-queue re-cuts it. The sweep's memo of that refusal lives
+    in the daemon process, so the bar asks the same question itself, one
+    HEAD and one manifest read, for the rare parked volume with no run.
+
+    :param scan: The scan the bar is for.
+    :param summary: The run summary, or ``None``.
+    :returns: The message, or ``None`` when nothing is missing.
+    :rtype: str | None
+    """
+    from scanning import services, sharding
+
+    if summary is not None or scan.status not in yolo.SWEEP_STATUSES:
+        return None
+    if not services.analyze_stage_open():
+        return OCR_UNAVAILABLE_MESSAGE
+    if not scan.source_fingerprint:
+        return OCR_REFUSED_MESSAGE.format(reason=OCR_NO_FINGERPRINT_REASON)
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        return OCR_REFUSED_MESSAGE.format(reason=reason)
+    return OCR_NOT_STARTED_MESSAGE
 
 
 def engine_label(name: str) -> str:
@@ -437,6 +502,27 @@ def detection_message(summary: dict | None) -> str:
         "Detection finished. The redactions are computed within a "
         "minute of the page completeness approval."
     )
+
+
+def _prints(reading: str | None, entry: dict) -> bool:
+    """Return whether a page map entry's number is the one its page prints.
+
+    ``build_issues`` gives a page the number it reads, and a page that
+    reads none, a range or a number outside the volume its PDF page, a
+    display value (#403). The two agree only on a page that prints its
+    ``logical_number``.
+
+    :param reading: The page's ``detected`` value, for a single number.
+    :param entry: A ``pdf_page`` entry of the page map.
+    :returns: Whether the entry's ``logical_number`` is a printed number.
+    :rtype: bool
+    """
+    if reading is None or "range_label" in entry:
+        return False
+    try:
+        return int(reading) == entry["logical_number"]
+    except (TypeError, ValueError):
+        return False
 
 
 @login_required
@@ -588,21 +674,37 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # remaining placeholder is stamped with the physical page it
         # follows, so an upload can send that address back (#214).
         page_map = page_edits.project_inserts(scan, scan.page_map)
+        # Every open missing-page request keeps a placeholder, whether
+        # or not the sequence still shows its gap (#393): the note, the
+        # Dismiss button and the insert form live on it.
+        page_map = repairs.project_requests(page_map, repair_requests)
         missing_pages = scan.missing_pages
 
         # The pages a curator replaced (#232). The viewer draws a note on
         # each one, with a link that opens the file the curator uploaded.
         replaced_pages = page_edits.replacements_by_page(scan)
 
-        # Map pdf_index → logical page number for navigation
+        # Map pdf_index → logical page number for navigation. A card
+        # names a printed number, so only a page that prints it resolves
+        # the card: an unnumbered page, a range page and an out-of-range
+        # reading carry their PDF page as ``logical_number``, a display
+        # value (#403), and a card of printed page 12 went to PDF page
+        # 12 of the front matter too. The page map was built from the
+        # stored readings, the curator's numbers included.
+        printed = {
+            r["pdf_page"] - 1: r.get("detected")
+            for r in scan.ocr_results or []
+            if r.get("type") == "single" and r.get("detected")
+        }
         idx_to_logical = {}
         logical_to_indices: dict[int, list[int]] = {}
         for entry in page_map:
             if entry.get("type") == "pdf_page":
                 idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
-                logical_to_indices.setdefault(
-                    entry["logical_number"], []
-                ).append(entry["pdf_index"])
+                if _prints(printed.get(entry["pdf_index"]), entry):
+                    logical_to_indices.setdefault(
+                        entry["logical_number"], []
+                    ).append(entry["pdf_index"])
 
         # PDF page indices the page_map flags as duplicates (a detected page
         # number that already appeared on an earlier page). The PDF viewer marks
@@ -623,6 +725,18 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # from the real pages (issue #90), so they must be resolved through the
         # page_map rather than matched directly. The set is shared with the
         # dismissal, which keeps its address in the same two spaces (#214).
+        # A missing page's card goes to the page its placeholder follows,
+        # with the placeholder right below it. That page is not at fault,
+        # so it gets no red border, as with the trailing range below. An
+        # upload into the gap takes the placeholder's entry and keeps
+        # its anchor (``page_edits._inserted_entry``), and the card
+        # stands until a recheck, so the inserted entry answers too.
+        gap_anchors = {
+            e["logical_number"]: e["anchor_pdf_page"]
+            for e in page_map
+            if e.get("type") in ("missing", "inserted")
+            and "anchor_pdf_page" in e
+        }
         flagged_indices: set[int] = set()
         for i in issues:
             # Resolve each issue to PDF page indices (unique physical positions),
@@ -631,6 +745,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             # has no page (or points at a missing page absent from the page_map).
             i.nav_pdf_index = None
             if i.page_number is None:
+                continue
+            if (
+                i.check_name == CheckName.MISSING_PAGE
+                and i.page_number in gap_anchors
+            ):
+                i.nav_pdf_index = max(gap_anchors[i.page_number] - 1, 0)
                 continue
             if i.check_name in PHYSICAL_PAGE_CHECKS:
                 indices = [i.page_number - 1]
@@ -641,8 +761,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 i.nav_pdf_index = indices[0]
 
         # The card of a range missing at the end names the placeholder
-        # ("ask a scanner for them at the placeholder at the end of the
-        # volume", #256), so the card must reach it. Its own address is a
+        # ("ask a scanner for them at the placeholder after the last
+        # numbered page", #256), so the card must reach it. Its own address is a
         # printed number the volume does not show, which resolves to no
         # page above, and the placeholder carries the range as its label,
         # so neither of ``goToPage``'s lookups finds it. The physical
@@ -863,6 +983,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
+            "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
             "surya_run": surya_run,
@@ -2768,6 +2889,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
     flags = _review_flags(scan)
     context = {
@@ -2777,7 +2899,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "issues": scan.issues.exclude(check_name__in=REVIEW2_CHECKS),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        "dots_run": dots_mocr.run_summary(scan),
+        "dots_run": dots_run,
+        "ocr_missing": ocr_missing(scan, dots_run),
         "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
         "surya_run": surya.run_summary(scan),

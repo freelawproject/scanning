@@ -1236,13 +1236,47 @@ a.doc-name:hover { text-decoration: underline; }
     border-color: rgba(107, 114, 128, 0.7);
     background: rgba(107, 114, 128, 0.06);
 }
+/* The section of a box (#399). The colour is the agreement, so the */
+/* section takes the border style, and the zone band shows the rule. */
+.ensemble-box[data-section="footnotes"] {
+    border-style: double;
+    border-width: 3px;
+}
+/* After the section rule, which has the same weight: the zone band */
+/* shows the section of a weak box, and nothing else shows the doubt. */
 .ensemble-box.weak {
     border-style: dashed;
+    border-width: 1px;
+}
+.ensemble-zone {
+    position: absolute;
+    pointer-events: none;
+    box-sizing: border-box;
+    border-top: 1px dashed rgba(8, 145, 178, 0.8);
+    background: rgba(8, 145, 178, 0.07);
+}
+/* The blockquote zone (#411): a band on the left edge, in the colour */
+/* the detection drawer gives BLOCKQUOTE, and a box in the quote. */
+.ensemble-zone.ensemble-quote-zone {
+    border-top: none;
+    border-left: 2px dashed rgba(146, 64, 14, 0.8);
+    background: rgba(146, 64, 14, 0.06);
+}
+.ensemble-box[data-blockquote="true"] {
+    border-left-width: 4px;
+}
+.ensemble-box.ensemble-doubt {
+    outline: 1px dashed #b45309;
+    outline-offset: 2px;
 }
 .ensemble-box.ensemble-selected {
     border-color: #dc2626;
     border-width: 2px;
     background: rgba(220, 38, 38, 0.12);
+}
+/* A double border under 3px draws as one solid line. */
+.ensemble-box[data-section="footnotes"].ensemble-selected {
+    border-width: 3px;
 }
 
 .opinion-text-page {
@@ -1272,6 +1306,29 @@ a.doc-name:hover { text-decoration: underline; }
     white-space: pre-wrap;
     cursor: default;
 }
+/* The kind of a group and the marks of its text (#404). */
+h3.ensemble-group {
+    font-size: 14px;
+    font-weight: 600;
+}
+li.ensemble-group {
+    display: list-item;
+    list-style: none;
+    margin-left: 1.2em;
+}
+.ensemble-group sup {
+    line-height: 0;
+    font-size: 0.75em;
+}
+.ensemble-table {
+    border-collapse: collapse;
+    margin: 2px 0;
+}
+.ensemble-table td {
+    border: 1px solid #d1d5db;
+    padding: 1px 6px;
+    vertical-align: top;
+}
 .ensemble-group[data-agreement="majority"],
 .ensemble-group[data-agreement="voted"] {
     border-left-color: rgba(217, 119, 6, 0.75);
@@ -1282,6 +1339,34 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-group.ensemble-selected {
     background: rgba(220, 38, 38, 0.10);
     border-left-color: #dc2626;
+}
+.ensemble-group.ensemble-doubt:not(.ensemble-selected) {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-blockquote {
+    margin: 0 0 10px 12px;
+    padding-left: 8px;
+    border-left: 3px solid rgba(146, 64, 14, 0.5);
+}
+.ensemble-blockquote.ensemble-quote-list {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-footnotes {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px dashed rgba(8, 145, 178, 0.6);
+}
+.ensemble-footnotes .ensemble-group {
+    font-size: 12px;
+}
+.ensemble-footnotes-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #0e7490;
+    margin-bottom: 6px;
 }
 .ensemble-low {
     background: rgba(217, 119, 6, 0.25);

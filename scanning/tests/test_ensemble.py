@@ -22,6 +22,7 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -41,12 +42,17 @@ from scanning.models import (
     PageEdit,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_opinion_ocr import (
     BODY_A,
     BODY_B,
+    IMG_H,
+    IMG_W,
     OpinionOcrTestCase,
     block,
+    footnote_band,
     mistral_document,
+    to_pt,
 )
 from scanning.tests.test_views import ScanningTestCase
 
@@ -66,18 +72,40 @@ def unit(
     text: str,
     exclusion=None,
     share: float = 0.0,
-    kind: str = "Text",
+    label: str = "Text",
+    marks=(),
+    kind: str = "paragraph",
+    table=None,
 ) -> dict:
-    """One engine's unit of a page, in the shape the alignment reads."""
+    """One engine's unit of a page, in the shape the alignment reads.
+
+    ``label`` is the engine's own label of the unit (``Text``,
+    ``Footnote``); ``kind`` and ``marks`` are the parse of #404.
+    """
     return {
         "engine": engine,
         "id": index,
         "box_pt": [float(v) for v in box],
         "text": text,
-        "type": kind,
+        "type": label,
         "exclusion": exclusion,
         "share": share,
+        "marks": [dict(mark) for mark in marks],
+        "kind": kind,
+        "table": table,
     }
+
+
+def em(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "em"}
+
+
+def strong(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "strong"}
+
+
+def sup(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "sup"}
 
 
 def group_of(*units) -> dict:
@@ -89,6 +117,9 @@ def group_of(*units) -> dict:
             "types": [member["type"]],
             "box_pt": member["box_pt"],
             "text": member["text"],
+            "marks": list(member.get("marks") or []),
+            "kind": member.get("kind") or "paragraph",
+            "table": member.get("table"),
             "excluded": False,
             "reason": "",
             "partial": False,
@@ -156,7 +187,7 @@ class TestTheAlignment(TestCase):
         still reported: one engine read nothing where the other read
         the text."""
         units = [
-            unit("dots_mocr", 0, (40, 100, 570, 620), "", kind="Picture"),
+            unit("dots_mocr", 0, (40, 100, 570, 620), "", label="Picture"),
             unit("mistral_ocr", 0, (50, 110, 290, 300), "left one"),
             unit("mistral_ocr", 1, (50, 320, 290, 600), "left two"),
             unit("mistral_ocr", 2, (330, 110, 560, 300), "right one"),
@@ -194,7 +225,7 @@ class TestTheAlignment(TestCase):
 
     def test_a_box_that_reads_nothing_and_covers_nothing_is_dropped(self):
         units = [
-            unit("dots_mocr", 0, (0, 0, 100, 60), "", kind="Picture"),
+            unit("dots_mocr", 0, (0, 0, 100, 60), "", label="Picture"),
             unit("mistral_ocr", 0, (300, 400, 560, 600), "alpha"),
         ]
 
@@ -268,18 +299,16 @@ class TestTheAlignment(TestCase):
             "left one left two right one right two",
         )
 
-    def test_an_image_placeholder_links_nothing(self):
-        """Mistral writes a picture box as an image placeholder, so a
-        box that reads nothing is not an empty string."""
+    def test_a_picture_box_links_nothing(self):
+        """Mistral writes a picture box as an image placeholder, and
+        the parse of the OCR glue leaves it an empty text (#404)."""
         cells = [
             unit("dots_mocr", 0, (50, 100, 290, 300), "left one"),
             unit("dots_mocr", 1, (50, 320, 290, 700), "left two"),
             unit("dots_mocr", 2, (320, 100, 560, 300), "right one"),
             unit("dots_mocr", 3, (320, 320, 560, 700), "right two"),
         ]
-        picture = unit(
-            "mistral_ocr", 4, (50, 100, 560, 700), "![img-0.jpeg](img-0.jpeg)"
-        )
+        picture = unit("mistral_ocr", 4, (50, 100, 560, 700), "")
 
         groups = ensemble.align_page([*cells, picture], WIDTH, HEIGHT)
 
@@ -290,9 +319,10 @@ class TestTheAlignment(TestCase):
             ensemble.resolve(silent[0])["silent"], ["mistral_ocr"]
         )
 
-    def test_a_line_break_tag_links_nothing(self):
+    def test_a_unit_of_whitespace_links_nothing(self):
+        """A break is a line break after the parse, and nothing else."""
         cells = [unit("dots_mocr", 0, (50, 100, 290, 300), "left one")]
-        tag = unit("mistral_ocr", 1, (50, 100, 560, 700), "<br>")
+        tag = unit("mistral_ocr", 1, (50, 100, 560, 700), " \n ")
 
         groups = ensemble.align_page([*cells, tag], WIDTH, HEIGHT)
 
@@ -643,6 +673,88 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(disputed, 1)
 
+    def test_a_join_of_two_words_never_deletes_the_second(self):
+        """#391: two engines read the pilcrow and the number as one
+        word, and the base read them as two. The span is recorded at
+        the first position, so the second holds no reading of theirs.
+        That is not a vote to drop the word, and it deleted a citation
+        number of a real opinion."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("La.), \u00b6 235-236. No one"),
+            [
+                ensemble._pairs("La.), \u00b6\u00b6235\u2013236. No one"),
+                ensemble._pairs("La.), \u00b61235-236. No one"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "La.), \u00b6 235-236. No one",
+        )
+        marked = [t["text"] for t in tokens if t.get("low_confidence")]
+        self.assertEqual(marked, ["\u00b6", "235-236."])
+        self.assertEqual(disputed, 2)
+
+    def test_a_join_two_engines_agree_on_writes_the_tail_once(self):
+        """The other side of #391: both engines joined the two base
+        words the same way, and their reading won at the head. It
+        holds the tail already, so the base's own tail word must not
+        go in after it."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("the wordone wordtwo end"),
+            [
+                ensemble._pairs("the wordonewordtwo end"),
+                ensemble._pairs("the wordonewordtwo end"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "the wordonewordtwo end",
+        )
+
+    def test_a_join_one_engine_alone_makes_leaves_the_split(self):
+        """One engine cannot carry the head, so the base's two words
+        both stand."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("the wordone wordtwo end"),
+            [
+                ensemble._pairs("the wordonewordtwo end"),
+                ensemble._pairs("the wordone wordtwo end"),
+            ],
+        )
+
+        self.assertEqual(
+            " ".join(token["text"] for token in tokens),
+            "the wordone wordtwo end",
+        )
+
+    def test_an_engine_that_abstains_confirms_nothing(self):
+        """A word the other engines did not answer for is not a word
+        every engine read, so it carries the majority flag (#380)."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("alpha beta gamma delta"),
+            [
+                ensemble._pairs("alpha betagamma delta"),
+                ensemble._pairs("alpha beta gamma delta"),
+            ],
+        )
+
+        by_word = {token["text"]: token for token in tokens}
+        self.assertEqual(by_word["gamma"].get("majority"), True)
+
+    def test_an_engine_that_read_nothing_still_votes_to_drop(self):
+        """A deletion is a reading, and a majority of them drops the
+        word. #391 changed the join alone."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("alpha beta gamma"),
+            [ensemble._pairs("alpha gamma"), ensemble._pairs("alpha gamma")],
+        )
+
+        self.assertEqual(
+            [token["text"] for token in tokens], ["alpha", "gamma"]
+        )
+
     def test_a_word_only_a_minority_read_is_dropped(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("alpha gamma"),
@@ -775,12 +887,26 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertEqual(page["text"], "878 N. C.\n\nbody A 2\n\nbody B 2")
+        self.assertEqual(page["text"], "body A 2\n\nbody B 2")
         self.assertEqual(
             [group["agreement"] for group in page["groups"]],
-            [ensemble.UNANIMOUS] * 3,
+            [ensemble.UNANIMOUS] * 2,
         )
-        self.assertEqual([g["band"] for g in page["groups"]][0], "head")
+        self.assertEqual([g["band"] for g in page["groups"]], ["body", "body"])
+
+    def test_the_page_number_is_left_out(self):
+        """The running head carries the approved number of the page,
+        and the glue marks it in every engine (#396). The group goes
+        whole, with no partial: every engine read the head alike."""
+        document = self.run_ensemble()
+
+        page = document["pages"][1]
+        self.assertEqual(len(page["dropped"]), 1)
+        drop = page["dropped"][0]
+        self.assertEqual(drop["reason"], opinion_ocr.PAGE_NUMBER)
+        self.assertFalse(drop["partial"])
+        self.assertEqual(sorted(drop["engines"]), ["dots_mocr", "mistral_ocr"])
+        self.assertEqual(page["counts"]["partial"], 0)
 
     def test_the_text_of_the_opinion_before_is_left_out(self):
         """The first page is shared, and the running head above the
@@ -807,10 +933,12 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertEqual(page["text"], "878 N. C.\n\nbody B 2")
-        self.assertEqual(len(page["dropped"]), 1)
-        self.assertEqual(page["dropped"][0]["reason"], "redaction")
-        self.assertEqual(page["counts"]["dropped"], 1)
+        self.assertEqual(page["text"], "body B 2")
+        self.assertEqual(
+            sorted(d["reason"] for d in page["dropped"]),
+            [opinion_ocr.PAGE_NUMBER, "redaction"],
+        )
+        self.assertEqual(page["counts"]["dropped"], 2)
 
     def test_a_part_of_a_block_under_a_box_is_a_partial_drop(self):
         self.redact(2, [36.0, 108.0, 288.0, 200.0])
@@ -818,8 +946,14 @@ class TestTheDocument(EnsembleTestCase):
         document = self.run_ensemble()
 
         page = document["pages"][1]
-        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertTrue(self.redaction_drop(page)["partial"])
         self.assertEqual(page["counts"]["partial"], 1)
+
+    @staticmethod
+    def redaction_drop(page: dict) -> dict:
+        """The one drop of a page a redaction made; the page number
+        makes the other (#396)."""
+        return next(d for d in page["dropped"] if d["reason"] == "redaction")
 
     def test_a_box_over_one_cell_of_a_block_is_a_partial_drop(self):
         """The daily shape of it: one engine reads the body as one
@@ -833,7 +967,7 @@ class TestTheDocument(EnsembleTestCase):
 
         page = built["pages"][1]
         self.assertNotIn("body", page["text"])
-        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertTrue(self.redaction_drop(page)["partial"])
         self.assertEqual(page["counts"]["partial"], 1)
 
     def test_a_block_only_one_engine_saw_is_a_disagreement(self):
@@ -944,7 +1078,9 @@ class TestTheDocument(EnsembleTestCase):
         self.assertEqual(document["opinion"]["first_printed_page"], 502)
         self.assertEqual(document["apply_run"], "a1")
         self.assertEqual(len(document["pages"]), 3)
-        self.assertEqual(document["counts"]["groups"], 8)
+        # Two body groups a page: every header is out, the first as
+        # the opinion before and the others as the page number.
+        self.assertEqual(document["counts"]["groups"], 6)
 
     def test_the_document_lands_beside_the_engine_files(self):
         self.run_ensemble()
@@ -987,7 +1123,7 @@ class TestTheRows(EnsembleTestCase):
         self.assertIsNone(rows[0].source_edit_id)
         self.assertEqual(rows[0].apply_run_id, self.apply_run.pk)
         self.assertTrue(rows[0].text.startswith("body A 1"))
-        self.assertTrue(rows[1].text.startswith("878 N. C."))
+        self.assertTrue(rows[1].text.startswith("body A 2"))
 
     def test_the_text_is_a_cache_and_the_human_text_is_not(self):
         self.run_ensemble()
@@ -1071,6 +1207,7 @@ class TestTheRows(EnsembleTestCase):
                 {
                     "start": 0,
                     "end": 10,
+                    "section": ensemble.BODY,
                     "agreement": ensemble.VOTED,
                     "variants": {
                         "dots_mocr": "alpha beta",
@@ -1212,6 +1349,27 @@ class TestTheFindings(EnsembleTestCase):
         )
         self.assertIn("The mask of the opinion before", card.message)
         self.assertNotIn("redaction covers", card.message)
+
+    def test_the_partial_card_names_the_page_number(self):
+        """One engine glued the head to the first paragraph, and the
+        group went whole (#396). The card must not call that a
+        redaction."""
+        page = page_of(partial=1)
+        page["dropped"] = [
+            {
+                "engines": {},
+                "box_pt": None,
+                "reason": opinion_ocr.PAGE_NUMBER,
+                "partial": True,
+            }
+        ]
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.PARTIAL_REDACTION
+        )
+        self.assertIn("The page number covers part of", card.message)
 
     def test_a_standing_dismissal_mutes_the_new_card(self):
         dismissal = OpinionFindingDismissal.objects.create(
@@ -1534,7 +1692,7 @@ class TestTheButton(EnsembleTestCase, ScanningTestCase):
         body = response.json()
         self.assertEqual(body["status"], "ok")
         self.assertIn("dots_mocr, mistral_ocr", body["message"])
-        self.assertIn("8 block(s)", body["message"])
+        self.assertIn("6 block(s)", body["message"])
         self.opinion.refresh_from_db()
         self.assertTrue(ensemble.is_written(self.opinion))
 
@@ -1864,3 +2022,1340 @@ class TestTheCommand(EnsembleTestCase):
     def test_an_unknown_scan_is_an_error(self):
         with self.assertRaises(CommandError):
             self.run_command(99999)
+
+
+# ── the section (#399) ───────────────────────────────────────────────
+#: The left and the right column of a test page, and a footnote band
+#: across both, in points.
+LEFT_X = (50, 300)
+RIGHT_X = (350, 580)
+FOOT_ZONE = [40.0, 590.0, 580.0, 710.0]
+
+
+def read_units(*specs) -> list[dict]:
+    """Units of two engines that read the same boxes alike.
+
+    Each spec is ``(box, text)`` or ``(box, text, kinds)``, with
+    ``kinds`` the ``(dots category, mistral type)`` pair.
+    """
+    units = []
+    for index, spec in enumerate(specs):
+        box, text = spec[0], spec[1]
+        kinds = spec[2] if len(spec) > 2 else ("Text", "text")
+        units.append(unit("dots_mocr", index, box, text, label=kinds[0]))
+        units.append(unit("mistral_ocr", index, box, text, label=kinds[1]))
+    return units
+
+
+def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
+    """One engine's page of an opinion document, for ``build_page``.
+
+    ``zones`` are the footnote zones and ``quotes`` the blockquote
+    zones, in points.
+    """
+    return {
+        "page_in_opinion": 0,
+        "page_index": 1,
+        "pdf_page": 2,
+        "source": {"kind": "original", "pdf_page": 2},
+        "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
+        "zones": {"footnotes": list(zones), "blockquotes": list(quotes)},
+        "units": [
+            {
+                "id": u["id"],
+                "type": u["type"],
+                "text": u["text"],
+                "box_pt": u["box_pt"],
+                "exclusion": u["exclusion"],
+                "share": u["share"],
+                "marks": list(u.get("marks") or []),
+                "kind": u.get("kind") or "paragraph",
+                "table": u.get("table"),
+            }
+            for u in units_of_engine
+        ],
+    }
+
+
+def build(units, zones=(), quotes=()) -> dict:
+    """The ensemble of one page read by the two engines of ``units``."""
+    pages = {
+        engine: engine_page(
+            [u for u in units if u["engine"] == engine], zones, quotes
+        )
+        for engine in ("dots_mocr", "mistral_ocr")
+    }
+    return ensemble.build_page(pages, 0)
+
+
+class TestTheSection(TestCase):
+    """``ensemble.section``: the zone decides, the labels doubt."""
+
+    def group(self, *units) -> dict:
+        groups = ensemble.align_page(list(units), WIDTH, HEIGHT)
+        self.assertEqual(len(groups), 1)
+        return groups[0]
+
+    def test_a_group_under_the_zone_is_a_footnote(self):
+        group = self.group(*read_units(((50, 600, 300, 700), "1. note")))
+
+        self.assertEqual(
+            ensemble.section(group, [FOOT_ZONE]), (ensemble.FOOTNOTES, False)
+        )
+
+    def test_a_group_outside_the_zone_is_body_text(self):
+        group = self.group(*read_units(((50, 100, 300, 200), "the body")))
+
+        self.assertEqual(
+            ensemble.section(group, [FOOT_ZONE]), (ensemble.BODY, False)
+        )
+
+    def test_a_group_half_under_the_zone_is_judged_by_its_share(self):
+        group = self.group(*read_units(((50, 500, 300, 700), "astride")))
+
+        half = [40.0, 600.0, 580.0, 710.0]
+        less = [40.0, 620.0, 580.0, 710.0]
+        self.assertEqual(
+            ensemble.section(group, [half])[0], ensemble.FOOTNOTES
+        )
+        self.assertEqual(ensemble.section(group, [less])[0], ensemble.BODY)
+
+    def test_a_page_scale_group_over_a_small_zone_stays_body_text(self):
+        """The share is of the group's own box, never of the zone."""
+        group = self.group(
+            *read_units(((20, 20, WIDTH - 20, HEIGHT - 20), "the whole page"))
+        )
+
+        self.assertEqual(
+            ensemble.section(group, [FOOT_ZONE]), (ensemble.BODY, False)
+        )
+
+    def test_the_share_is_the_maximum_over_the_zones(self):
+        group = self.group(*read_units(((50, 500, 300, 700), "astride")))
+        strips = [[40.0, 600.0, 580.0, 650.0], [40.0, 650.0, 580.0, 710.0]]
+
+        self.assertEqual(ensemble.section(group, strips)[0], ensemble.BODY)
+
+    def test_a_footnote_label_never_moves_a_group(self):
+        """Exact and rare (#399): a label outside every zone is a doubt
+        and no footnote, whatever every engine says."""
+        group = self.group(
+            *read_units(
+                ((50, 600, 300, 700), "1. note", ("Footnote", "references"))
+            )
+        )
+
+        self.assertEqual(ensemble.section(group, []), (ensemble.BODY, True))
+        self.assertEqual(
+            ensemble.section(group, [[40.0, 20.0, 580.0, 60.0]]),
+            (ensemble.BODY, True),
+        )
+
+    def test_a_body_label_under_the_zone_raises_no_doubt(self):
+        """Three zone pages in four carry no footnote label at all."""
+        group = self.group(*read_units(((50, 600, 300, 700), "1. note")))
+
+        self.assertEqual(
+            ensemble.section(group, [FOOT_ZONE]), (ensemble.FOOTNOTES, False)
+        )
+
+    def test_a_footnote_label_under_the_zone_raises_no_doubt(self):
+        group = self.group(
+            *read_units(
+                ((50, 600, 300, 700), "1. note", ("Footnote", "references"))
+            )
+        )
+
+        self.assertEqual(
+            ensemble.section(group, [FOOT_ZONE]), (ensemble.FOOTNOTES, False)
+        )
+
+    def test_one_engine_s_label_is_a_doubt(self):
+        group = self.group(
+            *read_units(((50, 600, 300, 700), "1. note", ("Footnote", "text")))
+        )
+
+        self.assertEqual(ensemble.section(group, []), (ensemble.BODY, True))
+        self.assertEqual(ensemble._footnote_labellers(group), ["dots_mocr"])
+
+    def test_a_silent_engine_s_label_counts_for_nothing(self):
+        group = self.group(
+            unit("dots_mocr", 0, (50, 600, 300, 700), "1. note"),
+            unit(
+                "mistral_ocr", 0, (50, 600, 300, 700), "", label="references"
+            ),
+        )
+
+        self.assertEqual(ensemble.section(group, []), (ensemble.BODY, False))
+
+    def test_a_merged_unit_of_mixed_labels_is_not_labelled(self):
+        """A footnote cell glued to a body cell says nothing."""
+        group = self.group(
+            unit(
+                "dots_mocr",
+                0,
+                (50, 600, 300, 650),
+                "1. note",
+                label="Footnote",
+            ),
+            unit("dots_mocr", 1, (50, 650, 300, 700), "more", label="Text"),
+            unit("mistral_ocr", 0, (50, 600, 300, 700), "1. note more"),
+        )
+
+        self.assertEqual(ensemble.section(group, []), (ensemble.BODY, False))
+
+    def test_every_engine_s_spelling_is_read(self):
+        for engine, spec in opinion_ocr.ENGINES.items():
+            for kind in spec.footnote_types:
+                group = self.group(
+                    unit(engine, 0, (50, 600, 300, 700), "1. note", label=kind)
+                )
+                self.assertEqual(
+                    ensemble.section(group, []),
+                    (ensemble.BODY, True),
+                    (engine, kind),
+                )
+
+    def test_an_unknown_engine_is_not_labelled(self):
+        group = self.group(
+            unit("other", 0, (50, 600, 300, 700), "1. note", label="Footnote")
+        )
+
+        self.assertEqual(ensemble.section(group, []), (ensemble.BODY, False))
+
+
+class TestTheTwoTexts(TestCase):
+    """``build_page`` over a hand-built page: the order and the offsets."""
+
+    #: Two columns of two paragraphs, and one footnote at the foot of
+    #: the left column, under the band.
+    TWO_COLUMNS = (
+        ((LEFT_X[0], 100, LEFT_X[1], 200), "left one"),
+        ((LEFT_X[0], 300, LEFT_X[1], 400), "left two"),
+        ((RIGHT_X[0], 100, RIGHT_X[1], 200), "right one"),
+        ((RIGHT_X[0], 300, RIGHT_X[1], 400), "right two"),
+    )
+    LEFT_NOTE = ((LEFT_X[0], 600, LEFT_X[1], 700), "1. left note")
+    RIGHT_NOTE = ((RIGHT_X[0], 600, RIGHT_X[1], 700), "2. right note")
+
+    def test_the_body_joins_across_a_footnote(self):
+        """The order of the whole page put the footnote between the
+        two columns (#317). The body is ordered without it."""
+        page = build(
+            read_units(*self.TWO_COLUMNS, self.LEFT_NOTE), zones=[FOOT_ZONE]
+        )
+
+        self.assertEqual(
+            page["text"], "left one\n\nleft two\n\nright one\n\nright two"
+        )
+        self.assertEqual(page["footnotes"], "1. left note")
+        self.assertEqual(
+            page["zones"], {"footnotes": [FOOT_ZONE], "blockquotes": []}
+        )
+
+    def test_without_a_zone_the_footnote_stays_in_the_body(self):
+        page = build(read_units(*self.TWO_COLUMNS, self.LEFT_NOTE))
+
+        self.assertEqual(
+            page["text"],
+            "left one\n\nleft two\n\n1. left note\n\nright one\n\nright two",
+        )
+        self.assertEqual(page["footnotes"], "")
+
+    def test_two_footnotes_read_left_then_right(self):
+        """The footnotes take the boundary of the whole page: two boxes
+        of their own could not find a gutter."""
+        page = build(
+            read_units(*self.TWO_COLUMNS, self.RIGHT_NOTE, self.LEFT_NOTE),
+            zones=[FOOT_ZONE],
+        )
+
+        self.assertEqual(page["footnotes"], "1. left note\n\n2. right note")
+        notes = [
+            g for g in page["groups"] if g["section"] == ensemble.FOOTNOTES
+        ]
+        self.assertEqual([g["column"] for g in notes], ["L", "R"])
+
+    def test_a_footnote_in_the_foot_band_keeps_its_column(self):
+        """A short last footnote sits in the foot band of ``place``,
+        which reads with no column (review of #401). The footnotes
+        split no band."""
+        low_zone = [40.0, 690.0, 580.0, 785.0]
+        right = ((RIGHT_X[0], 700, RIGHT_X[1], 780), "2. right note")
+        left = ((LEFT_X[0], 760, LEFT_X[1], 780), "1. left note")
+        page = build(
+            read_units(*self.TWO_COLUMNS, right, left), zones=[low_zone]
+        )
+
+        self.assertEqual(page["footnotes"], "1. left note\n\n2. right note")
+        notes = [
+            g for g in page["groups"] if g["section"] == ensemble.FOOTNOTES
+        ]
+        self.assertEqual([g["column"] for g in notes], ["L", "R"])
+        self.assertEqual({g["band"] for g in notes}, {ensemble.FOOTNOTES})
+
+    def test_every_group_names_its_section_and_its_own_offsets(self):
+        page = build(
+            read_units(*self.TWO_COLUMNS, self.RIGHT_NOTE, self.LEFT_NOTE),
+            zones=[FOOT_ZONE],
+        )
+
+        for group in page["groups"]:
+            text = page[group["section"]]
+            self.assertEqual(
+                text[group["start"] : group["end"]], group["text"]
+            )
+        notes = [
+            g for g in page["groups"] if g["section"] == ensemble.FOOTNOTES
+        ]
+        self.assertEqual(notes[0]["start"], 0)
+        self.assertEqual(page["counts"]["footnote_groups"], 2)
+        self.assertEqual(page["counts"]["footnote_doubt"], 0)
+
+    def test_a_labelled_footnote_outside_the_zone_is_counted(self):
+        note = (self.LEFT_NOTE[0], self.LEFT_NOTE[1], ("Footnote", "text"))
+        page = build(read_units(*self.TWO_COLUMNS, note))
+
+        group = next(g for g in page["groups"] if g["footnote_doubt"])
+        self.assertEqual(group["section"], ensemble.BODY)
+        self.assertEqual(group["footnote_by"], ["dots_mocr"])
+        self.assertEqual(page["counts"]["footnote_doubt"], 1)
+
+    def test_a_dropped_group_counts_no_doubt(self):
+        units = read_units(*self.TWO_COLUMNS)
+        excluded = {"reason": "redaction", "rect_type": "", "fill": ""}
+        for engine in ("dots_mocr", "mistral_ocr"):
+            units.append(
+                unit(
+                    engine,
+                    9,
+                    self.LEFT_NOTE[0],
+                    "1. note",
+                    exclusion=excluded,
+                    share=1.0,
+                    label="Footnote" if engine == "dots_mocr" else "footer",
+                )
+            )
+        page = build(units)
+
+        self.assertEqual(page["counts"]["footnote_doubt"], 0)
+        self.assertEqual(len(page["dropped"]), 1)
+
+    def test_the_zones_come_off_the_first_engine_page_that_has_them(self):
+        units = read_units(*self.TWO_COLUMNS, self.LEFT_NOTE)
+        pages = {
+            "dots_mocr": engine_page(
+                [u for u in units if u["engine"] == "dots_mocr"]
+            ),
+            "mistral_ocr": engine_page(
+                [u for u in units if u["engine"] == "mistral_ocr"], [FOOT_ZONE]
+            ),
+        }
+
+        page = ensemble.build_page(pages, 0)
+
+        self.assertEqual(page["footnotes"], "1. left note")
+
+
+class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
+    """The fixture of the glue with a footnote band over body B."""
+
+    #: The band over the second body cell of every page, so body A
+    #: stays in the text and body B goes to the footnotes.
+    BAND_B = (BODY_B[0], BODY_B[1] - 20, BODY_B[2] + 800, BODY_B[3] + 20)
+
+    def band(self, page_index):
+        footnote_band(self.scan, self.apply_run, page_index, self.BAND_B)
+
+    def test_the_footnotes_of_a_page_are_their_own_text(self):
+        self.band(2)
+
+        document = self.run_ensemble()
+
+        page = document["pages"][1]
+        # The header is the printed page number, excluded since #396.
+        self.assertEqual(page["text"], "body A 2")
+        self.assertEqual(page["footnotes"], "body B 2")
+        self.assertEqual(
+            page["zones"],
+            {"footnotes": [to_pt(self.BAND_B)], "blockquotes": []},
+        )
+        # The first page masks its header, above the caption.
+        self.assertEqual(document["pages"][0]["text"], "body A 1\n\nbody B 1")
+        self.assertEqual(document["pages"][0]["footnotes"], "")
+        self.assertEqual(document["counts"]["footnote_groups"], 1)
+
+    def test_the_row_carries_the_footnotes_apart(self):
+        self.band(2)
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(row.text, "body A 2")
+        self.assertEqual(row.footnotes, "body B 2")
+        other = OpinionText.objects.get(
+            opinion=self.opinion, page_in_opinion=0
+        )
+        self.assertEqual(other.footnotes, "")
+
+    def test_a_disagreement_in_the_footnotes_names_its_section(self):
+        self.band(2)
+        document = mistral_document()
+        for entry in document["pages"][2]["blocks"]:
+            if entry["content"] == "body B 2":
+                entry["content"] = "body B two"
+        self.objects[self.apply_run.extract_key] = document
+
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(len(row.disagreements), 1)
+        entry = row.disagreements[0]
+        self.assertEqual(entry["section"], ensemble.FOOTNOTES)
+        self.assertEqual(
+            row.footnotes[entry["start"] : entry["end"]], "body B 2"
+        )
+
+    def test_a_second_run_leaves_the_curator_s_text_alone(self):
+        self.band(2)
+        self.run_ensemble()
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        row.human_text = "typed"
+        row.save(update_fields=["human_text"])
+
+        self.run_ensemble()
+
+        row.refresh_from_db()
+        self.assertEqual(row.human_text, "typed")
+        self.assertEqual(row.footnotes, "body B 2")
+
+    def test_a_footnote_label_outside_the_zone_is_a_card(self):
+        document = mistral_document()
+        for entry in document["pages"][2]["blocks"]:
+            if entry["content"] == "body B 2":
+                entry["type"] = "references"
+        self.objects[self.apply_run.extract_key] = document
+
+        self.run_ensemble()
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.FOOTNOTE_UNSURE
+        )
+        self.assertEqual(card.page_in_opinion, 1)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("mistral_ocr read 1 block(s)", card.message)
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertIn("body B 2", row.text)
+
+    def test_a_body_label_under_the_zone_is_no_card(self):
+        self.band(2)
+
+        self.run_ensemble()
+
+        self.assertFalse(
+            OpinionFinding.objects.filter(
+                opinion=self.opinion, check_name=OpinionCheck.FOOTNOTE_UNSURE
+            ).exists()
+        )
+
+
+class TestTheFootnoteCard(TestTheFindings):
+    def test_a_doubt_is_its_own_card(self):
+        cards = self.rebuild(footnote_doubt=1)
+
+        self.assertEqual([c.check_name for c in cards], ["footnote_unsure"])
+        self.assertIn("An engine read 1 block(s)", cards[0].message)
+
+    def test_the_card_names_the_engines(self):
+        ensemble.rebuild_findings(
+            self.opinion,
+            document_of(
+                page_of(
+                    groups=[
+                        {
+                            "footnote_doubt": True,
+                            "footnote_by": ["mistral_ocr", "dots_mocr"],
+                        }
+                    ],
+                    footnote_doubt=1,
+                )
+            ),
+        )
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertIn("dots_mocr, mistral_ocr read 1 block(s)", card.message)
+
+    def test_a_standing_dismissal_mutes_the_card(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.FOOTNOTE_UNSURE,
+        )
+
+        cards = self.rebuild(footnote_doubt=1)
+
+        self.assertEqual(cards[0].dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own(self):
+        self.assertIn(OpinionCheck.FOOTNOTE_UNSURE, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheBracketToken(EnsembleTestCase):
+    """The bracket a box redacts never reaches the text (#373)."""
+
+    def test_the_text_of_the_page_holds_no_bracket(self):
+        for key, units, field in (
+            (self.apply_run.ocr_key, "cells", "text"),
+            (self.apply_run.extract_key, "blocks", "content"),
+        ):
+            self.objects[key]["pages"][2][units][1][field] = "[1] body A 2"
+        self.redact(
+            2, to_pt((105, 305, 140, 330)), rect_type="HEADNOTE_BRACKET"
+        )
+
+        document = self.run_ensemble()
+
+        self.assertEqual(document["pages"][1]["text"], "body A 2\n\nbody B 2")
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertNotIn("[1]", row.text)
+
+
+# ── the marks and the kind (#404) ────────────────────────────────────
+def three(*specs) -> dict:
+    """A group of up to three engines, each ``(text, marks, kind)``."""
+    names = ("dots_mocr", "mistral_ocr", "surya")
+    units = []
+    for index, spec in enumerate(specs):
+        text, marks = spec[0], spec[1] if len(spec) > 1 else ()
+        kind = spec[2] if len(spec) > 2 else "paragraph"
+        units.append(
+            unit(names[index], 0, BODY_A_PT, text, marks=marks, kind=kind)
+        )
+    return group_of(*units)
+
+
+class TestTheMarks(TestCase):
+    """The marks of a group are the union of its readings."""
+
+    def test_a_word_one_engine_marks_is_marked(self):
+        answer = ensemble.resolve(
+            three(
+                ("In Castleman, Justice", [em(3, 12)]),
+                ("In Castleman, Justice",),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        # The word carries the mark, comma included.
+        self.assertEqual(answer["marks"], [em(3, 13)])
+
+    def test_adjacent_marked_words_are_one_span(self):
+        answer = ensemble.resolve(
+            three(
+                ("see Lewis v. Marcotte, at 1", [em(4, 21)]),
+                ("see Lewis v. Marcotte, at 1",),
+            )
+        )
+
+        self.assertEqual(answer["marks"], [em(4, 22)])
+
+    def test_a_superscript_is_the_chars_and_not_the_word(self):
+        answer = ensemble.resolve(
+            three(('acts."1 The', [sup(6, 7)]), ('acts."1 The',))
+        )
+
+        self.assertEqual(answer["marks"], [sup(6, 7)])
+
+    def test_the_marks_of_every_engine_join(self):
+        answer = ensemble.resolve(
+            three(
+                ("Held: see Id. there", [strong(0, 5)]),
+                ("Held: see Id. there", [em(10, 13)]),
+            )
+        )
+
+        self.assertEqual(answer["marks"], [strong(0, 5), em(10, 13)])
+
+    def test_an_ellipsis_before_the_italic_moves_no_mark(self):
+        """Equal keys, different word counts: the alignment is by key."""
+        answer = ensemble.resolve(
+            three(
+                ("said . . . so Held", []), ("said ... so Held", [em(12, 16)])
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "said . . . so Held")
+        self.assertEqual(answer["marks"], [em(14, 18)])
+
+    def test_a_voted_group_keeps_the_marks_of_the_words_that_won(self):
+        answer = ensemble.resolve(
+            three(
+                ("the court held", [em(4, 9)]),
+                ("the court hold",),
+                ("the court helt",),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        self.assertEqual(answer["marks"], [em(4, 9)])
+
+    def test_a_word_the_source_did_not_read_carries_its_engine_s_mark(self):
+        answer = ensemble.resolve(
+            three(
+                ("the court", []),
+                ("the court held", [em(10, 14)]),
+                ("the court held", []),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["text"], "the court held")
+        self.assertEqual(answer["marks"], [em(10, 14)])
+
+    def test_a_silent_engine_marks_nothing(self):
+        answer = ensemble.resolve(three(("the court held", []), ("", [])))
+
+        self.assertEqual(answer["marks"], [])
+        self.assertEqual(answer["kind"], "paragraph")
+
+    def test_a_unit_of_the_glue_before_the_marks_reads_plain(self):
+        page = engine_page([unit("dots_mocr", 0, BODY_A_PT, "the text")])
+        for u in page["units"]:
+            del u["marks"], u["kind"], u["table"]
+        other = engine_page([unit("mistral_ocr", 0, BODY_A_PT, "the text")])
+
+        entry = ensemble.build_page(
+            {"dots_mocr": page, "mistral_ocr": other}, 0
+        )
+
+        group = entry["groups"][0]
+        self.assertEqual((group["kind"], group["marks"]), ("paragraph", []))
+        self.assertNotIn("table", group)
+
+    def test_the_marks_of_two_members_shift_by_the_join(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "left one",
+                    marks=[em(0, 4)],
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "left two",
+                    marks=[em(5, 8)],
+                ),
+                unit(
+                    "mistral_ocr", 0, (50, 600, 300, 700), "left one left two"
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(len(groups), 1)
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(merged["text"], "left one left two")
+        self.assertEqual(merged["marks"], [em(0, 4), em(14, 17)])
+        self.assertEqual(
+            ensemble.resolve(groups[0])["marks"], [em(0, 4), em(14, 17)]
+        )
+
+    def test_a_text_plain_shortens_keeps_its_words_and_loses_its_marks(self):
+        groups = ensemble.align_page(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "a  b", marks=[em(0, 1)]),
+                unit("mistral_ocr", 0, BODY_A_PT, "a b"),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual((merged["text"], merged["marks"]), ("a b", []))
+
+
+class TestTheKind(TestCase):
+    """The kind of a group is a majority, the rank breaking a tie."""
+
+    def test_the_majority_of_the_engines_names_the_kind(self):
+        answer = ensemble.resolve(
+            three(
+                ("FACTS", [], "heading"),
+                ("FACTS", [], "heading"),
+                ("FACTS", [], "paragraph"),
+            )
+        )
+
+        self.assertEqual(answer["kind"], "heading")
+
+    def test_a_tie_goes_to_the_first_engine(self):
+        answer = ensemble.resolve(
+            three(
+                ("Amanda JONES", [], "paragraph"),
+                ("Amanda JONES", [], "heading"),
+            )
+        )
+
+        # Mistral labels the caption ``title``; dots says text, and wins.
+        self.assertEqual(answer["kind"], "paragraph")
+
+    def test_a_silent_engine_has_no_say(self):
+        # Two paragraphs against one heading, were the silent engine
+        # counted; a tie the first engine breaks, since it is not.
+        answer = ensemble.resolve(
+            three(
+                ("FACTS", [], "heading"),
+                ("", [], "paragraph"),
+                ("FACTS", [], "paragraph"),
+            )
+        )
+
+        self.assertEqual(answer["kind"], "heading")
+
+    def test_mixed_members_of_one_engine_are_a_paragraph(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "FACTS",
+                    kind="heading",
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "the body",
+                    kind="paragraph",
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (50, 600, 300, 700),
+                    "FACTS the body",
+                    kind="heading",
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(
+            groups[0]["engines"]["dots_mocr"]["kind"], "paragraph"
+        )
+        self.assertEqual(ensemble.resolve(groups[0])["kind"], "paragraph")
+
+    def test_the_kind_is_on_the_group_of_the_page(self):
+        entry = build(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "FACTS", kind="heading"),
+                unit("mistral_ocr", 0, BODY_A_PT, "FACTS", kind="heading"),
+            ]
+        )
+
+        self.assertEqual(entry["groups"][0]["kind"], "heading")
+
+
+class TestTheTable(TestCase):
+    def test_the_rows_are_the_source_s(self):
+        rows = [["Property Damage", "$35,000.00"]]
+        answer = ensemble.resolve(
+            three(
+                ("Property Damage $35,000.00", [], "table"),
+                ("Property Damage $35,000.00", [], "table"),
+            )
+        )
+        self.assertEqual(answer["table"], None)
+
+        group = three(
+            ("Property Damage $35,000.00", [], "table"),
+            ("Property Damage $35,000.00", [], "table"),
+        )
+        group["engines"]["dots_mocr"]["table"] = rows
+        group["engines"]["mistral_ocr"]["table"] = [["other"]]
+        answer = ensemble.resolve(group)
+
+        self.assertEqual((answer["kind"], answer["table"]), ("table", rows))
+
+    def test_two_table_members_concatenate_their_rows(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "a b",
+                    kind="table",
+                    table=[["a", "b"]],
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "c d",
+                    kind="table",
+                    table=[["c", "d"]],
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (50, 600, 300, 700),
+                    "a b c d",
+                    kind="table",
+                    table=[["a", "b"], ["c", "d"]],
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(
+            groups[0]["engines"]["dots_mocr"]["table"],
+            [["a", "b"], ["c", "d"]],
+        )
+
+    def test_a_paragraph_group_carries_no_rows(self):
+        entry = build(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "the body"),
+                unit("mistral_ocr", 0, BODY_A_PT, "the body"),
+            ]
+        )
+
+        self.assertNotIn("table", entry["groups"][0])
+
+    def test_a_table_group_carries_its_rows(self):
+        rows = [["a", "b"]]
+        entry = build(
+            [
+                unit(
+                    "dots_mocr", 0, BODY_A_PT, "a b", kind="table", table=rows
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    BODY_A_PT,
+                    "a b",
+                    kind="table",
+                    table=rows,
+                ),
+            ]
+        )
+
+        self.assertEqual(entry["groups"][0]["table"], rows)
+
+
+class TestTheMarksOfAPage(TestCase):
+    """The marks of a row point into the field their section names."""
+
+    def test_the_marks_add_the_group_s_start_in_their_section(self):
+        entry = build(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (LEFT_X[0], 100, LEFT_X[1], 200),
+                    "left one",
+                    marks=[em(5, 8)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (LEFT_X[0], 100, LEFT_X[1], 200),
+                    "left one",
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (LEFT_X[0], 300, LEFT_X[1], 400),
+                    "left two",
+                    marks=[strong(0, 4)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    1,
+                    (LEFT_X[0], 300, LEFT_X[1], 400),
+                    "left two",
+                ),
+                unit(
+                    "dots_mocr",
+                    2,
+                    (LEFT_X[0], 600, LEFT_X[1], 700),
+                    "1. left note",
+                    marks=[em(3, 7)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    2,
+                    (LEFT_X[0], 600, LEFT_X[1], 700),
+                    "1. left note",
+                ),
+            ],
+            zones=[FOOT_ZONE],
+        )
+
+        self.assertEqual(entry["text"], "left one\n\nleft two")
+        self.assertEqual(entry["footnotes"], "1. left note")
+        marks = ensemble._marks(entry)
+        self.assertEqual(
+            marks,
+            [
+                {"start": 5, "end": 8, "kind": "em", "section": "text"},
+                {"start": 10, "end": 14, "kind": "strong", "section": "text"},
+                {"start": 3, "end": 7, "kind": "em", "section": "footnotes"},
+            ],
+        )
+        self.assertEqual(entry["text"][10:14], "left")
+        self.assertEqual(entry["footnotes"][3:7], "left")
+
+
+class TestTheMarksOfARow(EnsembleTestCase):
+    def test_the_row_holds_the_marks_of_its_text(self):
+        cells = self.objects[self.apply_run.ocr_key]["pages"][1]["cells"]
+        cells[1]["text"] = "In *Castleman*, Justice"
+        blocks = self.objects[self.apply_run.extract_key]["pages"][1]["blocks"]
+        blocks[1]["content"] = "In Castleman, Justice"
+
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertEqual(len(row.marks), 1)
+        mark = row.marks[0]
+        self.assertEqual((mark["kind"], mark["section"]), ("em", "text"))
+        self.assertEqual(row.text[mark["start"] : mark["end"]], "Castleman,")
+
+    def test_a_row_without_marks_is_empty(self):
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertEqual(row.marks, [])
+
+
+class TestTheContentStays(TestCase):
+    """The fold changes no character of a parsed unit (#404)."""
+
+    def test_a_literal_angle_bracket_of_the_print_stays_with_its_marks(self):
+        # Black's sets an example in angle brackets, and Surya copies it.
+        text = '("Untrue <a false statement>"); id., at 721'
+        groups = ensemble.align_page(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, text, marks=[em(32, 35)]),
+                unit("mistral_ocr", 0, BODY_A_PT, text),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(merged["text"], text)
+        self.assertEqual(merged["marks"], [em(32, 35)])
+        self.assertEqual(ensemble.resolve(groups[0])["text"], text)
+
+    def test_a_unit_of_the_glue_before_the_parse_loses_its_tags_once(self):
+        page = engine_page(
+            [unit("dots_mocr", 0, BODY_A_PT, "<b>Held</b> ![img](x) so")]
+        )
+        for u in page["units"]:
+            del u["marks"], u["kind"], u["table"]
+        other = engine_page([unit("mistral_ocr", 0, BODY_A_PT, "Held so")])
+
+        entry = ensemble.build_page(
+            {"dots_mocr": page, "mistral_ocr": other}, 0
+        )
+
+        self.assertEqual(entry["groups"][0]["text"], "Held so")
+        self.assertEqual(entry["groups"][0]["agreement"], ensemble.UNANIMOUS)
+
+    def test_plain_folds_the_whitespace_and_nothing_else(self):
+        self.assertEqual(ensemble.plain("a  <x>\nb"), "a <x> b")
+        self.assertEqual(ensemble.plain("###"), "")
+
+    def test_the_rows_follow_the_source_of_the_text(self):
+        """A majority without dots.mocr shows Mistral's rows."""
+        group = three(
+            ("a b", [], "table"),
+            ("a b c", [], "table"),
+            ("a b c", [], "table"),
+        )
+        group["engines"]["dots_mocr"]["table"] = [["a", "b"]]
+        group["engines"]["mistral_ocr"]["table"] = [["a", "b", "c"]]
+        answer = ensemble.resolve(group)
+
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["source"], "mistral_ocr")
+        self.assertEqual(answer["table"], [["a", "b", "c"]])
+
+
+# ── the blockquote (#411) ────────────────────────────────────────────
+#: Three paragraphs of the left column, in points, above the foot zone.
+QUOTE_A = (LEFT_X[0], 100, LEFT_X[1], 200)
+QUOTE_B = (LEFT_X[0], 300, LEFT_X[1], 400)
+QUOTE_C = (LEFT_X[0], 450, LEFT_X[1], 550)
+
+
+def zone_over(*boxes) -> list[float]:
+    """A blockquote zone a little wider than the given boxes."""
+    return [
+        min(b[0] for b in boxes) - 5.0,
+        min(b[1] for b in boxes) - 5.0,
+        max(b[2] for b in boxes) + 5.0,
+        max(b[3] for b in boxes) + 5.0,
+    ]
+
+
+def paragraphs(*specs) -> list[dict]:
+    """Units of two engines over the given boxes.
+
+    Each spec is ``(box, text)``, or ``(box, text, (dots kind, mistral
+    kind))``, or ``(box, text, kinds, exclusion)``.
+    """
+    units = []
+    for index, spec in enumerate(specs):
+        box, text = spec[0], spec[1]
+        kinds = spec[2] if len(spec) > 2 else ("paragraph", "paragraph")
+        exclusion = spec[3] if len(spec) > 3 else None
+        for engine, kind in zip(("dots_mocr", "mistral_ocr"), kinds):
+            units.append(
+                unit(
+                    engine,
+                    index,
+                    box,
+                    text,
+                    exclusion=exclusion,
+                    share=1.0 if exclusion else 0.0,
+                    kind=kind,
+                )
+            )
+    return units
+
+
+class TestTheQuotedRule(TestCase):
+    """``ensemble.quoted``: the zone decides, the group goes whole."""
+
+    def group(self, box, section=None) -> dict:
+        groups = ensemble.align_page(
+            read_units((box, "a quote")), WIDTH, HEIGHT
+        )
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        group["section"] = section or ensemble.BODY
+        return group
+
+    def test_a_group_the_zone_covers_is_quoted(self):
+        box = (50, 100, 300, 200)
+
+        self.assertTrue(ensemble.quoted(self.group(box), [list(box)]))
+
+    def test_a_group_the_zone_covers_in_part_is_judged_by_its_share(self):
+        box = (50, 100, 300, 200)
+        most = [40.0, 140.0, 310.0, 210.0]
+        little = [40.0, 170.0, 310.0, 210.0]
+
+        self.assertTrue(ensemble.quoted(self.group(box), [most]))
+        self.assertFalse(ensemble.quoted(self.group(box), [little]))
+
+    def test_a_page_with_no_zone_has_no_quote(self):
+        self.assertFalse(ensemble.quoted(self.group((50, 100, 300, 200)), []))
+
+    def test_a_footnote_group_is_never_quoted(self):
+        """The tagger reads the body text alone (#399)."""
+        box = (50, 600, 300, 700)
+        group = self.group(box, section=ensemble.FOOTNOTES)
+
+        self.assertFalse(ensemble.quoted(group, [list(box)]))
+
+
+class TestTheBlockquoteRuns(TestCase):
+    """One run of quoted groups is one blockquote of the page."""
+
+    def test_two_quoted_paragraphs_are_one_blockquote(self):
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "the quote one"),
+                (QUOTE_B, "the quote two"),
+                (QUOTE_C, "the body"),
+            ),
+            quotes=[zone_over(QUOTE_A, QUOTE_B)],
+        )
+
+        self.assertEqual(
+            entry["text"], "the quote one\n\nthe quote two\n\nthe body"
+        )
+        self.assertEqual(
+            entry["blockquotes"],
+            [{"start": 0, "end": 28, "groups": [0, 1], "list_groups": []}],
+        )
+        run = entry["blockquotes"][0]
+        self.assertEqual(
+            entry["text"][run["start"] : run["end"]],
+            "the quote one\n\nthe quote two",
+        )
+        self.assertEqual(
+            [g["blockquote"] for g in entry["groups"]], [True, True, False]
+        )
+        self.assertEqual(entry["counts"]["blockquotes"], 1)
+
+    def test_a_body_paragraph_between_two_quotes_ends_the_run(self):
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (QUOTE_B, "the body"),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A), zone_over(QUOTE_C)],
+        )
+
+        runs = entry["blockquotes"]
+        self.assertEqual([run["groups"] for run in runs], [[0], [2]])
+        self.assertEqual(
+            [entry["text"][r["start"] : r["end"]] for r in runs],
+            ["quote one", "quote two"],
+        )
+
+    def test_a_dropped_paragraph_inside_the_quote_does_not_end_the_run(
+        self,
+    ):
+        """A redacted name inside a quote leaves one quote."""
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (
+                    QUOTE_B,
+                    "a name",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A, QUOTE_C)],
+        )
+
+        self.assertEqual(entry["text"], "quote one\n\nquote two")
+        self.assertEqual(len(entry["blockquotes"]), 1)
+        run = entry["blockquotes"][0]
+        self.assertEqual((run["start"], run["end"]), (0, len(entry["text"])))
+
+    def test_a_dropped_paragraph_between_two_quotes_ends_the_run(self):
+        """A redacted body paragraph is in neither quote, so the two
+        quotes stay two, although it is not in the text."""
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (
+                    QUOTE_B,
+                    "a name",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A), zone_over(QUOTE_C)],
+        )
+
+        self.assertEqual(entry["text"], "quote one\n\nquote two")
+        runs = entry["blockquotes"]
+        self.assertEqual([run["groups"] for run in runs], [[0], [1]])
+        self.assertEqual(
+            [entry["text"][r["start"] : r["end"]] for r in runs],
+            ["quote one", "quote two"],
+        )
+
+    def test_a_footnote_under_a_quote_zone_is_no_blockquote(self):
+        box = (LEFT_X[0], 600, LEFT_X[1], 700)
+        entry = build(
+            paragraphs((QUOTE_A, "the body"), (box, "1. a note")),
+            zones=[FOOT_ZONE],
+            quotes=[zone_over(box)],
+        )
+
+        self.assertEqual(entry["footnotes"], "1. a note")
+        self.assertEqual(entry["blockquotes"], [])
+
+    def test_a_page_with_no_zone_has_no_blockquote(self):
+        entry = build(paragraphs((QUOTE_A, "the body")))
+
+        self.assertEqual(entry["blockquotes"], [])
+        self.assertEqual(entry["zones"]["blockquotes"], [])
+
+    def test_the_blockquote_is_a_mark_of_the_body_text(self):
+        units = paragraphs((QUOTE_A, "In Lewis v. Marcotte"))
+        units[0]["marks"] = [em(3, 8)]
+        entry = build(
+            units + paragraphs((QUOTE_B, "the body")),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(
+            ensemble._marks(entry),
+            [
+                {
+                    "start": 0,
+                    "end": 20,
+                    "kind": "blockquote",
+                    "section": "text",
+                },
+                {"start": 3, "end": 8, "kind": "em", "section": "text"},
+            ],
+        )
+
+    def test_the_block_mark_goes_before_an_inline_mark_that_starts_with_it(
+        self,
+    ):
+        units = paragraphs((QUOTE_A, "Lewis v. Marcotte"))
+        units[0]["marks"] = [em(0, 5)]
+        entry = build(units, quotes=[zone_over(QUOTE_A)])
+
+        self.assertEqual(
+            [mark["kind"] for mark in ensemble._marks(entry)],
+            ["blockquote", "em"],
+        )
+
+
+class TestTheListReaders(TestCase):
+    """A blockquote group two engines read as a list is a list group."""
+
+    def test_two_engines_that_read_a_list_make_a_list_group(self):
+        entry = build(
+            paragraphs((QUOTE_A, "- a bullet", ("list_item", "list_item"))),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(
+            entry["groups"][0]["list_by"], ["dots_mocr", "mistral_ocr"]
+        )
+        self.assertEqual(entry["blockquotes"][0]["list_groups"], [0])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 1)
+
+    def test_one_engine_is_not_enough(self):
+        """dots.mocr labels a quoted statute's ``(1)`` a list item."""
+        entry = build(
+            paragraphs((QUOTE_A, "(1) a clause", ("list_item", "paragraph"))),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(entry["groups"][0]["list_by"], ["dots_mocr"])
+        self.assertEqual(entry["blockquotes"][0]["list_groups"], [])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 0)
+
+    def test_a_list_outside_every_blockquote_is_no_list_group(self):
+        entry = build(
+            paragraphs((QUOTE_A, "- a bullet", ("list_item", "list_item")))
+        )
+
+        self.assertEqual(entry["blockquotes"], [])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 0)
+
+    def test_a_silent_engine_reads_no_list(self):
+        group = group_of(
+            unit("dots_mocr", 0, QUOTE_A, "- a bullet", kind="list_item"),
+            unit("mistral_ocr", 0, QUOTE_A, "", kind="list_item"),
+        )
+
+        self.assertEqual(ensemble.list_readers(group), ["dots_mocr"])
+
+
+class TestTheBlockquoteCard(TestTheFindings):
+    def page(self, **values) -> dict:
+        page = page_of(
+            groups=[
+                {
+                    "id": 0,
+                    "text": "1. The first item of a list that is long",
+                    "list_by": ["mistral_ocr", "dots_mocr"],
+                },
+                {"id": 1, "text": "a quote", "list_by": []},
+            ],
+            **values,
+        )
+        page["blockquotes"] = [
+            {"start": 0, "end": 49, "groups": [0, 1], "list_groups": [0]}
+        ]
+        return page
+
+    def rebuild_page(self, page) -> list[OpinionFinding]:
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_a_list_in_a_blockquote_is_its_own_card(self):
+        cards = self.rebuild_page(self.page(blockquotes=1, blockquote_lists=1))
+
+        self.assertEqual([c.check_name for c in cards], ["blockquote_list"])
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertIn(
+            "dots_mocr, mistral_ocr read 1 block(s) of a blockquote",
+            cards[0].message,
+        )
+        self.assertIn(
+            '"1. The first item of a list that..."', cards[0].message
+        )
+
+    def test_a_blockquote_with_no_list_has_no_card(self):
+        cards = self.rebuild(blockquotes=1)
+
+        self.assertEqual(cards, [])
+
+    def test_a_standing_dismissal_mutes_the_card(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.BLOCKQUOTE_LIST,
+        )
+
+        cards = self.rebuild_page(self.page(blockquotes=1, blockquote_lists=1))
+
+        self.assertEqual(cards[0].dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own(self):
+        self.assertIn(OpinionCheck.BLOCKQUOTE_LIST, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheBlockquoteOfAnOpinion(EnsembleTestCase):
+    """The fixture of the glue with a ``BLOCKQUOTE`` box over body A."""
+
+    #: A box a little wider than the first body cell of a page.
+    QUOTE = (BODY_A[0] - 20, BODY_A[1] - 20, BODY_A[2] + 20, BODY_A[3] + 20)
+
+    def quote(self, page_index, confidence=0.9):
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label=opinion_ocr.BLOCKQUOTE_LABEL,
+            label_id=int(Label.BLOCKQUOTE),
+            page_index=page_index,
+            source_page=page_index + 1,
+            confidence=confidence,
+            x0=self.QUOTE[0],
+            y0=self.QUOTE[1],
+            x1=self.QUOTE[2],
+            y1=self.QUOTE[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+
+    def test_the_row_holds_the_blockquote_as_a_mark(self):
+        self.quote(2)
+
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(row.text, "body A 2\n\nbody B 2")
+        self.assertEqual(
+            row.marks,
+            [{"start": 0, "end": 8, "kind": "blockquote", "section": "text"}],
+        )
+        self.assertNotIn("<", row.text)
+
+    def test_a_box_under_the_floor_is_no_blockquote(self):
+        self.quote(2, confidence=0.5)
+
+        document = self.run_ensemble()
+
+        self.assertEqual(document["pages"][1]["blockquotes"], [])
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(row.marks, [])

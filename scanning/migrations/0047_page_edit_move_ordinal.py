@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0042_page_edit_move'),
+        ('scanning', '0046_blockquote_list'),
     ]
 
     operations = [

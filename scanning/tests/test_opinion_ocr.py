@@ -29,7 +29,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import opinion_ocr, opinions, yolo
+from scanning import markup, opinion_ocr, opinions, yolo
 from scanning.factories import (
     ExternalJobFactory,
     OpinionBoundaryFactory,
@@ -119,6 +119,34 @@ def dots_document(pages=PAGES, width=IMG_W, height=IMG_H, failed=()) -> dict:
         "engine": "dots_mocr",
         "run": 1,
         "pages": entries,
+    }
+
+
+#: The approved page number of every page of the fixture: the value
+#: the ``HEADER`` cell carries. A fixture, not a sequence.
+PRINTED = "878"
+
+
+def printed_document(pages=PAGES, value=PRINTED) -> dict:
+    """A corrected volume's printed-page map over ``pages`` pages.
+
+    The document ``apply.printed_pages`` writes, with ``value`` on
+    every page. ``None`` gives a map whose pages carry no number.
+    """
+    return {
+        "schema_version": 1,
+        "apply_run": "a1",
+        "final_page_count": pages,
+        "pages": [
+            {
+                "final_page": index + 1,
+                "printed": value,
+                "type": "single" if value else None,
+                "by": "model" if value else None,
+                "source": {"kind": "original", "pdf_page": index + 1},
+            }
+            for index in range(pages)
+        ],
     }
 
 
@@ -290,6 +318,10 @@ class OpinionOcrTestCase(TestCase):
         prefix = f"processing/{scan.pk}/a/{scan.volume}/1/"
         run.ocr_key = f"{prefix}jobs/apply/a{number}/ocr-volume.json"
         self.objects[run.ocr_key] = dots_document()
+        run.printed_pages_key = (
+            f"{prefix}jobs/apply/a{number}/printed_pages.json"
+        )
+        self.objects[run.printed_pages_key] = printed_document()
         if mistral:
             run.extract_key = (
                 f"{prefix}jobs/apply/a{number}/extract-volume.json"
@@ -302,7 +334,14 @@ class OpinionOcrTestCase(TestCase):
             self.objects[run.surya_key] = surya_document()
         else:
             run.surya_key = ""
-        run.save(update_fields=["ocr_key", "extract_key", "surya_key"])
+        run.save(
+            update_fields=[
+                "ocr_key",
+                "printed_pages_key",
+                "extract_key",
+                "surya_key",
+            ]
+        )
         return run
 
     def measure(self, scan, run) -> list[ExternalJob]:
@@ -552,9 +591,10 @@ class TestTheVerdict(OpinionOcrTestCase):
         )
         self.assertGreaterEqual(unit["share"], 0.99)
         self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
-        # The header above the caption on the first page is the other
-        # exclusion, a neighbour's text.
-        self.assertEqual(document["counts"]["excluded"], 2)
+        # The header above the caption on the first page is a
+        # neighbour's text, and the headers of the two other pages are
+        # the page number (#396).
+        self.assertEqual(document["counts"]["excluded"], 4)
         self.assertEqual(document["counts"]["partial"], 0)
 
     def test_a_touch_under_a_tenth_is_kept(self):
@@ -594,9 +634,163 @@ class TestTheVerdict(OpinionOcrTestCase):
         self.assertGreaterEqual(header["share"], opinion_ocr.FULL_SHARE)
         # The body below the caption belongs to the opinion.
         self.assertIsNone(self.unit(document, 0, "body B")["exclusion"])
-        # A middle page has no neighbour.
-        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
+        # A middle page has no neighbour: its header is the page number
+        # (#396), and the mask of the opinion before wins on the first.
+        self.assertEqual(
+            self.unit(document, 1, "878")["exclusion"]["reason"],
+            opinion_ocr.PAGE_NUMBER,
+        )
         self.assertEqual(first["page_index"], 1)
+
+    def test_the_header_that_carries_the_page_number_is_excluded(self):
+        """The approved number of the page is in the running head, and
+        every engine reads the two as one unit (#396). The verdict is
+        read in each engine's own text, so the Mistral block gets it
+        too, off no dots.mocr box."""
+        self.write()
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            header = self.unit(document, 1, "878 N. C.")
+            self.assertEqual(
+                header["exclusion"],
+                {"reason": opinion_ocr.PAGE_NUMBER, "printed": PRINTED},
+                engine,
+            )
+            self.assertEqual(header["share"], 1.0, engine)
+            self.assertNotIn(
+                "878 N. C.",
+                [
+                    u["text"]
+                    for u in opinion_ocr.kept_units(document["pages"][1])
+                ],
+            )
+            # Two of the three pages: the first page's header is the
+            # mask of the opinion before.
+            self.assertEqual(document["counts"]["page_number"], 2, engine)
+            self.assertEqual(document["counts"]["partial"], 0, engine)
+
+    def low_head_cell(self, category):
+        """A two-line head cell that ends below the band, on page 2."""
+        dots = dots_document()
+        dots["pages"][2]["cells"][0] = cell(
+            100,
+            50,
+            800,
+            300,
+            text="STATE v. SMITH\nCite as 218 A.3d 877 -- 878",
+            category=category,
+        )
+        self.objects[self.apply_run.ocr_key] = dots
+
+    def test_a_labelled_head_cell_below_the_band_is_the_page_number(self):
+        """A two-line head cell with the ``Cite as`` line can end below
+        the band. Review 1 read its number through the label, and the
+        glue takes the label too."""
+        self.low_head_cell("Page-header")
+
+        document = self.write()
+
+        header = self.unit(document, 1, "STATE v. SMITH")
+        self.assertEqual(
+            header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER
+        )
+
+    def test_a_body_cell_below_the_band_is_judged_by_the_band(self):
+        """The same box and the same text under a body label: no zone,
+        so the number at the end of its line keeps it in the text."""
+        self.low_head_cell("Text")
+
+        document = self.write()
+
+        self.assertIsNone(
+            self.unit(document, 1, "STATE v. SMITH")["exclusion"]
+        )
+
+    def test_a_labelled_cell_with_a_headnote_number_is_kept(self):
+        """dots.mocr labels a headnote number ``Page-header`` too, in
+        the body. The value is what keeps it."""
+        dots = dots_document()
+        dots["pages"][2]["cells"][1] = cell(
+            *BODY_A, text="1", category="Page-header"
+        )
+        self.objects[self.apply_run.ocr_key] = dots
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "1")["exclusion"])
+
+    def test_a_body_cell_that_ends_in_the_number_is_kept(self):
+        """The band is required: a citation at the end of a paragraph
+        is opinion text."""
+        document = dots_document()
+        document["pages"][2]["cells"][1]["text"] = "the court said, at 878"
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        unit = self.unit(written, 1, "the court said")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_header_with_another_number_is_kept(self):
+        """The value is required: a head cell that carries a number the
+        page is not approved as is not the page number. The parallel
+        citation page is the daily shape of it."""
+        document = dots_document()
+        document["pages"][2]["cells"][0]["text"] = "877 N. C."
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(self.unit(written, 1, "877")["exclusion"])
+        self.assertEqual(written["counts"]["page_number"], 1)
+
+    def test_a_number_in_the_middle_of_the_head_line_is_not_the_number(self):
+        document = dots_document()
+        document["pages"][2]["cells"][0]["text"] = "Cite as 878 A.3d 1"
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(self.unit(written, 1, "Cite as")["exclusion"])
+
+    def test_a_redaction_over_the_header_wins_over_the_page_number(self):
+        row = self.redact(2, to_pt(HEADER))
+
+        document = self.write()
+
+        header = self.unit(document, 1, "878")
+        self.assertEqual(header["exclusion"]["reason"], "redaction")
+        self.assertEqual(header["exclusion"]["redaction_id"], row.pk)
+        self.assertEqual(document["counts"]["page_number"], 1)
+
+    def test_a_page_with_no_approved_number_keeps_its_header(self):
+        """No number, no verdict: the curator cleared it, or the page
+        never printed one. A page the map lacks reads the same."""
+        printed = printed_document()
+        printed["pages"][2]["printed"] = None
+        printed["pages"][2]["type"] = None
+        printed["pages"][2]["by"] = None
+        del printed["pages"][3]
+        self.objects[self.apply_run.printed_pages_key] = printed
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
+        self.assertIsNone(self.unit(document, 2, "878")["exclusion"])
+        self.assertEqual(document["counts"]["page_number"], 0)
+
+    def test_a_curators_label_the_page_does_not_print_matches_nothing(self):
+        printed = printed_document()
+        printed["pages"][2]["printed"] = "1234"
+        printed["pages"][2]["by"] = "curator"
+        self.objects[self.apply_run.printed_pages_key] = printed
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
 
     def test_the_share_is_the_maximum_and_not_the_sum(self):
         x0, y0, x1, y1 = to_pt(BODY_A)
@@ -642,8 +836,9 @@ class TestTheVerdict(OpinionOcrTestCase):
         )
         self.assertEqual(written["counts"]["unjudged"], 1)
         # An unjudged unit is not an excluded one: the three judged
-        # units under the page-wide box, plus the header of page 0.
-        self.assertEqual(written["counts"]["excluded"], 4)
+        # units under the page-wide box, plus the header of page 0 and
+        # the page number of page 2.
+        self.assertEqual(written["counts"]["excluded"], 5)
 
     def test_a_page_with_no_size_leaves_every_unit_unjudged(self):
         """No detection in the run's space and no dots.mocr render: the
@@ -671,8 +866,9 @@ class TestTheVerdict(OpinionOcrTestCase):
         self.assertEqual(
             manifest["engines"]["dots_mocr"]["counts"]["unjudged"], 3
         )
-        # The other pages are judged as before.
-        self.assertEqual(len(opinion_ocr.kept_units(written["pages"][2])), 3)
+        # The other pages are judged as before: the body is kept and
+        # the page number is not.
+        self.assertEqual(len(opinion_ocr.kept_units(written["pages"][2])), 2)
 
 
 # ── the document ─────────────────────────────────────────────────────
@@ -695,7 +891,7 @@ class TestTheDocument(OpinionOcrTestCase):
         document = self.write()
 
         kept = opinion_ocr.kept_units(document["pages"][1])
-        self.assertEqual([u["text"] for u in kept], ["878 N. C.", "body B 2"])
+        self.assertEqual([u["text"] for u in kept], ["body B 2"])
         self.assertEqual(
             [u["text"] for u in opinion_ocr.kept_units(document["pages"][0])],
             ["body A 1", "body B 1"],
@@ -756,6 +952,167 @@ class TestTheDocument(OpinionOcrTestCase):
         self.assertEqual(document["source"]["key"], self.apply_run.extract_key)
 
 
+# ── the parsed unit (#404) ───────────────────────────────────────────
+class TestTheParsedUnit(OpinionOcrTestCase):
+    """Every engine's markup becomes marks over a plain text."""
+
+    def set_body_a(self, page_index, dots=None, mistral=None, surya=None):
+        """Give ``BODY_A`` of one page a text per engine."""
+        if dots is not None:
+            cell = self.objects[self.apply_run.ocr_key]["pages"][page_index][
+                "cells"
+            ][1]
+            cell.update(dots)
+        if mistral is not None:
+            self.objects[self.apply_run.extract_key]["pages"][page_index][
+                "blocks"
+            ][1].update(mistral)
+        if surya is not None:
+            self.apply_run.surya_key = (
+                f"{self.prefix}jobs/apply/a1/surya-volume.json"
+            )
+            document = surya_document()
+            document["pages"][page_index]["blocks"][1].update(surya)
+            self.objects[self.apply_run.surya_key] = document
+            self.apply_run.save(update_fields=["surya_key"])
+
+    def document(self, engine):
+        return self.uploads[opinion_ocr.engine_key(self.opinion, engine)]
+
+    def test_a_dots_italic_is_an_em_mark(self):
+        self.set_body_a(2, dots={"text": "In *Castleman*, Justice Scalia"})
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "In Castleman, Justice Scalia")
+        self.assertEqual(
+            unit["marks"], [{"start": 3, "end": 12, "kind": "em"}]
+        )
+        self.assertEqual(unit["kind"], "paragraph")
+        self.assertNotIn("table", unit)
+        self.assertEqual(document["counts"]["marks"], 1)
+        self.assertEqual(document["schema_version"], 5)
+
+    def test_the_mistral_latex_superscript(self):
+        self.set_body_a(
+            2, mistral={"content": "(opinion of Scalia, J.).$^{4}$"}
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        unit = self.document("mistral_ocr")["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "(opinion of Scalia, J.).4")
+        self.assertEqual(
+            unit["marks"], [{"start": 24, "end": 25, "kind": "sup"}]
+        )
+
+    def test_the_surya_marks_come_from_the_html(self):
+        # The worker's flattened ``text`` lost the boundary already.
+        self.set_body_a(
+            2,
+            surya={
+                "html": "<p>See <i>Holt v. Hobbs</i>, x<sup>1</sup></p>",
+                "text": "See Holt v. Hobbs, x1",
+            },
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        unit = self.document("surya")["pages"][1]["units"][1]
+        self.assertEqual(unit["text"], "See Holt v. Hobbs, x1")
+        self.assertEqual(
+            unit["marks"],
+            [
+                {"start": 4, "end": 17, "kind": "em"},
+                {"start": 20, "end": 21, "kind": "sup"},
+            ],
+        )
+
+    def test_the_engine_s_label_names_the_kind(self):
+        self.set_body_a(
+            2,
+            dots={"text": "FACTS", "category": "Section-header"},
+            mistral={"content": "FACTS", "type": "title"},
+            surya={
+                "html": "<p>FACTS</p>",
+                "text": "FACTS",
+                "label": "SectionHeader",
+            },
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr", "surya"):
+            unit = self.document(engine)["pages"][1]["units"][1]
+            self.assertEqual(unit["kind"], "heading", engine)
+            self.assertEqual(unit["text"], "FACTS", engine)
+            self.assertEqual(
+                self.document(engine)["counts"]["headings"], 1, engine
+            )
+
+    def test_a_heading_mark_names_the_kind_and_leaves_the_text(self):
+        self.set_body_a(2, dots={"text": "## DISCUSSION"})
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(
+            (unit["kind"], unit["text"]), ("heading", "DISCUSSION")
+        )
+
+    def test_a_table_carries_its_rows(self):
+        self.set_body_a(
+            2,
+            dots={
+                "text": "<table><tr><td>Property Damage</td><td>$35,000.00</td></tr></table>",
+                "category": "Table",
+            },
+        )
+
+        document = self.write()
+
+        unit = document["pages"][1]["units"][1]
+        self.assertEqual(unit["kind"], "table")
+        self.assertEqual(unit["table"], [["Property Damage", "$35,000.00"]])
+        self.assertEqual(unit["text"], "Property Damage $35,000.00")
+        self.assertEqual(document["counts"]["tables"], 1)
+
+    def test_the_bracket_strip_moves_the_marks(self):
+        self.set_body_a(
+            2,
+            dots={"text": "[3]\n*Held:* so"},
+            surya={
+                "html": "<p>[3] <i>Held:</i> so</p>",
+                "text": "[3] Held: so",
+            },
+        )
+        self.redact(2, to_pt(BRACKET), rect_type="HEADNOTE_BRACKET")
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "surya"):
+            unit = self.document(engine)["pages"][1]["units"][1]
+            self.assertEqual(unit["text"], "Held: so", engine)
+            self.assertEqual(unit["removed"], ["[3]"], engine)
+            self.assertEqual(
+                unit["marks"], [{"start": 0, "end": 5, "kind": "em"}], engine
+            )
+
+    def test_every_engine_has_a_dialect_and_a_kind_table(self):
+        """A fourth engine is one entry of ``ENGINES`` (#368, #404)."""
+        for name, spec in opinion_ocr.ENGINES.items():
+            with self.subTest(engine=name):
+                self.assertTrue(callable(spec.dialect))
+                self.assertIsInstance(spec.kind_types, dict)
+                self.assertTrue(
+                    set(spec.kind_types.values()) <= set(markup.BLOCK_KINDS)
+                )
+                parsed = spec.parse({spec.markup_key: "", spec.type_key: ""})
+                self.assertEqual(parsed, markup.Parsed(text=""))
+        self.assertEqual(opinion_ocr.ENGINES["surya"].markup_key, "html")
+
+
 # ── the third engine ─────────────────────────────────────────────────
 class TestTheSuryaEngine(OpinionOcrTestCase):
     """Surya is one entry of ``ENGINES`` and no other code (#368)."""
@@ -773,6 +1130,39 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
     def surya_doc(self):
         """The opinion's Surya document, as written."""
         return self.uploads[opinion_ocr.engine_key(self.opinion, "surya")]
+
+    def test_a_marked_header_is_the_page_number(self):
+        """Mistral writes the running head as a heading, dots.mocr sets
+        bold marks, Surya a bullet. The parse takes the marks off the
+        text (#404) and the reader folds the bullet, or the group drops
+        on the dots.mocr cell alone and the page gets a partial card
+        for the clean Mistral block beside it."""
+        mistral = mistral_document()
+        mistral["pages"][2]["blocks"][0]["content"] = "# 878 N. C."
+        self.objects[self.apply_run.extract_key] = mistral
+        dots = dots_document()
+        dots["pages"][2]["cells"][0]["text"] = "**878 N. C.**"
+        self.objects[self.apply_run.ocr_key] = dots
+        surya = surya_document()
+        surya["pages"][2]["blocks"][0]["html"] = "<p>• 878 N. C.</p>"
+        surya["pages"][2]["blocks"][0]["text"] = "• 878 N. C."
+        self.add_surya(surya)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine, prefix in (
+            ("dots_mocr", "878"),
+            ("mistral_ocr", "878"),
+            ("surya", "• 878"),
+        ):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            header = self.unit(document, 1, prefix)
+            self.assertEqual(
+                header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER, engine
+            )
+            self.assertEqual(document["counts"]["partial"], 0, engine)
 
     def test_surya_is_last_in_the_table(self):
         """The order of the table is the rank of the ensemble vote
@@ -814,6 +1204,10 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
         self.assertIsNone(unit["exclusion"])
         header = self.unit(document, 1, "878 N. C.")
         self.assertEqual(header["type"], "PageHeader")
+        # The third engine reads the page number too (#396).
+        self.assertEqual(
+            header["exclusion"]["reason"], opinion_ocr.PAGE_NUMBER
+        )
         # The markup stays in the volume document: one unit shape for
         # every engine.
         self.assertNotIn("html", unit)
@@ -832,7 +1226,7 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
             [
                 u
                 for u in self.surya_doc()["pages"][1]["units"]
-                if not u["text"].startswith("body A")
+                if u["text"].startswith("body B")
             ],
         )
 
@@ -1092,7 +1486,13 @@ class TestThePass(OpinionOcrTestCase):
 
         self.assertEqual(
             sorted(self.pulls),
-            sorted([self.apply_run.ocr_key, self.apply_run.extract_key]),
+            sorted(
+                [
+                    self.apply_run.ocr_key,
+                    self.apply_run.extract_key,
+                    self.apply_run.printed_pages_key,
+                ]
+            ),
         )
         # The mirror serves the next tick.
         self.pulls.clear()
@@ -1309,6 +1709,18 @@ class TestThePass(OpinionOcrTestCase):
             "mistral_ocr document did not load", "\n".join(logs.output)
         )
 
+    def test_a_printed_page_map_that_does_not_pull_holds_the_scan(self):
+        """The page numbers are an input of the glue (#396), and a fact
+        about the scan."""
+        del self.objects[self.apply_run.printed_pages_key]
+
+        with self.assertLogs("scanning.opinion_ocr", level="INFO") as logs:
+            self.assertEqual(opinion_ocr.glue_due(), 0)
+
+        self.assertIn("printed-page map did not load", "\n".join(logs.output))
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.ocr_glue_attempts, 0)
+
     def test_a_lost_boundary_spends_an_attempt_and_three_end_the_row(self):
         Opinion.objects.filter(pk=self.opinion.pk).update(boundary=None)
 
@@ -1508,3 +1920,458 @@ class TestReglueCommand(OpinionOcrTestCase):
     def test_an_unknown_scan_is_an_error(self):
         with self.assertRaises(CommandError):
             self.run_command("999999")
+
+    def test_all_moves_every_volume(self):
+        other = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        run = self.make_run(other)
+        second = self.make_opinion(
+            other, run, self.make_boundary(other, run, 1, 2), 700
+        )
+
+        output = self.run_command("--all")
+
+        self.assertIn("Moved 2 opinion(s)", output)
+        for row in (self.opinion, second):
+            row.refresh_from_db()
+            self.assertEqual(row.glue_revision, 1)
+
+    def test_all_and_a_scan_are_refused_and_so_is_neither(self):
+        for args in (("--all", str(self.scan.pk)), ()):
+            with self.assertRaises(CommandError):
+                self.run_command(*args)
+
+
+# ── the footnote zone (#399) ─────────────────────────────────────────
+#: A footnote band across both columns, in render pixels.
+BAND = (100, 1600, 1600, 2100)
+
+#: The zones of a page no detection drew on (#399, #411).
+NO_ZONES = {"footnotes": [], "blockquotes": []}
+
+
+def footnote_band(scan, run, page_index, box=BAND) -> Detection:
+    """One ``FOOTNOTES`` detection over final page ``page_index``.
+
+    ``run=None`` leaves the row outside the run's space, the shape of a
+    human row ``detections.relocate_rows`` could not place.
+    """
+    return model_row(
+        scan,
+        apply_run=run,
+        label=opinion_ocr.FOOTNOTE_LABEL,
+        label_id=int(Label.FOOTNOTES),
+        page_index=page_index,
+        source_page=page_index + 1,
+        x0=box[0],
+        y0=box[1],
+        x1=box[2],
+        y1=box[3],
+        img_width=IMG_W,
+        img_height=IMG_H,
+    )
+
+
+class TestTheFootnoteZone(OpinionOcrTestCase):
+    """The ``FOOTNOTES`` detections of the run, frozen on every page."""
+
+    def band(self, page_index, in_run=True, box=BAND) -> Detection:
+        return footnote_band(
+            self.scan, self.apply_run if in_run else None, page_index, box
+        )
+
+    def test_a_band_is_a_zone_in_points_on_every_engine_page(self):
+        self.band(2)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            self.assertEqual(
+                document["pages"][1]["zones"],
+                {"footnotes": [to_pt(BAND)], "blockquotes": []},
+            )
+            self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        self.assertEqual(
+            manifest["engines"]["dots_mocr"]["counts"]["footnote_zones"], 1
+        )
+
+    def test_a_band_outside_the_run_s_space_is_no_zone(self):
+        """The run's space alone, the rule of ``inputs.renders``."""
+        self.band(2, in_run=False)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_a_withdrawn_band_is_no_zone(self):
+        row = self.band(2)
+        row.active = False
+        row.save(update_fields=["active"])
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_a_page_with_no_size_carries_no_zone(self):
+        """No size puts nothing in points. The band alone is a size, so
+        the page must lose its dots.mocr render too."""
+        self.band(2)
+        Detection.objects.filter(scan=self.scan, page_index=2).delete()
+        document = dots_document()
+        del document["pages"][2]["origin_width"]
+        self.objects[self.apply_run.ocr_key] = document
+
+        written = self.write()
+
+        self.assertIsNone(written["pages"][1]["frame"])
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_every_engine_names_its_footnote_labels(self):
+        """The spellings each engine writes, measured on the corpus
+        (#399): lowercase for Mistral, CamelCase for Surya."""
+        for spec in opinion_ocr.ENGINES.values():
+            self.assertIsInstance(spec.footnote_types, frozenset)
+        self.assertEqual(
+            opinion_ocr.ENGINES["dots_mocr"].footnote_types, {"Footnote"}
+        )
+        self.assertEqual(
+            opinion_ocr.ENGINES["mistral_ocr"].footnote_types,
+            {"references", "footer", "aside_text"},
+        )
+        self.assertEqual(
+            opinion_ocr.ENGINES["surya"].footnote_types,
+            {"Footnote", "Bibliography"},
+        )
+
+
+# ── the blockquote zone (#411) ───────────────────────────────────────
+#: A quote inside the left column, in render pixels.
+QUOTE = (260, 700, 800, 900)
+
+
+class TestTheBlockquoteZone(OpinionOcrTestCase):
+    """The ``BLOCKQUOTE`` detections of the run, frozen on every page
+    at the confidence floor or above it."""
+
+    def quote(self, page_index, **fields) -> Detection:
+        values = {
+            "apply_run": self.apply_run,
+            "label": opinion_ocr.BLOCKQUOTE_LABEL,
+            "label_id": int(Label.BLOCKQUOTE),
+            "page_index": page_index,
+            "source_page": page_index + 1,
+            "confidence": 0.9,
+            "x0": QUOTE[0],
+            "y0": QUOTE[1],
+            "x1": QUOTE[2],
+            "y1": QUOTE[3],
+            "img_width": IMG_W,
+            "img_height": IMG_H,
+        }
+        values.update(fields)
+        return model_row(self.scan, **values)
+
+    def test_a_quote_is_a_zone_in_points_on_every_engine_page(self):
+        self.quote(2)
+        footnote_band(self.scan, self.apply_run, 2)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            self.assertEqual(
+                document["pages"][1]["zones"],
+                {"footnotes": [to_pt(BAND)], "blockquotes": [to_pt(QUOTE)]},
+            )
+            self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        counts = manifest["engines"]["dots_mocr"]["counts"]
+        self.assertEqual(counts["blockquote_zones"], 1)
+        self.assertEqual(counts["footnote_zones"], 1)
+
+    def test_a_model_box_under_the_floor_is_no_zone(self):
+        self.quote(2, confidence=0.79)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_a_model_box_at_the_floor_is_a_zone(self):
+        self.quote(2, confidence=0.8)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    @override_settings(BLOCKQUOTE_MIN_CONFIDENCE=0.5)
+    def test_the_setting_moves_the_floor(self):
+        self.quote(2, confidence=0.6)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    def test_a_hand_drawn_box_is_a_zone(self):
+        """A person's box has confidence 1.0, the rule of
+        ``detections.add_manual``, so the floor never drops it."""
+        self.quote(2, confidence=1.0, model_name=Detection.ModelName.MANUAL)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    def test_a_withdrawn_box_is_no_zone(self):
+        row = self.quote(2)
+        row.active = False
+        row.save(update_fields=["active"])
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_the_floor_does_not_touch_the_footnote_zone(self):
+        row = footnote_band(self.scan, self.apply_run, 2)
+        row.confidence = 0.3
+        row.save(update_fields=["confidence"])
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["footnotes"], [to_pt(BAND)]
+        )
+
+
+# ── the headnote bracket (#373) ──────────────────────────────────────
+#: A bracket glyph at the start of ``BODY_A``, in render pixels.
+BRACKET = (105, 305, 140, 330)
+
+
+class TestTheBracketToken(OpinionOcrTestCase):
+    """A bracket box deletes the bracket of the unit it touches."""
+
+    def body_a(self, page_index, text, category=None, bbox=BODY_A):
+        """Give ``BODY_A`` of one page ``text`` in both engines."""
+        cells = self.objects[self.apply_run.ocr_key]["pages"][page_index][
+            "cells"
+        ]
+        cells[1]["text"] = text
+        cells[1]["bbox"] = list(bbox) if bbox else None
+        if category:
+            cells[1]["category"] = category
+        blocks = self.objects[self.apply_run.extract_key]["pages"][page_index][
+            "blocks"
+        ]
+        blocks[1]["content"] = text
+        blocks[1]["bbox"] = list(bbox) if bbox else None
+
+    def bracket(self, page_index, box=BRACKET, rect_type="HEADNOTE_BRACKET"):
+        return self.redact(page_index, to_pt(box), rect_type=rect_type)
+
+    def mistral(self):
+        return self.uploads[
+            opinion_ocr.engine_key(self.opinion, "mistral_ocr")
+        ]
+
+    def test_the_bracket_leaves_the_paragraph_in_every_engine(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2)
+
+        document = self.write()
+
+        for doc in (document, self.mistral()):
+            unit = doc["pages"][1]["units"][1]
+            self.assertEqual(unit["text"], "The court held.")
+            self.assertIsNone(unit["exclusion"])
+            self.assertEqual(unit["removed"], ["[1]"])
+        self.assertEqual(document["counts"]["brackets_removed"], 1)
+        self.assertEqual(document["schema_version"], 5)
+
+    def test_a_large_bracket_box_no_longer_drops_the_words(self):
+        """A share of 0.3 excluded the unit before #373."""
+        self.body_a(2, "[14, 15] It is well settled that")
+        self.bracket(2, box=(100, 300, 800, 480))
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "It is well settled that")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_bracket_no_box_touches_stays(self):
+        """The PDF shows it too; #328's card asks for the box."""
+        self.body_a(2, "[1] The court held.")
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertNotIn("removed", unit)
+
+    def test_a_bracket_box_elsewhere_on_the_page_leaves_it(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2, box=(105, 1005, 140, 1030))
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+
+    def test_a_curator_s_box_deletes_the_bracket_too(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2, rect_type=Redaction.MANUAL_TYPE)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_large_box_still_excludes(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(100, 300, 800, 480), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        self.assertEqual(unit["exclusion"]["rect_type"], "manual")
+        self.assertEqual(unit["text"], "[1] The court held.")
+
+    def test_a_curator_s_box_inside_the_line_keeps_the_bracket(self):
+        """A box over a word, 108 pt from the left edge of the unit."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(400, 305, 435, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_box_wider_than_a_bracket_keeps_it(self):
+        """61.2 pt wide, a tenth of nothing: no deletion, no exclusion."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(105, 305, 275, 330), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_curator_s_box_taller_than_a_bracket_keeps_it(self):
+        """21.2 pt high."""
+        self.body_a(2, "[1] The court held.")
+        self.bracket(
+            2, box=(105, 305, 140, 364), rect_type=Redaction.MANUAL_TYPE
+        )
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+
+    def test_the_label_of_the_unit_does_not_matter(self):
+        self.body_a(2, "[2] An accused is entitled", category="List-item")
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "An accused is entitled")
+
+    def test_a_joined_block_loses_the_bracket_of_every_line(self):
+        self.body_a(2, "[2] First.\n[3-5] Second.")
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "First.\nSecond.")
+        self.assertEqual(unit["removed"], ["[2]", "[3-5]"])
+
+    def test_a_unit_with_no_box_keeps_its_text(self):
+        """Unjudged: ``kept_units`` leaves it out already."""
+        self.body_a(2, "[1] The court held.", bbox=None)
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "[1] The court held.")
+        self.assertEqual(unit["exclusion"]["reason"], opinion_ocr.UNJUDGED)
+
+    def test_the_bracket_alone_leaves_an_empty_clean_unit(self):
+        self.body_a(2, "[3]", bbox=(100, 300, 150, 330))
+        self.bracket(2)
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["text"], "")
+        self.assertIsNone(unit["exclusion"])
+
+    def test_a_headnote_box_still_excludes_its_unit(self):
+        self.body_a(2, "[1] The court held.")
+        self.bracket(2)
+        self.redact(2, to_pt(BODY_A), rect_type="headnote")
+
+        unit = self.write()["pages"][1]["units"][1]
+
+        self.assertEqual(unit["exclusion"]["rect_type"], "headnote")
+        self.assertEqual(unit["text"], "The court held.")
+
+
+class TestTheBracketBox(TestCase):
+    """``opinion_ocr.is_bracket_box`` on its limits (#373)."""
+
+    #: A unit, in points.
+    UNIT = [36.0, 108.0, 288.0, 324.0]
+
+    @staticmethod
+    def rect(x0, y0, x1, y1, rect_type=Redaction.MANUAL_TYPE):
+        return {"rect_type": rect_type, "x0": x0, "y0": y0, "x1": x1, "y1": y1}
+
+    def check(self, *args, **kwargs):
+        return opinion_ocr.is_bracket_box(
+            self.rect(*args, **kwargs), self.UNIT
+        )
+
+    def test_a_manual_box_on_each_limit_counts(self):
+        self.assertTrue(self.check(36.0, 110.0, 96.0, 130.0))
+        self.assertTrue(self.check(56.0, 110.0, 70.0, 120.0))
+        self.assertTrue(self.check(16.0, 110.0, 40.0, 120.0))
+
+    def test_a_manual_box_past_a_limit_does_not(self):
+        self.assertFalse(self.check(36.0, 110.0, 96.1, 120.0))
+        self.assertFalse(self.check(36.0, 110.0, 50.0, 130.1))
+        self.assertFalse(self.check(56.1, 110.0, 70.0, 120.0))
+
+    def test_a_bracket_box_counts_at_any_size(self):
+        self.assertTrue(
+            self.check(36.0, 108.0, 288.0, 324.0, rect_type="HEADNOTE_BRACKET")
+        )
+
+    def test_a_box_that_does_not_touch_the_unit_does_not(self):
+        self.assertFalse(
+            self.check(36.0, 400.0, 50.0, 410.0, rect_type="HEADNOTE_BRACKET")
+        )
+        self.assertFalse(self.check(36.0, 400.0, 50.0, 410.0))
+
+    def test_another_type_never_counts(self):
+        self.assertFalse(
+            self.check(36.0, 110.0, 50.0, 120.0, rect_type="headnote")
+        )

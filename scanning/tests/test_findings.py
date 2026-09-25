@@ -16,7 +16,7 @@ from django.core.management import call_command
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import findings
+from scanning import detections, findings
 from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
     BUSY_STATUSES,
@@ -331,6 +331,127 @@ class TestRebuild(ScanningTestCase):
         findings.rebuild(scan)
 
         self.assertNotIn(CheckName.UNCOVERED_HEADNOTE, checks_of(scan))
+
+    def _bracket_scan(self):
+        """A scan with one computed boundary, so the measured checks run."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        return scan
+
+    def _low_brackets(self, scan):
+        return scan.issues.filter(
+            check_name=CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET
+        )
+
+    def test_a_bracket_under_the_gate_is_a_finding(self):
+        """#410: bl-warm redacts a bracket at 0.30 and above, and YOLO
+        keeps a box down to 0.20, so a box at 0.25 is drawn and not
+        redacted."""
+        scan = self._bracket_scan()
+        low = make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.30)
+
+        findings.rebuild(scan)
+
+        rows = self._low_brackets(scan)
+        self.assertEqual([r.metadata["detection_id"] for r in rows], [low.pk])
+        self.assertEqual(rows[0].target, Issue.Target.REDACTION)
+        self.assertEqual(rows[0].page_number, 2)
+        self.assertIn("0.25", rows[0].message)
+        self.assertIn("0.30", rows[0].message)
+
+    def test_a_volume_with_no_bl_warm_provenance_reads_the_legacy_gate(self):
+        """The compute reads the family off ``found_by`` (``rows_are_bl_warm``),
+        and a set with no provenance keeps the 0.50 gate."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0, found_by=[])
+        key = make_detection(scan, "KEY_ICON", 3, found_by=[])
+        make_boundary(scan, caption, key)
+        legacy = make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            1,
+            confidence=0.40,
+            model_name="",
+            found_by=[],
+        )
+        make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            2,
+            confidence=0.50,
+            model_name="",
+            found_by=[],
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(
+            [r.metadata["detection_id"] for r in self._low_brackets(scan)],
+            [legacy.pk],
+        )
+
+    def test_the_family_is_the_flag_the_compute_reads(self):
+        """A row with no ``model_name`` in a bl-warm volume is redacted
+        at 0.30, because the compute reads one flag off ``found_by``."""
+        scan = self._bracket_scan()
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.40, model_name=""
+        )
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_an_approval_or_a_deletion_answers_the_card(self):
+        """An approval writes 1.0 on the row, over the gate; a deletion
+        takes the box out."""
+        scan = self._bracket_scan()
+        approved = make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        deleted = make_detection(scan, "HEADNOTE_BRACKET", 2, confidence=0.25)
+        findings.rebuild(scan)
+        self.assertEqual(self._low_brackets(scan).count(), 2)
+        user = self.make_user()
+
+        detections.decide(scan, approved, DetectionDecision.Kind.APPROVE, user)
+        detections.decide(
+            scan, deleted, DetectionDecision.Kind.DEACTIVATE, user
+        )
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_hand_drawn_or_hidden_bracket_is_no_finding(self):
+        scan = self._bracket_scan()
+        make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            1,
+            confidence=0.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+        )
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 2, confidence=0.25, active=False
+        )
+        make_detection(scan, "HEADNOTE", 2, confidence=0.25)
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_low_confidence_bracket_can_be_dismissed(self):
+        scan = self._bracket_scan()
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        findings.rebuild(scan)
+        finding = self._low_brackets(scan).get()
+
+        findings.dismiss(scan, finding, self.make_user())
+        findings.rebuild(scan)
+
+        self.assertTrue(self._low_brackets(scan).get().is_dismissed)
 
     def test_the_rebuild_is_idempotent_and_leaves_review_1_alone(self):
         scan = make_scan()
@@ -1023,6 +1144,16 @@ class TestTheView(ScanningTestCase):
         # number over it from the page map, so both renders agree.
         self.assertIn('data-finding-page="2">p.3<', html)
         self.assertNotIn("Unmatched Key Icons", html)
+
+    def test_a_low_confidence_bracket_card_offers_the_detection_buttons(self):
+        """#410: the approval is the direct answer, so the card shows it."""
+        make_detection(self.scan, "HEADNOTE_BRACKET", 3, confidence=0.25)
+        findings.rebuild(self.scan)
+
+        html = self._page(2).content.decode()
+
+        self.assertIn("the next compute redacts the box", html)
+        self.assertEqual(html.count("deleteUnmatchedDetection(this)"), 2)
 
     def test_the_approve_button_asks_for_a_confirm_with_open_findings(self):
         response = self.client.get(

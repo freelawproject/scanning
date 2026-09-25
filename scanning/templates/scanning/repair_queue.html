@@ -21,6 +21,7 @@
   A reviewer found these pages and could not fix them. Each one needs a person with the book.
   Open the page, then upload the new scan with the <em>Replace</em> button, or in the gap for a missing page.
   The request closes by itself when the upload is saved.
+  If the page is fine, or the request no longer applies, dismiss it here or on the page.
 </p>
 
 <!-- State tabs -->
@@ -110,6 +111,20 @@
           </td>
           <td class="px-4 py-2 text-right whitespace-nowrap">
             <a href="{% url 'scan_process' scan.pk %}?step=1&amp;goto={{ r.nav_pdf_index }}" class="btn-outline text-xs px-2 py-1">Open page</a>
+            {% if not r.dismissed_at %}
+            {% comment %}
+              The button of the page card, here too (#249): a missing-page
+              request draws its card on the placeholder of its gap, and the
+              placeholder goes when the sequence stops showing the gap. The
+              form posts to the request, and the query string brings the
+              user back to this list with the same filters.
+            {% endcomment %}
+            <form method="post" action="{% url 'dismiss_repair_from_queue' r.pk %}{% url_replace %}" class="inline">
+              {% csrf_token %}
+              <button type="submit" class="btn-ghost text-xs px-2 py-1"
+                      title="{% if r.fulfilled %}Close this answered request. Then you can ask again.{% else %}The page is fine, or the request no longer applies{% endif %}">Dismiss</button>
+            </form>
+            {% endif %}
           </td>
         </tr>
         {% endfor %}

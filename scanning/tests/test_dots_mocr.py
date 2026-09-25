@@ -20,15 +20,17 @@ from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import dots_mocr, jobs, runpod_client, sharding
+from scanning import dots_mocr, jobs, runpod_client, sharding, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
+    ApplyRun,
     ExternalJob,
     JobEngine,
     JobProvider,
     JobStage,
     JobStatus,
     Scan,
+    Status,
 )
 from scanning.tests.test_jobs import make_manifest
 from scanning.tests.test_views import ScanningTestCase
@@ -1702,13 +1704,302 @@ class TestRunSummaryLabel(ScanningTestCase):
         self.assertIn("2 pending submit", label)
 
 
+# ── the sweep (#327) ────────────────────────────────────────────────
+class TestEnqueueMissingRuns(ScanningTestCase):
+    """The daemon catches up a parked volume the pipeline could not
+    start (#327), under detection's rule (#250): one run per shard
+    set, ever. The volume of the issue was converted and detected, and
+    sat in AWAITING_VALIDATION with no OCR row.
+    """
+
+    FINGERPRINT = "3072:30"
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = make_manifest(shard_count=3, pages_per_shard=10)
+        dots_mocr._REFUSED.clear()
+        self.addCleanup(dots_mocr._REFUSED.clear)
+
+    def _scan(self, status=Status.AWAITING_VALIDATION):
+        return ScanFactory(
+            page_count=30, status=status, source_fingerprint=self.FINGERPRINT
+        )
+
+    def _sweep(self, s3=True, manifest=True, **overrides):
+        with (
+            override_settings(**{**DOTS, **overrides}),
+            patch("scanning.s3_sync.s3_active", return_value=s3),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(
+                    (self.manifest, "") if manifest else (None, "refused")
+                ),
+            ) as committed,
+            patch("scanning.runpod_client.submit_job") as submit,
+        ):
+            started = dots_mocr.enqueue_missing_runs()
+        self.committed = committed
+        self.submit = submit
+        return started
+
+    def test_a_converted_and_detected_volume_gets_its_read(self):
+        scan = self._scan()
+        jobs.ensure_convert_jobs(scan, self.manifest)
+        yolo.ensure_detect_jobs(scan, self.manifest)
+        ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
+
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            self.assertEqual(self._sweep(), 1)
+
+        rows = analyze_jobs(scan)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row.status for row in rows}, {JobStatus.PENDING})
+        self.assertEqual(
+            {row.source_fingerprint for row in rows}, {self.FINGERPRINT}
+        )
+        self.assertIn("Started OCR run 1", "".join(logs.output))
+        # The sweep creates rows; the wave of the same tick sends them.
+        self.submit.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.AWAITING_VALIDATION)
+
+    def test_a_second_tick_starts_nothing(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(len(analyze_jobs(scan)), 3)
+        self.committed.assert_not_called()
+
+    def test_the_pipelines_run_is_left_alone_whatever_it_reached(self):
+        """A dead run is ``reread_failed_pages`` or the staff endpoint,
+        not a tick."""
+        for status in (
+            JobStatus.PENDING,
+            JobStatus.CONSUMED,
+            JobStatus.FAILED,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan()
+                rows = dots_mocr.ensure_analyze_jobs(scan, self.manifest)
+                ExternalJob.objects.filter(
+                    pk__in=[row.pk for row in rows]
+                ).update(status=status)
+                self.assertEqual(self._sweep(), 0)
+                self.assertEqual(len(analyze_jobs(scan)), 3)
+
+    def test_every_switch_of_this_engine_stops_the_sweep(self):
+        """The things that were blank in the issue's environment, one
+        at a time. Off means no S3 call and no row."""
+        for overrides in (
+            {"DOTS_MOCR_ENABLED": False},
+            {"RUNPOD_DOTSMOCR_ENDPOINT_ID": ""},
+            {"RUNPOD_API_KEY": ""},
+            {"RUNPOD_ENABLED": False},
+        ):
+            with self.subTest(**overrides):
+                scan = self._scan()
+                self.assertEqual(self._sweep(**overrides), 0)
+                self.committed.assert_not_called()
+                self.assertEqual(analyze_jobs(scan), [])
+        self.assertEqual(self._sweep(s3=False), 0)
+        self.committed.assert_not_called()
+
+    def test_only_the_parked_statuses_are_swept(self):
+        for status in (
+            Status.UPLOADED,
+            Status.QUEUED,
+            Status.PROCESSING,
+            Status.ERROR,
+            Status.PENDING_REVIEW,
+            Status.APPROVED,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 0)
+                self.assertEqual(analyze_jobs(scan), [])
+
+    def test_a_refused_shard_set_is_looked_at_once(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.dots_mocr", level="INFO"):
+            self.assertEqual(self._sweep(manifest=False), 0)
+        self.assertEqual(self._sweep(manifest=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(analyze_jobs(scan), [])
+
+    def test_a_blank_run_over_the_same_set_is_adopted_not_re_paid(self):
+        """A run from before the fingerprint column: most of the corpus
+        in review. ``ensure_analyze_jobs`` proves it still describes
+        today's set and hands it back; the sweep stamps it and counts
+        nothing, so the next tick pays no S3 call to learn the same
+        thing, and eight such volumes cannot hold the batch."""
+        scan = self._scan()
+        rows = dots_mocr.ensure_analyze_jobs(scan, self.manifest)
+        ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
+            source_fingerprint="", status=JobStatus.CONSUMED
+        )
+        with self.assertLogs("scanning.dots_mocr", level="INFO") as logs:
+            self.assertEqual(self._sweep(), 0)
+        self.assertIn("Adopted OCR run 1", "".join(logs.output))
+        self.assertEqual(self.committed.call_count, 1)
+        fresh = analyze_jobs(scan)
+        self.assertEqual([r.pk for r in fresh], [r.pk for r in rows])
+        self.assertEqual(
+            {r.source_fingerprint for r in fresh}, {self.FINGERPRINT}
+        )
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(self.committed.call_count, 0)
+
+    def test_a_blank_run_over_another_set_gets_a_new_run(self):
+        """The re-uploaded button-era volume: a blank arm in the query
+        would have hidden it for good."""
+        scan = self._scan()
+        Scan.objects.filter(pk=scan.pk).update(source_fingerprint="2048:20")
+        old = dots_mocr.ensure_analyze_jobs(
+            scan, make_manifest(shard_count=2, pages_per_shard=10)
+        )
+        ExternalJob.objects.filter(pk__in=[r.pk for r in old]).update(
+            source_fingerprint="", status=JobStatus.CONSUMED
+        )
+        Scan.objects.filter(pk=scan.pk).update(
+            source_fingerprint=self.FINGERPRINT
+        )
+
+        self.assertEqual(self._sweep(), 1)
+
+        fresh = dots_mocr.live_analyze_jobs(scan)
+        self.assertEqual(fresh[0].run, 2)
+        self.assertEqual(len(fresh), 3)
+        self.assertEqual(
+            {r.source_fingerprint for r in fresh}, {self.FINGERPRINT}
+        )
+
+    def test_an_apply_runs_rows_do_not_answer_for_the_volume(self):
+        """The apply (#224) reads one-page shards of the pages a curator
+        changed; its ANALYZE rows answer for no shard set."""
+        scan = self._scan()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        dots_mocr.ensure_analyze_jobs(scan, self.manifest, apply_run=run)
+
+        self.assertEqual(self._sweep(), 1)
+
+        volume = [r for r in analyze_jobs(scan) if r.apply_run_id is None]
+        self.assertEqual(len(volume), 3)
+
+
+class TestBarSaysWhenTheReadIsMissing(ScanningTestCase):
+    """A parked volume with no OCR run shows a line where the run's
+    state would be, never nothing (#327)."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.make_user())
+
+    def _bar(self, scan):
+        response = self.client.get(
+            reverse("process_actions", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+        return response.json()["html"]
+
+    def _parked(self, **overrides):
+        # The fingerprint is what the sweep names a shard set by; the
+        # factory's blank default is the case the sweep skips.
+        fields = {
+            "page_count": 30,
+            "status": Status.AWAITING_VALIDATION,
+            "source_fingerprint": "3072:30",
+        }
+        return ScanFactory(**{**fields, **overrides})
+
+    def test_a_parked_volume_says_the_read_is_coming_when_the_stage_is_on(
+        self,
+    ):
+        from scanning.views_process import OCR_NOT_STARTED_MESSAGE
+
+        scan = self._parked()
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(make_manifest(), ""),
+            ),
+        ):
+            self.assertIn(OCR_NOT_STARTED_MESSAGE, self._bar(scan))
+
+    def test_a_parked_volume_says_why_when_the_sweep_would_refuse_it(self):
+        """The sweep leaves a refused shard set alone until an admin
+        re-queue, so the bar must not promise a read that is not
+        coming."""
+        from scanning.views_process import (
+            OCR_NOT_STARTED_MESSAGE,
+            OCR_REFUSED_MESSAGE,
+        )
+
+        scan = self._parked()
+        reason = "The original PDF is not in the bucket."
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(None, reason),
+            ),
+        ):
+            html = self._bar(scan)
+        self.assertIn(OCR_REFUSED_MESSAGE.format(reason=reason), html)
+        self.assertNotIn(OCR_NOT_STARTED_MESSAGE, html)
+
+    def test_a_volume_with_no_fingerprint_is_not_promised_a_read(self):
+        """The sweep skips a blank ``source_fingerprint`` for good, so
+        the bar names the re-queue instead of a read that never comes.
+        The manifest is not asked: the answer is on the row."""
+        from scanning.views_process import (
+            OCR_NO_FINGERPRINT_REASON,
+            OCR_NOT_STARTED_MESSAGE,
+            OCR_REFUSED_MESSAGE,
+        )
+
+        scan = self._parked(source_fingerprint="")
+        with (
+            override_settings(**DOTS),
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.sharding.committed_manifest") as committed,
+        ):
+            html = self._bar(scan)
+        self.assertIn(
+            OCR_REFUSED_MESSAGE.format(reason=OCR_NO_FINGERPRINT_REASON), html
+        )
+        self.assertNotIn(OCR_NOT_STARTED_MESSAGE, html)
+        committed.assert_not_called()
+
+    def test_a_parked_volume_says_so_when_the_stage_is_off(self):
+        from scanning.views_process import OCR_UNAVAILABLE_MESSAGE
+
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        with override_settings(**{**DOTS, "RUNPOD_DOTSMOCR_ENDPOINT_ID": ""}):
+            self.assertIn(OCR_UNAVAILABLE_MESSAGE, self._bar(scan))
+
+    def test_a_run_takes_the_spot(self):
+        scan = ScanFactory(page_count=30, status=Status.AWAITING_VALIDATION)
+        dots_mocr.ensure_analyze_jobs(scan, make_manifest())
+        html = self._bar(scan)
+        self.assertIn("OCR running", html)
+        self.assertNotIn("OCR missing", html)
+
+    def test_a_legacy_volume_gets_no_line(self):
+        scan = ScanFactory(page_count=30, status=Status.PENDING_REVIEW)
+        self.assertNotIn("OCR missing", self._bar(scan))
+
+
 class TestKnownEnqueuePaths(ScanningTestCase):
     """Every path that creates paid GPU work, pinned.
 
-    dots.mocr has two: the pipeline (#207) and the button that remains
-    as the re-run and backfill path (#190). YOLO detection has one, the
-    daemon's sweep (#250), which starts one run per shard set and
-    replaced the staff button of #195.
+    dots.mocr has four: the pipeline (#207), the daemon's sweep that
+    catches up a parked volume once per shard set (#327), the endpoint
+    that remains as the staff re-run path (#190) and the backfill
+    command for runs that left pages unread (#238). YOLO
+    detection has one, the daemon's sweep (#250), which starts one run
+    per shard set and replaced the staff button of #195.
 
     Row creation is what costs GPU money, so a new caller of the
     creators must be a deliberate decision that updates this set -- not
@@ -1748,11 +2039,13 @@ class TestKnownEnqueuePaths(ScanningTestCase):
         self.assertEqual(
             callers,
             {
-                # dots.mocr: the staff button (#190), the pipeline (#207),
-                # and the backfill of runs that left pages unread (#238)
-                # -- a command, never a tick, because it spends money.
+                # dots.mocr: the staff endpoint (#190), the pipeline
+                # (#207), the daemon's sweep (#327) and the backfill of
+                # runs that left pages unread (#238) -- a command, never
+                # a tick, because it spends money.
                 ("scanning/views_process.py", "ensure_analyze_jobs"),
                 ("scanning/services.py", "ensure_analyze_jobs"),
+                ("scanning/dots_mocr.py", "ensure_analyze_jobs"),
                 (
                     "scanning/management/commands/reread_failed_pages.py",
                     "ensure_analyze_jobs",
