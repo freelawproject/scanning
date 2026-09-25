@@ -219,13 +219,14 @@ body.boundary-pick .opinion-nav.picking {
           <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" onclick="event.stopPropagation(); deleteFrontMatter(this)" data-message="{{ issue.message }}">Mark all for deletion</button>
           {% endif %}
           {% comment %}
-            Two adjacent pages scanned in the wrong order (#261). The view
-            sets ``swap`` on the card of a transposed pair alone: the
-            later page and the page it goes after. A backward step of
-            more than one is a misread and gets no button.
+            A span scanned out of its order (#261, #395). The view sets
+            ``move`` on the card whose sequence names one window: the
+            rows to write, the words of the button and the order they
+            produce. A backward step that closes no window is a misread
+            and gets no button.
           {% endcomment %}
-          {% if issue.swap and not page_edits_locked %}
-          <button class="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white" onclick="event.stopPropagation(); swapPages(this)" data-pdf-page="{{ issue.swap.pdf_page }}" data-anchor="{{ issue.swap.anchor_pdf_page }}" title="Move PDF page {{ issue.swap.pdf_page }} to before PDF page {{ issue.swap.anchor_pdf_page|add:1 }}">Swap PDF pages {{ issue.swap.anchor_pdf_page|add:1 }} and {{ issue.swap.pdf_page }}</button>
+          {% if issue.move and not page_edits_locked %}
+          <button class="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white" onclick="event.stopPropagation(); movePage(this)" data-moves="{{ issue.move.moves_json }}" title="{{ issue.move.title }}">{{ issue.move.label }}</button>
           {% endif %}
           {% if issue.severity != 'error' %}
           <button class="text-[10px] px-2 py-0.5 rounded bg-green-600 text-white" onclick="event.stopPropagation(); dismissIssue(this, {{ issue.pk }})">Dismiss</button>

@@ -1443,9 +1443,9 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     };
 
-    // --- Move a page (issue #261) ---
-    // Two adjacent pages scanned in the wrong order. The card of the
-    // ``backward_page`` warning carries the pair, the row is a saved
+    // --- Move a page (issues #261, #395) ---
+    // A page scanned out of its place. The card of the ``backward_page``
+    // warning carries the page and its anchor, the row is a saved
     // decision the apply builds, and the viewer draws the page at its
     // new place at once: the server renders the corrected order after
     // a reload (the page map and the sidebar follow the moves), so the
@@ -1523,18 +1523,20 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     }
 
-    window.swapPages = function (btn) {
-        var pdfPage = parseInt(btn.dataset.pdfPage, 10);
-        var anchor = parseInt(btn.dataset.anchor, 10);
-        if (isNaN(pdfPage) || isNaN(anchor)) { return; }
-        if (!confirm('Move PDF page ' + pdfPage + ' to before PDF page ' +
-                     (anchor + 1) + '?')) {
-            return;
-        }
+    // The card's button (#261, #395): the rows that put a shuffled span
+    // in the order of its printed numbers, the whole set of the volume's
+    // moves. One page is drawn at its new place here; anything else
+    // reloads, because the server's order is the one place that cannot
+    // disagree.
+    window.movePage = function (btn) {
+        var moves;
+        try { moves = JSON.parse(btn.dataset.moves || '[]'); } catch (e) { return; }
+        if (!moves.length) { return; }
+        if (!confirm(btn.title + '?')) { return; }
         fetch('/scans/' + documentId + '/move-page/', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-            body: JSON.stringify({ pdf_page: pdfPage, anchor_pdf_page: anchor }),
+            body: JSON.stringify({ moves: moves }),
         })
         .then(function (r) { return r.json(); })
         .then(function (data) {
@@ -1542,6 +1544,16 @@ document.addEventListener('DOMContentLoaded', function () {
                 showToast(data.error || 'Could not move this page.');
                 return;
             }
+            // The list replaces the standing set. Only the one move
+            // of a volume with none other is drawn here: beside other
+            // moves the slot depends on their ordinals too.
+            var standing = Object.keys(SCAN_CONFIG.movedPages || {}).length;
+            if (moves.length > 1 || standing) {
+                window.location.reload();
+                return;
+            }
+            var pdfPage = moves[0].pdf_page;
+            var anchor = moves[0].anchor_pdf_page;
             if (!SCAN_CONFIG.movedPages) { SCAN_CONFIG.movedPages = {}; }
             SCAN_CONFIG.movedPages[String(pdfPage)] = anchor;
             var pageDiv = pageContainer(pdfPage);

@@ -14,6 +14,7 @@ import fitz
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.http import (
     FileResponse,
@@ -801,16 +802,20 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # from ``duplicate_indices`` (the same page_map data the viewer uses);
         # ``seq_issue`` only covers ordering anomalies (backward / gap).
         #
-        # Two adjacent pages whose printed numbers run backward by one
-        # are a transposed pair, the case of #261: the card for that
-        # printed number gets a button that moves the later page to
-        # before the earlier one. A backward step of more than one is
-        # a misread, so it gets no button. The card names a printed
-        # number and nothing else, so a number two pairs share, or two
-        # cards share, gets no button either: the wrong pair would move
-        # the wrong page.
-        swaps: dict[int, list[dict]] = {}
-        prev_num = prev_pdf = None
+        # A span scanned out of its order (#261, #395): the card for the
+        # printed number that steps back gets a button that puts the
+        # span in the order of its printed numbers, when the sequence
+        # names one. ``page_edits.sorted_window`` is the one rule: a
+        # transposed pair, a page pulled early or late, two blocks the
+        # wrong way round and a span in reverse are all a window whose
+        # numbers are a shuffle of one consecutive run; a step whose
+        # window never closes is a misread and gets no button. The card
+        # names a printed number and nothing else, so a number two
+        # cards share, two windows share, or the volume prints twice
+        # gets no button: the wrong page would move.
+        runs: list[list[tuple[int, int]]] = [[]]
+        backward_steps: list[tuple[int, int, int]] = []
+        prev_num = None
         for r in ocr_results:
             r["seq_issue"] = ""
             r["is_duplicate"] = (r["pdf_page"] - 1) in duplicate_indices
@@ -824,36 +829,69 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 continue
             if not r.get("detected") or r.get("type") == "range":
                 prev_num = None
+                runs.append([])
                 continue
             try:
                 num = int(r["detected"])
             except (ValueError, TypeError):
                 prev_num = None
+                runs.append([])
                 continue
+            runs[-1].append((r["pdf_page"], num))
             if prev_num is not None:
                 diff = num - prev_num
                 if diff < 0:
                     r["seq_issue"] = "backward"
-                    if diff == -1 and prev_pdf == r["pdf_page"] - 1:
-                        swaps.setdefault(num, []).append(
-                            {
-                                "pdf_page": r["pdf_page"],
-                                "anchor_pdf_page": prev_pdf - 1,
-                            }
-                        )
+                    backward_steps.append(
+                        (len(runs) - 1, len(runs[-1]) - 1, num)
+                    )
                 elif diff > 2:
                     r["seq_issue"] = "gap"
             prev_num = num
-            prev_pdf = r["pdf_page"]
+        printed = Counter(num for run in runs for _, num in run)
+        current_order = [r["pdf_page"] for r in ocr_results]
+        offers: dict[int, list[dict]] = {}
+        answered: set[tuple[int, int]] = set()
+        for run_index, index, num in backward_steps:
+            if (run_index, index) in answered:
+                continue
+            answered.add((run_index, index))
+            run = runs[run_index]
+            window = page_edits.sorted_window(run, index)
+            if window is None:
+                continue
+            numbers = dict(run)
+            if any(printed[numbers[p]] != 1 for p in window["pdf_pages"]):
+                continue
+            # The rows come from the whole corrected order with the
+            # window sorted in place, so they fold into the moves that
+            # stand (an earlier correction, a swap of #379), and the
+            # endpoint replaces the standing set with them.
+            window["rows"] = page_edits.rows_for_order(
+                page_edits.sorted_order(current_order, window)
+            )
+            # Every step inside the window is answered by it: a span in
+            # reverse has one step per page and one window, so the
+            # window is computed once and each card carries it.
+            covered = set(window["pdf_pages"])
+            for other_run, other_index, other_num in backward_steps:
+                if other_run == run_index and run[other_index][0] in covered:
+                    answered.add((other_run, other_index))
+                    offers.setdefault(other_num, []).append(window)
         if scan.status not in LOCKED_STATUSES:
             backward = [
                 i for i in issues if i.check_name == CheckName.BACKWARD_PAGE
             ]
             cards = Counter(i.page_number for i in backward)
             for i in backward:
-                pairs = swaps.get(i.page_number, [])
-                if len(pairs) == 1 and cards[i.page_number] == 1:
-                    i.swap = pairs[0]
+                found = offers.get(i.page_number, [])
+                if len(found) == 1 and cards[i.page_number] == 1:
+                    i.move = {
+                        **found[0],
+                        "label": page_edits.move_label(found[0]),
+                        "title": page_edits.move_title(found[0]),
+                        "moves_json": json.dumps(found[0]["rows"]),
+                    }
         deleted_pages = sorted(page_edits.deleted_pages(scan))
 
     has_detections = Detection.objects.filter(scan=scan).exists()
@@ -3938,24 +3976,31 @@ MOVE_ONTO_ITSELF_MESSAGE = "A page cannot follow itself."
 @login_required
 @require_POST
 def move_page(request: HttpRequest, pk: int) -> HttpResponse:
-    """Move a page of the original to after another one (#261).
+    """Move pages of the original to after other ones (#261, #395).
 
-    Two adjacent pages scanned in the wrong order, the case the
-    ``backward_page`` card finds: one ``PageEdit`` row, addressed by
-    the page that moves and the original page it lands after (0 for
-    before page 1), the insert's vocabulary. The apply (#224) writes
-    the page at its new place and pays no read for it; until then the
-    row is a saved decision, and the page map is rebuilt so the viewer
-    and the sidebar draw the corrected order at once.
+    A span scanned out of its order, the case the ``backward_page``
+    card finds: one ``PageEdit`` row per page that moves, addressed by
+    the page and the original page it lands after (0 for before page
+    1), the insert's vocabulary, plus an ``ordinal`` that orders the
+    pages landing on one anchor. The apply (#224) writes each page at
+    its new place and pays no read for it; until then the rows are a
+    saved decision, and the page map is rebuilt so the viewer and the
+    sidebar draw the corrected order at once.
 
-    Both addresses are checked before the row is written. A second
-    move of the same page refreshes the open row, as a page number
-    does; an applied row is superseded.
+    The body is one move (``pdf_page``, ``anchor_pdf_page``), which is
+    added to the moves that stand, or a list of them under ``moves``,
+    the reorder the card offers, which **replaces** the standing set:
+    the card derives its rows from the whole corrected order
+    (``page_edits.rows_for_order``), so a page in no row of the list
+    goes back to its slot, and a row equal to the standing one is left
+    alone, applied or not. Every address is checked before any row is
+    written, and the rows go in one transaction: a reorder half written
+    is an order nobody chose. A second move of the same page refreshes
+    the open row, as a page number does; an applied row is superseded.
 
-    :param request: The HTTP request (JSON body with ``pdf_page`` and
-        ``anchor_pdf_page``).
+    :param request: The HTTP request (JSON body).
     :param pk: Scan primary key.
-    :return: JSON response confirming the move record.
+    :return: JSON response confirming the move records.
     """
     scan = get_object_or_404(Scan, pk=pk)
     locked = _refuse_locked_edits(scan)
@@ -3965,32 +4010,85 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
         data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
-    pdf_page = _pdf_page_of(scan, data.get("pdf_page"))
-    anchor = data.get("anchor_pdf_page")
-    if anchor == 0 or anchor == "0":
-        anchor = 0
-    else:
-        anchor = _pdf_page_of(scan, anchor)
-    if pdf_page is None or anchor is None:
-        return JsonResponse({"error": "Unknown PDF page."}, status=404)
-    if anchor == pdf_page:
-        return JsonResponse({"error": MOVE_ONTO_ITSELF_MESSAGE}, status=409)
+    requested = data.get("moves")
+    replace = requested is not None
+    if requested is None:
+        requested = [data]
+    if not isinstance(requested, list) or not requested:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    moves = []
+    for item in requested:
+        if not isinstance(item, dict):
+            return JsonResponse({"error": "Invalid JSON"}, status=400)
+        pdf_page = _pdf_page_of(scan, item.get("pdf_page"))
+        anchor = item.get("anchor_pdf_page")
+        if anchor == 0 or anchor == "0":
+            anchor = 0
+        else:
+            anchor = _pdf_page_of(scan, anchor)
+        if pdf_page is None or anchor is None:
+            return JsonResponse({"error": "Unknown PDF page."}, status=404)
+        if anchor == pdf_page:
+            return JsonResponse(
+                {"error": MOVE_ONTO_ITSELF_MESSAGE}, status=409
+            )
+        # The column's own range (a small positive integer), so a
+        # value it cannot hold is refused here and not by the database.
+        try:
+            ordinal = int(item.get("ordinal", 0))
+            PageEdit._meta.get_field("ordinal").run_validators(ordinal)
+        except (TypeError, ValueError, ValidationError):
+            return JsonResponse({"error": "Invalid JSON"}, status=400)
+        moves.append(
+            {
+                "pdf_page": pdf_page,
+                "anchor_pdf_page": anchor,
+                "ordinal": ordinal,
+            }
+        )
+    if len({m["pdf_page"] for m in moves}) != len(moves):
+        return JsonResponse({"error": "A page is named twice."}, status=409)
     from scanning import services
 
-    page_edits.supersede(
-        scan,
-        PageEdit.Kind.MOVE_PAGE,
-        {"pdf_page": pdf_page},
-        {
-            "anchor_pdf_page": anchor,
-            "source_fingerprint": scan.source_fingerprint,
-        },
-        request.user,
-    )
+    standing = {
+        edit.pdf_page: edit
+        for edit in page_edits.current_edits(scan, PageEdit.Kind.MOVE_PAGE)
+    }
+    with transaction.atomic():
+        if replace:
+            gone = [
+                edit.pk
+                for pdf_page, edit in standing.items()
+                if pdf_page not in {m["pdf_page"] for m in moves}
+            ]
+            if gone:
+                page_edits.withdraw(
+                    PageEdit.objects.filter(pk__in=gone), request.user
+                )
+        for move in moves:
+            edit = standing.get(move["pdf_page"])
+            if (
+                edit is not None
+                and edit.anchor_pdf_page == move["anchor_pdf_page"]
+                and edit.ordinal == move["ordinal"]
+            ):
+                continue
+            page_edits.supersede(
+                scan,
+                PageEdit.Kind.MOVE_PAGE,
+                {"pdf_page": move["pdf_page"]},
+                {
+                    "anchor_pdf_page": move["anchor_pdf_page"],
+                    "ordinal": move["ordinal"],
+                    "source_fingerprint": scan.source_fingerprint,
+                },
+                request.user,
+            )
     services.rebuild_page_map(scan)
-    return JsonResponse(
-        {"status": "ok", "pdf_page": pdf_page, "anchor_pdf_page": anchor}
-    )
+    answer = {"status": "ok", "moves": moves}
+    if len(moves) == 1:
+        answer.update(moves[0])
+    return JsonResponse(answer)
 
 
 @login_required
