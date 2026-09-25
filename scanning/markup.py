@@ -43,6 +43,13 @@ STRONG = "strong"
 SUP = "sup"
 INLINE_KINDS = (EM, STRONG, SUP)
 
+#: A block mark (#411): it spans one run of paragraphs of a page's
+#: text, never a part of one unit, so no parser writes it. The
+#: ensemble writes it off the ``BLOCKQUOTE`` zone, and
+#: :func:`serialize` writes its element once, at its two edges.
+BLOCKQUOTE = "blockquote"
+BLOCK_MARKS = (BLOCKQUOTE,)
+
 PARAGRAPH = "paragraph"
 HEADING = "heading"
 LIST_ITEM = "list_item"

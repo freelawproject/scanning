@@ -71,6 +71,19 @@ same rule and the same column boundary, so the body joins across a
 footnote at the foot of the left column, and the page carries two
 texts, ``text`` and ``footnotes``, each with its own offsets.
 
+**A sixth step, the blockquote (#411).** The OCR glue freezes the
+``BLOCKQUOTE`` detections as ``zones.blockquotes``, and :func:`quoted`
+flags a body group the zone covers :data:`BLOCKQUOTE_SHARE` of, whole,
+the rule of the section. The flag is ``blockquote`` on the group and
+never a ``kind``: ``kind`` is what the engines read (a paragraph, a
+list item), and a quote holds either. One run of consecutive quoted
+groups is one ``blockquote`` mark over the page's ``text``
+(:func:`blockquote_runs`), so a quote of two paragraphs, or one that
+goes on at the top of the right column, is one element. The model also
+boxes lists as blockquotes (#211), so a run that
+:data:`LIST_READERS` engines read as a list is the ``BLOCKQUOTE_LIST``
+card, which warns and changes nothing.
+
 **Three deviations from the prototype.**
 
 - Its constants are pixels of a 1700 by 2200 render. Here they are
@@ -143,8 +156,9 @@ logger = logging.getLogger(__name__)
 #: that a majority settled (#380). 3 puts every group in a section and
 #: gives the page a second text, the footnotes (#399). 4 gives every
 #: group its ``kind`` and its ``marks``, the formatting the engines
-#: read (#404).
-SCHEMA_VERSION = 4
+#: read (#404). 5 flags the quoted groups and writes the blockquote
+#: runs of a page (#411).
+SCHEMA_VERSION = 5
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue.
 DOCUMENT = "ensemble.json"
@@ -209,6 +223,23 @@ FOOTNOTES = "footnotes"
 #: whole and a body group outside it whole, so the value moves little.
 FOOTNOTE_SHARE = 0.5
 
+#: The name of the blockquote zone of a page, the key the OCR glue
+#: writes it under (``opinion_ocr.ZONES``, #411).
+BLOCKQUOTES = "blockquotes"
+
+#: The share of a group's box the blockquote zone must cover for the
+#: group to be in the quote (#411). The value of the footnote zone: an
+#: engine that joins a quote and the next paragraph into one block
+#: makes a group the zone covers in part, and the group goes whole to
+#: the side that holds more of it.
+BLOCKQUOTE_SHARE = 0.5
+
+#: How many engines must read a group of a blockquote as a list item
+#: before the ``BLOCKQUOTE_LIST`` card warns (#411). One engine is not
+#: enough: dots.mocr labels a ``(1)`` subsection of a quoted statute
+#: ``List-item``, and a quote of a statute is a real blockquote.
+LIST_READERS = 2
+
 #: How the engines agreed on one group.
 UNANIMOUS = "unanimous"
 MAJORITY = "majority"
@@ -233,6 +264,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.PARTIAL_REDACTION,
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
+        OpinionCheck.BLOCKQUOTE_LIST,
     }
 )
 
@@ -1335,19 +1367,102 @@ def _footnote_labellers(group: dict) -> list[str]:
     )
 
 
-def _zones_of(pages: dict[str, dict]) -> list[list[float]]:
-    """Return the footnote zones of one page, off the first engine
-    page that carries them.
+def quoted(group: dict, zones: list[list[float]]) -> bool:
+    """Return whether one aligned group is in a blockquote (#411).
+
+    **The one rule**, over the aligned group and never a unit, the rule
+    of :func:`section`: the zone alone decides, and a group goes whole.
+    A footnote group is never quoted, because the tagger reads the body
+    text alone (#399), so :func:`section` decides first.
+
+    :param group: One group of :func:`align_page`, with its
+        ``section``.
+    :param zones: The page's blockquote zones, in points.
+    :returns: Whether it is quoted.
+    :rtype: bool
+    """
+    return (
+        group.get("section", BODY) == BODY
+        and bool(zones)
+        and zone_share(group["box_pt"], zones) >= BLOCKQUOTE_SHARE
+    )
+
+
+def list_readers(group: dict) -> list[str]:
+    """Return the engines that read one group as a list item, ranked
+    (#411).
+
+    Each engine's own reading, the ``kind`` of its merged unit
+    (:func:`_merge`), and never the majority ``kind`` of the group: the
+    card asks how many engines saw a list, and with two engines a
+    majority is both. A silent engine read no word, so it says nothing.
+
+    :param group: One group of :func:`align_page`.
+    :returns: The engine names.
+    :rtype: list[str]
+    """
+    return _ranked(
+        name
+        for name, unit in group["engines"].items()
+        if plain(unit.get("text")) and unit.get("kind") == markup.LIST_ITEM
+    )
+
+
+def blockquote_runs(groups: list[dict]) -> list[dict]:
+    """Return the blockquotes of one page, one per run of quoted groups
+    (#411).
+
+    A run is the quoted groups of the body that follow each other in
+    reading order. A body group that is not quoted ends it; a dropped
+    group does not, because it is not in the text. So a quote of two
+    paragraphs, or one that goes on at the top of the right column, is
+    one blockquote. The offsets are those of the page's ``text``: the
+    ``start`` of the first group and the ``end`` of the last, so a run
+    holds the paragraph gaps between its groups.
+
+    :param groups: The groups of one page of the document, in order.
+    :returns: ``[{start, end, groups, list_groups}]``: the ids of the
+        groups, and of those :data:`LIST_READERS` engines read as a
+        list.
+    :rtype: list[dict]
+    """
+    runs: list[dict] = []
+    open_run = None
+    for group in groups:
+        if (group.get("section") or BODY) != BODY or not group.get(
+            "blockquote"
+        ):
+            open_run = None
+            continue
+        if open_run is None:
+            open_run = {
+                "start": group["start"],
+                "end": group["end"],
+                "groups": [],
+                "list_groups": [],
+            }
+            runs.append(open_run)
+        open_run["end"] = group["end"]
+        open_run["groups"].append(group["id"])
+        if len(group.get("list_by") or []) >= LIST_READERS:
+            open_run["list_groups"].append(group["id"])
+    return runs
+
+
+def _zones_of(pages: dict[str, dict], name: str) -> list[list[float]]:
+    """Return one kind of zone of one page, off the first engine page
+    that carries it.
 
     Every engine's page carries the same zones: the glue writes the
     page's fact on each of them, the rule of ``frame``.
 
     :param pages: ``{engine: the page}``.
+    :param name: The zone, a key of ``opinion_ocr.ZONES``.
     :returns: The zones, in points.
     :rtype: list[list[float]]
     """
     for page in pages.values():
-        zones = (page.get("zones") or {}).get("footnotes") or []
+        zones = (page.get("zones") or {}).get(name) or []
         boxes = [box for box in map(opinion_ocr.as_box, zones) if box]
         if boxes:
             return boxes
@@ -1776,6 +1891,8 @@ def _counts() -> dict:
         "partial": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
+        "blockquotes": 0,
+        "blockquote_lists": 0,
     }
 
 
@@ -1797,9 +1914,11 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "pdf_page": first.get("pdf_page"),
         "source": first.get("source"),
         "frame": None,
-        "zones": {"footnotes": []},
+        "zones": {FOOTNOTES: [], BLOCKQUOTES: []},
         "text": "",
         "footnotes": "",
+        # One entry per blockquote of the body text (#411).
+        "blockquotes": [],
         # Every engine of the document, and the ones whose read of
         # this page failed (#238 does fail single pages). A group of
         # fewer engines than this is a place they did not read alike,
@@ -1845,8 +1964,9 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         "width_pt": round(width, 2),
         "height_pt": round(height, 2),
     }
-    zones = _zones_of(read)
-    entry["zones"] = {"footnotes": zones}
+    zones = _zones_of(read, FOOTNOTES)
+    quotes = _zones_of(read, BLOCKQUOTES)
+    entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
     groups = align_page(units, width, height)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
@@ -1856,6 +1976,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
         group["section"], group["footnote_doubt"] = section(group, zones)
+        group["blockquote"] = quoted(group, quotes)
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
@@ -1895,6 +2016,8 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 "section": name,
                 "footnote_doubt": group["footnote_doubt"],
                 "footnote_by": _footnote_labellers(group),
+                "blockquote": group["blockquote"],
+                "list_by": list_readers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
                 "end": end,
@@ -1938,6 +2061,11 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
 
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
+    entry["blockquotes"] = blockquote_runs(entry["groups"])
+    entry["counts"]["blockquotes"] = len(entry["blockquotes"])
+    entry["counts"]["blockquote_lists"] = sum(
+        1 for run in entry["blockquotes"] if run["list_groups"]
+    )
     entry["counts"]["groups"] = len(entry["groups"])
     entry["counts"]["dropped"] = len(entry["dropped"])
     entry["counts"]["partial"] = sum(
@@ -2228,13 +2356,17 @@ def _marks(page: dict) -> list[dict]:
 
     Each group's marks plus the group's ``start``; ``section`` names
     the field the offsets point into, as a ``disagreements`` entry
-    does (#399, #404).
+    does (#399, #404). One ``blockquote`` mark per run of
+    :func:`blockquote_runs`, over the body text (#411). The body marks
+    come first, in the order of ``start``, and a block mark before an
+    inline mark that starts with it, the order :func:`markup.serialize`
+    nests them in.
 
     :param page: One page of the document.
     :returns: ``[{start, end, kind, section}]``.
     :rtype: list[dict]
     """
-    return [
+    inline = [
         {
             "start": group["start"] + mark["start"],
             "end": group["start"] + mark["end"],
@@ -2244,6 +2376,25 @@ def _marks(page: dict) -> list[dict]:
         for group in page["groups"]
         for mark in group.get("marks") or []
     ]
+    blocks = [
+        {
+            "start": run["start"],
+            "end": run["end"],
+            "kind": markup.BLOCKQUOTE,
+            "section": BODY,
+        }
+        for run in page.get("blockquotes") or []
+    ]
+    # A stable sort: the inline marks that start together keep the
+    # order the group wrote them in.
+    return sorted(
+        blocks + inline,
+        key=lambda mark: (
+            mark["section"] != BODY,
+            mark["start"],
+            mark["kind"] not in markup.BLOCK_MARKS,
+        ),
+    )
 
 
 def _disagreements(page: dict) -> list[dict]:
@@ -2373,6 +2524,17 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("blockquote_lists"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.BLOCKQUOTE_LIST,
+                    Issue.Severity.WARNING,
+                    _blockquote_list_message(page),
+                    standing,
+                )
+            )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
 
@@ -2449,6 +2611,42 @@ def _footnote_message(page: dict) -> str:
     return (
         f"{named} read {count} block(s) of this page as a footnote, but no "
         "footnote detection covers them. They are in the body text."
+    )
+
+
+#: How many words of a group the ``BLOCKQUOTE_LIST`` card quotes.
+_CARD_WORDS = 8
+
+
+def _blockquote_list_message(page: dict) -> str:
+    """Return the line of one ``BLOCKQUOTE_LIST`` card (#411).
+
+    It names the engines and quotes the first words of each list
+    group, because the reader judges the tag against the page: the
+    model boxes a bullet list or a numbered list as a blockquote, and
+    a quote of a statute is a list inside a real blockquote.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    listed = {
+        group_id
+        for run in page["blockquotes"]
+        for group_id in run["list_groups"]
+    }
+    groups = [g for g in page["groups"] if g["id"] in listed]
+    engines = _ranked(
+        {name for group in groups for name in group.get("list_by") or []}
+    )
+    starts = "; ".join(
+        f'"{" ".join(group["text"].split()[:_CARD_WORDS])}..."'
+        for group in groups
+    )
+    return (
+        f"{', '.join(engines)} read {len(groups)} block(s) of a blockquote "
+        f"on this page as a list: {starts}. It may be a list and not a "
+        "quote. The <blockquote> tag stays."
     )
 
 
