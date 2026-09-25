@@ -1413,14 +1413,19 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
     (#411).
 
     A run is the quoted groups of the body that follow each other in
-    reading order. A body group that is not quoted ends it; a dropped
-    group does not, because it is not in the text. So a quote of two
-    paragraphs, or one that goes on at the top of the right column, is
-    one blockquote. The offsets are those of the page's ``text``: the
+    reading order. A body group that is not quoted ends it, and so
+    does one that was dropped: a redacted paragraph between two quotes
+    is not in the text, but it is not in a quote either, and the two
+    quotes stay two. A dropped group that is quoted (a redacted name
+    inside a quote) does not end it. So a quote of two paragraphs, or
+    one that goes on at the top of the right column, is one
+    blockquote. The offsets are those of the page's ``text``: the
     ``start`` of the first group and the ``end`` of the last, so a run
     holds the paragraph gaps between its groups.
 
-    :param groups: The groups of one page of the document, in order.
+    :param groups: The groups of one page, in reading order: the
+        groups of the document, and a ``{"dropped": True, "section",
+        "blockquote"}`` entry in the place of each dropped group.
     :returns: ``[{start, end, groups, list_groups}]``: the ids of the
         groups, and of those :data:`LIST_READERS` engines read as a
         list.
@@ -1433,6 +1438,8 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
             "blockquote"
         ):
             open_run = None
+            continue
+        if group.get("dropped"):
             continue
         if open_run is None:
             open_run = {
@@ -1984,9 +1991,20 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
 
     parts: dict[str, list[str]] = {BODY: [], FOOTNOTES: []}
     offsets: dict[str, int] = {BODY: 0, FOOTNOTES: 0}
+    # The reading order with a place for every dropped group, for the
+    # blockquote runs (#411): a dropped paragraph outside every quote
+    # still parts two quotes.
+    sequence: list[dict] = []
     for group in ordered:
         read_back = resolve(group)
         if group["excluded"] or not read_back["text"]:
+            sequence.append(
+                {
+                    "dropped": True,
+                    "section": group["section"],
+                    "blockquote": group["blockquote"],
+                }
+            )
             entry["dropped"].append(
                 {
                     "engines": {
@@ -2046,6 +2064,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 },
             }
         )
+        sequence.append(entry["groups"][-1])
         if read_back["kind"] == markup.TABLE:
             entry["groups"][-1]["table"] = read_back["table"] or []
         entry["counts"][read_back["agreement"]] += 1
@@ -2061,7 +2080,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
 
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
-    entry["blockquotes"] = blockquote_runs(entry["groups"])
+    entry["blockquotes"] = blockquote_runs(sequence)
     entry["counts"]["blockquotes"] = len(entry["blockquotes"])
     entry["counts"]["blockquote_lists"] = sum(
         1 for run in entry["blockquotes"] if run["list_groups"]

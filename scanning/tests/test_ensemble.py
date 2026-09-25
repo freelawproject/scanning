@@ -3118,8 +3118,10 @@ class TestTheBlockquoteRuns(TestCase):
             ["quote one", "quote two"],
         )
 
-    def test_a_dropped_paragraph_does_not_end_the_run(self):
-        """A redacted group is not in the text, so the quote goes on."""
+    def test_a_dropped_paragraph_inside_the_quote_does_not_end_the_run(
+        self,
+    ):
+        """A redacted name inside a quote leaves one quote."""
         entry = build(
             paragraphs(
                 (QUOTE_A, "quote one"),
@@ -3138,6 +3140,31 @@ class TestTheBlockquoteRuns(TestCase):
         self.assertEqual(len(entry["blockquotes"]), 1)
         run = entry["blockquotes"][0]
         self.assertEqual((run["start"], run["end"]), (0, len(entry["text"])))
+
+    def test_a_dropped_paragraph_between_two_quotes_ends_the_run(self):
+        """A redacted body paragraph is in neither quote, so the two
+        quotes stay two, although it is not in the text."""
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (
+                    QUOTE_B,
+                    "a name",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A), zone_over(QUOTE_C)],
+        )
+
+        self.assertEqual(entry["text"], "quote one\n\nquote two")
+        runs = entry["blockquotes"]
+        self.assertEqual([run["groups"] for run in runs], [[0], [1]])
+        self.assertEqual(
+            [entry["text"][r["start"] : r["end"]] for r in runs],
+            ["quote one", "quote two"],
+        )
 
     def test_a_footnote_under_a_quote_zone_is_no_blockquote(self):
         box = (LEFT_X[0], 600, LEFT_X[1], 700)
