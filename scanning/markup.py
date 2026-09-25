@@ -43,6 +43,13 @@ STRONG = "strong"
 SUP = "sup"
 INLINE_KINDS = (EM, STRONG, SUP)
 
+#: A block mark (#411): it spans one run of paragraphs of a page's
+#: text, never a part of one unit, so no parser writes it. The
+#: ensemble writes it off the ``BLOCKQUOTE`` zone, and
+#: :func:`serialize` writes its element once, at its two edges.
+BLOCKQUOTE = "blockquote"
+BLOCK_MARKS = (BLOCKQUOTE,)
+
 PARAGRAPH = "paragraph"
 HEADING = "heading"
 LIST_ITEM = "list_item"
@@ -404,13 +411,21 @@ def shift(marks: list[Mark], deleted: list[tuple[int, int]]) -> list[Mark]:
 
 
 def serialize(parsed: Parsed) -> str:
-    """Write the one tagged string of a parsed unit.
+    """Write the one tagged string of a parsed unit, or of a page.
 
-    :param parsed: The unit.
+    A mark of :data:`BLOCK_MARKS` is written once, at its two edges,
+    and outside every inline element (#411): a blockquote spans
+    paragraphs, and an element per segment would write one quote per
+    italic. Its edges cut the inline marks, so every element closes
+    inside the one it opened in. A caller serializes a page's text with
+    the marks of its section (``OpinionText.marks``).
+
+    :param parsed: The unit, or a page's text and its marks.
     :returns: The text with ``<em>``, ``<strong>`` and ``<sup>`` at the
         marks (outer to inner in :data:`_NESTING` order, one element
-        per segment), ``&``, ``<`` and ``>`` escaped, and the block
-        kind as ``<heading>``, ``<li>`` or a ``<table>``.
+        per segment), ``<blockquote>`` at the block marks, ``&``,
+        ``<`` and ``>`` escaped, and the block kind as ``<heading>``,
+        ``<li>`` or a ``<table>``.
     :rtype: str
     """
     if parsed.kind == TABLE:
@@ -432,8 +447,12 @@ def serialize(parsed: Parsed) -> str:
             *(m.end for m in parsed.marks),
         }
     )
+    blocks = [
+        m for m in parsed.marks if m.kind in BLOCK_MARKS and m.end > m.start
+    ]
     parts: list[str] = []
     for start, end in zip(edges, edges[1:], strict=False):
+        parts.extend(f"<{m.kind}>" for m in blocks if m.start == start)
         covering = [
             m.kind for m in parsed.marks if m.start <= start and end <= m.end
         ]
@@ -442,6 +461,7 @@ def serialize(parsed: Parsed) -> str:
             if kind in covering:
                 segment = f"<{kind}>{segment}</{kind}>"
         parts.append(segment)
+        parts.extend(f"</{m.kind}>" for m in reversed(blocks) if m.end == end)
     body = "".join(parts)
     if parsed.kind == HEADING:
         return f"<heading>{body}</heading>"

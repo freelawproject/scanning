@@ -22,6 +22,7 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import CommandError
@@ -41,9 +42,12 @@ from scanning.models import (
     PageEdit,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_opinion_ocr import (
     BODY_A,
     BODY_B,
+    IMG_H,
+    IMG_W,
     OpinionOcrTestCase,
     block,
     footnote_band,
@@ -2043,15 +2047,19 @@ def read_units(*specs) -> list[dict]:
     return units
 
 
-def engine_page(units_of_engine: list[dict], zones=()) -> dict:
-    """One engine's page of an opinion document, for ``build_page``."""
+def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
+    """One engine's page of an opinion document, for ``build_page``.
+
+    ``zones`` are the footnote zones and ``quotes`` the blockquote
+    zones, in points.
+    """
     return {
         "page_in_opinion": 0,
         "page_index": 1,
         "pdf_page": 2,
         "source": {"kind": "original", "pdf_page": 2},
         "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
-        "zones": {"footnotes": list(zones)},
+        "zones": {"footnotes": list(zones), "blockquotes": list(quotes)},
         "units": [
             {
                 "id": u["id"],
@@ -2069,10 +2077,12 @@ def engine_page(units_of_engine: list[dict], zones=()) -> dict:
     }
 
 
-def build(units, zones=()) -> dict:
+def build(units, zones=(), quotes=()) -> dict:
     """The ensemble of one page read by the two engines of ``units``."""
     pages = {
-        engine: engine_page([u for u in units if u["engine"] == engine], zones)
+        engine: engine_page(
+            [u for u in units if u["engine"] == engine], zones, quotes
+        )
         for engine in ("dots_mocr", "mistral_ocr")
     }
     return ensemble.build_page(pages, 0)
@@ -2239,7 +2249,9 @@ class TestTheTwoTexts(TestCase):
             page["text"], "left one\n\nleft two\n\nright one\n\nright two"
         )
         self.assertEqual(page["footnotes"], "1. left note")
-        self.assertEqual(page["zones"], {"footnotes": [FOOT_ZONE]})
+        self.assertEqual(
+            page["zones"], {"footnotes": [FOOT_ZONE], "blockquotes": []}
+        )
 
     def test_without_a_zone_the_footnote_stays_in_the_body(self):
         page = build(read_units(*self.TWO_COLUMNS, self.LEFT_NOTE))
@@ -2364,7 +2376,10 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         # The header is the printed page number, excluded since #396.
         self.assertEqual(page["text"], "body A 2")
         self.assertEqual(page["footnotes"], "body B 2")
-        self.assertEqual(page["zones"], {"footnotes": [to_pt(self.BAND_B)]})
+        self.assertEqual(
+            page["zones"],
+            {"footnotes": [to_pt(self.BAND_B)], "blockquotes": []},
+        )
         # The first page masks its header, above the caption.
         self.assertEqual(document["pages"][0]["text"], "body A 1\n\nbody B 1")
         self.assertEqual(document["pages"][0]["footnotes"], "")
@@ -2975,3 +2990,372 @@ class TestTheContentStays(TestCase):
         self.assertEqual(answer["agreement"], ensemble.MAJORITY)
         self.assertEqual(answer["source"], "mistral_ocr")
         self.assertEqual(answer["table"], [["a", "b", "c"]])
+
+
+# ── the blockquote (#411) ────────────────────────────────────────────
+#: Three paragraphs of the left column, in points, above the foot zone.
+QUOTE_A = (LEFT_X[0], 100, LEFT_X[1], 200)
+QUOTE_B = (LEFT_X[0], 300, LEFT_X[1], 400)
+QUOTE_C = (LEFT_X[0], 450, LEFT_X[1], 550)
+
+
+def zone_over(*boxes) -> list[float]:
+    """A blockquote zone a little wider than the given boxes."""
+    return [
+        min(b[0] for b in boxes) - 5.0,
+        min(b[1] for b in boxes) - 5.0,
+        max(b[2] for b in boxes) + 5.0,
+        max(b[3] for b in boxes) + 5.0,
+    ]
+
+
+def paragraphs(*specs) -> list[dict]:
+    """Units of two engines over the given boxes.
+
+    Each spec is ``(box, text)``, or ``(box, text, (dots kind, mistral
+    kind))``, or ``(box, text, kinds, exclusion)``.
+    """
+    units = []
+    for index, spec in enumerate(specs):
+        box, text = spec[0], spec[1]
+        kinds = spec[2] if len(spec) > 2 else ("paragraph", "paragraph")
+        exclusion = spec[3] if len(spec) > 3 else None
+        for engine, kind in zip(("dots_mocr", "mistral_ocr"), kinds):
+            units.append(
+                unit(
+                    engine,
+                    index,
+                    box,
+                    text,
+                    exclusion=exclusion,
+                    share=1.0 if exclusion else 0.0,
+                    kind=kind,
+                )
+            )
+    return units
+
+
+class TestTheQuotedRule(TestCase):
+    """``ensemble.quoted``: the zone decides, the group goes whole."""
+
+    def group(self, box, section=None) -> dict:
+        groups = ensemble.align_page(
+            read_units((box, "a quote")), WIDTH, HEIGHT
+        )
+        self.assertEqual(len(groups), 1)
+        group = groups[0]
+        group["section"] = section or ensemble.BODY
+        return group
+
+    def test_a_group_the_zone_covers_is_quoted(self):
+        box = (50, 100, 300, 200)
+
+        self.assertTrue(ensemble.quoted(self.group(box), [list(box)]))
+
+    def test_a_group_the_zone_covers_in_part_is_judged_by_its_share(self):
+        box = (50, 100, 300, 200)
+        most = [40.0, 140.0, 310.0, 210.0]
+        little = [40.0, 170.0, 310.0, 210.0]
+
+        self.assertTrue(ensemble.quoted(self.group(box), [most]))
+        self.assertFalse(ensemble.quoted(self.group(box), [little]))
+
+    def test_a_page_with_no_zone_has_no_quote(self):
+        self.assertFalse(ensemble.quoted(self.group((50, 100, 300, 200)), []))
+
+    def test_a_footnote_group_is_never_quoted(self):
+        """The tagger reads the body text alone (#399)."""
+        box = (50, 600, 300, 700)
+        group = self.group(box, section=ensemble.FOOTNOTES)
+
+        self.assertFalse(ensemble.quoted(group, [list(box)]))
+
+
+class TestTheBlockquoteRuns(TestCase):
+    """One run of quoted groups is one blockquote of the page."""
+
+    def test_two_quoted_paragraphs_are_one_blockquote(self):
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "the quote one"),
+                (QUOTE_B, "the quote two"),
+                (QUOTE_C, "the body"),
+            ),
+            quotes=[zone_over(QUOTE_A, QUOTE_B)],
+        )
+
+        self.assertEqual(
+            entry["text"], "the quote one\n\nthe quote two\n\nthe body"
+        )
+        self.assertEqual(
+            entry["blockquotes"],
+            [{"start": 0, "end": 28, "groups": [0, 1], "list_groups": []}],
+        )
+        run = entry["blockquotes"][0]
+        self.assertEqual(
+            entry["text"][run["start"] : run["end"]],
+            "the quote one\n\nthe quote two",
+        )
+        self.assertEqual(
+            [g["blockquote"] for g in entry["groups"]], [True, True, False]
+        )
+        self.assertEqual(entry["counts"]["blockquotes"], 1)
+
+    def test_a_body_paragraph_between_two_quotes_ends_the_run(self):
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (QUOTE_B, "the body"),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A), zone_over(QUOTE_C)],
+        )
+
+        runs = entry["blockquotes"]
+        self.assertEqual([run["groups"] for run in runs], [[0], [2]])
+        self.assertEqual(
+            [entry["text"][r["start"] : r["end"]] for r in runs],
+            ["quote one", "quote two"],
+        )
+
+    def test_a_dropped_paragraph_inside_the_quote_does_not_end_the_run(
+        self,
+    ):
+        """A redacted name inside a quote leaves one quote."""
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (
+                    QUOTE_B,
+                    "a name",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A, QUOTE_C)],
+        )
+
+        self.assertEqual(entry["text"], "quote one\n\nquote two")
+        self.assertEqual(len(entry["blockquotes"]), 1)
+        run = entry["blockquotes"][0]
+        self.assertEqual((run["start"], run["end"]), (0, len(entry["text"])))
+
+    def test_a_dropped_paragraph_between_two_quotes_ends_the_run(self):
+        """A redacted body paragraph is in neither quote, so the two
+        quotes stay two, although it is not in the text."""
+        entry = build(
+            paragraphs(
+                (QUOTE_A, "quote one"),
+                (
+                    QUOTE_B,
+                    "a name",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (QUOTE_C, "quote two"),
+            ),
+            quotes=[zone_over(QUOTE_A), zone_over(QUOTE_C)],
+        )
+
+        self.assertEqual(entry["text"], "quote one\n\nquote two")
+        runs = entry["blockquotes"]
+        self.assertEqual([run["groups"] for run in runs], [[0], [1]])
+        self.assertEqual(
+            [entry["text"][r["start"] : r["end"]] for r in runs],
+            ["quote one", "quote two"],
+        )
+
+    def test_a_footnote_under_a_quote_zone_is_no_blockquote(self):
+        box = (LEFT_X[0], 600, LEFT_X[1], 700)
+        entry = build(
+            paragraphs((QUOTE_A, "the body"), (box, "1. a note")),
+            zones=[FOOT_ZONE],
+            quotes=[zone_over(box)],
+        )
+
+        self.assertEqual(entry["footnotes"], "1. a note")
+        self.assertEqual(entry["blockquotes"], [])
+
+    def test_a_page_with_no_zone_has_no_blockquote(self):
+        entry = build(paragraphs((QUOTE_A, "the body")))
+
+        self.assertEqual(entry["blockquotes"], [])
+        self.assertEqual(entry["zones"]["blockquotes"], [])
+
+    def test_the_blockquote_is_a_mark_of_the_body_text(self):
+        units = paragraphs((QUOTE_A, "In Lewis v. Marcotte"))
+        units[0]["marks"] = [em(3, 8)]
+        entry = build(
+            units + paragraphs((QUOTE_B, "the body")),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(
+            ensemble._marks(entry),
+            [
+                {
+                    "start": 0,
+                    "end": 20,
+                    "kind": "blockquote",
+                    "section": "text",
+                },
+                {"start": 3, "end": 8, "kind": "em", "section": "text"},
+            ],
+        )
+
+    def test_the_block_mark_goes_before_an_inline_mark_that_starts_with_it(
+        self,
+    ):
+        units = paragraphs((QUOTE_A, "Lewis v. Marcotte"))
+        units[0]["marks"] = [em(0, 5)]
+        entry = build(units, quotes=[zone_over(QUOTE_A)])
+
+        self.assertEqual(
+            [mark["kind"] for mark in ensemble._marks(entry)],
+            ["blockquote", "em"],
+        )
+
+
+class TestTheListReaders(TestCase):
+    """A blockquote group two engines read as a list is a list group."""
+
+    def test_two_engines_that_read_a_list_make_a_list_group(self):
+        entry = build(
+            paragraphs((QUOTE_A, "- a bullet", ("list_item", "list_item"))),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(
+            entry["groups"][0]["list_by"], ["dots_mocr", "mistral_ocr"]
+        )
+        self.assertEqual(entry["blockquotes"][0]["list_groups"], [0])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 1)
+
+    def test_one_engine_is_not_enough(self):
+        """dots.mocr labels a quoted statute's ``(1)`` a list item."""
+        entry = build(
+            paragraphs((QUOTE_A, "(1) a clause", ("list_item", "paragraph"))),
+            quotes=[zone_over(QUOTE_A)],
+        )
+
+        self.assertEqual(entry["groups"][0]["list_by"], ["dots_mocr"])
+        self.assertEqual(entry["blockquotes"][0]["list_groups"], [])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 0)
+
+    def test_a_list_outside_every_blockquote_is_no_list_group(self):
+        entry = build(
+            paragraphs((QUOTE_A, "- a bullet", ("list_item", "list_item")))
+        )
+
+        self.assertEqual(entry["blockquotes"], [])
+        self.assertEqual(entry["counts"]["blockquote_lists"], 0)
+
+    def test_a_silent_engine_reads_no_list(self):
+        group = group_of(
+            unit("dots_mocr", 0, QUOTE_A, "- a bullet", kind="list_item"),
+            unit("mistral_ocr", 0, QUOTE_A, "", kind="list_item"),
+        )
+
+        self.assertEqual(ensemble.list_readers(group), ["dots_mocr"])
+
+
+class TestTheBlockquoteCard(TestTheFindings):
+    def page(self, **values) -> dict:
+        page = page_of(
+            groups=[
+                {
+                    "id": 0,
+                    "text": "1. The first item of a list that is long",
+                    "list_by": ["mistral_ocr", "dots_mocr"],
+                },
+                {"id": 1, "text": "a quote", "list_by": []},
+            ],
+            **values,
+        )
+        page["blockquotes"] = [
+            {"start": 0, "end": 49, "groups": [0, 1], "list_groups": [0]}
+        ]
+        return page
+
+    def rebuild_page(self, page) -> list[OpinionFinding]:
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_a_list_in_a_blockquote_is_its_own_card(self):
+        cards = self.rebuild_page(self.page(blockquotes=1, blockquote_lists=1))
+
+        self.assertEqual([c.check_name for c in cards], ["blockquote_list"])
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertIn(
+            "dots_mocr, mistral_ocr read 1 block(s) of a blockquote",
+            cards[0].message,
+        )
+        self.assertIn(
+            '"1. The first item of a list that..."', cards[0].message
+        )
+
+    def test_a_blockquote_with_no_list_has_no_card(self):
+        cards = self.rebuild(blockquotes=1)
+
+        self.assertEqual(cards, [])
+
+    def test_a_standing_dismissal_mutes_the_card(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.BLOCKQUOTE_LIST,
+        )
+
+        cards = self.rebuild_page(self.page(blockquotes=1, blockquote_lists=1))
+
+        self.assertEqual(cards[0].dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own(self):
+        self.assertIn(OpinionCheck.BLOCKQUOTE_LIST, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheBlockquoteOfAnOpinion(EnsembleTestCase):
+    """The fixture of the glue with a ``BLOCKQUOTE`` box over body A."""
+
+    #: A box a little wider than the first body cell of a page.
+    QUOTE = (BODY_A[0] - 20, BODY_A[1] - 20, BODY_A[2] + 20, BODY_A[3] + 20)
+
+    def quote(self, page_index, confidence=0.9):
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label=opinion_ocr.BLOCKQUOTE_LABEL,
+            label_id=int(Label.BLOCKQUOTE),
+            page_index=page_index,
+            source_page=page_index + 1,
+            confidence=confidence,
+            x0=self.QUOTE[0],
+            y0=self.QUOTE[1],
+            x1=self.QUOTE[2],
+            y1=self.QUOTE[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+
+    def test_the_row_holds_the_blockquote_as_a_mark(self):
+        self.quote(2)
+
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(row.text, "body A 2\n\nbody B 2")
+        self.assertEqual(
+            row.marks,
+            [{"start": 0, "end": 8, "kind": "blockquote", "section": "text"}],
+        )
+        self.assertNotIn("<", row.text)
+
+    def test_a_box_under_the_floor_is_no_blockquote(self):
+        self.quote(2, confidence=0.5)
+
+        document = self.run_ensemble()
+
+        self.assertEqual(document["pages"][1]["blockquotes"], [])
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
+        self.assertEqual(row.marks, [])

@@ -2416,7 +2416,7 @@ class OpinionReviewStatus(models.TextChoices):
 class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
-    The first seven are the warnings the review shows on a page. The
+    The first eight are the warnings the review shows on a page. The
     last three are facts about the opinion row itself.
     """
 
@@ -2433,6 +2433,7 @@ class OpinionCheck(models.TextChoices):
         "footnote_unsure",
         "An engine read a footnote no detection covers",
     )
+    BLOCKQUOTE_LIST = "blockquote_list", "A blockquote may be a list"
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
@@ -2915,10 +2916,12 @@ class OpinionText(AbstractDateTimeModel):
         blank=True,
         help_text=(
             "The formatting the engines read (#404): "
-            "``{'start': int, 'end': int, 'kind': 'em' | 'strong' | 'sup', "
-            "'section': 'text' | 'footnotes'}``, with the offsets against "
-            "the field ``section`` names. A cache like ``text``, and of "
-            "``text``: an edit of ``human_text`` moves every offset."
+            "``{'start': int, 'end': int, 'kind': 'em' | 'strong' | 'sup' "
+            "| 'blockquote', 'section': 'text' | 'footnotes'}``, with the "
+            "offsets against the field ``section`` names. A ``blockquote`` "
+            "mark spans one run of quoted groups of the body (#411). A "
+            "cache like ``text``, and of ``text``: an edit of "
+            "``human_text`` moves every offset."
         ),
     )
     human_text = models.TextField(

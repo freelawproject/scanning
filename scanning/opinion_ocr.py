@@ -87,6 +87,15 @@ fact. The engines' own footnote labels (``EngineSpec.footnote_types``)
 are exact and rare, so they decide nothing and the ensemble reads them
 for one card alone.
 
+**The blockquote zone is the second zone of a page (#411).** The
+``BLOCKQUOTE`` detections go on every engine's page as
+``zones.blockquotes``, from the same table of zones (:data:`ZONES`)
+and the same query. A model box counts only at
+``settings.BLOCKQUOTE_MIN_CONFIDENCE`` or more: the model also boxes
+lists as blockquotes (#211), and a wrong tag is a wrong input of the
+tagger. A box a person drew or approved has confidence 1.0 and always
+counts.
+
 **The path is the invariant key.** ``Opinion.glue_prefix`` is
 ``jobs/opinions/{first_printed_page}.{index_in_page}/r{glue_revision}/``,
 so a script that walks the bucket finds an opinion by the printed page
@@ -129,6 +138,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from blackletter.models import Label
+from django.conf import settings
 from django.db.models import F, Q
 from django.utils import timezone
 
@@ -161,8 +171,9 @@ logger = logging.getLogger(__name__)
 #: Version of the documents this module writes. 2 puts the footnote
 #: zone on every page (#399); 3 deletes the headnote bracket from the
 #: unit text (#373); 4 parses the engine's markup into ``marks`` and
-#: ``kind`` beside a plain ``text`` (#404).
-SCHEMA_VERSION = 4
+#: ``kind`` beside a plain ``text`` (#404); 5 puts the blockquote zone
+#: beside the footnote zone (#411).
+SCHEMA_VERSION = 5
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -199,6 +210,42 @@ MANUAL_BRACKET_MAX_INDENT_PT = 20.0
 
 #: The detection label of the footnote band of a page (#399).
 FOOTNOTE_LABEL = Label.FOOTNOTES.name
+
+#: The detection label of a blockquote (#411).
+BLOCKQUOTE_LABEL = Label.BLOCKQUOTE.name
+
+
+@dataclass(frozen=True)
+class Zone:
+    """One kind of zone the glue freezes on every page.
+
+    :param label: The detection label whose rows are the zone.
+    :param count_key: The key of the manifest counts.
+    :param floor_setting: The name of the setting that holds the least
+        confidence of a row that counts, or empty for every row.
+    """
+
+    label: str
+    count_key: str
+    floor_setting: str = ""
+
+    def counts(self, row) -> bool:
+        """Return whether one live row of the label is part of the zone."""
+        if not self.floor_setting:
+            return True
+        return row.confidence >= getattr(settings, self.floor_setting)
+
+
+#: The zones of a page, by the name they take under ``zones`` (#399,
+#: #411). The ensemble reads them by these names. A hand-drawn row
+#: counts like a model row: a curator who drew the box said where the
+#: zone is.
+ZONES: dict[str, Zone] = {
+    "footnotes": Zone(FOOTNOTE_LABEL, "footnote_zones"),
+    "blockquotes": Zone(
+        BLOCKQUOTE_LABEL, "blockquote_zones", "BLOCKQUOTE_MIN_CONFIDENCE"
+    ),
+}
 
 #: The file that says a revision is glued, written last.
 MANIFEST = "manifest.json"
@@ -600,9 +647,10 @@ class ScanInputs:
     :param printed: ``{page_index: value}``, the approved page number
         of every final page that has one, off the run's printed-page
         map (#396).
-    :param footnotes: ``{page_index: [Detection]}``, the live
-        ``FOOTNOTES`` rows of the run (#399), in render pixels. They
-        become the page's zone in points once the page size is known.
+    :param zones: ``{zone name: {page_index: [Detection]}}``, the live
+        rows of every :data:`ZONES` label in the run (#399, #411), in
+        render pixels. They become the page's zones in points once the
+        page size is known.
     """
 
     run: object
@@ -610,7 +658,7 @@ class ScanInputs:
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
-    footnotes: dict[int, list] = field(default_factory=dict)
+    zones: dict[str, dict[int, list]] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -666,15 +714,18 @@ def load_inputs(scan: Scan) -> ScanInputs:
         .distinct()
     ):
         inputs.renders.setdefault(page_index, (width, height))
-    # The footnote band of every page, the run's space alone again
-    # (#399). A hand-drawn row counts like a model row: a curator who
-    # drew the band said where the footnotes are.
+    # The zones of every page, the run's space alone again (#399,
+    # #411), one query for every label of the table.
+    by_label = {zone.label: name for name, zone in ZONES.items()}
+    inputs.zones = {name: {} for name in ZONES}
     for row in (
         Detection.objects.live()
-        .filter(scan=scan, apply_run=run, label=FOOTNOTE_LABEL)
+        .filter(scan=scan, apply_run=run, label__in=list(by_label))
         .order_by("page_index", "y0", "x0")
     ):
-        inputs.footnotes.setdefault(row.page_index, []).append(row)
+        name = by_label[row.label]
+        if ZONES[name].counts(row):
+            inputs.zones[name].setdefault(row.page_index, []).append(row)
     return inputs
 
 
@@ -746,13 +797,13 @@ def page_size_pt(
 
 
 def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
-    """Return the footnote zone of one page, in points (#399).
+    """Return one zone of one page, in points (#399, #411).
 
-    One box per ``FOOTNOTES`` row, off the row's own render size, the
-    rule of ``opinion_pdf._image_rects``: the fields as they are, so a
-    zero render size falls back to the render density.
+    One box per row, off the row's own render size, the rule of
+    ``opinion_pdf._image_rects``: the fields as they are, so a zero
+    render size falls back to the render density.
 
-    :param rows: The page's ``FOOTNOTES`` detections.
+    :param rows: The page's detections of one :data:`ZONES` label.
     :param size: The page size in points.
     :returns: ``[[x0, y0, x1, y1], ...]``, rounded like every box.
     :rtype: list[list[float]]
@@ -1036,7 +1087,7 @@ def build_document(
         "partial": 0,
         "unjudged": 0,
         "page_number": 0,
-        "footnote_zones": 0,
+        **{zone.count_key: 0 for zone in ZONES.values()},
         "brackets_removed": 0,
         "marks": 0,
         "headings": 0,
@@ -1059,11 +1110,11 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
-            # The footnote band of the page, in points (#399). The same
-            # value on every engine's page, because it is a fact of the
-            # page and not of the engine. Empty when no detection drew
-            # it, or when no size puts it in points.
-            "zones": {"footnotes": []},
+            # The zones of the page, in points (#399, #411). The same
+            # value on every engine's page, because they are a fact of
+            # the page and not of the engine. Empty when no detection
+            # drew one, or when no size puts it in points.
+            "zones": {name: [] for name in ZONES},
             "units": [],
         }
         if size and frame:
@@ -1074,10 +1125,11 @@ def build_document(
                 "render_height": frame[1],
             }
         if size:
-            entry["zones"]["footnotes"] = zones_pt(
-                inputs.footnotes.get(page_index, []), size
-            )
-            counts["footnote_zones"] += len(entry["zones"]["footnotes"])
+            for name, zone in ZONES.items():
+                entry["zones"][name] = zones_pt(
+                    inputs.zones.get(name, {}).get(page_index, []), size
+                )
+                counts[zone.count_key] += len(entry["zones"][name])
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
