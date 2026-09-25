@@ -487,6 +487,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             ),
             "edit_text_url": address("edit_opinion_text"),
             "edit_section_url": address("edit_opinion_section"),
+            "edit_blockquote_url": address("edit_opinion_blockquote"),
             "edit_move_url": address("move_opinion_block"),
             "edit_withdraw_url": address("withdraw_opinion_edit"),
             # The approval (#375): offered where the endpoint takes it,

@@ -42,6 +42,7 @@ from scanning.views_api import (
     dismiss_finding,
     dismiss_opinion_finding,
     dismiss_redaction,
+    edit_opinion_blockquote,
     edit_opinion_section,
     edit_opinion_text,
     export_pdf,
@@ -268,6 +269,11 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/edits/section/",
         edit_opinion_section,
         name="edit_opinion_section",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/blockquote/",
+        edit_opinion_blockquote,
+        name="edit_opinion_blockquote",
     ),
     path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/edits/move/",

@@ -3133,9 +3133,11 @@ class OpinionFinding(AbstractDateTimeModel):
 class OpinionEdit(AbstractDateTimeModel):
     """One human edit of the text of one opinion (#376).
 
-    Three kinds: the text of one block (``TEXT``), the section of one
-    block (``SECTION``: the body or the footnotes), and the order of the
-    blocks of one section of one page (``ORDER``).
+    Four kinds: the text of one block (``TEXT``), the section of one
+    block (``SECTION``: the body or the footnotes), the order of the
+    blocks of one section of one page (``ORDER``), and the blockquote of
+    one block (``BLOCKQUOTE``, #419): the whole block, or one span of
+    its text.
 
     **The address plus a copy of the box, never the group id.** The id
     of a group in the ensemble document is its place on the page, and
@@ -3161,6 +3163,7 @@ class OpinionEdit(AbstractDateTimeModel):
         TEXT = "text", "Text of a block"
         SECTION = "section", "Section of a block"
         ORDER = "order", "Order of the blocks of a page"
+        BLOCKQUOTE = "blockquote", "Blockquote of a block"
 
     opinion = models.ForeignKey(
         Opinion,
@@ -3204,7 +3207,9 @@ class OpinionEdit(AbstractDateTimeModel):
     base_text = models.TextField(
         blank=True,
         default="",
-        help_text="TEXT: the text the curator saw.",
+        help_text=(
+            "TEXT, and BLOCKQUOTE with a span: the text the curator saw."
+        ),
     )
     text = models.TextField(
         blank=True,
@@ -3215,6 +3220,21 @@ class OpinionEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text="ORDER: the box copies of the section, in the new order.",
+    )
+    quoted = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text=(
+            "BLOCKQUOTE: true for a blockquote, false for no blockquote."
+        ),
+    )
+    span = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "BLOCKQUOTE: [start, end] of the quoted text in base_text; "
+            "null = the whole block."
+        ),
     )
     glue_revision = models.PositiveSmallIntegerField(
         help_text="The glue revision the curator saw.",
