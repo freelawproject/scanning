@@ -195,10 +195,24 @@
   </div>
 
   <div class="card p-2">
-    <h2 class="text-xs font-bold mb-1">
-      The text
-      <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
-    </h2>
+    <div class="flex items-start gap-2 mb-1">
+      <h2 class="text-xs font-bold">
+        The text
+        <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
+      </h2>
+      {% if ensemble_written %}
+      {% comment %}
+        The guide of the page (#419). It opens only on a press of "?".
+      {% endcomment %}
+      <div class="relative ml-auto">
+        <button type="button" id="text-review-help-btn"
+                class="btn-ghost text-xs px-2 py-0.5 font-bold"
+                aria-expanded="false" aria-controls="text-review-help-panel"
+                title="What a click, a double click and the colours do">?</button>
+        {% include "scanning/_text_review_help.html" %}
+      </div>
+      {% endif %}
+    </div>
     {% if ensemble_written %}
     <div id="opinion-text" class="opinion-text"></div>
     {% elif ocr_written %}

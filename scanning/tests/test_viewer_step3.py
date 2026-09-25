@@ -337,3 +337,35 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
         editor = source[source.index("function openEditor(") :]
         editor = editor[: editor.index("\n    }\n")]
         self.assertIn("locked.editor = { area: area", editor)
+
+
+class TestTheHandFootnoteBandIsNoZone(SimpleTestCase):
+    """A footnote a person set gets a band of its own (#419)."""
+
+    def test_the_band_reads_the_section_edits(self):
+        source = VIEWER.read_text()
+        bands = source[source.index("function handFootnoteBands(") :]
+        bands = bands[: bands.index("\n    }\n")]
+        self.assertIn("group.section_edit", bands)
+        self.assertIn("sectionOf(group) !== FOOTNOTES", bands)
+        # One band per column: a union over both columns would cover
+        # the body text between them.
+        self.assertIn("group.column", bands)
+        self.assertNotIn("zones", bands)
+
+    def test_the_band_is_removed_with_the_zones_and_has_a_rule(self):
+        self.assertIn("'ensemble-zone ensemble-hand-zone'", VIEWER.read_text())
+        self.assertIn(".ensemble-zone.ensemble-hand-zone", STYLES.read_text())
+
+
+class TestTheGuideOpensOnAPressAlone(SimpleTestCase):
+    """The "?" of the text review opens the guide, and nothing else
+    does (#419): the guide of review 2 opens once per session."""
+
+    def test_the_guide_keeps_no_key_and_opens_on_the_click(self):
+        source = VIEWER.read_text()
+        guide = source[source.index("function bindHelp(") :]
+        guide = guide[: guide.index("\n    }\n")]
+        self.assertNotIn("Storage", guide)
+        self.assertEqual(guide.count("setOpen(panel.hidden)"), 1)
+        self.assertIn("setOpen(false)", guide)

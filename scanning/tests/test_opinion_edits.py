@@ -21,7 +21,7 @@ from django.contrib.messages import get_messages
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from scanning import ensemble, opinion_edits, opinion_findings
+from scanning import ensemble, opinion_edits, opinion_findings, views_api
 from scanning.factories import ScanFactory
 from scanning.models import (
     Opinion,
@@ -549,6 +549,93 @@ class TestTheOrderEdit(TestCase):
         self.assertEqual(page["unresolved_edits"], [])
 
 
+class TestTheBlocksBelow(TestCase):
+    """``ensemble.blocks_below``: the body blocks a push of "Put in the
+    footnotes" takes too (#419). Below is a place on the page and not
+    the reading order."""
+
+    LEFT_TOP = [36.0, 400.0, 288.0, 450.0]
+    LEFT_LOW = [36.0, 460.0, 288.0, 520.0]
+    RIGHT_LOW = [324.0, 460.0, 576.0, 520.0]
+    FULL_LOW = [36.0, 600.0, 576.0, 650.0]
+    LEFT_HIGH = [36.0, 100.0, 288.0, 300.0]
+
+    def group(
+        self, id, box, section=ensemble.BODY, section_edit=None, column=None
+    ):
+        return {
+            "id": id,
+            "box_pt": box,
+            "column": column,
+            "section": section,
+            "section_edit": section_edit,
+        }
+
+    def test_the_same_column_and_a_full_width_block_go(self):
+        groups = [
+            self.group(0, self.LEFT_HIGH),
+            self.group(1, self.LEFT_TOP),
+            self.group(2, self.LEFT_LOW),
+            self.group(3, self.RIGHT_LOW),
+            self.group(4, self.FULL_LOW),
+        ]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[1]), [2, 4])
+
+    def test_the_column_stamp_decides_over_a_loose_box(self):
+        """A group box is the union of the engines' boxes, and a box of
+        one column may cross the gutter (``STRADDLE_L``,
+        ``STRADDLE_R``). Two boxes that cross it by 15 points each share
+        30 points of x-range, and the stamp keeps them apart."""
+        gutter = 306.0
+        left = [36.0, 400.0, gutter + 15, 450.0]
+        right = [gutter - 15, 460.0, 576.0, 520.0]
+        left_low = [36.0, 530.0, gutter + 15, 580.0]
+        groups = [
+            self.group(0, left, column="L"),
+            self.group(1, right, column="R"),
+            self.group(2, left_low, column="L"),
+            self.group(3, self.FULL_LOW),
+        ]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[0]), [2, 3])
+
+    def test_the_last_block_takes_nothing(self):
+        groups = [self.group(0, self.LEFT_TOP), self.group(1, self.FULL_LOW)]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[1]), [])
+
+    def test_a_footnote_and_a_block_set_in_the_body_stay(self):
+        groups = [
+            self.group(0, self.LEFT_TOP),
+            self.group(1, self.LEFT_LOW, section=ensemble.FOOTNOTES),
+            self.group(2, self.FULL_LOW, section_edit=9),
+        ]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[0]), [])
+
+    def test_a_footnote_takes_no_block(self):
+        groups = [
+            self.group(0, self.LEFT_TOP, section=ensemble.FOOTNOTES),
+            self.group(1, self.LEFT_LOW),
+        ]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[0]), [])
+
+    def test_the_build_writes_below_on_the_body_blocks(self):
+        dots, mistral = alike(
+            (BODY_A_PT, "The court held."), (BODY_B_PT, "1 See the note.")
+        )
+
+        page = page_with(dots, mistral)
+
+        self.assertEqual(
+            group_at(page, BODY_A_PT)["below"],
+            [group_at(page, BODY_B_PT)["id"]],
+        )
+        self.assertEqual(group_at(page, BODY_B_PT)["below"], [])
+
+
 class TestTheSwappedOrder(TestCase):
     """``opinion_edits.swapped_order``: one place, inside the section."""
 
@@ -1034,6 +1121,66 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
             OpinionEdit.objects.filter(withdrawn_at__isnull=False).count(), 1
         )
 
+    def test_the_blocks_below_go_to_the_footnotes_too(self):
+        top = self.split_group()
+        below = self.alike_group()
+        self.assertEqual(top["below"], [below["id"]])
+
+        response = self.post(
+            "edit_opinion_section",
+            page_in_opinion=0,
+            group_id=top["id"],
+            section="footnotes",
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        self.assertEqual(
+            response.json()["message"],
+            views_api.EDIT_SECTION_BELOW_SAVED_MESSAGE.format(count=1),
+        )
+        page = self.page()
+        for box in (top["box_pt"], below["box_pt"]):
+            self.assertEqual(group_at(page, box)["section"], "footnotes")
+        self.assertEqual(
+            OpinionEdit.objects.filter(
+                kind=OpinionEdit.Kind.SECTION, withdrawn_at__isnull=True
+            ).count(),
+            2,
+        )
+
+        # Each block has its own Undo: the lower block goes back alone.
+        response = self.undo(group_at(page, below["box_pt"])["section_edit"])
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        page = self.page()
+        self.assertEqual(group_at(page, top["box_pt"])["section"], "footnotes")
+        self.assertEqual(group_at(page, below["box_pt"])["section"], "text")
+
+    def test_the_body_text_direction_moves_one_block(self):
+        top = self.split_group()
+        below = self.alike_group()
+        for group in (top, below):
+            self.write_edit(
+                kind=OpinionEdit.Kind.SECTION,
+                box_pt=group["box_pt"],
+                section="footnotes",
+            )
+        self.run_ensemble()
+
+        response = self.post(
+            "edit_opinion_section",
+            page_in_opinion=0,
+            group_id=group_at(self.page(), top["box_pt"])["id"],
+            section="text",
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        page = self.page()
+        self.assertEqual(group_at(page, top["box_pt"])["section"], "text")
+        self.assertEqual(
+            group_at(page, below["box_pt"])["section"], "footnotes"
+        )
+
     def test_an_edit_whose_block_is_gone_is_undone_from_its_card(self):
         """The one way out of an ``UNRESOLVED_EDIT`` card (#376)."""
         edit = self.write_edit(
@@ -1160,6 +1307,29 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
             "withdraw_opinion_edit",
         ):
             self.assertEqual(self.client.get(self.url(name)).status_code, 405)
+
+    def test_the_review_page_has_a_closed_guide(self):
+        """The guide opens on the "?" alone (#419), and names the menu
+        only where the page offers it."""
+        address = reverse("opinion_review", kwargs={"pk": self.opinion.pk})
+
+        response = self.client.get(address)
+
+        self.assertContains(response, 'id="text-review-help-btn"')
+        self.assertContains(
+            response,
+            '<div id="text-review-help-panel" '
+            'class="viewer-help-panel text-review-help-panel" hidden>',
+        )
+        self.assertContains(response, "The menu of a locked block")
+
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        response = self.client.get(address)
+
+        self.assertContains(response, 'id="text-review-help-btn"')
+        self.assertNotContains(response, "The menu of a locked block")
 
     def test_the_review_page_offers_the_edits_while_ready(self):
         response = self.client.get(

@@ -1,0 +1,39 @@
+{% comment %}
+  The guide of the text review (#419). The double click that locks a
+  block and opens its menu had no text anywhere on the page.
+
+  The panel opens only when the reviewer presses "?". The guide of
+  review 2 opens itself once per session; this one never does, because
+  a reviewer of many opinions meets it on every page.
+
+  The edit lines show where the toolbar shows (`can_edit`), the gate of
+  the endpoints: the page never describes a control it does not offer.
+{% endcomment %}
+<div id="text-review-help-panel" class="viewer-help-panel text-review-help-panel" hidden>
+  <h3>Select and lock</h3>
+  <ul class="viewer-help-list">
+    <li>Point to a block of the text or to a box of the page. The other column goes to the same block and marks it.</li>
+    <li><b>Double click</b> a block or a box to lock it. The readings of each engine open under the block{% if can_edit %}, and so does its menu{% endif %}.</li>
+    <li>Click outside the locked block to release it.</li>
+  </ul>
+
+  {% if can_edit %}
+  <h3>The menu of a locked block</h3>
+  <ul class="viewer-help-list">
+    <li><b>Edit text</b> writes the text of a block the engines did not read alike.</li>
+    <li><b>Move up</b> and <b>Move down</b> change the order of the blocks.</li>
+    <li><b>Put in the footnotes</b> moves the block and the body blocks below it in the same column. <b>Put in the body text</b> moves one block back.</li>
+    <li><b>Undo</b> gives back what the engines and the detections read. Nothing is deleted.</li>
+  </ul>
+  {% endif %}
+
+  <h3>Colours</h3>
+  <ul class="viewer-help-list">
+    <li><span class="viewer-help-swatch text-review-help-blocking"></span>Red: the engines did not agree, and the approval waits for a person.</li>
+    <li><span class="viewer-help-swatch text-review-help-warning"></span>Yellow: a majority of the engines read the block alike.</li>
+    <li>No box: every engine read the block alike. <b>Show the blocks all engines agree on</b> draws these boxes.</li>
+    <li><span class="viewer-help-swatch text-review-help-zone"></span>Footnote zone: the footnote detections of the page. A dotted band shows the footnotes set by hand.</li>
+    <li><span class="viewer-help-swatch text-review-help-quote"></span>Blockquote zone: the blockquote detections of the page.</li>
+    <li>A double border is a footnote block. A green edge on a text block shows text a person wrote.</li>
+  </ul>
+</div>
