@@ -24,6 +24,8 @@ from scanning.factories import (
     ScanFactory,
 )
 from scanning.models import (
+    BUSY_STATUSES,
+    REVIEW_STATUSES,
     CheckName,
     Detection,
     Issue,
@@ -47,6 +49,7 @@ from scanning.views_process import (
     RECOMPUTE_DONE_MESSAGE,
     REPAIRS_WAITING_MESSAGE,
     REVALIDATE_UNAVAILABLE_MESSAGE,
+    WATCHED_STATUSES,
 )
 
 
@@ -1240,3 +1243,57 @@ class TestThePageNumberGate(ScanningTestCase):
 
         self.assertEqual(response.context["pages_without_number"], [])
         self.assertContains(response, "Page review done")
+
+
+class TestTheParkedPageWatches(ScanningTestCase):
+    """A page parked in AWAITING_VALIDATION polls until READY (#332).
+
+    The bitonal merge parks the scan there while dots.mocr still reads,
+    and the busy poller's reload is the last one. The page watches that
+    status at its own cadence, and no other status that is not busy.
+    """
+
+    POLLER = "scanning/viewer_progress.js"
+
+    def setUp(self):
+        self.client.force_login(self.make_user())
+
+    def _step_one(self, status):
+        """Render step 1 of a scan in one status.
+
+        :param status: The status the scan holds.
+        :returns: The response.
+        """
+        scan = ScanFactory(
+            status=status, page_count=2, ocr_results=dots_results()
+        )
+        return self.client.get(
+            reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=1"
+        )
+
+    def test_the_parked_page_watches_its_status(self):
+        response = self._step_one(Status.AWAITING_VALIDATION)
+
+        self.assertTrue(response.context["watches_status"])
+        self.assertContains(response, self.POLLER)
+        self.assertContains(response, "progressWatch: 'awaiting_validation'")
+        self.assertContains(response, 'id="awaiting-msg"')
+
+    def test_a_busy_page_polls_without_watching(self):
+        response = self._step_one(Status.AWAITING)
+
+        self.assertContains(response, self.POLLER)
+        self.assertNotContains(response, "progressWatch")
+
+    def test_a_review_page_polls_nothing(self):
+        response = self._step_one(Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+
+        self.assertFalse(response.context["watches_status"])
+        self.assertNotContains(response, self.POLLER)
+        self.assertNotContains(response, "progressUrl")
+
+    def test_a_watched_status_is_neither_busy_nor_a_review(self):
+        """A watched status is the viewer's question alone: it must not
+        join the stale sweep or the unpolled review states."""
+        self.assertFalse(WATCHED_STATUSES & BUSY_STATUSES)
+        self.assertFalse(WATCHED_STATUSES & REVIEW_STATUSES)

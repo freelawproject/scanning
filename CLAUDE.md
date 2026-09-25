@@ -105,6 +105,7 @@ State is `Scan.status`. The stages, and where each runs:
 
 - Every status write is a compare-and-swap over the current status, never a full `save()`. A second writer is always live: the collect tick, a second tab, the daemon shutdown handler
 - The four review statuses (`models.REVIEW_STATUSES`) and AWAITING are not `BUSY_STATUSES`: no polling, no stale sweep. Only PROCESSING is swept
+- AWAITING_VALIDATION is watched, not busy (`views_process.WATCHED_STATUSES`, #332): the viewer polls it every five seconds, refreshes the run lines of the bar and reloads when the status moves. Never add it to `BUSY_STATUSES`, and never a review status to the watch
 - ERROR is terminal; the way back is the admin re-queue. `run_compute_redactions`, `run_apply_page_edits` and `run_create_opinions` never write ERROR; the first two count their failures on the run (`provider_meta["apply"]`, `ApplyRun.attempts`), loud then quiet, and the third parks in READY_FOR_REDACTION_REVIEW with the reason, which the step-2 bar shows (#336)
 - The dots.mocr and detection stages write no scan status while they read. The bitonal stage alone owns AWAITING
 - A derived state has one rule function that every writer and every reader calls: `review_states.redaction_review_ready`, `review_states.final_run`, `yolo.redactions_current`, `_review_flags`, `repairs.has_waiting`, `boundaries.standing`. Never write a second copy

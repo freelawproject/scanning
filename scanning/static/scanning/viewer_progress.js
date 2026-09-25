@@ -4,7 +4,14 @@
  * Shows progress bar, status messages, and live OCR results in the
  * sidebar while a scan is being processed by the daemon.
  *
- * Expects SCAN_CONFIG global: { docId, progressUrl }
+ * Expects SCAN_CONFIG global: { docId, progressUrl, progressWatch }
+ *
+ * ``progressWatch`` is the status the page was rendered in, set only
+ * for a status of ``views_process.WATCHED_STATUSES`` (#332). The scan
+ * is parked, not busy: the bitonal copy is merged and the GPU runs are
+ * still out. The collect tick moves the status, so the poll is slower,
+ * refreshes the run lines of the action bar in place when a run moves,
+ * and reloads once the status leaves the one it was rendered in.
  */
 
 (function () {
@@ -13,6 +20,8 @@
 
     var apiUrl = cfg.progressUrl;
     var lastPageCount = 0;
+    var WATCH_INTERVAL_MS = 5000;
+    var lastRuns = null;
 
     function renderPages(results) {
         var spages = document.getElementById("sidebar-pages");
@@ -110,6 +119,44 @@
         spages.innerHTML = html;
     }
 
+    function watch() {
+        if (document.hidden) {
+            setTimeout(watch, WATCH_INTERVAL_MS);
+            return;
+        }
+        fetch(apiUrl)
+            .then(function (r) {
+                return r.json();
+            })
+            .then(function (data) {
+                if (data.status !== cfg.progressWatch) {
+                    window.location.reload();
+                    return;
+                }
+                var amsg = document.getElementById("awaiting-msg");
+                if (amsg && data.message) amsg.textContent = data.message;
+                var runs = JSON.stringify([
+                    data.dots_run || null,
+                    data.yolo_run || null,
+                    data.mistral_run || null,
+                    data.surya_run || null,
+                ]);
+                // The first answer refreshes too: a run may have moved
+                // between the render and the first poll.
+                if (
+                    runs !== lastRuns &&
+                    typeof window.refreshProcessActionBar === "function"
+                ) {
+                    window.refreshProcessActionBar();
+                }
+                lastRuns = runs;
+                setTimeout(watch, WATCH_INTERVAL_MS);
+            })
+            .catch(function () {
+                setTimeout(watch, WATCH_INTERVAL_MS);
+            });
+    }
+
     function poll() {
         fetch(apiUrl)
             .then(function (r) {
@@ -151,5 +198,6 @@
                 setTimeout(poll, 2000);
             });
     }
-    poll();
+    if (cfg.progressWatch) watch();
+    else poll();
 })();

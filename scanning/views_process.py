@@ -195,6 +195,16 @@ LOCKED_STATUSES = frozenset(
     }
 )
 
+#: The statuses the viewer watches without calling the scan busy
+#: (#332). AWAITING_VALIDATION is where the bitonal merge parks a scan
+#: while the dots.mocr run is still out, and the collect tick moves it
+#: to READY with no one on the page to see it. The page polls it at a
+#: slower cadence, refreshes the run lines of the bar, and reloads when
+#: the status moves. It stays out of ``BUSY_STATUSES``, which also
+#: gates the stale sweep and the step chooser, and the four review
+#: statuses stay unpolled.
+WATCHED_STATUSES = frozenset({Status.AWAITING_VALIDATION})
+
 #: What a page file may start with, and the extension that says what
 #: it is. The content type is the browser's word, and the stored
 #: extension decides how ``views_api.export_pdf`` and the apply (#206)
@@ -534,6 +544,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """
     scan = get_object_or_404(Scan.objects.select_related("reporter"), pk=pk)
     is_processing = scan.status in BUSY_STATUSES
+    watches_status = scan.status in WATCHED_STATUSES
     # Breadcrumb for the web-pod observability trail (issue #115): this view
     # does an S3 pull plus a render over potentially large detection sets, so a
     # hang/OOM here should leave a marker in the pod logs and Sentry.
@@ -944,6 +955,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "ocr_by_page_json": json.dumps(ocr_by_page),
             "has_detections": has_detections,
             "is_processing": is_processing,
+            "watches_status": watches_status,
             "dots_run": dots_run,
             "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
