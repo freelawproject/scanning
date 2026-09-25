@@ -5,9 +5,11 @@
   Opinion row. The legacy pipeline's opinions have their own page,
   linked under the title.
 
-  Each row carries open_findings and stale_findings, which the view
-  stamps after the pagination from opinions.finding_counts: one grouped
-  query for the 50 rows of this page, the badge rule of the scan list.
+  Each row carries open_findings, stale_findings and blocking_findings,
+  which the view stamps after the pagination from
+  opinions.finding_counts: one grouped query for the 50 rows of this
+  page, the badge rule of the scan list. The blocking count is the gate
+  of the approval of the text (#375).
 {% endcomment %}
 
 {% block title %}Opinions - FLP Scanning Portal{% endblock %}
@@ -104,6 +106,7 @@
         <td class="px-4 py-3 text-sm whitespace-nowrap">
           {% if opinion.open_findings %}
           <span class="text-yellow-700 dark:text-yellow-300 font-medium">{{ opinion.open_findings }}</span>
+          {% if opinion.blocking_findings %}<span class="ml-1 text-xs font-bold text-red-700 dark:text-red-300" title="Findings the approval of the text waits on">{{ opinion.blocking_findings }} blocking</span>{% endif %}
           {% if opinion.stale_findings %}<span class="ml-1 text-xs font-bold uppercase text-red-700 dark:text-red-300" title="A decision of a curator is not applied">{{ opinion.stale_findings }} not applied</span>{% endif %}
           {% else %}
           <span class="text-gray-400">&mdash;</span>

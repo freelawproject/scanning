@@ -34,7 +34,6 @@ from scanning.forms import (
     ProfileForm,
 )
 from scanning.models import (
-    Issue,
     Opinion,
     OpinionReviewStatus,
     OpinionScan,
@@ -50,6 +49,8 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
+from scanning.opinion_review import MIN_DOCUMENT_SCHEMA
+from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
 
@@ -265,7 +266,11 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
     for row in page_obj:
-        row.open_findings, row.stale_findings = counts.get(row.pk, (0, 0))
+        (
+            row.open_findings,
+            row.stale_findings,
+            row.blocking_findings,
+        ) = counts.get(row.pk, (0, 0, 0))
 
     return render(
         request,
@@ -376,10 +381,13 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     link (``opinion_file_index``), the rule of the volume's own glued
     outputs (#243).
 
-    The one write control is "Read the OCR documents again", which
-    posts to ``rerun_opinion_ensemble``. The approval, the dismissal
-    and the typing of a page come with the review that closes an
-    opinion.
+    The write controls are "Read the OCR documents again"
+    (``rerun_opinion_ensemble``), the dismissal of a card (#419), the
+    edits of a locked block (#376), and the approval of the text with
+    its staff reopen (#375). The approval is held while a card of
+    ``opinion_review.blocking_findings`` is open, and the cards are
+    sorted by the same rule (``opinion_review.blocks``, imported as
+    ``blocks_approval``: this view is named ``opinion_review``).
 
     :param request: The current HTTP request.
     :param pk: The primary key of the opinion.
@@ -423,10 +431,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     # Two lists (#419): the ERROR cards the approval waits on, with the
     # stale ones, and the warnings. A dismissed card goes to the end of
     # its list; the sort is stable, so the page order stays.
-    blocking = [
-        row.severity == Issue.Severity.ERROR or row.is_stale
-        for row in findings
-    ]
+    blocking = [blocks_approval(row) for row in findings]
     to_check = sorted(
         (row for row, block in zip(findings, blocking) if block),
         key=lambda row: row.dismissal_id is not None,
@@ -484,6 +489,33 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "edit_section_url": address("edit_opinion_section"),
             "edit_move_url": address("move_opinion_block"),
             "edit_withdraw_url": address("withdraw_opinion_edit"),
+            # The approval (#375): offered where the endpoint takes it,
+            # and held while a blocking card is open. The view is the
+            # gate; the button follows it.
+            "can_approve": (
+                opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+                and ensemble.is_written(opinion)
+            ),
+            "blocking_count": sum(
+                1
+                for row, block in zip(findings, blocking)
+                if block and row.dismissal_id is None
+            ),
+            # The two other refusals a render can know of (#375). An
+            # edit the text does not hold yet is a fact of the row, so
+            # the button says so here. The schema of the document is a
+            # fact of the bucket, which this view never reads: the
+            # script holds the button on a document older than this.
+            "approve_not_built": (
+                opinion.edit_revision != opinion.ensemble_edit_revision
+            ),
+            "min_document_schema": MIN_DOCUMENT_SCHEMA,
+            "approve_url": address("approve_opinion_text"),
+            "can_reopen": (
+                request.user.is_staff
+                and opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE
+            ),
+            "reopen_url": address("reopen_opinion_text"),
             # Absent when the PDF pass has not written the file at
             # the live revision: the template shows the reason instead
             # of the two links and the column of the pages.

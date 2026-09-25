@@ -2770,6 +2770,29 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
     return document
 
 
+def printed_numbers(printed: dict) -> dict[int, str]:
+    """Return the approved page number of every final page (#396, #375).
+
+    **The one parse** of a printed-page map into numbers: the OCR glue
+    reads it for the page-number verdict and the text approval for the
+    page table. The map is the one review 1 approved, the model's
+    reading with the curator's own numbers over it. A page with no
+    number is absent, so a reader's ``get`` answers None.
+
+    :param printed: The document of :func:`load_printed_pages`.
+    :returns: ``{page_index: value}``, the index 0-based.
+    :rtype: dict[int, str]
+    """
+    numbers: dict[int, str] = {}
+    for page in printed.get("pages") or []:
+        if not isinstance(page, dict) or not page.get("printed"):
+            continue
+        final = page.get("final_page")
+        if isinstance(final, int) and final > 0:
+            numbers[final - 1] = str(page["printed"])
+    return numbers
+
+
 def viewer_pages(printed: dict) -> tuple[list[dict], dict[int, dict]]:
     """Return the step-2 page map and page-number labels of a run.
 

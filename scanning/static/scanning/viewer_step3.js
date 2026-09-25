@@ -2443,6 +2443,72 @@
         });
     }
 
+    /**
+     * The approval of the text, and its staff reopen (#375).
+     *
+     * The approval sends the revisions of the text this page drew
+     * (``postEdit``), so the curator approves the text they saw, and a
+     * page older than the stamped text is refused. A warning card asks
+     * for a confirm; a blocking card holds the button, which the
+     * template writes disabled, and the server refuses it too. Both
+     * answers are Django messages, so the page reloads to show them.
+     */
+    function holdOldApproval() {
+        // The approval reads a document of this schema or later (#375),
+        // and the endpoint refuses an older one. The render never reads
+        // the bucket, so the page holds the button once it has the
+        // document, and the template writes the least schema.
+        var approve = document.getElementById('approve-text');
+        if (!approve || !doc) { return; }
+        var least = Number(approve.dataset.minSchema || 0);
+        if ((doc.schema_version || 0) >= least) { return; }
+        approve.disabled = true;
+        approve.title = 'This text was written by an older version. Press '
+            + '"Read the OCR documents again", then approve.';
+        approve.textContent = 'Read the OCR documents again to approve';
+    }
+
+    function bindApproval() {
+        var approve = document.getElementById('approve-text');
+        if (approve) {
+            approve.addEventListener('click', function () {
+                if (approve.disabled) { return; }
+                if (!doc) {
+                    showToast('The text is not loaded yet. Wait, then '
+                        + 'approve.', 'error');
+                    return;
+                }
+                var warnings = Number(approve.dataset.openWarnings || 0);
+                var asked = warnings
+                    ? warnings + ' warning(s) of this opinion are open. '
+                        + 'Approve the text anyway?'
+                    : 'Approve the text of this opinion?';
+                if (!window.confirm(asked)) { return; }
+                postEdit(endpoint('approveUrl'), {}, approve);
+            });
+        }
+        var reopen = document.getElementById('reopen-text');
+        if (reopen) {
+            reopen.addEventListener('click', function () {
+                if (!window.confirm('Open the text review of this opinion '
+                    + 'again? The approved text stays until the next '
+                    + 'approval.')) { return; }
+                reopen.disabled = true;
+                fetch(endpoint('reopenUrl'), {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRFToken': csrfToken() }
+                })
+                    .then(function () { window.location.reload(); })
+                    .catch(function () {
+                        showToast('The request got no answer. Try again.',
+                            'error');
+                        reopen.disabled = false;
+                    });
+            });
+        }
+    }
+
     // -----------------------------------------------------------------
     // The load
     // -----------------------------------------------------------------
@@ -2479,6 +2545,7 @@
                     );
                 }
                 bindUnresolvedCards();
+                holdOldApproval();
                 if (!hasLevels()) {
                     textColumn.insertBefore(note(
                         'opinion-text-error',
@@ -2532,6 +2599,7 @@
         pagesColumn = document.getElementById('opinion-pages');
         textColumn = document.getElementById('opinion-text');
         bindRerun();
+        bindApproval();
         bindFindings();
         bindZoom();
         bindQuiet();

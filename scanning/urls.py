@@ -33,6 +33,7 @@ from scanning.views_api import (
     add_single_detection,
     apply_rect_to_opinion,
     approve_detection,
+    approve_opinion_text,
     approve_scan,
     bake_redactions,
     compute_redactions_api,
@@ -48,6 +49,7 @@ from scanning.views_api import (
     move_opinion_block,
     move_redaction,
     rebuild_findings,
+    reopen_opinion_text,
     rerun_opinion_ensemble,
     restore_boundary,
     restore_finding,
@@ -276,6 +278,17 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/edits/withdraw/",
         withdraw_opinion_edit,
         name="withdraw_opinion_edit",
+    ),
+    # The approval of the text, and the staff reopen (#375).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/approve-text/",
+        approve_opinion_text,
+        name="approve_opinion_text",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/reopen-text/",
+        reopen_opinion_text,
+        name="reopen_opinion_text",
     ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).
