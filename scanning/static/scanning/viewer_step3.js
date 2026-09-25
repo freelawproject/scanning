@@ -40,6 +40,11 @@
  * group and never off its place in the list: a page shows its body
  * text, then its footnotes in a block of their own, and the page
  * draws its footnote zones under the boxes.
+ *
+ * A blockquote is a run the document writes (``page.blockquotes``,
+ * #411), and the viewer never derives one: the groups of a run go in
+ * one ``<blockquote>`` element, and the page draws the blockquote
+ * zones beside the footnote zones.
  */
 
 (function () {
@@ -397,6 +402,12 @@
             placeOver(zone, box, scale);
             wrapper.appendChild(zone);
         });
+        ((page.zones || {}).blockquotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-quote-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
         (page.groups || []).forEach(function (group) {
             var box = group.box_pt;
             if (!box) { return; }
@@ -408,6 +419,7 @@
             el.dataset.section = sectionOf(group);
             if (group.weak) { el.classList.add('weak'); }
             if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
+            if (group.blockquote) { el.dataset.blockquote = 'true'; }
             placeOver(el, box, scale);
             wrapper.appendChild(el);
         });
@@ -539,18 +551,64 @@
                 ));
             } else {
                 var footnotes = [];
+                var runs = runOfGroup(page);
+                var quote = null;
+                var quoteRun = -1;
                 page.groups.forEach(function (group) {
                     if (sectionOf(group) === FOOTNOTES) {
                         footnotes.push(group);
-                    } else {
-                        block.appendChild(groupNode(page, group));
+                        return;
                     }
+                    var run = runs[group.id];
+                    if (run === undefined) {
+                        quote = null;
+                        block.appendChild(groupNode(page, group));
+                        return;
+                    }
+                    if (!quote || quoteRun !== run) {
+                        quote = blockquoteNode(page.blockquotes[run]);
+                        quoteRun = run;
+                        block.appendChild(quote);
+                    }
+                    quote.appendChild(groupNode(page, group));
                 });
                 if (footnotes.length) {
                     block.appendChild(footnoteBlock(page, footnotes));
                 }
             }
             textColumn.appendChild(block);
+        });
+    }
+
+    /**
+     * Return the blockquote run of every quoted group of one page.
+     *
+     * The runs are the document's (``ensemble.blockquote_runs``,
+     * #411): the viewer reads them and never finds its own, so the
+     * text column shows the quote the tagger reads.
+     *
+     * @param {Object} page - The page entry.
+     * @returns {Object} ``{group id: index into page.blockquotes}``.
+     */
+    function runOfGroup(page) {
+        var runs = {};
+        (page.blockquotes || []).forEach(function (run, index) {
+            (run.groups || []).forEach(function (id) { runs[id] = index; });
+        });
+        return runs;
+    }
+
+    /**
+     * Return whether a group is a list group of its blockquote (#411):
+     * the ensemble says so, off the engines that read it as a list.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {boolean} Whether it is.
+     */
+    function isQuotedList(page, group) {
+        return (page.blockquotes || []).some(function (run) {
+            return (run.list_groups || []).indexOf(group.id) >= 0;
         });
     }
 
@@ -761,6 +819,26 @@
             node.classList.add('differs');
         }
         return node;
+    }
+
+    /**
+     * Build the element of one blockquote run (#411). The groups go in
+     * it as the run lists them.
+     *
+     * @param {Object} run - The run entry of ``page.blockquotes``.
+     * @returns {HTMLElement} The element.
+     */
+    function blockquoteNode(run) {
+        var quote = document.createElement('blockquote');
+        quote.className = 'ensemble-blockquote';
+        quote.title = 'The text under a blockquote detection of this page.';
+        if ((run.list_groups || []).length) {
+            quote.classList.add('ensemble-quote-list');
+            quote.title = 'The text under a blockquote detection of this '
+                + 'page. Engines read part of it as a list, so it may be '
+                + 'a list and not a quote.';
+        }
+        return quote;
     }
 
     /**
@@ -1242,6 +1320,13 @@
                 labellers.join(', ')
                 + (labellers.length === 1 ? ' calls' : ' call')
                 + ' this a footnote; no footnote zone here'
+            );
+        }
+        if (isQuotedList(page, group)) {
+            // The tag stays: the card warns and changes nothing (#411).
+            parts.push(
+                (group.list_by || []).join(', ')
+                + ' read this as a list; the blockquote may be a list'
             );
         }
         return parts.length ? '[' + parts.join('; ') + ']' : '';

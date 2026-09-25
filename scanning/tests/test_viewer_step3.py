@@ -96,6 +96,8 @@ class TestEveryPanelClassHasARule(SimpleTestCase):
         self.assertIn("ensemble-why", written, "the reason line is gone")
         self.assertIn("ensemble-footnotes", written, "the block is gone")
         self.assertIn("ensemble-zone", written, "the zone is gone")
+        self.assertIn("ensemble-blockquote", written, "the quote is gone")
+        self.assertIn("ensemble-quote-zone", written, "the band is gone")
         for name in sorted(written):
             self.assertIn(
                 f".{name}",
@@ -172,3 +174,26 @@ class TestTheMarksAreNodes(SimpleTestCase):
     def test_a_table_with_no_rows_draws_its_text(self):
         source = VIEWER.read_text()
         self.assertIn("kind === 'table' && (group.table || []).length", source)
+
+
+class TestTheBlockquoteIsTheDocumentsOwn(SimpleTestCase):
+    """The viewer draws the runs the ensemble wrote (#411)."""
+
+    def test_the_viewer_reads_the_runs_of_the_page(self):
+        """A run the browser found by itself could differ from the one
+        the tagger reads."""
+        source = VIEWER.read_text()
+        self.assertIn("page.blockquotes", source)
+        self.assertIn("run.list_groups", source)
+        self.assertIn("document.createElement('blockquote')", source)
+
+    def test_the_quote_is_built_with_the_group_nodes(self):
+        """The blockquote holds the group nodes and sets no HTML."""
+        source = VIEWER.read_text()
+        block = source[
+            source.index("function blockquoteNode(") : source.index(
+                "function differs("
+            )
+        ]
+        for name in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(name, block)

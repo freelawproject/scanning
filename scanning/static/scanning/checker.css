@@ -1255,6 +1255,16 @@ a.doc-name:hover { text-decoration: underline; }
     border-top: 1px dashed rgba(8, 145, 178, 0.8);
     background: rgba(8, 145, 178, 0.07);
 }
+/* The blockquote zone (#411): a band on the left edge, in the colour */
+/* the detection drawer gives BLOCKQUOTE, and a box in the quote. */
+.ensemble-zone.ensemble-quote-zone {
+    border-top: none;
+    border-left: 2px dashed rgba(146, 64, 14, 0.8);
+    background: rgba(146, 64, 14, 0.06);
+}
+.ensemble-box[data-blockquote="true"] {
+    border-left-width: 4px;
+}
 .ensemble-box.ensemble-doubt {
     outline: 1px dashed #b45309;
     outline-offset: 2px;
@@ -1331,6 +1341,15 @@ li.ensemble-group {
     border-left-color: #dc2626;
 }
 .ensemble-group.ensemble-doubt:not(.ensemble-selected) {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-blockquote {
+    margin: 0 0 10px 12px;
+    padding-left: 8px;
+    border-left: 3px solid rgba(146, 64, 14, 0.5);
+}
+.ensemble-blockquote.ensemble-quote-list {
     border-left-style: dashed;
     border-left-color: #b45309;
 }
