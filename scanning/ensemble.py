@@ -3333,7 +3333,12 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             # and ``update_or_create`` between two of them is a lost
             # select and an ``IntegrityError``. The lock is held over
             # row writes alone: no HTTP call is inside it.
-            Opinion.objects.select_for_update().filter(pk=opinion.pk).exists()
+            before = (
+                Opinion.objects.select_for_update()
+                .filter(pk=opinion.pk)
+                .values_list("ensemble_revision", "ensemble_edit_revision")
+                .first()
+            )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
             stamped = Opinion.objects.filter(
@@ -3376,8 +3381,56 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             opinion,
             opinion.scan_id,
         )
+        _drop_unstamped(opinion, key, edit_revision)
         raise
+    _drop_superseded(opinion, before, edit_revision)
     return document
+
+
+def _drop_superseded(
+    opinion: Opinion, before: tuple | None, edit_revision: int
+) -> None:
+    """Delete the document the new stamp replaced, best effort (#376).
+
+    Each build over a new edit revision writes a key of its own, so the
+    document of the stamp before it is read by nothing once the row
+    names the new one: the stamps only rise, and no build stamps an old
+    revision again. Only a document under the same glue prefix is this
+    function's; a re-glue leaves the old prefix whole, as before #376.
+
+    :param opinion: The row, with the new stamp.
+    :param before: ``(ensemble_revision, ensemble_edit_revision)`` read
+        under the lock, before the stamp.
+    :param edit_revision: The edit revision of the new stamp.
+    """
+    if not before:
+        return
+    old_revision, old_edit = before
+    if old_revision != opinion.ocr_glue_revision or old_edit == edit_revision:
+        return
+    s3_sync.delete_objects([document_key(opinion, old_edit)])
+
+
+def _drop_unstamped(opinion: Opinion, key: str, edit_revision: int) -> None:
+    """Delete the document of a build that lost the swap, best effort.
+
+    The stamp the build did not write is behind the row's revisions, and
+    they only rise, so no later build stamps that key. The one case to
+    spare is a key the row names now: a build of the same revisions that
+    won before this one lost, which wrote the same key.
+
+    :param opinion: The row, as the build read it.
+    :param key: The key this build uploaded.
+    :param edit_revision: The edit revision the build read.
+    """
+    stamp = (
+        Opinion.objects.filter(pk=opinion.pk)
+        .values_list("ensemble_revision", "ensemble_edit_revision")
+        .first()
+    )
+    if stamp == (opinion.ocr_glue_revision, edit_revision):
+        return
+    s3_sync.delete_objects([key])
 
 
 def rerun(opinion: Opinion) -> dict:

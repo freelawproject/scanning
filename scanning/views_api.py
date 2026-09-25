@@ -1559,7 +1559,12 @@ def move_opinion_block(
         return target
     page, group, address = target
     direction = body.get("direction")
-    if direction not in EDIT_MOVE_SAVED_MESSAGE:
+    # A list or an object is no key of the table and would raise in the
+    # lookup, so the type is read first.
+    if (
+        not isinstance(direction, str)
+        or direction not in EDIT_MOVE_SAVED_MESSAGE
+    ):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     section = group.get("section") or ensemble.BODY
     same = [

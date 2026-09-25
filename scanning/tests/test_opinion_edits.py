@@ -638,6 +638,79 @@ class TestTheWriteWithEdits(EditTestCase):
         ):
             ensemble.rerun(self.opinion)
 
+    def test_a_new_stamp_deletes_the_document_it_replaced(self):
+        old_key = ensemble.document_key(self.opinion)
+        self.write_edit(
+            kind=OpinionEdit.Kind.SECTION,
+            box_pt=self.alike_group()["box_pt"],
+            section=ensemble.FOOTNOTES,
+        )
+        self.opinion.refresh_from_db()
+
+        with patch("scanning.s3_sync.delete_objects") as delete:
+            ensemble.rerun(self.opinion)
+
+        delete.assert_called_once_with([old_key])
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(ensemble.document_key(self.opinion), old_key)
+
+    def test_a_build_of_the_same_revisions_deletes_nothing(self):
+        with patch("scanning.s3_sync.delete_objects") as delete:
+            ensemble.rerun(self.opinion)
+
+        delete.assert_not_called()
+
+    def test_a_build_that_lost_the_swap_deletes_its_own_document(self):
+        self.write_edit(
+            kind=OpinionEdit.Kind.SECTION,
+            box_pt=self.alike_group()["box_pt"],
+            section=ensemble.FOOTNOTES,
+        )
+        self.opinion.refresh_from_db()
+        lost = ensemble.document_key(self.opinion, 1)
+
+        def edit_now(*args, **kwargs):
+            Opinion.objects.filter(pk=self.opinion.pk).update(edit_revision=5)
+            return 0
+
+        with (
+            patch("scanning.ensemble.rebuild_findings", side_effect=edit_now),
+            patch("scanning.s3_sync.delete_objects") as delete,
+            self.assertRaises(ensemble.RevisionMoved),
+        ):
+            ensemble.rerun(self.opinion)
+
+        delete.assert_called_once_with([lost])
+
+    def test_a_lost_build_spares_the_key_a_winner_stamped(self):
+        """Two builds of the same revisions write one key.
+
+        The winner committed its stamp before this build reached its
+        swap, and an edit then raised the revision under this build.
+        """
+        self.write_edit(
+            kind=OpinionEdit.Kind.SECTION,
+            box_pt=self.alike_group()["box_pt"],
+            section=ensemble.FOOTNOTES,
+        )
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            ensemble_edit_revision=1
+        )
+        self.opinion.refresh_from_db()
+
+        def moved(*args, **kwargs):
+            Opinion.objects.filter(pk=self.opinion.pk).update(edit_revision=2)
+            return 0
+
+        with (
+            patch("scanning.ensemble.rebuild_findings", side_effect=moved),
+            patch("scanning.s3_sync.delete_objects") as delete,
+            self.assertRaises(ensemble.RevisionMoved),
+        ):
+            ensemble.rerun(self.opinion)
+
+        delete.assert_not_called()
+
     def test_a_row_whose_edit_the_text_does_not_hold_is_due(self):
         self.assertNotIn(self.opinion, ensemble.due())
         Opinion.objects.filter(pk=self.opinion.pk).update(edit_revision=1)
@@ -936,6 +1009,18 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
 
         self.assertAnswered(response, 409, messages.ERROR)
         self.assertIn("edge", response.json()["message"])
+
+    def test_a_direction_that_is_no_string_is_a_400(self):
+        for direction in ([], {"up": 1}, 1):
+            response = self.post(
+                "move_opinion_block",
+                page_in_opinion=0,
+                group_id=self.alike_group()["id"],
+                direction=direction,
+            )
+
+            self.assertAnswered(response, 400, messages.ERROR)
+        self.assertFalse(OpinionEdit.objects.exists())
 
     def test_a_build_that_fails_keeps_the_edit_and_warns(self):
         with patch(

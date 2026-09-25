@@ -307,3 +307,17 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
         bar = bar[: bar.index("\n    }\n")]
         self.assertIn("group.level", bar)
         self.assertNotIn("agreement", bar)
+
+    def test_the_release_asks_before_it_drops_typed_text(self):
+        """A stray click must not throw a curator's text away (#376)."""
+        source = VIEWER.read_text()
+        release = source[source.index("function release(") :]
+        release = release[: release.index("\n    }\n")]
+        self.assertIn("hasUnsavedText()", release)
+        self.assertIn("window.confirm(", release)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("!release()", lock)
+        editor = source[source.index("function openEditor(") :]
+        editor = editor[: editor.index("\n    }\n")]
+        self.assertIn("locked.editor = { area: area", editor)

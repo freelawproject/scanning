@@ -139,6 +139,11 @@
     // panel it opened and no other.
     var locked = null;
 
+    // True for a moment after the curator kept their typed text at the
+    // release prompt (#376). A double click on another block is a click
+    // and then a ``dblclick``, and the second must not ask again.
+    var kept = false;
+
     // The page a card of the findings asked for before the text was
     // read. The text column holds no block until then, so the jump is
     // done again when the blocks exist.
@@ -1539,13 +1544,15 @@
         if (locked && locked.page === page && locked.group === group) {
             return;
         }
-        release();
+        if (kept || !release()) { return; }
         select(page, group, from);
         var node = nodeFor(page, group);
         var entry = groupOf(pageOf(page), group);
         var opened = !!(node && entry && !readingsOf(node));
         if (opened) { openReadings(pageOf(page), entry, node); }
-        locked = { page: page, group: group, opened: opened, bar: null };
+        locked = {
+            page: page, group: group, opened: opened, bar: null, editor: null
+        };
         if (node && entry && canEdit()) {
             locked.bar = editBar(pageOf(page), entry);
             var after = readingsOf(node) || node;
@@ -1556,10 +1563,20 @@
 
     /**
      * Release the lock: close the readings it opened, and clear the
-     * selection.
+     * selection. An editor with typed text asks first (#376).
+     *
+     * @returns {boolean} Whether the lock was released.
      */
     function release() {
-        if (!locked) { return; }
+        if (!locked) { return true; }
+        // An open editor with typed text is the curator's work (#376):
+        // a stray click or a double click on another block must not
+        // throw it away without a word.
+        if (hasUnsavedText() && !window.confirm(
+            'Discard the text you typed for this block?'
+        )) {
+            return false;
+        }
         var node = nodeFor(locked.page, locked.group);
         if (node && locked.opened) { closeReadings(node); }
         if (locked.bar) { locked.bar.remove(); }
@@ -1568,6 +1585,19 @@
         });
         locked = null;
         clearSelection();
+        return true;
+    }
+
+    /**
+     * Return whether the editor of the locked group holds text the
+     * curator typed and did not save (#376).
+     *
+     * @returns {boolean} Whether it does.
+     */
+    function hasUnsavedText() {
+        var editor = locked && locked.editor;
+        if (!editor || !editor.area.isConnected) { return false; }
+        return editor.area.value.trim() !== editor.base.trim();
     }
 
     /**
@@ -1761,7 +1791,10 @@
             if (event.target.closest && event.target.closest('.edit-modal')) {
                 return;
             }
-            release();
+            if (!release()) {
+                kept = true;
+                setTimeout(function () { kept = false; }, 600);
+            }
         }, true);
     }
 
@@ -2020,6 +2053,7 @@
         var area = document.createElement('textarea');
         area.className = 'ensemble-edit-area';
         area.value = group.text || '';
+        if (locked) { locked.editor = { area: area, base: area.value }; }
         area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
         bar.appendChild(area);
         var row = document.createElement('div');
@@ -2041,6 +2075,7 @@
             }));
         row.appendChild(barButton('Cancel', 'Keep the text as it is',
             function () {
+                if (locked) { locked.editor = null; }
                 bar.classList.remove('ensemble-editor');
                 fillBar(bar, page, group);
             }));
