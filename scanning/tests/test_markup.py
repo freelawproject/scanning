@@ -172,32 +172,19 @@ class TestParseMarkdown(SimpleTestCase):
         self.assertEqual(markup.parse_markdown(None).text, "")
 
 
-class TestTheDehyphenation(SimpleTestCase):
-    def test_a_word_broken_at_the_line_end_is_joined(self):
+class TestTheLineBreak(SimpleTestCase):
+    def test_a_word_broken_at_the_line_end_stays_as_the_engine_wrote_it(self):
         parsed = markup.parse_markdown(
             "The Government agrees with this princi-\nple, and"
         )
         self.assertEqual(
-            parsed.text, "The Government agrees with this principle, and"
+            parsed.text, "The Government agrees with this princi-\nple, and"
         )
 
-    def test_a_prefix_of_the_keep_list_keeps_its_hyphen(self):
-        self.assertEqual(markup.dehyphenate("a non-\nparty"), "a non-party")
-        self.assertEqual(
-            markup.dehyphenate("rea-\nsoning fol-\nlows"), "reasoning follows"
-        )
-
-    def test_a_syllable_that_pr_310_kept_is_joined(self):
-        # ``pro-tection``, ``in-vestigated``, ``de-fining`` in the survey.
-        self.assertEqual(
-            markup.dehyphenate("equal pro-\ntection"), "equal protection"
-        )
-        self.assertEqual(markup.dehyphenate("in-\nvestigated"), "investigated")
-
-    def test_a_mark_across_the_join_keeps_its_offsets(self):
+    def test_a_mark_across_one_line_break_holds(self):
         parsed = markup.parse_markdown("see *Wharton's Crimi-\nnal Law* there")
-        self.assertEqual(parsed.text, "see Wharton's Criminal Law there")
-        self.assertEqual(marked(parsed), [(EM, "Wharton's Criminal Law")])
+        self.assertEqual(parsed.text, "see Wharton's Crimi-\nnal Law there")
+        self.assertEqual(marked(parsed), [(EM, "Wharton's Crimi-\nnal Law")])
 
 
 class TestParseHtml(SimpleTestCase):

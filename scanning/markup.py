@@ -18,7 +18,9 @@ a tagged string, for the editor, the XML and the tagger's projection.
 **The whitespace contract.** ``Parsed.text`` holds one space between
 words, keeps a line break as one ``\\n`` with no other whitespace
 beside it, and has no leading or trailing whitespace. The ensemble's
-``plain`` then changes no offset, only ``\\n`` to a space.
+``plain`` then changes no offset, only ``\\n`` to a space. The words
+themselves are the engine's: a word broken at a line end
+(``princi-\\nple``) stays broken, and joining it is its own step.
 
 Measured over six volume documents (three engines, 2,300 pages) in the
 comment of 2026-09-24 on #404: the heading level of a mark does not
@@ -82,23 +84,6 @@ _HEADING_MD = re.compile(r"^[ \t]*#{1,6}[ \t]+")
 #: ``*`` follows is an asterism (``* * *``), not a bullet.
 _LIST_MD = re.compile(r"^[ \t]*(?:\d{1,3}\.|[-•·]|\*(?![ \t]*\*))[ \t]+\S")
 _TABLE_START = re.compile(r"^\s*<table\b", re.I)
-#: The word breaks dots and Mistral copy from the print: a hyphen at the
-#: end of a line inside a word. These left parts keep their hyphen,
-#: because the print hyphenates them (``non-party``, ``self-defense``,
-#: ``one-half``). A prefix that is also a syllable of an ordinary word
-#: is not here: PR #310's list had ``pro``, ``in``, ``de``, ``ex``,
-#: ``re``, ``pre``, ``sub``, ``mid``, ``ten``, and the survey documents
-#: showed ``pro-tection``, ``in-vestigated``, ``de-fining`` and
-#: ``ex-ample`` broken at the line end.
-_KEEP_HYPHEN = {
-    "non", "self", "cross", "co", "anti", "semi", "well", "quasi", "multi",
-    "all", "half", "one", "two", "three", "four", "five", "six", "seven",
-    "eight", "nine", "twenty", "thirty", "first", "second", "third",
-    "fourth", "fifth", "sixth", "step", "vice", "attorney", "brother",
-    "sister", "mother", "father", "son", "daughter", "counter", "long",
-    "short", "high", "low", "full", "part",
-}  # fmt: skip
-_HYPHEN_EOL = re.compile(r"(\w+)-\n(\w+)")
 #: A tag of either dialect: a name and attributes with values. Surya
 #: copies a literal angle bracket of the print unescaped (``"Untrue
 #: <a false statement>"``), and a looser shape would eat those words.
@@ -241,43 +226,6 @@ def _scan_html(text: str, out: _Out) -> None:
     out.add(text[at:])
 
 
-def dehyphenate(text: str) -> str:
-    """Join a word the engine broke at a line end, keeping a real hyphen.
-
-    :param text: Text with hard line breaks.
-    :returns: The text with the end-of-line hyphenation undone.
-    :rtype: str
-    """
-
-    def repl(match: re.Match) -> str:
-        left, right = match.group(1), match.group(2)
-        if left.lower() in _KEEP_HYPHEN:
-            return f"{left}-{right}"
-        return left + right
-
-    return _HYPHEN_EOL.sub(repl, text)
-
-
-def _dehyphenate(out: _Out) -> None:
-    """The same rule over the flagged characters."""
-    text = "".join(out.chars)
-    drop: set[int] = set()
-    for match in _HYPHEN_EOL.finditer(text):
-        hyphen = match.start() + len(match.group(1))
-        # The line break goes in both cases; the hyphen stays for a
-        # left part of the keep list.
-        drop.add(hyphen + 1)
-        if match.group(1).lower() not in _KEEP_HYPHEN:
-            drop.add(hyphen)
-    if drop:
-        _delete(out, drop)
-
-
-def _delete(out: _Out, drop: set[int]) -> None:
-    out.chars = [c for i, c in enumerate(out.chars) if i not in drop]
-    out.flags = [f for i, f in enumerate(out.flags) if i not in drop]
-
-
 def _normalize_whitespace(out: _Out) -> None:
     """Apply the whitespace contract: one space, one ``\\n``, no edges.
 
@@ -319,7 +267,6 @@ def marks_of(flags: list[frozenset[str]]) -> list[Mark]:
 
 
 def _finish(out: _Out) -> Parsed:
-    _dehyphenate(out)
     _normalize_whitespace(out)
     return Parsed(
         text="".join(out.chars), marks=marks_of(out.flags), kind=out.kind
