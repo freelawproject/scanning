@@ -32,6 +32,15 @@ docker exec scanning-daemon python manage.py reglue_opinion_ocr 2845 --dry-run
 # Write the OCR documents of every volume's opinions again, after a rule change such as the bracket deletion (#373)
 docker exec scanning-daemon python manage.py reglue_opinion_ocr --all --dry-run
 
+# Read the volumes again whose detection run lacks the current class set, leaving partner scans out (#338)
+docker exec scanning-daemon python manage.py enqueue_yolo_detect --stale-labels --read-since 2026-09-16T18:00Z --exclude 2561 --dry-run
+
+# Compare a volume's live detection run with the run before it, and count the decisions it would lose (#338)
+docker exec scanning-daemon python manage.py compare_detection_runs 2845
+
+# Take approved volumes back to review 2, so a new detection run is imported (#338)
+docker exec scanning-daemon python manage.py reopen_redaction_review 2845 --dry-run
+
 # Read the page numbers of the volumes in review 1 again, once after a deploy that changes the reading (#228/#351)
 docker exec scanning-daemon python manage.py reapply_page_numbers --dry-run
 
@@ -196,6 +205,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 ## Review 2 (#195, #196, #240, #263)
 
 - The daemon starts one detection run per `Scan.source_fingerprint` (`yolo.enqueue_missing_runs`, at most `YOLO_MAX_CONCURRENCY` scans per tick). A dead run is re-run only by `enqueue_yolo_detect`. The merge runs on the collect tick; the compute is queued
+- A DETECT row's identity carries `yolo.LABEL_SET` (#338): the carry refuses a result read without it, `_still_describes` accepts a row that lacks it (`jobs.LENIENT_IDENTITY_KEYS`), so no tick re-pays a run, and the re-read is `enqueue_yolo_detect --stale-labels` alone. A second volume run writes the standing apply run's `detections_key` again before it is consumed (`apply.refresh_detections`), because the compute reads that document and never the merged one
 - `found_by` must survive the merge, the `Detection` row and `services.detection_entries`: it picks the confidence gates. A hand-drawn row carries none
 - Model rows are disposable and rebuilt at every import or compute; human rows are withdrawn, never deleted: MANUAL `Detection`, `DetectionDecision`, `Redaction` add and dismiss, `OpinionBoundary` add and dismiss. A second withdrawal is a no-op
 - A decision names its target by address plus a copy of the box, never by a write on the model row. `resolve` lands it on the rebuilt row by IoU at least `IOU_THRESHOLD` (a boundary: the start point within `ANCHOR_TOLERANCE_PT`), each row taken once, and reads no model row when no decision stands. An unresolved decision is logged and left standing
