@@ -2103,8 +2103,16 @@ def blocks_below(groups: list[dict], group: dict) -> list[int]:
     other column does not. A block a person put in the body text keeps
     that section.
 
+    The ``column`` stamp decides first where both blocks carry one: a
+    group box is the union of the engines' boxes, and a box of one
+    column may cross the gutter by the ``STRADDLE_L`` and
+    ``STRADDLE_R`` share of the width, so the x-ranges of a loose left
+    box and a loose right box overlap. A full-width block, a head or a
+    foot and a page of one column have no stamp, and the x-range
+    decides alone.
+
     :param groups: The kept groups of one page, each with its
-        ``box_pt``, ``section`` and ``section_edit``.
+        ``box_pt``, ``column``, ``section`` and ``section_edit``.
     :param group: The pushed group, a body group.
     :returns: The ids of the other groups, in the order of the page.
     :rtype: list[int]
@@ -2112,6 +2120,7 @@ def blocks_below(groups: list[dict], group: dict) -> list[int]:
     box = group.get("box_pt")
     if not box or (group.get("section") or BODY) != BODY:
         return []
+    column = group.get("column")
     return [
         other["id"]
         for other in groups
@@ -2122,6 +2131,11 @@ def blocks_below(groups: list[dict], group: dict) -> list[int]:
         and other["box_pt"][1] >= box[1]
         and other["box_pt"][0] < box[2]
         and box[0] < other["box_pt"][2]
+        and (
+            column is None
+            or other.get("column") is None
+            or other["column"] == column
+        )
     ]
 
 

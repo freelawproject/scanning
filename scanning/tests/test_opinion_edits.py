@@ -526,10 +526,13 @@ class TestTheBlocksBelow(TestCase):
     FULL_LOW = [36.0, 600.0, 576.0, 650.0]
     LEFT_HIGH = [36.0, 100.0, 288.0, 300.0]
 
-    def group(self, id, box, section=ensemble.BODY, section_edit=None):
+    def group(
+        self, id, box, section=ensemble.BODY, section_edit=None, column=None
+    ):
         return {
             "id": id,
             "box_pt": box,
+            "column": column,
             "section": section,
             "section_edit": section_edit,
         }
@@ -544,6 +547,24 @@ class TestTheBlocksBelow(TestCase):
         ]
 
         self.assertEqual(ensemble.blocks_below(groups, groups[1]), [2, 4])
+
+    def test_the_column_stamp_decides_over_a_loose_box(self):
+        """A group box is the union of the engines' boxes, and a box of
+        one column may cross the gutter (``STRADDLE_L``,
+        ``STRADDLE_R``). Two boxes that cross it by 15 points each share
+        30 points of x-range, and the stamp keeps them apart."""
+        gutter = 306.0
+        left = [36.0, 400.0, gutter + 15, 450.0]
+        right = [gutter - 15, 460.0, 576.0, 520.0]
+        left_low = [36.0, 530.0, gutter + 15, 580.0]
+        groups = [
+            self.group(0, left, column="L"),
+            self.group(1, right, column="R"),
+            self.group(2, left_low, column="L"),
+            self.group(3, self.FULL_LOW),
+        ]
+
+        self.assertEqual(ensemble.blocks_below(groups, groups[0]), [2, 3])
 
     def test_the_last_block_takes_nothing(self):
         groups = [self.group(0, self.LEFT_TOP), self.group(1, self.FULL_LOW)]
