@@ -68,18 +68,40 @@ def unit(
     text: str,
     exclusion=None,
     share: float = 0.0,
-    kind: str = "Text",
+    label: str = "Text",
+    marks=(),
+    kind: str = "paragraph",
+    table=None,
 ) -> dict:
-    """One engine's unit of a page, in the shape the alignment reads."""
+    """One engine's unit of a page, in the shape the alignment reads.
+
+    ``label`` is the engine's own label of the unit (``Text``,
+    ``Footnote``); ``kind`` and ``marks`` are the parse of #404.
+    """
     return {
         "engine": engine,
         "id": index,
         "box_pt": [float(v) for v in box],
         "text": text,
-        "type": kind,
+        "type": label,
         "exclusion": exclusion,
         "share": share,
+        "marks": [dict(mark) for mark in marks],
+        "kind": kind,
+        "table": table,
     }
+
+
+def em(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "em"}
+
+
+def strong(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "strong"}
+
+
+def sup(start, end) -> dict:
+    return {"start": start, "end": end, "kind": "sup"}
 
 
 def group_of(*units) -> dict:
@@ -91,6 +113,9 @@ def group_of(*units) -> dict:
             "types": [member["type"]],
             "box_pt": member["box_pt"],
             "text": member["text"],
+            "marks": list(member.get("marks") or []),
+            "kind": member.get("kind") or "paragraph",
+            "table": member.get("table"),
             "excluded": False,
             "reason": "",
             "partial": False,
@@ -158,7 +183,7 @@ class TestTheAlignment(TestCase):
         still reported: one engine read nothing where the other read
         the text."""
         units = [
-            unit("dots_mocr", 0, (40, 100, 570, 620), "", kind="Picture"),
+            unit("dots_mocr", 0, (40, 100, 570, 620), "", label="Picture"),
             unit("mistral_ocr", 0, (50, 110, 290, 300), "left one"),
             unit("mistral_ocr", 1, (50, 320, 290, 600), "left two"),
             unit("mistral_ocr", 2, (330, 110, 560, 300), "right one"),
@@ -196,7 +221,7 @@ class TestTheAlignment(TestCase):
 
     def test_a_box_that_reads_nothing_and_covers_nothing_is_dropped(self):
         units = [
-            unit("dots_mocr", 0, (0, 0, 100, 60), "", kind="Picture"),
+            unit("dots_mocr", 0, (0, 0, 100, 60), "", label="Picture"),
             unit("mistral_ocr", 0, (300, 400, 560, 600), "alpha"),
         ]
 
@@ -2014,8 +2039,8 @@ def read_units(*specs) -> list[dict]:
     for index, spec in enumerate(specs):
         box, text = spec[0], spec[1]
         kinds = spec[2] if len(spec) > 2 else ("Text", "text")
-        units.append(unit("dots_mocr", index, box, text, kind=kinds[0]))
-        units.append(unit("mistral_ocr", index, box, text, kind=kinds[1]))
+        units.append(unit("dots_mocr", index, box, text, label=kinds[0]))
+        units.append(unit("mistral_ocr", index, box, text, label=kinds[1]))
     return units
 
 
@@ -2036,6 +2061,9 @@ def engine_page(units_of_engine: list[dict], zones=()) -> dict:
                 "box_pt": u["box_pt"],
                 "exclusion": u["exclusion"],
                 "share": u["share"],
+                "marks": list(u.get("marks") or []),
+                "kind": u.get("kind") or "paragraph",
+                "table": u.get("table"),
             }
             for u in units_of_engine
         ],
@@ -2144,7 +2172,9 @@ class TestTheSection(TestCase):
     def test_a_silent_engine_s_label_counts_for_nothing(self):
         group = self.group(
             unit("dots_mocr", 0, (50, 600, 300, 700), "1. note"),
-            unit("mistral_ocr", 0, (50, 600, 300, 700), "", kind="references"),
+            unit(
+                "mistral_ocr", 0, (50, 600, 300, 700), "", label="references"
+            ),
         )
 
         self.assertEqual(ensemble.section(group, []), (ensemble.BODY, False))
@@ -2153,9 +2183,13 @@ class TestTheSection(TestCase):
         """A footnote cell glued to a body cell says nothing."""
         group = self.group(
             unit(
-                "dots_mocr", 0, (50, 600, 300, 650), "1. note", kind="Footnote"
+                "dots_mocr",
+                0,
+                (50, 600, 300, 650),
+                "1. note",
+                label="Footnote",
             ),
-            unit("dots_mocr", 1, (50, 650, 300, 700), "more", kind="Text"),
+            unit("dots_mocr", 1, (50, 650, 300, 700), "more", label="Text"),
             unit("mistral_ocr", 0, (50, 600, 300, 700), "1. note more"),
         )
 
@@ -2165,7 +2199,7 @@ class TestTheSection(TestCase):
         for engine, spec in opinion_ocr.ENGINES.items():
             for kind in spec.footnote_types:
                 group = self.group(
-                    unit(engine, 0, (50, 600, 300, 700), "1. note", kind=kind)
+                    unit(engine, 0, (50, 600, 300, 700), "1. note", label=kind)
                 )
                 self.assertEqual(
                     ensemble.section(group, []),
@@ -2175,7 +2209,7 @@ class TestTheSection(TestCase):
 
     def test_an_unknown_engine_is_not_labelled(self):
         group = self.group(
-            unit("other", 0, (50, 600, 300, 700), "1. note", kind="Footnote")
+            unit("other", 0, (50, 600, 300, 700), "1. note", label="Footnote")
         )
 
         self.assertEqual(ensemble.section(group, []), (ensemble.BODY, False))
@@ -2288,7 +2322,7 @@ class TestTheTwoTexts(TestCase):
                     "1. note",
                     exclusion=excluded,
                     share=1.0,
-                    kind="Footnote" if engine == "dots_mocr" else "footer",
+                    label="Footnote" if engine == "dots_mocr" else "footer",
                 )
             )
         page = build(units)
@@ -2469,3 +2503,421 @@ class TestTheBracketToken(EnsembleTestCase):
         self.assertEqual(document["pages"][1]["text"], "body A 2\n\nbody B 2")
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
         self.assertNotIn("[1]", row.text)
+
+
+# ── the marks and the kind (#404) ────────────────────────────────────
+def three(*specs) -> dict:
+    """A group of up to three engines, each ``(text, marks, kind)``."""
+    names = ("dots_mocr", "mistral_ocr", "surya")
+    units = []
+    for index, spec in enumerate(specs):
+        text, marks = spec[0], spec[1] if len(spec) > 1 else ()
+        kind = spec[2] if len(spec) > 2 else "paragraph"
+        units.append(
+            unit(names[index], 0, BODY_A_PT, text, marks=marks, kind=kind)
+        )
+    return group_of(*units)
+
+
+class TestTheMarks(TestCase):
+    """The marks of a group are the union of its readings."""
+
+    def test_a_word_one_engine_marks_is_marked(self):
+        answer = ensemble.resolve(
+            three(
+                ("In Castleman, Justice", [em(3, 12)]),
+                ("In Castleman, Justice",),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        # The word carries the mark, comma included.
+        self.assertEqual(answer["marks"], [em(3, 13)])
+
+    def test_adjacent_marked_words_are_one_span(self):
+        answer = ensemble.resolve(
+            three(
+                ("see Lewis v. Marcotte, at 1", [em(4, 21)]),
+                ("see Lewis v. Marcotte, at 1",),
+            )
+        )
+
+        self.assertEqual(answer["marks"], [em(4, 22)])
+
+    def test_a_superscript_is_the_chars_and_not_the_word(self):
+        answer = ensemble.resolve(
+            three(('acts."1 The', [sup(6, 7)]), ('acts."1 The',))
+        )
+
+        self.assertEqual(answer["marks"], [sup(6, 7)])
+
+    def test_the_marks_of_every_engine_join(self):
+        answer = ensemble.resolve(
+            three(
+                ("Held: see Id. there", [strong(0, 5)]),
+                ("Held: see Id. there", [em(10, 13)]),
+            )
+        )
+
+        self.assertEqual(answer["marks"], [strong(0, 5), em(10, 13)])
+
+    def test_an_ellipsis_before_the_italic_moves_no_mark(self):
+        """Equal keys, different word counts: the alignment is by key."""
+        answer = ensemble.resolve(
+            three(
+                ("said . . . so Held", []), ("said ... so Held", [em(12, 16)])
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "said . . . so Held")
+        self.assertEqual(answer["marks"], [em(14, 18)])
+
+    def test_a_voted_group_keeps_the_marks_of_the_words_that_won(self):
+        answer = ensemble.resolve(
+            three(
+                ("the court held", [em(4, 9)]),
+                ("the court hold",),
+                ("the court helt",),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        self.assertEqual(answer["marks"], [em(4, 9)])
+
+    def test_a_word_the_source_did_not_read_carries_its_engine_s_mark(self):
+        answer = ensemble.resolve(
+            three(
+                ("the court", []),
+                ("the court held", [em(10, 14)]),
+                ("the court held", []),
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["text"], "the court held")
+        self.assertEqual(answer["marks"], [em(10, 14)])
+
+    def test_a_silent_engine_marks_nothing(self):
+        answer = ensemble.resolve(three(("the court held", []), ("", [])))
+
+        self.assertEqual(answer["marks"], [])
+        self.assertEqual(answer["kind"], "paragraph")
+
+    def test_a_unit_of_the_glue_before_the_marks_reads_plain(self):
+        page = engine_page([unit("dots_mocr", 0, BODY_A_PT, "the text")])
+        for u in page["units"]:
+            del u["marks"], u["kind"], u["table"]
+        other = engine_page([unit("mistral_ocr", 0, BODY_A_PT, "the text")])
+
+        entry = ensemble.build_page(
+            {"dots_mocr": page, "mistral_ocr": other}, 0
+        )
+
+        group = entry["groups"][0]
+        self.assertEqual((group["kind"], group["marks"]), ("paragraph", []))
+        self.assertNotIn("table", group)
+
+    def test_the_marks_of_two_members_shift_by_the_join(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "left one",
+                    marks=[em(0, 4)],
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "left two",
+                    marks=[em(5, 8)],
+                ),
+                unit(
+                    "mistral_ocr", 0, (50, 600, 300, 700), "left one left two"
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(len(groups), 1)
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(merged["text"], "left one left two")
+        self.assertEqual(merged["marks"], [em(0, 4), em(14, 17)])
+        self.assertEqual(
+            ensemble.resolve(groups[0])["marks"], [em(0, 4), em(14, 17)]
+        )
+
+    def test_a_text_plain_shortens_keeps_its_words_and_loses_its_marks(self):
+        groups = ensemble.align_page(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "a  b", marks=[em(0, 1)]),
+                unit("mistral_ocr", 0, BODY_A_PT, "a b"),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        merged = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual((merged["text"], merged["marks"]), ("a b", []))
+
+
+class TestTheKind(TestCase):
+    """The kind of a group is a majority, the rank breaking a tie."""
+
+    def test_the_majority_of_the_engines_names_the_kind(self):
+        answer = ensemble.resolve(
+            three(
+                ("FACTS", [], "heading"),
+                ("FACTS", [], "heading"),
+                ("FACTS", [], "paragraph"),
+            )
+        )
+
+        self.assertEqual(answer["kind"], "heading")
+
+    def test_a_tie_goes_to_the_first_engine(self):
+        answer = ensemble.resolve(
+            three(
+                ("Amanda JONES", [], "paragraph"),
+                ("Amanda JONES", [], "heading"),
+            )
+        )
+
+        # Mistral labels the caption ``title``; dots says text, and wins.
+        self.assertEqual(answer["kind"], "paragraph")
+
+    def test_a_silent_engine_has_no_say(self):
+        # Two paragraphs against one heading, were the silent engine
+        # counted; a tie the first engine breaks, since it is not.
+        answer = ensemble.resolve(
+            three(
+                ("FACTS", [], "heading"),
+                ("", [], "paragraph"),
+                ("FACTS", [], "paragraph"),
+            )
+        )
+
+        self.assertEqual(answer["kind"], "heading")
+
+    def test_mixed_members_of_one_engine_are_a_paragraph(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "FACTS",
+                    kind="heading",
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "the body",
+                    kind="paragraph",
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (50, 600, 300, 700),
+                    "FACTS the body",
+                    kind="heading",
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(
+            groups[0]["engines"]["dots_mocr"]["kind"], "paragraph"
+        )
+        self.assertEqual(ensemble.resolve(groups[0])["kind"], "paragraph")
+
+    def test_the_kind_is_on_the_group_of_the_page(self):
+        entry = build(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "FACTS", kind="heading"),
+                unit("mistral_ocr", 0, BODY_A_PT, "FACTS", kind="heading"),
+            ]
+        )
+
+        self.assertEqual(entry["groups"][0]["kind"], "heading")
+
+
+class TestTheTable(TestCase):
+    def test_the_rows_are_the_source_s(self):
+        rows = [["Property Damage", "$35,000.00"]]
+        answer = ensemble.resolve(
+            three(
+                ("Property Damage $35,000.00", [], "table"),
+                ("Property Damage $35,000.00", [], "table"),
+            )
+        )
+        self.assertEqual(answer["table"], None)
+
+        group = three(
+            ("Property Damage $35,000.00", [], "table"),
+            ("Property Damage $35,000.00", [], "table"),
+        )
+        group["engines"]["dots_mocr"]["table"] = rows
+        group["engines"]["mistral_ocr"]["table"] = [["other"]]
+        answer = ensemble.resolve(group)
+
+        self.assertEqual((answer["kind"], answer["table"]), ("table", rows))
+
+    def test_two_table_members_concatenate_their_rows(self):
+        groups = ensemble.align_page(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (50, 600, 300, 650),
+                    "a b",
+                    kind="table",
+                    table=[["a", "b"]],
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (50, 650, 300, 700),
+                    "c d",
+                    kind="table",
+                    table=[["c", "d"]],
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (50, 600, 300, 700),
+                    "a b c d",
+                    kind="table",
+                    table=[["a", "b"], ["c", "d"]],
+                ),
+            ],
+            WIDTH,
+            HEIGHT,
+        )
+
+        self.assertEqual(
+            groups[0]["engines"]["dots_mocr"]["table"],
+            [["a", "b"], ["c", "d"]],
+        )
+
+    def test_a_paragraph_group_carries_no_rows(self):
+        entry = build(
+            [
+                unit("dots_mocr", 0, BODY_A_PT, "the body"),
+                unit("mistral_ocr", 0, BODY_A_PT, "the body"),
+            ]
+        )
+
+        self.assertNotIn("table", entry["groups"][0])
+
+    def test_a_table_group_carries_its_rows(self):
+        rows = [["a", "b"]]
+        entry = build(
+            [
+                unit(
+                    "dots_mocr", 0, BODY_A_PT, "a b", kind="table", table=rows
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    BODY_A_PT,
+                    "a b",
+                    kind="table",
+                    table=rows,
+                ),
+            ]
+        )
+
+        self.assertEqual(entry["groups"][0]["table"], rows)
+
+
+class TestTheMarksOfAPage(TestCase):
+    """The marks of a row point into the field their section names."""
+
+    def test_the_marks_add_the_group_s_start_in_their_section(self):
+        entry = build(
+            [
+                unit(
+                    "dots_mocr",
+                    0,
+                    (LEFT_X[0], 100, LEFT_X[1], 200),
+                    "left one",
+                    marks=[em(5, 8)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    0,
+                    (LEFT_X[0], 100, LEFT_X[1], 200),
+                    "left one",
+                ),
+                unit(
+                    "dots_mocr",
+                    1,
+                    (LEFT_X[0], 300, LEFT_X[1], 400),
+                    "left two",
+                    marks=[strong(0, 4)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    1,
+                    (LEFT_X[0], 300, LEFT_X[1], 400),
+                    "left two",
+                ),
+                unit(
+                    "dots_mocr",
+                    2,
+                    (LEFT_X[0], 600, LEFT_X[1], 700),
+                    "1. left note",
+                    marks=[em(3, 7)],
+                ),
+                unit(
+                    "mistral_ocr",
+                    2,
+                    (LEFT_X[0], 600, LEFT_X[1], 700),
+                    "1. left note",
+                ),
+            ],
+            zones=[FOOT_ZONE],
+        )
+
+        self.assertEqual(entry["text"], "left one\n\nleft two")
+        self.assertEqual(entry["footnotes"], "1. left note")
+        marks = ensemble._marks(entry)
+        self.assertEqual(
+            marks,
+            [
+                {"start": 5, "end": 8, "kind": "em", "section": "text"},
+                {"start": 10, "end": 14, "kind": "strong", "section": "text"},
+                {"start": 3, "end": 7, "kind": "em", "section": "footnotes"},
+            ],
+        )
+        self.assertEqual(entry["text"][10:14], "left")
+        self.assertEqual(entry["footnotes"][3:7], "left")
+
+
+class TestTheMarksOfARow(EnsembleTestCase):
+    def test_the_row_holds_the_marks_of_its_text(self):
+        cells = self.objects[self.apply_run.ocr_key]["pages"][1]["cells"]
+        cells[1]["text"] = "In *Castleman*, Justice"
+        blocks = self.objects[self.apply_run.extract_key]["pages"][1]["blocks"]
+        blocks[1]["content"] = "In Castleman, Justice"
+
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertEqual(len(row.marks), 1)
+        mark = row.marks[0]
+        self.assertEqual((mark["kind"], mark["section"]), ("em", "text"))
+        self.assertEqual(row.text[mark["start"] : mark["end"]], "Castleman,")
+
+    def test_a_row_without_marks_is_empty(self):
+        self.run_ensemble()
+
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertEqual(row.marks, [])

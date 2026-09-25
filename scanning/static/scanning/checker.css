@@ -1296,6 +1296,29 @@ a.doc-name:hover { text-decoration: underline; }
     white-space: pre-wrap;
     cursor: default;
 }
+/* The kind of a group and the marks of its text (#404). */
+h3.ensemble-group {
+    font-size: 14px;
+    font-weight: 600;
+}
+li.ensemble-group {
+    display: list-item;
+    list-style: none;
+    margin-left: 1.2em;
+}
+.ensemble-group sup {
+    line-height: 0;
+    font-size: 0.75em;
+}
+.ensemble-table {
+    border-collapse: collapse;
+    margin: 2px 0;
+}
+.ensemble-table td {
+    border: 1px solid #d1d5db;
+    padding: 1px 6px;
+    vertical-align: top;
+}
 .ensemble-group[data-agreement="majority"],
 .ensemble-group[data-agreement="voted"] {
     border-left-color: rgba(217, 119, 6, 0.75);
