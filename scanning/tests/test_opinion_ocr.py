@@ -992,7 +992,7 @@ class TestTheParsedUnit(OpinionOcrTestCase):
         self.assertEqual(unit["kind"], "paragraph")
         self.assertNotIn("table", unit)
         self.assertEqual(document["counts"]["marks"], 1)
-        self.assertEqual(document["schema_version"], 4)
+        self.assertEqual(document["schema_version"], 5)
 
     def test_the_mistral_latex_superscript(self):
         self.set_body_a(
@@ -1949,6 +1949,9 @@ class TestReglueCommand(OpinionOcrTestCase):
 #: A footnote band across both columns, in render pixels.
 BAND = (100, 1600, 1600, 2100)
 
+#: The zones of a page no detection drew on (#399, #411).
+NO_ZONES = {"footnotes": [], "blockquotes": []}
+
 
 def footnote_band(scan, run, page_index, box=BAND) -> Detection:
     """One ``FOOTNOTES`` detection over final page ``page_index``.
@@ -1990,9 +1993,10 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
                 opinion_ocr.engine_key(self.opinion, engine)
             ]
             self.assertEqual(
-                document["pages"][1]["zones"], {"footnotes": [to_pt(BAND)]}
+                document["pages"][1]["zones"],
+                {"footnotes": [to_pt(BAND)], "blockquotes": []},
             )
-            self.assertEqual(document["pages"][0]["zones"], {"footnotes": []})
+            self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
         manifest = self.uploads[
             opinion_ocr.engine_key(self.opinion, "manifest")
         ]
@@ -2006,7 +2010,7 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
 
         written = self.write()
 
-        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
 
     def test_a_withdrawn_band_is_no_zone(self):
         row = self.band(2)
@@ -2015,7 +2019,7 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
 
         written = self.write()
 
-        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
 
     def test_a_page_with_no_size_carries_no_zone(self):
         """No size puts nothing in points. The band alone is a size, so
@@ -2029,7 +2033,7 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
         written = self.write()
 
         self.assertIsNone(written["pages"][1]["frame"])
-        self.assertEqual(written["pages"][1]["zones"], {"footnotes": []})
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
 
     def test_every_engine_names_its_footnote_labels(self):
         """The spellings each engine writes, measured on the corpus
@@ -2046,6 +2050,113 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
         self.assertEqual(
             opinion_ocr.ENGINES["surya"].footnote_types,
             {"Footnote", "Bibliography"},
+        )
+
+
+# ── the blockquote zone (#411) ───────────────────────────────────────
+#: A quote inside the left column, in render pixels.
+QUOTE = (260, 700, 800, 900)
+
+
+class TestTheBlockquoteZone(OpinionOcrTestCase):
+    """The ``BLOCKQUOTE`` detections of the run, frozen on every page
+    at the confidence floor or above it."""
+
+    def quote(self, page_index, **fields) -> Detection:
+        values = {
+            "apply_run": self.apply_run,
+            "label": opinion_ocr.BLOCKQUOTE_LABEL,
+            "label_id": int(Label.BLOCKQUOTE),
+            "page_index": page_index,
+            "source_page": page_index + 1,
+            "confidence": 0.9,
+            "x0": QUOTE[0],
+            "y0": QUOTE[1],
+            "x1": QUOTE[2],
+            "y1": QUOTE[3],
+            "img_width": IMG_W,
+            "img_height": IMG_H,
+        }
+        values.update(fields)
+        return model_row(self.scan, **values)
+
+    def test_a_quote_is_a_zone_in_points_on_every_engine_page(self):
+        self.quote(2)
+        footnote_band(self.scan, self.apply_run, 2)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            self.assertEqual(
+                document["pages"][1]["zones"],
+                {"footnotes": [to_pt(BAND)], "blockquotes": [to_pt(QUOTE)]},
+            )
+            self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        counts = manifest["engines"]["dots_mocr"]["counts"]
+        self.assertEqual(counts["blockquote_zones"], 1)
+        self.assertEqual(counts["footnote_zones"], 1)
+
+    def test_a_model_box_under_the_floor_is_no_zone(self):
+        self.quote(2, confidence=0.79)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_a_model_box_at_the_floor_is_a_zone(self):
+        self.quote(2, confidence=0.8)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    @override_settings(BLOCKQUOTE_MIN_CONFIDENCE=0.5)
+    def test_the_setting_moves_the_floor(self):
+        self.quote(2, confidence=0.6)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    def test_a_hand_drawn_box_is_a_zone(self):
+        """A person's box has confidence 1.0, the rule of
+        ``detections.add_manual``, so the floor never drops it."""
+        self.quote(2, confidence=1.0, model_name=Detection.ModelName.MANUAL)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["blockquotes"], [to_pt(QUOTE)]
+        )
+
+    def test_a_withdrawn_box_is_no_zone(self):
+        row = self.quote(2)
+        row.active = False
+        row.save(update_fields=["active"])
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+    def test_the_floor_does_not_touch_the_footnote_zone(self):
+        row = footnote_band(self.scan, self.apply_run, 2)
+        row.confidence = 0.3
+        row.save(update_fields=["confidence"])
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["footnotes"], [to_pt(BAND)]
         )
 
 
@@ -2092,7 +2203,7 @@ class TestTheBracketToken(OpinionOcrTestCase):
             self.assertIsNone(unit["exclusion"])
             self.assertEqual(unit["removed"], ["[1]"])
         self.assertEqual(document["counts"]["brackets_removed"], 1)
-        self.assertEqual(document["schema_version"], 4)
+        self.assertEqual(document["schema_version"], 5)
 
     def test_a_large_bracket_box_no_longer_drops_the_words(self):
         """A share of 0.3 excluded the unit before #373."""

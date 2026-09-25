@@ -64,3 +64,11 @@ OPINION_PDF_RETRY_AFTER_SECONDS = env.int(
 OPINION_ENSEMBLE_MIN_ENGINES = env.int(
     "OPINION_ENSEMBLE_MIN_ENGINES", default=3
 )
+
+# The least confidence of a model BLOCKQUOTE box that the OCR glue of an
+# opinion reads as a blockquote (#411). The model also boxes bullet and
+# numbered lists as blockquotes (#211), and a wrong <blockquote> is a
+# wrong input of the tagger, so the floor is high. A box a person drew
+# or approved has confidence 1.0 and always counts. A change is a
+# re-glue (reglue_opinion_ocr).
+BLOCKQUOTE_MIN_CONFIDENCE = env.float("BLOCKQUOTE_MIN_CONFIDENCE", default=0.8)
