@@ -562,8 +562,16 @@ def _same_but_for(word: str, other: str, span: tuple[int, int]) -> bool:
     number glued to a word (``court1407``) is longer than the word the
     other engines read (``courts``), and its range would land on the
     last letter.
+
+    A range over the whole word leaves nothing before or after it to
+    compare, so it carries only onto the same key or onto a word of
+    one character (``l`` for a footnote ``1``). A star page number an
+    engine read as its own word (``1407``) would otherwise land on any
+    word of four letters the alignment pairs with it.
     """
     low, high = span
+    if low == 0 and high >= len(other):
+        return compare_word(word) == compare_word(other) or len(word) == 1
     return (
         len(word) == len(other)
         and compare_word(word[:low]) == compare_word(other[:low])

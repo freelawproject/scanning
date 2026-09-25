@@ -2723,6 +2723,28 @@ class TestTheMarks(TestCase):
 
         self.assertEqual(marks, [])
 
+    def test_a_star_page_read_as_its_own_word_marks_no_word(self):
+        """The engine missed ``This`` and read the star page there."""
+        marks = ensemble.union_marks(
+            "This case is", [("1407 case is", [sup(0, 4)])]
+        )
+
+        self.assertEqual(marks, [])
+
+    def test_a_misread_footnote_word_of_one_character_carries(self):
+        marks = ensemble.union_marks(
+            "held. 1 The", [("held. l The", [sup(6, 7)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 7)])
+
+    def test_a_footnote_word_of_the_same_key_carries(self):
+        marks = ensemble.union_marks(
+            "held. 12 The", [("held. 12 The", [sup(6, 8)])]
+        )
+
+        self.assertEqual(marks, [sup(6, 8)])
+
     def test_an_italic_carries_onto_a_misread_word(self):
         """A whole-word mark is not a range: the #423 rule is the
         superscript's alone."""
