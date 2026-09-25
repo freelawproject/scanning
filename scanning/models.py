@@ -3141,7 +3141,7 @@ class OpinionEdit(AbstractDateTimeModel):
     of a group in the ensemble document is its place on the page, and
     a re-glue or a re-run gives the same block another one. So an edit
     names its page by the durable address of ``OpinionText`` and its
-    block by a copy of the block's box, and ``opinion_edits.resolve``
+    block by a copy of the block's box, and ``ensemble.land_edits``
     lands it on the group of each new build, the rule of review 2's
     decisions.
 

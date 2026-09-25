@@ -607,6 +607,9 @@
                 label.textContent += ' (order set by hand)';
             }
             block.appendChild(label);
+            if ((page.unresolved_edits || []).length) {
+                block.appendChild(unresolvedList(page.unresolved_edits));
+            }
 
             if (page.error) {
                 block.appendChild(note('opinion-text-error', page.error));
@@ -2065,12 +2068,14 @@
                     showToast('The text did not change.', 'error');
                     return;
                 }
-                confirmText(group.text || '', text, function () {
+                // The modal's own Save goes to the post, so a request
+                // with no answer gives that button back.
+                confirmText(group.text || '', text, function (saving) {
                     postEdit(endpoint('editTextUrl'), {
                         page_in_opinion: page.page_in_opinion,
                         group_id: group.id,
                         text: text
-                    }, button);
+                    }, saving);
                 });
             }));
         row.appendChild(barButton('Cancel', 'Keep the text as it is',
@@ -2090,7 +2095,8 @@
      *
      * @param {string} before - The text the block shows.
      * @param {string} after - The text the curator wrote.
-     * @param {Function} onConfirm - What Save does.
+     * @param {Function} onConfirm - What Save does. It takes the
+     *     modal's Save button, which the post disables and gives back.
      */
     function confirmText(before, after, onConfirm) {
         var modal = document.createElement('div');
@@ -2132,7 +2138,7 @@
             if (event.key === 'Escape') { close(); }
         }
         row.appendChild(barButton('Save', 'Save the text on the right',
-            function (button) { button.disabled = true; onConfirm(); }));
+            function (button) { onConfirm(button); }));
         row.appendChild(barButton('Cancel', 'Go back to the text',
             function () { close(); }));
         box.appendChild(row);
@@ -2142,6 +2148,62 @@
         });
         document.addEventListener('keydown', onKey);
         document.body.appendChild(modal);
+    }
+
+    /**
+     * Build the list of the edits a build did not apply (#376), each
+     * with its Undo. Such an edit has no block to lock, or its block
+     * offers no Undo, so this list is its one way out, and the
+     * ``UNRESOLVED_EDIT`` card waits on it. The line is the document's
+     * own (``said``); the browser spells no reason.
+     *
+     * @param {Object[]} entries - ``unresolved_edits`` of a page or of
+     *     the document.
+     * @returns {HTMLElement} The list.
+     */
+    function unresolvedList(entries) {
+        var list = document.createElement('div');
+        list.className = 'ensemble-unresolved';
+        entries.forEach(function (entry) {
+            var line = document.createElement('div');
+            line.className = 'ensemble-unresolved-line';
+            var said = document.createElement('span');
+            said.textContent = entry.said || entry.kind;
+            line.appendChild(said);
+            if (canEdit()) {
+                line.appendChild(barButton(
+                    'Undo',
+                    'Take this edit back. The text is written again'
+                        + ' without it.',
+                    function (button) {
+                        if (!window.confirm('Undo this edit? It is not'
+                                + ' in the text now.')) { return; }
+                        withdrawEdit(entry.edit_id, button);
+                    }
+                ));
+            }
+            list.appendChild(line);
+        });
+        return list;
+    }
+
+    /**
+     * Put the Undo of each unresolved edit on its card of the findings
+     * (#376): the card says to undo it, so the card holds the button.
+     * A card with no page is about the whole opinion.
+     */
+    function bindUnresolvedCards() {
+        document.querySelectorAll(
+            '.finding-card[data-check="unresolved_edit"]'
+        ).forEach(function (card) {
+            var entries = card.dataset.page === undefined
+                ? doc.unresolved_edits
+                : (pageOf(parseInt(card.dataset.page, 10)) || {})
+                    .unresolved_edits;
+            if ((entries || []).length) {
+                card.appendChild(unresolvedList(entries));
+            }
+        });
     }
 
     function moveBlock(page, group, direction, button) {
@@ -2327,6 +2389,13 @@
             .then(function (data) {
                 doc = data;
                 drawText();
+                if ((doc.unresolved_edits || []).length) {
+                    textColumn.insertBefore(
+                        unresolvedList(doc.unresolved_edits),
+                        textColumn.firstChild
+                    );
+                }
+                bindUnresolvedCards();
                 if (!hasLevels()) {
                     textColumn.insertBefore(note(
                         'opinion-text-error',

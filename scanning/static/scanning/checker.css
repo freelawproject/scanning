@@ -1643,3 +1643,19 @@ li.ensemble-group {
     border: 1px solid rgba(107, 114, 128, 0.35);
     border-radius: 4px;
 }
+/* The edits a build did not apply, each with its Undo (#376). */
+.ensemble-unresolved {
+    margin: 4px 0 8px;
+    padding: 4px 6px;
+    border-left: 2px solid #dc2626;
+    background: rgba(220, 38, 38, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-unresolved-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}

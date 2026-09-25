@@ -262,6 +262,7 @@ HUMAN = "human"
 EDIT_NO_PAGE = "no_page"
 EDIT_NO_GROUP = "no_group"
 EDIT_DROPPED = "dropped"
+EDIT_EMPTY = "empty"
 EDIT_BASE_CHANGED = "base_changed"
 
 #: The risk of a group the engines did not read alike (#419). A
@@ -2086,14 +2087,21 @@ def _human_read(read_back: dict, edit: dict) -> dict:
 
 
 def _unresolved(edit: dict, reason: str) -> dict:
-    """Return the entry of one edit the build did not apply."""
-    return {
+    """Return the entry of one edit the build did not apply.
+
+    ``said`` is the line the viewer shows beside the Undo of the edit,
+    written here so the browser spells no reason of its own.
+    """
+    entry = {
         "edit_id": edit["id"],
         "kind": edit["kind"],
         "reason": reason,
         "by": edit.get("by", ""),
         "base_text": edit.get("base_text", ""),
     }
+    line = _unresolved_line(entry)
+    entry["said"] = line[0].upper() + line[1:]
+    return entry
 
 
 def build_page(
@@ -2232,9 +2240,12 @@ def build_page(
     for group in ordered:
         read_back = resolve(group)
         if group["excluded"] or not read_back["text"]:
+            # A redaction or a mask took the block, or no engine reads
+            # a word there now: two causes, and the card names the one.
+            gone = EDIT_DROPPED if group["excluded"] else EDIT_EMPTY
             for key in ("_section_edit", "_text_edit"):
                 if group.get(key):
-                    unresolved.append(_unresolved(group[key], EDIT_DROPPED))
+                    unresolved.append(_unresolved(group[key], gone))
             sequence.append(
                 {
                     "dropped": True,
@@ -3142,6 +3153,7 @@ _EDIT_REASON_WORDS = {
     EDIT_NO_PAGE: "its page is no longer in this opinion",
     EDIT_NO_GROUP: "no block of the text is where it was",
     EDIT_DROPPED: "a redaction or a mask now takes its block out",
+    EDIT_EMPTY: "no engine reads a word in its block now",
     EDIT_BASE_CHANGED: "the engines now read other words there",
 }
 
@@ -3153,6 +3165,14 @@ _EDIT_KIND_WORDS = {
 }
 
 
+def _unresolved_line(entry: dict) -> str:
+    """Return what one unresolved edit is and why it is out (#376)."""
+    kind = _EDIT_KIND_WORDS.get(entry["kind"], entry["kind"])
+    who = f" by {entry['by']}" if entry.get("by") else ""
+    why = _EDIT_REASON_WORDS.get(entry["reason"], entry["reason"])
+    return f"{kind}{who}: {why}"
+
+
 def _unresolved_message(entries: list[dict]) -> str:
     """Return the line of one ``UNRESOLVED_EDIT`` card (#376).
 
@@ -3160,15 +3180,10 @@ def _unresolved_message(entries: list[dict]) -> str:
     :returns: The message.
     :rtype: str
     """
-    said = "; ".join(
-        f"{_EDIT_KIND_WORDS.get(entry['kind'], entry['kind'])}"
-        f"{' by ' + entry['by'] if entry.get('by') else ''}: "
-        f"{_EDIT_REASON_WORDS.get(entry['reason'], entry['reason'])}"
-        for entry in entries
-    )
+    said = "; ".join(_unresolved_line(entry) for entry in entries)
     return (
-        f"{len(entries)} human edit(s) are not in the text ({said}). Undo "
-        "the edit, or edit the block again."
+        f"{len(entries)} human edit(s) are not in the text ({said}). Press "
+        "Undo on this card to take an edit back, or edit the block again."
     )
 
 

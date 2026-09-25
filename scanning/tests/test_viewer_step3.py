@@ -299,7 +299,23 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
         source = VIEWER.read_text()
         match = re.search(r"var EDIT_SCHEMA = (\d+);", source)
         self.assertIsNotNone(match)
-        self.assertEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+        # A floor, the pin of ``LEVEL_SCHEMA``: a later schema still
+        # holds the edits, and its document keeps the toolbar.
+        self.assertLessEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_an_unresolved_edit_has_its_undo(self):
+        """An edit with no block to lock is undone from its line (#376)."""
+        source = VIEWER.read_text()
+        lines = source[source.index("function unresolvedList(") :]
+        lines = lines[: lines.index("\n    }\n")]
+        self.assertIn("withdrawEdit(entry.edit_id", lines)
+        self.assertIn("entry.said", lines)
+        for reader in (
+            "page.unresolved_edits",
+            "doc.unresolved_edits",
+            'data-check="unresolved_edit"',
+        ):
+            self.assertIn(reader, source)
 
     def test_the_edit_reads_the_level_and_derives_none(self):
         source = VIEWER.read_text()

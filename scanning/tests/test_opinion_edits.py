@@ -272,6 +272,38 @@ class TestTheTextEdit(TestCase):
             [ensemble.EDIT_DROPPED],
         )
 
+    def test_a_block_no_engine_reads_now_says_so(self):
+        """No redaction took it, so the card must not name one."""
+        dots = [unit("dots_mocr", 0, BODY_A_PT, "")]
+        mistral = [unit("mistral_ocr", 0, BODY_A_PT, "")]
+
+        page = page_with(
+            dots,
+            mistral,
+            [entry(OpinionEdit.Kind.TEXT, BODY_A_PT, base_text="x", text="y")],
+        )
+
+        [unresolved] = page["unresolved_edits"]
+        self.assertEqual(unresolved["reason"], ensemble.EDIT_EMPTY)
+        self.assertIn("no engine reads", unresolved["said"])
+        self.assertNotIn("redaction", unresolved["said"])
+
+    def test_an_unresolved_edit_carries_its_line(self):
+        dots, mistral = self.disagree()
+
+        page = page_with(
+            dots,
+            mistral,
+            [entry(OpinionEdit.Kind.SECTION, BODY_C_PT, section="footnotes")],
+        )
+
+        [unresolved] = page["unresolved_edits"]
+        self.assertEqual(
+            unresolved["said"],
+            "The section of a block by curator: no block of the text is "
+            "where it was",
+        )
+
     def test_the_marks_carry_to_the_words_the_curator_kept(self):
         dots = [
             unit(
@@ -966,6 +998,36 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         )
         self.assertEqual(
             OpinionEdit.objects.filter(withdrawn_at__isnull=False).count(), 1
+        )
+
+    def test_an_edit_whose_block_is_gone_is_undone_from_its_card(self):
+        """The one way out of an ``UNRESOLVED_EDIT`` card (#376)."""
+        edit = self.write_edit(
+            kind=OpinionEdit.Kind.SECTION,
+            box_pt=[36.0, 600.0, 100.0, 700.0],
+            section="footnotes",
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+        self.assertEqual(
+            self.page()["unresolved_edits"][0]["edit_id"], edit.pk
+        )
+        self.assertTrue(
+            OpinionFinding.objects.filter(
+                check_name=OpinionCheck.UNRESOLVED_EDIT
+            ).exists()
+        )
+
+        response = self.undo(edit.pk)
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        edit.refresh_from_db()
+        self.assertIsNotNone(edit.withdrawn_at)
+        self.assertEqual(self.page()["unresolved_edits"], [])
+        self.assertFalse(
+            OpinionFinding.objects.filter(
+                check_name=OpinionCheck.UNRESOLVED_EDIT
+            ).exists()
         )
 
     def test_a_second_undo_is_refused(self):
