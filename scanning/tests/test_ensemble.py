@@ -1209,6 +1209,7 @@ class TestTheRows(EnsembleTestCase):
                     "end": 10,
                     "section": ensemble.BODY,
                     "agreement": ensemble.VOTED,
+                    "level": ensemble.BLOCKING,
                     "variants": {
                         "dots_mocr": "alpha beta",
                         "mistral_ocr": "alpha peta",
@@ -1251,7 +1252,7 @@ class TestTheFindings(EnsembleTestCase):
         )
 
     def test_a_majority_group_is_an_engines_disagree_card(self):
-        cards = self.rebuild(majority=2, differing=2)
+        cards = self.rebuild(majority=2, differing=2, warning=2)
 
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
@@ -1259,31 +1260,76 @@ class TestTheFindings(EnsembleTestCase):
         self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
         self.assertIn("2 place(s)", cards[0].message)
 
-    def test_a_voted_group_is_an_engines_disagree_card(self):
-        """With two engines no group can hold a majority, and a card
-        that read the majority alone would never be written."""
-        cards = self.rebuild(voted=2, differing=2)
+    def test_a_voted_group_is_a_no_majority_card(self):
+        """No reading of the block held a majority, so the approval
+        waits for a person (#419). With two engines every split is
+        voted."""
+        cards = self.rebuild(voted=2, differing=2, blocking=2)
 
-        self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
-        self.assertIn("2 place(s)", cards[0].message)
+        self.assertEqual(
+            [c.check_name for c in cards], [OpinionCheck.NO_MAJORITY]
+        )
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
+        self.assertIn("2 block(s)", cards[0].message)
 
-    def test_the_card_counts_what_the_row_calls_a_disagreement(self):
-        cards = self.rebuild(majority=1, voted=1, differing=2)
+    def test_a_voted_group_blocks_when_every_word_is_settled(self):
+        """The word vote settled every word, and the block still holds
+        no reading a majority shares (#419)."""
+        cards = self.rebuild(voted=1, differing=1, blocking=1)
 
-        self.assertIn("2 place(s)", cards[0].message)
+        self.assertEqual(cards[0].check_name, OpinionCheck.NO_MAJORITY)
+        self.assertNotIn("word(s)", cards[0].message)
+
+    def test_the_cards_count_what_the_row_calls_a_disagreement(self):
+        cards = self.rebuild(
+            majority=1, voted=1, differing=2, warning=1, blocking=1
+        )
+
+        by_check = {c.check_name: c for c in cards}
+        self.assertIn("1 place(s)", by_check["engines_disagree"].message)
+        self.assertIn("1 block(s)", by_check["no_majority"].message)
 
     def test_a_silent_engine_is_a_place_the_engines_differ(self):
-        cards = self.rebuild(differing=1, silent=1)
+        cards = self.rebuild(differing=1, silent=1, warning=1)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.ENGINES_DISAGREE)
         self.assertIn("1 place(s)", cards[0].message)
 
-    def test_a_word_with_no_majority_is_its_own_card(self):
-        cards = self.rebuild(low_confidence=3)
+    def test_the_no_majority_card_counts_the_words(self):
+        cards = self.rebuild(
+            voted=1, differing=1, blocking=1, low_confidence=3
+        )
 
         self.assertEqual(cards[0].check_name, OpinionCheck.NO_MAJORITY)
         self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
         self.assertIn("3 word(s)", cards[0].message)
+
+    def test_a_block_one_engine_read_is_its_own_card(self):
+        """Nothing confirms the words of one engine, so the card is an
+        ERROR the approval waits on until a person dismisses it
+        (#419)."""
+        page = page_of(
+            groups=[
+                {
+                    "id": 0,
+                    "agreement": ensemble.SINGLE,
+                    "level": ensemble.BLOCKING,
+                    "source": "mistral_ocr",
+                }
+            ],
+            single=1,
+            differing=1,
+            blocking=1,
+            single_engine=1,
+        )
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.check_name, OpinionCheck.SINGLE_ENGINE)
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+        self.assertIn("1 block(s)", card.message)
+        self.assertIn("(mistral_ocr)", card.message)
 
     def test_a_partial_redaction_is_its_own_card(self):
         cards = self.rebuild(partial=1)
@@ -1378,7 +1424,7 @@ class TestTheFindings(EnsembleTestCase):
             check_name=OpinionCheck.ENGINES_DISAGREE,
         )
 
-        cards = self.rebuild(majority=1, differing=1)
+        cards = self.rebuild(majority=1, differing=1, warning=1)
 
         self.assertEqual(cards[0].dismissal_id, dismissal.pk)
 
@@ -1392,7 +1438,7 @@ class TestTheFindings(EnsembleTestCase):
             withdrawn_at=timezone.now(),
         )
 
-        cards = self.rebuild(majority=1, differing=1)
+        cards = self.rebuild(majority=1, differing=1, warning=1)
 
         self.assertIsNone(cards[0].dismissal_id)
 
@@ -1405,13 +1451,13 @@ class TestTheFindings(EnsembleTestCase):
             message="no boundary",
         )
 
-        self.rebuild(majority=1, differing=1)
+        self.rebuild(majority=1, differing=1, warning=1)
 
         self.assertTrue(OpinionFinding.objects.filter(pk=stale.pk).exists())
 
     def test_a_second_rebuild_writes_one_card(self):
-        self.rebuild(majority=1, differing=1)
-        cards = self.rebuild(majority=1, differing=1)
+        self.rebuild(majority=1, differing=1, warning=1)
+        cards = self.rebuild(majority=1, differing=1, warning=1)
 
         self.assertEqual(len(cards), 1)
 
@@ -2022,6 +2068,26 @@ class TestTheCommand(EnsembleTestCase):
     def test_an_unknown_scan_is_an_error(self):
         with self.assertRaises(CommandError):
             self.run_command(99999)
+
+    def test_all_reads_every_volume_with_an_opinion(self):
+        """The deploy of a new document schema (#419) reads every
+        volume again."""
+        self.glue()
+
+        output = self.run_command("--all")
+
+        self.assertIn("Wrote 1 opinion(s)", output)
+        self.assertEqual(
+            OpinionText.objects.filter(opinion=self.opinion).count(), 3
+        )
+
+    def test_all_and_a_scan_together_is_an_error(self):
+        with self.assertRaises(CommandError):
+            self.run_command(self.scan.pk, "--all")
+
+    def test_no_scan_and_no_all_is_an_error(self):
+        with self.assertRaises(CommandError):
+            self.run_command()
 
 
 # ── the section (#399) ───────────────────────────────────────────────
@@ -3359,3 +3425,136 @@ class TestTheBlockquoteOfAnOpinion(EnsembleTestCase):
         self.assertEqual(document["pages"][1]["blockquotes"], [])
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=1)
         self.assertEqual(row.marks, [])
+
+
+# ── the risk of a disagreement (#419) ────────────────────────────────
+class TestTheLevel(TestCase):
+    """``disagreement_level`` is the one rule of the cards, the
+    ``disagreements`` entries and the colours of the review page."""
+
+    def level(self, agreement, engines=("dots_mocr", "mistral_ocr"), **more):
+        group = {
+            "agreement": agreement,
+            "engines": {name: {} for name in engines},
+            "silent": [],
+        }
+        group.update(more)
+        return ensemble.disagreement_level(group, 3)
+
+    def test_a_group_every_engine_read_alike_has_no_level(self):
+        self.assertIsNone(
+            self.level(
+                ensemble.UNANIMOUS,
+                engines=("dots_mocr", "mistral_ocr", "surya"),
+            )
+        )
+
+    def test_a_majority_is_a_warning(self):
+        self.assertEqual(
+            self.level(
+                ensemble.MAJORITY,
+                engines=("dots_mocr", "mistral_ocr", "surya"),
+            ),
+            ensemble.WARNING,
+        )
+
+    def test_two_readers_alike_beside_a_silent_engine_is_a_warning(self):
+        self.assertEqual(
+            self.level(
+                ensemble.UNANIMOUS,
+                engines=("dots_mocr", "mistral_ocr", "surya"),
+                silent=["surya"],
+            ),
+            ensemble.WARNING,
+        )
+
+    def test_a_voted_group_blocks(self):
+        self.assertEqual(
+            self.level(
+                ensemble.VOTED,
+                engines=("dots_mocr", "mistral_ocr", "surya"),
+            ),
+            ensemble.BLOCKING,
+        )
+
+    def test_a_block_one_engine_read_blocks(self):
+        self.assertEqual(
+            self.level(ensemble.SINGLE, engines=("mistral_ocr",)),
+            ensemble.BLOCKING,
+        )
+
+    def test_the_page_writes_the_level_on_each_group(self):
+        """One engine drew a box no other engine drew: a single group,
+        and the page counts it on the ``SINGLE_ENGINE`` card."""
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [unit("dots_mocr", 0, (36, 108, 288, 200), "alpha")]
+                ),
+                "mistral_ocr": engine_page(
+                    [unit("mistral_ocr", 0, (36, 300, 288, 400), "beta")]
+                ),
+            },
+            0,
+        )
+
+        self.assertEqual(
+            [g["level"] for g in page["groups"]],
+            [ensemble.BLOCKING, ensemble.BLOCKING],
+        )
+        self.assertEqual(page["counts"]["single_engine"], 2)
+        self.assertEqual(page["counts"][ensemble.BLOCKING], 2)
+        self.assertEqual(page["counts"]["differing"], 2)
+
+    def test_a_page_read_alike_has_no_level(self):
+        box = (36, 108, 288, 200)
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page([unit("dots_mocr", 0, box, "alpha")]),
+                "mistral_ocr": engine_page(
+                    [unit("mistral_ocr", 0, box, "alpha")]
+                ),
+            },
+            0,
+        )
+
+        self.assertIsNone(page["groups"][0]["level"])
+        self.assertEqual(page["counts"]["differing"], 0)
+
+
+class TestTheBracketDrop(TestCase):
+    """A partial drop of a group that lost a bracket token writes no
+    ``PARTIAL_REDACTION`` card (#419)."""
+
+    def page(self, removed):
+        box = (36, 108, 288, 200)
+        excluded = {"reason": "redaction", "rect_type": "manual"}
+        dots = engine_page(
+            [unit("dots_mocr", 0, box, "The court held.", excluded, 0.3)]
+        )
+        if removed:
+            dots["units"][0]["removed"] = ["[1]"]
+        return ensemble.build_page(
+            {
+                "dots_mocr": dots,
+                "mistral_ocr": engine_page(
+                    [unit("mistral_ocr", 0, box, "The court held.")]
+                ),
+            },
+            0,
+        )
+
+    def test_a_bracket_drop_counts_apart(self):
+        page = self.page(removed=True)
+
+        self.assertTrue(page["dropped"][0]["partial"])
+        self.assertTrue(page["dropped"][0]["bracket"])
+        self.assertEqual(page["counts"]["partial"], 0)
+        self.assertEqual(page["counts"]["partial_bracket"], 1)
+
+    def test_a_drop_with_no_bracket_is_still_a_partial_card(self):
+        page = self.page(removed=False)
+
+        self.assertFalse(page["dropped"][0]["bracket"])
+        self.assertEqual(page["counts"]["partial"], 1)
+        self.assertEqual(page["counts"]["partial_bracket"], 0)

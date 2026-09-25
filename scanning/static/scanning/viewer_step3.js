@@ -45,6 +45,19 @@
  * #411), and the viewer never derives one: the groups of a run go in
  * one ``<blockquote>`` element, and the page draws the blockquote
  * zones beside the footnote zones.
+ *
+ * A group says its risk (``level``, #419), and the viewer reads it and
+ * derives nothing: ``ensemble.disagreement_level`` is the one rule of
+ * the cards, the colours and the badge. A ``blocking`` group is red, a
+ * ``warning`` group is yellow, and the box of a group with no level
+ * (every engine read it alike) is quiet: it shows while its group is
+ * selected, or while the reviewer asks for every box. A document of an
+ * older schema has no level, and the page says so.
+ *
+ * A double click locks one group (#419): the pointer no longer moves
+ * the selection, and the readings of the group open under it. A
+ * single click outside the group, its readings and its box releases
+ * the lock.
  */
 
 (function () {
@@ -77,6 +90,14 @@
     var BODY = 'text';
     var FOOTNOTES = 'footnotes';
 
+    // The first schema of the ensemble document that writes ``level``
+    // on its groups (``ensemble.SCHEMA_VERSION``, #419).
+    var LEVEL_SCHEMA = 6;
+
+    // The key of the reviewer's choice to see every box, in this
+    // browser alone. A convenience: the page works without it.
+    var QUIET_KEY = 'opinion-review-show-quiet';
+
     var root = null;
     var pagesColumn = null;
     var textColumn = null;
@@ -88,6 +109,11 @@
 
     // The group under the pointer, so a move clears the one before it.
     var selected = null;
+
+    // The group a double click locked, or null (#419). ``opened`` says
+    // whether the lock opened its readings, so the release closes the
+    // panel it opened and no other.
+    var locked = null;
 
     // The page a card of the findings asked for before the text was
     // read. The text column holds no block until then, so the jump is
@@ -420,6 +446,13 @@
             if (group.weak) { el.classList.add('weak'); }
             if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
             if (group.blockquote) { el.dataset.blockquote = 'true'; }
+            if (hasLevels()) {
+                if (group.level) {
+                    el.dataset.level = group.level;
+                } else {
+                    el.classList.add('ensemble-quiet');
+                }
+            }
             placeOver(el, box, scale);
             wrapper.appendChild(el);
         });
@@ -761,6 +794,7 @@
         node.dataset.kind = kind;
         if (group.weak) { node.classList.add('weak'); }
         if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
+        if (hasLevels() && group.level) { node.dataset.level = group.level; }
 
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
@@ -808,15 +842,15 @@
             var tag = document.createElement('span');
             tag.className = 'ensemble-note';
             tag.textContent = line;
-            tag.title = 'What the engines did here. Press the readings'
-                + ' badge to see each one.';
+            tag.title = 'What the engines did here. Double-click the'
+                + ' block to see each reading.';
             node.appendChild(document.createTextNode(' '));
             node.appendChild(tag);
         }
-        if (differs(page, group)) {
+        var readers = readerCount(group);
+        if (readers < (page.engines || []).length) {
             node.appendChild(document.createTextNode(' '));
-            node.appendChild(compareButton(page, group, node));
-            node.classList.add('differs');
+            node.appendChild(compareButton(page, group, node, readers));
         }
         return node;
     }
@@ -842,58 +876,104 @@
     }
 
     /**
-     * Return whether the engines did not read one group alike.
+     * Return whether the document says the risk of its groups.
      *
-     * The browser's copy of ``ensemble._differs``, which the card of
-     * the findings and the ``OpinionText`` row both read: a majority,
-     * a word vote, an engine that read nothing, or fewer engines in
-     * the group than the page holds. A group this answers for carries
-     * the badge that opens the readings.
+     * A document of a schema before ``LEVEL_SCHEMA`` holds no
+     * ``level``, and the viewer derives none (#419): its groups keep
+     * the colour of their agreement and every box is drawn.
      *
-     * @param {Object} page - The page entry.
-     * @param {Object} group - The group entry.
-     * @returns {boolean} Whether they differ.
+     * @returns {boolean} Whether the groups carry ``level``.
      */
-    function differs(page, group) {
-        if (group.agreement === 'majority' || group.agreement === 'voted') {
-            return true;
-        }
-        if ((group.silent || []).length) { return true; }
-        var engines = (page.engines || []).length;
-        return engines > 0
-            && Object.keys(group.engines || {}).length < engines;
+    function hasLevels() {
+        return !!doc && (doc.schema_version || 0) >= LEVEL_SCHEMA;
     }
 
     /**
-     * Build the badge that opens the readings of one group.
+     * Return how many engines read words in one group.
+     *
+     * An engine with a box and no word here is ``silent``, and it is
+     * not a reading.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {number} The count.
+     */
+    function readerCount(group) {
+        var silent = group.silent || [];
+        return Object.keys(group.engines || {}).filter(function (name) {
+            return silent.indexOf(name) < 0;
+        }).length;
+    }
+
+    /**
+     * Build the badge of a group fewer engines read than the page
+     * holds (#419). Most groups hold a reading of every engine, and a
+     * badge on each would say nothing; the double click opens the
+     * readings of every group.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @param {HTMLElement} node - The node of the group.
+     * @param {number} readers - How many engines read words here.
      * @returns {HTMLElement} The button.
      */
-    function compareButton(page, group, node) {
+    function compareButton(page, group, node, readers) {
         var button = document.createElement('button');
         button.type = 'button';
         button.className = 'ensemble-compare';
-        button.textContent = (page.engines || []).length + ' readings';
-        button.title = 'Show what each engine read here, and why this'
-            + ' reading won';
+        button.textContent = readers + (readers === 1 ? ' reading' : ' readings');
+        button.title = 'Only ' + readers + ' of the '
+            + (page.engines || []).length + ' engines read words here.'
+            + ' Show what each engine read, and why this reading won';
         button.addEventListener('click', function (event) {
             event.stopPropagation();
-            var standing = node.nextSibling;
-            if (standing && standing.classList
-                    && standing.classList.contains('ensemble-variants')) {
-                standing.remove();
-                button.classList.remove('open');
-                return;
+            if (readingsOf(node)) {
+                closeReadings(node);
+            } else {
+                openReadings(page, group, node);
             }
+        });
+        return button;
+    }
+
+    /**
+     * Return the readings panel open under one node, or null.
+     *
+     * @param {HTMLElement} node - The node of a group.
+     * @returns {HTMLElement|null} The panel.
+     */
+    function readingsOf(node) {
+        var next = node.nextSibling;
+        return (next && next.classList
+            && next.classList.contains('ensemble-variants')) ? next : null;
+    }
+
+    /**
+     * Open the readings of one group under its node, once.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {HTMLElement} node - The node of the group.
+     */
+    function openReadings(page, group, node) {
+        if (!readingsOf(node)) {
             node.parentNode.insertBefore(
                 variantsPanel(page, group), node.nextSibling
             );
-            button.classList.add('open');
-        });
-        return button;
+        }
+        var button = node.querySelector('.ensemble-compare');
+        if (button) { button.classList.add('open'); }
+    }
+
+    /**
+     * Close the readings of one group.
+     *
+     * @param {HTMLElement} node - The node of the group.
+     */
+    function closeReadings(node) {
+        var panel = readingsOf(node);
+        if (panel) { panel.remove(); }
+        var button = node.querySelector('.ensemble-compare');
+        if (button) { button.classList.remove('open'); }
     }
 
     /**
@@ -1079,8 +1159,8 @@
     // see. So this code holds no table and normalizes nothing, and a
     // reader must not copy ``ensemble.compare_word`` into it.
     //
-    // The mark says nothing about the vote. ``differs`` alone decides
-    // which group carries the badge that opens the panel.
+    // The mark says nothing about the vote. The group's ``level``
+    // alone says where the engines did not read alike (#419).
     // -----------------------------------------------------------------
 
     /**
@@ -1380,8 +1460,87 @@
             boxFor(selected.page, selected.group),
             nodeFor(selected.page, selected.group)
         ].forEach(function (el) {
-            if (el) { el.classList.add('ensemble-selected'); }
+            if (!el) { return; }
+            el.classList.add('ensemble-selected');
+            if (locked) { el.classList.add('ensemble-locked'); }
         });
+    }
+
+    /**
+     * Return the group entry of one page, or null.
+     *
+     * @param {Object} page - The page entry.
+     * @param {number} id - The id of the group inside that page.
+     * @returns {Object|null} The group.
+     */
+    function groupOf(page, id) {
+        var found = null;
+        ((page && page.groups) || []).forEach(function (group) {
+            if (group.id === id) { found = group; }
+        });
+        return found;
+    }
+
+    /**
+     * Lock one group, and open its readings (#419).
+     *
+     * The pointer no longer moves the selection, so the reviewer can
+     * take the mouse to the readings. A lock of the group locked
+     * already changes nothing; a lock of another group moves it.
+     *
+     * @param {number} page - The 0-based page of the opinion.
+     * @param {number} group - The id of the group inside that page.
+     * @param {string} from - ``text`` or ``page``: the column of the
+     *     double click, which is the column that does not move.
+     */
+    function lock(page, group, from) {
+        if (locked && locked.page === page && locked.group === group) {
+            return;
+        }
+        release();
+        select(page, group, from);
+        var node = nodeFor(page, group);
+        var entry = groupOf(pageOf(page), group);
+        var opened = !!(node && entry && !readingsOf(node));
+        if (opened) { openReadings(pageOf(page), entry, node); }
+        locked = { page: page, group: group, opened: opened };
+        paintSelection();
+    }
+
+    /**
+     * Release the lock: close the readings it opened, and clear the
+     * selection.
+     */
+    function release() {
+        if (!locked) { return; }
+        var node = nodeFor(locked.page, locked.group);
+        if (node && locked.opened) { closeReadings(node); }
+        root.querySelectorAll('.ensemble-locked').forEach(function (el) {
+            el.classList.remove('ensemble-locked');
+        });
+        locked = null;
+        clearSelection();
+    }
+
+    /**
+     * Return whether a click belongs to the locked group: its node, its
+     * readings, or its box on the page.
+     *
+     * @param {MouseEvent} event - The click.
+     * @returns {boolean} Whether it is inside.
+     */
+    function insideLock(event) {
+        var node = nodeFor(locked.page, locked.group);
+        var panel = node ? readingsOf(node) : null;
+        if (node && node.contains(event.target)) { return true; }
+        if (panel && panel.contains(event.target)) { return true; }
+        var wrapper = event.target.closest
+            ? event.target.closest('.canvas-wrapper') : null;
+        if (!wrapper) { return false; }
+        var box = boxAt(wrapper, event);
+        return !!box
+            && parseInt(box.dataset.page, 10) === locked.page
+            && parseInt(box.dataset.group, 10) === locked.group;
     }
 
     function boxFor(page, group) {
@@ -1465,8 +1624,25 @@
         return found;
     }
 
+    /**
+     * Find the box under one pointer event on a page.
+     *
+     * @param {HTMLElement} wrapper - The wrapper of the page.
+     * @param {MouseEvent} event - The event.
+     * @returns {HTMLElement|null} The box.
+     */
+    function boxAt(wrapper, event) {
+        var frame = wrapper.getBoundingClientRect();
+        return boxUnder(
+            wrapper,
+            event.clientX - frame.left,
+            event.clientY - frame.top
+        );
+    }
+
     function bindPointers() {
         textColumn.addEventListener('mouseover', function (event) {
+            if (locked) { return; }
             var node = event.target.closest('.ensemble-group');
             if (!node) { return; }
             select(
@@ -1476,20 +1652,60 @@
             );
         });
         pagesColumn.addEventListener('mousemove', function (event) {
+            if (locked) { return; }
             var wrapper = event.target.closest('.canvas-wrapper');
             if (!wrapper) { return; }
-            var frame = wrapper.getBoundingClientRect();
-            var box = boxUnder(
-                wrapper,
-                event.clientX - frame.left,
-                event.clientY - frame.top
-            );
+            var box = boxAt(wrapper, event);
             if (!box) { clearSelection(); return; }
             select(
                 parseInt(box.dataset.page, 10),
                 parseInt(box.dataset.group, 10),
                 'page'
             );
+        });
+        bindLock();
+    }
+
+    /**
+     * The lock of one group (#419): a double click sets it, a single
+     * click outside releases it.
+     */
+    function bindLock() {
+        // A double click selects a word of the text; the lock is what
+        // the reviewer asked for, so the second press selects nothing.
+        textColumn.addEventListener('mousedown', function (event) {
+            if (event.detail > 1 && event.target.closest('.ensemble-group')) {
+                event.preventDefault();
+            }
+        });
+        textColumn.addEventListener('dblclick', function (event) {
+            if (event.target.closest('button')) { return; }
+            var node = event.target.closest('.ensemble-group');
+            if (!node) { return; }
+            lock(
+                parseInt(node.dataset.page, 10),
+                parseInt(node.dataset.group, 10),
+                'text'
+            );
+        });
+        pagesColumn.addEventListener('dblclick', function (event) {
+            var wrapper = event.target.closest('.canvas-wrapper');
+            if (!wrapper) { return; }
+            var box = boxAt(wrapper, event);
+            if (!box) { return; }
+            lock(
+                parseInt(box.dataset.page, 10),
+                parseInt(box.dataset.group, 10),
+                'page'
+            );
+        });
+        // The clicks of a double click are one and two; the first one
+        // on another group releases the lock, and the double click
+        // then sets the new one.
+        document.addEventListener('click', function (event) {
+            if (!locked || event.detail !== 1) { return; }
+            if (insideLock(event)) { return; }
+            release();
         });
     }
 
@@ -1505,6 +1721,75 @@
                 });
             }
         );
+        // The dismissal of a card, and its undo (#419). The template
+        // writes the address; the answer's line survives the reload,
+        // because the counts of the strip are the server's.
+        document.querySelectorAll('.finding-dismiss, .finding-restore')
+            .forEach(function (button) {
+                button.addEventListener('click', function (event) {
+                    event.stopPropagation();
+                    postAndReload(
+                        button.dataset.dismissUrl || button.dataset.restoreUrl,
+                        button
+                    );
+                });
+            });
+    }
+
+    /**
+     * Post to one address, and reload the page on success.
+     *
+     * @param {string} address - The route.
+     * @param {HTMLButtonElement} button - The button that asked.
+     */
+    function postAndReload(address, button) {
+        button.disabled = true;
+        fetch(address, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-CSRFToken': csrfToken() }
+        })
+            .then(function (response) {
+                return response.json().then(function (data) {
+                    return { ok: response.ok, data: data };
+                });
+            })
+            .then(function (result) {
+                if (!result.ok) {
+                    showToast(result.data.message, 'error');
+                    button.disabled = false;
+                    return;
+                }
+                showSavedAfterReload(result.data);
+                window.location.reload();
+            })
+            .catch(function () {
+                showToast('The request failed. Try again.', 'error');
+                button.disabled = false;
+            });
+    }
+
+    /**
+     * The choice to see the boxes every engine read alike (#419). They
+     * are quiet by default: nothing there asks for the reviewer's eye.
+     * The choice is kept in this browser, and the page works without
+     * the storage.
+     */
+    function bindQuiet() {
+        var box = document.getElementById('show-quiet');
+        if (!box || !pagesColumn) { return; }
+        var stored = null;
+        try {
+            stored = window.localStorage.getItem(QUIET_KEY);
+        } catch (error) { stored = null; }
+        box.checked = stored === '1';
+        pagesColumn.classList.toggle('show-quiet', box.checked);
+        box.addEventListener('change', function () {
+            pagesColumn.classList.toggle('show-quiet', box.checked);
+            try {
+                window.localStorage.setItem(QUIET_KEY, box.checked ? '1' : '0');
+            } catch (error) { /* the page works without it */ }
+        });
     }
 
     /**
@@ -1601,6 +1886,15 @@
             .then(function (data) {
                 doc = data;
                 drawText();
+                if (!hasLevels()) {
+                    textColumn.insertBefore(note(
+                        'opinion-text-error',
+                        'This text was written before the risk levels, so'
+                        + ' no block shows its level and every box is drawn.'
+                        + ' Press "Read the OCR documents again" to write'
+                        + ' it again.'
+                    ), textColumn.firstChild);
+                }
                 summarise();
                 redrawBoxes();
                 if (pending !== null) { goToPage(pending); }
@@ -1646,6 +1940,7 @@
         bindRerun();
         bindFindings();
         bindZoom();
+        bindQuiet();
         if (pagesColumn) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =
                 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/' +

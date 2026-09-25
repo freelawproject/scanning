@@ -57,6 +57,14 @@ WRITE_VIEWS = (
     "withdraw_stale_edit",
 )
 
+#: The writes of review 3 (#419). Apart, because ``test_detection_preview``
+#: holds every name of ``WRITE_VIEWS`` to the review-2 gate, and a
+#: review-3 write has a gate of its own: the opinion's status.
+REVIEW3_WRITE_VIEWS = (
+    "dismiss_opinion_finding",
+    "restore_opinion_finding",
+)
+
 #: The calls that make a function a write of review 2: it rebuilds the
 #: findings, or it writes a curator's dismissal of one.
 WRITE_CALLS = (
@@ -138,11 +146,14 @@ class TestEveryWriteAnswersAMessage(ScanningTestCase):
     """The set of the write views, and the message in each answer."""
 
     def test_the_write_views_are_the_pinned_set(self):
-        self.assertEqual(sorted(_write_functions()), sorted(WRITE_VIEWS))
+        self.assertEqual(
+            sorted(_write_functions()),
+            sorted(WRITE_VIEWS + REVIEW3_WRITE_VIEWS),
+        )
 
     def test_every_success_answer_carries_a_message(self):
         functions = _write_functions()
-        for name in WRITE_VIEWS:
+        for name in WRITE_VIEWS + REVIEW3_WRITE_VIEWS:
             answers = _success_answers(functions[name])
             self.assertTrue(answers, f"{name} answers no success dict")
             for keys in answers:

@@ -14,7 +14,9 @@ engine documents, which a volume read by two engines never holds, so
 this command is how such a volume is read.
 
 Two reasons to run it: a change of the transform in ``ensemble`` after
-a deploy, and a volume the daemon pass will not take.
+a deploy, and a volume the daemon pass will not take. After a change
+of the document itself, such as the risk levels of #419, run it over
+every volume: ``--all``.
 
 A ``TEXT_REVIEW_DONE`` row is left alone: a human approved its text,
 and nothing derived overwrites that. An ``ERROR`` row is read again and
@@ -31,6 +33,10 @@ Examples:
     # Write the text of two volumes again.
     docker exec scanning-daemon python manage.py \\
         rerun_opinion_ensemble 2845 2702
+
+    # Write the text of every volume again.
+    docker exec scanning-daemon python manage.py \\
+        rerun_opinion_ensemble --all --dry-run
 """
 
 from django.core.management.base import BaseCommand, CommandError
@@ -42,8 +48,8 @@ from scanning.models import Opinion, OpinionReviewStatus, Scan
 class Command(BaseCommand):
     help = (
         "Read the OCR documents of every unapproved opinion of the named "
-        "volumes and write its text, its warnings and its ensemble "
-        "document again."
+        "volumes, or of every volume with --all, and write its text, its "
+        "warnings and its ensemble document again."
     )
 
     def add_arguments(self, parser):
@@ -54,9 +60,14 @@ class Command(BaseCommand):
         """
         parser.add_argument(
             "scan_pks",
-            nargs="+",
+            nargs="*",
             type=int,
             help="Scan numbers whose opinions are read again.",
+        )
+        parser.add_argument(
+            "--all",
+            action="store_true",
+            help="Read the opinions of every volume that has one again.",
         )
         parser.add_argument(
             "--dry-run",
@@ -70,11 +81,21 @@ class Command(BaseCommand):
         :param args: Unused positional arguments.
         :param options: Parsed CLI options.
         :return: None.
-        :raises CommandError: If a named scan does not exist.
+        :raises CommandError: If a named scan does not exist, or if the
+            call names scans and passes ``--all``, or does neither.
         """
         dry_run = options["dry_run"]
+        pks = options["scan_pks"]
+        if options["all"] == bool(pks):
+            raise CommandError("name the scans or pass --all, not both")
+        if options["all"]:
+            pks = list(
+                Opinion.objects.order_by("scan_id")
+                .values_list("scan_id", flat=True)
+                .distinct()
+            )
         written = failed = 0
-        for pk in options["scan_pks"]:
+        for pk in pks:
             scan = Scan.objects.filter(pk=pk).first()
             if scan is None:
                 raise CommandError(f"scan {pk} does not exist")

@@ -172,8 +172,10 @@ logger = logging.getLogger(__name__)
 #: zone on every page (#399); 3 deletes the headnote bracket from the
 #: unit text (#373); 4 parses the engine's markup into ``marks`` and
 #: ``kind`` beside a plain ``text`` (#404); 5 puts the blockquote zone
-#: beside the footnote zone (#411).
-SCHEMA_VERSION = 5
+#: beside the footnote zone (#411); 6 keeps a ``manual`` bracket box
+#: out of the verdict of the unit whose bracket token it deleted
+#: (#419).
+SCHEMA_VERSION = 6
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -186,8 +188,11 @@ SCHEMA_VERSION = 5
 #: - a plain redaction, which the card does not see. Its type,
 #:   ``manual``, is the type of every box a curator draws, over a name
 #:   or over anything, so it counts only with the size and the place of
-#:   a bracket (:func:`is_bracket_box`), and :func:`verdict` still
-#:   measures it.
+#:   a bracket (:func:`is_bracket_box`). :func:`verdict` still measures
+#:   it, except for a unit whose bracket token it deleted (#419): the
+#:   deleted token is the proof that the box is a bracket, so a short
+#:   line under it is not dropped whole. A box that deleted nothing,
+#:   over a name at the start of a line, still excludes its unit.
 #:
 #: A ``HEADNOTE_BRACKET`` box never excludes a unit, whatever its size.
 #: So a bracket box the model draws over a whole paragraph blacks out
@@ -1177,9 +1182,16 @@ def build_document(
             elif parsed.kind == markup.TABLE:
                 counts["tables"] += 1
             label = unit.get(spec.type_key) or ""
+            # A ``manual`` bracket box that deleted a token of this unit
+            # is the bracket, and it does not take the unit (#419).
+            unit_rects = (
+                [r for r in rects if not is_bracket_box(r, box_pt)]
+                if removed
+                else rects
+            )
             exclusion, share = verdict(
                 box_pt,
-                rects,
+                unit_rects,
                 page_masks,
                 text,
                 printed,

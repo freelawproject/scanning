@@ -212,6 +212,18 @@ ENSEMBLE_APPROVED_MESSAGE = (
     "The text review of this opinion is done, so its text is not "
     "written again. Reopen it first."
 )
+#: A review-3 finding takes a dismissal while its opinion is ready for
+#: the text review alone (#419): before, the text of the live revision
+#: is not written; after, a person approved it.
+OPINION_FINDING_CLOSED_MESSAGE = (
+    "This opinion is not ready for the text review, so its findings "
+    "take no dismissal now."
+)
+#: The two stale checks of review 3 are facts about the row (#336).
+OPINION_FINDING_UNDISMISSABLE_MESSAGE = (
+    "This finding cannot be dismissed. It says the opinion row no "
+    "longer matches the volume, and the way out is to fix the row."
+)
 #: A fault that passes. The detail goes to the log and not to the
 #: answer: it carries the words of a library, and a message of ours is
 #: what a curator can act on.
@@ -1022,6 +1034,113 @@ def rerun_opinion_ensemble(
                 groups=counts["groups"],
                 dropped=counts["dropped"],
                 low=counts["low_confidence"],
+            ),
+        }
+    )
+
+
+def _opinion_finding_or_refusal(
+    pk: int, opinion_pk: int, finding_pk: int
+) -> tuple[Opinion, Any] | JsonResponse:
+    """Return ``(opinion, finding)``, or the refusal of the request.
+
+    A finding of another opinion, or of an opinion of another scan, is
+    a 404. An opinion that is not ready for the text review refuses
+    with 409 (#419): the gate lives here, in the view.
+
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :param finding_pk: The ``OpinionFinding`` primary key.
+    :returns: The two rows, or the refusal.
+    """
+    from scanning.models import OpinionFinding, OpinionReviewStatus
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    finding = get_object_or_404(OpinionFinding, pk=finding_pk, opinion=opinion)
+    if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_FINDING_CLOSED_MESSAGE},
+            status=409,
+        )
+    return opinion, finding
+
+
+@login_required
+@require_POST
+def dismiss_opinion_finding(
+    request: HttpRequest, pk: int, opinion_pk: int, finding_pk: int
+) -> JsonResponse:
+    """Dismiss a finding of review 3 (#419).
+
+    One ``OpinionFindingDismissal`` row at the finding's address, and
+    the card's FK set at once, so the card is muted with no rebuild.
+    Any logged-in user may press it, the rule of review 1 and review 2.
+    A dismissal is the answer to an ERROR card: the approval of the
+    text waits on the open ones.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :param finding_pk: The ``OpinionFinding`` primary key.
+    :return: ``{status, message}``; 404 for a finding of another
+        opinion, 409 for a closed opinion or a stale finding.
+    """
+    from scanning import opinion_findings
+
+    rows = _opinion_finding_or_refusal(pk, opinion_pk, finding_pk)
+    if isinstance(rows, JsonResponse):
+        return rows
+    opinion, finding = rows
+    try:
+        opinion_findings.dismiss(opinion, finding, request.user)
+    except opinion_findings.UndismissableOpinionFinding:
+        return JsonResponse(
+            {
+                "status": "error",
+                "message": OPINION_FINDING_UNDISMISSABLE_MESSAGE,
+            },
+            status=409,
+        )
+    logger.info(
+        "%s of scan %s: %s dismissed the %s card of page %s",
+        opinion,
+        pk,
+        request.user,
+        finding.check_name,
+        finding.page_in_opinion,
+    )
+    return JsonResponse({"status": "ok", "message": DISMISSED_FINDING_MESSAGE})
+
+
+@login_required
+@require_POST
+def restore_opinion_finding(
+    request: HttpRequest, pk: int, opinion_pk: int, finding_pk: int
+) -> JsonResponse:
+    """Take back the dismissal of a review-3 finding (#419).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :param finding_pk: The ``OpinionFinding`` primary key.
+    :return: ``{status, message}``; 404 for a finding of another
+        opinion, 409 for a closed opinion.
+    """
+    from scanning import opinion_findings
+
+    rows = _opinion_finding_or_refusal(pk, opinion_pk, finding_pk)
+    if isinstance(rows, JsonResponse):
+        return rows
+    opinion, finding = rows
+    restored = opinion_findings.restore(opinion, finding)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": (
+                RESTORED_FINDING_MESSAGE
+                if restored
+                else STANDING_FINDING_MESSAGE
             ),
         }
     )

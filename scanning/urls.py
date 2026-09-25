@@ -39,6 +39,7 @@ from scanning.views_api import (
     delete_detection,
     dismiss_boundary,
     dismiss_finding,
+    dismiss_opinion_finding,
     dismiss_redaction,
     export_pdf,
     generate_files,
@@ -47,6 +48,7 @@ from scanning.views_api import (
     rerun_opinion_ensemble,
     restore_boundary,
     restore_finding,
+    restore_opinion_finding,
     restore_redaction,
     review_findings,
     serve_detections,
@@ -236,6 +238,19 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble/rerun/",
         rerun_opinion_ensemble,
         name="rerun_opinion_ensemble",
+    ),
+    # The curator's answer to a finding of review 3 (#419).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/findings/"
+        "<int:finding_pk>/dismiss/",
+        dismiss_opinion_finding,
+        name="dismiss_opinion_finding",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/findings/"
+        "<int:finding_pk>/restore/",
+        restore_opinion_finding,
+        name="restore_opinion_finding",
     ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).

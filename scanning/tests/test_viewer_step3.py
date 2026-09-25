@@ -22,6 +22,10 @@ the page by position would look right on every page of today's
 documents and go wrong in silence the day the order changes. The page
 column draws the footnote zones beside the boxes, and a zone left
 over from an older scale is a band in the wrong place.
+
+**The risk is the document's (#419).** ``ensemble.disagreement_level``
+is the one rule of the cards, the colours and the badge. A copy of it
+in the browser would drift from the cards in silence.
 """
 
 import pathlib
@@ -154,7 +158,7 @@ class TestTheMarksAreNodes(SimpleTestCase):
         self.assertIn("function markedNodes(", source)
         block = source[
             source.index("var KIND_ELEMENTS") : source.index(
-                "function differs("
+                "function hasLevels("
             )
         ]
         self.assertIn("createTextNode", block)
@@ -192,8 +196,53 @@ class TestTheBlockquoteIsTheDocumentsOwn(SimpleTestCase):
         source = VIEWER.read_text()
         block = source[
             source.index("function blockquoteNode(") : source.index(
-                "function differs("
+                "function hasLevels("
             )
         ]
         for name in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
             self.assertNotIn(name, block)
+
+
+class TestTheRiskIsTheDocuments(SimpleTestCase):
+    """The viewer reads ``level`` and derives no risk (#419)."""
+
+    def test_the_viewer_reads_the_level_of_the_group(self):
+        source = VIEWER.read_text()
+        self.assertIn("group.level", source)
+        self.assertIn("dataset.level", source)
+
+    def test_the_viewer_holds_no_copy_of_the_rule(self):
+        """``differs`` was the browser's copy of ``ensemble._differs``;
+        the document says it now."""
+        source = VIEWER.read_text()
+        self.assertNotIn("function differs(", source)
+        self.assertNotIn("_differs", source)
+
+    def test_the_viewer_knows_the_schema_that_writes_the_level(self):
+        source = VIEWER.read_text()
+        match = re.search(r"var LEVEL_SCHEMA = (\d+);", source)
+        self.assertIsNotNone(match)
+        self.assertLessEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_the_stylesheet_draws_both_levels(self):
+        styles = STYLES.read_text()
+        for level in (ensemble.WARNING, ensemble.BLOCKING):
+            self.assertIn(f'[data-level="{level}"]', styles)
+
+    def test_the_stylesheet_draws_the_quiet_boxes_and_the_lock(self):
+        styles = STYLES.read_text()
+        self.assertIn(".ensemble-quiet", styles)
+        self.assertIn(".show-quiet", styles)
+        self.assertIn(".ensemble-locked", styles)
+
+
+class TestTheStorageIsAConvenience(SimpleTestCase):
+    """The page works when the browser refuses the storage (#419)."""
+
+    def test_every_storage_call_is_inside_a_try(self):
+        source = VIEWER.read_text()
+        calls = [m.start() for m in re.finditer(r"localStorage\.", source)]
+        self.assertTrue(calls, "the choice of the quiet boxes is gone")
+        for at in calls:
+            before = source[max(0, at - 80) : at]
+            self.assertIn("try {", before, "a storage call outside a try")

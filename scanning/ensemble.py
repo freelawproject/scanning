@@ -157,8 +157,9 @@ logger = logging.getLogger(__name__)
 #: gives the page a second text, the footnotes (#399). 4 gives every
 #: group its ``kind`` and its ``marks``, the formatting the engines
 #: read (#404). 5 flags the quoted groups and writes the blockquote
-#: runs of a page (#411).
-SCHEMA_VERSION = 5
+#: runs of a page (#411). 6 gives every group its ``level``, and
+#: every drop its ``bracket`` (#419).
+SCHEMA_VERSION = 6
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue.
 DOCUMENT = "ensemble.json"
@@ -246,6 +247,14 @@ MAJORITY = "majority"
 VOTED = "voted"
 SINGLE = "single"
 
+#: The risk of a group the engines did not read alike (#419). A
+#: ``BLOCKING`` group is a place no majority of the engines read, or a
+#: place one engine alone read: its card is an ERROR, and the approval
+#: waits for a person. A ``WARNING`` group is a place a majority read.
+#: A group every engine read alike has no level.
+BLOCKING = "blocking"
+WARNING = "warning"
+
 #: Why a group is not in the text.
 DROP_EXCLUDED = "excluded"
 DROP_EMPTY = "empty"
@@ -261,6 +270,7 @@ ENSEMBLE_CHECKS = frozenset(
     {
         OpinionCheck.ENGINES_DISAGREE,
         OpinionCheck.NO_MAJORITY,
+        OpinionCheck.SINGLE_ENGINE,
         OpinionCheck.PARTIAL_REDACTION,
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
@@ -849,6 +859,10 @@ def _merge(
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        # Whether the OCR glue deleted a bracket token of a member
+        # (``removed``, #373). A drop of such a group writes no
+        # ``PARTIAL_REDACTION`` card (#419).
+        "bracket": any(m.get("bracket") for m in ordered),
         # Whether this engine read a word here that no exclusion
         # covers. A group is dropped whole, so a clean reading beside
         # an excluded one is text the reader loses, and that is what
@@ -1850,6 +1864,8 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
             "marks": unit.get("marks") or [],
             "kind": unit.get("kind") or markup.PARAGRAPH,
             "table": unit.get("table"),
+            # The glue deleted a bracket token of this unit (#373).
+            "bracket": bool(unit.get("removed")),
         }
         (placed if box else unplaced).append(entry)
     return placed, unplaced
@@ -1877,10 +1893,14 @@ def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
 def _counts() -> dict:
     """Return an empty count of one page or of one document.
 
-    ``differing`` is one per group the engines did not read alike, and
-    it is the number the ``ENGINES_DISAGREE`` card reads: a group can
-    be voted and hold a silent engine at once, and it is one place,
-    not two.
+    ``differing`` is one per group the engines did not read alike: a
+    group can be voted and hold a silent engine at once, and it is one
+    place, not two. It is ``warning`` plus ``blocking`` (#419), the two
+    levels of :func:`disagreement_level`; ``warning`` is the count of
+    the ``ENGINES_DISAGREE`` card, ``voted`` of ``NO_MAJORITY`` and
+    ``single_engine`` of ``SINGLE_ENGINE``. ``partial_bracket`` counts
+    the partial drops of a group that lost a bracket token, which no
+    card counts.
 
     :returns: Every count at zero.
     :rtype: dict
@@ -1894,8 +1914,12 @@ def _counts() -> dict:
         SINGLE: 0,
         "silent": 0,
         "differing": 0,
+        WARNING: 0,
+        BLOCKING: 0,
+        "single_engine": 0,
         "low_confidence": 0,
         "partial": 0,
+        "partial_bracket": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
         "blockquotes": 0,
@@ -1954,6 +1978,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                     "reason": (unit["exclusion"] or {}).get("reason")
                     or DROP_EXCLUDED,
                     "partial": False,
+                    "bracket": unit.get("bracket", False),
                 }
             )
     if size is None:
@@ -2018,6 +2043,10 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                         else DROP_EMPTY
                     ),
                     "partial": group["partial"],
+                    "bracket": any(
+                        unit.get("bracket")
+                        for unit in group["engines"].values()
+                    ),
                 }
             )
             continue
@@ -2047,6 +2076,7 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
                 "page_scale": group["page_scale"],
                 "silent": read_back["silent"],
                 "n_low_confidence": read_back["n_low_confidence"],
+                "level": None,
                 "tokens": read_back["tokens"],
                 "text": read_back["text"],
                 # The formatting (#404): the marks are offsets into
@@ -2071,8 +2101,13 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
         entry["counts"]["low_confidence"] += read_back["n_low_confidence"]
         if read_back["silent"]:
             entry["counts"]["silent"] += 1
-        if _differs(entry["groups"][-1], len(pages)):
+        level = disagreement_level(entry["groups"][-1], len(pages))
+        entry["groups"][-1]["level"] = level
+        if level:
             entry["counts"]["differing"] += 1
+            entry["counts"][level] += 1
+        if level == BLOCKING and read_back["agreement"] == SINGLE:
+            entry["counts"]["single_engine"] += 1
         if name == FOOTNOTES:
             entry["counts"]["footnote_groups"] += 1
         if group["footnote_doubt"]:
@@ -2087,8 +2122,16 @@ def build_page(pages: dict[str, dict], page_in_opinion: int) -> dict:
     )
     entry["counts"]["groups"] = len(entry["groups"])
     entry["counts"]["dropped"] = len(entry["dropped"])
+    # A partial drop of a group that lost a bracket token is the
+    # bracket, and the card would say nothing new (#419): the PDF shows
+    # the box and the count stays here.
     entry["counts"]["partial"] = sum(
-        1 for drop in entry["dropped"] if drop["partial"]
+        1
+        for drop in entry["dropped"]
+        if drop["partial"] and not drop["bracket"]
+    )
+    entry["counts"]["partial_bracket"] = sum(
+        1 for drop in entry["dropped"] if drop["partial"] and drop["bracket"]
     )
     return entry
 
@@ -2112,6 +2155,32 @@ def _differs(group: dict, engines: int) -> bool:
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True
     return len(group.get("engines") or {}) < engines
+
+
+def disagreement_level(group: dict, engines: int) -> str | None:
+    """Return the risk of one group: ``BLOCKING``, ``WARNING`` or None.
+
+    **The one rule** of the three cards of a disagreement, of the level
+    of an ``OpinionText.disagreements`` entry, and of the colour and the
+    badge of the review page, which reads ``level`` off the group and
+    derives nothing (#419).
+
+    A place no majority of the engines read alike (``VOTED``) blocks,
+    also when the word vote settled every word of it, and so does a
+    place one engine alone read (``SINGLE``): nothing confirms its
+    words. Every other place :func:`_differs` answers for is a place a
+    majority read alike, a warning.
+
+    :param group: One group of the document.
+    :param engines: How many engines the document holds.
+    :returns: The level, or None when the engines read it alike.
+    :rtype: str | None
+    """
+    if not _differs(group, engines):
+        return None
+    if group["agreement"] in (VOTED, SINGLE):
+        return BLOCKING
+    return WARNING
 
 
 def build_document(opinion: Opinion, documents: dict[str, dict]) -> dict:
@@ -2424,7 +2493,7 @@ def _disagreements(page: dict) -> list[dict]:
     group of a document older than the sections is body text.
 
     :param page: One page of the document.
-    :returns: ``[{start, end, section, agreement, variants}]``.
+    :returns: ``[{start, end, section, agreement, level, variants}]``.
     :rtype: list[dict]
     """
     engines = len(page.get("engines") or [])
@@ -2434,6 +2503,7 @@ def _disagreements(page: dict) -> list[dict]:
             "end": group["end"],
             "section": group.get("section") or BODY,
             "agreement": group["agreement"],
+            "level": disagreement_level(group, engines),
             "variants": {
                 name: unit["text"] for name, unit in group["engines"].items()
             },
@@ -2475,13 +2545,13 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
     for page in document["pages"]:
         page_number = page["page_in_opinion"]
         counts = page["counts"]
-        # Every group the engines did not read alike (``_differs``):
-        # the ones a majority settled, the ones the word vote settled,
-        # and the ones an engine read nothing of. It is the count of
-        # ``OpinionText.disagreements`` for this page, and a card and
-        # an entry must not disagree. With two engines no group can
-        # hold a majority, so a card that read ``counts[MAJORITY]``
-        # alone would never be written.
+        # Every group the engines did not read alike (``_differs``) is
+        # on one card of its level (``disagreement_level``, #419): a
+        # place a majority read is a warning, a place no majority read
+        # or one engine alone read is an ERROR, and those are the cards
+        # the approval waits on. The three counts add up to the entries
+        # of ``OpinionText.disagreements`` for this page, and a card and
+        # an entry must not disagree.
         if page.get("error"):
             # The page has no text at all, so it has no group to
             # count and no other card to write.
@@ -2496,28 +2566,40 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
             continue
-        differing = counts["differing"]
+        warning = counts.get(WARNING, 0)
         missing = page.get("missing") or []
-        if differing or missing:
+        if warning or missing:
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.ENGINES_DISAGREE,
                     Issue.Severity.WARNING,
-                    _disagree_message(differing, missing),
+                    _disagree_message(warning, missing),
                     standing,
                 )
             )
-        if counts["low_confidence"]:
+        if counts[VOTED]:
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.NO_MAJORITY,
                     Issue.Severity.ERROR,
-                    f"{counts['low_confidence']} word(s) on this page have "
-                    "no majority. Read them against the PDF.",
+                    _no_majority_message(
+                        counts[VOTED], counts["low_confidence"]
+                    ),
+                    standing,
+                )
+            )
+        if counts.get("single_engine"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.SINGLE_ENGINE,
+                    Issue.Severity.ERROR,
+                    _single_message(page),
                     standing,
                 )
             )
@@ -2669,6 +2751,48 @@ def _blockquote_list_message(page: dict) -> str:
     )
 
 
+def _no_majority_message(blocks: int, words: int) -> str:
+    """Return the line of one ``NO_MAJORITY`` card (#419).
+
+    :param blocks: How many groups no majority of the engines read.
+    :param words: How many words of them no majority settled.
+    :returns: The message.
+    :rtype: str
+    """
+    said = (
+        f"{blocks} block(s) on this page have no reading that a majority "
+        "of the engines share"
+    )
+    if words:
+        said += f", and {words} word(s) in them have no majority"
+    return said + ". Read them against the PDF."
+
+
+def _single_message(page: dict) -> str:
+    """Return the line of one ``SINGLE_ENGINE`` card (#419).
+
+    It names the engine of each block, because the reader judges the
+    words of one engine against the page, and no other engine confirms
+    them.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    alone = [
+        group
+        for group in page["groups"]
+        if group.get("level") == BLOCKING and group["agreement"] == SINGLE
+    ]
+    count = page["counts"].get("single_engine") or len(alone)
+    engines = _ranked({group["source"] for group in alone})
+    named = ", ".join(engines) or "one engine"
+    return (
+        f"{count} block(s) on this page were read by one engine alone "
+        f"({named}). Read them against the PDF."
+    )
+
+
 def _disagree_message(differing: int, missing: list[str]) -> str:
     """Return the line of one ``ENGINES_DISAGREE`` card.
 
@@ -2676,7 +2800,8 @@ def _disagree_message(differing: int, missing: list[str]) -> str:
     must know that the text of the page comes from the others, and the
     count alone does not say it.
 
-    :param differing: How many groups the engines did not read alike.
+    :param differing: How many groups a majority read alike, and not
+        every engine (the ``WARNING`` level, #419).
     :param missing: The engines whose read of the page failed.
     :returns: The message.
     :rtype: str
@@ -2688,8 +2813,8 @@ def _disagree_message(differing: int, missing: list[str]) -> str:
             "engine(s) that did."
         )
     count = (
-        f"The engines differ in {differing} place(s) on this page. The "
-        "vote picked a read for each."
+        f"The engines differ in {differing} place(s) on this page. A "
+        "majority of the engines that read agree in each."
     )
     if missing:
         return f"{named} did not read this page. {count}"

@@ -34,6 +34,7 @@ from scanning.forms import (
     ProfileForm,
 )
 from scanning.models import (
+    Issue,
     Opinion,
     OpinionReviewStatus,
     OpinionScan,
@@ -406,6 +407,34 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         )
     open_findings = sum(1 for row in findings if row.dismissal_id is None)
     ocr_written = opinion_ocr.is_written(opinion)
+    # The dismissal answers a card while the opinion is ready for the
+    # text review alone, the gate of the endpoint (#419). A stale card
+    # is a fact about the row and takes none.
+    can_dismiss = opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+    for row in findings:
+        if can_dismiss and not row.is_stale:
+            kwargs = {
+                "pk": opinion.scan_id,
+                "opinion_pk": opinion.pk,
+                "finding_pk": row.pk,
+            }
+            row.dismiss_url = reverse("dismiss_opinion_finding", kwargs=kwargs)
+            row.restore_url = reverse("restore_opinion_finding", kwargs=kwargs)
+    # Two lists (#419): the ERROR cards the approval waits on, with the
+    # stale ones, and the warnings. A dismissed card goes to the end of
+    # its list; the sort is stable, so the page order stays.
+    blocking = [
+        row.severity == Issue.Severity.ERROR or row.is_stale
+        for row in findings
+    ]
+    to_check = sorted(
+        (row for row, block in zip(findings, blocking) if block),
+        key=lambda row: row.dismissal_id is not None,
+    )
+    warnings = sorted(
+        (row for row, block in zip(findings, blocking) if not block),
+        key=lambda row: row.dismissal_id is not None,
+    )
 
     def address(name: str) -> str:
         """Return one route of this opinion, for a ``data-`` attribute."""
@@ -420,6 +449,14 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "opinion": opinion,
             "findings": findings,
             "open_findings": open_findings,
+            "to_check": to_check,
+            "warnings": warnings,
+            "open_to_check": sum(
+                1 for r in to_check if r.dismissal_id is None
+            ),
+            "open_warnings": sum(
+                1 for r in warnings if r.dismissal_id is None
+            ),
             # The three addresses the script reads (#365). They are
             # routes and not presigned URLs: each one is minted per
             # request, and a URL signed at render time would die in an
