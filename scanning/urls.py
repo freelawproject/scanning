@@ -63,6 +63,7 @@ from scanning.views_api import (
     serve_opinionscan_pdf,
     serve_redacted_pdf,
     serve_redactions,
+    start_caselaw_tagger,
     update_detection,
     withdraw_opinion_edit,
     withdraw_stale_edit,
@@ -101,6 +102,7 @@ from scanning.views_process import (
     serve_glued_volume,
     serve_opinion_ocr,
     serve_opinion_pdf,
+    serve_opinion_tags,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -296,6 +298,13 @@ urlpatterns = [
         reopen_opinion_text,
         name="reopen_opinion_text",
     ),
+    # The tagger of an approved text (#272): the one creator of its
+    # jobs, and nothing enqueues them on a tick.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/tag/",
+        start_caselaw_tagger,
+        name="start_caselaw_tagger",
+    ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).
     path(
@@ -322,6 +331,11 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/files/",
         opinion_file_index,
         name="opinion_file_index",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/tags/",
+        serve_opinion_tags,
+        name="serve_opinion_tags",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.

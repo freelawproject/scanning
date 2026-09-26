@@ -41,6 +41,7 @@ from scanning import (
     s3_sync,
     stats,
     surya,
+    tagger,
     yolo,
 )
 from scanning.models import (
@@ -2104,6 +2105,45 @@ def serve_opinion_ocr(
 
 
 @login_required
+def serve_opinion_tags(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the tagger's spans of one opinion (#272).
+
+    A developer's route, so it redirects (#243/#262). A 404 while the
+    spans of the approved text do not exist (``tagger.is_written``),
+    and for an opinion of another scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not tagger.is_written(opinion):
+        return _json_404(
+            f"The approved text of {opinion} is not tagged.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-tags",
+        opinion.tag_key,
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-tags.json"
+        ),
+        missing_message=(
+            f"The spans of {opinion} are stamped, but {opinion.tag_key} "
+            "is not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
 def opinion_file_index(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> JsonResponse:
@@ -2194,6 +2234,20 @@ def opinion_file_index(
                 ),
             }
         )
+    # The tagger's spans (#272), outside the glue prefix: they are over
+    # the approved text, which no re-glue moves.
+    files.append(
+        {
+            "name": "tags.json",
+            "output": "opinion-tags",
+            "written": tagger.is_written(opinion),
+            "key": opinion.tag_key,
+            "url": reverse(
+                "serve_opinion_tags",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
     for entry in files:
         if not entry["written"]:
             entry.pop("url")

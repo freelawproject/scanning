@@ -713,9 +713,12 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "surya.json",
                 "manifest.json",
                 "ensemble.json",
+                "tags.json",
             ],
         )
-        for entry in body["files"]:
+        # The tagger's spans are over the approved text, outside the
+        # glue prefix (#272), and blank before a run is placed.
+        for entry in body["files"][:-1]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"

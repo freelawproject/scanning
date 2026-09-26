@@ -40,6 +40,13 @@ joins the per-shard payloads of any scan whose detection rows are all
 status and keeps the per-shard results: a page insert recomputes the
 merge from them.
 
+**5b. ``tagger.finish_ready_runs()`` glues finished tagger runs.** One
+row per approved opinion (#272); a ``COMPLETED`` row's spans are placed
+on the paragraphs of the approved text and written beside the input it
+was computed from, the opinion's ledger is stamped, and the row goes to
+``CONSUMED``. Writes no scan status and no opinion status: the assembly
+step reads the spans, not the review flow.
+
 **6. ``yolo.queue_ready_runs()`` queues the redaction computation.**
 It is a trigger, not the work: it takes a scan in
 ``PAGE_COMPLETENESS_REVIEW_DONE`` to ``QUEUED`` with
@@ -175,6 +182,7 @@ class Command(BaseCommand):
             opinions,
             review_states,
             surya,
+            tagger,
             yolo,
         )
 
@@ -186,6 +194,7 @@ class Command(BaseCommand):
                 glued = dots_mocr.finish_ready_runs()
                 applied = dots_mocr.apply_ready_runs()
                 detected = yolo.finish_ready_runs()
+                tagged = tagger.finish_ready_runs()
                 applied_edits = apply.queue_ready_scans()
                 queued = yolo.queue_ready_runs()
                 promoted = review_states.promote_ready_scans()
@@ -220,6 +229,7 @@ class Command(BaseCommand):
                 glued,
                 applied,
                 detected,
+                tagged,
                 applied_edits,
                 queued,
                 promoted,
@@ -237,8 +247,9 @@ class Command(BaseCommand):
                 f"failed {summary.failed}, still waiting {summary.pending}, "
                 f"check errors {summary.errors}; finished {finished} "
                 f"scan(s), glued {glued} OCR run(s), applied {applied}, "
-                f"merged {detected} detection run(s), queued "
-                f"{applied_edits} page edit apply(s) and {queued} "
+                f"merged {detected} detection run(s), glued {tagged} "
+                f"tagger run(s), queued {applied_edits} page edit "
+                f"apply(s) and {queued} "
                 f"redaction computation(s), opened {promoted} redaction "
                 f"review(s), glued {extracted} Mistral run(s) and "
                 f"{extracted_applies} corrected volume(s), glued "

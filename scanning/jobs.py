@@ -410,7 +410,7 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
     :returns: The engine table.
     :rtype: dict[str, RunpodEngine]
     """
-    from scanning import dots_mocr, surya, yolo
+    from scanning import dots_mocr, surya, tagger, yolo
 
     return {
         JobEngine.DOTS_MOCR: RunpodEngine(
@@ -445,6 +445,22 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
             is_enabled=surya.enabled,
             build_payload=surya.build_payload,
             label="Surya",
+        ),
+        # One job per opinion, not per shard (#272): the input is a
+        # JSON document written from the approved text
+        # (``tagger.ensure_tag_jobs``), and ``page_count`` on its row
+        # is the pages of that opinion, which the per-page allowance
+        # is per.
+        JobEngine.CASELAW_TAGGER: RunpodEngine(
+            engine=JobEngine.CASELAW_TAGGER,
+            stage=JobStage.TAG,
+            endpoint_setting="RUNPOD_TAGGER_ENDPOINT_ID",
+            concurrency_setting="TAGGER_MAX_CONCURRENCY",
+            attempts_setting="TAGGER_MAX_ATTEMPTS",
+            seconds_per_page_setting="TAGGER_SECONDS_PER_PAGE",
+            is_enabled=tagger.enabled,
+            build_payload=tagger.build_payload,
+            label="tagger",
         ),
     }
 
@@ -898,9 +914,12 @@ def _log_run_complete(job: ExternalJob) -> None:
     # purpose (the provider is done, we have applied nothing), and a run
     # of COMPLETED rows is exactly the case this logs. What must be
     # empty is the work still to come. The row's own target, not the
-    # volume's: an apply run (#224) is a run of its own, and reading
-    # the volume's rows here would time and name the wrong one.
-    rows = live_run(job.scan_id, job.stage, job.engine, job.apply_run)
+    # volume's: an apply run (#224) or an opinion (#272) is a run of
+    # its own, and reading the volume's rows here would time and name
+    # the wrong one.
+    rows = live_run(
+        job.scan_id, job.stage, job.engine, job.apply_run, job.opinion_id
+    )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     if not rows or any(row.status in unfinished for row in rows):
         return
@@ -1733,7 +1752,7 @@ def shard_entry(job: ExternalJob, index: int, tuning_keys: tuple = ()) -> dict:
 
 
 def live_run(
-    scan, stage: str, engine: str, apply_run=None
+    scan, stage: str, engine: str, apply_run=None, opinion=None
 ) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 
@@ -1751,6 +1770,8 @@ def live_run(
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param apply_run: The apply run whose rows are wanted, or None for
         the volume run.
+    :param opinion: The opinion whose rows are wanted, for an
+        opinion-level stage (the tagger, #272), or None for the volume.
     :returns: The live run's rows ordered by shard index, or an empty
         list when the engine has never run for this target.
     :rtype: list[ExternalJob]
@@ -1760,7 +1781,7 @@ def live_run(
             scan=scan,
             stage=stage,
             engine=engine,
-            opinion=None,
+            opinion=opinion,
             apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
@@ -1951,6 +1972,7 @@ def _reusable_results(
     engine: str,
     specs: list[tuple[str, dict]],
     carry_stable_holes: bool = True,
+    opinion=None,
 ) -> dict[int, ExternalJob]:
     """Map today's shard indexes to prior rows whose results still serve.
 
@@ -1989,6 +2011,8 @@ def _reusable_results(
         shard is its first read again. False for a provider whose
         failed line may be a transient fault (Mistral's batch API): two
         unlucky runs would otherwise freeze a page as unread for good.
+    :param opinion: The opinion the rows address, or None for the
+        volume (:func:`ensure_run_jobs`).
     :returns: ``{shard_index: prior_row}`` for every reusable shard.
     :rtype: dict[int, ExternalJob]
     """
@@ -2003,7 +2027,7 @@ def _reusable_results(
         scan=scan,
         stage=stage,
         engine=engine,
-        opinion=None,
+        opinion=opinion,
         status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED),
     ).order_by("-run", "-attempt")
     for row in prior_rows:
@@ -2113,14 +2137,87 @@ def ensure_shard_jobs(
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
-    specs = _shard_specs(scan, manifest)
+    # The set the run is cut for, as one string. Not in the identity:
+    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
+    # key there would read every live run as stale and re-pay it. The
+    # column is what lets the detection sweep ask "has this set been
+    # detected" in one query (#250).
+    #
+    # An apply run (#224) is not a shard set of an original: its
+    # manifest source is the sum over the one-page shards of the pages
+    # a curator changed. So it carries no fingerprint, and the sweep's
+    # question stays about the volume alone.
+    fingerprint = (
+        ""
+        if apply_run is not None
+        else sharding.fingerprint_value(manifest["source"])
+    )
+    return ensure_run_jobs(
+        scan,
+        _shard_specs(scan, manifest),
+        stage=stage,
+        engine=engine,
+        provider=provider,
+        fingerprint=fingerprint,
+        reuse_results=reuse_results,
+        force_new_run=force_new_run,
+        carry_stable_holes=carry_stable_holes,
+        apply_run=apply_run,
+    )
 
+
+def ensure_run_jobs(
+    scan,
+    specs: list[tuple[str, dict]],
+    *,
+    stage: str,
+    engine: str,
+    provider: str,
+    fingerprint: str,
+    reuse_results: bool = False,
+    force_new_run: bool = False,
+    carry_stable_holes: bool = True,
+    apply_run=None,
+    opinion=None,
+) -> list[ExternalJob]:
+    """Return the live rows for one engine over ``specs``, creating
+    them if the current run does not describe that work.
+
+    The body of :func:`ensure_shard_jobs`, with the work described by
+    the caller: one ``(input_key, identity)`` pair per row, in row
+    order. The shard stages describe a shard set with it; the tagger
+    describes one input document per opinion (``opinion``, #272). The idempotence, the reuse
+    of prior results, the unique key and the race with a second writer
+    are the same whatever the rows address, which is why there is one
+    creator and not one per shape.
+
+    :param scan: The scan the rows belong to.
+    :param specs: ``(input_key, identity)`` per row, ordered.
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param provider: A :class:`~scanning.models.JobProvider` value.
+    :param fingerprint: The ``source_fingerprint`` every row carries;
+        blank for an apply run.
+    :param reuse_results: Carry prior results forward
+        (:func:`_reusable_results`).
+    :param force_new_run: Start a new run even when the live one still
+        describes today's work.
+    :param carry_stable_holes: See :func:`_reusable_results`. Pass
+        False for a provider whose failed pages are not reproducible.
+    :param apply_run: The apply run the rows work for, or None.
+    :param opinion: The opinion the rows work for, for an opinion-level
+        stage, or None. The run number is scoped by it
+        (``ExternalJob.next_run``), so a new run of one opinion leaves
+        the runs of the others alone.
+    :returns: The live run's rows, ordered by row index.
+    :rtype: list[ExternalJob]
+    """
     existing = list(
         ExternalJob.objects.filter(
             scan=scan,
             stage=stage,
             engine=engine,
-            opinion=None,
+            opinion=opinion,
             apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
@@ -2146,27 +2243,14 @@ def ensure_shard_jobs(
             sorted({job.status for job in live}),
         )
 
-    run = ExternalJob.next_run(scan, stage, engine)
+    run = ExternalJob.next_run(scan, stage, engine, opinion=opinion)
     now = timezone.now()
     reusable = (
-        _reusable_results(scan, stage, engine, specs, carry_stable_holes)
+        _reusable_results(
+            scan, stage, engine, specs, carry_stable_holes, opinion=opinion
+        )
         if reuse_results
         else {}
-    )
-    # The set the run is cut for, as one string. Not in the identity:
-    # ``_still_describes`` compares ``input_manifest`` exactly, so a new
-    # key there would read every live run as stale and re-pay it. The
-    # column is what lets the detection sweep ask "has this set been
-    # detected" in one query (#250).
-    #
-    # An apply run (#224) is not a shard set of an original: its
-    # manifest source is the sum over the one-page shards of the pages
-    # a curator changed. So it carries no fingerprint, and the sweep's
-    # question stays about the volume alone.
-    fingerprint = (
-        ""
-        if apply_run is not None
-        else sharding.fingerprint_value(manifest["source"])
     )
     rows = []
     for index, (key, identity) in enumerate(specs):
@@ -2180,6 +2264,7 @@ def ensure_shard_jobs(
             shard_index=index,
             shard_count=len(specs),
             apply_run=apply_run,
+            opinion=opinion,
             input_key=key,
             # Travels with the row, so the reuse check and any later
             # merge read what was actually processed rather than a
@@ -2213,7 +2298,7 @@ def ensure_shard_jobs(
         # (bulk_create is one statement inside one transaction), so
         # re-read and hand theirs back. This is what keeps two staff
         # presses a no-op rather than a 500 for whoever lost.
-        rows = live_run(scan, stage, engine, apply_run)
+        rows = live_run(scan, stage, engine, apply_run, opinion)
         logger.info(
             "scan %s %s/%s run %d was created by another writer; "
             "reusing its %d row(s)",
