@@ -1,8 +1,9 @@
 """The human edits of the text of review 3 (#376).
 
-A curator changes three things of an opinion's text: the text of one
-block, the section of one block (the body or the footnotes), and the
-order of the blocks of one section of one page. Each change is one
+A curator changes four things of an opinion's text: the text of one
+block, the section of one block (the body or the footnotes), the order
+of the blocks of one section of one page, and the blockquote of one
+block, whole or over one span of its text (#419). Each change is one
 ``OpinionEdit`` row, and the ensemble applies the standing rows at
 every build (``ensemble.build_page``), so the text, the document and
 the cards hold them.
@@ -59,6 +60,35 @@ def fold(text: str) -> str:
         lambda match: "\n" if "\n" in match.group() else " ",
         text.replace("\r\n", "\n").replace("\r", "\n").strip(),
     )
+
+
+def snap_span(text: str, start: int, end: int) -> tuple[int, int] | None:
+    """Move a selection of a block's text to the edges of its words.
+
+    A selection by hand starts and ends inside a word or on a space;
+    the quote takes whole words (#419). ``start`` goes back to the
+    start of its word and ``end`` forward to the end of its word, and
+    the whitespace at the two edges is left out.
+
+    :param text: The text of the block, as the page shows it.
+    :param start: The first selected character.
+    :param end: The character after the last selected one.
+    :returns: ``(start, end)``, or None when no word is selected.
+    :rtype: tuple[int, int] | None
+    """
+    start = max(0, min(start, len(text)))
+    end = max(start, min(end, len(text)))
+    while start < end and text[start].isspace():
+        start += 1
+    while end > start and text[end - 1].isspace():
+        end -= 1
+    if start >= end:
+        return None
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    while end < len(text) and not text[end].isspace():
+        end += 1
+    return start, end
 
 
 def _standing(opinion: Opinion, kind: str, address: tuple):

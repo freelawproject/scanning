@@ -289,6 +289,7 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
         for name in (
             "editTextUrl",
             "editSectionUrl",
+            "editBlockquoteUrl",
             "editMoveUrl",
             "editWithdrawUrl",
         ):
@@ -369,3 +370,37 @@ class TestTheGuideOpensOnAPressAlone(SimpleTestCase):
         self.assertNotIn("Storage", guide)
         self.assertEqual(guide.count("setOpen(panel.hidden)"), 1)
         self.assertIn("setOpen(false)", guide)
+
+
+class TestTheQuoteEditsAreTheDocuments(SimpleTestCase):
+    """The blockquote edits (#419): the toolbar offers what the
+    endpoint takes, and a part quote is drawn from the document's
+    ``quote_span``."""
+
+    def test_the_buttons_are_in_the_toolbar_of_the_lock(self):
+        source = VIEWER.read_text()
+        bar = source[source.index("function fillBar(") :]
+        bar = bar[: bar.index("\n    }\n")]
+        self.assertIn("quoteButtons(bar, page, group)", bar)
+        buttons = source[source.index("function quoteButtons(") :]
+        buttons = buttons[: buttons.index("\n    }\n")]
+        # The refusals of the endpoint: no quote in a footnote or a table.
+        self.assertIn("sectionOf(group) !== BODY", buttons)
+        self.assertIn("group.kind === 'table'", buttons)
+
+    def test_a_part_quote_is_drawn_from_the_span_in_a_div(self):
+        source = VIEWER.read_text()
+        node = source[source.index("function groupNode(") :]
+        node = node[: node.index("\n    }\n")]
+        self.assertIn("group.quote_span", node)
+        self.assertIn("span ? 'div'", node)
+        # A voted group draws its tokens through the same helper.
+        self.assertIn("fillText(", node)
+        self.assertNotIn("tokens.forEach", node)
+
+    def test_a_part_quoted_group_is_drawn_outside_the_runs(self):
+        source = VIEWER.read_text()
+        text = source[source.index("function drawText(") :]
+        text = text[: text.index("\n    }\n")]
+        self.assertIn("run === undefined || group.quote_span", text)
+        self.assertIn('[data-blockquote="part"]', STYLES.read_text())

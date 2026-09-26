@@ -484,6 +484,7 @@
             if (group.weak) { el.classList.add('weak'); }
             if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
             if (group.blockquote) { el.dataset.blockquote = 'true'; }
+            if (group.quote_span) { el.dataset.blockquote = 'part'; }
             if (hasLevels()) {
                 if (group.level) {
                     el.dataset.level = group.level;
@@ -671,7 +672,10 @@
                         return;
                     }
                     var run = runs[group.id];
-                    if (run === undefined) {
+                    // A group that quotes part of its text draws its
+                    // own quote inside its node (#419): the text around
+                    // the span is not in the quote.
+                    if (run === undefined || group.quote_span) {
                         quote = null;
                         block.appendChild(groupNode(page, group));
                         return;
@@ -864,8 +868,15 @@
      */
     function groupNode(page, group) {
         var kind = group.kind || 'paragraph';
-        var node = document.createElement(KIND_ELEMENTS[kind] || 'p');
+        // A quote over part of the text (#419) puts the parts in
+        // elements of the group's kind inside a ``div``, because a
+        // ``p`` holds no blockquote.
+        var span = kind !== 'table' ? group.quote_span : null;
+        var node = document.createElement(
+            span ? 'div' : (KIND_ELEMENTS[kind] || 'p')
+        );
         node.className = 'ensemble-group';
+        if (span) { node.classList.add('ensemble-part-quoted'); }
         node.dataset.page = String(page.page_in_opinion);
         node.dataset.group = String(group.id);
         node.dataset.agreement = group.agreement;
@@ -875,46 +886,44 @@
         if (group.human) { node.classList.add('ensemble-human'); }
         if (hasLevels() && group.level) { node.dataset.level = group.level; }
 
-        var tokens = (group.tokens || []).filter(function (token) {
-            return token.text;
-        });
-        var at = 0;
         if (kind === 'table' && (group.table || []).length) {
             node.appendChild(tableNode(group));
-        } else if (group.agreement === 'voted' && tokens.length) {
-            // The words join with one space, the rule the document's
-            // own ``text`` follows, so ``at`` is where each token
-            // starts in the group text and the marks cut to it.
-            tokens.forEach(function (token, position) {
-                var span = document.createElement('span');
-                markedNodes(
-                    span, token.text,
-                    clipMarks(group.marks, at, token.text.length)
-                );
-                at += token.text.length + 1;
-                if (token.low_confidence && token.inserted) {
-                    span.className = 'ensemble-low';
-                    span.title = 'The first engine that read here did'
-                        + ' not read this word. The engines that read'
-                        + ' it put it in.';
-                } else if (token.low_confidence) {
-                    span.className = 'ensemble-low';
-                    span.title = 'No majority settled this word. It is'
-                        + ' the reading of the first engine that read'
-                        + ' here.';
-                } else if (token.majority) {
-                    span.className = 'ensemble-voted';
-                    span.title = 'A majority chose this word, and not'
-                        + ' every engine read it so.';
+        } else if (span) {
+            // The text before the span, the span in a blockquote, and
+            // the text after.
+            var text = group.text || '';
+            [[0, span[0], null], [span[0], span[1], 'quote'],
+                [span[1], text.length, null]].forEach(function (part) {
+                // The space between two parts is no word of either,
+                // and the column keeps whitespace.
+                while (part[0] < part[1] && /\s/.test(text[part[0]])) {
+                    part[0] += 1;
                 }
-                node.appendChild(span);
-                if (position < tokens.length - 1) {
-                    node.appendChild(document.createTextNode(' '));
+                while (part[1] > part[0] && /\s/.test(text[part[1] - 1])) {
+                    part[1] -= 1;
+                }
+                if (part[1] <= part[0]) { return; }
+                var el = document.createElement(KIND_ELEMENTS[kind] || 'p');
+                el.className = 'ensemble-part';
+                fillText(el, group, part[0], part[1]);
+                if (part[2]) {
+                    var quote = document.createElement('blockquote');
+                    quote.className = 'ensemble-blockquote';
+                    quote.title = 'A person quoted this part of the block.';
+                    quote.appendChild(el);
+                    node.appendChild(quote);
+                } else {
+                    node.appendChild(el);
                 }
             });
         } else {
-            markedNodes(node, group.text || '', group.marks || []);
+            fillText(node, group, 0, (group.text || '').length);
         }
+        // The note and the badge go after the last words of the group.
+        var tail = span && node.lastElementChild
+            ? (node.lastElementChild.querySelector('.ensemble-part')
+                || node.lastElementChild)
+            : node;
 
         var line = groupNote(page, group);
         if (line) {
@@ -923,15 +932,73 @@
             tag.textContent = line;
             tag.title = 'What the engines did here. Double-click the'
                 + ' block to see each reading.';
-            node.appendChild(document.createTextNode(' '));
-            node.appendChild(tag);
+            tail.appendChild(document.createTextNode(' '));
+            tail.appendChild(tag);
         }
         var readers = readerCount(group);
         if (readers < (page.engines || []).length) {
-            node.appendChild(document.createTextNode(' '));
-            node.appendChild(compareButton(page, group, node, readers));
+            tail.appendChild(document.createTextNode(' '));
+            tail.appendChild(compareButton(page, group, node, readers));
         }
         return node;
+    }
+
+    /**
+     * Put the words of one part of a group's text in an element.
+     *
+     * The part is ``[from, to)`` of the group's ``text``. A voted group
+     * draws its tokens with their flags; the words join with one space,
+     * the rule the document's own ``text`` follows, so a token starts
+     * where the one before it ends plus one, and a part cut at word
+     * edges (``opinion_edits.snap_span``) never cuts a token. Every
+     * other group draws its text with its marks cut to the part.
+     *
+     * @param {HTMLElement} target - The element.
+     * @param {Object} group - The group entry.
+     * @param {number} from - The first character of the part.
+     * @param {number} to - The character after the part.
+     */
+    function fillText(target, group, from, to) {
+        var tokens = (group.tokens || []).filter(function (token) {
+            return token.text;
+        });
+        if (!(group.agreement === 'voted' && tokens.length)) {
+            markedNodes(
+                target, (group.text || '').slice(from, to),
+                clipMarks(group.marks, from, to - from)
+            );
+            return;
+        }
+        var at = 0;
+        var first = true;
+        tokens.forEach(function (token) {
+            var start = at;
+            at += token.text.length + 1;
+            if (start < from || start >= to) { return; }
+            var span = document.createElement('span');
+            markedNodes(
+                span, token.text,
+                clipMarks(group.marks, start, token.text.length)
+            );
+            if (token.low_confidence && token.inserted) {
+                span.className = 'ensemble-low';
+                span.title = 'The first engine that read here did'
+                    + ' not read this word. The engines that read'
+                    + ' it put it in.';
+            } else if (token.low_confidence) {
+                span.className = 'ensemble-low';
+                span.title = 'No majority settled this word. It is'
+                    + ' the reading of the first engine that read'
+                    + ' here.';
+            } else if (token.majority) {
+                span.className = 'ensemble-voted';
+                span.title = 'A majority chose this word, and not'
+                    + ' every engine read it so.';
+            }
+            if (!first) { target.appendChild(document.createTextNode(' ')); }
+            first = false;
+            target.appendChild(span);
+        });
     }
 
     /**
@@ -2124,6 +2191,113 @@
                 }
             ));
         }
+        quoteButtons(bar, page, group);
+    }
+
+    /**
+     * Add the blockquote buttons of the locked group (#419): the whole
+     * block, a part of it, and the Undo. A footnote and a table hold no
+     * quote, the refusals of ``edit_opinion_blockquote``.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function quoteButtons(bar, page, group) {
+        if (sectionOf(group) !== BODY || group.kind === 'table') { return; }
+        function post(button, payload) {
+            payload.page_in_opinion = page.page_in_opinion;
+            payload.group_id = group.id;
+            postEdit(endpoint('editBlockquoteUrl'), payload, button);
+        }
+        if (group.blockquote || group.quote_span) {
+            bar.appendChild(barButton(
+                'Not a blockquote',
+                'No part of this block is a quote',
+                function (button) {
+                    if (!window.confirm('Take this block out of the'
+                            + ' blockquote?')) { return; }
+                    post(button, { quoted: false });
+                }
+            ));
+        }
+        if (!group.blockquote) {
+            bar.appendChild(barButton(
+                'Make a blockquote',
+                'The whole block is a quote',
+                function (button) {
+                    if (!window.confirm('Make the whole block a'
+                            + ' blockquote?')) { return; }
+                    post(button, { quoted: true });
+                }
+            ));
+        }
+        bar.appendChild(barButton(
+            'Quote part of it',
+            'Select the words of this block that are a quote',
+            function () { openQuotePicker(bar, page, group, post); }
+        ));
+        if (group.quote_edit) {
+            bar.appendChild(barButton(
+                'Undo the blockquote',
+                'Give the block back the quote the zones read',
+                function (button) {
+                    if (!window.confirm('Undo the blockquote set by hand'
+                            + ' on this block?')) { return; }
+                    withdrawEdit(group.quote_edit, button);
+                }
+            ));
+        }
+    }
+
+    /**
+     * Replace the toolbar with a picker of the quoted words (#419).
+     *
+     * The text is read-only: the curator selects the words, and the
+     * server moves the selection to the edges of its words. The offsets
+     * are of ``group.text``, the text the textarea holds.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {Function} post - The post of :func:`quoteButtons`.
+     */
+    function openQuotePicker(bar, page, group, post) {
+        bar.textContent = '';
+        bar.classList.add('ensemble-editor');
+        bar.appendChild(note(
+            'ensemble-edit-hint',
+            'Select the words that are a quote, then push Save.'
+        ));
+        var area = document.createElement('textarea');
+        area.className = 'ensemble-edit-area';
+        area.readOnly = true;
+        area.value = group.text || '';
+        area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
+        if (group.quote_span) {
+            area.setSelectionRange(group.quote_span[0], group.quote_span[1]);
+        }
+        bar.appendChild(area);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+        row.appendChild(barButton('Save', 'Quote the selected words',
+            function (button) {
+                if (area.selectionEnd <= area.selectionStart) {
+                    showToast('Select the words of the quote first.', 'error');
+                    return;
+                }
+                post(button, {
+                    quoted: true,
+                    span: [area.selectionStart, area.selectionEnd]
+                });
+            }));
+        row.appendChild(barButton('Cancel', 'Keep the block as it is',
+            function () {
+                bar.classList.remove('ensemble-editor');
+                fillBar(bar, page, group);
+            }));
+        bar.appendChild(row);
+        area.focus();
     }
 
     /**

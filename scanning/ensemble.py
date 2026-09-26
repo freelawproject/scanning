@@ -166,8 +166,10 @@ logger = logging.getLogger(__name__)
 #: blocks ``below`` it, which a push of "Put in the footnotes" takes
 #: too (#419). 9 gives every drop its place in the reading order
 #: (``after``, ``section``, ``band``, ``column``), so the approval can
-#: tell a redaction between two blocks from a column break (#375).
-SCHEMA_VERSION = 9
+#: tell a redaction between two blocks from a column break (#375). 10
+#: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
+#: a group (#419).
+SCHEMA_VERSION = 10
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -268,6 +270,7 @@ EDIT_NO_GROUP = "no_group"
 EDIT_DROPPED = "dropped"
 EDIT_EMPTY = "empty"
 EDIT_BASE_CHANGED = "base_changed"
+EDIT_IN_FOOTNOTES = "in_footnotes"
 
 #: The risk of a group the engines did not read alike (#419). A
 #: ``BLOCKING`` group is a place no majority of the engines read, or a
@@ -1504,6 +1507,11 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
     ``start`` of the first group and the ``end`` of the last, so a run
     holds the paragraph gaps between its groups.
 
+    A group with a ``quote_span`` (#419) quotes part of its text: the
+    run starts at the span, or goes on from the quote before when the
+    span starts the text, and ends at the span, or stays open for the
+    next quoted group when the span ends the text.
+
     :param groups: The groups of one page, in reading order: the
         groups of the document, and a ``{"dropped": True, "section",
         "blockquote"}`` entry in the place of each dropped group.
@@ -1515,6 +1523,24 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
     runs: list[dict] = []
     open_run = None
     for group in groups:
+        span = group.get("quote_span")
+        if span is not None and not group.get("dropped"):
+            first, last = span
+            if open_run is None or first > 0:
+                open_run = {
+                    "start": group["start"] + first,
+                    "end": group["start"] + last,
+                    "groups": [],
+                    "list_groups": [],
+                }
+                runs.append(open_run)
+            open_run["end"] = group["start"] + last
+            open_run["groups"].append(group["id"])
+            if len(group.get("list_by") or []) >= LIST_READERS:
+                open_run["list_groups"].append(group["id"])
+            if last < group["end"] - group["start"]:
+                open_run = None
+            continue
         if (group.get("section") or BODY) != BODY or not group.get(
             "blockquote"
         ):
@@ -2029,6 +2055,8 @@ def edit_entries(opinion: Opinion) -> list[dict]:
             "base_text": row.base_text,
             "text": row.text,
             "order": row.order or [],
+            "quoted": row.quoted,
+            "span": row.span,
             "by": row.created_by.username if row.created_by else "",
             "at": row.date_created.isoformat() if row.date_created else "",
         }
@@ -2301,6 +2329,7 @@ def build_page(
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
         (OpinionEdit.Kind.TEXT, "_text_edit"),
+        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
         landed = land_edits([edit["box_pt"] for edit in wanted], groups)
@@ -2319,6 +2348,20 @@ def build_page(
             group["section"] = placed["section"]
             group["footnote_doubt"] = False
         group["blockquote"] = quoted(group, quotes)
+        # The flag of the zone, for the place of a dropped group in the
+        # runs: an edit whose block a redaction takes is not applied,
+        # so it parts no quote either (#419).
+        group["_zone_blockquote"] = group["blockquote"]
+        quote = group.get("_quote_edit")
+        if quote and group["section"] != BODY:
+            # The footnotes hold no quote (``quoted``). A section edit
+            # or the footnote zone of a new glue put the block there.
+            unresolved.append(_unresolved(quote, EDIT_IN_FOOTNOTES))
+            group["_quote_edit"] = None
+        elif quote and quote.get("span") is None:
+            # A person said whether the whole block is a quote, so the
+            # zone does not decide (#419). A span waits for the text.
+            group["blockquote"] = bool(quote.get("quoted"))
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
@@ -2342,14 +2385,14 @@ def build_page(
             # A redaction or a mask took the block, or no engine reads
             # a word there now: two causes, and the card names the one.
             gone = EDIT_DROPPED if group["excluded"] else EDIT_EMPTY
-            for key in ("_section_edit", "_text_edit"):
+            for key in ("_section_edit", "_text_edit", "_quote_edit"):
                 if group.get(key):
                     unresolved.append(_unresolved(group[key], gone))
             sequence.append(
                 {
                     "dropped": True,
                     "section": group["section"],
-                    "blockquote": group["blockquote"],
+                    "blockquote": group["_zone_blockquote"],
                 }
             )
             entry["dropped"].append(
@@ -2400,6 +2443,18 @@ def build_page(
                     "at": written["at"],
                     "base_text": written["base_text"],
                 }
+        quote_span = None
+        quote = group.get("_quote_edit")
+        if quote and quote.get("span") is not None:
+            # The span is offsets into the text the curator saw, so the
+            # text must be that text to the character (#419): the key
+            # of the vote folds quotes and would move them.
+            if quote["base_text"] != read_back["text"]:
+                unresolved.append(_unresolved(quote, EDIT_BASE_CHANGED))
+                quote = None
+            else:
+                quote_span = [int(v) for v in quote["span"]]
+                group["blockquote"] = False
         name = group["section"]
         start = offsets[name]
         end = start + len(read_back["text"])
@@ -2414,6 +2469,8 @@ def build_page(
                 "footnote_doubt": group["footnote_doubt"],
                 "footnote_by": _footnote_labellers(group),
                 "blockquote": group["blockquote"],
+                "quote_span": quote_span,
+                "quote_edit": (quote or {}).get("id"),
                 "list_by": list_readers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
@@ -3267,6 +3324,7 @@ _EDIT_REASON_WORDS = {
     EDIT_DROPPED: "a redaction or a mask now takes its block out",
     EDIT_EMPTY: "no engine reads a word in its block now",
     EDIT_BASE_CHANGED: "the engines now read other words there",
+    EDIT_IN_FOOTNOTES: "its block is in the footnotes, which hold no quote",
 }
 
 #: What an edit is, in words.
@@ -3274,6 +3332,7 @@ _EDIT_KIND_WORDS = {
     OpinionEdit.Kind.TEXT: "the text of a block",
     OpinionEdit.Kind.SECTION: "the section of a block",
     OpinionEdit.Kind.ORDER: "the order of the blocks",
+    OpinionEdit.Kind.BLOCKQUOTE: "the blockquote of a block",
 }
 
 

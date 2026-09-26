@@ -62,6 +62,8 @@ def entry(kind, box=None, **fields) -> dict:
         "base_text": "",
         "text": "",
         "order": [],
+        "quoted": None,
+        "span": None,
         "by": "curator",
         "at": "",
     }

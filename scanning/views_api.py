@@ -270,6 +270,11 @@ EDIT_SECTION_SAVED_MESSAGE = {
 EDIT_SECTION_BELOW_SAVED_MESSAGE = (
     "The block and the {count} block(s) below it were put in the footnotes."
 )
+EDIT_QUOTE_SAVED_MESSAGE = {
+    "whole": "The block is a blockquote now.",
+    "none": "The block is not a blockquote now.",
+    "span": "The selected text is a blockquote now.",
+}
 EDIT_MOVE_SAVED_MESSAGE = {
     "up": "The block was moved up.",
     "down": "The block was moved down.",
@@ -323,6 +328,14 @@ EDIT_TOO_LONG_MESSAGE = (
 )
 EDIT_UNCHANGED_MESSAGE = "The text did not change, so nothing was saved."
 EDIT_SAME_SECTION_MESSAGE = "The block is in that section already."
+EDIT_QUOTE_FOOTNOTE_MESSAGE = (
+    "A footnote holds no blockquote. Put the block in the body text first."
+)
+EDIT_QUOTE_TABLE_MESSAGE = "A table holds no blockquote."
+EDIT_QUOTE_NO_WORD_MESSAGE = (
+    "Select at least one word of the block, then save."
+)
+EDIT_QUOTE_UNCHANGED_MESSAGE = "The block is quoted that way already."
 EDIT_EDGE_MESSAGE = (
     "The block is at the edge of its section on this page, so it does "
     "not move."
@@ -1592,6 +1605,97 @@ def edit_opinion_section(
         else EDIT_SECTION_SAVED_MESSAGE[section]
     )
     return _build_after_edit(request, opinion, saved)
+
+
+@login_required
+@require_POST
+def edit_opinion_blockquote(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Say whether one block of an opinion is a blockquote (#419).
+
+    ``quoted`` alone says it of the whole block, over the zone of the
+    detections. ``quoted`` plus a ``span`` of the text the page shows
+    quotes that part alone: the server moves the span to the edges of
+    its words (``opinion_edits.snap_span``), a span of the whole text
+    is the whole block, and the text is copied as ``base_text``, so a
+    build over other words holds the edit, the rule of a text edit.
+    One standing edit per block: a new one supersedes the old one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, markup, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    quoted = body.get("quoted")
+    span = body.get("span")
+    if not isinstance(quoted, bool):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if span is not None and (
+        not quoted
+        or not isinstance(span, list)
+        or len(span) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) for v in span
+        )
+    ):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if (group.get("section") or ensemble.BODY) != ensemble.BODY:
+        return _edit_refusal(request, EDIT_QUOTE_FOOTNOTE_MESSAGE)
+    if group.get("kind") == markup.TABLE:
+        return _edit_refusal(request, EDIT_QUOTE_TABLE_MESSAGE)
+    text = group.get("text") or ""
+    if span is not None:
+        snapped = opinion_edits.snap_span(text, span[0], span[1])
+        if snapped is None:
+            return _edit_refusal(request, EDIT_QUOTE_NO_WORD_MESSAGE)
+        span = None if snapped == (0, len(text)) else list(snapped)
+    if span is None:
+        unchanged = (
+            not group.get("quote_span")
+            and bool(group.get("blockquote")) == quoted
+        )
+    else:
+        unchanged = group.get("quote_span") == span
+    if unchanged:
+        return _edit_refusal(request, EDIT_QUOTE_UNCHANGED_MESSAGE)
+    opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.BLOCKQUOTE,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=ensemble.BODY,
+        base_text=text if span is not None else "",
+        quoted=quoted,
+        span=span,
+        glue_revision=opinion.glue_revision,
+    )
+    said = "span" if span is not None else ("whole" if quoted else "none")
+    logger.info(
+        "%s of scan %s: %s set the blockquote of block %s of page %s: %s %s",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        said,
+        span or "",
+    )
+    return _build_after_edit(request, opinion, EDIT_QUOTE_SAVED_MESSAGE[said])
 
 
 @login_required

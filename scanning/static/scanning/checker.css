@@ -1308,6 +1308,10 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-box[data-blockquote="true"] {
     border-left-width: 4px;
 }
+.ensemble-box[data-blockquote="part"] {
+    border-left-width: 4px;
+    border-left-style: dotted;
+}
 .ensemble-box.ensemble-doubt {
     outline: 1px dashed #b45309;
     outline-offset: 2px;
@@ -1406,6 +1410,11 @@ li.ensemble-group {
     padding-left: 8px;
     border-left: 3px solid rgba(146, 64, 14, 0.5);
 }
+/* A block a person quoted in part (#419): the parts are the words
+   of the group, so they take no margin of their own, and the quote
+   inside the group keeps the gap of a paragraph. */
+.ensemble-part-quoted .ensemble-part { margin: 0; }
+.ensemble-part-quoted .ensemble-blockquote { margin: 4px 0 4px 12px; }
 .ensemble-blockquote.ensemble-quote-list {
     border-left-style: dashed;
     border-left-color: #b45309;
@@ -1596,6 +1605,11 @@ li.ensemble-group {
     border-radius: 4px;
     background: transparent;
     color: inherit;
+}
+.ensemble-edit-hint {
+    margin: 0 0 4px;
+    font-size: 12px;
+    color: #6b7280;
 }
 .ensemble-edit-row {
     display: flex;
