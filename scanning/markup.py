@@ -103,14 +103,19 @@ _HEADING_MD = re.compile(r"^[ \t]*#{1,6}[ \t]+")
 #: under any label, and so is a dash. A ``*`` is one only under a list
 #: label: on the six volumes of #404 a ``* `` at the start of a unit
 #: with no list label is a footnote symbol (``* The syllabus
-#: constitutes no part...``) in 36 of 36 units. A ``*`` that another
-#: ``*`` follows is an asterism (``* * *``) under any label. The
-#: middle dot is a bullet at the start of a line alone: an old print
-#: sets a decimal point with it.
+#: constitutes no part...``) in 36 of 36 units. A line of stars
+#: alone is an asterism (``* * *``) under any label; a bullet before
+#: an italic (``* *Smith v. Jones*``) is a bullet. A dash starts an
+#: item on any line under a list label, and at the start of the unit
+#: alone under another: the survey found no dash item inside a unit
+#: with no list label, and Mistral keeps the print's lines. The middle
+#: dot is a bullet at the start of a line alone: an old print sets a
+#: decimal point with it.
 BULLET_GLYPHS = "•·▪◦●"
 _GLYPH_BULLET = re.compile(rf"^([ \t]*)[{BULLET_GLYPHS}][ \t]*(?=\S)", re.M)
 _DASH_BULLET = re.compile(r"^([ \t]*)-[ \t]+(?=\S)", re.M)
-_STAR_BULLET = re.compile(r"^([ \t]*)\*(?![ \t]*\*)[ \t]+(?=\S)", re.M)
+_FIRST_DASH_BULLET = re.compile(r"^([ \t]*)-[ \t]+(?=\S)")
+_STAR_BULLET = re.compile(r"^([ \t]*)\*(?![ \t*]*$)[ \t]+(?=\S)", re.M)
 #: A bullet of the HTML dialect: at the start of the text, or after a
 #: tag or a line break (Surya writes ``<p>• A<br/>• B</p>``).
 _HTML_BULLET = re.compile(
@@ -309,7 +314,7 @@ def _normalize_whitespace(out: _Out) -> None:
 
     A kept space takes the flags both its neighbours share, so a phrase
     keeps its italic across its spaces and a mark never starts or ends
-    on a space.
+    on a space. The space before the start of an item takes none.
     """
     chars: list[str] = []
     flags: list[frozenset[str]] = []
@@ -326,7 +331,13 @@ def _normalize_whitespace(out: _Out) -> None:
         flags.append(flag)
     for index, char in enumerate(chars):
         if char in (" ", "\n") and 0 < index < len(chars) - 1:
-            flags[index] = (flags[index - 1] & flags[index + 1]) - {_ITEM_FLAG}
+            # The space before an item is no part of an italic that
+            # goes on into the item (#428): it is between two items.
+            flags[index] = (
+                frozenset()
+                if _ITEM_FLAG in flags[index + 1]
+                else (flags[index - 1] & flags[index + 1])
+            )
     out.chars, out.flags = chars, flags
 
 
@@ -463,16 +474,22 @@ def _mark_items(text: str, listed: bool) -> str:
     """
     marked = rf"\1{_ITEM_START}"
     text = _GLYPH_BULLET.sub(marked, text)
-    text = _DASH_BULLET.sub(marked, text)
-    if listed:
-        text = _STAR_BULLET.sub(marked, text)
-        if _ENUMERATED_START.match(text):
-            text = _ITEM_START + text
+    if not listed:
+        return _FIRST_DASH_BULLET.sub(marked, text)
+    text = _STAR_BULLET.sub(marked, _DASH_BULLET.sub(marked, text))
+    if _ENUMERATED_START.match(text):
+        text = _ITEM_START + text
     return text
 
 
 def parse_html(html: str, kind: str | None = None) -> Parsed:
     """Parse the dialect of Surya.
+
+    A bullet glyph goes wherever it is, a heading's too (``<h2>•
+    Title</h2>`` is the heading ``Title``). The type of a list is its
+    text and never its tag (#428): Surya writes ``<ol>`` over bullets
+    and over numbers alike, so an ``<ol>`` whose numbers are not in the
+    text is a bullet list.
 
     :param html: The block's ``html``.
     :param kind: The kind the engine's own label gives the unit, or

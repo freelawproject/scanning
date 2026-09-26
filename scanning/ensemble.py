@@ -1683,9 +1683,14 @@ def list_runs(groups: list[dict]) -> list[dict]:
     another kind ends it, and so does a dropped one, unless the drop is
     a list item too (a redacted item). A change of the blockquote flag
     ends it, so a list never crosses the edge of a quote, and so does a
-    change of type. A group that starts no item (``list`` None) goes on
-    with the run it follows. A run of such groups alone is a bullet
-    list.
+    change of type. A group a curator quoted in part (``quote_span``,
+    #419) is in no run and ends the one before it: its quote opens
+    inside the group, and a list over it would close inside the quote.
+    A group that starts no item (``list`` None) goes on with the run it
+    follows, and a run in which no group starts an item is no list:
+    with two engines, dots.mocr's ``List-item`` on a headnote wins the
+    kind on the tie and starts no item. The footnotes hold no list:
+    :func:`build_page` takes the items off every group outside a run.
 
     :param groups: The groups of one page, in reading order, with a
         ``{"dropped": True, "section", "blockquote", "kind"}`` entry in
@@ -1697,9 +1702,14 @@ def list_runs(groups: list[dict]) -> list[dict]:
     runs: list[dict] = []
     open_run = None
     for group in groups:
-        if (group.get("section") or BODY) != BODY or group.get(
-            "kind"
-        ) != markup.LIST_ITEM:
+        if (
+            (group.get("section") or BODY) != BODY
+            or group.get("kind") != markup.LIST_ITEM
+            or (
+                group.get("quote_span") is not None
+                and not group.get("dropped")
+            )
+        ):
             open_run = None
             continue
         quoted_here = bool(group.get("blockquote"))
@@ -1730,10 +1740,31 @@ def list_runs(groups: list[dict]) -> list[dict]:
         open_run["end"] = group["end"]
         open_run["groups"].append(group["id"])
         open_run["type"] = open_run["type"] or kind
+    kept = []
     for run in runs:
-        run["type"] = run["type"] or markup.BULLET_LIST
+        if run["type"] is None:
+            # No group of the run starts an item: no list.
+            continue
         del run["quoted"]
-    return runs
+        kept.append(run)
+    return kept
+
+
+def _outside_lists(groups: list[dict], runs: list[dict]) -> None:
+    """Take the items off every group no list run holds (#428).
+
+    A footnote, a part-quoted group and a group of a run with no item
+    would otherwise carry ``li`` marks with no ``ul`` or ``ol`` around
+    them, in ``OpinionText.marks`` and in the approved text alike.
+    """
+    held = {gid for run in runs for gid in run["groups"]}
+    for group in groups:
+        if group["id"] in held:
+            continue
+        group["list"] = None
+        group["marks"] = [
+            mark for mark in group["marks"] if mark["kind"] != markup.ITEM
+        ]
 
 
 def _zones_of(pages: dict[str, dict], name: str) -> list[list[float]]:
@@ -2713,6 +2744,7 @@ def build_page(
     entry["blockquotes"] = blockquote_runs(sequence)
     entry["counts"]["blockquotes"] = len(entry["blockquotes"])
     entry["lists"] = list_runs(sequence)
+    _outside_lists(entry["groups"], entry["lists"])
     entry["counts"]["lists"] = len(entry["lists"])
     entry["counts"]["blockquote_lists"] = sum(
         1 for run in entry["blockquotes"] if run["list_groups"]

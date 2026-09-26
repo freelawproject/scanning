@@ -641,3 +641,39 @@ class TestListItems(SimpleTestCase):
             "<blockquote><ul><li>A 1996 conviction;</li> "
             "<li>a 1997 <em>conviction</em></li></ul></blockquote>",
         )
+
+
+class TestTheReviewOfTheListParse(SimpleTestCase):
+    """The shapes the review of PR #429 found (#428)."""
+
+    def items(self, parsed):
+        return [
+            parsed.text[m.start : m.end]
+            for m in parsed.marks
+            if m.kind == markup.ITEM
+        ]
+
+    def test_a_bullet_before_an_italic_is_a_bullet(self):
+        parsed = markup.parse_markdown(
+            "* *Smith v. Jones*\n* *Doe v. Roe*", kind=markup.LIST_ITEM
+        )
+        self.assertEqual(parsed.text, "Smith v. Jones\nDoe v. Roe")
+        self.assertEqual(self.items(parsed), ["Smith v. Jones", "Doe v. Roe"])
+        # Two italics beside each other are one mark (#404), but not
+        # across the edge of an item.
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<li><em>Smith v. Jones</em></li>\n<li><em>Doe v. Roe</em></li>",
+        )
+
+    def test_a_dash_inside_an_unlabelled_unit_is_text(self):
+        parsed = markup.parse_markdown(
+            "the fine was\n- in the court's view - too low"
+        )
+        self.assertEqual(parsed.kind, markup.PARAGRAPH)
+        self.assertEqual(self.items(parsed), [])
+
+    def test_a_bullet_of_a_heading_goes_and_starts_no_item(self):
+        parsed = markup.parse_html("<h2>• Title</h2>")
+        self.assertEqual((parsed.kind, parsed.text), (markup.HEADING, "Title"))
+        self.assertEqual(parsed.marks, [])

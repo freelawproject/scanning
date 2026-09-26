@@ -3948,3 +3948,48 @@ class TestTheListRuns(TestCase):
             + "\n\n".join(f"<li>{line}</li>" for line in OFFENSES)
             + "</ul>",
         )
+
+
+class TestTheListsTheReviewFound(TestCase):
+    """A list mark always holds an item, and an item a list (#428)."""
+
+    def test_a_run_that_starts_no_item_is_no_list(self):
+        # Two engines tie on a headnote: dots.mocr's label wins the kind
+        # and nobody starts an item.
+        self.assertEqual(
+            ensemble.list_runs([list_entry(0), list_entry(1)]), []
+        )
+
+    def test_a_part_quoted_group_ends_the_list(self):
+        runs = ensemble.list_runs(
+            [
+                list_entry(0, list_type="ul"),
+                list_entry(1, list_type="ul", quote_span=[0, 4]),
+                list_entry(2, list_type="ul"),
+            ]
+        )
+
+        self.assertEqual([run["groups"] for run in runs], [[0], [2]])
+
+    def test_a_footnote_list_item_loses_its_items(self):
+        units = []
+        for engine in ("dots_mocr", "mistral_ocr"):
+            parsed = markup.parse_markdown(
+                "1. Among the posts by Citizens", kind=markup.LIST_ITEM
+            )
+            units.append(
+                list_unit(engine, 0, (LEFT_X[0], 600, LEFT_X[1], 700), parsed)
+            )
+
+        entry = build(units, zones=[FOOT_ZONE])
+
+        (group,) = entry["groups"]
+        self.assertEqual(group["section"], ensemble.FOOTNOTES)
+        self.assertEqual(entry["lists"], [])
+        self.assertIsNone(group["list"])
+        self.assertNotIn(
+            markup.ITEM, [mark["kind"] for mark in group["marks"]]
+        )
+        self.assertNotIn(
+            markup.ITEM, [mark["kind"] for mark in ensemble._marks(entry)]
+        )
