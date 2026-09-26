@@ -107,7 +107,17 @@ class _Element:
 _XML_NAME = re.compile(r"[A-Za-z_][\w.-]*\Z")
 #: The characters XML 1.0 does not allow, which OCR text can carry
 #: (a vertical tab, a form feed, a lone surrogate).
-_NOT_XML = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+_NOT_XML = dict.fromkeys(
+    [
+        *range(0x00, 0x09),
+        0x0B,
+        0x0C,
+        *range(0x0E, 0x20),
+        *range(0xD800, 0xE000),
+        0xFFFE,
+        0xFFFF,
+    ]
+)
 
 
 def element_of(label: str) -> str:
@@ -131,12 +141,12 @@ def element_of(label: str) -> str:
 
 
 def _escape(text: str) -> str:
-    return _html.escape(_NOT_XML.sub("", text), quote=False)
+    return _html.escape(text.translate(_NOT_XML), quote=False)
 
 
 def _attrs(attrs: dict) -> str:
     return "".join(
-        f' {name}="{_html.escape(_NOT_XML.sub("", str(value)), quote=True)}"'
+        f' {name}="{_html.escape(str(value).translate(_NOT_XML), quote=True)}"'
         for name, value in attrs.items()
         if value is not None
     )
@@ -636,7 +646,7 @@ def display_html(xml: str) -> str:
 #: ``"[^"]*"``, and :func:`build` escapes ``"`` in every value), so no
 #: input makes the pattern backtrack.
 _SOURCE_TOKEN = re.compile(
-    r"(?P<comment><!--.*?-->)"
+    r"(?P<comment><!--.*?--!?>)"
     r"|(?P<decl><\?[^?]*\?>)"
     r"|<(?P<close>/?)(?P<name>[\w-]+)"
     r'(?P<attrs>(?:\s+[\w-]+="[^"]*")*)(?P<end>\s*/?)>',
