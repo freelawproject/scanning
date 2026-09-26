@@ -18,7 +18,8 @@
   The write controls are the re-run of the ensemble, the dismissal
   of a finding (#419), the human edits of the text (#376), which
   show on a locked block alone, and the approval of the text with its
-  staff reopen (#375), and the tagger of an approved text (#272). A
+  staff reopen (#375), and the tagger of an approved text (#272). The
+  final XML (#432) is a link, where the spans exist. A
   button the endpoint would refuse
   is the one thing a viewer must never offer (the rule of the step-1
   bar, #151).
@@ -98,6 +99,12 @@
     <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-spinner fa-spin"></i> Tagging the text</span>
     {% elif tag_state == "done" %}
     <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-tags"></i> Text tagged</span>
+    {% endif %}
+    {% if final_xml_url %}
+    <a href="{{ final_xml_url }}" target="_blank" rel="noopener" class="btn-outline text-sm"
+       title="The approved text with the tagger's tags, in the CAP casebody shape">
+      <i class="fa-solid fa-code"></i> Display final XML
+    </a>
     {% endif %}
     {% if can_rerun %}
     <button type="button" id="rerun-ensemble" class="btn-outline text-sm"

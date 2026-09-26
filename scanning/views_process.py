@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -25,11 +26,13 @@ from django.http import (
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
+from django.utils.safestring import mark_safe
 from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning import (
     boundaries,
+    casebody,
     dots_mocr,
     findings,
     jobs,
@@ -2184,6 +2187,149 @@ def serve_opinion_tags(
     )
 
 
+FINAL_XML_REFUSED_MESSAGE = (
+    "The final XML of {opinion} was not built: the approved text or the "
+    "spans could not be read, or the spans do not fit the text. The log "
+    "of the web pod has the reason."
+)
+
+
+class _FinalXmlRefused(Exception):
+    """The final XML of an opinion cannot be built now."""
+
+    def __init__(self, response: JsonResponse) -> None:
+        super().__init__(response)
+        self.response = response
+
+
+def _final_xml(opinion: Opinion) -> tuple[str, dict]:
+    """Build the final XML of an opinion from its two objects (#432).
+
+    The spans must be over the approved text the row names now
+    (``tagger.is_written``), the one rule of the tagger's ledger.
+
+    :param opinion: The opinion, with ``scan``.
+    :returns: The XML, and the spans object for the legend.
+    :rtype: tuple[str, dict]
+    :raises _FinalXmlRefused: 404 before the spans exist, 409 when an
+        object cannot be read or the spans do not fit the text.
+    """
+    if not tagger.is_written(opinion):
+        raise _FinalXmlRefused(
+            _json_404(
+                f"The approved text of {opinion} is not tagged.",
+                opinion=opinion.pk,
+                label=opinion.status,
+            )
+        )
+    try:
+        approved = tagger.load_approved(opinion.approved_text_key)
+        tags = s3_sync.download_json_object(opinion.tag_key)
+        if not isinstance(tags, dict):
+            raise casebody.CasebodyError(
+                f"{opinion.tag_key} is not a spans object"
+            )
+        return casebody.build(approved, tags), tags
+    except (
+        tagger.TaggerInputError,
+        casebody.CasebodyError,
+        BotoCoreError,
+        ClientError,
+        ValueError,
+    ) as exc:
+        # The reason goes to the log alone: an S3 fault's text is the
+        # client library's, and no answer of this route repeats it.
+        logger.warning("%s: the final XML was not built: %s", opinion, exc)
+        raise _FinalXmlRefused(
+            JsonResponse(
+                {
+                    "status": "error",
+                    "message": FINAL_XML_REFUSED_MESSAGE.format(
+                        opinion=opinion
+                    ),
+                },
+                status=409,
+            )
+        ) from exc
+
+
+def _final_xml_name(opinion: Opinion) -> str:
+    return (
+        f"scan-{opinion.scan_id}-opinion-{opinion.first_printed_page}."
+        f"{opinion.index_in_page}-final.xml"
+    )
+
+
+@login_required
+def serve_opinion_final_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Answer the final XML of one opinion, computed now (#432).
+
+    :param request: The HTTP request. ``?download=1`` answers it as a
+        file; any other value does not.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: The XML, or a JSON 404 or 409.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    try:
+        xml, _tags = _final_xml(opinion)
+    except _FinalXmlRefused as refused:
+        return refused.response
+    response = HttpResponse(xml, content_type="application/xml; charset=utf-8")
+    if request.GET.get("download") == "1":
+        response["Content-Disposition"] = (
+            f'attachment; filename="{_final_xml_name(opinion)}"'
+        )
+    return response
+
+
+@login_required
+def opinion_final_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Show the final XML of one opinion, for display and debugging (#432).
+
+    Two views of one document: every element drawn as a box with its
+    name, and the XML text. Nothing is stored; the export for
+    CourtListener is #408.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: The page, or a JSON 404 or 409.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan__reporter"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    try:
+        xml, tags = _final_xml(opinion)
+    except _FinalXmlRefused as refused:
+        return refused.response
+    kwargs = {"pk": scan.pk, "opinion_pk": opinion.pk}
+    return render(
+        request,
+        "scanning/opinion_final_xml.html",
+        {
+            "opinion": opinion,
+            "display": mark_safe(casebody.display_html(xml)),  # noqa: S308
+            "source": mark_safe(casebody.source_html(xml)),  # noqa: S308
+            "labels": casebody.label_counts(tags),
+            "span_count": len(tags.get("spans") or []),
+            "model": tags.get("model"),
+            "run": tags.get("run"),
+            "review_url": reverse("opinion_review", kwargs={"pk": opinion.pk}),
+            "xml_url": reverse("serve_opinion_final_xml", kwargs=kwargs),
+            "tags_url": reverse("serve_opinion_tags", kwargs=kwargs),
+        },
+    )
+
+
 @login_required
 def opinion_file_index(
     request: HttpRequest, pk: int, opinion_pk: int
@@ -2304,6 +2450,21 @@ def opinion_file_index(
             "key": opinion.tag_key,
             "url": reverse(
                 "serve_opinion_tags",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    # The final XML (#432) is no object: it is built at each request
+    # from the approved text and the spans, so it exists with them.
+    files.append(
+        {
+            "name": "final.xml",
+            "output": "opinion-final-xml",
+            "written": tagger.is_written(opinion),
+            "computed": True,
+            "key": None,
+            "url": reverse(
+                "serve_opinion_final_xml",
                 kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
             ),
         }

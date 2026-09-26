@@ -1,0 +1,276 @@
+/* The final XML of an opinion (#432), in the style of centralia's review
+   sheet (freelawproject/centralia, centralia/render/html.py).
+
+   The reading view is the opinion as it reads: a serif measure, indented
+   paragraphs, no boxes. The head matter is one block of rows, each tinted
+   by its role with a rule at its left, and the role is named in the left
+   margin where a run of it starts. A tag inside a paragraph is a tint on
+   its words. One colour per role, keyed by data-role, and the source view
+   colours its tags with the same one. */
+
+:root {
+  --cb-ink: #1a1a1a;
+  --cb-muted: #6b6b6b;
+  --cb-line: #dcdcdc;
+  --cb-bg: #ffffff;
+  --cb-panel: #f7f7f8;
+  --cb-paper: #fdfdfc;
+  --cb-accent: #6b4b9a;
+  --cb-page: #b8b2c8;
+  --cb-mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  --cb-sans: system-ui, -apple-system, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --cb-ink: #e8e8e8;
+    --cb-muted: #9a9a9a;
+    --cb-line: #3a3a3a;
+    --cb-bg: #161617;
+    --cb-panel: #1e1e20;
+    --cb-paper: #1b1b1d;
+    --cb-accent: #b39ddb;
+    --cb-page: #5d566e;
+  }
+}
+
+/* The colour of each role: centralia's rule colours, one per CAP element.
+   The tint is the same colour, faint, so it reads in both themes. */
+[data-role] { --c: #b0b0b0; }
+[data-role="court"] { --c: #88aabb; }
+[data-role="docketnumber"] { --c: #aa99bb; }
+[data-role="decisiondate"],
+[data-role="otherdate"] { --c: #a99bc9; }
+[data-role="parties"],
+[data-role="party"],
+[data-role="separator"] { --c: #ddcc99; }
+[data-role="attorneys"] { --c: #dd99bb; }
+[data-role="judges"] { --c: #88cc99; }
+[data-role="author"] { --c: #7bbf95; }
+[data-role="disposition"] { --c: #99cc88; }
+[data-role="history"] { --c: #77bbbb; }
+[data-role="heading"] { --c: #a8b6c2; }
+
+/* ── The bar: the view toggle and the file links ─────────────────────── */
+.cb-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin: 0 0 10px;
+}
+.cb-bar .cb-fill { flex: 1; }
+.cb-btn {
+  font: 14px/1.4 var(--cb-sans);
+  padding: 6px 13px;
+  border: 1px solid var(--cb-line);
+  border-radius: 6px;
+  background: var(--cb-panel);
+  color: var(--cb-ink);
+  cursor: pointer;
+  text-decoration: none;
+}
+.cb-btn:hover { border-color: var(--cb-accent); }
+.cb-btn:focus-visible { outline: 2px solid var(--cb-accent); outline-offset: 2px; }
+/* The view on screen is pressed in, the affordance of centralia's CL button. */
+.cb-btn.on,
+.cb-btn[aria-pressed="true"] {
+  background: var(--cb-accent);
+  border-color: var(--cb-accent);
+  color: #fff;
+}
+
+.cb-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  margin: 0 0 14px;
+  padding: 0;
+  list-style: none;
+}
+.cb-chip {
+  font: 12px var(--cb-mono);
+  padding: 3px 8px;
+  border-radius: 99px;
+  border: 1px solid var(--cb-line);
+  background: var(--cb-panel);
+  color: var(--cb-ink);
+}
+.cb-chip[data-role] {
+  border-left: 4px solid var(--c);
+  background: color-mix(in srgb, var(--c) 16%, var(--cb-panel));
+}
+.cb-chip .cb-count { color: var(--cb-muted); }
+
+/* ── The reading view ────────────────────────────────────────────────── */
+.cb-sheet {
+  border: 1px solid var(--cb-line);
+  border-radius: 8px;
+  background: var(--cb-paper);
+  overflow-x: auto;
+}
+.cb-doc {
+  max-width: 52em;
+  margin: 0 auto;
+  padding-block: 1.5em 3em;
+  padding-inline: 1.25em;
+  font: 15px/1.5 Georgia, "Times New Roman", serif;
+  color: var(--cb-ink);
+}
+.cb-doc section { margin: 1.4em 0; }
+.cb-doc section > h2 {
+  margin: 0 0 0.6em;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--cb-line);
+  font: 600 12px var(--cb-sans);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--cb-muted);
+}
+
+/* A row of the head matter, or a tagged block of the opinion. */
+.cb-row {
+  position: relative;
+  margin: 0.24em 0;
+  padding-left: 8px;
+  border-left: 3px solid var(--c);
+  background: color-mix(in srgb, var(--c) 18%, transparent);
+}
+/* The head matter is one thing, and the opinion plainly starts after it. */
+.cb-headmatter {
+  border-left: 2px solid var(--cb-line);
+  padding-left: 10px;
+  margin-left: 2px;
+}
+/* The margin label names a role where a run of it starts. It needs the
+   gutter, so it shows only where the sheet is wide enough to give one. */
+.cb-row.role-start::before {
+  content: attr(data-role);
+  display: block;
+  font: 10px/1.7 var(--cb-sans);
+  color: var(--cb-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+@media (min-width: 760px) {
+  .cb-doc { padding-inline: 9.5em 2em; }
+  .cb-row.role-start::before {
+    position: absolute;
+    left: -136px;
+    width: 118px;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+  }
+  .cb-headmatter .cb-row.role-start::before { left: -148px; }
+}
+
+.cb-doc p { margin: 0.55em 0; text-indent: 1.6em; }
+.cb-doc blockquote { margin: 0.7em 2.2em; font-size: 0.95em; }
+.cb-doc ul,
+.cb-doc ol { margin: 0.55em 0; padding-left: 2.2em; }
+.cb-heading {
+  margin: 1em 0 0.4em;
+  font-size: 1em;
+  font-weight: bold;
+  text-align: center;
+}
+.cb-opinion {
+  border-top: 2px solid var(--cb-accent);
+  padding-top: 0.5em;
+  margin-top: 1.6em;
+}
+.cb-doc .cb-opinion > h2 { border-bottom: 0; }
+
+/* A tag inside a paragraph: a tint on its words, its name on hover. */
+.cb-tag {
+  padding: 0 0.1em;
+  border-radius: 2px;
+  border-bottom: 2px solid var(--c);
+  background: color-mix(in srgb, var(--c) 24%, transparent);
+}
+
+.cb-fnmark { color: var(--cb-accent); font-weight: bold; }
+.cb-pg {
+  margin: 0 3px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font: 600 10px var(--cb-sans);
+  vertical-align: 2px;
+  color: #fff;
+  background: var(--cb-page);
+}
+
+.cb-fns {
+  margin-top: 1em;
+  padding-top: 0.4em;
+  border-top: 1px solid var(--cb-line);
+  font-size: 0.88em;
+}
+.cb-fn { display: flex; gap: 0.6em; margin: 0.35em 0; }
+.cb-fn .cb-lbl {
+  min-width: 1.4em;
+  font-weight: bold;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.cb-fn p { margin: 0.2em 0; text-indent: 0; }
+
+.cb-tb { border-collapse: collapse; margin: 0.6em 0; max-width: 100%; }
+.cb-tb td {
+  padding: 2px 8px;
+  border: 1px solid var(--cb-line);
+  vertical-align: top;
+}
+
+/* ── The XML view ────────────────────────────────────────────────────── */
+.cb-source {
+  margin: 0;
+  padding: 12px 14px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: 12.5px/1.6 var(--cb-mono);
+  color: var(--cb-ink);
+  background: var(--cb-panel);
+  border: 1px solid var(--cb-line);
+  border-radius: 8px;
+}
+.x-tag { color: var(--cb-muted); }
+.x-tag[data-role] {
+  color: color-mix(in srgb, var(--c) 55%, var(--cb-ink));
+  font-weight: 600;
+}
+.x-attr { color: var(--cb-muted); font-weight: 400; }
+.x-value { color: var(--cb-accent); font-weight: 400; }
+.x-comment { color: var(--cb-muted); font-style: italic; }
+
+/* ── The footnote links ──────────────────────────────────────────────── */
+.cb-fnmark a,
+.cb-fn .cb-lbl a {
+  color: var(--cb-accent);
+  text-decoration: none;
+}
+.cb-fnmark a:hover,
+.cb-fn .cb-lbl a:hover { text-decoration: underline; }
+.cb-fnmark a:focus-visible,
+.cb-fn .cb-lbl a:focus-visible {
+  outline: 2px solid var(--cb-accent);
+  outline-offset: 1px;
+}
+.cb-back { font-size: 0.8em; font-weight: normal; }
+/* The end of a jump: the note, or the mark it came from, shows where it is. */
+.cb-fn,
+.cb-fnmark { scroll-margin-top: 6em; }
+.cb-fn:target,
+.cb-fnmark:target {
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--cb-accent) 16%, transparent);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .cb-sheet { scroll-behavior: smooth; }
+  html:has(.cb-sheet) { scroll-behavior: smooth; }
+}

@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% comment %}
+  The final XML of one opinion (#432), for display and debugging.
+
+  Built at this request from the approved text (#375) and the tagger's
+  spans (#272) by `casebody.build`; nothing is stored, and the export
+  for CourtListener is #408. Two views of the one document, in the
+  style of centralia's review sheet: the reading (the opinion as it
+  reads, its tags tinted by role) and the XML. A toggle shows one at a
+  time, and `r` and `x` press it. Both are escaped by `casebody`, and
+  the view marks them safe.
+{% endcomment %}
+
+{% block title %}Final XML - {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/final_xml.css' %}">
+{% endblock %}
+
+{% block content %}
+<a href="{{ review_url }}"
+   class="inline-flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 mb-4">
+  <i class="fa-solid fa-arrow-left"></i> Back to the opinion
+</a>
+
+<h1 class="text-2xl font-bold">
+  Final XML: {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}
+  {% if opinion.index_in_page %}<span class="text-base font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
+</h1>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
+  The approved text with {{ span_count }} span{{ span_count|pluralize }} of tagger run {{ run }}{% if model %} ({{ model }}){% endif %}, in the CAP casebody shape. Built now, stored nowhere.
+</p>
+
+<ul class="cb-chips" aria-label="The labels of the spans">
+  {% for label, element, count in labels %}
+  <li class="cb-chip" data-role="{{ element }}">{{ element }}{% if element != label %} <span class="cb-count">({{ label }})</span>{% endif %} <span class="cb-count">&times;{{ count }}</span></li>
+  {% endfor %}
+</ul>
+
+<div class="cb-bar">
+  <button type="button" class="cb-btn" id="view-reading" aria-pressed="true"
+          title="The opinion as it reads, its tags tinted by role (r)">Reading</button>
+  <button type="button" class="cb-btn" id="view-xml" aria-pressed="false"
+          title="The XML file (x)">XML</button>
+  <span class="cb-fill"></span>
+  <a href="{{ xml_url }}" target="_blank" rel="noopener" class="cb-btn">Open the XML</a>
+  <a href="{{ xml_url }}?download=1" class="cb-btn">Download</a>
+  <a href="{{ tags_url }}" target="_blank" rel="noopener" class="cb-btn">The spans</a>
+</div>
+
+<div id="pane-reading" class="cb-sheet">{{ display }}</div>
+<pre id="pane-xml" class="cb-source" hidden>{{ source }}</pre>
+
+<script>
+  (function () {
+    var views = {
+      reading: [document.getElementById('view-reading'), document.getElementById('pane-reading')],
+      xml: [document.getElementById('view-xml'), document.getElementById('pane-xml')]
+    };
+    function show(name) {
+      Object.keys(views).forEach(function (key) {
+        views[key][0].setAttribute('aria-pressed', String(key === name));
+        views[key][1].hidden = key !== name;
+      });
+    }
+    views.reading[0].addEventListener('click', function () { show('reading'); });
+    views.xml[0].addEventListener('click', function () { show('xml'); });
+    document.addEventListener('keydown', function (event) {
+      if (event.target.closest('input, select, textarea')) { return; }
+      if (event.metaKey || event.ctrlKey || event.altKey) { return; }
+      if (event.key === 'r') { show('reading'); }
+      if (event.key === 'x') { show('xml'); }
+    });
+  })();
+</script>
+{% endblock %}

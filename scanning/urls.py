@@ -81,6 +81,7 @@ from scanning.views_process import (
     move_page,
     opinion_ensemble_url,
     opinion_file_index,
+    opinion_final_xml,
     opinion_pdf_url,
     page_edit_file,
     process_actions,
@@ -101,6 +102,7 @@ from scanning.views_process import (
     serve_glued_shard,
     serve_glued_volume,
     serve_opinion_approved_text,
+    serve_opinion_final_xml,
     serve_opinion_ocr,
     serve_opinion_pdf,
     serve_opinion_tags,
@@ -342,6 +344,18 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/tags/",
         serve_opinion_tags,
         name="serve_opinion_tags",
+    ),
+    # The final XML of an opinion (#432), built at each request from the
+    # approved text and the tagger's spans: the page, and the file.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/",
+        opinion_final_xml,
+        name="opinion_final_xml",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final.xml",
+        serve_opinion_final_xml,
+        name="serve_opinion_final_xml",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
