@@ -103,6 +103,24 @@ _INLINE_RANK = {markup.STRONG: 0, markup.EM: 1, markup.SUP: 2}
 _EDGE = " \n\t.,;:"
 
 
+def _covers(text: str, start: int, end: int) -> bool:
+    """Return whether a span covers a paragraph whole.
+
+    The worker trims a span to its words, so a span that leaves out
+    only :data:`_EDGE` at the edges covers it whole. The one rule of
+    "this paragraph is that element", and of "this paragraph is a
+    caption line" (:func:`head_matter_end`).
+
+    :param text: The paragraph's text.
+    :param start: The span's start in it.
+    :param end: The span's end, exclusive.
+    :rtype: bool
+    """
+    return start <= len(text) - len(text.lstrip(_EDGE)) and end >= len(
+        text.rstrip(_EDGE)
+    )
+
+
 class CasebodyError(Exception):
     """The spans do not describe the approved text."""
 
@@ -304,10 +322,6 @@ def _paragraph(
             )
 
     whole = None
-    # The worker trims a span to its words, so a span that leaves out a
-    # full stop at an edge still covers the paragraph whole.
-    body_start = len(text) - len(text.lstrip(_EDGE))
-    body_end = len(text.rstrip(_EDGE))
     for span in spans:
         start, end = at(span["start"]), at(span["end"])
         if not text[start:end].strip():
@@ -317,8 +331,7 @@ def _paragraph(
             whole is None
             and name in ("p", "heading")
             and not paragraph.get("blockquote")
-            and start <= body_start
-            and end >= body_end
+            and _covers(text, start, end)
         ):
             whole = element
             continue
@@ -379,9 +392,9 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     The head matter ends at the first ``author`` span. The tagger can
     miss a line of the caption (a "Rehearing denied" line, an OCR
     fragment), so a paragraph with no span does not end it: it ends
-    after the last paragraph before that author with a label of
-    :data:`HEAD_MATTER_LABELS`, where that is later than the leading
-    run of tagged paragraphs. A per curiam opinion has no author line,
+    after the last paragraph before that author that a span of
+    :data:`HEAD_MATTER_LABELS` covers whole (:func:`_covers`), where
+    that is later than the leading run of tagged paragraphs. A per curiam opinion has no author line,
     and the first author span is its dissent's; its text holds none of
     those labels, so its head matter ends with the leading run.
 
@@ -401,11 +414,19 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     run = 0
     while run < author and run in by:
         run += 1
+    # A caption line is a whole block: a date or a court named in a
+    # sentence of the opinion is a span over some of its words.
     caption = [
         index
         for index in sorted(by)
         if index < author
-        and any(span["label"] in HEAD_MATTER_LABELS for span in by[index])
+        and any(
+            span["label"] in HEAD_MATTER_LABELS
+            and _covers(
+                body[index].get("text") or "", span["start"], span["end"]
+            )
+            for span in by[index]
+        )
     ]
     return max(run, caption[-1] + 1) if caption else run
 

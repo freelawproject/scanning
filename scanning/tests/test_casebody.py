@@ -260,6 +260,49 @@ class TestTheHeadMatter(TestCase):
             ["p", "p", "judges", "author", "p"],
         )
 
+    def test_a_caption_label_inside_the_text_is_no_caption_line(self):
+        """A per curiam, a date the tagger read in its text, and a
+        dissent: the date is a span over some words of a sentence, and
+        the main opinion stays in the opinion."""
+        text = "The trial court ruled on June 1, 2020, that the claim failed."
+        date = text.index("June")
+        _xml, root = build(
+            doc(
+                para("Smith v. Jones"),
+                para("PER CURIAM."),
+                para("We affirm."),
+                para(text),
+                para("JONES, J., dissenting."),
+                para("I dissent."),
+            ),
+            span(0, 0, 14, "party"),
+            span(3, date, date + len("June 1, 2020"), "otherdate"),
+            span(4, 0, 22, "author"),
+        )
+
+        self.assertEqual([c.tag for c in root], ["parties", "opinion"])
+        paragraph = root.find("opinion")[2]
+        self.assertEqual(paragraph.find("otherdate").text, "June 1, 2020")
+
+    def test_with_no_author_a_span_deep_in_the_text_is_no_caption_line(self):
+        text = "The case came from the circuit court."
+        court = text.index("the circuit")
+        _xml, root = build(
+            doc(
+                para("Supreme Court."),
+                para("We affirm."),
+                para(text),
+                para("More text."),
+            ),
+            span(0, 0, 14, "court"),
+            span(2, court, court + len("the circuit court"), "history"),
+        )
+
+        self.assertEqual([c.tag for c in root], ["court", "opinion"])
+        self.assertEqual(
+            [c.tag for c in root.find("opinion")], ["p", "p", "p"]
+        )
+
     def test_with_no_author_the_leading_tagged_run_is_the_head_matter(self):
         _xml, root = build(
             doc(para("Supreme Court."), para("We affirm.")),
