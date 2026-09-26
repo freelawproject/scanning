@@ -646,7 +646,7 @@ class Projection:
     paragraphs: list[int]
 
 
-def _kept(
+def projected_characters(
     text: str, items: frozenset[int] = frozenset()
 ) -> list[tuple[int, str]]:
     """Return ``(source index, character)`` for each character sent.
@@ -722,7 +722,7 @@ def project(body: list[dict]) -> Projection:
             for mark in paragraph.get("marks") or []
             if mark.get("kind") == ITEM and mark.get("start", 0) > 0
         )
-        kept = _kept(source, items)
+        kept = projected_characters(source, items)
         if not "".join(char for _, char in kept).strip():
             continue
         marks = [
