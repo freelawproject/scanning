@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0049_opinion_edit_blockquote'),
+        ('scanning', '0050_opinion_text_list_marks'),
     ]
 
     operations = [

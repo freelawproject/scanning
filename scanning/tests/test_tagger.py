@@ -248,7 +248,7 @@ class TestEnsureTagJobs(_S3Case):
                 "projection": tagger.PROJECTION_VERSION,
                 "chars": len(text),
                 "paragraphs": 3,
-                "page_count": 2,
+                "page_count": 1,
             },
         )
 
@@ -285,6 +285,30 @@ class TestEnsureTagJobs(_S3Case):
 
         self.assertEqual([r.pk for r in first], [r.pk for r in second])
         self.assertEqual(self.upload.call_count, writes)
+
+    def test_the_page_count_comes_from_the_text(self):
+        long = ("word " * 1300).strip()
+        self.stored[APPROVED_KEY] = approved(long, long)
+
+        row = tagger.ensure_tag_jobs(self.opinion)[0]
+
+        chars = row.input_manifest["chars"]
+        self.assertGreater(chars, 2 * tagger.CHARS_PER_PAGE)
+        self.assertEqual(
+            row.input_manifest["page_count"],
+            -(-chars // tagger.CHARS_PER_PAGE),
+        )
+
+    def test_another_page_table_with_the_same_text_reuses_the_run(self):
+        first = tagger.ensure_tag_jobs(self.opinion)[0]
+        key = self.approve_again(*CAPTION)
+        self.stored[key]["pages"].append(
+            {"page_in_opinion": 2, "page_index": 12, "printed": "504"}
+        )
+
+        second = tagger.ensure_tag_jobs(self.opinion)[0]
+
+        self.assertEqual(second.pk, first.pk)
 
     def test_a_second_approval_of_the_same_text_reuses_the_run(self):
         first = tagger.ensure_tag_jobs(self.opinion)[0]
@@ -447,6 +471,18 @@ class TestGlue(_S3Case):
         self.assertEqual(row.provider_meta["glue"]["attempts"], 1)
         self.assertEqual(tagger.state(self.opinion), tagger.RUNNING)
 
+    def test_a_span_with_no_start_is_a_counted_fault(self):
+        row = self.completed_row()
+        self.stored[row.result_key] = self.envelope(
+            row, spans=[{"end": 4, "label": "party"}]
+        )
+
+        self.assertEqual(tagger.finish_ready_runs(), 0)
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, JobStatus.COMPLETED)
+        self.assertIn("span", row.provider_meta["glue"]["last_error"])
+
     def test_out_of_tries_is_left_alone_and_reads_as_failed(self):
         row = self.completed_row()
         row.provider_meta = {"glue": {"attempts": tagger.GLUE_MAX_ATTEMPTS}}
@@ -579,6 +615,74 @@ class TestTheButton(_S3Case):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.tagged_text_key, key)
         self.assertTrue(tagger.is_written(self.opinion))
+
+    def gave_up(self, envelope=None):
+        """A completed row whose glue reached the cap on the tick."""
+        row = self.completed_row()
+        row.provider_meta = {"glue": {"attempts": tagger.GLUE_MAX_ATTEMPTS}}
+        row.save(update_fields=["provider_meta"])
+        self.stored[row.result_key] = envelope or self.envelope(row)
+        return row
+
+    def test_a_press_after_the_glue_gave_up_places_the_spans(self):
+        row = self.gave_up()
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], TAG_PLACED_MESSAGE)
+        row.refresh_from_db()
+        self.opinion.refresh_from_db()
+        self.assertEqual(row.status, JobStatus.CONSUMED)
+        self.assertTrue(tagger.is_written(self.opinion))
+        self.assertEqual([r.pk for r in tag_jobs(self.opinion)], [row.pk])
+
+    def test_a_press_after_the_glue_gave_up_answers_the_fault(self):
+        row = self.completed_row()
+        row = self.gave_up(self.envelope(row, scan_pk=-1))
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("envelope", response.json()["message"])
+        row.refresh_from_db()
+        self.assertEqual(row.status, JobStatus.COMPLETED)
+        self.assertEqual(
+            row.provider_meta["glue"]["attempts"], tagger.GLUE_MAX_ATTEMPTS + 1
+        )
+        self.assertEqual([r.pk for r in tag_jobs(self.opinion)], [row.pk])
+        self.assertEqual(tagger.state(self.opinion), tagger.FAILED)
+
+    def test_a_malformed_span_is_a_refusal_and_not_a_crash(self):
+        row = self.completed_row()
+        self.gave_up(self.envelope(row, spans=[{"label": "party"}]))
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_a_carried_run_is_placed_in_the_request(self):
+        # A, then B, then A again: the third run carries the result of
+        # the first, is born COMPLETED, and no job runs.
+        first = self.finished_row()
+        tagger.finish_ready_runs()
+        self.approve_again("Another text.", key=APPROVED_KEY + ".b")
+        second = tagger.ensure_tag_jobs(self.opinion)[0]
+        ExternalJob.objects.filter(pk=second.pk).update(
+            status=JobStatus.FAILED
+        )
+        key = self.approve_again(*CAPTION, key=APPROVED_KEY + ".a")
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], TAG_PLACED_MESSAGE)
+        third = tag_jobs(self.opinion)[-1]
+        self.assertEqual(third.run, 3)
+        self.assertEqual(third.status, JobStatus.CONSUMED)
+        self.assertEqual(third.result_key, first.result_key)
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.tagged_text_key, key)
 
     def test_an_input_that_does_not_load_is_a_refusal(self):
         self.download.side_effect = ValueError("no such key")

@@ -74,7 +74,12 @@ ENGINE = JobEngine.CASELAW_TAGGER
 #: Bumped whenever ``markup.project`` writes another text for the same
 #: approved body. Part of every row's identity, so a projection change
 #: starts a new run rather than reusing spans over another text.
-PROJECTION_VERSION = 1
+PROJECTION_VERSION = 2
+
+#: The characters of tagger input one page allowance of the running-job
+#: deadline covers (``jobs.runpod_execution_deadline``). A page of a
+#: two-column reporter holds about 3,000 characters of text.
+CHARS_PER_PAGE = 3000
 
 #: Version of the spans document :func:`glue_run` writes.
 SPANS_SCHEMA = 1
@@ -319,9 +324,11 @@ def ensure_tag_jobs(
         "chars": len(projection.text),
         "paragraphs": len(projection.paragraphs),
         # What the running-job deadline multiplies by
-        # (``jobs.runpod_execution_deadline``): the model's time scales
-        # with the text, and the pages are the measure of it.
-        "page_count": len(approved.get("pages") or []) or 1,
+        # (``jobs.runpod_execution_deadline``). From the text and never
+        # from the page table: ``_still_describes`` compares the whole
+        # identity, so a count the digest does not fix would start a paid
+        # run for a second approval of the same text.
+        "page_count": max(1, -(-len(projection.text) // CHARS_PER_PAGE)),
     }
     return jobs.ensure_run_jobs(
         opinion.scan,
@@ -453,11 +460,23 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
             "sequence(s), not one"
         )
     sequence = sequences[0]
+    if not isinstance(sequence, dict):
+        raise TaggerGlueError(
+            f"{opinion} run {row.run}: the sequence is not an object"
+        )
     spans = []
     for span in sequence.get("spans") or []:
-        for part in markup.lift_span(
-            projection, int(span["start"]), int(span["end"])
+        if not (
+            isinstance(span, dict)
+            and isinstance(span.get("start"), int)
+            and isinstance(span.get("end"), int)
+            and isinstance(span.get("label"), str)
         ):
+            raise TaggerGlueError(
+                f"{opinion} run {row.run}: a span has no integer start and "
+                f"end or no label: {str(span)[:200]}"
+            )
+        for part in markup.lift_span(projection, span["start"], span["end"]):
             spans.append({**part, "label": span["label"]})
     document = {
         "schema": SPANS_SCHEMA,
@@ -531,6 +550,37 @@ def _consume(row: ExternalJob) -> None:
     ExternalJob.objects.filter(pk=row.pk, status=JobStatus.COMPLETED).update(
         status=JobStatus.CONSUMED, consumed_at=timezone.now()
     )
+
+
+def place(opinion: Opinion, row: ExternalJob) -> str:
+    """Place a finished row's spans now, in the request of a press.
+
+    The press after :func:`ensure_tag_jobs` hands back a row that needs
+    no job: ``COMPLETED`` (a result carried from an earlier run of the
+    same text, or a row whose glue gave up on the tick) or ``CONSUMED``
+    (a second approval of the same text). The result is paid for, so
+    the retry is this press and not a new job (the rule of #336). A
+    fault counts on the row like a fault of the tick, and the next
+    press tries again.
+
+    :param opinion: The opinion.
+    :param row: Its live row, ``COMPLETED`` or ``CONSUMED``.
+    :returns: The key written.
+    :rtype: str
+    :raises TaggerGlueError: If the glue fails; :class:`TextMoved` when
+        the approved text moved, after the row is consumed.
+    """
+    try:
+        key = glue_run(opinion, row)
+    except TextMoved:
+        _consume(row)
+        raise
+    except TaggerGlueError as exc:
+        if row.status == JobStatus.COMPLETED:
+            _record_glue_failure(row, exc)
+        raise
+    _consume(row)
+    return key
 
 
 def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:

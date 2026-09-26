@@ -67,6 +67,45 @@ class TestTheBlocks(TestCase):
             markup.project(body).text, "<p>OPINION</p>\n<p>1. First</p>"
         )
 
+    def test_a_list_group_is_one_p_per_item(self):
+        # One group can hold several items (#428): one ``li`` mark per
+        # item, with a line end between two items.
+        text = "a. First item\nb. The appel-\nlant"
+        body = [
+            para(
+                text,
+                kind="list_item",
+                marks=[(0, 13, "li"), (14, len(text), "li")],
+            )
+        ]
+
+        projection = markup.project(body)
+
+        self.assertEqual(
+            projection.text,
+            "<p>a. First item</p>\n<p>b. The appellant</p>",
+        )
+        assert_exact(self, body, projection)
+        start = projection.text.index("b.")
+        self.assertEqual(
+            markup.lift_span(projection, start, start + 2),
+            [{"paragraph": 0, "start": 14, "end": 16}],
+        )
+
+    def test_no_word_is_joined_across_two_items(self):
+        text = "a. appel-\nb. fine"
+        body = [
+            para(
+                text,
+                kind="list_item",
+                marks=[(0, 9, "li"), (10, len(text), "li")],
+            )
+        ]
+
+        self.assertEqual(
+            markup.project(body).text, "<p>a. appel-</p>\n<p>b. fine</p>"
+        )
+
     def test_a_table_is_left_out_with_its_text(self):
         body = [para("Before."), para("a | b", kind="table"), para("After.")]
 
@@ -246,7 +285,9 @@ class TestTheMapIsExact(TestCase):
             for _ in range(rng.randint(0, 3)):
                 start = rng.randrange(len(text))
                 end = rng.randint(start + 1, len(text))
-                marks.append((start, end, rng.choice(["em", "sup", "strong"])))
+                marks.append(
+                    (start, end, rng.choice(["em", "sup", "strong", "li"]))
+                )
             body.append(
                 para(
                     text,

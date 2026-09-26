@@ -409,6 +409,10 @@ TAG_FAILED_MESSAGE = (
     "The tagger job could not be started: {reason}. Try again, or ask a "
     "staff member to read the log."
 )
+TAG_GLUE_FAILED_MESSAGE = (
+    "The tagger's result could not be placed on the approved text: "
+    "{reason}. Press again to retry, or ask a staff member to read the log."
+)
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -1968,9 +1972,10 @@ def start_caselaw_tagger(
     the bucket, and a state of ``tagger.state`` that a press can move
     (no run, a dead one, or a run over an earlier approved text).
 
-    A press over a text the tagger already read (a second approval of
-    the same text) starts no job: ``tagger.ensure_tag_jobs`` reuses the
-    run, and its spans are placed on the new approved text here.
+    A press that finds its result paid for already starts no job: a
+    second approval of the same text, a result carried from an earlier
+    run, or a glue the tick gave up on. ``tagger.place`` puts the spans
+    on the approved text in this request, and a fault is its answer.
 
     Every answer is a Django message too, and the viewer reloads the
     page to show it.
@@ -2006,11 +2011,7 @@ def start_caselaw_tagger(
         return _edit_refusal(request, TAG_DONE_MESSAGE)
     try:
         rows = tagger.ensure_tag_jobs(opinion)
-        message = TAG_STARTED_MESSAGE
-        if rows and rows[0].status == JobStatus.CONSUMED:
-            tagger.glue_run(opinion, rows[0])
-            message = TAG_PLACED_MESSAGE
-    except (tagger.TaggerInputError, tagger.TaggerGlueError) as exc:
+    except tagger.TaggerInputError as exc:
         logger.warning(
             "%s of scan %s: the tagger press by %s did not start: %s",
             opinion,
@@ -2019,6 +2020,27 @@ def start_caselaw_tagger(
             exc,
         )
         return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
+    message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
+        # A result that is paid for already: carried from an earlier
+        # run of the same text, a glue the tick gave up on, or a second
+        # approval of the same text. No job runs, so the spans are
+        # placed now, and a fault is the answer of this press.
+        try:
+            tagger.place(opinion, rows[0])
+        except tagger.TaggerGlueError as exc:
+            logger.warning(
+                "%s of scan %s: the tagger press by %s did not place the "
+                "spans: %s",
+                opinion,
+                pk,
+                request.user,
+                exc,
+            )
+            return _edit_refusal(
+                request, TAG_GLUE_FAILED_MESSAGE.format(reason=exc)
+            )
+        message = TAG_PLACED_MESSAGE
     logger.info(
         "%s of scan %s: %s started the tagger (run %s)",
         opinion,

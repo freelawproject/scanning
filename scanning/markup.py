@@ -646,7 +646,9 @@ class Projection:
     paragraphs: list[int]
 
 
-def _kept(text: str) -> list[tuple[int, str]]:
+def _kept(
+    text: str, items: frozenset[int] = frozenset()
+) -> list[tuple[int, str]]:
     """Return ``(source index, character)`` for each character sent.
 
     Two changes and no other: a word cut at a line end loses its
@@ -654,11 +656,15 @@ def _kept(text: str) -> list[tuple[int, str]]:
     before it, which keeps the hyphen), and every other ``\\n`` becomes
     a space, because ``\\n`` is the tagger's block separator.
     ``paragraphs.JOIN`` is a ``\\n``, so a word cut at a column or a
-    page edge is joined by the same rule.
+    page edge is joined by the same rule. A line end before an item
+    start (``items``) is the edge of a block, so no word is joined
+    across it.
     """
     dropped: set[int] = set()
     for match in _LINE_HYPHEN.finditer(text):
         hyphen = match.end(1)
+        if hyphen + 2 in items:
+            continue
         if match.group(1).lower() not in KEEP_HYPHEN:
             dropped.add(hyphen)
         dropped.add(hyphen + 1)
@@ -677,8 +683,9 @@ def project(body: list[dict]) -> Projection:
     and no footnote content (the model card of
     ``freelawproject/caselaw-block-tagger``). So:
 
-    - each ``body`` paragraph is one block, and a ``heading`` or a
-      ``list_item`` is a ``<p>``; a ``table`` is left out whole;
+    - each ``body`` paragraph is one block, and a ``heading`` is a
+      ``<p>``; a ``list_item`` paragraph is one ``<p>`` per item, cut at
+      each ``li`` mark (#428); a ``table`` is left out whole;
     - a quoted paragraph is a ``<blockquote>`` block in place of its
       ``<p>``, because the worker cuts its windows at ``</p>`` and at
       ``</blockquote>``, so a quote is a block beside the paragraphs;
@@ -708,7 +715,14 @@ def project(body: list[dict]) -> Projection:
         if paragraph.get("kind") == TABLE:
             continue
         source = paragraph.get("text") or ""
-        kept = _kept(source)
+        # A list group holds one ``li`` mark per item (#428), with a
+        # ``\n`` between two items; each item is a block of its own.
+        items = frozenset(
+            mark["start"]
+            for mark in paragraph.get("marks") or []
+            if mark.get("kind") == ITEM and mark.get("start", 0) > 0
+        )
+        kept = _kept(source, items)
         if not "".join(char for _, char in kept).strip():
             continue
         marks = [
@@ -724,6 +738,13 @@ def project(body: list[dict]) -> Projection:
         markup(f"<{block}>")
         open_kinds: tuple[str, ...] = ()
         for position, char in kept:
+            if position + 1 in items and source[position] == "\n":
+                continue
+            if position in items:
+                for kind in reversed(open_kinds):
+                    markup(f"</{kind}>")
+                open_kinds = ()
+                markup(f"</{block}>\n<{block}>")
             kinds = tuple(
                 kind
                 for kind in _NESTING

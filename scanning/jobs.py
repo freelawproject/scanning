@@ -914,9 +914,12 @@ def _log_run_complete(job: ExternalJob) -> None:
     # purpose (the provider is done, we have applied nothing), and a run
     # of COMPLETED rows is exactly the case this logs. What must be
     # empty is the work still to come. The row's own target, not the
-    # volume's: an apply run (#224) is a run of its own, and reading
-    # the volume's rows here would time and name the wrong one.
-    rows = live_run(job.scan_id, job.stage, job.engine, job.apply_run)
+    # volume's: an apply run (#224) or an opinion (#272) is a run of
+    # its own, and reading the volume's rows here would time and name
+    # the wrong one.
+    rows = live_run(
+        job.scan_id, job.stage, job.engine, job.apply_run, job.opinion_id
+    )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
     if not rows or any(row.status in unfinished for row in rows):
         return
