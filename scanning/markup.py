@@ -48,7 +48,19 @@ INLINE_KINDS = (EM, STRONG, SUP)
 #: ensemble writes it off the ``BLOCKQUOTE`` zone, and
 #: :func:`serialize` writes its element once, at its two edges.
 BLOCKQUOTE = "blockquote"
-BLOCK_MARKS = (BLOCKQUOTE,)
+#: The two list marks (#428). Like a blockquote, a list spans a run of
+#: groups of a page, so the ensemble writes it and no parser does.
+BULLET_LIST = "ul"
+NUMBERED_LIST = "ol"
+LIST_TYPES = (BULLET_LIST, NUMBERED_LIST)
+#: One item of a list (#428), over the item's text and never over its
+#: marker: the parse takes the bullet off, because it is a glyph and
+#: not a word, and it keeps the number of a numbered item, because an
+#: opinion refers to "item (b)".
+ITEM = "li"
+#: The block marks, outermost first: the order :func:`serialize` opens
+#: them in when they start together.
+BLOCK_MARKS = (BLOCKQUOTE, BULLET_LIST, NUMBERED_LIST, ITEM)
 
 PARAGRAPH = "paragraph"
 HEADING = "heading"
@@ -87,13 +99,41 @@ class Parsed:
 SUP_CHARS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
 _SUP_TRANS = str.maketrans(SUP_CHARS, "0123456789")
 _HEADING_MD = re.compile(r"^[ \t]*#{1,6}[ \t]+")
-#: A list item by its shape: a bullet. A ``*`` that another ``*``
-#: follows is an asterism (``* * *``), not a bullet. An enumerator
-#: (``5. ``) is not here: on the corpus it opens a footnote or a
-#: numbered paragraph far more often than a list, so a list of
-#: enumerated items is the engine's label (``kind``) and never the
-#: shape of the line.
-_LIST_MD = re.compile(r"^[ \t]*(?:[-•·]|\*(?![ \t]*\*))[ \t]+\S")
+#: A bullet at the start of a line (#428). A glyph bullet is a bullet
+#: under any label, and so is a dash. A ``*`` is one only under a list
+#: label: on the six volumes of #404 a ``* `` at the start of a unit
+#: with no list label is a footnote symbol (``* The syllabus
+#: constitutes no part...``) in 36 of 36 units. A ``*`` that another
+#: ``*`` follows is an asterism (``* * *``) under any label. The
+#: middle dot is a bullet at the start of a line alone: an old print
+#: sets a decimal point with it.
+BULLET_GLYPHS = "•·▪◦●"
+_GLYPH_BULLET = re.compile(rf"^([ \t]*)[{BULLET_GLYPHS}][ \t]*(?=\S)", re.M)
+_DASH_BULLET = re.compile(r"^([ \t]*)-[ \t]+(?=\S)", re.M)
+_STAR_BULLET = re.compile(r"^([ \t]*)\*(?![ \t]*\*)[ \t]+(?=\S)", re.M)
+#: A bullet of the HTML dialect: at the start of the text, or after a
+#: tag or a line break (Surya writes ``<p>• A<br/>• B</p>``).
+_HTML_BULLET = re.compile(
+    rf"(^|>|\n)([ \t]*)(?:[{BULLET_GLYPHS}]|&bull;|&#8226;)[ \t]*(?=\S)"
+)
+#: The enumerator of a numbered item: ``1.``, ``1)``, ``(1)``, ``a.``,
+#: ``(a)``, ``iv.``, ``(iv)``. It starts an item only at the start of a
+#: unit the engine labels a list (#428): a line inside a unit that
+#: starts with ``v. Smith`` is a wrapped case name, and a paragraph
+#: that starts with ``5.`` is a footnote or a numbered paragraph far
+#: more often than a list item. A ``[2]`` is a headnote number.
+_ENUMERATOR = (
+    r"(?:\((?:\d{1,3}|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})\)"
+    r"|(?:\d{1,3}|[a-zA-Z]|[ivxlcdmIVXLCDM]{1,6})[.)])"
+)
+ENUMERATOR = re.compile(rf"^{_ENUMERATOR}$")
+_ENUMERATED_START = re.compile(rf"^[ \t]*{_ENUMERATOR}[ \t]+\S")
+#: The start of an item inside a text under parse: a character of the
+#: private use area, which no engine writes. :class:`_Out` reads it as
+#: "the next word starts an item" and adds no character.
+_ITEM_START = "\ue000"
+#: The flag :class:`_Out` puts on the first character of an item.
+_ITEM_FLAG = "item"
 _TABLE_START = re.compile(r"^\s*<table\b", re.I)
 #: A tag of either dialect: a name and attributes with values. Surya
 #: copies a literal angle bracket of the print unescaped (``"Untrue
@@ -152,12 +192,26 @@ class _Out:
         self.flags: list[frozenset[str]] = []
         self.open: dict[str, int] = {}
         self.kind: str = PARAGRAPH
+        self.item_open = False
 
     def add(self, text: str) -> None:
         flags = frozenset(kind for kind, count in self.open.items() if count)
         for char in text:
+            if char == _ITEM_START:
+                self.begin_item()
+                continue
+            if self.item_open and not char.isspace():
+                self.chars.append(char)
+                self.flags.append(flags | {_ITEM_FLAG})
+                self.item_open = False
+                continue
             self.chars.append(char)
             self.flags.append(flags)
+
+    def begin_item(self) -> None:
+        """Start an item at the next character that is not a space."""
+        self.item_open = True
+        self.set_kind(LIST_ITEM)
 
     def begin(self, kind: str) -> None:
         self.open[kind] = self.open.get(kind, 0) + 1
@@ -186,9 +240,10 @@ def _tag(out: _Out, closing: bool, name: str) -> None:
         if closing:
             out.newline()
     elif name == "li":
-        out.set_kind(LIST_ITEM)
         if closing:
             out.newline()
+        else:
+            out.begin_item()
     elif closing and name in _BREAK_TAGS:
         out.newline()
 
@@ -271,8 +326,41 @@ def _normalize_whitespace(out: _Out) -> None:
         flags.append(flag)
     for index, char in enumerate(chars):
         if char in (" ", "\n") and 0 < index < len(chars) - 1:
-            flags[index] = flags[index - 1] & flags[index + 1]
+            flags[index] = (flags[index - 1] & flags[index + 1]) - {_ITEM_FLAG}
     out.chars, out.flags = chars, flags
+
+
+def item_marks(text: str, starts: list[int]) -> list[Mark]:
+    """Return one :data:`ITEM` mark per item of ``text`` (#428).
+
+    An item runs from its start to the start of the next one, less the
+    whitespace before it, and the last one to the end of the text. The
+    text before the first start is no item: it is the end of an item
+    that began above, in another unit or another column.
+
+    :param text: The text.
+    :param starts: The offsets where the items start.
+    :returns: The marks, in order.
+    :rtype: list[Mark]
+    """
+    edges = sorted(set(starts))
+    marks = []
+    for index, start in enumerate(edges):
+        end = edges[index + 1] if index + 1 < len(edges) else len(text)
+        end = start + len(text[start:end].rstrip())
+        if end > start:
+            marks.append(Mark(start, end, ITEM))
+    return marks
+
+
+def sort_key(kind: str) -> int:
+    """Return the rank of a mark kind among the marks that start
+    together: the block marks outermost first, then :data:`_NESTING`."""
+    if kind in BLOCK_MARKS:
+        return BLOCK_MARKS.index(kind)
+    if kind in _NESTING:
+        return len(BLOCK_MARKS) + _NESTING.index(kind)
+    return len(BLOCK_MARKS) + len(_NESTING)
 
 
 def marks_of(flags: list[frozenset[str]]) -> list[Mark]:
@@ -291,9 +379,15 @@ def marks_of(flags: list[frozenset[str]]) -> list[Mark]:
 
 def _finish(out: _Out) -> Parsed:
     _normalize_whitespace(out)
-    return Parsed(
-        text="".join(out.chars), marks=marks_of(out.flags), kind=out.kind
-    )
+    text = "".join(out.chars)
+    starts = [i for i, flag in enumerate(out.flags) if _ITEM_FLAG in flag]
+    marks = marks_of(out.flags)
+    if out.kind == LIST_ITEM:
+        marks = sorted(
+            item_marks(text, starts) + marks,
+            key=lambda m: (m.start, sort_key(m.kind)),
+        )
+    return Parsed(text=text, marks=marks, kind=out.kind)
 
 
 def _cell_text(fragment: str) -> str:
@@ -347,10 +441,34 @@ def parse_markdown(text: str, kind: str | None = None) -> Parsed:
         # over a text that is no ``<table>`` names no table: the rows
         # are the table, and a kind with no rows would show no text.
         out.set_kind(kind)
-    if _LIST_MD.match(text):
-        out.set_kind(LIST_ITEM)
+    if out.kind in (PARAGRAPH, LIST_ITEM):
+        text = _mark_items(text, listed=out.kind == LIST_ITEM)
     _scan_markdown(text, out)
     return _finish(out)
+
+
+def _mark_items(text: str, listed: bool) -> str:
+    """Put :data:`_ITEM_START` where each item of a text starts (#428).
+
+    A bullet at the start of a line is replaced: it is the marker, not
+    a word. Under a list label a ``*`` is a bullet too, and a text that
+    starts with an enumerator starts an item there, the enumerator
+    kept. Mistral writes ``- (a) the named insured``: the dash is its
+    markdown list and the ``(a)`` is the print's.
+
+    :param text: The unit's text, after the heading marks.
+    :param listed: Whether the engine labels the unit a list.
+    :returns: The text with the item starts in it.
+    :rtype: str
+    """
+    marked = rf"\1{_ITEM_START}"
+    text = _GLYPH_BULLET.sub(marked, text)
+    text = _DASH_BULLET.sub(marked, text)
+    if listed:
+        text = _STAR_BULLET.sub(marked, text)
+        if _ENUMERATED_START.match(text):
+            text = _ITEM_START + text
+    return text
 
 
 def parse_html(html: str, kind: str | None = None) -> Parsed:
@@ -366,7 +484,7 @@ def parse_html(html: str, kind: str | None = None) -> Parsed:
     if _TABLE_START.match(html):
         return parse_table(html)
     out = _Out()
-    _scan_html(html, out)
+    _scan_html(_HTML_BULLET.sub(rf"\1\2{_ITEM_START}", html), out)
     if kind and kind != TABLE:
         out.set_kind(kind)
     return _finish(out)
@@ -416,16 +534,19 @@ def serialize(parsed: Parsed) -> str:
     A mark of :data:`BLOCK_MARKS` is written once, at its two edges,
     and outside every inline element (#411): a blockquote spans
     paragraphs, and an element per segment would write one quote per
-    italic. Its edges cut the inline marks, so every element closes
+    italic. Block marks that start together open outermost first, the
+    order of :data:`BLOCK_MARKS`, and close in the reverse order. Its edges cut the inline marks, so every element closes
     inside the one it opened in. A caller serializes a page's text with
     the marks of its section (``OpinionText.marks``).
 
     :param parsed: The unit, or a page's text and its marks.
     :returns: The text with ``<em>``, ``<strong>`` and ``<sup>`` at the
         marks (outer to inner in :data:`_NESTING` order, one element
-        per segment), ``<blockquote>`` at the block marks, ``&``,
-        ``<`` and ``>`` escaped, and the block kind as ``<heading>``,
-        ``<li>`` or a ``<table>``.
+        per segment), ``<blockquote>``, ``<ul>``, ``<ol>`` and ``<li>``
+        at the block marks, ``&``, ``<`` and ``>`` escaped, and the
+        block kind as ``<heading>`` or a ``<table>``. A list item is
+        its ``li`` marks (#428), never its kind: a unit that goes on
+        with the item of the unit above has the kind and no mark.
     :rtype: str
     """
     if parsed.kind == TABLE:
@@ -447,9 +568,10 @@ def serialize(parsed: Parsed) -> str:
             *(m.end for m in parsed.marks),
         }
     )
-    blocks = [
-        m for m in parsed.marks if m.kind in BLOCK_MARKS and m.end > m.start
-    ]
+    blocks = sorted(
+        (m for m in parsed.marks if m.kind in BLOCK_MARKS and m.end > m.start),
+        key=lambda m: (-m.end, sort_key(m.kind)),
+    )
     parts: list[str] = []
     for start, end in zip(edges, edges[1:], strict=False):
         parts.extend(f"<{m.kind}>" for m in blocks if m.start == start)
@@ -465,6 +587,4 @@ def serialize(parsed: Parsed) -> str:
     body = "".join(parts)
     if parsed.kind == HEADING:
         return f"<heading>{body}</heading>"
-    if parsed.kind == LIST_ITEM:
-        return f"<li>{body}</li>"
     return body

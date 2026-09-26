@@ -174,8 +174,9 @@ logger = logging.getLogger(__name__)
 #: ``kind`` beside a plain ``text`` (#404); 5 puts the blockquote zone
 #: beside the footnote zone (#411); 6 keeps a ``manual`` bracket box
 #: out of the verdict of the unit whose bracket token it deleted
-#: (#419).
-SCHEMA_VERSION = 6
+#: (#419); 7 takes the bullet of a list item off its text and marks
+#: every item with an ``li`` mark (#428).
+SCHEMA_VERSION = 7
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed

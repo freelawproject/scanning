@@ -404,3 +404,23 @@ class TestTheQuoteEditsAreTheDocuments(SimpleTestCase):
         text = text[: text.index("\n    }\n")]
         self.assertIn("run === undefined || group.quote_span", text)
         self.assertIn('[data-blockquote="part"]', STYLES.read_text())
+
+
+class TestTheItemsAreTheDocumentsOwn(SimpleTestCase):
+    """The viewer draws the ``li`` marks the ensemble voted (#428)."""
+
+    def test_the_viewer_reads_the_item_marks(self):
+        from scanning import markup
+
+        source = VIEWER.read_text()
+        self.assertIn(f"mark.kind === '{markup.ITEM}'", source)
+        self.assertIn("group.list", source)
+        self.assertIn("function itemParents(", source)
+
+    def test_the_stylesheet_draws_the_bullet_of_a_bullet_list(self):
+        from scanning import markup
+
+        self.assertIn(
+            f'.ensemble-group[data-list="{markup.BULLET_LIST}"] .ensemble-item',
+            STYLES.read_text(),
+        )

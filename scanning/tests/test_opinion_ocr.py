@@ -992,7 +992,9 @@ class TestTheParsedUnit(OpinionOcrTestCase):
         self.assertEqual(unit["kind"], "paragraph")
         self.assertNotIn("table", unit)
         self.assertEqual(document["counts"]["marks"], 1)
-        self.assertEqual(document["schema_version"], 6)
+        self.assertEqual(
+            document["schema_version"], opinion_ocr.SCHEMA_VERSION
+        )
 
     def test_the_mistral_latex_superscript(self):
         self.set_body_a(
@@ -1133,8 +1135,8 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
 
     def test_a_marked_header_is_the_page_number(self):
         """Mistral writes the running head as a heading, dots.mocr sets
-        bold marks, Surya a bullet. The parse takes the marks off the
-        text (#404) and the reader folds the bullet, or the group drops
+        bold marks, Surya a bullet. The parse takes the marks and the
+        bullet off the text (#404, #428), or the group drops
         on the dots.mocr cell alone and the page gets a partial card
         for the clean Mistral block beside it."""
         mistral = mistral_document()
@@ -1153,7 +1155,7 @@ class TestTheSuryaEngine(OpinionOcrTestCase):
         for engine, prefix in (
             ("dots_mocr", "878"),
             ("mistral_ocr", "878"),
-            ("surya", "• 878"),
+            ("surya", "878"),
         ):
             document = self.uploads[
                 opinion_ocr.engine_key(self.opinion, engine)
@@ -2203,7 +2205,9 @@ class TestTheBracketToken(OpinionOcrTestCase):
             self.assertIsNone(unit["exclusion"])
             self.assertEqual(unit["removed"], ["[1]"])
         self.assertEqual(document["counts"]["brackets_removed"], 1)
-        self.assertEqual(document["schema_version"], 6)
+        self.assertEqual(
+            document["schema_version"], opinion_ocr.SCHEMA_VERSION
+        )
 
     def test_a_large_bracket_box_no_longer_drops_the_words(self):
         """A share of 0.3 excluded the unit before #373."""
