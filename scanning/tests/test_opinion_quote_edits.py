@@ -22,7 +22,7 @@ from scanning.tests.test_ensemble import (
     BODY_B_PT,
     engine_page,
 )
-from scanning.tests.test_opinion_edits import alike, entry, group_at
+from scanning.tests.test_opinion_edits import BODY_C_PT, alike, entry, group_at
 
 QUOTE_TEXT = (
     '"(1) Dangerous weapon means any weapon, device, instrument, material '
@@ -86,6 +86,35 @@ class TestTheWholeBlock(TestCase):
 
         self.assertFalse(group_at(page, BODY_B_PT)["blockquote"])
         self.assertEqual(page["blockquotes"], [])
+
+    def test_an_edit_on_a_dropped_block_parts_no_quote(self):
+        """A redaction takes a block a curator took out of the quote:
+        the edit is not applied, so the quote of the zone stays one."""
+        specs = [
+            (BODY_A_PT, "The rule reads."),
+            (BODY_B_PT, "A name."),
+            (BODY_C_PT, "It goes on."),
+        ]
+        dots, mistral = alike(*specs)
+        for engine_units in (dots, mistral):
+            engine_units[1]["exclusion"] = {"reason": "redaction"}
+            engine_units[1]["share"] = 1.0
+        zone = [30.0, 100.0, 300.0, 710.0]
+        pages = {
+            "dots_mocr": engine_page(dots, quotes=[zone]),
+            "mistral_ocr": engine_page(mistral, quotes=[zone]),
+        }
+
+        page = ensemble.build_page(
+            pages, 0, [quote_edit(BODY_B_PT, id=9, quoted=False)]
+        )
+
+        self.assertEqual(
+            [(e["edit_id"], e["reason"]) for e in page["unresolved_edits"]],
+            [(9, ensemble.EDIT_DROPPED)],
+        )
+        [run] = page["blockquotes"]
+        self.assertEqual(len(run["groups"]), 2)
 
     def test_an_edit_of_a_block_now_in_the_footnotes_is_unresolved(self):
         page = build(
@@ -206,6 +235,34 @@ class TestAPartOfTheBlock(TestCase):
             page["text"][run["start"] : run["end"]],
             f"{before}\n\n{QUOTE_TEXT}",
         )
+
+    def test_a_list_item_quoted_in_part_is_a_list_group(self):
+        dots, mistral = alike(
+            (BODY_A_PT, "The court held."), (BODY_B_PT, BLOCK_TEXT)
+        )
+        for engine_units in (dots, mistral):
+            engine_units[1]["kind"] = markup.LIST_ITEM
+        pages = {
+            "dots_mocr": engine_page(dots),
+            "mistral_ocr": engine_page(mistral),
+        }
+
+        page = ensemble.build_page(
+            pages,
+            0,
+            [
+                quote_edit(
+                    BODY_B_PT,
+                    id=6,
+                    quoted=True,
+                    span=[0, len(QUOTE_TEXT)],
+                    base_text=BLOCK_TEXT,
+                )
+            ],
+        )
+
+        [run] = page["blockquotes"]
+        self.assertEqual(run["list_groups"], run["groups"])
 
     def test_other_words_hold_the_edit(self):
         """The span is offsets into the text the curator saw, so a

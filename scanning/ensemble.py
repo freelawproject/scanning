@@ -1536,6 +1536,8 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
                 runs.append(open_run)
             open_run["end"] = group["start"] + last
             open_run["groups"].append(group["id"])
+            if len(group.get("list_by") or []) >= LIST_READERS:
+                open_run["list_groups"].append(group["id"])
             if last < group["end"] - group["start"]:
                 open_run = None
             continue
@@ -2346,10 +2348,14 @@ def build_page(
             group["section"] = placed["section"]
             group["footnote_doubt"] = False
         group["blockquote"] = quoted(group, quotes)
+        # The flag of the zone, for the place of a dropped group in the
+        # runs: an edit whose block a redaction takes is not applied,
+        # so it parts no quote either (#419).
+        group["_zone_blockquote"] = group["blockquote"]
         quote = group.get("_quote_edit")
         if quote and group["section"] != BODY:
-            # The footnotes hold no quote (``quoted``), and a later
-            # section edit moved the block there.
+            # The footnotes hold no quote (``quoted``). A section edit
+            # or the footnote zone of a new glue put the block there.
             unresolved.append(_unresolved(quote, EDIT_IN_FOOTNOTES))
             group["_quote_edit"] = None
         elif quote and quote.get("span") is None:
@@ -2386,7 +2392,7 @@ def build_page(
                 {
                     "dropped": True,
                     "section": group["section"],
-                    "blockquote": group["blockquote"],
+                    "blockquote": group["_zone_blockquote"],
                 }
             )
             entry["dropped"].append(
