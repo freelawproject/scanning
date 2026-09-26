@@ -69,13 +69,28 @@ ELEMENTS = {
 PARTIES = "parties"
 PARTY_ELEMENTS = frozenset({ELEMENTS["party"], ELEMENTS["separator"]})
 
-#: The label whose first paragraph starts the opinion: the head matter
-#: is every paragraph before it.
+#: The label whose first paragraph starts the opinion (:func:`head_matter_end`).
 AUTHOR = "author"
+#: The labels of the caption alone. ``judges``, ``disposition`` and
+#: ``heading`` are not here: the end of a main opinion and its body
+#: hold them too.
+HEAD_MATTER_LABELS = frozenset({
+    "party", "separator", "docketnumber", "court", "datefiled",
+    "otherdate", "attorneys", "history",
+})  # fmt: skip
 
 #: The element of a ``sup`` mark whose text is a footnote label.
 FOOTNOTE_MARK = "footnotemark"
 PAGE_NUMBER = "page-number"
+
+#: The elements that give the text its shape. Every other element is a
+#: role: a tag of the tagger (or ``parties``), drawn with the tint of its
+#: role, the review sheet of centralia.
+STRUCTURE = frozenset({
+    "casebody", "opinion", "p", "blockquote", "heading", "footnote",
+    "ul", "ol", "li", "table", "tr", "td", "em", "strong", "sup",
+    FOOTNOTE_MARK, PAGE_NUMBER,
+})  # fmt: skip
 
 #: The layers of the inline elements, outermost first: a list item
 #: holds a span, and a span holds the marks of the approved text.
@@ -125,17 +140,22 @@ def element_of(label: str) -> str:
 
     A label of :data:`ELEMENTS` gives its CAP name. Any other label
     keeps its own name where that is an XML name; otherwise every
-    character an XML name cannot hold is a ``-``, after a ``label-``
-    where the name would start badly or with ``xml``, the prefix XML
-    keeps for itself. So a new label of the model shows in the XML
+    character an XML name cannot hold is a ``-``. A ``label-`` goes
+    before a name that would start badly, start with ``xml`` (the
+    prefix XML keeps for itself), or be an element of the structure
+    (:data:`STRUCTURE`, ``parties``), which a reader would take for
+    one. So a new label of the model shows in the XML
     and never breaks it; the spans object keeps the label as it was.
     """
     if label in ELEMENTS:
         return ELEMENTS[label]
-    if _XML_NAME.match(label) and not label.lower().startswith("xml"):
-        return label
     name = re.sub(r"[^\w.-]", "-", label) or "label"
-    if not _XML_NAME.match(name) or name.lower().startswith("xml"):
+    if (
+        not _XML_NAME.match(name)
+        or name.lower().startswith("xml")
+        or name in STRUCTURE
+        or name == PARTIES
+    ):
         name = f"label-{name}"
     return name
 
@@ -356,23 +376,38 @@ def _spans_by_paragraph(body: list[dict], spans: list[dict]) -> dict:
 def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     """Return the index of the first paragraph of the opinion.
 
-    The head matter is the leading run of paragraphs that carry a span,
-    and it ends early at an ``author`` span inside that run. An author
-    after the run is no end of the head matter: a per curiam opinion has
-    no author line, and the first author span is then its dissent's.
+    The head matter ends at the first ``author`` span. The tagger can
+    miss a line of the caption (a "Rehearing denied" line, an OCR
+    fragment), so a paragraph with no span does not end it: it ends
+    after the last paragraph before that author with a label of
+    :data:`HEAD_MATTER_LABELS`, where that is later than the leading
+    run of tagged paragraphs. A per curiam opinion has no author line,
+    and the first author span is its dissent's; its text holds none of
+    those labels, so its head matter ends with the leading run.
 
     :param body: The body paragraphs.
     :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
     :returns: The index.
     :rtype: int
     """
+    author = next(
+        (
+            index
+            for index in sorted(by)
+            if any(span["label"] == AUTHOR for span in by[index])
+        ),
+        len(body),
+    )
     run = 0
-    while run < len(body) and run in by:
+    while run < author and run in by:
         run += 1
-    for index in range(run):
-        if any(span["label"] == AUTHOR for span in by[index]):
-            return index
-    return run
+    caption = [
+        index
+        for index in sorted(by)
+        if index < author
+        and any(span["label"] in HEAD_MATTER_LABELS for span in by[index])
+    ]
+    return max(run, caption[-1] + 1) if caption else run
 
 
 def _comment(text: str) -> str:
@@ -481,14 +516,6 @@ def build(approved: dict, tags: dict) -> str:
 
 
 # ── The display (#432) ──────────────────────────────────────────────
-#: The elements that give the text its shape. Every other element is a
-#: role: a tag of the tagger (or ``parties``), drawn with the tint of its
-#: role, the review sheet of centralia.
-STRUCTURE = frozenset({
-    "casebody", "opinion", "p", "blockquote", "heading", "footnote",
-    "ul", "ol", "li", "table", "tr", "td", "em", "strong", "sup",
-    FOOTNOTE_MARK, PAGE_NUMBER,
-})  # fmt: skip
 #: The marks of the approved text, drawn as the text they format.
 _PLAIN = frozenset({"em", "strong", "sup", "ul", "ol", "li", "blockquote"})
 

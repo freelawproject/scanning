@@ -206,6 +206,60 @@ class TestTheHeadMatter(TestCase):
             ["p", "p", "author", "p"],
         )
 
+    def test_an_untagged_caption_line_does_not_end_the_head_matter(self):
+        """The tagger missed a line of the caption: the caption labels
+        after it keep it in the head matter."""
+        _xml, root = build(
+            doc(
+                para("Smith v. Jones"),
+                para("ON MOTION FOR REHEARING"),
+                para("Supreme Court of Florida."),
+                para("Attorneys for appellant."),
+                para("JONES, J."),
+                para("We affirm."),
+            ),
+            span(0, 0, 14, "party"),
+            span(2, 0, 25, "court"),
+            span(3, 0, 24, "attorneys"),
+            span(4, 0, 9, "author"),
+        )
+
+        self.assertEqual(
+            [c.tag for c in root],
+            ["parties", "p", "court", "attorneys", "opinion"],
+        )
+        self.assertEqual(
+            [c.tag for c in root.find("opinion")], ["author", "p"]
+        )
+
+    def test_a_per_curiam_with_an_untagged_caption_line(self):
+        """Both cases at once: the caption's own labels end it, and the
+        judges of the main opinion are not caption labels."""
+        _xml, root = build(
+            doc(
+                para("Smith v. Jones"),
+                para("Rehearing denied."),
+                para("Supreme Court of Florida."),
+                para("PER CURIAM."),
+                para("We affirm."),
+                para("Kuntz and Artau, JJ., concur."),
+                para("JONES, J., dissenting."),
+                para("I dissent."),
+            ),
+            span(0, 0, 14, "party"),
+            span(2, 0, 25, "court"),
+            span(5, 0, 29, "judges"),
+            span(6, 0, 22, "author"),
+        )
+
+        self.assertEqual(
+            [c.tag for c in root], ["parties", "p", "court", "opinion"]
+        )
+        self.assertEqual(
+            [c.tag for c in root.find("opinion")],
+            ["p", "p", "judges", "author", "p"],
+        )
+
     def test_with_no_author_the_leading_tagged_run_is_the_head_matter(self):
         _xml, root = build(
             doc(para("Supreme Court."), para("We affirm.")),
@@ -372,6 +426,13 @@ class TestTheXmlIsAlwaysWellFormed(TestCase):
         )
 
         self.assertEqual(root.find("other-date").text, "June 1.")
+
+    def test_a_label_named_as_a_structure_element_gets_a_prefix(self):
+        for label in ("opinion", "footnote", "p", "page-number", "parties"):
+            with self.subTest(label=label):
+                self.assertEqual(casebody.element_of(label), f"label-{label}")
+        # A label of the table keeps its CAP name, heading too.
+        self.assertEqual(casebody.element_of("heading"), "heading")
 
     def test_a_label_that_starts_badly_gets_a_prefix(self):
         self.assertEqual(casebody.element_of("1st"), "label-1st")
