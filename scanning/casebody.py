@@ -48,8 +48,8 @@ from dataclasses import dataclass, field
 from scanning import markup
 
 #: The tagger label and the CAP element it writes. A label that is not
-#: here keeps its own name, so a new label of the model shows in the
-#: XML and does not break the build.
+#: here is written by :func:`element_of`, so a new label of the model
+#: shows in the XML and does not break the build.
 ELEMENTS = {
     "party": "party",
     "separator": "separator",
@@ -102,18 +102,41 @@ class _Element:
     attrs: dict = field(default_factory=dict)
 
 
+#: An XML name, less the colon of a namespace. A label that is not one
+#: (``other date``) would write a document no parser reads.
+_XML_NAME = re.compile(r"[A-Za-z_][\w.-]*\Z")
+#: The characters XML 1.0 does not allow, which OCR text can carry
+#: (a vertical tab, a form feed, a lone surrogate).
+_NOT_XML = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+
+
 def element_of(label: str) -> str:
-    """Return the CAP element of one tagger label."""
-    return ELEMENTS.get(label, label)
+    """Return the CAP element of one tagger label.
+
+    A label of :data:`ELEMENTS` gives its CAP name. Any other label
+    keeps its own name where that is an XML name; otherwise every
+    character an XML name cannot hold is a ``-``, after a ``label-``
+    where the name would start badly or with ``xml``, the prefix XML
+    keeps for itself. So a new label of the model shows in the XML
+    and never breaks it; the spans object keeps the label as it was.
+    """
+    if label in ELEMENTS:
+        return ELEMENTS[label]
+    if _XML_NAME.match(label) and not label.lower().startswith("xml"):
+        return label
+    name = re.sub(r"[^\w.-]", "-", label) or "label"
+    if not _XML_NAME.match(name) or name.lower().startswith("xml"):
+        name = f"label-{name}"
+    return name
 
 
 def _escape(text: str) -> str:
-    return _html.escape(text, quote=False)
+    return _html.escape(_NOT_XML.sub("", text), quote=False)
 
 
 def _attrs(attrs: dict) -> str:
     return "".join(
-        f' {name}="{_html.escape(str(value), quote=True)}"'
+        f' {name}="{_html.escape(_NOT_XML.sub("", str(value)), quote=True)}"'
         for name, value in attrs.items()
         if value is not None
     )
@@ -187,11 +210,17 @@ def _paragraph(
     :rtype: tuple[str, str]
     """
     if paragraph.get("kind") == markup.TABLE:
+        # A page that starts at a table is numbered in its first cell:
+        # the star number is a citation anchor, and no page may lose it.
+        numbers = "".join(_page_number(breaks[at]) for at in sorted(breaks))
+        table = [list(row) for row in paragraph.get("table") or [] if row]
+        cells = [[_escape(cell) for cell in row] for row in table] or [[""]]
+        cells[0][0] = numbers + cells[0][0]
+        if not table and not numbers:
+            cells = []
         rows = "".join(
-            "<tr>"
-            + "".join(f"<td>{_escape(cell)}</td>" for cell in row)
-            + "</tr>"
-            for row in paragraph.get("table") or []
+            "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+            for row in cells
         )
         return "table", rows
     source = paragraph.get("text") or ""
@@ -317,16 +346,23 @@ def _spans_by_paragraph(body: list[dict], spans: list[dict]) -> dict:
 def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     """Return the index of the first paragraph of the opinion.
 
-    The first paragraph with an ``author`` span. With none, the first
-    paragraph after the leading run of paragraphs that carry a span.
+    The head matter is the leading run of paragraphs that carry a span,
+    and it ends early at an ``author`` span inside that run. An author
+    after the run is no end of the head matter: a per curiam opinion has
+    no author line, and the first author span is then its dissent's.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
+    :returns: The index.
+    :rtype: int
     """
-    for index in sorted(by):
+    run = 0
+    while run < len(body) and run in by:
+        run += 1
+    for index in range(run):
         if any(span["label"] == AUTHOR for span in by[index]):
             return index
-    index = 0
-    while index < len(body) and index in by:
-        index += 1
-    return index
+    return run
 
 
 def _comment(text: str) -> str:
@@ -425,7 +461,13 @@ def build(approved: dict, tags: dict) -> str:
         out.append("    </footnote>")
     out.append("  </opinion>")
     out.append("</casebody>")
-    return "\n".join(out) + "\n"
+    xml = "\n".join(out) + "\n"
+    try:
+        ET.fromstring(xml)
+    except ET.ParseError as exc:
+        # A rule above missed a case: refuse it, never send it.
+        raise CasebodyError(f"the XML is not well-formed: {exc}") from exc
+    return xml
 
 
 # ── The display (#432) ──────────────────────────────────────────────
@@ -527,10 +569,7 @@ def display_html(xml: str) -> str:
             elif tag == "table":
                 cells = "".join(
                     "<tr>"
-                    + "".join(
-                        f"<td>{_escape(''.join(cell.itertext()))}</td>"
-                        for cell in row
-                    )
+                    + "".join(f"<td>{inline(cell)}</td>" for cell in row)
                     + "</tr>"
                     for row in child
                 )
@@ -592,13 +631,18 @@ def display_html(xml: str) -> str:
     return "".join(parts)
 
 
+#: One token of the XML text, read before the escape. Every part of a
+#: tag is a character class its neighbours cannot match (a value is
+#: ``"[^"]*"``, and :func:`build` escapes ``"`` in every value), so no
+#: input makes the pattern backtrack.
 _SOURCE_TOKEN = re.compile(
-    r"(?P<comment>&lt;!--.*?--&gt;)"
-    r"|(?P<decl>&lt;\?.*?\?&gt;)"
-    r"|(?P<tag>&lt;/?)(?P<name>[\w-]+)"
-    r"(?P<attrs>(?:\s+[\w-]+=&quot;.*?&quot;)*)(?P<end>/?&gt;)"
+    r"(?P<comment><!--.*?-->)"
+    r"|(?P<decl><\?[^?]*\?>)"
+    r"|<(?P<close>/?)(?P<name>[\w-]+)"
+    r'(?P<attrs>(?:\s+[\w-]+="[^"]*")*)(?P<end>\s*/?)>',
+    re.S,
 )
-_SOURCE_ATTR = re.compile(r"([\w-]+)=(&quot;.*?&quot;)")
+_SOURCE_ATTR = re.compile(r'(\s+)([\w-]+)="([^"]*)"')
 
 
 def source_html(xml: str) -> str:
@@ -609,23 +653,39 @@ def source_html(xml: str) -> str:
     :rtype: str
     """
 
+    def escape(text: str) -> str:
+        return _html.escape(text, quote=True)
+
     def token(match: re.Match) -> str:
-        if match.group("comment"):
-            return f'<span class="x-comment">{match.group("comment")}</span>'
-        if match.group("decl"):
-            return f'<span class="x-comment">{match.group("decl")}</span>'
+        for group in ("comment", "decl"):
+            if match.group(group):
+                return (
+                    f'<span class="x-comment">{escape(match.group(group))}'
+                    "</span>"
+                )
         name = match.group("name")
         attrs = _SOURCE_ATTR.sub(
-            r'<span class="x-attr">\1</span>=<span class="x-value">\2</span>',
+            lambda attr: (
+                f'{attr.group(1)}<span class="x-attr">{escape(attr.group(2))}'
+                f'</span>=<span class="x-value">&quot;{escape(attr.group(3))}'
+                "&quot;</span>"
+            ),
             match.group("attrs"),
         )
-        role = "" if name in STRUCTURE else f' data-role="{name}"'
+        role = "" if name in STRUCTURE else f' data-role="{escape(name)}"'
         return (
-            f'<span class="x-tag"{role}>{match.group("tag")}'
-            f"{name}{attrs}{match.group('end')}</span>"
+            f'<span class="x-tag"{role}>&lt;{match.group("close")}'
+            f"{escape(name)}{attrs}{escape(match.group('end'))}&gt;</span>"
         )
 
-    return _SOURCE_TOKEN.sub(token, _html.escape(xml, quote=True))
+    parts = []
+    at = 0
+    for match in _SOURCE_TOKEN.finditer(xml):
+        parts.append(escape(xml[at : match.start()]))
+        parts.append(token(match))
+        at = match.end()
+    parts.append(escape(xml[at:]))
+    return "".join(parts)
 
 
 def label_counts(tags: dict) -> list[tuple[str, str, int]]:

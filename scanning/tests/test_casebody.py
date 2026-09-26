@@ -12,6 +12,7 @@ import ast
 import html
 import json
 import pathlib
+import re
 import xml.etree.ElementTree as ET
 
 from django.test import TestCase
@@ -149,24 +150,60 @@ class TestTheElements(TestCase):
 class TestTheHeadMatter(TestCase):
     """The head matter ends at the author."""
 
-    def test_the_opinion_starts_at_the_first_author_paragraph(self):
+    def test_the_opinion_starts_at_an_author_in_the_tagged_run(self):
         _xml, root = build(
             doc(
                 para("Supreme Court."),
-                para("OPINION"),
+                para("ON MOTION"),
                 para("Smith, J."),
                 para("We affirm."),
                 para("Jones, J., concurs."),
             ),
             span(0, 0, 14, "court"),
+            span(1, 0, 9, "heading"),
             span(2, 0, 9, "author"),
             span(4, 0, 19, "judges"),
         )
 
-        self.assertEqual([c.tag for c in root], ["court", "p", "opinion"])
+        self.assertEqual(
+            [c.tag for c in root], ["court", "heading", "opinion"]
+        )
         self.assertEqual(
             [c.tag for c in root.find("opinion")],
             ["author", "p", "judges"],
+        )
+
+    def test_an_untagged_paragraph_ends_the_head_matter(self):
+        _xml, root = build(
+            doc(para("Supreme Court."), para("OPINION"), para("Smith, J.")),
+            span(0, 0, 14, "court"),
+            span(2, 0, 9, "author"),
+        )
+
+        self.assertEqual([c.tag for c in root], ["court", "opinion"])
+        self.assertEqual(
+            [c.tag for c in root.find("opinion")], ["p", "author"]
+        )
+
+    def test_a_per_curiam_opinion_is_no_head_matter(self):
+        """The first author span is the dissent's: the main opinion has
+        none, and its text stays in the opinion."""
+        _xml, root = build(
+            doc(
+                para("Smith v. Jones"),
+                para("PER CURIAM."),
+                para("We affirm the judgment."),
+                para("JONES, J., dissenting."),
+                para("I dissent."),
+            ),
+            span(0, 0, 14, "party"),
+            span(3, 0, 22, "author"),
+        )
+
+        self.assertEqual([c.tag for c in root], ["parties", "opinion"])
+        self.assertEqual(
+            [c.tag for c in root.find("opinion")],
+            ["p", "p", "author", "p"],
         )
 
     def test_with_no_author_the_leading_tagged_run_is_the_head_matter(self):
@@ -288,6 +325,65 @@ class TestThePages(TestCase):
         _xml, root = build(approved_doc)
 
         self.assertIsNone(root.find(".//page-number"))
+
+
+class TestTheTables(TestCase):
+    """A table keeps its rows, and the page that starts at it."""
+
+    def table(self, rows, pages=(0,)):
+        return para("", kind="table", table=rows, pages=pages)
+
+    def test_the_rows_are_cells(self):
+        _xml, root = build(doc(self.table([["a", "b"], ["c", "d"]])))
+
+        self.assertEqual(
+            [[td.text for td in tr] for tr in root.find("opinion/table")],
+            [["a", "b"], ["c", "d"]],
+        )
+
+    def test_a_page_that_starts_at_a_table_is_numbered_in_its_first_cell(self):
+        _xml, root = build(
+            doc(
+                para("one"),
+                self.table([["a", "b"]], pages=(1,)),
+                para("two", pages=(1,)),
+            )
+        )
+
+        numbers = list(root.iter("page-number"))
+        self.assertEqual([n.get("label") for n in numbers], ["503"])
+        cell = root.find("opinion/table/tr/td")
+        self.assertEqual("".join(cell.itertext()), "*503a")
+
+
+class TestTheXmlIsAlwaysWellFormed(TestCase):
+    """A character or a label XML does not allow never breaks the file."""
+
+    def test_a_control_character_of_the_ocr_is_dropped(self):
+        _xml, root = build(doc(para("a\x0bb\x0cc")))
+
+        self.assertEqual(root.find("opinion/p").text, "abc")
+
+    def test_a_label_that_is_no_xml_name_is_made_one(self):
+        _xml, root = build(
+            doc(para("June 1."), para("Smith, J.")),
+            span(0, 0, 7, "other date"),
+            span(1, 0, 9, "author"),
+        )
+
+        self.assertEqual(root.find("other-date").text, "June 1.")
+
+    def test_a_label_that_starts_badly_gets_a_prefix(self):
+        self.assertEqual(casebody.element_of("1st"), "label-1st")
+        self.assertEqual(casebody.element_of("xmlish"), "label-xmlish")
+        self.assertEqual(casebody.element_of(""), "label")
+
+    def test_the_display_draws_both(self):
+        xml = casebody.build(
+            doc(para("a\x0bb")), {"spans": [span(0, 0, 3, "other date")]}
+        )
+
+        self.assertIn('data-role="other-date"', casebody.display_html(xml))
 
 
 class TestTheText(TestCase):
@@ -468,6 +564,26 @@ class TestTheFootnoteLinks(TestCase):
         self.assertEqual(html_.count('id="cb-fn-1"'), 1)
 
 
+class TestTheSourceView(TestCase):
+    """The XML view is the XML, escaped, with its tags coloured."""
+
+    def test_it_is_the_xml_character_for_character(self):
+        xml, _root = build(
+            doc(para('A & "B" <c>', marks=[mark(0, 1, "em")])),
+            span(0, 0, 1, "court"),
+        )
+
+        shown = casebody.source_html(xml)
+
+        self.assertEqual(html.unescape(re.sub(r"<[^>]+>", "", shown)), xml)
+
+    def test_an_unclosed_attribute_is_plain_text(self):
+        """The shape CodeQL named: no tag matches, and it is escaped."""
+        text = "<a" + ' b="c"' * 50 + ' -="' * 50
+
+        self.assertEqual(casebody.source_html(text), html.escape(text))
+
+
 class TestTheModuleIsPure(TestCase):
     """The merge reads its two dicts alone, like ``paragraphs``."""
 
@@ -547,6 +663,26 @@ class TestTheFinalXmlRoutes(_S3Case):
 
         self.assertIn("attachment", response["Content-Disposition"])
         self.assertIn("-final.xml", response["Content-Disposition"])
+
+    def test_another_download_value_is_no_download(self):
+        self.tagged()
+
+        response = self.client.get(
+            self.url("serve_opinion_final_xml") + "?download=0"
+        )
+
+        self.assertNotIn("Content-Disposition", response)
+
+    def test_a_refusal_names_no_exception(self):
+        self.tagged()
+        self.stored[self.opinion.tag_key]["spans"] = [span(9, 0, 1, "court")]
+
+        message = self.client.get(self.url("serve_opinion_final_xml")).json()[
+            "message"
+        ]
+
+        self.assertNotIn("paragraph 9", message)
+        self.assertIn("The log of the web pod has the reason", message)
 
     def test_the_page_draws_both_views(self):
         self.tagged()

@@ -2187,6 +2187,13 @@ def serve_opinion_tags(
     )
 
 
+FINAL_XML_REFUSED_MESSAGE = (
+    "The final XML of {opinion} was not built: the approved text or the "
+    "spans could not be read, or the spans do not fit the text. The log "
+    "of the web pod has the reason."
+)
+
+
 class _FinalXmlRefused(Exception):
     """The final XML of an opinion cannot be built now."""
 
@@ -2230,12 +2237,16 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
         ClientError,
         ValueError,
     ) as exc:
+        # The reason goes to the log alone: an S3 fault's text is the
+        # client library's, and no answer of this route repeats it.
         logger.warning("%s: the final XML was not built: %s", opinion, exc)
         raise _FinalXmlRefused(
             JsonResponse(
                 {
                     "status": "error",
-                    "message": f"The final XML of {opinion} was not built: {exc}",
+                    "message": FINAL_XML_REFUSED_MESSAGE.format(
+                        opinion=opinion
+                    ),
                 },
                 status=409,
             )
@@ -2256,7 +2267,7 @@ def serve_opinion_final_xml(
     """Answer the final XML of one opinion, computed now (#432).
 
     :param request: The HTTP request. ``?download=1`` answers it as a
-        file.
+        file; any other value does not.
     :param pk: Scan primary key.
     :param opinion_pk: The ``Opinion`` primary key.
     :return: The XML, or a JSON 404 or 409.
@@ -2268,7 +2279,7 @@ def serve_opinion_final_xml(
     except _FinalXmlRefused as refused:
         return refused.response
     response = HttpResponse(xml, content_type="application/xml; charset=utf-8")
-    if request.GET.get("download"):
+    if request.GET.get("download") == "1":
         response["Content-Disposition"] = (
             f'attachment; filename="{_final_xml_name(opinion)}"'
         )
