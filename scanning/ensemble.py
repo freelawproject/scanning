@@ -84,6 +84,17 @@ boxes lists as blockquotes (#211), so a run that
 :data:`LIST_READERS` engines read as a list is the ``BLOCKQUOTE_LIST``
 card, which warns and changes nothing.
 
+**A seventh step, the list (#428).** The OCR glue takes the bullet off
+every list item and writes one ``li`` mark per item, because the
+engines agree on the words and not on the glyph (``*``, ``•``, a
+``<li>``). The items of a group are a vote (:func:`list_items`): a word
+starts an item when a majority of the engines that read the group
+start one there, and never a union, because dots.mocr labels a
+headnote and a footnote a list item. The list type is the markers
+(:func:`list_type`), and one run of consecutive list groups of a page
+is one ``ul`` or ``ol`` mark over its ``text`` (:func:`list_runs`), the
+rule of the blockquote.
+
 **Three deviations from the prototype.**
 
 - Its constants are pixels of a 1700 by 2200 render. Here they are
@@ -169,7 +180,9 @@ logger = logging.getLogger(__name__)
 #: tell a redaction between two blocks from a column break (#375). 10
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
-SCHEMA_VERSION = 10
+#: 11 gives a list item group its ``li`` marks and its ``list`` type,
+#: and the page its list runs (``lists``, #428).
+SCHEMA_VERSION = 11
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -339,8 +352,12 @@ _SAME_CHARACTER = str.maketrans(
 
 #: The markdown marks a comparison drops: a heading, an emphasis, a
 #: code span. One engine writes ``## FACTS`` where the other writes
-#: ``### FACTS``, and both read the same words.
-_MARKUP = re.compile(r"[*_`~#]+")
+#: ``### FACTS``, and both read the same words. A bullet glyph too
+#: (#428): dots.mocr writes ``*`` where Mistral and Surya write ``•``.
+#: The parse takes the bullet off a list item, and this fold covers a
+#: document written before it. The middle dot is not here: an old
+#: print sets a decimal point with it.
+_MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 
 #: A run of two periods or more, and a run of spaced periods: one
 #: engine writes ``....`` where the other writes ``. . . .``.
@@ -756,24 +773,119 @@ def _table_of(engines: dict[str, dict], names: list[str]) -> list | None:
     return None
 
 
+def list_items(
+    text: str, readings: list[tuple[str, list[dict]]], quorum: int
+) -> list[dict]:
+    """Return the ``li`` marks of a group's text: a vote (#428).
+
+    A word of ``text`` starts an item when ``quorum`` of the readings
+    start an item at the word :func:`_aligned` pairs with it. A vote
+    and not a union: dots.mocr labels a headnote (``[2] An accused``)
+    and a footnote (``1. Among the posts``) a list item, and a union
+    would cut a paragraph into items no print has. The text before the
+    first item is no item: it goes on with an item above it.
+
+    :param text: The group's text, the one the marks are over.
+    :param readings: ``[(an engine's text, its marks)]`` for every
+        engine that read the group.
+    :param quorum: How many readings must start an item at one word.
+    :returns: The marks over ``text``, ``{start, end, kind}``.
+    :rtype: list[dict]
+    """
+    spans = word_spans(text)
+    if not spans:
+        return []
+    keys = [compare_word(text[start:end]) for start, end in spans]
+    votes: Counter = Counter()
+    for other_text, other_marks in readings:
+        starts = {
+            mark["start"]
+            for mark in other_marks or []
+            if mark["kind"] == markup.ITEM
+        }
+        if not starts:
+            continue
+        other_spans = word_spans(other_text)
+        opens = {
+            index
+            for index, (start, _) in enumerate(other_spans)
+            if start in starts
+        }
+        other_keys = [compare_word(other_text[a:b]) for a, b in other_spans]
+        for here, there in _aligned(keys, other_keys).items():
+            if there in opens:
+                votes[here] += 1
+    starts = [spans[i][0] for i in sorted(votes) if votes[i] >= quorum]
+    return [mark.as_dict() for mark in markup.item_marks(text, starts)]
+
+
+def list_type(text: str, items: list[dict]) -> str | None:
+    """Return the type of the list a group's items make (#428).
+
+    A numbered list when every item starts with an enumerator
+    (``(1)``, ``a.``, ``iv.``), else a bullet list: the parse took the
+    bullets off and kept the numbers. None when the group starts no
+    item: it goes on with the item of a group above.
+
+    :param text: The group's text.
+    :param items: Its ``li`` marks.
+    :returns: :data:`markup.NUMBERED_LIST`, :data:`markup.BULLET_LIST`
+        or None.
+    :rtype: str | None
+    """
+    if not items:
+        return None
+    firsts = [
+        (text[item["start"] : item["end"]].split() or [""])[0]
+        for item in items
+    ]
+    if all(markup.ENUMERATOR.match(word) for word in firsts):
+        return markup.NUMBERED_LIST
+    return markup.BULLET_LIST
+
+
+def _with_items(
+    text: str,
+    marks: list[dict],
+    readings: list[tuple[str, list[dict]]],
+    quorum,
+) -> tuple[list[dict], str | None]:
+    """Return the marks of a list item group with its ``li`` marks in
+    them, and its list type."""
+    items = list_items(text, readings, quorum)
+    ordered = sorted(
+        items + marks,
+        key=lambda mark: (mark["start"], markup.sort_key(mark["kind"])),
+    )
+    return ordered, list_type(text, items)
+
+
 def _formatting(
     text: str, engines: dict[str, dict], present: list[str], source: str
 ) -> dict:
-    """Return the ``marks``, ``kind`` and ``table`` of one read.
+    """Return the ``marks``, ``kind``, ``list`` and ``table`` of one
+    read.
 
     The rows are the source's when it read a table, else the first
     engine's in rank order that did: the reader sees the rows alone.
+    The items of a list item are a majority of the engines that read
+    it (:func:`list_items`), the rule of :func:`group_kind`.
     """
     kind = group_kind(engines, present)
+    readings = [
+        (engines[name]["text"], engines[name].get("marks") or [])
+        for name in present
+    ]
+    marks = union_marks(text, readings)
+    kind_of_list = None
+    if kind == markup.LIST_ITEM:
+        marks, kind_of_list = _with_items(
+            text, marks, readings, len(present) // 2 + 1
+        )
     return {
-        "marks": union_marks(
-            text,
-            [
-                (engines[name]["text"], engines[name].get("marks") or [])
-                for name in present
-            ],
-        ),
+        "marks": marks,
         "kind": kind,
+        "list": kind_of_list,
         "table": (
             _table_of(engines, [source, *present])
             if kind == markup.TABLE
@@ -1563,6 +1675,98 @@ def blockquote_runs(groups: list[dict]) -> list[dict]:
     return runs
 
 
+def list_runs(groups: list[dict]) -> list[dict]:
+    """Return the lists of one page, one per run of list groups (#428).
+
+    A run is the list item groups of the body that follow each other in
+    reading order, the rule of :func:`blockquote_runs`: a group of
+    another kind ends it, and so does a dropped one, unless the drop is
+    a list item too (a redacted item). A change of the blockquote flag
+    ends it, so a list never crosses the edge of a quote, and so does a
+    change of type. A group a curator quoted in part (``quote_span``,
+    #419) is in no run and ends the one before it: its quote opens
+    inside the group, and a list over it would close inside the quote.
+    A group that starts no item (``list`` None) goes on with the run it
+    follows, and a run in which no group starts an item is no list:
+    with two engines, dots.mocr's ``List-item`` on a headnote wins the
+    kind on the tie and starts no item. The footnotes hold no list:
+    :func:`build_page` takes the items off every group outside a run.
+
+    :param groups: The groups of one page, in reading order, with a
+        ``{"dropped": True, "section", "blockquote", "kind"}`` entry in
+        the place of each dropped group.
+    :returns: ``[{start, end, type, groups}]``, the offsets of the
+        page's ``text``.
+    :rtype: list[dict]
+    """
+    runs: list[dict] = []
+    open_run = None
+    for group in groups:
+        if (
+            (group.get("section") or BODY) != BODY
+            or group.get("kind") != markup.LIST_ITEM
+            or (
+                group.get("quote_span") is not None
+                and not group.get("dropped")
+            )
+        ):
+            open_run = None
+            continue
+        quoted_here = bool(group.get("blockquote"))
+        if open_run is not None and open_run["quoted"] != quoted_here:
+            open_run = None
+        if group.get("dropped"):
+            continue
+        kind = group.get("list")
+        if (
+            open_run is not None
+            and kind
+            and open_run["type"]
+            not in (
+                None,
+                kind,
+            )
+        ):
+            open_run = None
+        if open_run is None:
+            open_run = {
+                "start": group["start"],
+                "end": group["end"],
+                "type": kind,
+                "groups": [],
+                "quoted": quoted_here,
+            }
+            runs.append(open_run)
+        open_run["end"] = group["end"]
+        open_run["groups"].append(group["id"])
+        open_run["type"] = open_run["type"] or kind
+    kept = []
+    for run in runs:
+        if run["type"] is None:
+            # No group of the run starts an item: no list.
+            continue
+        del run["quoted"]
+        kept.append(run)
+    return kept
+
+
+def _outside_lists(groups: list[dict], runs: list[dict]) -> None:
+    """Take the items off every group no list run holds (#428).
+
+    A footnote, a part-quoted group and a group of a run with no item
+    would otherwise carry ``li`` marks with no ``ul`` or ``ol`` around
+    them, in ``OpinionText.marks`` and in the approved text alike.
+    """
+    held = {gid for run in runs for gid in run["groups"]}
+    for group in groups:
+        if group["id"] in held:
+            continue
+        group["list"] = None
+        group["marks"] = [
+            mark for mark in group["marks"] if mark["kind"] != markup.ITEM
+        ]
+
+
 def _zones_of(pages: dict[str, dict], name: str) -> list[list[float]]:
     """Return one kind of zone of one page, off the first engine page
     that carries it.
@@ -1860,6 +2064,7 @@ def resolve(group: dict) -> dict:
             "n_low_confidence": 0,
             "marks": [],
             "kind": markup.PARAGRAPH,
+            "list": None,
             "table": None,
         }
 
@@ -2018,6 +2223,7 @@ def _counts() -> dict:
         "footnote_doubt": 0,
         "blockquotes": 0,
         "blockquote_lists": 0,
+        "lists": 0,
         "unresolved_edits": 0,
     }
 
@@ -2145,6 +2351,13 @@ def _human_read(read_back: dict, edit: dict) -> dict:
     """
     text = edit["text"]
     kind = read_back["kind"]
+    readings = [(read_back["text"], read_back.get("marks") or [])]
+    marks = union_marks(text, readings)
+    kind_of_list = None
+    if kind == markup.LIST_ITEM:
+        # The items carry like the marks: a word the curator kept
+        # still starts its item (#428).
+        marks, kind_of_list = _with_items(text, marks, readings, 1)
     return {
         **read_back,
         "agreement": HUMAN,
@@ -2154,10 +2367,9 @@ def _human_read(read_back: dict, edit: dict) -> dict:
         "text": text,
         "tokens": [],
         "n_low_confidence": 0,
-        "marks": union_marks(
-            text, [(read_back["text"], read_back.get("marks") or [])]
-        ),
+        "marks": marks,
         "kind": markup.PARAGRAPH if kind == markup.TABLE else kind,
+        "list": kind_of_list,
         "table": None,
     }
 
@@ -2393,6 +2605,7 @@ def build_page(
                     "dropped": True,
                     "section": group["section"],
                     "blockquote": group["_zone_blockquote"],
+                    "kind": read_back["kind"],
                 }
             )
             entry["dropped"].append(
@@ -2492,6 +2705,7 @@ def build_page(
                 # this group's own ``text``, the convention of
                 # ``start`` and ``end`` over the page's.
                 "kind": read_back["kind"],
+                "list": read_back["list"],
                 "marks": read_back["marks"],
                 "engines": {
                     name: {
@@ -2529,6 +2743,9 @@ def build_page(
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
     entry["counts"]["blockquotes"] = len(entry["blockquotes"])
+    entry["lists"] = list_runs(sequence)
+    _outside_lists(entry["groups"], entry["lists"])
+    entry["counts"]["lists"] = len(entry["lists"])
     entry["counts"]["blockquote_lists"] = sum(
         1 for run in entry["blockquotes"] if run["list_groups"]
     )
@@ -2914,10 +3131,11 @@ def _marks(page: dict) -> list[dict]:
     Each group's marks plus the group's ``start``; ``section`` names
     the field the offsets point into, as a ``disagreements`` entry
     does (#399, #404). One ``blockquote`` mark per run of
-    :func:`blockquote_runs`, over the body text (#411). The body marks
-    come first, in the order of ``start``, and a block mark before an
-    inline mark that starts with it, the order :func:`markup.serialize`
-    nests them in.
+    :func:`blockquote_runs`, over the body text (#411), and one ``ul``
+    or ``ol`` mark per run of :func:`list_runs` (#428). The body marks
+    come first, in the order of ``start``, and the block marks that
+    start together outermost first and before an inline mark, the
+    order :func:`markup.serialize` nests them in.
 
     :param page: One page of the document.
     :returns: ``[{start, end, kind, section}]``.
@@ -2941,15 +3159,28 @@ def _marks(page: dict) -> list[dict]:
             "section": BODY,
         }
         for run in page.get("blockquotes") or []
+    ] + [
+        {
+            "start": run["start"],
+            "end": run["end"],
+            "kind": run["type"],
+            "section": BODY,
+        }
+        for run in page.get("lists") or []
     ]
     # A stable sort: the inline marks that start together keep the
-    # order the group wrote them in.
+    # order the group wrote them in, and the block marks go outermost
+    # first.
     return sorted(
         blocks + inline,
         key=lambda mark: (
             mark["section"] != BODY,
             mark["start"],
-            mark["kind"] not in markup.BLOCK_MARKS,
+            (
+                markup.BLOCK_MARKS.index(mark["kind"])
+                if mark["kind"] in markup.BLOCK_MARKS
+                else len(markup.BLOCK_MARKS)
+            ),
         ),
     )
 

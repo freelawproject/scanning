@@ -23,7 +23,9 @@ paragraph when all four are true:
    same blockquote flag. A group a curator quoted in part
    (``quote_span``, #419) is its parts: the text before the span, the
    span, and the text after, each a paragraph of its own with its own
-   flag, and only the first part can join the group above it.
+   flag, and only the first part can join the group above it. A list
+   item group that starts an item at its first word starts a block
+   (#428): it is the next item, not the rest of the one above.
 4. The text says the sentence goes on (:func:`continues`).
 
 A column that ends at the end of a sentence, with a capital letter at
@@ -67,7 +69,12 @@ COLUMN = "column"
 PAGE = "page"
 
 #: The kinds of block that join (condition 3).
-JOINABLE_KINDS = frozenset({"paragraph", "list_item"})
+LIST_ITEM = "list_item"
+JOINABLE_KINDS = frozenset({"paragraph", LIST_ITEM})
+
+#: The mark of one list item (``markup.ITEM``, #428), spelled here to
+#: keep this module free of imports; ``test_paragraphs`` pins it.
+ITEM = "li"
 
 #: The band of the body, and the two bands of the page furniture.
 BODY_BAND = "body"
@@ -215,9 +222,19 @@ def _joins(before: dict | None, after: dict) -> str | None:
         return None
     if bool(above.get("blockquote")) != bool(below.get("blockquote")):
         return None
+    if kind == LIST_ITEM and _starts_item(below):
+        return None
     if not continues(_before_mark(above), below.get("text") or ""):
         return None
     return edge
+
+
+def _starts_item(group: dict) -> bool:
+    """Return whether a group starts a list item at its first word."""
+    return any(
+        mark.get("kind") == ITEM and mark["start"] == 0
+        for mark in group.get("marks") or []
+    )
 
 
 def _before_mark(group: dict) -> str:
@@ -258,6 +275,8 @@ def _paragraph(item: dict, text: str | None = None, marks=None) -> dict:
     }
     if group.get("table") is not None:
         paragraph["table"] = group["table"]
+    if paragraph["kind"] == LIST_ITEM:
+        paragraph["list"] = group.get("list")
     return paragraph
 
 
@@ -270,6 +289,8 @@ def _append(paragraph: dict, item: dict, edge: str) -> None:
         {**mark, "start": mark["start"] + offset, "end": mark["end"] + offset}
         for mark in group.get("marks") or []
     )
+    if paragraph["kind"] == LIST_ITEM:
+        _go_on_with_item(paragraph, group, offset)
     paragraph["joins"].append({"offset": offset, "at": edge})
     if item["page"] != paragraph["pages"][-1]:
         paragraph["pages"].append(item["page"])
@@ -330,6 +351,32 @@ def _quote_parts(item: dict) -> list[dict]:
             }
         )
     return parts
+
+
+def _go_on_with_item(paragraph: dict, group: dict, offset: int) -> None:
+    """Stretch the last item of a paragraph over the words of a joined
+    group that start no item (#428): a column cut the item in two.
+
+    :param paragraph: The paragraph, with the group's text and marks in
+        it already.
+    :param group: The joined group.
+    :param offset: Where the group's text starts in the paragraph.
+    """
+    text = group.get("text") or ""
+    starts = [
+        mark["start"]
+        for mark in group.get("marks") or []
+        if mark.get("kind") == ITEM
+    ]
+    lead = text[: min(starts)] if starts else text
+    items = [
+        mark
+        for mark in paragraph["marks"]
+        if mark.get("kind") == ITEM and mark["start"] < offset
+    ]
+    if items and lead.strip():
+        items[-1]["end"] = offset + len(lead.rstrip())
+    paragraph["list"] = paragraph.get("list") or group.get("list")
 
 
 def body(document: dict) -> list[dict]:

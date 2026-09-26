@@ -29,7 +29,7 @@ from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from scanning import ensemble, opinion_ocr, opinion_pdf, views_process
+from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
     Issue,
@@ -3715,3 +3715,281 @@ class TestTheBracketDrop(TestCase):
         self.assertFalse(page["dropped"][0]["bracket"])
         self.assertEqual(page["counts"]["partial"], 1)
         self.assertEqual(page["counts"]["partial_bracket"], 0)
+
+
+# ── the lists (#428) ─────────────────────────────────────────────────
+#: The list of scan 1843's predicate offenses, as each engine wrote it:
+#: the same words, three bullets.
+OFFENSES = (
+    "A 1996 conviction for possession, a class 3 felony;",
+    "a 1997 conviction for possession, a class 4 felony; and",
+    "a 1999 conviction for possession, a class 4 felony.",
+)
+
+
+def list_unit(engine, index, box, parsed: markup.Parsed) -> dict:
+    """One engine's unit of a page, from the parse of its dialect."""
+    return unit(
+        engine,
+        index,
+        box,
+        parsed.text,
+        marks=[mark.as_dict() for mark in parsed.marks],
+        kind=parsed.kind,
+    )
+
+
+def offenses_group() -> dict:
+    dots = markup.parse_markdown(
+        "\n".join(f"* {line}" for line in OFFENSES), kind=markup.LIST_ITEM
+    )
+    mistral = markup.parse_markdown("\n".join(f"•{line}" for line in OFFENSES))
+    surya = markup.parse_html(
+        "<p>" + "<br/>".join(f"• {line}" for line in OFFENSES) + "</p>",
+        kind=markup.LIST_ITEM,
+    )
+    return group_of(
+        list_unit("dots_mocr", 0, BODY_A_PT, dots),
+        list_unit("mistral_ocr", 0, BODY_A_PT, mistral),
+        list_unit("surya", 0, BODY_A_PT, surya),
+    )
+
+
+def items_of(answer: dict) -> list[str]:
+    return [
+        answer["text"][mark["start"] : mark["end"]]
+        for mark in answer["marks"]
+        if mark["kind"] == markup.ITEM
+    ]
+
+
+class TestTheList(TestCase):
+    """The items of a list are a vote, and the bullet is no word."""
+
+    def test_the_three_engines_read_one_list_alike(self):
+        answer = ensemble.resolve(offenses_group())
+
+        # The bullets were the only difference, and the parse took them
+        # off: every engine reads the same text.
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["kind"], markup.LIST_ITEM)
+        self.assertEqual(answer["list"], markup.BULLET_LIST)
+        self.assertEqual(items_of(answer), list(OFFENSES))
+
+    def test_the_fold_reads_a_bullet_as_no_word(self):
+        # A document of the glue before #428 still holds the glyphs.
+        self.assertEqual(
+            ensemble.compare_text("•A 1996 conviction; • a 1997"),
+            ensemble.compare_text("* A 1996 conviction; * a 1997"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("a rate of 3·5"), "a rate of 3·5"
+        )
+
+    def test_one_engine_alone_starts_no_item(self):
+        # dots.mocr labels a headnote a list item; the others read a
+        # paragraph, and a union would cut it.
+        dots = markup.parse_markdown(
+            "(1) the court held that the text", kind=markup.LIST_ITEM
+        )
+        plain = markup.parse_markdown("(1) the court held that the text")
+        answer = ensemble.resolve(
+            group_of(
+                list_unit("dots_mocr", 0, BODY_A_PT, dots),
+                list_unit("mistral_ocr", 0, BODY_A_PT, plain),
+                list_unit("surya", 0, BODY_A_PT, plain),
+            )
+        )
+
+        self.assertEqual(answer["kind"], markup.PARAGRAPH)
+        self.assertEqual(items_of(answer), [])
+        self.assertIsNone(answer["list"])
+
+    def test_an_item_start_is_a_majority(self):
+        # Two engines cut the list in two items, one reads one item.
+        two = markup.parse_markdown(
+            "- (a) the insured; and\n- (b) any other person",
+            kind=markup.LIST_ITEM,
+        )
+        one = markup.parse_markdown(
+            "(a) the insured; and (b) any other person",
+            kind=markup.LIST_ITEM,
+        )
+        answer = ensemble.resolve(
+            group_of(
+                list_unit("dots_mocr", 0, BODY_A_PT, one),
+                list_unit("mistral_ocr", 0, BODY_A_PT, two),
+                list_unit("surya", 0, BODY_A_PT, two),
+            )
+        )
+
+        self.assertEqual(
+            items_of(answer), ["(a) the insured; and", "(b) any other person"]
+        )
+        # The print numbers the items, so the list is a numbered one.
+        self.assertEqual(answer["list"], markup.NUMBERED_LIST)
+
+    def test_a_group_that_goes_on_with_an_item_starts_none(self):
+        rest = markup.parse_markdown(
+            "grams or less of a schedule II substance", kind=markup.LIST_ITEM
+        )
+        answer = ensemble.resolve(
+            group_of(
+                list_unit("dots_mocr", 0, BODY_A_PT, rest),
+                list_unit("mistral_ocr", 0, BODY_A_PT, rest),
+            )
+        )
+
+        self.assertEqual(answer["kind"], markup.LIST_ITEM)
+        self.assertEqual(items_of(answer), [])
+        self.assertIsNone(answer["list"])
+
+    def test_a_curator_s_text_keeps_the_items_of_its_words(self):
+        answer = ensemble.resolve(offenses_group())
+        text = answer["text"].replace("possession", "the possession")
+
+        read = ensemble._human_read(answer, {"text": text})
+
+        self.assertEqual(read["list"], markup.BULLET_LIST)
+        self.assertEqual(
+            [text[m["start"] : m["end"]] for m in read["marks"]],
+            [
+                line.replace("possession", "the possession")
+                for line in OFFENSES
+            ],
+        )
+
+
+def list_entry(group_id, kind="list_item", list_type=None, **values) -> dict:
+    """A group of a page for :func:`ensemble.list_runs`."""
+    start = group_id * 10
+    return {
+        "id": group_id,
+        "section": ensemble.BODY,
+        "kind": kind,
+        "list": list_type,
+        "start": start,
+        "end": start + 8,
+        **values,
+    }
+
+
+class TestTheListRuns(TestCase):
+    """One run of list groups of a page is one list."""
+
+    def test_the_groups_that_follow_each_other_are_one_list(self):
+        runs = ensemble.list_runs(
+            [
+                list_entry(0, kind="paragraph"),
+                list_entry(1, list_type="ul"),
+                # A column cut the second item: it starts no item.
+                list_entry(2),
+                list_entry(3, list_type="ul"),
+                list_entry(4, kind="paragraph"),
+                list_entry(5, list_type="ol"),
+            ]
+        )
+
+        self.assertEqual(
+            runs,
+            [
+                {"start": 10, "end": 38, "type": "ul", "groups": [1, 2, 3]},
+                {"start": 50, "end": 58, "type": "ol", "groups": [5]},
+            ],
+        )
+
+    def test_a_redacted_item_goes_on_and_a_quote_edge_ends(self):
+        runs = ensemble.list_runs(
+            [
+                list_entry(0, list_type="ul"),
+                {
+                    "dropped": True,
+                    "section": ensemble.BODY,
+                    "kind": "list_item",
+                },
+                list_entry(1, list_type="ul"),
+                list_entry(2, list_type="ul", blockquote=True),
+                list_entry(3, list_type="ol", blockquote=True),
+                list_entry(4, section=ensemble.FOOTNOTES, list_type="ul"),
+            ]
+        )
+
+        self.assertEqual([run["groups"] for run in runs], [[0, 1], [2], [3]])
+
+    def test_the_page_holds_its_list_as_marks(self):
+        units = []
+        for index, line in enumerate(OFFENSES):
+            box = (LEFT_X[0], 100 + 100 * index, LEFT_X[1], 180 + 100 * index)
+            parsed = markup.parse_markdown(f"- {line}")
+            units.append(list_unit("dots_mocr", index, box, parsed))
+            units.append(list_unit("mistral_ocr", index, box, parsed))
+
+        entry = build(units)
+
+        self.assertEqual(
+            [group["list"] for group in entry["groups"]], ["ul"] * 3
+        )
+        self.assertEqual(len(entry["lists"]), 1)
+        marks = ensemble._marks(entry)
+        self.assertEqual(
+            [mark["kind"] for mark in marks], ["ul", "li", "li", "li"]
+        )
+        self.assertEqual(
+            markup.serialize(
+                markup.Parsed(
+                    text=entry["text"],
+                    marks=[
+                        markup.Mark(m["start"], m["end"], m["kind"])
+                        for m in marks
+                    ],
+                )
+            ),
+            "<ul>"
+            + "\n\n".join(f"<li>{line}</li>" for line in OFFENSES)
+            + "</ul>",
+        )
+
+
+class TestTheListsTheReviewFound(TestCase):
+    """A list mark always holds an item, and an item a list (#428)."""
+
+    def test_a_run_that_starts_no_item_is_no_list(self):
+        # Two engines tie on a headnote: dots.mocr's label wins the kind
+        # and nobody starts an item.
+        self.assertEqual(
+            ensemble.list_runs([list_entry(0), list_entry(1)]), []
+        )
+
+    def test_a_part_quoted_group_ends_the_list(self):
+        runs = ensemble.list_runs(
+            [
+                list_entry(0, list_type="ul"),
+                list_entry(1, list_type="ul", quote_span=[0, 4]),
+                list_entry(2, list_type="ul"),
+            ]
+        )
+
+        self.assertEqual([run["groups"] for run in runs], [[0], [2]])
+
+    def test_a_footnote_list_item_loses_its_items(self):
+        units = []
+        for engine in ("dots_mocr", "mistral_ocr"):
+            parsed = markup.parse_markdown(
+                "1. Among the posts by Citizens", kind=markup.LIST_ITEM
+            )
+            units.append(
+                list_unit(engine, 0, (LEFT_X[0], 600, LEFT_X[1], 700), parsed)
+            )
+
+        entry = build(units, zones=[FOOT_ZONE])
+
+        (group,) = entry["groups"]
+        self.assertEqual(group["section"], ensemble.FOOTNOTES)
+        self.assertEqual(entry["lists"], [])
+        self.assertIsNone(group["list"])
+        self.assertNotIn(
+            markup.ITEM, [mark["kind"] for mark in group["marks"]]
+        )
+        self.assertNotIn(
+            markup.ITEM, [mark["kind"] for mark in ensemble._marks(entry)]
+        )

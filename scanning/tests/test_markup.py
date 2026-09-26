@@ -70,7 +70,10 @@ class TestParseMarkdown(SimpleTestCase):
             "1. The first item", kind=markup.LIST_ITEM
         )
         self.assertEqual(parsed.kind, markup.LIST_ITEM)
+        # The number is a word of the item, and the item mark covers it
+        # (#428).
         self.assertEqual(parsed.text, "1. The first item")
+        self.assertEqual(marked(parsed), [(markup.ITEM, "1. The first item")])
 
     def test_a_markdown_escape_is_the_character(self):
         parsed = markup.parse_markdown(
@@ -92,19 +95,18 @@ class TestParseMarkdown(SimpleTestCase):
         self.assertEqual(parsed.kind, markup.HEADING)
 
     def test_a_bullet_is_a_list_item_and_an_asterism_is_text(self):
+        parsed = markup.parse_markdown("- a fact the jury could consider")
+        self.assertEqual(parsed.kind, markup.LIST_ITEM)
+        self.assertEqual(parsed.text, "a fact the jury could consider")
+        # A ``* `` with no list label is a footnote symbol (#428).
+        parsed = markup.parse_markdown("* The syllabus constitutes no part")
         self.assertEqual(
-            markup.parse_markdown("- a fact the jury could consider").kind,
-            markup.LIST_ITEM,
+            (parsed.kind, parsed.text),
+            (markup.PARAGRAPH, "* The syllabus constitutes no part"),
         )
-        self.assertEqual(
-            markup.parse_markdown("* The syllabus constitutes no part").kind,
-            markup.LIST_ITEM,
-        )
-        asterism = markup.parse_markdown("* * *")
-        self.assertEqual(
-            (asterism.kind, asterism.text), (markup.PARAGRAPH, "* * *")
-        )
-        self.assertEqual(asterism.marks, [])
+        asterism = markup.parse_markdown("* * *", kind=markup.LIST_ITEM)
+        self.assertEqual(asterism.text, "* * *")
+        self.assertEqual(marked(asterism), [])
 
     def test_the_engine_s_label_names_the_kind_before_the_line_shape(self):
         # A ``Section-header`` that reads like a list item is a heading.
@@ -360,9 +362,11 @@ class TestTheOffsets(SimpleTestCase):
                 rng.choice(words) for _ in range(rng.randint(1, 8))
             )
             spans = markup.marks_of(self._random_flags(rng, text))
-            parsed = Parsed(
-                text=text, marks=spans, kind=rng.choice(markup.BLOCK_KINDS[:3])
-            )
+            kind = rng.choice(markup.BLOCK_KINDS[:3])
+            if kind == markup.LIST_ITEM:
+                # A list item is its ``li`` mark (#428).
+                spans = [Mark(0, len(text), markup.ITEM), *spans]
+            parsed = Parsed(text=text, marks=spans, kind=kind)
             with self.subTest(text=text, marks=spans):
                 again = markup.parse_html(markup.serialize(parsed))
                 self.assertEqual(again, parsed)
@@ -511,3 +515,165 @@ class TestTheTableLabel(SimpleTestCase):
             "<table><tr><td>a</td></tr></table>", kind=markup.TABLE
         )
         self.assertEqual((parsed.kind, parsed.table), (markup.TABLE, [["a"]]))
+
+
+class TestListItems(SimpleTestCase):
+    """The items of a list (#428): the bullet goes, the number stays."""
+
+    def items(self, parsed):
+        return [
+            parsed.text[m.start : m.end]
+            for m in parsed.marks
+            if m.kind == markup.ITEM
+        ]
+
+    def test_three_bullets_of_one_unit_are_three_items(self):
+        # The three readings of scan 1843's list of predicate offenses:
+        # the words agree, the bullets do not.
+        readings = [
+            (
+                "* A 1996 conviction, a class 3 felony;\n"
+                "* a 1997 conviction, a class 4 felony; and\n"
+                "* a 1999 conviction, a class 4 felony.",
+                markup.LIST_ITEM,
+            ),
+            (
+                "•A 1996 conviction, a class 3 felony;\n"
+                "•a 1997 conviction, a class 4 felony; and\n"
+                "• a 1999 conviction, a class 4 felony.",
+                None,
+            ),
+        ]
+        for text, kind in readings:
+            with self.subTest(text=text):
+                parsed = markup.parse_markdown(text, kind=kind)
+                self.assertEqual(parsed.kind, markup.LIST_ITEM)
+                self.assertEqual(
+                    parsed.text,
+                    "A 1996 conviction, a class 3 felony;\n"
+                    "a 1997 conviction, a class 4 felony; and\n"
+                    "a 1999 conviction, a class 4 felony.",
+                )
+                self.assertEqual(
+                    self.items(parsed),
+                    [
+                        "A 1996 conviction, a class 3 felony;",
+                        "a 1997 conviction, a class 4 felony; and",
+                        "a 1999 conviction, a class 4 felony.",
+                    ],
+                )
+
+    def test_surya_s_bullets_and_its_li_tags_are_items(self):
+        parsed = markup.parse_html(
+            "<p>• A 1996 conviction;<br/>&bull; a 1997 <i>conviction</i></p>"
+        )
+        self.assertEqual(
+            self.items(parsed), ["A 1996 conviction;", "a 1997 conviction"]
+        )
+        self.assertEqual(marked(parsed)[-1], (EM, "conviction"))
+        parsed = markup.parse_html(
+            '<ol style="list-style-type: none;">\n<li>(1) knowing</li>\n'
+            "<li>(2) causing</li>\n</ol>"
+        )
+        self.assertEqual(self.items(parsed), ["(1) knowing", "(2) causing"])
+
+    def test_mistral_s_dash_before_the_print_s_letter(self):
+        parsed = markup.parse_markdown(
+            "- (a) the named insured;\n- (b) any other person",
+            kind=markup.LIST_ITEM,
+        )
+        self.assertEqual(
+            self.items(parsed),
+            ["(a) the named insured;", "(b) any other person"],
+        )
+
+    def test_a_list_item_with_no_marker_goes_on_from_above(self):
+        # The second half of an item a column cut: the label says list,
+        # but no word of it starts an item.
+        parsed = markup.parse_markdown(
+            "grams or less of a schedule II substance", kind=markup.LIST_ITEM
+        )
+        self.assertEqual(parsed.kind, markup.LIST_ITEM)
+        self.assertEqual(self.items(parsed), [])
+
+    def test_an_enumerator_starts_an_item_at_the_start_of_the_unit_only(self):
+        parsed = markup.parse_markdown(
+            "(1) the court held in Smith\nv. Jones that", kind=markup.LIST_ITEM
+        )
+        self.assertEqual(
+            self.items(parsed), ["(1) the court held in Smith\nv. Jones that"]
+        )
+        # A headnote number is no enumerator.
+        parsed = markup.parse_markdown(
+            "[2] An accused is entitled", kind=markup.LIST_ITEM
+        )
+        self.assertEqual(self.items(parsed), [])
+
+    def test_a_middle_dot_inside_a_line_is_text(self):
+        parsed = markup.parse_markdown("a rate of 3·5 per cent")
+        self.assertEqual(parsed.kind, markup.PARAGRAPH)
+        self.assertEqual(parsed.text, "a rate of 3·5 per cent")
+
+    def test_a_star_under_a_list_label_is_a_bullet(self):
+        parsed = markup.parse_markdown(
+            "* whether a sexual assault is incident to service",
+            kind=markup.LIST_ITEM,
+        )
+        self.assertEqual(
+            self.items(parsed),
+            ["whether a sexual assault is incident to service"],
+        )
+
+    def test_serialize_writes_the_list_marks_outermost_first(self):
+        text = "A 1996 conviction; a 1997 conviction"
+        parsed = Parsed(
+            text=text,
+            marks=[
+                Mark(0, 18, markup.ITEM),
+                Mark(0, len(text), markup.BULLET_LIST),
+                Mark(0, len(text), markup.BLOCKQUOTE),
+                Mark(19, len(text), markup.ITEM),
+                Mark(26, len(text), EM),
+            ],
+        )
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<blockquote><ul><li>A 1996 conviction;</li> "
+            "<li>a 1997 <em>conviction</em></li></ul></blockquote>",
+        )
+
+
+class TestTheReviewOfTheListParse(SimpleTestCase):
+    """The shapes the review of PR #429 found (#428)."""
+
+    def items(self, parsed):
+        return [
+            parsed.text[m.start : m.end]
+            for m in parsed.marks
+            if m.kind == markup.ITEM
+        ]
+
+    def test_a_bullet_before_an_italic_is_a_bullet(self):
+        parsed = markup.parse_markdown(
+            "* *Smith v. Jones*\n* *Doe v. Roe*", kind=markup.LIST_ITEM
+        )
+        self.assertEqual(parsed.text, "Smith v. Jones\nDoe v. Roe")
+        self.assertEqual(self.items(parsed), ["Smith v. Jones", "Doe v. Roe"])
+        # Two italics beside each other are one mark (#404), but not
+        # across the edge of an item.
+        self.assertEqual(
+            markup.serialize(parsed),
+            "<li><em>Smith v. Jones</em></li>\n<li><em>Doe v. Roe</em></li>",
+        )
+
+    def test_a_dash_inside_an_unlabelled_unit_is_text(self):
+        parsed = markup.parse_markdown(
+            "the fine was\n- in the court's view - too low"
+        )
+        self.assertEqual(parsed.kind, markup.PARAGRAPH)
+        self.assertEqual(self.items(parsed), [])
+
+    def test_a_bullet_of_a_heading_goes_and_starts_no_item(self):
+        parsed = markup.parse_html("<h2>• Title</h2>")
+        self.assertEqual((parsed.kind, parsed.text), (markup.HEADING, "Title"))
+        self.assertEqual(parsed.marks, [])

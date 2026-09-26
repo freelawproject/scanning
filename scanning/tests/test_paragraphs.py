@@ -12,7 +12,7 @@ import pathlib
 
 from django.test import TestCase
 
-from scanning import ensemble, paragraphs
+from scanning import ensemble, markup, paragraphs
 
 
 def group(
@@ -598,3 +598,81 @@ class TestTheModuleIsPure(TestCase):
     def test_the_section_names_are_the_ensembles(self):
         self.assertEqual(paragraphs.BODY_SECTION, ensemble.BODY)
         self.assertEqual(paragraphs.FOOTNOTE_SECTION, ensemble.FOOTNOTES)
+
+    def test_the_list_names_are_the_parse_s(self):
+        self.assertEqual(paragraphs.ITEM, markup.ITEM)
+        self.assertEqual(paragraphs.LIST_ITEM, markup.LIST_ITEM)
+
+
+def item(start, end):
+    return {"start": start, "end": end, "kind": "li"}
+
+
+class TestTheListItems(TestCase):
+    """A list item a column cut goes on; the next item starts (#428)."""
+
+    def test_the_rest_of_an_item_goes_on_with_it(self):
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        "a 1997 conviction for possession of 2",
+                        kind="list_item",
+                        list="ul",
+                        marks=[item(0, 37)],
+                    ),
+                    group(
+                        1,
+                        "grams or less; and a 1999 conviction.",
+                        column="R",
+                        kind="list_item",
+                        marks=[item(19, 37)],
+                    ),
+                ],
+            )
+        )
+
+        (paragraph,) = paragraphs.body(doc)
+
+        self.assertEqual(paragraph["list"], "ul")
+        self.assertEqual(
+            [
+                paragraph["text"][m["start"] : m["end"]]
+                for m in paragraph["marks"]
+            ],
+            [
+                "a 1997 conviction for possession of 2\ngrams or less; and",
+                "a 1999 conviction.",
+            ],
+        )
+
+    def test_a_group_that_starts_an_item_starts_a_paragraph(self):
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        "a 1997 conviction for possession; and",
+                        kind="list_item",
+                        list="ul",
+                        marks=[item(0, 37)],
+                    ),
+                    group(
+                        1,
+                        "a 1999 conviction.",
+                        column="R",
+                        kind="list_item",
+                        list="ul",
+                        marks=[item(0, 18)],
+                    ),
+                ],
+            )
+        )
+
+        self.assertEqual(
+            texts(paragraphs.body(doc)),
+            ["a 1997 conviction for possession; and", "a 1999 conviction."],
+        )

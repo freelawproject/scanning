@@ -1365,10 +1365,23 @@ h3.ensemble-group {
     font-size: 14px;
     font-weight: 600;
 }
-li.ensemble-group {
-    display: list-item;
-    list-style: none;
+div.ensemble-group[data-kind="list_item"] {
     margin-left: 1.2em;
+}
+/* The items of a list (#428): the ``li`` marks of the group. A bullet
+   list draws its bullet here, a numbered list has its numbers in the
+   text, and the rest of an item above has no bullet. */
+.ensemble-item {
+    display: block;
+}
+.ensemble-group[data-list="ul"] .ensemble-item:not(.ensemble-item-rest)::before {
+    content: "\2022";
+    display: inline-block;
+    width: 1.2em;
+    margin-left: -1.2em;
+}
+.ensemble-item-rest {
+    display: block;
 }
 .ensemble-group sup {
     line-height: 0;

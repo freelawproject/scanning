@@ -757,14 +757,70 @@
 
     /**
      * The element a group's kind draws (#404). A table is built from
-     * its rows and holds no text of its own.
+     * its rows and holds no text of its own. A list item is a ``div``:
+     * a group holds one item or several, or the rest of an item above,
+     * and its items are the ``li`` marks (#428, :func:`itemParents`).
      */
     var KIND_ELEMENTS = {
         heading: 'h3',
-        list_item: 'li',
+        list_item: 'div',
         table: 'div',
         paragraph: 'p'
     };
+
+    /**
+     * Put one element per item of a list item group in its node (#428).
+     *
+     * The items are the group's ``li`` marks, which the ensemble voted,
+     * so the viewer finds none of its own. The text before the first
+     * item is the rest of an item above, and it gets an element with
+     * no bullet. A bullet list draws its bullet from the stylesheet
+     * (``data-list``); a numbered list has its numbers in the text.
+     *
+     * @param {HTMLElement} node - The group node.
+     * @param {Object} group - The group entry.
+     * @returns {Object} ``{cuts, parentAt}``: the offsets where the
+     *     text changes element, and the element of one offset.
+     */
+    function itemParents(node, group) {
+        var text = group.text || '';
+        var items = (group.marks || []).filter(function (mark) {
+            return mark.kind === 'li';
+        }).sort(function (a, b) { return a.start - b.start; });
+        if (!items.length) {
+            return {
+                cuts: [0, text.length],
+                parentAt: function () { return node; }
+            };
+        }
+        node.dataset.list = group.list || 'ul';
+        var rest = null;
+        if (items[0].start > 0) {
+            rest = document.createElement('span');
+            rest.className = 'ensemble-item ensemble-item-rest';
+            node.appendChild(rest);
+        }
+        var parents = items.map(function () {
+            var element = document.createElement('span');
+            element.className = 'ensemble-item';
+            node.appendChild(element);
+            return element;
+        });
+        var cuts = [0];
+        items.forEach(function (mark) {
+            if (mark.start > 0) { cuts.push(mark.start); }
+        });
+        cuts.push(text.length);
+        return {
+            cuts: cuts,
+            parentAt: function (offset) {
+                for (var i = items.length - 1; i >= 0; i -= 1) {
+                    if (offset >= items[i].start) { return parents[i]; }
+                }
+                return rest || node;
+            }
+        };
+    }
 
     /**
      * Fill ``parent`` with ``text`` and its marks.
@@ -917,7 +973,18 @@
                 }
             });
         } else {
-            fillText(node, group, 0, (group.text || '').length);
+            // One element per item of a list (#428), each drawn by the
+            // same helper, so a voted item keeps its token marks.
+            var whole = group.text || '';
+            var items = itemParents(node, group);
+            for (var cut = 0; cut + 1 < items.cuts.length; cut += 1) {
+                var from = items.cuts[cut];
+                // The whitespace before the next item is its line
+                // break, which the item element draws.
+                var to = from + whole.slice(from, items.cuts[cut + 1])
+                    .replace(/\s+$/, '').length;
+                fillText(items.parentAt(from), group, from, to);
+            }
         }
         // The note and the badge go after the last words of the group.
         var tail = span && node.lastElementChild

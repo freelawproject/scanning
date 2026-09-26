@@ -2949,9 +2949,11 @@ class OpinionText(AbstractDateTimeModel):
         help_text=(
             "The formatting the engines read (#404): "
             "``{'start': int, 'end': int, 'kind': 'em' | 'strong' | 'sup' "
-            "| 'blockquote', 'section': 'text' | 'footnotes'}``, with the "
-            "offsets against the field ``section`` names. A ``blockquote`` "
-            "mark spans one run of quoted groups of the body (#411). A "
+            "| 'blockquote' | 'ul' | 'ol' | 'li', 'section': 'text' | "
+            "'footnotes'}``, with the offsets against the field ``section`` "
+            "names. A ``blockquote`` mark spans one run of quoted groups of "
+            "the body (#411), a ``ul`` or ``ol`` mark one run of list "
+            "groups, and an ``li`` mark one item of a list (#428). A "
             "cache like ``text``, and of ``text``: an edit of "
             "``human_text`` moves every offset."
         ),
