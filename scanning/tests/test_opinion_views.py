@@ -713,12 +713,13 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "surya.json",
                 "manifest.json",
                 "ensemble.json",
+                "approved.json",
                 "tags.json",
             ],
         )
-        # The tagger's spans are over the approved text, outside the
-        # glue prefix (#272), and blank before a run is placed.
-        for entry in body["files"][:-1]:
+        # The approved text and the tagger's spans over it are outside
+        # the glue prefix (#272, #431), and blank before they exist.
+        for entry in body["files"][:-2]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"
@@ -801,6 +802,32 @@ class TestOpinionFileIndex(ScanningTestCase):
             ),
         )
 
+    def test_the_approved_text_is_listed_once_approved(self):
+        key = "processing/1/jobs/opinions/11.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=key
+        )
+
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertTrue(files["approved.json"]["written"])
+        self.assertEqual(files["approved.json"]["key"], key)
+        self.assertEqual(
+            files["approved.json"]["url"],
+            reverse(
+                "serve_opinion_approved_text",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+
+    def test_an_opinion_never_approved_lists_no_approved_url(self):
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertFalse(files["approved.json"]["written"])
+        self.assertNotIn("url", files["approved.json"])
+
     def test_it_makes_no_s3_call(self):
         """Every fact is on the row, so the index answers anywhere."""
         with patch("scanning.s3_sync.object_exists") as exists:
@@ -808,6 +835,98 @@ class TestOpinionFileIndex(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         exists.assert_not_called()
+
+
+class TestServeOpinionApprovedText(ScanningTestCase):
+    """The route of the approved text of one opinion (#431)."""
+
+    KEY = "processing/1/jobs/opinions/11.0/approved/r0.e0.j1.t1.json"
+
+    def setUp(self):
+        self.client.force_login(self.make_user())
+        self.scan = ScanFactory()
+        self.opinion = OpinionFactory(scan=self.scan, first_printed_page=11)
+        self.enterContext(
+            patch("scanning.s3_sync.s3_active", return_value=True)
+        )
+
+    def url(self, scan=None):
+        return reverse(
+            "serve_opinion_approved_text",
+            kwargs={
+                "pk": (scan or self.scan).pk,
+                "opinion_pk": self.opinion.pk,
+            },
+        )
+
+    def approve(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=self.KEY,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+        )
+
+    def test_an_approved_text_redirects_to_a_presigned_get(self):
+        self.approve()
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://s3/a"
+            ) as presign,
+        ):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://s3/a")
+        key, _ttl = presign.call_args.args
+        self.assertEqual(key, self.KEY)
+        self.assertIn(
+            f"scan-{self.scan.pk}-opinion-11.0-approved.json",
+            presign.call_args.kwargs["content_disposition"],
+        )
+
+    def test_a_reopened_opinion_serves_the_last_approved_text(self):
+        # A reopen keeps the key until the next approval (#375).
+        self.approve()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.s3_sync.presign_get", return_value="https://s3/a"),
+        ):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+
+    def test_an_opinion_never_approved_is_a_404(self):
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_key_the_bucket_does_not_hold_is_a_404(self):
+        self.approve()
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_an_opinion_of_another_scan_is_a_404(self):
+        self.approve()
+
+        response = self.client.get(self.url(scan=ScanFactory()))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_login_is_required(self):
+        self.client.logout()
+
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("s3", response["Location"])
 
 
 class TestTheStepThreeTab(ScanningTestCase):

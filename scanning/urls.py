@@ -100,6 +100,7 @@ from scanning.views_process import (
     serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
+    serve_opinion_approved_text,
     serve_opinion_ocr,
     serve_opinion_pdf,
     serve_opinion_tags,
@@ -331,6 +332,11 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/files/",
         opinion_file_index,
         name="opinion_file_index",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/approved-text/",
+        serve_opinion_approved_text,
+        name="serve_opinion_approved_text",
     ),
     path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/tags/",

@@ -2105,6 +2105,47 @@ def serve_opinion_ocr(
 
 
 @login_required
+def serve_opinion_approved_text(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the approved text of one opinion (#431).
+
+    The output of the text review (#375), the object the tagger reads.
+    A developer's route, so it redirects (#243/#262). A 404 before the
+    first approval, and for an opinion of another scan. A reopen keeps
+    ``approved_text_key`` until the next approval, so after a reopen
+    this is the text of the last approval.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not opinion.approved_text_key:
+        return _json_404(
+            f"The text of {opinion} is not approved.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-approved",
+        opinion.approved_text_key,
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-approved.json"
+        ),
+        missing_message=(
+            f"The text of {opinion} is approved, but "
+            f"{opinion.approved_text_key} is not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
 def serve_opinion_tags(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> HttpResponse:
@@ -2180,6 +2221,11 @@ def opinion_file_index(
     re-glue raises the revision, so this index never names an object of
     an older prefix, although that object stays in the bucket.
 
+    **Two entries are not glues**: the approved text (#375, #431),
+    written once by the approval, and the tagger's spans over it
+    (#272). They are outside the glue prefix, and their ledgers are
+    ``approved_text_key`` and ``tagger.is_written``.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
@@ -2234,8 +2280,22 @@ def opinion_file_index(
                 ),
             }
         )
-    # The tagger's spans (#272), outside the glue prefix: they are over
-    # the approved text, which no re-glue moves.
+    # The approved text (#375, #431) and the tagger's spans over it
+    # (#272), outside the glue prefix: the approval writes the text
+    # once, and no re-glue moves it. A reopen keeps the key until the
+    # next approval, and ``status`` below says the review is open again.
+    files.append(
+        {
+            "name": "approved.json",
+            "output": "opinion-approved",
+            "written": bool(opinion.approved_text_key),
+            "key": opinion.approved_text_key,
+            "url": reverse(
+                "serve_opinion_approved_text",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
     files.append(
         {
             "name": "tags.json",
