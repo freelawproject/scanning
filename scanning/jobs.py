@@ -446,10 +446,11 @@ def _runpod_engines() -> dict[str, RunpodEngine]:
             build_payload=surya.build_payload,
             label="Surya",
         ),
-        # One job per volume, not per shard: the input is a JSON
-        # document the daemon writes (``tagger.ensure_tag_jobs``), and
-        # ``page_count`` on its row counts cases, which is what the
-        # per-page allowance is per.
+        # One job per opinion, not per shard (#272): the input is a
+        # JSON document written from the approved text
+        # (``tagger.ensure_tag_jobs``), and ``page_count`` on its row
+        # is the pages of that opinion, which the per-page allowance
+        # is per.
         JobEngine.CASELAW_TAGGER: RunpodEngine(
             engine=JobEngine.CASELAW_TAGGER,
             stage=JobStage.TAG,
@@ -1748,7 +1749,7 @@ def shard_entry(job: ExternalJob, index: int, tuning_keys: tuple = ()) -> dict:
 
 
 def live_run(
-    scan, stage: str, engine: str, apply_run=None
+    scan, stage: str, engine: str, apply_run=None, opinion=None
 ) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 
@@ -1766,6 +1767,8 @@ def live_run(
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param apply_run: The apply run whose rows are wanted, or None for
         the volume run.
+    :param opinion: The opinion whose rows are wanted, for an
+        opinion-level stage (the tagger, #272), or None for the volume.
     :returns: The live run's rows ordered by shard index, or an empty
         list when the engine has never run for this target.
     :rtype: list[ExternalJob]
@@ -1775,7 +1778,7 @@ def live_run(
             scan=scan,
             stage=stage,
             engine=engine,
-            opinion=None,
+            opinion=opinion,
             apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
@@ -1966,6 +1969,7 @@ def _reusable_results(
     engine: str,
     specs: list[tuple[str, dict]],
     carry_stable_holes: bool = True,
+    opinion=None,
 ) -> dict[int, ExternalJob]:
     """Map today's shard indexes to prior rows whose results still serve.
 
@@ -2004,6 +2008,8 @@ def _reusable_results(
         shard is its first read again. False for a provider whose
         failed line may be a transient fault (Mistral's batch API): two
         unlucky runs would otherwise freeze a page as unread for good.
+    :param opinion: The opinion the rows address, or None for the
+        volume (:func:`ensure_run_jobs`).
     :returns: ``{shard_index: prior_row}`` for every reusable shard.
     :rtype: dict[int, ExternalJob]
     """
@@ -2018,7 +2024,7 @@ def _reusable_results(
         scan=scan,
         stage=stage,
         engine=engine,
-        opinion=None,
+        opinion=opinion,
         status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED),
     ).order_by("-run", "-attempt")
     for row in prior_rows:
@@ -2169,6 +2175,7 @@ def ensure_run_jobs(
     force_new_run: bool = False,
     carry_stable_holes: bool = True,
     apply_run=None,
+    opinion=None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``specs``, creating
     them if the current run does not describe that work.
@@ -2176,7 +2183,7 @@ def ensure_run_jobs(
     The body of :func:`ensure_shard_jobs`, with the work described by
     the caller: one ``(input_key, identity)`` pair per row, in row
     order. The shard stages describe a shard set with it; the tagger
-    describes one input document per volume. The idempotence, the reuse
+    describes one input document per opinion (``opinion``, #272). The idempotence, the reuse
     of prior results, the unique key and the race with a second writer
     are the same whatever the rows address, which is why there is one
     creator and not one per shape.
@@ -2195,6 +2202,10 @@ def ensure_run_jobs(
     :param carry_stable_holes: See :func:`_reusable_results`. Pass
         False for a provider whose failed pages are not reproducible.
     :param apply_run: The apply run the rows work for, or None.
+    :param opinion: The opinion the rows work for, for an opinion-level
+        stage, or None. The run number is scoped by it
+        (``ExternalJob.next_run``), so a new run of one opinion leaves
+        the runs of the others alone.
     :returns: The live run's rows, ordered by row index.
     :rtype: list[ExternalJob]
     """
@@ -2203,7 +2214,7 @@ def ensure_run_jobs(
             scan=scan,
             stage=stage,
             engine=engine,
-            opinion=None,
+            opinion=opinion,
             apply_run=apply_run,
         ).order_by("-run", "shard_index")
     )
@@ -2229,10 +2240,12 @@ def ensure_run_jobs(
             sorted({job.status for job in live}),
         )
 
-    run = ExternalJob.next_run(scan, stage, engine)
+    run = ExternalJob.next_run(scan, stage, engine, opinion=opinion)
     now = timezone.now()
     reusable = (
-        _reusable_results(scan, stage, engine, specs, carry_stable_holes)
+        _reusable_results(
+            scan, stage, engine, specs, carry_stable_holes, opinion=opinion
+        )
         if reuse_results
         else {}
     )
@@ -2248,6 +2261,7 @@ def ensure_run_jobs(
             shard_index=index,
             shard_count=len(specs),
             apply_run=apply_run,
+            opinion=opinion,
             input_key=key,
             # Travels with the row, so the reuse check and any later
             # merge read what was actually processed rather than a
@@ -2281,7 +2295,7 @@ def ensure_run_jobs(
         # (bulk_create is one statement inside one transaction), so
         # re-read and hand theirs back. This is what keeps two staff
         # presses a no-op rather than a 500 for whoever lost.
-        rows = live_run(scan, stage, engine, apply_run)
+        rows = live_run(scan, stage, engine, apply_run, opinion)
         logger.info(
             "scan %s %s/%s run %d was created by another writer; "
             "reusing its %d row(s)",

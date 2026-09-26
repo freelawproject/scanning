@@ -35,8 +35,10 @@ from scanning.models import (
     Detection,
     DetectionDecision,
     Issue,
+    JobStatus,
     Opinion,
     OpinionBoundary,
+    OpinionReviewStatus,
     OpinionScan,
     Redaction,
     Scan,
@@ -384,6 +386,29 @@ REOPENED_TEXT_MESSAGE = (
 )
 REOPEN_REFUSED_MESSAGE = "This opinion is not approved, so it does not reopen."
 REOPEN_STAFF_MESSAGE = "Only a staff member reopens an approved opinion."
+
+#: The answers of the tagger button (#272).
+TAG_STARTED_MESSAGE = (
+    "The tagger job of this opinion is queued. The daemon sends it to "
+    "RunPod and places the spans on the approved text when it finishes."
+)
+TAG_PLACED_MESSAGE = (
+    "The tagger already read this text. Its spans are placed on the "
+    "approved text, and no new job was started."
+)
+TAG_NOT_APPROVED_MESSAGE = (
+    "The text of this opinion is not approved, so it is not tagged."
+)
+TAG_DISABLED_MESSAGE = (
+    "The tagger is switched off on this server: RUNPOD_TAGGER_ENDPOINT_ID "
+    "or TAGGER_ENABLED is not set."
+)
+TAG_RUNNING_MESSAGE = "The tagger job of this opinion is already running."
+TAG_DONE_MESSAGE = "The approved text of this opinion is already tagged."
+TAG_FAILED_MESSAGE = (
+    "The tagger job could not be started: {reason}. Try again, or ask a "
+    "staff member to read the log."
+)
 
 #: The two labels the opinion pairing reads: a box of one of them
 #: changes the boundaries, and only the measurement pairs them again.
@@ -1928,6 +1953,81 @@ def reopen_opinion_text(
         return _edit_refusal(request, REOPEN_REFUSED_MESSAGE)
     messages.success(request, REOPENED_TEXT_MESSAGE)
     return JsonResponse({"status": "ok", "message": REOPENED_TEXT_MESSAGE})
+
+
+@login_required
+@require_POST
+def start_caselaw_tagger(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Start the tagger job of one approved opinion (#272).
+
+    The one creator of the tagger rows: nothing enqueues them on a
+    tick. Any logged-in user presses it, the rule of the approval. The
+    gate is in the view: an approved text, the switches of the stage,
+    the bucket, and a state of ``tagger.state`` that a press can move
+    (no run, a dead one, or a run over an earlier approved text).
+
+    A press over a text the tagger already read (a second approval of
+    the same text) starts no job: ``tagger.ensure_tag_jobs`` reuses the
+    run, and its spans are placed on the new approved text here.
+
+    Every answer is a Django message too, and the viewer reloads the
+    page to show it.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404 for an opinion of another scan,
+        409 for a refusal.
+    """
+    from scanning import s3_sync, tagger
+
+    opinion = (
+        Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
+        .select_related("scan")
+        .first()
+    )
+    if opinion is None:
+        return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
+    if (
+        opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
+        or not opinion.approved_text_key
+    ):
+        return _edit_refusal(request, TAG_NOT_APPROVED_MESSAGE)
+    if not tagger.enabled():
+        return _edit_refusal(request, TAG_DISABLED_MESSAGE)
+    if not s3_sync.s3_active():
+        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
+    state = tagger.state(opinion)
+    if state == tagger.RUNNING:
+        return _edit_refusal(request, TAG_RUNNING_MESSAGE)
+    if state == tagger.DONE:
+        return _edit_refusal(request, TAG_DONE_MESSAGE)
+    try:
+        rows = tagger.ensure_tag_jobs(opinion)
+        message = TAG_STARTED_MESSAGE
+        if rows and rows[0].status == JobStatus.CONSUMED:
+            tagger.glue_run(opinion, rows[0])
+            message = TAG_PLACED_MESSAGE
+    except (tagger.TaggerInputError, tagger.TaggerGlueError) as exc:
+        logger.warning(
+            "%s of scan %s: the tagger press by %s did not start: %s",
+            opinion,
+            pk,
+            request.user,
+            exc,
+        )
+        return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
+    logger.info(
+        "%s of scan %s: %s started the tagger (run %s)",
+        opinion,
+        pk,
+        request.user,
+        rows[0].run if rows else None,
+    )
+    messages.success(request, message)
+    return JsonResponse({"status": "ok", "message": message})
 
 
 @login_required

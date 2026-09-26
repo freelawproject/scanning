@@ -2702,6 +2702,25 @@ class Opinion(AbstractDateTimeModel):
             "frozen output the tagger reads (#272). Not a glue."
         ),
     )
+    tag_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "S3 key of the tagger's spans over the approved text (#272), "
+            "written by ``tagger.glue_run``. Blank until a run is glued."
+        ),
+    )
+    tagged_text_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "The ``approved_text_key`` the spans at ``tag_key`` were "
+            "computed over. The spans are current when the two keys are "
+            "equal (``tagger.is_written``)."
+        ),
+    )
     redacted_pdf_revision = models.PositiveSmallIntegerField(
         null=True,
         blank=True,
@@ -4236,11 +4255,12 @@ class JobStage(models.TextChoices):
     TIEBREAK = "tiebreak", "Tiebreak disputed reads"
 
 
-#: Stages whose unit of work is one opinion PDF rather than the volume.
-#: A tuple, not a frozenset: it is embedded in a database constraint,
-#: and an unordered container rewrites the migration every time the
-#: interpreter hashes it differently.
-OPINION_LEVEL_STAGES = (JobStage.TIEBREAK,)
+#: Stages whose unit of work is one opinion rather than the volume: the
+#: tiebreak of an opinion PDF, and the tagger of an approved text
+#: (#272). A tuple, not a frozenset: it is embedded in a database
+#: constraint, and an unordered container rewrites the migration every
+#: time the interpreter hashes it differently.
+OPINION_LEVEL_STAGES = (JobStage.TIEBREAK, JobStage.TAG)
 
 #: Stages that take either shape: a volume-level row (``opinion`` NULL,
 #: keyed by shard) or an opinion-level row (``opinion`` set). ``EXTRACT``

@@ -41,10 +41,11 @@ status and keeps the per-shard results: a page insert recomputes the
 merge from them.
 
 **5b. ``tagger.finish_ready_runs()`` glues finished tagger runs.** One
-row per volume; a ``COMPLETED`` row's result envelope is written into
-``r{run}-volume.json`` beside the input it was computed from, and the
-row goes to ``CONSUMED``. Writes no scan status: the assembly step reads
-the document, not the review flow.
+row per approved opinion (#272); a ``COMPLETED`` row's spans are placed
+on the paragraphs of the approved text and written beside the input it
+was computed from, the opinion's ledger is stamped, and the row goes to
+``CONSUMED``. Writes no scan status and no opinion status: the assembly
+step reads the spans, not the review flow.
 
 **6. ``yolo.queue_ready_runs()`` queues the redaction computation.**
 It is a trigger, not the work: it takes a scan in

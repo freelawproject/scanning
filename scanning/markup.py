@@ -605,3 +605,182 @@ def serialize(parsed: Parsed) -> str:
     if parsed.kind == HEADING:
         return f"<heading>{body}</heading>"
     return body
+
+
+# ── The tagger's projection (#272, #404) ────────────────────────────
+#: The inline marks the case-law block tagger was trained on. ``strong``
+#: is not among them: its element goes and its text stays.
+TAGGER_INLINE = (EM, SUP)
+
+#: The prefixes whose hyphen at a line end is a real hyphen
+#: (``self-⏎made``), measured over sixteen volumes in encoder-testing.
+#: Every other word cut at a line end is joined (:func:`project`).
+KEEP_HYPHEN = frozenset({
+    "non", "self", "cross", "co", "pre", "post", "anti", "ex", "semi",
+    "well", "mid", "quasi", "pro", "multi", "all", "half", "de", "sub",
+    "one", "two", "three", "four", "five", "six", "seven", "eight",
+    "nine", "ten", "twenty", "thirty", "first", "second", "third",
+    "fourth", "fifth", "sixth", "so", "in", "step", "then", "vice",
+    "re", "attorney", "brother", "sister", "mother", "father", "son",
+    "daughter", "counter", "long", "short", "high", "low", "full",
+    "part", "on", "off", "out", "up", "down", "over", "under",
+})  # fmt: skip
+
+#: A word cut by a hyphen at a line end, and the letter that goes on
+#: after it.
+_LINE_HYPHEN = re.compile(r"([^\W\d_]+)-\n(?=[^\W\d_])")
+
+
+@dataclass(frozen=True)
+class Projection:
+    """The tagger's text of an approved body, and where it came from.
+
+    ``offsets[i]`` is ``(paragraph, char)``, the address in the approved
+    ``body`` of the character ``i`` of ``text``, or None for a character
+    the projection wrote (a tag, or the ``\\n`` between two blocks).
+    ``paragraphs`` names the body paragraphs that were sent, in order.
+    """
+
+    text: str
+    offsets: list[tuple[int, int] | None]
+    paragraphs: list[int]
+
+
+def _kept(text: str) -> list[tuple[int, str]]:
+    """Return ``(source index, character)`` for each character sent.
+
+    Two changes and no other: a word cut at a line end loses its
+    hyphen and the line end (unless :data:`KEEP_HYPHEN` names the part
+    before it, which keeps the hyphen), and every other ``\\n`` becomes
+    a space, because ``\\n`` is the tagger's block separator.
+    ``paragraphs.JOIN`` is a ``\\n``, so a word cut at a column or a
+    page edge is joined by the same rule.
+    """
+    dropped: set[int] = set()
+    for match in _LINE_HYPHEN.finditer(text):
+        hyphen = match.end(1)
+        if match.group(1).lower() not in KEEP_HYPHEN:
+            dropped.add(hyphen)
+        dropped.add(hyphen + 1)
+    return [
+        (index, " " if char == "\n" else char)
+        for index, char in enumerate(text)
+        if index not in dropped
+    ]
+
+
+def project(body: list[dict]) -> Projection:
+    """Write the tagger's input for the body of an approved text.
+
+    The tagger reads one case as minimal HTML: a ``<p>`` per block, one
+    ``\\n`` between blocks, ``<blockquote>``, ``<em>`` and ``<sup>``,
+    and no footnote content (the model card of
+    ``freelawproject/caselaw-block-tagger``). So:
+
+    - each ``body`` paragraph is one block, and a ``heading`` or a
+      ``list_item`` is a ``<p>``; a ``table`` is left out whole;
+    - a quoted paragraph is a ``<blockquote>`` block in place of its
+      ``<p>``, because the worker cuts its windows at ``</p>`` and at
+      ``</blockquote>``, so a quote is a block beside the paragraphs;
+    - the ``em`` and ``sup`` marks are copied, and ``strong`` is left
+      out with its text kept;
+    - ``&``, ``<`` and ``>`` are escaped, and each character of an
+      entity maps to its source character.
+
+    The projection deletes characters and writes markup, and it changes
+    no character but a ``\\n``, so :func:`lift_span` places every span
+    of the answer exactly. The footnotes of the approved text are not
+    an argument: the caller sends ``body`` alone.
+
+    :param body: ``paragraphs.approved_document(...)["body"]``.
+    :returns: The text, its offset map and the paragraphs sent.
+    :rtype: Projection
+    """
+    text: list[str] = []
+    offsets: list[tuple[int, int] | None] = []
+    sent: list[int] = []
+
+    def markup(tag: str) -> None:
+        text.append(tag)
+        offsets.extend([None] * len(tag))
+
+    for index, paragraph in enumerate(body):
+        if paragraph.get("kind") == TABLE:
+            continue
+        source = paragraph.get("text") or ""
+        kept = _kept(source)
+        if not "".join(char for _, char in kept).strip():
+            continue
+        marks = [
+            mark
+            for mark in paragraph.get("marks") or []
+            if mark.get("kind") in TAGGER_INLINE
+            and mark.get("end", 0) > mark.get("start", 0)
+        ]
+        if sent:
+            markup("\n")
+        sent.append(index)
+        block = BLOCKQUOTE if paragraph.get("blockquote") else "p"
+        markup(f"<{block}>")
+        open_kinds: tuple[str, ...] = ()
+        for position, char in kept:
+            kinds = tuple(
+                kind
+                for kind in _NESTING
+                if kind in TAGGER_INLINE
+                and any(
+                    m["kind"] == kind and m["start"] <= position < m["end"]
+                    for m in marks
+                )
+            )
+            if kinds != open_kinds:
+                # Both are in ``_NESTING`` order, so the tags they share
+                # are a common head, and only the rest closes and opens.
+                shared = 0
+                while (
+                    shared < min(len(kinds), len(open_kinds))
+                    and kinds[shared] == open_kinds[shared]
+                ):
+                    shared += 1
+                for kind in reversed(open_kinds[shared:]):
+                    markup(f"</{kind}>")
+                for kind in kinds[shared:]:
+                    markup(f"<{kind}>")
+                open_kinds = kinds
+            escaped = _html.escape(char, quote=False)
+            text.append(escaped)
+            offsets.extend([(index, position)] * len(escaped))
+        for kind in reversed(open_kinds):
+            markup(f"</{kind}>")
+        markup(f"</{block}>")
+    return Projection("".join(text), offsets, sent)
+
+
+def lift_span(projection: Projection, start: int, end: int) -> list[dict]:
+    """Place one span of the tagger's answer on the approved body.
+
+    The worker trims a span to the text it covers, and this trims too:
+    a markup character at an edge is not part of the span. A span over
+    two blocks (a caption the tagger read as one ``party``) is cut per
+    paragraph, and each part covers its paragraph from the first to the
+    last character the span holds there.
+
+    :param projection: :func:`project` of the body the tagger read.
+    :param start: The span's start in ``projection.text``.
+    :param end: Its end, exclusive.
+    :returns: ``[{"paragraph", "start", "end"}]`` in body order, with
+        ``end`` exclusive; empty when the span covers no text.
+    :rtype: list[dict]
+    """
+    parts: dict[int, list[int]] = {}
+    for address in projection.offsets[max(start, 0) : max(end, 0)]:
+        if address is None:
+            continue
+        paragraph, char = address
+        edges = parts.setdefault(paragraph, [char, char])
+        edges[0] = min(edges[0], char)
+        edges[1] = max(edges[1], char)
+    return [
+        {"paragraph": paragraph, "start": first, "end": last + 1}
+        for paragraph, (first, last) in sorted(parts.items())
+    ]

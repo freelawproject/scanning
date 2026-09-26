@@ -28,6 +28,7 @@ from scanning import (
     repairs,
     s3_sync,
     stats,
+    tagger,
 )
 from scanning.forms import (
     OpinionScanUploadForm,
@@ -441,6 +442,12 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         key=lambda row: row.dismissal_id is not None,
     )
 
+    tag_state = (
+        tagger.state(opinion)
+        if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE
+        else None
+    )
+
     def address(name: str) -> str:
         """Return one route of this opinion, for a ``data-`` attribute."""
         return reverse(
@@ -517,6 +524,17 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
                 and opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE
             ),
             "reopen_url": address("reopen_opinion_text"),
+            # The tagger (#272): offered on an approved text where a
+            # press can move ``tagger.state``, the gate of
+            # ``views_api.start_caselaw_tagger``.
+            "tag_state": tag_state,
+            "can_tag": (
+                opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE
+                and bool(opinion.approved_text_key)
+                and tagger.enabled()
+                and tag_state in (tagger.NONE, tagger.FAILED, tagger.STALE)
+            ),
+            "tag_url": address("start_caselaw_tagger"),
             # Absent when the PDF pass has not written the file at
             # the live revision: the template shows the reason instead
             # of the two links and the column of the pages.

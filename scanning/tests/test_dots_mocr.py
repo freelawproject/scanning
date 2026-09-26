@@ -2097,16 +2097,13 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 ("scanning/jobs.py", "ensure_shard_jobs"),
                 # The shard creator is a thin caller of the row creator
                 # since the tagger, whose rows address one input
-                # document per volume rather than a shard set.
+                # document per opinion rather than a shard set.
                 ("scanning/jobs.py", "ensure_run_jobs"),
                 ("scanning/tagger.py", "ensure_run_jobs"),
-                # The tagger: one volume per row, after review 2, and
-                # only from the command -- a staff decision, like the
-                # detection re-run. No tick pass yet, on purpose.
-                (
-                    "scanning/management/commands/enqueue_caselaw_tagger.py",
-                    "ensure_tag_jobs",
-                ),
+                # The tagger: one approved opinion per row (#272), and
+                # only from the button of the review page. No tick pass
+                # yet, on purpose.
+                ("scanning/views_api.py", "ensure_tag_jobs"),
             },
             "Something new creates external-job rows. Row creation "
             "starts paid GPU work, so update this set only on purpose.",

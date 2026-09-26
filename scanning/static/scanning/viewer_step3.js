@@ -2748,6 +2748,26 @@
                     });
             });
         }
+        // The tagger of the approved text (#272). The server answers a
+        // Django message either way, so the page reloads to show it.
+        var tag = document.getElementById('start-tagger');
+        if (tag) {
+            tag.addEventListener('click', function () {
+                if (tag.disabled) { return; }
+                tag.disabled = true;
+                fetch(endpoint('tagUrl'), {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRFToken': csrfToken() }
+                })
+                    .then(function () { window.location.reload(); })
+                    .catch(function () {
+                        showToast('The request got no answer. Try again.',
+                            'error');
+                        tag.disabled = false;
+                    });
+            });
+        }
     }
 
     // -----------------------------------------------------------------

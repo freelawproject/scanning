@@ -18,7 +18,8 @@
   The write controls are the re-run of the ensemble, the dismissal
   of a finding (#419), the human edits of the text (#376), which
   show on a locked block alone, and the approval of the text with its
-  staff reopen (#375). A button the endpoint would refuse
+  staff reopen (#375), and the tagger of an approved text (#272). A
+  button the endpoint would refuse
   is the one thing a viewer must never offer (the rule of the step-1
   bar, #151).
 {% endcomment %}
@@ -81,6 +82,22 @@
             title="Take this opinion back to the text review">
       <i class="fa-solid fa-lock-open"></i> Reopen the text review
     </button>
+    {% endif %}
+    {% comment %}
+      The tagger (#272): on an approved text, where a press can move
+      its state. A run in progress or a text already tagged shows the
+      state and offers no button, because the endpoint refuses both.
+    {% endcomment %}
+    {% if can_tag %}
+    <button type="button" id="start-tagger" class="btn-outline text-sm"
+            title="Send the approved text to the case-law block tagger">
+      <i class="fa-solid fa-tags"></i>
+      {% if tag_state == "none" %}Tag the text{% else %}Tag the text again{% endif %}
+    </button>
+    {% elif tag_state == "running" %}
+    <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-spinner fa-spin"></i> Tagging the text</span>
+    {% elif tag_state == "done" %}
+    <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-tags"></i> Text tagged</span>
     {% endif %}
     {% if can_rerun %}
     <button type="button" id="rerun-ensemble" class="btn-outline text-sm"
@@ -178,6 +195,7 @@
      data-edit-withdraw-url="{{ edit_withdraw_url }}"
      data-approve-url="{{ approve_url }}"
      data-reopen-url="{{ reopen_url }}"
+     data-tag-url="{{ tag_url }}"
      data-page-count="{{ opinion.page_count }}">
 
   <div class="card p-2">

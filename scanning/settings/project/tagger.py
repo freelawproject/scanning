@@ -2,9 +2,9 @@
 
 The tagger labels the structural parts of each opinion (party, docket
 number, court, judges, disposition, ...) on RunPod Serverless: one job
-per **volume**, input from a presigned GET of a JSON document the
-daemon writes, output to a presigned PUT (see ``scanning/tagger.py``,
-``scanning/tagger_input.py`` and ``scanning/runpod-caselaw-tagger/``).
+per **approved opinion** (#272), input from a presigned GET of a JSON
+document written from the approved text, output to a presigned PUT
+(see ``scanning/tagger.py`` and ``scanning/runpod-caselaw-tagger/``).
 
 Five variables, the shape of ``dots_mocr.py`` and ``yolo.py``. The
 account-level ones already exist in ``runpod.py`` and are reused rather
@@ -20,9 +20,10 @@ env = environ.FileAwareEnv()
 # dots.mocr switch it gates the submit of rows that already exist; it
 # enqueues nothing. Nothing auto-enqueues this stage yet: the only
 # creator of TAG rows is ``tagger.ensure_tag_jobs`` and its one caller
-# is the ``enqueue_caselaw_tagger`` command, a staff decision, pinned
-# by ``TestKnownEnqueuePaths``. A tick pass comes after the stage has
-# been watched on a few volumes.
+# is the button of the opinion review page
+# (``views_api.start_caselaw_tagger``), pinned by
+# ``TestKnownEnqueuePaths``. A tick pass comes after the stage has been
+# watched on a few volumes.
 TAGGER_ENABLED = env.bool("TAGGER_ENABLED", default=True)
 
 # The engine's own RunPod serverless endpoint id (from the RunPod
@@ -33,16 +34,16 @@ TAGGER_ENABLED = env.bool("TAGGER_ENABLED", default=True)
 RUNPOD_TAGGER_ENDPOINT_ID = env.str("RUNPOD_TAGGER_ENDPOINT_ID", default="")
 
 # How many jobs may be in flight at once, which is also how many rows
-# one submit tick claims. One job is one volume, so this is volumes in
-# flight; the endpoint's ``max_workers`` (3) must be at least this.
+# one submit tick claims. One job is one opinion, so this is opinions
+# in flight; the endpoint's ``max_workers`` (3) must be at least this.
 TAGGER_MAX_CONCURRENCY = env.int("TAGGER_MAX_CONCURRENCY", default=3)
 
-# Attempts per volume before its job is failed.
+# Attempts per opinion before its job is failed.
 TAGGER_MAX_ATTEMPTS = env.int("TAGGER_MAX_ATTEMPTS", default=3)
 
 # Per-page allowance added to RUNPOD_REQUEST_TIMEOUT to bound a
 # *running* job (``jobs.runpod_execution_deadline`` reads the row's
-# ``page_count``: for this stage, the pages the sent text covers, so a
+# ``page_count``: for this stage, the pages of the opinion, so a
 # two-hundred-page case counts as two hundred). The first GPU run
 # tagged 65 pages of text in four seconds, so one second a page is
 # generous; the base timeout carries the cold start.
