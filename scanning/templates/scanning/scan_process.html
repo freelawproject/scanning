@@ -118,7 +118,7 @@ body.boundary-pick .opinion-nav.picking {
       {% endcomment %}
       <div class="rounded border border-slate-300 dark:border-slate-600 bg-slate-100 dark:bg-slate-800 p-3 mb-2 mt-3 text-xs text-slate-700 dark:text-slate-200">
         <p class="font-bold mb-1">Awaiting validation</p>
-        <p class="m-0">{{ scan.progress_message }}</p>
+        <p id="awaiting-msg" class="m-0">{{ scan.progress_message }}</p>
       </div>
       {% endif %}
       {% if is_processing %}
@@ -538,7 +538,8 @@ var SCAN_CONFIG = {
     // Whether one exists is the button's presence, which the view
     // decides: a second flag here would be a surface nobody reads.
     ocrTextUrlApi: '{% url "scan_ocr_text_url" scan.pk %}',
-    {% if is_processing %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
+    {% if is_processing or watches_status %}progressUrl: '{% url "progress_api" scan.pk %}',{% endif %}
+    {% if watches_status %}progressWatch: '{{ scan.status }}',{% endif %}
 };
 // Backward-compatible globals used by viewer_step1.js and shared.js
 var csrfToken = SCAN_CONFIG.csrfToken;
@@ -580,7 +581,7 @@ document.addEventListener('DOMContentLoaded', function () {
     });
 });
 </script>
-{% if is_processing %}
+{% if is_processing or watches_status %}
 <script src="{% static 'scanning/viewer_progress.js' %}"></script>
 {% endif %}
 {% comment %}
