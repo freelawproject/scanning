@@ -106,6 +106,9 @@ PY
 # commit writes no ``refs/main``, and the offline runtime (and the load
 # gate below) resolves the bare repo id through it, so the build writes
 # that ref by hand. A new model is a new SURYA_REVISION.
+# The retry loop exits 0 whatever its last try did, so the check after
+# it resolves the bare id offline, as the worker does, and fails the
+# build unless it lands on the pinned commit.
 ENV SURYA_MODEL=${SURYA_MODEL}
 RUN set -e; \
     for i in 1 2 3; do \
@@ -116,6 +119,9 @@ RUN set -e; \
     done \
  && python3 -c "\
 import pathlib; \
+from huggingface_hub import snapshot_download; \
+snap = pathlib.Path(snapshot_download('${SURYA_MODEL}', local_files_only=True, ignore_patterns=['assets/*', '*.png', '.eval_results/*'])); \
+assert snap.name == '${SURYA_REVISION}', f'bare repo id resolves to {snap.name}, not the pinned revision'; \
 files = list(pathlib.Path('/opt/hf').rglob('*.safetensors')); \
 total = sum(f.stat().st_size for f in files); \
 assert total > 1_200_000_000, f'weights missing or truncated: {total} bytes in {len(files)} files'; \

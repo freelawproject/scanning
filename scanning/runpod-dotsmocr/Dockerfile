@@ -69,6 +69,9 @@ WORKDIR /app
 # bare repo id through it, so the build writes that ref by hand: every
 # reader of the cache (vLLM, the tokenizer, the remote code) lands on
 # the pinned snapshot. A new model is a new DOTSMOCR_REVISION.
+# The retry loop exits 0 whatever its last try did, so the check after
+# it resolves the bare id offline, as the worker does, and fails the
+# build unless it lands on the pinned commit.
 ARG DOTSMOCR_MODEL=freelawproject/dots.mocr
 ARG DOTSMOCR_REVISION=a4cead5fa6d72a81e468c341267757687e0b0bd4
 ENV DOTSMOCR_MODEL=${DOTSMOCR_MODEL}
@@ -81,6 +84,9 @@ RUN set -e; \
     done \
  && python3 -c "\
 import pathlib; \
+from huggingface_hub import snapshot_download; \
+snap = pathlib.Path(snapshot_download('${DOTSMOCR_MODEL}', local_files_only=True)); \
+assert snap.name == '${DOTSMOCR_REVISION}', f'bare repo id resolves to {snap.name}, not the pinned revision'; \
 files = list(pathlib.Path('/opt/hf').rglob('*.safetensors')); \
 total = sum(f.stat().st_size for f in files); \
 assert total > 4_000_000_000, f'weights missing or truncated: {total} bytes in {len(files)} files'; \
