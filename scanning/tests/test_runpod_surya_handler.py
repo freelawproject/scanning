@@ -424,7 +424,9 @@ class TestSuryaConfiguration(SimpleTestCase):
 
     def test_serve_command_carries_the_kit_flags(self):
         cmd = handler._vllm_command()
-        self.assertEqual(cmd[:3], ["vllm", "serve", "datalab-to/surya-ocr-2"])
+        self.assertEqual(
+            cmd[:3], ["vllm", "serve", "freelawproject/surya-ocr-2"]
+        )
         flags = {}
         rest = cmd[3:]
         for i, token in enumerate(rest):
