@@ -309,85 +309,24 @@ def enqueue_missing_runs() -> int:
     is logged once at INFO, then at DEBUG, and left alone for
     :data:`REFUSAL_RETRY_SECONDS` (see :data:`_REFUSED`), so a
     permanent refusal neither fills the log nor holds a place in the
-    batch. The pass makes no call to RunPod.
+    batch. The pass makes no call to RunPod. The body is
+    ``jobs.enqueue_missing_runs``, which the other sweeps share.
 
     :returns: How many runs were started.
     :rtype: int
     """
-    from django.db.models import Exists, OuterRef
-
-    from scanning import sharding
-
     if not enabled() or not s3_sync.s3_active():
         return 0
-
-    now = time.monotonic()
-    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
-
-    detected = ExternalJob.objects.filter(
-        scan=OuterRef("pk"),
+    return jobs.enqueue_missing_runs(
         stage=JobStage.DETECT,
         engine=JobEngine.BLACKLETTER,
-        opinion=None,
-        # The volume run only. An apply run's rows (#224) are one-page
-        # shards of the pages a curator changed, and they answer for
-        # no shard set, so a volume that has them and no run of its
-        # own must still get one.
-        apply_run__isnull=True,
-    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
-    candidates = (
-        Scan.objects.filter(status__in=SWEEP_STATUSES)
-        .exclude(source_fingerprint="")
-        .exclude(pk__in=skipped)
-        .annotate(detected=Exists(detected))
-        .filter(detected=False)
-        .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
+        create=ensure_detect_jobs,
+        statuses=SWEEP_STATUSES,
+        cap=settings.YOLO_MAX_CONCURRENCY,
+        refused=_REFUSED,
+        label="detection run",
+        log=logger,
     )
-
-    started = 0
-    for scan in candidates:
-        manifest, reason = sharding.committed_manifest(scan)
-        if manifest is None:
-            _, times = _REFUSED.get(scan.pk, (0.0, 0))
-            _REFUSED[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
-            logger.log(
-                logging.INFO if times == 0 else logging.DEBUG,
-                "Scan %s is not swept for detection (refusal %d, next look "
-                "in %ds): %s",
-                scan.pk,
-                times + 1,
-                REFUSAL_RETRY_SECONDS,
-                reason,
-            )
-            continue
-        _REFUSED.pop(scan.pk, None)
-        rows = ensure_detect_jobs(scan, manifest)
-        blank = [row.pk for row in rows if not row.source_fingerprint]
-        if blank:
-            # A run from before the column, handed back because it
-            # still describes today's set. Stamp it, so the next tick
-            # does not pay two S3 calls to learn the same thing.
-            ExternalJob.objects.filter(pk__in=blank).update(
-                source_fingerprint=scan.source_fingerprint
-            )
-            logger.info(
-                "Adopted detection run %s of scan %s (%d row(s) from "
-                "before the fingerprint column)",
-                rows[0].run,
-                scan.pk,
-                len(blank),
-            )
-            continue
-        logger.info(
-            "Started detection run %s for scan %s over %d shard(s) "
-            "(%d carried)",
-            rows[0].run,
-            scan.pk,
-            len(rows),
-            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
-        )
-        started += 1
-    return started
 
 
 def live_detect_jobs(scan) -> list[ExternalJob]:
