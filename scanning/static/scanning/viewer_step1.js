@@ -872,6 +872,20 @@ document.addEventListener('DOMContentLoaded', function () {
         }
     });
 
+    // The "Ask for a rescan" button of a bad-page card (#436): the same
+    // request as the page's own button, for a page the lazy loader may
+    // not have drawn yet. The note lands on the page when it is drawn,
+    // from the request list the viewer keeps.
+    window.askForRescan = function (pdfPage) {
+        var pageDiv = container.querySelector(
+            '.lazy-page[data-pdf-index="' + (pdfPage - 1) + '"]'
+        );
+        askForRepair(
+            { dataset: { action: 'replace', pdfPage: String(pdfPage) } },
+            pageDiv
+        );
+    };
+
     function askForRepair(btn, pageDiv) {
         var action = btn.dataset.action;
         var what = btn.dataset.repairWhat ||
@@ -1028,8 +1042,25 @@ document.addEventListener('DOMContentLoaded', function () {
     // takes the approve button away, and the last dismissal gives it
     // back, so a bar left as it was would offer a button the view
     // refuses, or hide the one it accepts.
+    // A rescan request answers a bad-page card (#436), so the card
+    // goes, as the server drops it on the next rebuild. Read off the
+    // same list as the section, on the same calls, so a request made
+    // from the page's own button takes the card too.
+    function syncBadPageCards(waiting) {
+        var asked = {};
+        waiting.forEach(function (r) {
+            if (r.action === 'replace' && r.pdf_page) { asked[r.pdf_page] = true; }
+        });
+        document.querySelectorAll('#bad-pages-section .issue-card').forEach(function (card) {
+            var pdfPage = parseInt(card.dataset.pdfIndex, 10) + 1;
+            if (asked[pdfPage]) { card.remove(); }
+        });
+        refreshBadPagesCount();
+    }
+
     function renderRepairsSection() {
         var waiting = repairRequests.filter(function (r) { return !r.fulfilled; });
+        syncBadPageCards(waiting);
         var section = document.getElementById('repairs-section');
         var list = document.getElementById('repairs-list');
         var badge = document.getElementById('repairs-badge');
@@ -1626,6 +1657,7 @@ document.addEventListener('DOMContentLoaded', function () {
             var card = btn.closest('.issue-card');
             if (card) card.remove();
             refreshIssuesCount();
+            refreshBadPagesCount();
             if (typeof window.refreshProcessActionBar === 'function') {
                 window.refreshProcessActionBar();
             }
@@ -1648,6 +1680,17 @@ document.addEventListener('DOMContentLoaded', function () {
             var allClear = document.getElementById('issues-all-clear');
             if (allClear) allClear.hidden = false;
         }
+    }
+
+    // The bad-page section (#436) has no "all clear" state: an empty
+    // section is hidden, and the issue list says all clear on its own.
+    function refreshBadPagesCount() {
+        var section = document.getElementById('bad-pages-section');
+        if (!section) return;
+        var remaining = section.querySelectorAll('.issue-card').length;
+        var countEl = document.getElementById('bad-pages-count');
+        if (countEl) countEl.textContent = remaining;
+        if (remaining === 0) section.hidden = true;
     }
 
     // --- Delete duplicate pages ---

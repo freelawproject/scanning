@@ -41,6 +41,9 @@ docker exec scanning-daemon python manage.py refit_text_redactions --dry-run
 # Write the text of a volume's opinions again, after a transform change or for a two-engine volume (#365)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble 2845 --dry-run
 
+# Score a volume's pages with the bad-page model and write its review-1 cards (#436)
+docker exec scanning-daemon python manage.py score_bad_pages 2845
+
 # Write the approved texts again after a change of the join rule (#375)
 docker exec scanning-daemon python manage.py rewrite_approved_text --all --dry-run
 
@@ -93,7 +96,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 State is `Scan.status`. The stages, and where each runs:
 
 1. `run_full_pipeline` (daemon, `process_next_scan`): shards the original (#164), sets `page_count`, creates the CONVERT rows (doctor bitonal, #176) and the ANALYZE rows (dots.mocr on RunPod, #190/#207), then parks the scan in AWAITING or AWAITING_VALIDATION.
-2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run and one OCR run per shard set (`yolo.enqueue_missing_runs`, #250; `dots_mocr.enqueue_missing_runs`, #327). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), places the tagger's spans (`tagger.finish_ready_runs`, #272), and promotes the review states (#263). `build_opinion_pdfs` is the fifth daemon task, last in the schedule, and writes one opinion PDF per tick (#336).
+2. Daemon ticks (`submit_external_jobs`, `collect_external_jobs`, serial scheduler, #156). The submit tick starts one detection run and one OCR run per shard set (`yolo.enqueue_missing_runs`, #250; `dots_mocr.enqueue_missing_runs`, #327). The collect tick merges the bitonal shards, glues the dots.mocr run, applies the page numbers (`run_compute_issues`, #204), triggers the apply (#224), merges the detection run and queues the redaction compute (#196), places the tagger's spans (`tagger.finish_ready_runs`, #272), and promotes the review states (#263). `build_opinion_pdfs` is the fifth daemon task and writes one opinion PDF per tick (#336); `score_bad_pages` is the sixth and scores one volume per tick (#436), a new upload in AWAITING_VALIDATION alone: an older volume is scored by the command, never by the pass. Both block the loop, so both come after every fast tick.
 3. Review 1: READY_FOR_PAGE_COMPLETENESS_REVIEW, then PAGE_COMPLETENESS_REVIEW_DONE (`approve_page_completeness`, #151/#154).
 4. The apply (#224): queued work (`APPLY_PAGE_EDITS`) that builds the corrected volume from the `PageEdit` rows under `jobs/apply/a{n}/`.
 5. The redaction compute (#196): queued work (`COMPUTE_REDACTIONS`) that renders every page; parks in READY_FOR_REDACTION_REVIEW. The approval (`approve_redaction_review`, #263) queues `CREATE_OPINIONS` (#336), whose worker writes the `Opinion` rows and parks in REDACTION_REVIEW_DONE.
@@ -184,6 +187,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - The unnumbered run before the first printed number is one `front_matter` card (`_ask_about_front_matter`), addressed by its first undeleted page, never a run later in the volume or a volume with no number at all; its button sends `pdf_pages` to `delete_page`, which checks every page before it writes one row
 - Every page label is narrowed (`_page_label`) and escaped (`escapeHtml`). A note is escaped only
 - Step-1 buttons bind by delegation on the container, and `refreshSavedLabel` runs after a note changes on a live page
+- The bad-page score (#436) is a stamp on the scan (`Scan.page_scores`, written by `badpage.scoring.stamp`, read only through `scores_of`, which drops a stamp of another fingerprint), measured on the review-1 bitonal copy, page for page the original. `badpage.scoring.issues` is the one deriver of the `bad_page` cards, called from `recalculate_issues` before the deletion and dismissal filters; an open rescan request or a standing replacement answers a card too, and the two repair views rebuild the issues when a request moves a card (`_rebuild_bad_page_card`). `scanning/badpage/features.py` holds only the measures of its two portal-code sources, kept line for line with the model they trained: a changed measure is a retrain
 
 ## The apply (#224, #269)
 

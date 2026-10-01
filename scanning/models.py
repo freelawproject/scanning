@@ -682,6 +682,18 @@ class Scan(AbstractDateTimeModel):
         blank=True,
         help_text="List of missing logical page numbers.",
     )
+    page_scores = models.JSONField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The bad-page model's score of every page of the review-1"
+            " bitonal copy, keyed by the 1-based original page, with the"
+            " model version and the source fingerprint it was measured"
+            " under. Written by badpage.scoring.stamp; read through"
+            " badpage.scoring.scores_of, which drops a stamp made"
+            " against another upload. Null until a volume is scored."
+        ),
+    )
     source_fingerprint = models.CharField(
         max_length=64,
         blank=True,
@@ -1049,6 +1061,7 @@ class CheckName(models.TextChoices):
     BACKWARD_PAGE = "backward_page", "Page number goes backward"
     LARGE_GAP = "large_gap", "Large gap in page numbers"
     SUSPICIOUS_READING = "suspicious_reading", "Suspicious OCR reading"
+    BAD_PAGE = "bad_page", "Possible bad scan"
     PAGE_RANGE = "page_range", "Page range detected"
     MISLABELED_DOCUMENT = "mislabeled_document", "Mislabeled document type"
     AUTO_CORRECTED = "auto_corrected", "Auto-corrected page number"
@@ -1107,6 +1120,7 @@ PHYSICAL_PAGE_CHECKS = frozenset(
         CheckName.NO_PAGE_NUMBER,
         CheckName.FRONT_MATTER,
         CheckName.SUSPICIOUS_READING,
+        CheckName.BAD_PAGE,
         CheckName.AUTO_CORRECTED,
         CheckName.BLANK_PAGE,
         CheckName.ORIENTATION,

@@ -47,6 +47,7 @@ from scanning import (
     tagger,
     yolo,
 )
+from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -623,6 +624,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     pages_needing_repair = {
         r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
     }
+    # The pages the bad-page model suspects (#436), for the score at
+    # the end of each page row. The ranked section reads the ``Issue``
+    # rows instead, so a page a scanner is asked for keeps its score
+    # here and loses its card there.
+    bad_scores = dict(badpage_scoring.flagged(scan))
 
     # One read of the review flags for the bar and the page (#151), and
     # with them the space the page is drawn in (#269). Step 2 shows the
@@ -821,6 +827,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             r["is_replaced"] = r["pdf_page"] in replaced_pages
             r["is_moved"] = r["pdf_page"] in moves
             r["needs_repair"] = r["pdf_page"] in pages_needing_repair
+            r["bad_score"] = bad_scores.get(r["pdf_page"])
             if r.get("type") == page_numbers.SUFFIXED:
                 # The book adds this page between two numbered ones, so
                 # it breaks no sequence: the page before it and the page
@@ -934,6 +941,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
 
+    # The bad-page cards have their own section, ranked by score and
+    # not by page (#436): a reviewer works the worst page first. They
+    # stayed in ``issues`` until here so the walk above gave them a
+    # jump target and a red border like every other physical card.
+    bad_pages = sorted(
+        (i for i in issues if i.check_name == CheckName.BAD_PAGE),
+        key=lambda i: (-(i.metadata or {}).get("score", 0), i.page_number),
+    )
+    issues = [i for i in issues if i.check_name != CheckName.BAD_PAGE]
+
     return render(
         request,
         "scanning/scan_process.html",
@@ -941,6 +958,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "scan": scan,
             "step": step,
             "issues": issues,
+            "bad_pages": bad_pages,
+            "bad_page_state": badpage_scoring.state(scan),
             "page_map_json": json.dumps(page_map),
             "missing_pages": missing_pages,
             "flagged_indices_json": json.dumps(sorted(flagged_indices)),
@@ -4820,6 +4839,8 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
             "source_fingerprint": scan.source_fingerprint,
         },
     )
+    if created:
+        _rebuild_bad_page_card(scan, address.get("pdf_page"))
     row = repairs.open_requests(scan).get(pk=row.pk)
     answer = {
         "status": "ok",
@@ -4858,5 +4879,28 @@ def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     rows = scan.repair_requests.filter(pk=request_id)
     if not rows.exists():
         return JsonResponse({"error": "Unknown request."}, status=404)
+    row = rows.first()
     repairs.dismiss(rows, request.user)
+    if row.action == PageRepairRequest.Action.REPLACE:
+        _rebuild_bad_page_card(scan, row.pdf_page)
     return JsonResponse({"status": "ok"})
+
+
+def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
+    """Rebuild the review-1 issues when a request moves a bad-page card.
+
+    A rescan request answers the card of its page and a dismissed one
+    gives it back (``badpage.scoring.issues``), so the ``Issue`` rows
+    must follow the write. Only for a page the model flagged, so the
+    rebuild is not paid on every request, and only in a review state,
+    which the rebuild keeps.
+
+    :param scan: The scan.
+    :param pdf_page: The page the request names, or None for a gap.
+    """
+    from scanning import services
+
+    if pdf_page is None or scan.status not in REVIEW_STATUSES:
+        return
+    if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
+        services.recalculate_issues(scan)

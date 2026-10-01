@@ -1854,7 +1854,7 @@ def _rows_by_edit(
     }
 
 
-def _volume_bitonal_key(scan: Scan) -> str:
+def volume_bitonal_key(scan: Scan) -> str:
     """Return the key of the review-1 bitonal copy, or of the original.
 
     A volume that skipped the conversion (its source is already 1-bit)
@@ -1915,11 +1915,11 @@ def _glue_bitonal(
         raise ApplyError(f"run {run.label} of scan {scan.pk} has no page map")
     entries = page_map["pages"]
     if is_identity_map(page_map):
-        return _volume_bitonal_key(scan)
+        return volume_bitonal_key(scan)
 
     converted = _rows_by_edit(rows, JobStage.CONVERT)
     volume_path = tmp_dir / "volume-bitonal.pdf"
-    s3_sync.download_object(_volume_bitonal_key(scan), volume_path)
+    s3_sync.download_object(volume_bitonal_key(scan), volume_path)
     shards: dict[int, fitz.Document] = {}
 
     def shard_of(edit_id: int) -> fitz.Document:
