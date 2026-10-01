@@ -2073,6 +2073,126 @@ def _reusable_results(
     return reusable
 
 
+def enqueue_missing_runs(
+    *,
+    stage: str,
+    engine: str,
+    create: Callable[[object, dict], list[ExternalJob]],
+    statuses: frozenset,
+    cap: int,
+    refused: dict[int, tuple[float, int]],
+    label: str,
+    log: logging.Logger,
+) -> int:
+    """Start one engine's run over every shard set that has none yet.
+
+    The one body of the submit tick's sweeps: detection (#250),
+    dots.mocr (#327) and Mistral (#341). Each stage module keeps its
+    own switch, cap and refusal memo and passes them here, so the rule
+    lives once. The rationale is in ``yolo.enqueue_missing_runs``.
+
+    **A shard set is read once.** A candidate is a scan in
+    ``statuses`` whose current ``source_fingerprint`` has no
+    volume row of ``stage``/``engine`` at all, alive or dead: a dead
+    run is a staff decision, never a tick's. A run from before the
+    fingerprint column is blank, so its scan is a candidate; when the
+    creator hands that run back unchanged, this stamps it rather than
+    count it. At most ``cap`` scans are looked at, newest first, and a
+    shard set ``sharding.committed_manifest`` refused is left alone for
+    ``yolo.REFUSAL_RETRY_SECONDS``.
+
+    :param stage: The row stage.
+    :param engine: The row engine.
+    :param create: The stage's creator, ``(scan, manifest) -> rows``.
+    :param statuses: The scan statuses the stage reads in:
+        ``yolo.SWEEP_STATUSES``, or ``mistral_ocr.SWEEP_STATUSES``.
+    :param cap: Scans looked at on one tick.
+    :param refused: The stage's memo, ``scan pk -> (retry at, times
+        refused)``.
+    :param label: What a log line calls the run ("OCR run").
+    :param log: The stage module's logger.
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    import time
+
+    from django.db.models import Exists, OuterRef
+
+    from scanning import yolo
+    from scanning.models import Scan
+
+    now = time.monotonic()
+    skipped = [pk for pk, (retry_at, _) in refused.items() if retry_at > now]
+
+    existing = ExternalJob.objects.filter(
+        scan=OuterRef("pk"),
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        # The volume run only. An apply run's rows (#224) are one-page
+        # shards of the pages a curator changed, and they answer for
+        # no shard set, so a volume that has them and no run of its
+        # own must still get one.
+        apply_run__isnull=True,
+    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
+    candidates = (
+        Scan.objects.filter(status__in=statuses)
+        .exclude(source_fingerprint="")
+        .exclude(pk__in=skipped)
+        .annotate(existing=Exists(existing))
+        .filter(existing=False)
+        .order_by("-pk")[:cap]
+    )
+
+    started = 0
+    for scan in candidates:
+        manifest, reason = sharding.committed_manifest(scan)
+        if manifest is None:
+            _, times = refused.get(scan.pk, (0.0, 0))
+            refused[scan.pk] = (now + yolo.REFUSAL_RETRY_SECONDS, times + 1)
+            log.log(
+                logging.INFO if times == 0 else logging.DEBUG,
+                "Scan %s is not swept for its %s (refusal %d, next look "
+                "in %ds): %s",
+                scan.pk,
+                label,
+                times + 1,
+                yolo.REFUSAL_RETRY_SECONDS,
+                reason,
+            )
+            continue
+        refused.pop(scan.pk, None)
+        rows = create(scan, manifest)
+        blank = [row.pk for row in rows if not row.source_fingerprint]
+        if blank:
+            # A run from before the column, handed back because it
+            # still describes today's set. Stamp it, so the next tick
+            # does not pay two S3 calls to learn the same thing, and
+            # does not count a run it did not start.
+            ExternalJob.objects.filter(pk__in=blank).update(
+                source_fingerprint=scan.source_fingerprint
+            )
+            log.info(
+                "Adopted %s %s of scan %s (%d row(s) from before the "
+                "fingerprint column)",
+                label,
+                rows[0].run,
+                scan.pk,
+                len(blank),
+            )
+            continue
+        log.info(
+            "Started %s %s for scan %s over %d shard(s) (%d carried)",
+            label,
+            rows[0].run,
+            scan.pk,
+            len(rows),
+            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
+        )
+        started += 1
+    return started
+
+
 def ensure_shard_jobs(
     scan,
     manifest: dict,
