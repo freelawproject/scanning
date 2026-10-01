@@ -1561,8 +1561,8 @@ class TestThePass(OpinionOcrTestCase):
         self.assertTrue(opinion_ocr.is_written(self.opinion))
 
     def test_a_dead_engine_run_holds_nothing(self):
-        """A FAILED Mistral run brings no read; only a person restarts
-        it, so it must not hold the glue for good."""
+        """A FAILED Mistral run brings no read and no tick restarts it,
+        so it must not hold the glue for good."""
         self.apply_run.extract_key = ""
         self.apply_run.save(update_fields=["extract_key"])
         ExternalJobFactory(
