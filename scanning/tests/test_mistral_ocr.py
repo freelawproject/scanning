@@ -1076,13 +1076,16 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         self.committed.assert_not_called()
 
     def test_a_status_outside_the_sweep_is_left_alone(self):
-        # Review 1 included: the read waits for its approval (#341).
+        # Review 1 included: the read waits for its approval (#341). An
+        # approved volume too: its opinions are glued, and no pass
+        # glues them again for a late read.
         for status in (
             Status.QUEUED,
             Status.PROCESSING,
             Status.AWAITING,
             Status.AWAITING_VALIDATION,
             Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
             Status.ERROR,
             Status.APPROVED,
         ):
@@ -1092,12 +1095,10 @@ class TestEnqueueMissingRuns(ScanningTestCase):
                 self.assertEqual(extract_jobs(scan), [])
 
     def test_every_sweep_status_is_swept(self):
-        # From the review-1 approval through REDACTION_REVIEW_DONE,
-        # when the read is consumed (#341).
+        # Between the review-1 approval and the review-2 approval.
         for status in (
             Status.PAGE_COMPLETENESS_REVIEW_DONE,
             Status.READY_FOR_REDACTION_REVIEW,
-            Status.REDACTION_REVIEW_DONE,
         ):
             with self.subTest(status=status):
                 scan = self._scan(status=status)

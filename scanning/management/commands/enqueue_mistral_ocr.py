@@ -7,7 +7,10 @@ is paid. This command is that staff decision, and the way in the staff
 button of #191 was until #341 removed it. It covers what the sweep
 leaves alone on purpose: one volume whose run died, a Mistral outage
 that failed many volumes at once, and a named volume in a status the
-sweep does not read.
+sweep does not read. The last is how an approved volume
+(``REDACTION_REVIEW_DONE``) gets its read: its opinions were glued
+without Mistral, so run ``reglue_opinion_ocr`` on it once the read is
+glued, or the paid text reaches no opinion.
 
 It calls ``mistral_ocr.ensure_extract_jobs``, which replaces a run that
 holds a dead row and carries every shard whose result is still in the
