@@ -42,7 +42,10 @@ module never removes a hyphen.
 **The footnotes** (:func:`footnotes`) are a list keyed by label: a
 group that starts with a label starts a footnote, and a group with no
 label goes on with the footnote before it, as a paragraph of its own
-or joined to the last one by the same rule.
+or joined to the last one by the same rule. A concurrence or a dissent
+can number its notes from 1 again (#442), so a small number after a
+larger one starts a footnote where the marks of the body start again
+too, and a label repeats in the list.
 
 Everything here reads the ensemble document alone and imports no
 Django module (``test_paragraphs`` pins that), so a better rule is a
@@ -58,7 +61,7 @@ APPROVED_SCHEMA = 1
 #: Version of the join rule and of the footnote rule. It is in the
 #: object and in its key: raise it when the same ensemble document
 #: gives another text.
-JOIN_RULE = 1
+JOIN_RULE = 2
 
 #: What a join writes between two groups: a line break, never a space,
 #: so the dehyphenation downstream reads the two edges as one.
@@ -444,13 +447,65 @@ def _is_next_label(label: str, last: int | None) -> bool:
     return last < int(label) <= last + LABEL_STEP
 
 
+def _starts_again(label: str, last: int | None) -> bool:
+    """Return whether a number starts the numbers again (#442).
+
+    A sub-opinion numbers its notes from 1, or from the next number a
+    redaction left, so the number is at most ``LABEL_STEP`` and not
+    above the last label.
+    """
+    return (
+        label.isdigit()
+        and last is not None
+        and int(label) <= min(last, LABEL_STEP)
+    )
+
+
+def mark_restarts(document: dict) -> int:
+    """Return how many times the footnote marks of the body start again.
+
+    A mark is a ``sup`` mark whose text is a number alone, in the order
+    of the body flow. It starts the numbers again when it passes
+    :func:`_starts_again` over the mark before it: the first note of a
+    concurrence or a dissent that numbers its notes from 1 (#442). An
+    engine that marked no ``sup`` gives no restart, and the footnotes
+    keep the rule of one series.
+
+    :param document: The ensemble document.
+    :returns: The count.
+    :rtype: int
+    """
+    count = 0
+    last = None
+    for item in _flow(document, BODY_SECTION):
+        group = item.get("group")
+        if group is None:
+            continue
+        text = group.get("text") or ""
+        for mark in sorted(
+            (m for m in group.get("marks") or [] if m.get("kind") == "sup"),
+            key=lambda m: m["start"],
+        ):
+            found = _LABEL_ALONE.match(text[mark["start"] : mark["end"]])
+            if not found or not found.group(1).isdigit():
+                continue
+            if _starts_again(found.group(1), last):
+                count += 1
+            last = int(found.group(1))
+    return count
+
+
 def footnotes(document: dict) -> list[dict]:
     """Return the footnotes of an opinion, a list keyed by label.
 
     A group that starts with a label starts a footnote. A group with no
     label goes on with the footnote before it: the first footnote group
     of a page with no label is the rest of the last footnote of the
-    page before, the rule of the legacy pipeline. It is joined to the
+    page before, the rule of the legacy pipeline. A label that starts
+    the numbers again (:func:`_starts_again`) starts a footnote once for
+    each restart of the body marks (:func:`mark_restarts`), so the
+    first note of a dissent numbered from 1 is a note and not the rest
+    of the last note of the majority. It is joined to the
     last paragraph of that footnote by the rule of :func:`body`, or it
     is a paragraph of its own. A group before any label has no footnote
     to go on with, so it is a footnote with ``label`` None, and no text
@@ -463,12 +518,20 @@ def footnotes(document: dict) -> list[dict]:
     notes: list[dict] = []
     last_number = None
     before = None
+    restarts = mark_restarts(document)
     for item in _flow(document, FOOTNOTE_SECTION):
         if "group" not in item:
             before = item
             continue
         split = split_label(item["group"])
-        if split and _is_next_label(split[0], last_number):
+        again = (
+            split is not None
+            and restarts > 0
+            and _starts_again(split[0], last_number)
+        )
+        if split and (again or _is_next_label(split[0], last_number)):
+            if again:
+                restarts -= 1
             label, text, marks = split
             if label.isdigit():
                 last_number = int(label)

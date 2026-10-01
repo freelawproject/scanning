@@ -544,6 +544,117 @@ class TestTheFootnotes(TestCase):
             [n["label"] for n in paragraphs.footnotes(doc)], ["3", "5"]
         )
 
+    @staticmethod
+    def cited(gid, text, label, column="L"):
+        """A body group that ends in the footnote mark ``label``."""
+        return group(
+            gid,
+            f"{text}{label}",
+            column=column,
+            marks=[
+                {
+                    "start": len(text),
+                    "end": len(text) + len(label),
+                    "kind": "sup",
+                }
+            ],
+        )
+
+    def test_a_dissent_that_numbers_from_one_again_starts_a_note(self):
+        """A concurrence or a dissent numbers its notes from 1 (#442)."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "1. The first note."),
+                    self.note(3, "2. The second note.", column="R"),
+                ],
+            ),
+            page(
+                1,
+                [
+                    group(0, "Jones, J., dissenting."),
+                    self.cited(1, "I would reverse.", "1"),
+                    self.note(2, "1. The dissent's note."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["1", "2", "1"])
+        self.assertEqual(
+            notes[2]["paragraphs"][0]["text"], "The dissent's note."
+        )
+        self.assertEqual(paragraphs.mark_restarts(doc), 1)
+
+    def test_with_no_restart_of_the_marks_a_small_number_is_text(self):
+        """The rule of one series stands where the body numbers on: a
+        continuation can start with a small number."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "2. The rule has"),
+                ],
+            ),
+            page(1, [self.note(0, "1 exception.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "2")
+        self.assertEqual(
+            note["paragraphs"][0]["text"], "The rule has\n1 exception."
+        )
+
+    def test_a_restart_is_taken_once(self):
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.cited(2, "I would reverse.", "1"),
+                    self.note(3, "1. One."),
+                    self.note(4, "2. Two."),
+                    self.note(5, "1. The dissent's."),
+                    self.note(6, "1 more of it.", column="R"),
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            [n["label"] for n in paragraphs.footnotes(doc)], ["1", "2", "1"]
+        )
+
+    def test_a_restart_past_a_redacted_note(self):
+        """The dissent's note 1 went with a redaction: it starts at 2."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "Again.", "2"),
+                    self.cited(2, "Thrice.", "3"),
+                    self.cited(3, "I would reverse.", "2"),
+                    self.note(4, "1. One."),
+                    self.note(5, "2. Two."),
+                    self.note(6, "3. Three."),
+                    self.note(7, "2. The dissent's second."),
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            [n["label"] for n in paragraphs.footnotes(doc)],
+            ["1", "2", "3", "2"],
+        )
+
     def test_the_body_holds_no_footnote(self):
         doc = document(page(0, [group(0, "Body."), self.note(1, "1. Note.")]))
 

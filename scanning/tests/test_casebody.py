@@ -14,6 +14,7 @@ import json
 import pathlib
 import re
 import xml.etree.ElementTree as ET
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.urls import reverse
@@ -200,11 +201,14 @@ class TestTheHeadMatter(TestCase):
             span(3, 0, 22, "author"),
         )
 
-        self.assertEqual([c.tag for c in root], ["parties", "opinion"])
         self.assertEqual(
-            [c.tag for c in root.find("opinion")],
-            ["p", "p", "author", "p"],
+            [c.tag for c in root], ["parties", "opinion", "opinion"]
         )
+        majority, dissent = root.findall("opinion")
+        self.assertEqual(majority.get("type"), "majority")
+        self.assertEqual([c.tag for c in majority], ["p", "p"])
+        self.assertEqual(dissent.get("type"), "dissent")
+        self.assertEqual([c.tag for c in dissent], ["author", "p"])
 
     def test_an_untagged_caption_line_does_not_end_the_head_matter(self):
         """The tagger missed a line of the caption: the caption labels
@@ -253,12 +257,12 @@ class TestTheHeadMatter(TestCase):
         )
 
         self.assertEqual(
-            [c.tag for c in root], ["parties", "p", "court", "opinion"]
+            [c.tag for c in root],
+            ["parties", "p", "court", "opinion", "opinion"],
         )
-        self.assertEqual(
-            [c.tag for c in root.find("opinion")],
-            ["p", "p", "judges", "author", "p"],
-        )
+        majority, dissent = root.findall("opinion")
+        self.assertEqual([c.tag for c in majority], ["p", "p", "judges"])
+        self.assertEqual([c.tag for c in dissent], ["author", "p"])
 
     def test_a_caption_label_inside_the_text_is_no_caption_line(self):
         """A per curiam, a date the tagger read in its text, and a
@@ -280,7 +284,9 @@ class TestTheHeadMatter(TestCase):
             span(4, 0, 22, "author"),
         )
 
-        self.assertEqual([c.tag for c in root], ["parties", "opinion"])
+        self.assertEqual(
+            [c.tag for c in root], ["parties", "opinion", "opinion"]
+        )
         paragraph = root.find("opinion")[2]
         self.assertEqual(paragraph.find("otherdate").text, "June 1, 2020")
 
@@ -633,39 +639,371 @@ class TestTheFootnoteLinks(TestCase):
         html_ = self.display("The rule.1", [(9, 10)], ["1"])
 
         self.assertIn(
-            '<sup class="cb-fnmark" id="cb-fn-1-ref-1" title="footnotemark">'
-            '<a href="#cb-fn-1">1</a></sup>',
+            '<sup class="cb-fnmark" id="cb-fn-1-1-ref-1" '
+            'title="footnotemark"><a href="#cb-fn-1-1">1</a></sup>',
             html_,
         )
-        self.assertIn('<div class="cb-fn" id="cb-fn-1">', html_)
+        self.assertIn('<div class="cb-fn" id="cb-fn-1-1">', html_)
         self.assertIn(
-            '<a href="#cb-fn-1-ref-1" title="Back to the text">1</a>', html_
+            '<a href="#cb-fn-1-1-ref-1" title="Back to the text">1</a>', html_
         )
 
     def test_a_note_two_marks_cite_links_back_to_each(self):
         html_ = self.display("A.1 B.1", [(2, 3), (6, 7)], ["1"])
 
-        self.assertIn('id="cb-fn-1-ref-2"', html_)
-        self.assertIn('href="#cb-fn-1-ref-2"', html_)
+        self.assertIn('id="cb-fn-1-1-ref-2"', html_)
+        self.assertIn('href="#cb-fn-1-1-ref-2"', html_)
 
     def test_a_note_no_mark_cites_has_no_back_link(self):
         html_ = self.display("No mark.", [], ["1"])
 
         self.assertIn(
-            '<div class="cb-fn" id="cb-fn-1"><span class="cb-lbl">1</span>',
+            '<div class="cb-fn" id="cb-fn-1-1"><span class="cb-lbl">1</span>',
             html_,
         )
 
     def test_a_symbol_label_gives_an_id(self):
         html_ = self.display("The rule.*", [(9, 10)], ["*"])
 
-        self.assertIn('href="#cb-fn-_2a"', html_)
-        self.assertIn('id="cb-fn-_2a"', html_)
+        self.assertIn('href="#cb-fn-1-_2a"', html_)
+        self.assertIn('id="cb-fn-1-_2a"', html_)
 
     def test_a_second_note_of_one_label_is_no_target(self):
         html_ = self.display("The rule.1", [(9, 10)], ["1", "1"])
 
-        self.assertEqual(html_.count('id="cb-fn-1"'), 1)
+        self.assertEqual(html_.count('id="cb-fn-1-1"'), 1)
+
+
+def note(label, *, pages=(0,), text="A note."):
+    return {"label": label, "pages": list(pages), "paragraphs": [para(text)]}
+
+
+def sup_para(text, label, **fields):
+    """A paragraph that ends in the footnote mark ``label``."""
+    return para(
+        f"{text}{label}",
+        marks=[mark(len(text), len(text) + len(label), "sup")],
+        **fields,
+    )
+
+
+class TestTheSubOpinions(TestCase):
+    """One ``opinion`` per writing of the cluster, with its type (#442)."""
+
+    def types(self, *body, spans=()):
+        _xml, root = build(doc(*body), *spans)
+        return [o.get("type") for o in root.findall("opinion")]
+
+    def test_an_author_line_with_its_role_starts_a_writing(self):
+        _xml, root = build(
+            doc(
+                para("Smith, J."),
+                para("We affirm."),
+                para("Jones, J., dissenting."),
+                para("I would reverse."),
+            ),
+            span(0, 0, 9, "author"),
+            span(2, 0, 22, "author"),
+        )
+
+        majority, dissent = root.findall("opinion")
+        self.assertEqual(majority.get("type"), "majority")
+        self.assertEqual([c.tag for c in majority], ["author", "p"])
+        self.assertEqual(dissent.get("type"), "dissent")
+        self.assertEqual(dissent.find("author").text, "Jones, J., dissenting.")
+
+    def test_the_role_in_the_next_paragraph_is_read(self):
+        """The CAP shape of Palsgraf: ``<author>`` then "(dissenting)."."""
+        self.assertEqual(
+            self.types(
+                para("Cardozo, Ch. J."),
+                para("We reverse."),
+                para("Andrews, J."),
+                para("(dissenting). Assisting a passenger to board a train."),
+                spans=[span(0, 0, 15, "author"), span(2, 0, 11, "author")],
+            ),
+            ["majority", "dissent"],
+        )
+
+    def test_the_role_in_the_rest_of_the_author_paragraph_is_read(self):
+        text = "Andrews, J. (dissenting). Assisting a passenger."
+        self.assertEqual(
+            self.types(
+                para("Cardozo, Ch. J."),
+                para("We reverse."),
+                para(text),
+                spans=[span(0, 0, 15, "author"), span(2, 0, 11, "author")],
+            ),
+            ["majority", "dissent"],
+        )
+
+    def test_a_role_later_in_the_next_sentence_is_text_not_a_role(self):
+        """The majority's author line, then a sentence that names a role
+        in its middle: one writing."""
+        self.assertEqual(
+            self.types(
+                para("OPINION"),
+                para("Smith, J."),
+                para("We concur with the trial court that the claim fails."),
+                spans=[span(1, 0, 9, "author")],
+            ),
+            ["majority"],
+        )
+
+    def test_the_types_of_a_partial_dissent(self):
+        for line in (
+            "Ciklin, J., concurring in part and dissenting in part.",
+            "Ciklin, J., dissenting in part and concurring in part.",
+            "Ciklin, J., concurring in part, dissenting in part.",
+            "Ciklin, J., dissenting in part.",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(
+                    self.types(
+                        para("Gerber, J."),
+                        para("We affirm."),
+                        para(line),
+                        spans=[
+                            span(0, 0, 10, "author"),
+                            span(2, 0, len(line), "author"),
+                        ],
+                    ),
+                    ["majority", casebody.IN_PART],
+                )
+
+    def test_the_first_role_word_decides(self):
+        cases = {
+            "Jones, J., dissenting, in which Smith, J., concurs.": "dissent",
+            "Jones, J., specially concurring.": "concurrence",
+            "Jones, J., concurring in the result.": "concurrence",
+        }
+        for line, expected in cases.items():
+            with self.subTest(line=line):
+                self.assertEqual(
+                    self.types(
+                        para("Gerber, J."),
+                        para("We affirm."),
+                        para(line),
+                        spans=[
+                            span(0, 0, 10, "author"),
+                            span(2, 0, len(line), "author"),
+                        ],
+                    )[1],
+                    expected,
+                )
+
+    def test_a_stage_of_the_case_is_read_from_its_heading(self):
+        self.assertEqual(
+            self.types(
+                para("Gerber, J."),
+                para("We affirm."),
+                para("ON PETITION FOR REHEARING", kind="heading"),
+                para("PER CURIAM."),
+                para("The petition is denied."),
+                spans=[span(0, 0, 10, "author"), span(3, 0, 11, "author")],
+            ),
+            ["majority", "rehearing"],
+        )
+
+    def test_a_vote_line_cut_into_author_spans_starts_nothing(self):
+        """Scan 3593, opinion 826.0: the tagger cuts the vote line into
+        ``judges`` and ``author`` spans of a word or two."""
+        line = "Ciklin, J., concurs in part and dissents in part with opinion."
+        self.assertEqual(
+            self.types(
+                para("Gerber, J."),
+                para("We affirm."),
+                para(line),
+                spans=[
+                    span(0, 0, 10, "author"),
+                    span(2, 0, 19, "judges"),
+                    span(2, 20, 22, "author"),
+                    span(2, 28, 31, "author"),
+                ],
+            ),
+            ["majority"],
+        )
+
+    def test_a_plurality_says_so(self):
+        line = "Smith, J., announced the judgment and delivered a plurality opinion."
+        self.assertEqual(
+            self.types(
+                para(line),
+                para("We affirm."),
+                spans=[span(0, 0, len(line), "author")],
+            ),
+            ["plurality"],
+        )
+
+    def test_a_writing_whose_type_is_not_read_refuses_the_xml(self):
+        with self.assertRaises(casebody.OpinionTypeError) as caught:
+            build(
+                doc(
+                    para("Gerber, J."),
+                    para("We affirm."),
+                    para("Jones, J., dissenting."),
+                    para("I would reverse."),
+                    para("Brown, J."),
+                    para("The majority is right in part."),
+                ),
+                span(0, 0, 10, "author"),
+                span(2, 0, 22, "author"),
+                span(4, 0, 9, "author"),
+            )
+
+        self.assertIn("brown, j.", str(caught.exception))
+        self.assertIsInstance(caught.exception, casebody.CasebodyError)
+
+    def test_every_type_is_a_key_of_the_courtlistener_map(self):
+        """The keys of ``harvard_opinions.map_opinion_type``, spelled here
+        at courtlistener 58784cac: a value outside them is ``combined``
+        in one importer and an error in the other."""
+        harvard_keys = {
+            "unanimous",
+            "majority",
+            "plurality",
+            "concurrence",
+            "concurring-in-part-and-dissenting-in-part",
+            "dissent",
+            "remittitur",
+            "rehearing",
+            "on-the-merits",
+            "on-motion-to-strike-cost-bill",
+        }
+        self.assertEqual(casebody.CL_TYPES, harvard_keys)
+        tables = casebody.OPINION_TYPES + casebody.FIRST_OPINION_TYPES
+        values = {value for _pattern, value in tables if value}
+        self.assertLessEqual(
+            values | casebody.SEPARATE_TYPES | {casebody.MAJORITY},
+            harvard_keys,
+        )
+        self.assertEqual(set(casebody.TYPE_NAMES), harvard_keys)
+
+
+class TestTheSubOpinionFootnotes(TestCase):
+    """A footnote goes to the writing that holds its mark (#442)."""
+
+    def opinions(self, body, notes, spans):
+        _xml, root = build(doc(*body, footnotes=notes), *spans)
+        return [
+            [n.get("label") for n in o.findall("footnote")]
+            for o in root.findall("opinion")
+        ]
+
+    def test_a_note_goes_to_the_writing_of_its_mark(self):
+        self.assertEqual(
+            self.opinions(
+                [
+                    para("Gerber, J."),
+                    sup_para("We affirm.", "1"),
+                    para("Jones, J., dissenting."),
+                    sup_para("I would reverse.", "2"),
+                ],
+                [note("1"), note("2")],
+                [span(0, 0, 10, "author"), span(2, 0, 22, "author")],
+            ),
+            [["1"], ["2"]],
+        )
+
+    def test_a_dissent_that_numbers_from_one_again_takes_its_own_notes(self):
+        self.assertEqual(
+            self.opinions(
+                [
+                    para("Gerber, J."),
+                    sup_para("We affirm.", "1"),
+                    sup_para("For two reasons.", "2"),
+                    para("Jones, J., dissenting."),
+                    sup_para("I would reverse.", "1"),
+                ],
+                [note("1"), note("2"), note("1")],
+                [span(0, 0, 10, "author"), span(3, 0, 22, "author")],
+            ),
+            [["1", "2"], ["1"]],
+        )
+
+    def test_a_note_with_no_mark_goes_by_its_page(self):
+        self.assertEqual(
+            self.opinions(
+                [
+                    para("Gerber, J."),
+                    sup_para("We affirm.", "1"),
+                    para("Jones, J., dissenting.", pages=(1,)),
+                    para("I would reverse.", pages=(1,)),
+                ],
+                [note("1"), note("2", pages=(1,))],
+                [span(0, 0, 10, "author"), span(2, 0, 22, "author")],
+            ),
+            [["1"], ["2"]],
+        )
+
+    def test_the_display_scopes_the_note_ids_by_writing(self):
+        xml, _root = build(
+            doc(
+                para("Gerber, J."),
+                sup_para("We affirm.", "1"),
+                para("Jones, J., dissenting."),
+                sup_para("I would reverse.", "1"),
+                footnotes=[note("1"), note("1", text="The other note.")],
+            ),
+            span(0, 0, 10, "author"),
+            span(2, 0, 22, "author"),
+        )
+
+        display = casebody.display_html(xml)
+
+        ids = re.findall(r'id="([^"]+)"', display)
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertIn('href="#cb-fn-2-1"', display)
+        self.assertIn('<div class="cb-fn" id="cb-fn-2-1">', display)
+        self.assertIn('<nav class="cb-opinions"', display)
+        self.assertIn(
+            '<a href="#cb-op-2">Dissent — Jones, J., dissenting.</a>', display
+        )
+        self.assertIn('id="cb-op-1" data-type="majority"', display)
+
+    def test_one_writing_has_no_nav(self):
+        xml, _root = build(
+            doc(para("Gerber, J."), para("We affirm.")),
+            span(0, 0, 10, "author"),
+        )
+
+        self.assertNotIn("cb-opinions", casebody.display_html(xml))
+
+
+class TestTheClusterSample(TestCase):
+    """Scan 3593, opinion 826.0: the cluster of the issue (#442)."""
+
+    def setUp(self):
+        approved = json.loads(
+            (FIXTURES / "approved.so3d.388.826.json").read_text()
+        )
+        tags = json.loads((FIXTURES / "tags.so3d.388.826.json").read_text())
+        self.root = ET.fromstring(casebody.build(approved, tags))
+
+    def test_a_majority_and_a_partial_dissent(self):
+        majority, partial = self.root.findall("opinion")
+
+        self.assertEqual(majority.get("type"), "majority")
+        self.assertEqual(majority.find("author").text, "Gerber, J.")
+        self.assertEqual(partial.get("type"), casebody.IN_PART)
+        self.assertEqual(
+            partial.find("author").text,
+            "Ciklin, J., concurring in part and dissenting in part.",
+        )
+
+    def test_the_vote_line_stays_in_the_majority(self):
+        majority = self.root.findall("opinion")[0]
+        last = "".join(majority[-1].itertext())
+
+        self.assertTrue(last.startswith("Ciklin, J., concurs in part"))
+
+    def test_the_notes_are_the_partial_dissents(self):
+        majority, partial = self.root.findall("opinion")
+
+        self.assertEqual(majority.findall("footnote"), [])
+        self.assertEqual(
+            [n.get("label") for n in partial.findall("footnote")], ["1", "2"]
+        )
 
 
 class TestTheSourceView(TestCase):
@@ -797,6 +1135,25 @@ class TestTheFinalXmlRoutes(_S3Case):
         self.assertContains(response, 'id="pane-reading"')
         self.assertContains(response, 'id="pane-xml"')
         self.assertContains(response, 'data-role="parties"')
+
+    def test_a_type_that_is_not_read_is_a_409_that_says_why(self):
+        """The words are the opinion's own, so the answer says them, and
+        the log is an error so that a developer is told (#442)."""
+        self.tagged()
+        with (
+            patch.object(
+                casebody,
+                "build",
+                side_effect=casebody.OpinionTypeError("'brown, j.'"),
+            ),
+            self.assertLogs("scanning.views_process", level="ERROR") as logs,
+        ):
+            response = self.client.get(self.url("serve_opinion_final_xml"))
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("brown, j.", response.json()["message"])
+        self.assertIn("does not read yet", response.json()["message"])
+        self.assertIn("brown, j.", logs.output[0])
 
     def test_spans_that_do_not_fit_the_text_are_a_409(self):
         self.tagged()
