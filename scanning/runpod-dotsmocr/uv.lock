@@ -754,7 +754,7 @@ wheels = [
 [[package]]
 name = "dots-mocr"
 version = "1.0"
-source = { git = "https://github.com/rednote-hilab/dots.mocr.git?rev=23f3e5612fb8066d4034d5ecfc8f33a9243533eb#23f3e5612fb8066d4034d5ecfc8f33a9243533eb" }
+source = { git = "https://github.com/freelawproject/dots.mocr.git?rev=23f3e5612fb8066d4034d5ecfc8f33a9243533eb#23f3e5612fb8066d4034d5ecfc8f33a9243533eb" }
 dependencies = [
     { name = "cairosvg" },
     { name = "openai" },
@@ -784,7 +784,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cairosvg" },
-    { name = "dots-mocr", git = "https://github.com/rednote-hilab/dots.mocr.git?rev=23f3e5612fb8066d4034d5ecfc8f33a9243533eb" },
+    { name = "dots-mocr", git = "https://github.com/freelawproject/dots.mocr.git?rev=23f3e5612fb8066d4034d5ecfc8f33a9243533eb" },
     { name = "numpy" },
     { name = "openai", specifier = ">=1.5" },
     { name = "pillow", specifier = ">=10" },

@@ -2,7 +2,7 @@
 #
 # GPU worker image for RunPod Serverless: Surya OCR 2 full-page reads.
 #
-# Runs datalab-to/surya-ocr-2 (a Qwen3.5-based vision-language OCR
+# Runs freelawproject/surya-ocr-2 (our fork of datalab-to/surya-ocr-2, a Qwen3.5-based vision-language OCR
 # model) behind a local vLLM server, driven by handler.py. No Django,
 # no AWS credentials, no DB client. Model weights are baked in so cold
 # start skips the network.
@@ -63,7 +63,8 @@ WORKDIR /app
 # between releases, and a build must not break just because the probe
 # went stale. In that case it warns and the runtime health check
 # remains the backstop.
-ARG SURYA_MODEL=datalab-to/surya-ocr-2
+ARG SURYA_MODEL=freelawproject/surya-ocr-2
+ARG SURYA_REVISION=a292bd0b75862efb8a0c6eed682d1003ba2dfd1d
 ARG SURYA_ARCH=Qwen3_5ForConditionalGeneration
 RUN python3 - <<PY
 import sys
@@ -99,16 +100,28 @@ PY
 # Deliberately ordered BEFORE the handler venv: the weights only need
 # the base image, so a dependency bump in pyproject/uv.lock rebuilds
 # the (small) venv layer without re-downloading the weights.
+#
+# The snapshot comes from our fork, pinned to a commit, so a deleted or
+# rewritten upstream repo cannot break a build (#438). A download by
+# commit writes no ``refs/main``, and the offline runtime (and the load
+# gate below) resolves the bare repo id through it, so the build writes
+# that ref by hand. A new model is a new SURYA_REVISION.
+# The retry loop exits 0 whatever its last try did, so the check after
+# it resolves the bare id offline, as the worker does, and fails the
+# build unless it lands on the pinned commit.
 ENV SURYA_MODEL=${SURYA_MODEL}
 RUN set -e; \
     for i in 1 2 3; do \
-      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('${SURYA_MODEL}', ignore_patterns=['assets/*', '*.png', '.eval_results/*'])" \
+      python3 -c "import pathlib; from huggingface_hub import snapshot_download; snap = pathlib.Path(snapshot_download('${SURYA_MODEL}', revision='${SURYA_REVISION}', ignore_patterns=['assets/*', '*.png', '.eval_results/*'])); ref = snap.parent.parent / 'refs' / 'main'; ref.parent.mkdir(exist_ok=True); ref.write_text('${SURYA_REVISION}')" \
         && break; \
       echo "snapshot_download attempt $i failed; sleeping 10s"; \
       sleep 10; \
     done \
  && python3 -c "\
 import pathlib; \
+from huggingface_hub import snapshot_download; \
+snap = pathlib.Path(snapshot_download('${SURYA_MODEL}', local_files_only=True, ignore_patterns=['assets/*', '*.png', '.eval_results/*'])); \
+assert snap.name == '${SURYA_REVISION}', f'bare repo id resolves to {snap.name}, not the pinned revision'; \
 files = list(pathlib.Path('/opt/hf').rglob('*.safetensors')); \
 total = sum(f.stat().st_size for f in files); \
 assert total > 1_200_000_000, f'weights missing or truncated: {total} bytes in {len(files)} files'; \
