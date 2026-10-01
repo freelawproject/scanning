@@ -160,21 +160,23 @@ MAX_SUBMITS_PER_TICK = 1
 #: row's first claim (#218), so a backlog of waiting rows expires none.
 SWEEP_SCANS_PER_TICK = 2
 
-#: The scan statuses the sweep reads a volume in (#341): from the
-#: review-1 approval on, never before it. Review 1 decides which pages
-#: and which volumes are kept, so a read after it pays for no page a
-#: curator deletes and no volume nobody finishes; the read then runs
-#: while review 2 does, and is usually glued by the time the opinion
-#: OCR documents want it. ``REDACTION_REVIEW_DONE`` is in it because
-#: that is when the read is consumed: a volume approved before the
-#: sweep reached it still owes it, or its opinions hold two engines and
-#: the ensemble, which wants three, never takes them. The price is the
+#: The scan statuses the sweep reads a volume in (#341): between the
+#: review-1 approval and the review-2 approval. Review 1 decides which
+#: pages and which volumes are kept, so a read after it pays for no
+#: page a curator deletes and no volume nobody finishes; the read then
+#: runs while review 2 does, and a live run holds the opinion OCR glue
+#: (``opinion_ocr.engines_owed``) until it lands. The price is the
 #: page-number fill of #351, which reads Mistral only in review 1.
+#:
+#: ``REDACTION_REVIEW_DONE`` is out on purpose. Its opinions are glued
+#: within a tick or two of the approval, and no pass glues them again
+#: when a late engine lands, so a read of an approved volume is paid
+#: for text nothing uses. Such a volume is read by a person, who names
+#: it to ``enqueue_mistral_ocr`` and then runs ``reglue_opinion_ocr``.
 SWEEP_STATUSES = frozenset(
     {
         Status.PAGE_COMPLETENESS_REVIEW_DONE,
         Status.READY_FOR_REDACTION_REVIEW,
-        Status.REDACTION_REVIEW_DONE,
     }
 )
 

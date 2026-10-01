@@ -113,16 +113,23 @@ class TestEnqueueMistralOcr(TestCase):
             2,
         )
 
-    def test_a_volume_past_review_2_is_in_dead_runs(self):
-        # The sweep's statuses, REDACTION_REVIEW_DONE included.
-        scan = self._scan_with_run(status=Status.REDACTION_REVIEW_DONE)
+    def test_a_volume_in_review_2_is_in_dead_runs(self):
+        scan = self._scan_with_run(status=Status.READY_FOR_REDACTION_REVIEW)
         self._call("--dead-runs")
         self.assertEqual(mistral_ocr.live_extract_jobs(scan)[0].run, 2)
 
+    def test_a_named_approved_volume_gets_its_read(self):
+        # The backlog path: its opinions are glued, so the sweep leaves
+        # it alone, and a person names it.
+        scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE, page_count=20)
+        self._call(str(scan.pk))
+        self.assertEqual(len(mistral_ocr.live_extract_jobs(scan)), 2)
+
     def test_a_volume_out_of_the_sweep_is_out_of_dead_runs(self):
-        # Review 1 and a legacy status alike.
+        # Review 1, an approved volume and a legacy status alike.
         for status in (
             Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
             Status.APPROVED,
         ):
             with self.subTest(status=status):
