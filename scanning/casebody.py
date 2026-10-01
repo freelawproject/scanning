@@ -12,10 +12,19 @@ Two inputs, and nothing else:
 :func:`build` merges them into one XML document in the shape of the
 CAP casebody, the shape CourtListener reads (``harvard_opinions.py``,
 #408): the head matter (``parties``, ``docketnumber``, ``court``,
-``decisiondate``, ``attorneys``, ...) before one ``opinion``, whose
-paragraphs carry the marks of the approved text, the ``page-number``
-of every page the text crosses, and the ``footnote`` elements at its
-end.
+``decisiondate``, ``attorneys``, ...) before one ``opinion`` for each
+writing of the cluster (#442), whose paragraphs carry the marks of the
+approved text, the ``page-number`` of every page the text crosses, and
+the ``footnote`` elements of that writing at its end.
+
+**A writing starts at its author.** The majority starts where the head
+matter ends (:func:`head_matter_end`); a concurrence or a dissent
+starts at an ``author`` span that starts its paragraph
+(:func:`opinion_starts`), and its ``type`` is read from its words
+(:func:`opinion_type`, :data:`OPINION_TYPES`). A type the table does
+not read refuses the XML (:class:`OpinionTypeError`), never a guess,
+so a developer adds the phrase. A footnote goes to the writing that
+holds its mark (:func:`assign_footnotes`).
 
 **The spans are the tags, the approved text is the rest.** A span that
 covers a whole paragraph is that paragraph's element (``<court>``); a
@@ -92,6 +101,81 @@ STRUCTURE = frozenset({
     FOOTNOTE_MARK, PAGE_NUMBER,
 })  # fmt: skip
 
+#: The ``type`` of a CAP ``opinion`` (#442). Every value is a key of
+#: CourtListener's map from the Harvard type to ``Opinion.type``
+#: (``harvard_opinions.map_opinion_type`` and
+#: ``harvard_merge.HarvardConversionUtil.types_mapping``, which agree
+#: at courtlistener 58784cac); :data:`CL_TYPES` is that key set, and a
+#: test pins every type to it. A value outside it is ``combined`` in one
+#: importer and an error in the other.
+MAJORITY = "majority"
+PLURALITY = "plurality"
+UNANIMOUS = "unanimous"
+CONCURRENCE = "concurrence"
+IN_PART = "concurring-in-part-and-dissenting-in-part"
+DISSENT = "dissent"
+REHEARING = "rehearing"
+REMITTITUR = "remittitur"
+ON_THE_MERITS = "on-the-merits"
+ON_MOTION_TO_STRIKE = "on-motion-to-strike-cost-bill"
+CL_TYPES = frozenset({
+    UNANIMOUS, MAJORITY, PLURALITY, CONCURRENCE, IN_PART, DISSENT,
+    REMITTITUR, REHEARING, ON_THE_MERITS, ON_MOTION_TO_STRIKE,
+})  # fmt: skip
+
+#: The word forms of a role, a closed set: "concurrent" and
+#: "concurrently" are no role.
+_CONCUR = r"concur(?:s|red|ring|rence|rences)?\b"
+_DISSENT = r"dissent(?:s|ed|ing)?\b"
+#: The words of a writing that name its type, tried in this order over
+#: the folded text of :func:`role_text`. "Dissenting in part" alone is
+#: the type of both, the one CAP value of a partial dissent. Between
+#: ``concur`` and ``dissent`` the earlier word wins
+#: (:func:`opinion_type`), so "dissenting, in which X concurs" is a
+#: dissent. A stage of the case comes last: its heading can sit above
+#: the author of a dissent.
+OPINION_TYPES: tuple[tuple[re.Pattern, str], ...] = (
+    (
+        re.compile(
+            rf"\b{_CONCUR},? in part,? (?:and|&|but) {_DISSENT} in part\b"
+            rf"|\b{_DISSENT},? in part,? (?:and|&|but) {_CONCUR} in part\b"
+            rf"|\b{_DISSENT} in part\b"
+        ),
+        IN_PART,
+    ),
+    (re.compile(rf"\b(?:{_CONCUR}|{_DISSENT})"), ""),
+    (re.compile(r"\brehearing\b"), REHEARING),
+    (re.compile(r"\bon the merits\b"), ON_THE_MERITS),
+    (re.compile(r"\bremittitur\b"), REMITTITUR),
+    (re.compile(r"\bmotion to strike\b"), ON_MOTION_TO_STRIKE),
+)
+#: The start of a text after the author line that names its role:
+#: "(dissenting).", "concurring.", "I respectfully dissent." A sentence
+#: that names a role later ("We concur with the trial court that ...")
+#: is the opinion's text, not its role.
+_ROLE_LEAD = re.compile(
+    r"\(?\s*(?:i\s+(?:respectfully\s+)?|specially\s+)?"
+    rf"(?:{_CONCUR}|{_DISSENT})"
+)
+#: The types of a writing that end the one before it when its author
+#: line is the first after the head matter: a per curiam majority has no
+#: author line, and its first author is a concurrence's or a dissent's.
+SEPARATE_TYPES = frozenset({CONCURRENCE, IN_PART, DISSENT})
+#: The words of the first writing that make it other than the majority.
+FIRST_OPINION_TYPES: tuple[tuple[re.Pattern, str], ...] = (
+    (re.compile(r"\bplurality\b"), PLURALITY),
+    (re.compile(r"\bunanimous"), UNANIMOUS),
+)
+#: How much of the text after the author :func:`role_text` reads: its
+#: first sentence, cut at a period that does not end an abbreviation
+#: of a name or a title ("J.", "C. J.", "Mr.").
+_ROLE_REACH = 300
+_SENTENCE_STOP = re.compile(
+    r"(?<!\b[A-Z])(?<!\bJJ)(?<!\bMr)(?<!\bMrs)(?<!\bCh)(?<!\bJr)"
+    r"[.;:!?](?=\s|$)"
+)
+
+
 #: The layers of the inline elements, outermost first: a list item
 #: holds a span, and a span holds the marks of the approved text.
 _BLOCK, _SPAN, _INLINE = 0, 1, 2
@@ -123,6 +207,13 @@ def _covers(text: str, start: int, end: int) -> bool:
 
 class CasebodyError(Exception):
     """The spans do not describe the approved text."""
+
+
+class OpinionTypeError(CasebodyError):
+    """A writing whose words :data:`OPINION_TYPES` does not read (#442).
+
+    The view logs it as an error, so a developer adds the phrase.
+    """
 
 
 @dataclass
@@ -431,18 +522,293 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     return max(run, caption[-1] + 1) if caption else run
 
 
+def _starts_paragraph(text: str, span: dict) -> bool:
+    """Return whether a span starts at the first word of its paragraph."""
+    return not text[: span["start"]].strip(_EDGE)
+
+
+def opinion_starts(
+    body: list[dict], by: dict[int, list[dict]], split: int
+) -> list[int]:
+    """Return the first paragraph of every writing after the head matter.
+
+    A writing starts at an ``author`` span that starts its paragraph,
+    the author line of a concurrence or a dissent ("Ciklin, J.,
+    concurring in part and dissenting in part.", or "Andrews, J.
+    (dissenting). Assisting ..."). The vote line names its judges in
+    the middle of a sentence ("Ciklin, J., concurs in part and dissents
+    in part with opinion."), where the tagger cuts it into ``judges``
+    and ``author`` spans of a word or two (scan 3593, opinion 826.0);
+    none of those starts its paragraph, so none starts a writing.
+
+    The first entry is ``split`` whatever it holds. The first author
+    line after it starts a writing only where its words name a
+    concurrence or a dissent (:data:`SEPARATE_TYPES`): a per curiam
+    majority has no author line, and its first author is a dissent's;
+    an untagged line the head matter did not take ("OPINION") can come
+    before the majority's own author line. Every later author line
+    starts a writing.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
+    :param split: :func:`head_matter_end`.
+    :returns: The indexes, ``split`` first, rising.
+    :rtype: list[int]
+    """
+    starts = [split]
+    authors = [
+        index
+        for index in sorted(by)
+        if index >= split
+        and any(
+            span["label"] == AUTHOR
+            and _starts_paragraph(body[index].get("text") or "", span)
+            for span in by[index]
+        )
+    ]
+    if authors and authors[0] > split:
+        # The first author line ends the majority only when it names a
+        # concurrence or a dissent; else it is the majority's own, after
+        # an untagged line the head matter did not take ("OPINION").
+        words = role_text(body, by, authors[0])
+        if not any(
+            _type_of(words, OPINION_TYPES) == value for value in SEPARATE_TYPES
+        ):
+            authors = authors[1:]
+    starts.extend(index for index in authors if index > split)
+    return starts
+
+
+def _author_line(
+    body: list[dict], by: dict[int, list[dict]], start: int, end: int
+) -> int:
+    """Return the author line of the first writing, or ``start``.
+
+    The first writing can open with an untagged line the head matter did
+    not take ("OPINION") before its author line, and its type ("a
+    plurality opinion") is in that author line (:func:`opinion_starts`).
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param start: The first paragraph of the writing.
+    :param end: The first paragraph after it.
+    :returns: The first paragraph in that range that an ``author`` span
+        starts, or ``start`` when none does (a per curiam).
+    :rtype: int
+    """
+    return next(
+        (
+            index
+            for index in range(start, end)
+            if any(
+                span["label"] == AUTHOR
+                and _starts_paragraph(body[index].get("text") or "", span)
+                for span in by.get(index, [])
+            )
+        ),
+        start,
+    )
+
+
+def _first_sentence(text: str) -> str:
+    """Return the first sentence of a text, at most :data:`_ROLE_REACH`."""
+    text = text[:_ROLE_REACH]
+    stop = _SENTENCE_STOP.search(text)
+    return text[: stop.end()] if stop else text
+
+
+def role_text(body: list[dict], by: dict[int, list[dict]], index: int) -> str:
+    """Return the words that name the type of the writing at ``index``.
+
+    The author line, and the first sentence after it where that
+    sentence starts with a role (:data:`_ROLE_LEAD`): in the same
+    paragraph ("Andrews, J. (dissenting). Assisting ..."), or in the
+    next one when the author line is a paragraph of its own (the CAP
+    shape of Palsgraf, ``<author>`` then ``<p>(dissenting). ...``). A
+    heading just above the author goes first: a stage of the case
+    ("ON PETITION FOR REHEARING") is named there.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param index: The first paragraph of the writing.
+    :returns: The text, folded: lower case, one space between words.
+    :rtype: str
+    """
+    if index >= len(body):
+        return ""
+    text = body[index].get("text") or ""
+    author = next(
+        (
+            span
+            for span in by.get(index, [])
+            if span["label"] == AUTHOR and _starts_paragraph(text, span)
+        ),
+        None,
+    )
+    end = author["end"] if author else 0
+    parts = []
+    if index > 0 and body[index - 1].get("kind") == markup.HEADING:
+        parts.append(body[index - 1].get("text") or "")
+    parts.append(text[:end])
+    rest = text[end:]
+    if not rest.strip(_EDGE) and index + 1 < len(body):
+        rest = body[index + 1].get("text") or ""
+    sentence = _first_sentence(rest.lstrip(_EDGE))
+    if _ROLE_LEAD.match(sentence.lower()):
+        parts.append(sentence)
+    return " ".join(" ".join(parts).lower().split())
+
+
+def _type_of(words: str, table) -> str | None:
+    """Return the type of the first rule of ``table`` that ``words``
+    match, or None. The rule of no value is ``concur`` or ``dissent``,
+    whichever comes first."""
+    for pattern, value in table:
+        found = pattern.search(words)
+        if found:
+            if value:
+                return value
+            return (
+                DISSENT if found.group().startswith("dissent") else CONCURRENCE
+            )
+    return None
+
+
+def opinion_type(
+    body: list[dict], by: dict[int, list[dict]], index: int, first: bool
+) -> str:
+    """Return the CAP ``type`` of the writing that starts at ``index``.
+
+    The first writing is the majority, a plurality or a unanimous
+    opinion where its author line says so (:data:`FIRST_OPINION_TYPES`).
+    Every later one is read from its words by :data:`OPINION_TYPES`:
+    the first rule that matches decides, and the rule of ``concur`` and
+    ``dissent`` takes the word that comes first.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param index: The first paragraph of the writing.
+    :param first: Whether it is the first writing of the cluster.
+    :returns: A value of :data:`CL_TYPES`.
+    :rtype: str
+    :raises OpinionTypeError: When a later writing names no type the
+        table reads.
+    """
+    words = role_text(body, by, index)
+    if first:
+        return _type_of(words, FIRST_OPINION_TYPES) or MAJORITY
+    value = _type_of(words, OPINION_TYPES)
+    if value:
+        return value
+    raise OpinionTypeError(
+        f"paragraph {index} starts a writing whose type is not read: "
+        f"{words[:200]!r}"
+    )
+
+
+def footnote_marks(paragraph: dict, labels: frozenset[str]) -> list[str]:
+    """Return the footnote labels a paragraph cites, in order.
+
+    The rule of :data:`FOOTNOTE_MARK` in :func:`_paragraph`: a ``sup``
+    mark whose text is a footnote label.
+
+    :param paragraph: A body paragraph.
+    :param labels: The footnote labels.
+    :rtype: list[str]
+    """
+    text = paragraph.get("text") or ""
+    return [
+        text[mark["start"] : mark["end"]].strip()
+        for mark in sorted(
+            paragraph.get("marks") or [], key=lambda m: m.get("start", 0)
+        )
+        if mark.get("kind") == markup.SUP
+        and text[mark.get("start", 0) : mark.get("end", 0)].strip() in labels
+    ]
+
+
+def assign_footnotes(
+    body: list[dict], notes: list[dict], starts: list[int]
+) -> list[int]:
+    """Return the writing each footnote belongs to (#442).
+
+    A note goes to the first writing, at or after the writing of the
+    note before it, that holds a mark of its label no note took yet.
+    The walk never goes back, so a dissent that numbers its notes from
+    1 again takes its own note 1 (``paragraphs.mark_restarts`` keeps
+    that note apart in the approved text). The search stops at the
+    last of those writings that holds the note's first page: a note
+    whose mark is not a ``sup`` must not take the mark of the dissent's
+    note of the same label. A note with no such mark goes to the first
+    writing that holds its first page, and with no page to the writing
+    of the note before it.
+
+    :param body: The body paragraphs.
+    :param notes: The footnotes of the approved text, in reading order.
+    :param starts: :func:`opinion_starts`.
+    :returns: An index into ``starts`` for every note.
+    :rtype: list[int]
+    """
+    labels = frozenset(
+        str(note["label"]) for note in notes if note.get("label") is not None
+    )
+    bounds = list(zip(starts, [*starts[1:], len(body)], strict=True))
+    marks = []
+    pages = []
+    for start, end in bounds:
+        cited: dict[str, int] = {}
+        held: set = set()
+        for paragraph in body[start:end]:
+            for label in footnote_marks(paragraph, labels):
+                cited[label] = cited.get(label, 0) + 1
+            held.update(paragraph.get("pages") or [])
+        marks.append(cited)
+        pages.append(held)
+    owners = []
+    cursor = 0
+    for note in notes:
+        label = note.get("label")
+        first = (note.get("pages") or [None])[0]
+        holders = [
+            at for at in range(cursor, len(bounds)) if first in pages[at]
+        ]
+        # A mark never takes a note past the writings of its first page:
+        # a mark an engine did not read as ``sup`` would else send the
+        # note, and every note after it, to the next writing that holds
+        # a mark of the same label. The last of them is the bound, as a
+        # dissent can start in the middle of a page.
+        last = holders[-1] if holders else len(bounds) - 1
+        owner = next(
+            (
+                at
+                for at in range(cursor, last + 1)
+                if label is not None and marks[at].get(str(label), 0) > 0
+            ),
+            None,
+        )
+        if owner is not None:
+            marks[owner][str(label)] -= 1
+        else:
+            owner = holders[0] if holders else cursor
+        owners.append(owner)
+        cursor = owner
+    return owners
+
+
 def _comment(text: str) -> str:
     return "<!-- " + re.sub(r"-{2,}", "-", text) + " -->"
 
 
 def build(approved: dict, tags: dict) -> str:
-    """Return the final XML of one opinion.
+    """Return the final XML of one opinion: one ``opinion`` per writing.
 
     :param approved: The approved object (``paragraphs.approved_document``).
     :param tags: The spans object (``tagger.glue_run``).
     :returns: The XML document, one block element per line.
     :rtype: str
     :raises CasebodyError: When a span does not address the body.
+    :raises OpinionTypeError: When a writing names no type the table
+        reads (:func:`opinion_type`).
     """
     body = approved.get("body") or []
     by = _spans_by_paragraph(body, tags.get("spans") or [])
@@ -496,6 +862,18 @@ def build(approved: dict, tags: dict) -> str:
         return out
 
     split = head_matter_end(body, by)
+    starts = opinion_starts(body, by, split)
+    ends = [*starts[1:], len(body)]
+    types = [
+        opinion_type(
+            body,
+            by,
+            _author_line(body, by, start, end) if at == 0 else start,
+            first=at == 0,
+        )
+        for at, (start, end) in enumerate(zip(starts, ends, strict=True))
+    ]
+    owners = assign_footnotes(body, notes, starts)
     out = ['<?xml version="1.0" encoding="utf-8"?>']
     out.append(
         _comment(
@@ -516,16 +894,19 @@ def build(approved: dict, tags: dict) -> str:
         + ">"
     )
     out.extend(lines(blocks[:split], "  "))
-    out.append("  <opinion>")
-    out.extend(lines(blocks[split:], "    "))
-    for note in notes:
-        label = note.get("label")
-        out.append(f"    <footnote{_attrs({'label': label})}>")
-        for paragraph in note.get("paragraphs") or []:
-            name, inner = _paragraph(paragraph, [], labels, {})
-            out.append(f"      <{name}>{inner}</{name}>")
-        out.append("    </footnote>")
-    out.append("  </opinion>")
+    for at, (start, end) in enumerate(zip(starts, ends, strict=True)):
+        out.append(f"  <opinion{_attrs({'type': types[at]})}>")
+        out.extend(lines(blocks[start:end], "    "))
+        for note, owner in zip(notes, owners, strict=True):
+            if owner != at:
+                continue
+            label = note.get("label")
+            out.append(f"    <footnote{_attrs({'label': label})}>")
+            for paragraph in note.get("paragraphs") or []:
+                name, inner = _paragraph(paragraph, [], labels, {})
+                out.append(f"      <{name}>{inner}</{name}>")
+            out.append("    </footnote>")
+        out.append("  </opinion>")
     out.append("</casebody>")
     xml = "\n".join(out) + "\n"
     try:
@@ -545,15 +926,70 @@ def _role(tag: str) -> str:
     return _html.escape(tag, quote=True)
 
 
-def _note_id(label: str) -> str:
-    """Return the HTML id of the footnote with this label.
+def _note_id(label: str, writing: int) -> str:
+    """Return the HTML id of the footnote with this label in a writing.
 
     Every character that is not a letter or a digit is spelled as its
     code point, so ``*`` and ``†`` give ids too, and two labels never
-    give one id.
+    give one id. The writing is in the id because a concurrence or a
+    dissent can number its notes from 1 again (#442), the rule of
+    centralia's ``render_opinion_ingest``.
     """
     safe = re.sub(r"[^A-Za-z0-9]", lambda m: f"_{ord(m.group()):x}", label)
-    return f"cb-fn-{safe}"
+    return f"cb-fn-{writing}-{safe}"
+
+
+#: The words a person reads for each ``type`` of a writing (#442).
+TYPE_NAMES = {
+    MAJORITY: "Majority",
+    PLURALITY: "Plurality",
+    UNANIMOUS: "Unanimous",
+    CONCURRENCE: "Concurrence",
+    IN_PART: "Concurring in part and dissenting in part",
+    DISSENT: "Dissent",
+    REHEARING: "Rehearing",
+    REMITTITUR: "Remittitur",
+    ON_THE_MERITS: "On the merits",
+    ON_MOTION_TO_STRIKE: "On motion to strike cost bill",
+}
+
+
+def _writing_author(opinion: ET.Element) -> str:
+    """Return the author line that opens one writing, or ``""``.
+
+    The author is the author line that opens the writing, a paragraph
+    of its own or the start of the first one; a per curiam writing has
+    none, and an ``author`` span of its vote line is no author line.
+
+    :param opinion: An ``opinion`` element of :func:`build`.
+    :returns: The text, one space between words.
+    """
+    first = next((child for child in opinion if child.tag != "footnote"), None)
+    author = None
+    if first is not None and first.tag == AUTHOR:
+        author = first
+    elif (
+        first is not None
+        and len(first)
+        and first[0].tag == AUTHOR
+        and not (first.text or "").strip()
+    ):
+        author = first[0]
+    if author is None:
+        return ""
+    return " ".join("".join(author.itertext()).split())
+
+
+def _writing_title(opinion: ET.Element) -> str:
+    """Return the name of one writing: its type, then its author.
+
+    :param opinion: An ``opinion`` element of :func:`build`.
+    :returns: Escaped HTML.
+    """
+    kind = opinion.get("type") or ""
+    name = TYPE_NAMES.get(kind, kind or "Opinion")
+    who = _writing_author(opinion)
+    return _escape(f"{name} — {who}" if who else name)
 
 
 def display_html(xml: str) -> str:
@@ -570,15 +1006,25 @@ def display_html(xml: str) -> str:
     A footnote mark links to its footnote, and the footnote's label
     links back to the first mark of that label (:func:`_note_id`); a
     note that more marks cite links back to each. The XML carries no
-    such link: CAP names a note by its label alone.
+    such link: CAP names a note by its label alone. A mark links only
+    inside its own writing, whose notes can repeat the labels of
+    another.
+
+    Every writing of the cluster is a section of its own, headed by its
+    type and its author, and a cluster of two or more writings opens
+    with one link to each (#442).
 
     :param xml: From :func:`build`.
     :returns: The HTML fragment.
     :rtype: str
     """
     root = ET.fromstring(xml)
-    #: The mark ids of each footnote label, in the order they read.
+    #: The mark ids of each footnote label of the writing being drawn,
+    #: in the order they read.
     marks: dict[str, list[str]] = {}
+    # The head matter's notes belong to the first writing
+    # (:func:`assign_footnotes`), so its marks link there.
+    writing = 1
 
     def inline(node: ET.Element) -> str:
         """The content of a node, its children drawn inline."""
@@ -594,11 +1040,11 @@ def display_html(xml: str) -> str:
         if tag == FOOTNOTE_MARK:
             label = "".join(node.itertext()).strip()
             refs = marks.setdefault(label, [])
-            ref = f"{_note_id(label)}-ref-{len(refs) + 1}"
+            ref = f"{_note_id(label, writing)}-ref-{len(refs) + 1}"
             refs.append(ref)
             return (
                 f'<sup class="cb-fnmark" id="{ref}" title="footnotemark">'
-                f'<a href="#{_note_id(label)}">{inner}</a></sup>'
+                f'<a href="#{_note_id(label, writing)}">{inner}</a></sup>'
             )
         if tag == PAGE_NUMBER:
             return f'<span class="cb-pg" title="page-number">{inner}</span>'
@@ -642,19 +1088,36 @@ def display_html(xml: str) -> str:
                 last = tag
         return "".join(out)
 
-    opinion = root.find("opinion")
+    opinions = root.findall("opinion")
     head = [child for child in root if child.tag != "opinion"]
     parts = ['<div class="cb-doc">']
+    if len(opinions) > 1:
+        links = "".join(
+            f'<li><a href="#cb-op-{n}">{_writing_title(opinion)}</a></li>'
+            for n, opinion in enumerate(opinions, start=1)
+        )
+        parts.append(
+            '<nav class="cb-opinions" aria-label="Opinions of the cluster">'
+            f"<h2>{len(opinions)} opinions</h2><ol>{links}</ol></nav>"
+        )
     if head:
         parts.append(
             '<section class="cb-headmatter"><h2>headmatter</h2>'
             f"{rows(head)}</section>"
         )
-    if opinion is not None:
+    for n, opinion in enumerate(opinions, start=1):
+        writing = n
+        if n > 1:
+            # The first writing keeps the marks of the head matter.
+            marks = {}
+        kind = opinion.get("type") or ""
         body = [child for child in opinion if child.tag != "footnote"]
         notes = [child for child in opinion if child.tag == "footnote"]
         parts.append(
-            f'<section class="cb-opinion"><h2>opinion</h2>{rows(body)}'
+            f'<section class="cb-opinion" id="cb-op-{n}" '
+            f'data-type="{_role(kind)}"><h2>'
+            f'<span class="cb-chip" title="opinion type">{_role(kind)}</span> '
+            f"{_escape(_writing_author(opinion))}</h2>{rows(body)}"
         )
         if notes:
             parts.append('<div class="cb-fns">')
@@ -666,7 +1129,7 @@ def display_html(xml: str) -> str:
                 # names one element.
                 anchor = ""
                 if label is not None and label not in seen:
-                    anchor = f' id="{_note_id(label)}"'
+                    anchor = f' id="{_note_id(label, writing)}"'
                     seen.add(label)
                 text = _escape(label or "")
                 if refs and anchor:
@@ -676,8 +1139,8 @@ def display_html(xml: str) -> str:
                     )
                     text += "".join(
                         f' <a class="cb-back" href="#{ref}" '
-                        f'title="Back to mark {n}">&#8617;{n}</a>'
-                        for n, ref in enumerate(refs[1:], start=2)
+                        f'title="Back to mark {k}">&#8617;{k}</a>'
+                        for k, ref in enumerate(refs[1:], start=2)
                     )
                 parts.append(
                     f'<div class="cb-fn"{anchor}><span class="cb-lbl">'

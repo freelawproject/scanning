@@ -2192,6 +2192,13 @@ FINAL_XML_REFUSED_MESSAGE = (
     "spans could not be read, or the spans do not fit the text. The log "
     "of the web pod has the reason."
 )
+#: The refusal of a writing whose type is not read (#442). The words
+#: go to the error log, where a developer reads them; no answer repeats
+#: an exception's text.
+FINAL_XML_TYPE_MESSAGE = (
+    "The final XML of {opinion} was not built: a concurrence or a dissent "
+    "names a type the builder does not read yet. A developer was told."
+)
 
 
 class _FinalXmlRefused(Exception):
@@ -2238,16 +2245,23 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
         ValueError,
     ) as exc:
         # The reason goes to the log alone: an S3 fault's text is the
-        # client library's, and no answer of this route repeats it.
-        logger.warning("%s: the final XML was not built: %s", opinion, exc)
+        # client library's, and no answer of this route repeats it. A
+        # writing whose type is not read is an error, so Sentry tells a
+        # developer to add its words to ``casebody.OPINION_TYPES`` (#442).
+        log = (
+            logger.error
+            if isinstance(exc, casebody.OpinionTypeError)
+            else logger.warning
+        )
+        log("%s: the final XML was not built: %s", opinion, exc)
+        message = (
+            FINAL_XML_TYPE_MESSAGE.format(opinion=opinion)
+            if isinstance(exc, casebody.OpinionTypeError)
+            else FINAL_XML_REFUSED_MESSAGE.format(opinion=opinion)
+        )
         raise _FinalXmlRefused(
             JsonResponse(
-                {
-                    "status": "error",
-                    "message": FINAL_XML_REFUSED_MESSAGE.format(
-                        opinion=opinion
-                    ),
-                },
+                {"status": "error", "message": message},
                 status=409,
             )
         ) from exc

@@ -360,7 +360,9 @@ def is_written(opinion: Opinion) -> bool:
     The one rule (#272): the spans at ``tag_key`` were placed on the
     object the opinion names now. A reopen keeps ``approved_text_key``,
     so the spans stay valid for it (#375); a new approval and
-    ``rewrite_approved_text`` write another key.
+    ``rewrite_approved_text`` write another key. A rewrite whose body is
+    the old body moves ``tagged_text_key`` with it, because a span
+    addresses a body paragraph alone (#442).
 
     :param opinion: The row.
     :returns: Whether ``tagged_text_key`` is the approved key.

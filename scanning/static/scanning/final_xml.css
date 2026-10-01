@@ -184,6 +184,32 @@
   margin-top: 1.6em;
 }
 .cb-doc .cb-opinion > h2 { border-bottom: 0; }
+/* Each writing of a cluster is its own section, headed by its CAP type
+   (#442). A jump leaves a little room above the heading. */
+.cb-opinion { scroll-margin-top: 4em; }
+.cb-opinion > h2 .cb-chip {
+  margin-right: 0.4em;
+  text-transform: none;
+  letter-spacing: 0;
+}
+.cb-opinion[data-type="concurrence"] { border-top-color: #7bbf95; }
+.cb-opinion[data-type="dissent"] { border-top-color: #d08770; }
+.cb-opinion[data-type="concurring-in-part-and-dissenting-in-part"] {
+  border-top-color: #d0b070;
+}
+
+/* The links to every writing of a cluster, above the head matter. */
+.cb-opinions {
+  margin: 0 0 1.2em;
+  padding: 0.5em 0.9em;
+  border: 1px solid var(--cb-line);
+  border-radius: 6px;
+  background: var(--cb-panel);
+  font-family: var(--cb-sans);
+}
+.cb-doc .cb-opinions > h2 { margin: 0 0 0.3em; border-bottom: 0; }
+.cb-opinions ol { margin: 0; padding-left: 1.6em; }
+.cb-opinions a { color: var(--cb-accent); }
 
 /* A tag inside a paragraph: a tint on its words, its name on hover. */
 .cb-tag {
