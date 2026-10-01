@@ -124,15 +124,15 @@ class Command(BaseCommand):
                 ),
             ),
             # Last two, on purpose: the loop walks the list in order, and
-            # these block it, one for an opinion's write (#336) and one
-            # for a volume's bad-page score (#436).
-            ScheduledTask(
-                name="build_opinion_pdfs",
-                interval_seconds=float(settings.DAEMON_OPINION_PDF_INTERVAL),
-            ),
+            # these block it, one for a volume's bad-page score (#436)
+            # and one for an opinion's write (#336).
             ScheduledTask(
                 name="score_bad_pages",
                 interval_seconds=float(settings.DAEMON_BADPAGE_INTERVAL),
+            ),
+            ScheduledTask(
+                name="build_opinion_pdfs",
+                interval_seconds=float(settings.DAEMON_OPINION_PDF_INTERVAL),
             ),
         ]
 
