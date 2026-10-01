@@ -81,8 +81,11 @@ dependencies = [
   # it as a per-crop digit fallback when PaddleOCR cannot read a page number,
   # and blackletter does not declare it itself.
   "pytesseract>=0.3.13",
+  # The bad-page model (#436): scikit-learn at the version the model
+  # was pickled under, and the two libraries its scorer imports itself.
   "scikit-learn==1.7.2",
   "joblib>=1.6.0",
+  "numpy",
 ]
 
 [project.optional-dependencies]

@@ -40,12 +40,12 @@ daemon's cores for the job waves.
 
 import functools
 import logging
+import warnings
 from pathlib import Path
 
 import fitz
 import joblib
 import numpy as np
-import pandas as pd
 from django.conf import settings
 from django.utils import timezone
 
@@ -61,9 +61,6 @@ MODEL_PATH = Path(__file__).with_name("badpage-v2.joblib")
 #: asks a little wider, because a page it misses is a page nobody looks
 #: at again.
 THRESHOLD = 0.2
-
-#: The columns of a feature frame that are not measures.
-NON_FEATURES = {"scan", "page", "label", "weight"}
 
 #: Faults a row may spend before the pass leaves it alone.
 MAX_ATTEMPTS = 3
@@ -84,24 +81,43 @@ def load_model() -> dict:
     return joblib.load(MODEL_PATH)
 
 
-def add_relative(data: pd.DataFrame) -> pd.DataFrame:
+def add_relative(pages: list[int], rows: list[dict]) -> list[dict]:
     """Add every measure relative to the median of its volume and parity.
 
     Page numbers sit left on even pages and right on odd ones, so the
     median is taken over the pages of the same parity. Typeface, layout
     and scanner differences between volumes cancel out, and "bolder,
     blurrier or emptier than the rest of this book" is what remains.
-    Line for line the training step of the model (``train.add_relative``).
+    The same arithmetic as the training step of the model
+    (``train.add_relative``, a pandas ``groupby`` median): a NaN-aware
+    median per parity and per measure, and the measure minus it under
+    the measure's name plus ``_rel``.
 
-    :param data: One row per page, with a ``scan`` and a ``page`` column.
-    :returns: The frame plus one ``*_rel`` column per measure.
-    :rtype: pandas.DataFrame
+    :param pages: The 1-based page of each row, in the same order.
+    :param rows: One dict of measures per page.
+    :returns: New dicts, each row's measures plus their ``_rel`` twins.
+    :rtype: list[dict]
     """
-    base = [c for c in data.columns if c not in NON_FEATURES]
-    parity = data["page"] % 2
-    med = data.groupby([data["scan"], parity])[base].transform("median")
-    rel = (data[base] - med).add_suffix("_rel")
-    return pd.concat([data, rel], axis=1)
+    names = list(rows[0]) if rows else []
+    matrix = np.array(
+        [[float(r.get(n, np.nan)) for n in names] for r in rows], dtype=float
+    )
+    parity = np.asarray(pages) % 2
+    rel = np.full_like(matrix, np.nan)
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        # An all-NaN column within a parity is a NaN median, as in pandas.
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        for par in (0, 1):
+            mask = parity == par
+            if mask.any():
+                med = np.nanmedian(matrix[mask], axis=0)
+                rel[mask] = matrix[mask] - med
+    out = []
+    for i, r in enumerate(rows):
+        row = dict(r)
+        row.update({f"{n}_rel": rel[i, j] for j, n in enumerate(names)})
+        out.append(row)
+    return out
 
 
 def score_pdf(path, jobs: int | None = None) -> dict[int, float]:
@@ -117,22 +133,23 @@ def score_pdf(path, jobs: int | None = None) -> dict[int, float]:
     :returns: ``{page: score}``, scores rounded to four places.
     :rtype: dict[int, float]
     """
-    rows = features.features_of_pdf(path, jobs)
-    if not rows:
+    measured = features.features_of_pdf(path, jobs)
+    if not measured:
         return {}
-    frame = pd.DataFrame([dict(page=p, **rows[p]) for p in sorted(rows)])
-    frame.insert(0, "scan", 0)
-    frame["label"] = 0
-    frame["weight"] = 1.0
-    frame = add_relative(frame)
+    pages = sorted(measured)
+    rows = add_relative(pages, [measured[p] for p in pages])
     bundle = load_model()
-    for col in bundle["features"]:
-        # Tolerate a model trained on a slightly different column set.
-        if col not in frame.columns:
-            frame[col] = np.nan
-    matrix = frame[bundle["features"]].to_numpy(dtype=float)
+    # A column the model was trained on and these rows lack is NaN,
+    # which the model treats as missing.
+    matrix = np.array(
+        [
+            [float(r.get(col, np.nan)) for col in bundle["features"]]
+            for r in rows
+        ],
+        dtype=float,
+    )
     scores = bundle["model"].predict_proba(matrix)[:, 1]
-    return {int(p): round(float(s), 4) for p, s in zip(frame["page"], scores)}
+    return {int(p): round(float(s), 4) for p, s in zip(pages, scores)}
 
 
 def stamp(scan, scores: dict[int, float]) -> None:
