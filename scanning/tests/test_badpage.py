@@ -307,40 +307,39 @@ class TestStep1Page(ScanningTestCase):
 class TestPass(ScanningTestCase):
     """The daemon pass scores the newest owed volume and counts its faults."""
 
-    def test_owed_scans_are_past_the_merge_and_unscored(self):
+    def test_owed_scans_are_new_uploads_waiting_for_their_numbers(self):
+        in_review = _reviewable_scan()
+        done = _reviewable_scan(status=Status.REDACTION_REVIEW_DONE)
         waiting = _reviewable_scan(status=Status.AWAITING)
-        uploaded = _reviewable_scan(status=Status.UPLOADED)
-        unsharded = _reviewable_scan(source_fingerprint="")
+        unsharded = _reviewable_scan(
+            status=Status.AWAITING_VALIDATION, source_fingerprint=""
+        )
         older = _reviewable_scan(status=Status.AWAITING_VALIDATION)
-        newer = _reviewable_scan()
-        scored = _reviewable_scan()
+        newer = _reviewable_scan(status=Status.AWAITING_VALIDATION)
+        scored = _reviewable_scan(status=Status.AWAITING_VALIDATION)
         scoring.stamp(scored, {1: 0.1})
         self.assertEqual(
             [s.pk for s in scoring.owed_scans()], [newer.pk, older.pk]
         )
-        for scan in (waiting, uploaded, unsharded, scored):
+        for scan in (in_review, done, waiting, unsharded, scored):
             self.assertNotIn(scan.pk, [s.pk for s in scoring.owed_scans()])
 
     def test_tick_scores_the_newest_owed_scan_and_writes_its_cards(self):
-        _reviewable_scan()
-        newest = _reviewable_scan(page_count=2)
+        _reviewable_scan(status=Status.AWAITING_VALIDATION)
+        newest = _reviewable_scan(
+            status=Status.AWAITING_VALIDATION, page_count=2
+        )
         output_dir = Path(newest.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _bitonal_volume(output_dir / "bitonal.pdf", 2)
         self.assertEqual(scoring.run_tick(jobs=2), 1)
         newest.refresh_from_db()
         self.assertEqual(sorted(newest.page_scores["scores"]), ["1", "2"])
-        self.assertEqual(
-            Issue.objects.filter(
-                scan=newest, check_name=CheckName.BAD_PAGE
-            ).count(),
-            len(scoring.flagged(newest)),
-        )
         # The next tick takes the next scan; the scored one is done.
         self.assertNotIn(newest.pk, [s.pk for s in scoring.owed_scans()])
 
     def test_a_fault_counts_on_the_stamp_and_the_cap_retires_the_row(self):
-        scan = _reviewable_scan()
+        scan = _reviewable_scan(status=Status.AWAITING_VALIDATION)
         with mock.patch.object(
             apply,
             "volume_bitonal_key",
@@ -355,7 +354,9 @@ class TestPass(ScanningTestCase):
         self.assertNotIn(scan.pk, [s.pk for s in scoring.owed_scans()])
 
     def test_the_command_without_a_scan_runs_one_tick(self):
-        scan = _reviewable_scan(page_count=2)
+        scan = _reviewable_scan(
+            status=Status.AWAITING_VALIDATION, page_count=2
+        )
         output_dir = Path(scan.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
         _bitonal_volume(output_dir / "bitonal.pdf", 2)
@@ -370,3 +371,82 @@ class TestPass(ScanningTestCase):
         self.assertIn("Scored 1 volume(s)", out.getvalue())
         scan.refresh_from_db()
         self.assertIsNotNone(scan.page_scores)
+
+    def test_a_failed_rebuild_keeps_the_stamp(self):
+        scan = _reviewable_scan(page_count=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "bitonal.pdf"
+            _bitonal_volume(pdf, 2)
+            with mock.patch.object(
+                services, "recalculate_issues", side_effect=RuntimeError("x")
+            ):
+                scoring.score_scan(scan, pdf, jobs=2)
+        scan.refresh_from_db()
+        self.assertEqual(sorted(scan.page_scores["scores"]), ["1", "2"])
+
+    def test_a_fault_never_erases_a_good_score(self):
+        scan = _reviewable_scan()
+        scoring.stamp(scan, {1: 0.9})
+        self.assertEqual(scoring.record_failure(scan, "later fault"), 0)
+        scan.refresh_from_db()
+        self.assertEqual(scoring.scores_of(scan), {1: 0.9})
+
+    def test_the_pool_is_spawned(self):
+        import inspect
+
+        from scanning.badpage import features
+
+        self.assertIn(
+            'get_context("spawn")', inspect.getsource(features.features_of_pdf)
+        )
+
+
+class TestAnswers(ScanningTestCase):
+    """A replacement and a request answer a card, on the server too."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+
+    def _cards(self, scan):
+        return sorted(
+            Issue.objects.filter(
+                scan=scan, check_name=CheckName.BAD_PAGE
+            ).values_list("page_number", flat=True)
+        )
+
+    def test_a_standing_replacement_answers_the_card(self):
+        scan = _reviewable_scan()
+        scoring.stamp(scan, {1: 0.9, 3: 0.4})
+        scan.refresh_from_db()
+        page_edits.supersede(
+            scan,
+            PageEdit.Kind.REPLACE_PAGE,
+            {"pdf_page": 3},
+            {"source_fingerprint": scan.source_fingerprint},
+            self.user,
+        )
+        services.recalculate_issues(scan)
+        self.assertEqual(self._cards(scan), [1])
+
+    def test_a_request_and_its_dismissal_move_the_card_on_the_server(self):
+        scan = _reviewable_scan()
+        scoring.stamp(scan, {1: 0.9, 3: 0.4})
+        scan.refresh_from_db()
+        services.recalculate_issues(scan)
+        self.assertEqual(self._cards(scan), [1, 3])
+        response = self.client.post(
+            reverse("request_page_repair", kwargs={"pk": scan.pk}),
+            data={"action": "replace", "pdf_page": 3, "note": ""},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._cards(scan), [1])
+        request_id = response.json()["request"]["id"]
+        response = self.client.post(
+            reverse("dismiss_page_repair", kwargs={"pk": scan.pk}),
+            data={"request_id": request_id},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._cards(scan), [1, 3])

@@ -709,7 +709,11 @@ def features_of_pdf(path, jobs=None):
     with fitz.open(path) as doc:
         n = len(doc)
     rows = {}
-    with mp.Pool(jobs, initializer=_init, initargs=(str(path),)) as pool:
+    # Spawned, not forked: a forked worker inherits the daemon's SIGTERM
+    # handler, which re-queues scans over the parent's database socket,
+    # and a worker still alive at Pool.terminate() then hangs the join.
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(jobs, initializer=_init, initargs=(str(path),)) as pool:
         for p, f in pool.imap_unordered(_work, range(1, n + 1), chunksize=8):
             rows[p] = f
     return rows

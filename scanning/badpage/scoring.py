@@ -16,8 +16,8 @@ above :data:`THRESHOLD`, which a curator dismisses or answers with a
 rescan request. The cards are derived by :func:`issues` on every
 rebuild of the review-1 issues, so a dismissal matches them the way it
 matches every other card (check name plus page), a deletion answers
-them (``CHECKS_A_DELETION_ANSWERS``), and an open rescan request
-answers them too. The card exists to get a page looked at fast, and
+them (``CHECKS_A_DELETION_ANSWERS``), and an open rescan request or a
+standing replacement answers them too. The card exists to get a page looked at fast, and
 it goes once that has happened.
 
 The pages are the **original's**: the score is measured on the review-1
@@ -27,8 +27,8 @@ unscored, never as scored wrong (:func:`scores_of`).
 
 The pass is a daemon task (``score_bad_pages`` with no argument, the
 sixth task of ``run_daemon``): a fact on the row and no hand-off, the
-shape of the opinion PDF pass (#336). A scan owes a score when it is
-past the bitonal merge and carries no stamp (:func:`owed_scans`), the
+shape of the opinion PDF pass (#336). A scan owes a score while it
+waits for its page numbers after the bitonal merge and carries no stamp (:func:`owed_scans`), the
 tick takes the newest one, pulls its bitonal copy, scores it with
 ``settings.BADPAGE_JOBS`` worker processes and stamps it. No scan status moves. A
 fault spends one of :data:`MAX_ATTEMPTS` on the row's own stamp, loud
@@ -245,7 +245,7 @@ def issues(scan) -> list[dict]:
     :returns: Issue dicts in the shape ``Issue(**d)`` takes.
     :rtype: list[dict]
     """
-    from scanning import repairs
+    from scanning import page_edits, repairs
     from scanning.models import CheckName, PageRepairRequest
 
     # A page a scanner is asked for needs no card: the card's job was
@@ -257,7 +257,7 @@ def issues(scan) -> list[dict]:
         row.pdf_page
         for row in repairs.open_requests(scan)
         if row.action == PageRepairRequest.Action.REPLACE
-    }
+    } | set(page_edits.replacements_by_page(scan))
     return [
         {
             "page_number": page,
@@ -287,27 +287,21 @@ def jobs_setting() -> int:
 def owed_scans():
     """Return the scans that owe a score, newest first.
 
-    A scan owes one when it is past the bitonal merge, which every
-    status outside the busy, uploaded, error and cancelled ones is,
-    and carries no stamp, or a failed stamp under the attempt cap. A
-    stamp made against another upload is not found here: a re-upload is
-    rare, and the command rescores it by hand.
+    A scan owes one in ``AWAITING_VALIDATION`` alone: the status a new
+    upload holds from the bitonal merge until its page numbers land.
+    So the pass scores the volumes uploaded after it landed and no
+    older one; those are scored by the command when a person wants it.
+    Within the status, a scan with no stamp, or a failed stamp under
+    the attempt cap.
 
     :returns: A queryset of ``Scan`` rows.
     """
     from django.db.models import Q
 
-    from scanning.models import BUSY_STATUSES, Scan, Status
+    from scanning.models import Scan, Status
 
-    skipped = set(BUSY_STATUSES) | {
-        Status.UPLOADED,
-        Status.ERROR,
-        Status.ERROR_MAX_RETRIES,
-        Status.ERROR_INTERRUPTED,
-        Status.CANCELLED,
-    }
     return (
-        Scan.objects.exclude(status__in=skipped)
+        Scan.objects.filter(status=Status.AWAITING_VALIDATION)
         .exclude(source_fingerprint="")
         .filter(
             Q(page_scores__isnull=True)
@@ -331,6 +325,15 @@ def record_failure(scan, reason: str) -> int:
     """
     from scanning.models import Scan
 
+    if scores_of(scan):
+        # A stamp with scores under this original stands; a later fault
+        # must not erase a good score.
+        logger.warning(
+            "bad-page score: scan %s is scored; not counting a fault: %s",
+            scan.pk,
+            reason,
+        )
+        return 0
     previous = scan.page_scores or {}
     attempts = int(previous.get("attempts") or 0) + 1
     payload = {
@@ -380,7 +383,16 @@ def score_scan(scan, pdf, jobs: int | None = None) -> dict[int, float]:
     stamp(scan, scores)
     scan.refresh_from_db()
     if scan.ocr_results and scan.status in REVIEW_STATUSES:
-        services.recalculate_issues(scan)
+        # The stamp is the fact and it is written; a rebuild that
+        # fails must not read as a failed score, and the next recompute
+        # or page-number rebuild writes the cards anyway.
+        try:
+            services.recalculate_issues(scan)
+        except Exception:
+            logger.exception(
+                "bad-page score: scan %s scored, but the issue rebuild failed",
+                scan.pk,
+            )
     return scores
 
 

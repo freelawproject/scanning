@@ -4839,6 +4839,8 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
             "source_fingerprint": scan.source_fingerprint,
         },
     )
+    if created:
+        _rebuild_bad_page_card(scan, address.get("pdf_page"))
     row = repairs.open_requests(scan).get(pk=row.pk)
     answer = {
         "status": "ok",
@@ -4877,5 +4879,28 @@ def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     rows = scan.repair_requests.filter(pk=request_id)
     if not rows.exists():
         return JsonResponse({"error": "Unknown request."}, status=404)
+    row = rows.first()
     repairs.dismiss(rows, request.user)
+    if row.action == PageRepairRequest.Action.REPLACE:
+        _rebuild_bad_page_card(scan, row.pdf_page)
     return JsonResponse({"status": "ok"})
+
+
+def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
+    """Rebuild the review-1 issues when a request moves a bad-page card.
+
+    A rescan request answers the card of its page and a dismissed one
+    gives it back (``badpage.scoring.issues``), so the ``Issue`` rows
+    must follow the write. Only for a page the model flagged, so the
+    rebuild is not paid on every request, and only in a review state,
+    which the rebuild keeps.
+
+    :param scan: The scan.
+    :param pdf_page: The page the request names, or None for a gap.
+    """
+    from scanning import services
+
+    if pdf_page is None or scan.status not in REVIEW_STATUSES:
+        return
+    if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
+        services.recalculate_issues(scan)

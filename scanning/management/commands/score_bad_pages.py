@@ -1,11 +1,12 @@
 """Score volumes with the bad-page model and write their review-1 cards (#436).
 
-With no argument, one tick of the daemon pass: the newest scan past
-the bitonal merge that carries no score is pulled, scored and stamped
+With no argument, one tick of the daemon pass: the newest scan that
+waits for its page numbers after the bitonal merge and carries no
+score is pulled, scored and stamped
 (:func:`scanning.badpage.scoring.run_tick`). ``run_daemon`` calls it
-this way every ``DAEMON_BADPAGE_INTERVAL`` seconds, which is how a
-new upload gets its score and how the existing corpus is backfilled,
-newest first. No scan status moves.
+this way every ``DAEMON_BADPAGE_INTERVAL`` seconds, which is how a new
+upload gets its score. Volumes that were on the portal before the pass
+are not scored by it. No scan status moves.
 
 With a scan pk, that scan is scored now, whatever it holds: the way
 to rescore a volume after a retrain, or one the pass gave up on.
