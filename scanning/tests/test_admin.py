@@ -255,10 +255,11 @@ class ScanAdminRequeueActionTests(TestCase):
 
 
 class ScanAdminDeleteShardSweepTests(TestCase):
-    """Scan deletion sweeps the shards, job results and page edits.
+    """Scan deletion sweeps the shards, job results, page edits and the
+    exported final XML.
 
-    The three prefixes nothing else removes (PR #169 review, issues
-    #176 and #214). The shard PDFs duplicate the original's bytes, each
+    The four prefixes nothing else removes (PR #169 review, issues
+    #176, #214 and #408). The shard PDFs duplicate the original's bytes, each
     job result holds a converted copy of the volume, and the page edit
     images are the only copy of what a curator uploaded.
     """
@@ -272,9 +273,10 @@ class ScanAdminDeleteShardSweepTests(TestCase):
             patch("scanning.s3_sync.delete_shard_objects") as shards,
             patch("scanning.s3_sync.delete_job_objects") as results,
             patch("scanning.s3_sync.delete_page_edit_objects") as images,
+            patch("scanning.s3_sync.delete_final_xml_objects") as exported,
         ):
             self.admin.delete_model(_request_with_messages(), scan)
-        for mock_delete in (shards, results, images):
+        for mock_delete in (shards, results, images, exported):
             mock_delete.assert_called_once()
             self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())

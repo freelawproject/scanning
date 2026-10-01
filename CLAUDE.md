@@ -47,6 +47,9 @@ docker exec scanning-daemon python manage.py rewrite_approved_text --all --dry-r
 # Write the text of every volume's opinions again, after a change of the ensemble document; --all skips a one-engine opinion (#419)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble --all --dry-run
 
+# Store the final XML of the approved opinions for CourtListener, once after the deploy and after a casebody.SCHEMA change (#408)
+docker exec scanning-daemon python manage.py export_final_xml --all --dry-run
+
 # Generate migrations
 DEVELOPMENT=True DB_HOST=localhost DB_SSL_MODE=prefer python manage.py makemigrations scanning
 
@@ -294,7 +297,8 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - `markup.project` is the one writer of the tagger's input, over the approved `body` alone (the footnotes and the page table are not sent): a `<p>` or a `<blockquote>` per paragraph and one per `li` item of a list group (#428), `em` and `sup` kept, `strong` and every `table` left out. It deletes characters and writes markup, and changes no character but a `\n` (to a space), so `markup.lift_span` places a span exactly; a rule that changes a character breaks the map. Bump `tagger.PROJECTION_VERSION` when the same body gives another text (#272)
 - A tagger row's identity is fixed by the projected text (its digest, its counts, a `page_count` from its length) and `PROJECTION_VERSION`, never by the approved key or the page table, so a second approval of the same text reuses the paid run. A press that gets back a COMPLETED or CONSUMED row places the spans in the request (`tagger.place`), with no job: the retry of a glue the tick gave up on is the next press. `tagger.is_written` is the one rule of "the spans exist": `tagged_text_key == approved_text_key`, which a reopen keeps (#272)
 - The tagger glue projects the approved text the row holds at glue time again and places the spans only when its digest is the run's; otherwise it consumes the row with no stamp (`TextMoved`). It keeps the result object, writes no scan or opinion status, and counts a fault on `provider_meta["glue"]`, loud then quiet (#272)
-- `casebody.build` is the one writer of an opinion's final XML (#432): pure, over the approved object and the spans of `tagger.is_written`, in the text of `markup.projected_characters` (the tagger's own), the CAP element of a label from `casebody.ELEMENTS` alone. It is built at each request and stored nowhere until #408, so its route answers 404 wherever `tagger.is_written` is false
+- `casebody.build` is the one writer of an opinion's final XML (#432): pure, over the approved object and the spans of `tagger.is_written`, in the text of `markup.projected_characters` (the tagger's own), the CAP element of a label from `casebody.ELEMENTS` alone. The review page builds it at each request through `final_xml.render`, the one build the export stores, and its route answers 404 wherever `tagger.is_written` is false
+- The export of the final XML (`final_xml.py`, #408) is pass fifteen of the collect tick and stores the build at `final-xml/{scan}/{opinion}.xml`, outside `processing/`, the one key the pipeline writes over, because CourtListener builds it from the two ids. An object exists only for a `TEXT_REVIEW_DONE` opinion whose spans exist (`final_xml.exportable`): a reopen keeps both keys, so the pass deletes the object of a row that is no longer exportable before it writes. `final_xml.is_written` (`final_xml_tag_key == tag_key` and `final_xml_schema == casebody.SCHEMA`) is the one rule of "the export is current", and the stamp is a compare-and-swap over the inputs the build read. Raise `casebody.SCHEMA` when the same inputs give another XML, or CourtListener keeps the old file
 
 ## Worker images
 

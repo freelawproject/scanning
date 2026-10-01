@@ -2721,6 +2721,34 @@ class Opinion(AbstractDateTimeModel):
             "equal (``tagger.is_written``)."
         ),
     )
+    final_xml_tag_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "The ``tag_key`` the exported final XML was built from "
+            "(#408), at ``final-xml/{scan}/{opinion}.xml``. Blank: no "
+            "object is stored. The export is current when it equals "
+            "``tag_key`` and ``final_xml_schema`` is ``casebody.SCHEMA`` "
+            "(``final_xml.is_written``)."
+        ),
+    )
+    final_xml_schema = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The ``casebody.SCHEMA`` the exported final XML was built "
+            "with (#408). Null: no object is stored."
+        ),
+    )
+    final_xml_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed exports of the final XML that the objects explain "
+            "(#408); a transient S3 fault counts none. Reset when the "
+            "spans are placed again and when the export is written."
+        ),
+    )
     redacted_pdf_revision = models.PositiveSmallIntegerField(
         null=True,
         blank=True,

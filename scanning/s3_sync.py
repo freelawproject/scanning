@@ -98,6 +98,13 @@ SHARD_MANIFEST_NAME = "manifest.json"
 # The admin scan deletion sweeps this prefix, since nothing else does.
 PAGE_EDITS_SUBDIR = "page_edits/"
 
+# The top-level prefix of the final XML of every approved opinion, the
+# export CourtListener reads (#408). Outside ``processing/`` on
+# purpose: the key is built from the two ids alone
+# (``final-xml/{scan}/{opinion}.xml``), so the generic sync never sees
+# it. The admin scan deletion sweeps a scan's part of it.
+FINAL_XML_PREFIX = "final-xml/"
+
 # The bitonal PDF the detect stage runs against. Named because its S3
 # ``LastModified`` is a reference timestamp, not just a filename: see
 # :func:`_is_stage_input`.
@@ -365,6 +372,15 @@ def presign_original_get(scan: Scan) -> str | None:
 _MISSING_OBJECT_CODES = ("404", "NoSuchKey", "NotFound")
 
 
+def is_missing_object(exc: ClientError) -> bool:
+    """Return whether an S3 error says the key holds no object.
+
+    :param exc: The error of a GET or a HEAD.
+    :rtype: bool
+    """
+    return exc.response.get("Error", {}).get("Code") in _MISSING_OBJECT_CODES
+
+
 def object_exists(key: str) -> bool:
     """Return whether an object is present at ``key``.
 
@@ -505,6 +521,58 @@ def upload_json_object(key: str, data: dict) -> bool:
         logger.warning(
             "Could not upload a JSON object to %s", key, exc_info=True
         )
+        return False
+    return True
+
+
+def upload_bytes_object(key: str, body: bytes, content_type: str) -> bool:
+    """Upload bytes to an exact key, bypassing the sync.
+
+    The twin of :func:`upload_json_object` for a document that is not
+    JSON: the final XML of an opinion (#408).
+
+    :param key: Object key inside the private bucket.
+    :param body: The bytes to store.
+    :param content_type: The ``ContentType`` to store.
+    :returns: Whether the object was uploaded. False when S3 is off or
+        the PUT failed; the caller decides whether that is fatal.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    try:
+        _s3_client().put_object(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME,
+            Key=key,
+            Body=body,
+            ContentType=content_type,
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning("Could not upload an object to %s", key, exc_info=True)
+        return False
+    return True
+
+
+def delete_object(key: str) -> bool:
+    """Delete one object by key, and say whether S3 took the delete.
+
+    Not best effort, unlike :func:`delete_objects`: the caller clears a
+    ledger stamp only when the object is gone. A missing key is a
+    success in S3.
+
+    :param key: Object key inside the private bucket.
+    :returns: Whether the delete was issued. False when S3 is off or
+        the call failed.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    try:
+        _s3_client().delete_object(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Key=key
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning("Could not delete %s", key, exc_info=True)
         return False
     return True
 
@@ -1145,6 +1213,30 @@ def delete_page_edit_objects(scan: Scan) -> int:
     """
     prefix = f"{s3_processing_prefix(scan)}{PAGE_EDITS_SUBDIR}"
     return _delete_prefix(scan, prefix, "page edit image")
+
+
+def final_xml_prefix(scan: Scan) -> str:
+    """Return the prefix of a scan's exported final XML (#408).
+
+    :param scan: The scan.
+    :returns: ``final-xml/{pk}/``.
+    :rtype: str
+    """
+    return f"{FINAL_XML_PREFIX}{scan.pk}/"
+
+
+def delete_final_xml_objects(scan: Scan) -> int:
+    """Delete every exported final XML of a scan (#408).
+
+    For a scan that is going away: the prefix is outside the
+    processing prefix, so no other sweep reaches it.
+
+    :param scan: The scan whose exported XML to delete.
+    :returns: Number of objects deleted (0 when S3 sync is disabled or
+        the prefix is empty).
+    :rtype: int
+    """
+    return _delete_prefix(scan, final_xml_prefix(scan), "final XML")
 
 
 def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:

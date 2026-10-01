@@ -93,6 +93,7 @@ def _release_scan_external_work(scan):
         ("shard", s3_sync.delete_shard_objects),
         ("job result", s3_sync.delete_job_objects),
         ("page edit image", s3_sync.delete_page_edit_objects),
+        ("final XML", s3_sync.delete_final_xml_objects),
     ):
         try:
             sweep(scan)
