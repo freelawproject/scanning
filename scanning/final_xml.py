@@ -23,11 +23,30 @@ names one approved text and one tagger run, so a new approval, a
 ``rewrite_approved_text`` and a new run all make the row due again, and
 a new ``SCHEMA`` makes every row due (:func:`is_written`).
 
-**An object exists only for an exportable opinion** (:func:`exportable`:
-the text review is done and the spans are over the approved text). A
-reopen keeps both keys (#375), so the pass also deletes the object of
-a row that stopped being exportable and clears its stamp. A listing of
-the prefix is then the list of what CourtListener may import.
+**The pass writes an object only for an exportable opinion**
+(:func:`exportable`: the text review is done and the spans are over the
+approved text), **and deletes it only when the text is no longer
+approved** (a reopen or an error: the status left ``TEXT_REVIEW_DONE``).
+A reopen keeps both keys (#375), so the deletion reads the status. A
+``rewrite_approved_text`` moves the approved key and leaves the spans
+behind, and the object it keeps is still a whole document: the text the
+curator approved, under the old join rule, and the spans over that
+text. It stays until a tagger run of the new text writes the new one. A
+listing of the prefix is then the list of what CourtListener may import.
+
+**A stamp names every object.** ``final_xml_tag_key`` is not blank
+whenever an object may be at the key, so no object is left with no row
+to delete it. A ``final_xml_schema`` of None beside a stamp says "an
+object may be there, of unknown content": the row is owed again.
+
+**One exporter at a time.** S3 keeps the last PUT, and the stamp is a
+second write, so two exporters of one row could stamp the new inputs
+over the old object. The pass takes a Postgres advisory lock
+(:data:`EXPORT_LOCK`) that the tick and the command share: the tick
+skips while the command holds it, and the command refuses while the
+tick holds it. The web process
+changes the inputs and never exports, and the compare-and-swap of the
+stamp answers it.
 
 **The pass** (:func:`export_due`) is pass fifteen of the collect tick:
 two small JSON reads and one small PUT per row, the work of the glues.
@@ -35,16 +54,20 @@ The object is written first and the row second, by a compare-and-swap
 over the inputs it read. A fault of the objects (a missing key, spans
 that do not fit the text) counts on ``final_xml_attempts`` and stops at
 :data:`MAX_ATTEMPTS`, loud then quiet; an S3 fault counts nothing and
-waits for the next tick. It writes no opinion status and no scan
-status: the approval stands whatever the export does.
+waits for the next tick, and a database fault goes to the tick's own
+retry. It writes no opinion status and no scan status: the approval
+stands whatever the export does.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 from botocore.exceptions import BotoCoreError, ClientError
-from django.db.models import F, Q, QuerySet
+from django.db import DatabaseError, connection
+from django.db.models import Case, F, Q, QuerySet, Value, When
 
 from scanning import casebody, s3_sync, tagger
 from scanning.models import Opinion, OpinionReviewStatus
@@ -61,6 +84,10 @@ MAX_ATTEMPTS = 3
 #: How many rows one tick writes or deletes. A row is two reads and one
 #: write of small objects, so the cap only bounds a long backlog.
 EXPORTS_PER_TICK = 50
+
+#: The key of the Postgres advisory lock the pass holds: one exporter at
+#: a time (the tick or the command). Any constant no other code takes.
+EXPORT_LOCK = 408_001
 
 
 class FinalXmlError(Exception):
@@ -130,6 +157,62 @@ def is_written(opinion: Opinion) -> bool:
     )
 
 
+def is_stored(opinion: Opinion) -> bool:
+    """Return whether an object may be at the opinion's key.
+
+    A stamp names every object (see the module docstring), so this is
+    the stamp. The object may be older than the row's inputs: after a
+    ``rewrite_approved_text`` it holds the text approved before.
+
+    :param opinion: The row.
+    :rtype: bool
+    """
+    return bool(opinion.final_xml_tag_key)
+
+
+def parse_key(object_key: str) -> tuple[int, int] | None:
+    """Return the scan and opinion pks a key of :func:`key` names.
+
+    :param object_key: A key under ``final-xml/``.
+    :returns: ``(scan_pk, opinion_pk)``, or None for a key of another
+        shape.
+    :rtype: tuple[int, int] | None
+    """
+    rest = object_key.removeprefix(s3_sync.FINAL_XML_PREFIX)
+    scan, _, name = rest.partition("/")
+    opinion, dot, ext = name.partition(".")
+    if rest == object_key or not dot or ext != "xml":
+        return None
+    if not (scan.isdigit() and opinion.isdigit()):
+        return None
+    return int(scan), int(opinion)
+
+
+def orphan_keys(prefix: str = s3_sync.FINAL_XML_PREFIX) -> list[str]:
+    """Return the objects under the prefix that no stamp names.
+
+    The backup of the admin sweep (#408): a key of another shape, of an
+    opinion that does not exist or is of another scan, or of a row with
+    no stamp. A row with a stamp is the pass's own (it deletes it when
+    the review is open again). Read under :func:`exporter_lock`, or an
+    export between its PUT and its stamp reads as an orphan.
+
+    :param prefix: ``final-xml/`` or one scan's part of it.
+    :returns: The keys.
+    :rtype: list[str]
+    """
+    named = {k: parse_key(k) for k in s3_sync.list_keys(prefix)}
+    stamped = {
+        (scan_id, pk)
+        for pk, scan_id in Opinion.objects.filter(
+            pk__in=[ids[1] for ids in named.values() if ids]
+        )
+        .exclude(final_xml_tag_key="")
+        .values_list("pk", "scan_id")
+    }
+    return [k for k, ids in named.items() if ids not in stamped]
+
+
 # ── The build ───────────────────────────────────────────────────────
 def _read(object_key: str):
     try:
@@ -182,9 +265,10 @@ def export(opinion: Opinion) -> bool:
     """Store the final XML of one exportable opinion and stamp the row.
 
     The object first, then a compare-and-swap over the inputs the build
-    read. When the row moved during the build, the stamp is not written:
-    the next pass writes the new inputs, or deletes an object that no
-    stamp names.
+    read. When the row moved during the build, the object holds old
+    inputs: the row is marked "content unknown" (:func:`_mark_unknown`),
+    and the next pass writes it again or deletes it. A row that is gone
+    takes its object with it.
 
     :param opinion: An :func:`exportable` row.
     :returns: Whether the row was stamped.
@@ -212,15 +296,13 @@ def export(opinion: Opinion) -> bool:
         final_xml_attempts=0,
     )
     if not stamped:
-        fresh = Opinion.objects.filter(pk=opinion.pk).first()
-        if fresh is None or (
-            not exportable(fresh) and not fresh.final_xml_tag_key
-        ):
-            # No stamp names the object, so no pass would delete it.
+        if not _mark_unknown(opinion, tag_key):
+            # The row is gone (a scan deletion): no stamp can name the
+            # object, so no pass would delete it.
             s3_sync.delete_object(object_key)
         logger.info(
             "%s of scan %s: the row moved during the export of %s; "
-            "the next pass writes it again",
+            "the next pass writes it again or deletes it",
             opinion,
             opinion.scan_id,
             object_key,
@@ -238,8 +320,33 @@ def export(opinion: Opinion) -> bool:
     return True
 
 
+def _mark_unknown(opinion: Opinion, tag_key: str) -> bool:
+    """Say that the object of a row holds content no stamp describes.
+
+    The schema goes to None, so :func:`is_written` is false and the row
+    is owed again; the stamp stays, or takes ``tag_key`` when it was
+    blank, so a deletion still finds the object. Unconditional on
+    purpose: the one exporter wrote the object last, and the worst a
+    mark costs is one more write.
+
+    :param opinion: The row.
+    :param tag_key: The spans key the object was built from.
+    :returns: Whether the row still exists.
+    :rtype: bool
+    """
+    return bool(
+        Opinion.objects.filter(pk=opinion.pk).update(
+            final_xml_tag_key=Case(
+                When(final_xml_tag_key="", then=Value(tag_key)),
+                default=F("final_xml_tag_key"),
+            ),
+            final_xml_schema=None,
+        )
+    )
+
+
 def withdraw(opinion: Opinion) -> None:
-    """Delete the stored final XML of a row that is not exportable.
+    """Delete the stored final XML of a row whose text is not approved.
 
     The object first, then the stamp, by a compare-and-swap over the
     stamp the row held.
@@ -281,7 +388,12 @@ def _record_failure(opinion: Opinion, exc: Exception) -> None:
 
 # ── The pass ────────────────────────────────────────────────────────
 def withdrawn_rows(opinions: QuerySet | None = None) -> QuerySet:
-    """Return the rows whose stored object must go.
+    """Return the rows whose stored object must go: the text review is
+    no longer done.
+
+    Not "not exportable": a rewrite of the approved text leaves the
+    spans behind, and the object of the old text stays until a tagger
+    run of the new one (see the module docstring).
 
     :param opinions: The rows to look in; every opinion by default.
     :rtype: QuerySet
@@ -289,7 +401,7 @@ def withdrawn_rows(opinions: QuerySet | None = None) -> QuerySet:
     opinions = Opinion.objects.all() if opinions is None else opinions
     return (
         opinions.exclude(final_xml_tag_key="")
-        .exclude(_exportable_q())
+        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
         .order_by("pk")
     )
 
@@ -322,6 +434,27 @@ def due_rows(opinions: QuerySet | None = None) -> QuerySet:
     return owed_rows(opinions).filter(final_xml_attempts__lt=MAX_ATTEMPTS)
 
 
+@contextmanager
+def exporter_lock() -> Iterator[bool]:
+    """Hold the one exporter's advisory lock, if no one else holds it.
+
+    A session lock and not a transaction lock: the pass makes S3 calls,
+    and a transaction around them would hold the row locks of every
+    stamp until the pass ends. Nobody waits for it.
+
+    :returns: (as the context value) Whether this call holds the lock.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", [EXPORT_LOCK])
+        held = cursor.fetchone()[0]
+    try:
+        yield held
+    finally:
+        if held:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", [EXPORT_LOCK])
+
+
 def export_due(
     limit: int | None = EXPORTS_PER_TICK, opinions: QuerySet | None = None
 ) -> int:
@@ -329,7 +462,8 @@ def export_due(
 
     Pass fifteen of the collect tick. The deletions go first: a
     reopened opinion must leave the listing CourtListener reads before
-    the newest approvals are written.
+    the newest approvals are written. Nothing runs while another
+    exporter holds :func:`exporter_lock`.
 
     :param limit: The most rows one call writes or deletes; None for no
         cap (the command).
@@ -337,8 +471,42 @@ def export_due(
     :returns: How many objects were written or deleted.
     :rtype: int
     """
+    done = run_locked(limit, opinions)
+    if done is None:
+        logger.info("Another exporter holds the lock; the pass waits")
+        return 0
+    return done
+
+
+def run_locked(
+    limit: int | None = EXPORTS_PER_TICK, opinions: QuerySet | None = None
+) -> int | None:
+    """Run the pass under :func:`exporter_lock`.
+
+    :param limit: See :func:`export_due`.
+    :param opinions: See :func:`export_due`.
+    :returns: How many objects were written or deleted, or None when
+        another exporter holds the lock. 0 when S3 is off.
+    :rtype: int | None
+    """
     if not s3_sync.s3_active():
         return 0
+    with exporter_lock() as held:
+        if not held:
+            return None
+        return export_rows(limit, opinions)
+
+
+def export_rows(limit: int | None, opinions: QuerySet | None) -> int:
+    """Delete the objects that must go, then write the ones owed.
+
+    The body of the pass. Call it under :func:`exporter_lock` alone.
+
+    :param limit: See :func:`export_due`.
+    :param opinions: See :func:`export_due`.
+    :returns: How many objects were written or deleted.
+    :rtype: int
+    """
     done = 0
     for opinion in withdrawn_rows(opinions)[:limit]:
         try:
@@ -359,6 +527,10 @@ def export_due(
         except FinalXmlError as exc:
             _record_failure(opinion, exc)
             continue
+        except DatabaseError:
+            # The tick retries a database fault; it says nothing of the
+            # row, so it counts nothing.
+            raise
         except Exception as exc:
             # A fault of this code must not stop the tick at this row on
             # every pass: it counts like a fault of the objects.

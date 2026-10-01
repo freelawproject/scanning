@@ -1215,34 +1215,58 @@ def delete_page_edit_objects(scan: Scan) -> int:
     return _delete_prefix(scan, prefix, "page edit image")
 
 
-def final_xml_prefix(scan: Scan) -> str:
+def list_keys(prefix: str) -> list[str]:
+    """Return every key under a prefix of the private bucket.
+
+    :param prefix: Full S3 prefix.
+    :returns: The keys; empty when S3 sync is disabled.
+    :rtype: list[str]
+    :raises ClientError: On an S3 error: a caller that deletes what the
+        listing misses must not read a fault as "nothing there".
+    """
+    if not _s3_enabled():
+        return []
+    paginator = _s3_client().get_paginator("list_objects_v2")
+    return [
+        obj["Key"]
+        for page in paginator.paginate(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Prefix=prefix
+        )
+        for obj in page.get("Contents", [])
+    ]
+
+
+def final_xml_prefix(scan_pk: int) -> str:
     """Return the prefix of a scan's exported final XML (#408).
 
-    :param scan: The scan.
+    :param scan_pk: The scan's primary key.
     :returns: ``final-xml/{pk}/``.
     :rtype: str
     """
-    return f"{FINAL_XML_PREFIX}{scan.pk}/"
+    return f"{FINAL_XML_PREFIX}{scan_pk}/"
 
 
-def delete_final_xml_objects(scan: Scan) -> int:
+def delete_final_xml_objects(scan_pk: int) -> int:
     """Delete every exported final XML of a scan (#408).
 
-    For a scan that is going away: the prefix is outside the
-    processing prefix, so no other sweep reaches it.
+    For a scan that is gone: the prefix is outside the processing
+    prefix, so no other sweep reaches it. It takes the pk and not the
+    row, because the admin calls it after the row delete commits.
 
-    :param scan: The scan whose exported XML to delete.
+    :param scan_pk: The deleted scan's primary key.
     :returns: Number of objects deleted (0 when S3 sync is disabled or
         the prefix is empty).
     :rtype: int
+    :raises ClientError: On an S3 error.
     """
-    return _delete_prefix(scan, final_xml_prefix(scan), "final XML")
+    return _delete_prefix(scan_pk, final_xml_prefix(scan_pk), "final XML")
 
 
-def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:
+def _delete_prefix(scan: Scan | int, prefix: str, kind: str) -> int:
     """Delete every object under one prefix, paginating the listing.
 
-    :param scan: The scan the prefix belongs to (for the log line).
+    :param scan: The scan the prefix belongs to, or its pk (for the log
+        line).
     :param prefix: Full S3 prefix to sweep.
     :param kind: What the objects are, for the log line.
     :returns: Number of objects deleted.
@@ -1268,7 +1292,7 @@ def _delete_prefix(scan: Scan, prefix: str, kind: str) -> int:
             "Deleted %d %s object(s) for scan %s under s3://%s/%s",
             deleted,
             kind,
-            scan.pk,
+            getattr(scan, "pk", scan),
             bucket,
             prefix,
         )

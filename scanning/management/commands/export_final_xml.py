@@ -10,6 +10,13 @@ It also takes the rows the tick stopped trying at
 ``final_xml.MAX_ATTEMPTS``: their count starts again, so a fault fixed
 in the code is one run of this command.
 
+Last, it deletes the objects under ``final-xml/`` that no stamp names
+(``final_xml.orphan_keys``): the files of a deleted scan whose admin
+sweep failed. The tick does not list the prefix; this command does.
+
+It holds the exporter's lock, the one the tick takes, and refuses when
+the tick holds it: run it again a moment later.
+
 Examples:
 
     # Say what would be written and deleted, and change nothing.
@@ -76,35 +83,62 @@ class Command(BaseCommand):
             if not Scan.objects.filter(pk=pk).exists():
                 raise CommandError(f"scan {pk} does not exist")
         rows = Opinion.objects.all()
+        prefixes = [s3_sync.FINAL_XML_PREFIX]
         if pks:
             rows = rows.filter(scan_id__in=pks)
-        owed = list(final_xml.owed_rows(rows))
-        withdrawn = list(final_xml.withdrawn_rows(rows))
-        if options["dry_run"]:
-            for opinion in owed:
-                self.stdout.write(
-                    f"write {final_xml.key(opinion)} ({opinion} of scan "
-                    f"{opinion.scan_id})"
-                )
-            for opinion in withdrawn:
-                self.stdout.write(
-                    f"delete {final_xml.key(opinion)} ({opinion} of scan "
-                    f"{opinion.scan_id}, {opinion.status})"
-                )
-            self.stdout.write(
-                f"Would write {len(owed)} and delete {len(withdrawn)} final "
-                f"XML document(s) under schema {casebody.SCHEMA}"
-            )
-            return
-        if not s3_sync.s3_active():
+            prefixes = [s3_sync.final_xml_prefix(pk) for pk in pks]
+        dry_run = options["dry_run"]
+        if not dry_run and not s3_sync.s3_active():
             raise CommandError("S3 is off: nothing can be exported")
-        Opinion.objects.filter(pk__in=[o.pk for o in owed]).update(
-            final_xml_attempts=0
-        )
-        done = final_xml.export_due(limit=None, opinions=rows)
+        with final_xml.exporter_lock() as held:
+            if not held:
+                raise CommandError(
+                    "the collect tick is exporting now; run this again in "
+                    "a moment"
+                )
+            owed = list(final_xml.owed_rows(rows))
+            withdrawn = list(final_xml.withdrawn_rows(rows))
+            orphans = [
+                key
+                for prefix in prefixes
+                for key in final_xml.orphan_keys(prefix)
+            ]
+            if dry_run:
+                self._report(owed, withdrawn, orphans)
+                return
+            Opinion.objects.filter(pk__in=[o.pk for o in owed]).update(
+                final_xml_attempts=0
+            )
+            done = final_xml.export_rows(None, rows)
+            deleted = 0
+            for key in orphans:
+                if s3_sync.delete_object(key):
+                    deleted += 1
+                    self.stdout.write(f"deleted the orphan {key}")
+                else:
+                    self.stderr.write(f"could not delete the orphan {key}")
         left = final_xml.owed_rows(rows).count()
         self.stdout.write(
             f"Wrote or deleted {done} final XML document(s) under schema "
-            f"{casebody.SCHEMA}; {left} still owed (the log has the "
-            "reasons)"
+            f"{casebody.SCHEMA}, deleted {deleted} orphan(s); {left} still "
+            "owed (the log has the reasons)"
+        )
+
+    def _report(self, owed, withdrawn, orphans):
+        for opinion in owed:
+            self.stdout.write(
+                f"write {final_xml.key(opinion)} ({opinion} of scan "
+                f"{opinion.scan_id})"
+            )
+        for opinion in withdrawn:
+            self.stdout.write(
+                f"delete {final_xml.key(opinion)} ({opinion} of scan "
+                f"{opinion.scan_id}, {opinion.status})"
+            )
+        for key in orphans:
+            self.stdout.write(f"delete the orphan {key}")
+        self.stdout.write(
+            f"Would write {len(owed)} and delete {len(withdrawn)} final "
+            f"XML document(s) under schema {casebody.SCHEMA}, and delete "
+            f"{len(orphans)} orphan(s)"
         )

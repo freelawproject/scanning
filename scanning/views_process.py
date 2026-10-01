@@ -2282,8 +2282,10 @@ def serve_opinion_exported_xml(
     """Send the browser to the stored final XML of one opinion (#408).
 
     The object CourtListener reads, at ``final_xml.key``. A developer's
-    route, so it redirects (#243/#262). A 404 while the export of the
-    row's spans is not written (``final_xml.is_written``).
+    route, so it redirects (#243/#262). A 404 while no object is stored
+    (``final_xml.is_stored``). The object may be older than the row:
+    after a rewrite of the approved text it holds the text approved
+    before, until a tagger run of the new one.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -2292,7 +2294,7 @@ def serve_opinion_exported_xml(
     """
     scan = get_object_or_404(Scan, pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
-    if not final_xml.is_written(opinion):
+    if not final_xml.is_stored(opinion):
         return _json_404(
             f"The final XML of {opinion} is not exported.",
             opinion=opinion.pk,
@@ -2501,7 +2503,10 @@ def opinion_file_index(
         {
             "name": "exported.xml",
             "output": "opinion-exported-xml",
-            "written": final_xml.is_written(opinion),
+            "written": final_xml.is_stored(opinion),
+            # False while the object holds older inputs than the row:
+            # the pass writes it again, or a tagger run is owed.
+            "current": final_xml.is_written(opinion),
             "key": final_xml.key(opinion),
             "url": reverse(
                 "serve_opinion_exported_xml",

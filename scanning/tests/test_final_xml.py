@@ -16,6 +16,7 @@ from unittest.mock import patch
 from botocore.exceptions import ClientError, EndpointConnectionError
 from django.core.management import call_command
 from django.core.management.base import CommandError
+from django.db import OperationalError
 from django.urls import reverse
 
 from scanning import casebody, final_xml, tagger
@@ -72,6 +73,24 @@ class TestTheKey(_ExportCase):
             final_xml.key(self.opinion),
             f"final-xml/{self.scan.pk}/{self.opinion.pk}.xml",
         )
+
+
+class TestParseKey(_ExportCase):
+    def test_it_reads_back_the_key(self):
+        self.assertEqual(
+            final_xml.parse_key(final_xml.key(self.opinion)),
+            (self.scan.pk, self.opinion.pk),
+        )
+
+    def test_another_shape_is_none(self):
+        for key in (
+            "final-xml/1/2.json",
+            "final-xml/1/x.xml",
+            "final-xml/2.xml",
+            "processing/1/2.xml",
+        ):
+            with self.subTest(key=key):
+                self.assertIsNone(final_xml.parse_key(key))
 
 
 class TestTheIds(_ExportCase):
@@ -175,14 +194,33 @@ class TestThePass(_ExportCase):
         self.assertIsNone(opinion.final_xml_schema)
         self.assertFalse(final_xml.is_written(opinion))
 
-    def test_a_new_approval_deletes_it_until_the_new_text_is_tagged(self):
+    def test_a_rewrite_of_the_approved_text_keeps_the_object(self):
+        """The spans stay behind the new approved key, and the object of
+        the text approved before is still a whole document."""
         self.tagged()
         final_xml.export_due()
-        self.approve_again("Another text.")
+        before = self.xml[final_xml.key(self.opinion)]
+        self.approve_again("Jane ROE, Appellant, joined again.")
 
+        self.assertEqual(final_xml.export_due(), 0)
+
+        opinion = self.refresh()
+        self.assertEqual(self.xml[final_xml.key(opinion)], before)
+        self.assertTrue(final_xml.is_stored(opinion))
+        self.assertFalse(final_xml.is_written(opinion))
+
+    def test_the_tagger_run_after_a_rewrite_writes_the_new_text(self):
+        self.tagged()
         final_xml.export_due()
+        self.approve_again("Jane ROE, Appellant, joined again.")
+        self.opinion.refresh_from_db()
+        self.finished_row()
+        tagger.finish_ready_runs()
 
-        self.assertEqual(self.xml, {})
+        self.assertEqual(final_xml.export_due(), 1)
+
+        self.assertTrue(final_xml.is_written(self.refresh()))
+        self.assertIn(b"joined again", self.xml[final_xml.key(self.opinion)])
 
     def test_the_approval_after_a_reopen_writes_it_again(self):
         self.tagged()
@@ -286,6 +324,18 @@ class TestTheFaults(_ExportCase):
 
         self.assertEqual(self.refresh().final_xml_attempts, 1)
 
+    def test_a_database_fault_counts_nothing_and_reaches_the_tick(self):
+        self.tagged()
+        with (
+            patch.object(
+                final_xml, "render", side_effect=OperationalError("gone")
+            ),
+            self.assertRaises(OperationalError),
+        ):
+            final_xml.export_due()
+
+        self.assertEqual(self.refresh().final_xml_attempts, 0)
+
     def test_new_spans_reset_the_count(self):
         self.tagged()
         Opinion.objects.filter(pk=self.opinion.pk).update(
@@ -300,39 +350,126 @@ class TestTheFaults(_ExportCase):
 
 
 class TestTheSwap(_ExportCase):
-    def test_a_row_that_moved_during_the_build_is_not_stamped(self):
-        self.tagged()
+    def render_then(self, change):
         real = final_xml.render
 
-        def reopen_then_render(opinion):
-            Opinion.objects.filter(pk=opinion.pk).update(
-                status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
-            )
+        def side_effect(opinion):
+            change(opinion)
             return real(opinion)
 
-        with patch.object(final_xml, "render", side_effect=reopen_then_render):
+        return patch.object(final_xml, "render", side_effect=side_effect)
+
+    def test_a_reopen_during_the_build_leaves_a_stamp_to_delete(self):
+        self.tagged()
+        tag_key = self.opinion.tag_key
+
+        with self.render_then(
+            lambda o: Opinion.objects.filter(pk=o.pk).update(
+                status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+            )
+        ):
             self.assertEqual(final_xml.export_due(), 0)
 
-        # No stamp names the object, so the export deletes it itself.
-        self.assertEqual(self.refresh().final_xml_tag_key, "")
-        self.assertEqual(self.xml, {})
+        # The object is there and a stamp names it, of unknown content.
+        opinion = self.refresh()
+        self.assertEqual(opinion.final_xml_tag_key, tag_key)
+        self.assertIsNone(opinion.final_xml_schema)
+        self.assertIn(final_xml.key(opinion), self.xml)
 
-    def test_new_spans_during_the_build_leave_it_for_the_next_tick(self):
+        self.assertEqual(final_xml.export_due(), 1)
+        self.assertEqual(self.xml, {})
+        self.assertEqual(self.refresh().final_xml_tag_key, "")
+
+    def test_new_spans_during_the_build_are_written_on_the_next_pass(self):
         self.tagged()
-        real = final_xml.render
         moved = self.opinion.tag_key + ".2"
         self.stored[moved] = self.stored[self.opinion.tag_key]
 
-        def retag_then_render(opinion):
-            Opinion.objects.filter(pk=opinion.pk).update(tag_key=moved)
-            return real(opinion)
-
-        with patch.object(final_xml, "render", side_effect=retag_then_render):
+        with self.render_then(
+            lambda o: Opinion.objects.filter(pk=o.pk).update(tag_key=moved)
+        ):
             self.assertEqual(final_xml.export_due(), 0)
-        self.assertEqual(self.refresh().final_xml_tag_key, "")
+        self.assertFalse(final_xml.is_written(self.refresh()))
 
         self.assertEqual(final_xml.export_due(), 1)
         self.assertEqual(self.refresh().final_xml_tag_key, moved)
+        self.assertTrue(final_xml.is_written(self.opinion))
+
+    def test_an_old_object_over_a_current_stamp_is_written_again(self):
+        """The case of the review (#440): another writer stamped newer
+        inputs while this build ran, and this PUT lands last. The lost
+        swap marks the content unknown, so a pass writes it again."""
+        self.tagged()
+        old = self.opinion.tag_key
+        middle, newest = old + ".1", old + ".2"
+        self.stored[middle] = self.stored[newest] = self.stored[old]
+        Opinion.objects.filter(pk=self.opinion.pk).update(tag_key=middle)
+
+        def newer_writer_stamps(opinion):
+            Opinion.objects.filter(pk=opinion.pk).update(
+                tag_key=newest,
+                final_xml_tag_key=newest,
+                final_xml_schema=casebody.SCHEMA,
+            )
+
+        with self.render_then(newer_writer_stamps):
+            self.assertEqual(final_xml.export_due(), 0)
+
+        opinion = self.refresh()
+        self.assertEqual(opinion.final_xml_tag_key, newest)
+        self.assertIsNone(opinion.final_xml_schema)
+        self.assertFalse(final_xml.is_written(opinion))
+
+        self.assertEqual(final_xml.export_due(), 1)
+        self.assertTrue(final_xml.is_written(self.refresh()))
+
+    def test_a_row_deleted_during_the_build_takes_its_object(self):
+        self.tagged()
+
+        with self.render_then(
+            lambda o: Opinion.objects.filter(pk=o.pk).delete()
+        ):
+            self.assertEqual(final_xml.export_due(), 0)
+
+        self.assertEqual(self.xml, {})
+
+
+class TestTheLock(_ExportCase):
+    def test_the_pass_waits_while_another_exporter_holds_it(self):
+        self.tagged()
+        with patch.object(
+            final_xml, "exporter_lock", return_value=_held(False)
+        ):
+            self.assertEqual(final_xml.export_due(), 0)
+        self.assertEqual(self.xml, {})
+
+    def test_the_command_refuses_while_the_tick_holds_it(self):
+        self.tagged()
+        with (
+            patch.object(
+                final_xml, "exporter_lock", return_value=_held(False)
+            ),
+            self.assertRaises(CommandError),
+        ):
+            call_command("export_final_xml", "--all", stdout=StringIO())
+
+    def test_the_lock_is_free_after_the_pass(self):
+        final_xml.export_due()
+        with final_xml.exporter_lock() as held:
+            self.assertTrue(held)
+
+
+class _held:
+    """A stand-in for ``exporter_lock`` that holds or does not."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __enter__(self):
+        return self.value
+
+    def __exit__(self, *exc):
+        return False
 
 
 class TestTheCommand(_ExportCase):
@@ -368,6 +505,35 @@ class TestTheCommand(_ExportCase):
         self.run_command("--all")
 
         self.assertTrue(final_xml.is_written(self.refresh()))
+
+    def test_it_deletes_the_objects_no_stamp_names(self):
+        self.tagged()
+        final_xml.export_due()
+        kept = final_xml.key(self.opinion)
+        gone = f"final-xml/{self.scan.pk}/{self.opinion.pk + 1000}.xml"
+        other_scan = f"final-xml/{self.scan.pk + 1}/{self.opinion.pk}.xml"
+        odd = "final-xml/notes.txt"
+        for key in (gone, other_scan, odd):
+            self.xml[key] = b"<casebody/>"
+
+        with patch(
+            "scanning.s3_sync.list_keys",
+            side_effect=lambda prefix: [
+                k for k in self.xml if k.startswith(prefix)
+            ],
+        ):
+            dry = self.run_command("--all", "--dry-run")
+            self.assertIn("delete 3 orphan(s)", dry)
+            self.assertEqual(len(self.xml), 4)
+
+            self.run_command("--all")
+
+        self.assertEqual(list(self.xml), [kept])
+
+    def test_a_named_scan_lists_its_own_prefix(self):
+        with patch("scanning.s3_sync.list_keys", return_value=[]) as listing:
+            self.run_command(str(self.scan.pk), "--dry-run")
+        listing.assert_called_once_with(f"final-xml/{self.scan.pk}/")
 
     def test_it_refuses_both_or_neither(self):
         with self.assertRaises(CommandError):
@@ -433,6 +599,7 @@ class TestTheRoute(_ExportCase):
         final_xml.export_due()
 
         self.assertTrue(entry()["written"])
+        self.assertTrue(entry()["current"])
         self.assertEqual(entry()["key"], final_xml.key(self.opinion))
         self.assertEqual(
             entry()["url"], self.url("serve_opinion_exported_xml")

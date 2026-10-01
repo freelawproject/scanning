@@ -255,11 +255,10 @@ class ScanAdminRequeueActionTests(TestCase):
 
 
 class ScanAdminDeleteShardSweepTests(TestCase):
-    """Scan deletion sweeps the shards, job results, page edits and the
-    exported final XML.
+    """Scan deletion sweeps the shards, job results and page edits.
 
-    The four prefixes nothing else removes (PR #169 review, issues
-    #176, #214 and #408). The shard PDFs duplicate the original's bytes, each
+    The three prefixes nothing else removes (PR #169 review, issues
+    #176 and #214). The shard PDFs duplicate the original's bytes, each
     job result holds a converted copy of the volume, and the page edit
     images are the only copy of what a curator uploaded.
     """
@@ -273,10 +272,9 @@ class ScanAdminDeleteShardSweepTests(TestCase):
             patch("scanning.s3_sync.delete_shard_objects") as shards,
             patch("scanning.s3_sync.delete_job_objects") as results,
             patch("scanning.s3_sync.delete_page_edit_objects") as images,
-            patch("scanning.s3_sync.delete_final_xml_objects") as exported,
         ):
             self.admin.delete_model(_request_with_messages(), scan)
-        for mock_delete in (shards, results, images, exported):
+        for mock_delete in (shards, results, images):
             mock_delete.assert_called_once()
             self.assertEqual(mock_delete.call_args.args[0].pk, scan.pk)
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
@@ -308,6 +306,67 @@ class ScanAdminDeleteShardSweepTests(TestCase):
         results.assert_called_once()
         images.assert_called_once()
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
+
+
+class ScanAdminDeleteFinalXmlSweepTests(TestCase):
+    """The exported final XML goes after the row delete commits (#408).
+
+    ``final-xml/`` is the list CourtListener imports, so the sweep runs
+    once no row is left for an export to stamp.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+
+    def sweep_sees(self):
+        seen = []
+
+        def record(scan_pk):
+            seen.append((scan_pk, Scan.objects.filter(pk=scan_pk).exists()))
+            return 0
+
+        return seen, record
+
+    def test_delete_model_sweeps_after_the_commit(self):
+        scan = ScanFactory()
+        pk = scan.pk
+        seen, record = self.sweep_sees()
+        with patch(
+            "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+        ):
+            with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                self.admin.delete_model(_request_with_messages(), scan)
+            # Nothing ran before the commit.
+            self.assertEqual(seen, [])
+            for callback in callbacks:
+                callback()
+        self.assertEqual(seen, [(pk, False)])
+
+    def test_delete_queryset_sweeps_each_scan_after_the_commit(self):
+        scans = [ScanFactory(), ScanFactory()]
+        queryset = Scan.objects.filter(pk__in=[s.pk for s in scans])
+        seen, record = self.sweep_sees()
+        with (
+            patch(
+                "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.admin.delete_queryset(_request_with_messages(), queryset)
+        self.assertEqual(sorted(seen), sorted((s.pk, False) for s in scans))
+
+    def test_a_failed_sweep_is_an_error(self):
+        scan = ScanFactory()
+        error = ClientError({"Error": {"Code": "SlowDown"}}, "DeleteObjects")
+        with (
+            patch(
+                "scanning.s3_sync.delete_final_xml_objects", side_effect=error
+            ),
+            self.assertLogs("scanning.admin", level="ERROR") as logs,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.admin.delete_model(_request_with_messages(), scan)
+        self.assertIn("export_final_xml --all", logs.output[0])
 
 
 class ScanAdminDeleteSummaryTests(TestCase):
