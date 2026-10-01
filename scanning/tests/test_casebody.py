@@ -852,6 +852,24 @@ class TestTheSubOpinions(TestCase):
             ["plurality"],
         )
 
+    def test_a_plurality_after_an_untagged_line_says_so(self):
+        """The type of the first writing is read from its author line,
+        not from the "OPINION" line the head matter did not take."""
+        line = "Smith, J., announced the judgment and delivered a plurality opinion."
+        self.assertEqual(
+            self.types(
+                para("Supreme Court."),
+                para("OPINION"),
+                para(line),
+                para("We affirm."),
+                spans=[
+                    span(0, 0, 14, "court"),
+                    span(2, 0, len(line), "author"),
+                ],
+            ),
+            ["plurality"],
+        )
+
     def test_a_writing_whose_type_is_not_read_refuses_the_xml(self):
         with self.assertRaises(casebody.OpinionTypeError) as caught:
             build(
@@ -874,7 +892,9 @@ class TestTheSubOpinions(TestCase):
     def test_every_type_is_a_key_of_the_courtlistener_map(self):
         """The keys of ``harvard_opinions.map_opinion_type``, spelled here
         at courtlistener 58784cac: a value outside them is ``combined``
-        in one importer and an error in the other."""
+        in one importer and an error in the other. This repo does not
+        import CourtListener and a test fetches nothing, so a change of
+        that map is not caught here: compare it by hand at that commit."""
         harvard_keys = {
             "unanimous",
             "majority",

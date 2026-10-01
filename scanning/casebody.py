@@ -579,6 +579,37 @@ def opinion_starts(
     return starts
 
 
+def _author_line(
+    body: list[dict], by: dict[int, list[dict]], start: int, end: int
+) -> int:
+    """Return the author line of the first writing, or ``start``.
+
+    The first writing can open with an untagged line the head matter did
+    not take ("OPINION") before its author line, and its type ("a
+    plurality opinion") is in that author line (:func:`opinion_starts`).
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param start: The first paragraph of the writing.
+    :param end: The first paragraph after it.
+    :returns: The first paragraph in that range that an ``author`` span
+        starts, or ``start`` when none does (a per curiam).
+    :rtype: int
+    """
+    return next(
+        (
+            index
+            for index in range(start, end)
+            if any(
+                span["label"] == AUTHOR
+                and _starts_paragraph(body[index].get("text") or "", span)
+                for span in by.get(index, [])
+            )
+        ),
+        start,
+    )
+
+
 def _first_sentence(text: str) -> str:
     """Return the first sentence of a text, at most :data:`_ROLE_REACH`."""
     text = text[:_ROLE_REACH]
@@ -832,9 +863,15 @@ def build(approved: dict, tags: dict) -> str:
 
     split = head_matter_end(body, by)
     starts = opinion_starts(body, by, split)
+    ends = [*starts[1:], len(body)]
     types = [
-        opinion_type(body, by, start, first=at == 0)
-        for at, start in enumerate(starts)
+        opinion_type(
+            body,
+            by,
+            _author_line(body, by, start, end) if at == 0 else start,
+            first=at == 0,
+        )
+        for at, (start, end) in enumerate(zip(starts, ends, strict=True))
     ]
     owners = assign_footnotes(body, notes, starts)
     out = ['<?xml version="1.0" encoding="utf-8"?>']
@@ -857,7 +894,6 @@ def build(approved: dict, tags: dict) -> str:
         + ">"
     )
     out.extend(lines(blocks[:split], "  "))
-    ends = [*starts[1:], len(body)]
     for at, (start, end) in enumerate(zip(starts, ends, strict=True)):
         out.append(f"  <opinion{_attrs({'type': types[at]})}>")
         out.extend(lines(blocks[start:end], "    "))

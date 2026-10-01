@@ -461,8 +461,8 @@ def _starts_again(label: str, last: int | None) -> bool:
     )
 
 
-def mark_restarts(document: dict) -> list[str]:
-    """Return the labels where the footnote marks of the body start again.
+def mark_restarts(document: dict) -> list[tuple[str, int]]:
+    """Return where the footnote marks of the body start again.
 
     A mark is a ``sup`` mark whose text is a number alone, in the order
     of the body flow. It starts the numbers again when it passes
@@ -473,8 +473,9 @@ def mark_restarts(document: dict) -> list[str]:
     series.
 
     :param document: The ensemble document.
-    :returns: The label of each restart, in reading order.
-    :rtype: list[str]
+    :returns: ``(label, page)`` of each restart, in reading order: the
+        page is the ``page_in_opinion`` of the mark.
+    :rtype: list[tuple[str, int]]
     """
     restarts = []
     last = None
@@ -491,7 +492,7 @@ def mark_restarts(document: dict) -> list[str]:
             if not found or not found.group(1).isdigit():
                 continue
             if _starts_again(found.group(1), last):
-                restarts.append(str(int(found.group(1))))
+                restarts.append((str(int(found.group(1))), item["page"]))
             last = int(found.group(1))
     return restarts
 
@@ -505,10 +506,10 @@ def footnotes(document: dict) -> list[dict]:
     page before, the rule of the legacy pipeline. A label that starts
     the numbers again (:func:`_starts_again`) starts a footnote only
     where it is the next restart label of the body marks
-    (:func:`mark_restarts`), so the first note of a dissent numbered
-    from 1 is a note and not the rest of the last note of the majority,
-    and a continued note that starts with another small number ("3 Am.
-    Jur. 2d") stays text. It is joined to the
+    (:func:`mark_restarts`), on the page of that mark or later, so the
+    first note of a dissent numbered from 1 is a note and not the rest
+    of the last note of the majority, and a continued note that starts
+    with a small number ("3 Am. Jur. 2d", "1 U.S.C. 1") stays text. It is joined to the
     last paragraph of that footnote by the rule of :func:`body`, or it
     is a paragraph of its own. A group before any label has no footnote
     to go on with, so it is a footnote with ``label`` None, and no text
@@ -527,11 +528,15 @@ def footnotes(document: dict) -> list[dict]:
             before = item
             continue
         split = split_label(item["group"])
+        # A note starts on the page of its mark, so a group on a page
+        # before the restart mark is no restart: it is the rest of a
+        # note that starts with the same number ("1 U.S.C. 1").
         again = (
             split is not None
             and bool(restarts)
             and split[0].isdigit()
-            and str(int(split[0])) == restarts[0]
+            and str(int(split[0])) == restarts[0][0]
+            and item["page"] >= restarts[0][1]
             and _starts_again(split[0], last_number)
         )
         if split and (again or _is_next_label(split[0], last_number)):

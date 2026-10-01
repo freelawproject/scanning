@@ -588,7 +588,7 @@ class TestTheFootnotes(TestCase):
         self.assertEqual(
             notes[2]["paragraphs"][0]["text"], "The dissent's note."
         )
-        self.assertEqual(paragraphs.mark_restarts(doc), ["1"])
+        self.assertEqual(paragraphs.mark_restarts(doc), [("1", 1)])
 
     def test_with_no_restart_of_the_marks_a_small_number_is_text(self):
         """The rule of one series stands where the body numbers on: a
@@ -652,6 +652,49 @@ class TestTheFootnotes(TestCase):
         )
         self.assertEqual(
             notes[4]["paragraphs"][0]["text"], "The dissent's note."
+        )
+
+    def test_a_continued_note_that_starts_with_the_restart_label(self):
+        """A note starts on the page of its mark: "1 U.S.C. 1" on a page
+        before the dissent's first mark goes on with the majority's note,
+        and the dissent's note 1 is still a note."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "2"),
+                    self.note(2, "1. One."),
+                    self.note(3, "2. The statute is"),
+                ],
+            ),
+            page(
+                1,
+                [
+                    self.note(0, "1 U.S.C. 1, which reads."),
+                    group(1, "More of the majority."),
+                ],
+            ),
+            page(
+                2,
+                [
+                    group(0, "Jones, J., dissenting."),
+                    self.cited(1, "I would reverse.", "1"),
+                    self.note(2, "1. The dissent's note."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["1", "2", "1"])
+        self.assertEqual(
+            notes[1]["paragraphs"][0]["text"],
+            "The statute is\n1 U.S.C. 1, which reads.",
+        )
+        self.assertEqual(notes[2]["pages"], [2])
+        self.assertEqual(
+            notes[2]["paragraphs"][0]["text"], "The dissent's note."
         )
 
     def test_a_restart_is_taken_once(self):
