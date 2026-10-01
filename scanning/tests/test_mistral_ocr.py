@@ -955,10 +955,200 @@ class TestSweep(ScanningTestCase):
         mocks["poll"].assert_not_called()
 
 
-# ── the start button ────────────────────────────────────────────────
+# ── the sweep that starts the read (#341) ──────────────────────────
 @override_settings(**MISTRAL)
-class TestStartButton(ScanningTestCase):
-    """Staff-only, like the dots.mocr button, and it writes rows only."""
+class TestEnqueueMissingRuns(ScanningTestCase):
+    """The daemon starts the Mistral read (#341), under the rule of the
+    detection and dots.mocr sweeps: one run per shard set, ever. It
+    replaced the staff button of #191.
+    """
+
+    FINGERPRINT = "2048:20"
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        mistral_ocr._REFUSED.clear()
+        self.addCleanup(mistral_ocr._REFUSED.clear)
+
+    def _scan(
+        self, status=Status.PAGE_COMPLETENESS_REVIEW_DONE, fingerprint=None
+    ):
+        return ScanFactory(
+            page_count=20,
+            status=status,
+            source_fingerprint=(
+                self.FINGERPRINT if fingerprint is None else fingerprint
+            ),
+        )
+
+    def _sweep(self, s3=True, manifest=True, **overrides):
+        with (
+            override_settings(**overrides),
+            patch("scanning.s3_sync.s3_active", return_value=s3),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(
+                    (self.manifest, "") if manifest else (None, "refused")
+                ),
+            ) as committed,
+            patch("scanning.mistral_client.upload_file") as upload,
+            patch("scanning.mistral_client.create_batch") as create,
+        ):
+            started = mistral_ocr.enqueue_missing_runs()
+        self.committed = committed
+        self.upload = upload
+        self.create = create
+        return started
+
+    def test_a_volume_with_no_read_gets_one_run(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.mistral_ocr", level="INFO") as logs:
+            self.assertEqual(self._sweep(), 1)
+        rows = extract_jobs(scan)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.status for r in rows}, {JobStatus.PENDING})
+        self.assertEqual({r.provider for r in rows}, {JobProvider.MISTRAL})
+        self.assertEqual(
+            {r.source_fingerprint for r in rows}, {self.FINGERPRINT}
+        )
+        self.assertIn("Started Mistral OCR run 1", "".join(logs.output))
+
+    def test_the_sweep_calls_no_mistral_endpoint(self):
+        # Rows only: the wave renders, uploads and submits.
+        self._scan()
+        self._sweep()
+        self.upload.assert_not_called()
+        self.create.assert_not_called()
+
+    def test_a_shard_set_is_read_once(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(), 1)
+        first = [r.pk for r in extract_jobs(scan)]
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual([r.pk for r in extract_jobs(scan)], first)
+        self.committed.assert_not_called()
+
+    def test_a_dead_run_is_not_re_run_by_a_tick(self):
+        # Every attempt is paid: a dead run waits for a person.
+        scan = self._scan()
+        self._sweep()
+        ExternalJob.objects.filter(scan=scan).update(status=JobStatus.FAILED)
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(
+            {r.status for r in extract_jobs(scan)}, {JobStatus.FAILED}
+        )
+
+    def test_a_re_cut_shard_set_gets_a_run(self):
+        scan = self._scan()
+        self._sweep()
+        ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        self.manifest = make_manifest(shard_count=4, pages_per_shard=5)
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            self.assertEqual(self._sweep(), 1)
+        live = mistral_ocr.live_extract_jobs(scan)
+        self.assertEqual(len(live), 4)
+        self.assertEqual({r.source_fingerprint for r in live}, {"4096:20"})
+
+    def test_an_apply_run_row_answers_for_no_shard_set(self):
+        # The one-page rows of a corrected volume are not a volume run.
+        from scanning.models import ApplyRun
+
+        scan = self._scan()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        jobs.ensure_shard_jobs(
+            scan,
+            make_manifest(shard_count=1, pages_per_shard=1),
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            reuse_results=True,
+            apply_run=run,
+        )
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(len(mistral_ocr.live_extract_jobs(scan)), 2)
+
+    def test_a_volume_without_a_shard_set_is_not_swept(self):
+        self._scan(fingerprint="")
+        self.assertEqual(self._sweep(), 0)
+        self.committed.assert_not_called()
+
+    def test_a_status_outside_the_sweep_is_left_alone(self):
+        # Review 1 included: the read waits for its approval (#341). An
+        # approved volume too: its opinions are glued, and no pass
+        # glues them again for a late read.
+        for status in (
+            Status.QUEUED,
+            Status.PROCESSING,
+            Status.AWAITING,
+            Status.AWAITING_VALIDATION,
+            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+            Status.REDACTION_REVIEW_DONE,
+            Status.ERROR,
+            Status.APPROVED,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 0)
+                self.assertEqual(extract_jobs(scan), [])
+
+    def test_every_sweep_status_is_swept(self):
+        # Between the review-1 approval and the review-2 approval.
+        for status in (
+            Status.PAGE_COMPLETENESS_REVIEW_DONE,
+            Status.READY_FOR_REDACTION_REVIEW,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 1)
+                self.assertEqual(len(extract_jobs(scan)), 2)
+
+    def test_no_key_no_sweep(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(MISTRAL_API_KEY=""), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(extract_jobs(scan), [])
+
+    def test_no_s3_no_sweep(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(s3=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(extract_jobs(scan), [])
+
+    def test_a_few_volumes_per_tick_newest_first(self):
+        scans = [self._scan() for _ in range(3)]
+        with patch.object(mistral_ocr, "SWEEP_SCANS_PER_TICK", 2):
+            self.assertEqual(self._sweep(), 2)
+            self.assertEqual(
+                [scan.pk for scan in scans if extract_jobs(scan)],
+                [scans[1].pk, scans[2].pk],
+            )
+            self.assertEqual(self._sweep(), 1)
+        self.assertTrue(all(len(extract_jobs(scan)) == 2 for scan in scans))
+
+    def test_a_refused_shard_set_is_looked_at_once(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.mistral_ocr", level="INFO") as logs:
+            self.assertEqual(self._sweep(manifest=False), 0)
+        self.assertIn("refused", "".join(logs.output))
+        self.assertEqual(self._sweep(manifest=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(extract_jobs(scan), [])
+
+    def test_the_sweep_writes_no_scan_status(self):
+        scan = self._scan(status=Status.READY_FOR_REDACTION_REVIEW)
+        self._sweep()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.READY_FOR_REDACTION_REVIEW)
+
+
+# ── the step-1 bar (#341) ───────────────────────────────────────────
+@override_settings(**MISTRAL)
+class TestProcessBar(ScanningTestCase):
+    """The bar shows the Mistral run and offers no button: the daemon
+    starts the read (#341)."""
 
     def setUp(self):
         super().setUp()
@@ -966,151 +1156,29 @@ class TestStartButton(ScanningTestCase):
         self.scan = ScanFactory(
             page_count=20, status=Status.AWAITING_VALIDATION
         )
-        self.url = reverse("start_mistral_ocr", kwargs={"pk": self.scan.pk})
-        self.manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        self.url = reverse("process_actions", kwargs={"pk": self.scan.pk})
 
-    _UNSET = object()
-
-    def _committed(self, manifest=_UNSET, reason=""):
-        return patch(
-            "scanning.sharding.committed_manifest",
-            return_value=(
-                self.manifest if manifest is self._UNSET else manifest,
-                reason,
-            ),
-        )
-
-    def _press(self, user=None):
+    def _bar(self, user=None):
         self.client.force_login(user or self.staff)
-        return self.client.post(self.url)
+        return self.client.get(f"{self.url}?step=1").json()["html"]
 
-    def _messages(self, response):
-        return [str(m) for m in response.wsgi_request._messages]
-
-    def test_staff_press_creates_one_row_per_shard(self):
-        with self._committed():
-            response = self._press()
-        self.assertRedirects(
-            response,
-            reverse("scan_process", kwargs={"pk": self.scan.pk}),
-            fetch_redirect_response=False,
+    def test_the_run_shows_on_the_bar(self):
+        mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=10)
         )
-        rows = extract_jobs(self.scan)
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({r.status for r in rows}, {JobStatus.PENDING})
-        self.assertIn("Queued Mistral OCR for 2", self._messages(response)[0])
+        self.assertIn("Mistral OCR running", self._bar())
 
-    def test_no_review_state_is_required(self):
-        # The button gates on the key and the shard set, not on a
-        # status: the read is over the original shards, so what it
-        # needs exists from the moment the pipeline cut them, and
-        # where the stage is called from is a separate question.
-        for status in (
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
-            Status.PAGE_COMPLETENESS_REVIEW_DONE,
-            Status.APPROVED,
-        ):
-            scan = ScanFactory(page_count=20, status=status)
-            self.client.force_login(self.staff)
-            with self._committed():
-                self.client.post(
-                    reverse("start_mistral_ocr", kwargs={"pk": scan.pk})
-                )
-            self.assertEqual(len(extract_jobs(scan)), 2, status)
+    def test_staff_is_offered_no_mistral_button(self):
+        html = self._bar()
+        self.assertNotIn("Run Mistral OCR", html)
+        self.assertNotIn("Re-run Mistral OCR", html)
+        self.assertNotIn("start-mistral", html)
 
-    def test_the_request_never_calls_mistral(self):
-        with (
-            self._committed(),
-            patch("scanning.mistral_client.upload_file") as upload,
-            patch("scanning.mistral_client.create_batch") as create,
-        ):
-            self._press()
-        upload.assert_not_called()
-        create.assert_not_called()
+    def test_the_surya_button_stays(self):
+        self.assertIn("Run Surya OCR", self._bar())
 
-    def test_the_request_never_cuts_shards(self):
-        with (
-            self._committed(),
-            patch("scanning.sharding.ensure_shards") as cut,
-        ):
-            self._press()
-        cut.assert_not_called()
+    def test_the_route_is_gone(self):
+        from django.urls import NoReverseMatch
 
-    def test_a_non_staff_user_is_refused(self):
-        with self._committed():
-            response = self._press(self.make_user())
-        self.assertEqual(extract_jobs(self.scan), [])
-        self.assertIn("Only staff", self._messages(response)[0])
-
-    def test_an_anonymous_user_is_redirected_to_login(self):
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, 302)
-        self.assertIn("/login", response["Location"])
-
-    def test_a_get_is_rejected(self):
-        self.client.force_login(self.staff)
-        self.assertEqual(self.client.get(self.url).status_code, 405)
-
-    def test_no_key_is_refused(self):
-        with override_settings(MISTRAL_API_KEY=""), self._committed():
-            response = self._press()
-        self.assertEqual(extract_jobs(self.scan), [])
-        self.assertIn("MISTRAL_API_KEY", self._messages(response)[0])
-
-    def test_no_committed_shard_set_is_refused(self):
-        with self._committed(manifest=None, reason="no shard set"):
-            response = self._press()
-        self.assertEqual(extract_jobs(self.scan), [])
-        self.assertIn("no shard set", self._messages(response)[0])
-
-    def test_a_second_press_while_a_run_is_open_is_refused(self):
-        with self._committed():
-            self._press()
-            first = [r.pk for r in extract_jobs(self.scan)]
-            response = self._press()
-        self.assertEqual([r.pk for r in extract_jobs(self.scan)], first)
-        self.assertIn("already going", self._messages(response)[-1])
-
-    def test_a_press_after_a_finished_run_reuses_it(self):
-        with self._committed():
-            self._press()
-            rows = extract_jobs(self.scan)
-            ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
-                status=JobStatus.CONSUMED
-            )
-            with (
-                patch("scanning.s3_sync.s3_active", return_value=True),
-                patch("scanning.s3_sync.object_exists", return_value=True),
-            ):
-                response = self._press()
-        self.assertEqual(len(extract_jobs(self.scan)), 2)
-        self.assertIn("already read", self._messages(response)[-1])
-
-    def test_the_run_shows_on_the_process_page(self):
-        with self._committed():
-            self._press()
-        self.client.force_login(self.staff)
-        response = self.client.get(
-            reverse("process_actions", kwargs={"pk": self.scan.pk})
-        )
-        self.assertIn("Mistral OCR running", response.json()["html"])
-
-    def test_the_bar_offers_the_button_to_staff(self):
-        # Beside the dots.mocr control on the step-1 bar, because the
-        # read is over the same shards that control reads.
-        url = reverse("process_actions", kwargs={"pk": self.scan.pk})
-        self.client.force_login(self.staff)
-        self.assertIn(
-            "Run Mistral OCR",
-            self.client.get(f"{url}?step=1").json()["html"],
-        )
-
-    def test_the_bar_offers_a_curator_no_button(self):
-        # The template gate, ahead of the view's: a curator is never
-        # offered work that costs money.
-        url = reverse("process_actions", kwargs={"pk": self.scan.pk})
-        self.client.force_login(self.make_user())
-        self.assertNotIn(
-            "Run Mistral OCR",
-            self.client.get(f"{url}?step=1").json()["html"],
-        )
+        with self.assertRaises(NoReverseMatch):
+            reverse("start_mistral_ocr", kwargs={"pk": self.scan.pk})

@@ -937,8 +937,8 @@ def stored_shard_manifest(scan: Scan, run: ApplyRun) -> dict:
     file, so a web pod or a collect tick may call it.
 
     It exists for a stage that joins a built run late: the Mistral read
-    (#191) starts by hand, and issue #336 will start it after the
-    second review, so its rows are created long after ``_build`` ran
+    (#191) is started by the daemon's sweep (#341) and Surya's by hand
+    (#364), so their rows are created long after ``_build`` ran
     (``mistral_ocr.ensure_apply_jobs``). Those rows must carry the
     identity the build would have given them, or the carry
     (``jobs._still_describes``) reads them as another shard set and
