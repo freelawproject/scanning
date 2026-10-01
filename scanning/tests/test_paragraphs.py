@@ -588,7 +588,7 @@ class TestTheFootnotes(TestCase):
         self.assertEqual(
             notes[2]["paragraphs"][0]["text"], "The dissent's note."
         )
-        self.assertEqual(paragraphs.mark_restarts(doc), 1)
+        self.assertEqual(paragraphs.mark_restarts(doc), ["1"])
 
     def test_with_no_restart_of_the_marks_a_small_number_is_text(self):
         """The rule of one series stands where the body numbers on: a
@@ -610,6 +610,48 @@ class TestTheFootnotes(TestCase):
         self.assertEqual(note["label"], "2")
         self.assertEqual(
             note["paragraphs"][0]["text"], "The rule has\n1 exception."
+        )
+
+    def test_a_continued_note_that_starts_with_another_small_number(self):
+        """Only the label where the body marks start again takes the
+        restart: "3 Am. Jur. 2d" goes on with the note before it, and the
+        dissent's note 1 is still a note."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "2"),
+                    self.cited(2, "C.", "3"),
+                    self.cited(3, "D.", "4"),
+                    self.note(4, "1. One."),
+                    self.note(5, "2. Two."),
+                    self.note(6, "3. Three."),
+                    self.note(7, "4. See generally"),
+                ],
+            ),
+            page(
+                1,
+                [
+                    self.note(0, "3 Am. Jur. 2d Appeal § 5."),
+                    group(1, "Jones, J., dissenting."),
+                    self.cited(2, "I would reverse.", "1"),
+                    self.note(3, "1. The dissent's note."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual(
+            [n["label"] for n in notes], ["1", "2", "3", "4", "1"]
+        )
+        self.assertEqual(
+            notes[3]["paragraphs"][0]["text"],
+            "See generally\n3 Am. Jur. 2d Appeal § 5.",
+        )
+        self.assertEqual(
+            notes[4]["paragraphs"][0]["text"], "The dissent's note."
         )
 
     def test_a_restart_is_taken_once(self):

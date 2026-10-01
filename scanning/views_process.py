@@ -2192,12 +2192,12 @@ FINAL_XML_REFUSED_MESSAGE = (
     "spans could not be read, or the spans do not fit the text. The log "
     "of the web pod has the reason."
 )
-#: The refusal of a writing whose type is not read (#442). Its reason is
-#: the opinion's own words, so the answer says it.
+#: The refusal of a writing whose type is not read (#442). The words
+#: go to the error log, where a developer reads them; no answer repeats
+#: an exception's text.
 FINAL_XML_TYPE_MESSAGE = (
     "The final XML of {opinion} was not built: a concurrence or a dissent "
-    "names a type the builder does not read yet ({reason}). A developer "
-    "was told."
+    "names a type the builder does not read yet. A developer was told."
 )
 
 
@@ -2255,7 +2255,7 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
         )
         log("%s: the final XML was not built: %s", opinion, exc)
         message = (
-            FINAL_XML_TYPE_MESSAGE.format(opinion=opinion, reason=exc)
+            FINAL_XML_TYPE_MESSAGE.format(opinion=opinion)
             if isinstance(exc, casebody.OpinionTypeError)
             else FINAL_XML_REFUSED_MESSAGE.format(opinion=opinion)
         )

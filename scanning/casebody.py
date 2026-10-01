@@ -123,8 +123,10 @@ CL_TYPES = frozenset({
     REMITTITUR, REHEARING, ON_THE_MERITS, ON_MOTION_TO_STRIKE,
 })  # fmt: skip
 
-_CONCUR = r"concur\w*"
-_DISSENT = r"dissent\w*"
+#: The word forms of a role, a closed set: "concurrent" and
+#: "concurrently" are no role.
+_CONCUR = r"concur(?:s|red|ring|rence|rences)?\b"
+_DISSENT = r"dissent(?:s|ed|ing)?\b"
 #: The words of a writing that name its type, tried in this order over
 #: the folded text of :func:`role_text`. "Dissenting in part" alone is
 #: the type of both, the one CAP value of a partial dissent. Between
@@ -152,7 +154,8 @@ OPINION_TYPES: tuple[tuple[re.Pattern, str], ...] = (
 #: that names a role later ("We concur with the trial court that ...")
 #: is the opinion's text, not its role.
 _ROLE_LEAD = re.compile(
-    r"\(?\s*(?:i\s+(?:respectfully\s+)?|specially\s+)?(?:concur|dissent)"
+    r"\(?\s*(?:i\s+(?:respectfully\s+)?|specially\s+)?"
+    rf"(?:{_CONCUR}|{_DISSENT})"
 )
 #: The types of a writing that end the one before it when its author
 #: line is the first after the head matter: a per curiam majority has no
@@ -702,9 +705,12 @@ def assign_footnotes(
     note before it, that holds a mark of its label no note took yet.
     The walk never goes back, so a dissent that numbers its notes from
     1 again takes its own note 1 (``paragraphs.mark_restarts`` keeps
-    that note apart in the approved text). A note with no such mark
-    goes to the first of those writings that holds its first page, and
-    else stays with the writing of the note before it.
+    that note apart in the approved text). The search stops at the
+    last of those writings that holds the note's first page: a note
+    whose mark is not a ``sup`` must not take the mark of the dissent's
+    note of the same label. A note with no such mark goes to the first
+    writing that holds its first page, and with no page to the writing
+    of the note before it.
 
     :param body: The body paragraphs.
     :param notes: The footnotes of the approved text, in reading order.
@@ -731,10 +737,20 @@ def assign_footnotes(
     cursor = 0
     for note in notes:
         label = note.get("label")
+        first = (note.get("pages") or [None])[0]
+        holders = [
+            at for at in range(cursor, len(bounds)) if first in pages[at]
+        ]
+        # A mark never takes a note past the writings of its first page:
+        # a mark an engine did not read as ``sup`` would else send the
+        # note, and every note after it, to the next writing that holds
+        # a mark of the same label. The last of them is the bound, as a
+        # dissent can start in the middle of a page.
+        last = holders[-1] if holders else len(bounds) - 1
         owner = next(
             (
                 at
-                for at in range(cursor, len(bounds))
+                for at in range(cursor, last + 1)
                 if label is not None and marks[at].get(str(label), 0) > 0
             ),
             None,
@@ -742,15 +758,7 @@ def assign_footnotes(
         if owner is not None:
             marks[owner][str(label)] -= 1
         else:
-            first = (note.get("pages") or [None])[0]
-            owner = next(
-                (
-                    at
-                    for at in range(cursor, len(bounds))
-                    if first in pages[at]
-                ),
-                cursor,
-            )
+            owner = holders[0] if holders else cursor
         owners.append(owner)
         cursor = owner
     return owners
@@ -978,7 +986,9 @@ def display_html(xml: str) -> str:
     #: The mark ids of each footnote label of the writing being drawn,
     #: in the order they read.
     marks: dict[str, list[str]] = {}
-    writing = 0
+    # The head matter's notes belong to the first writing
+    # (:func:`assign_footnotes`), so its marks link there.
+    writing = 1
 
     def inline(node: ET.Element) -> str:
         """The content of a node, its children drawn inline."""
@@ -1061,7 +1071,9 @@ def display_html(xml: str) -> str:
         )
     for n, opinion in enumerate(opinions, start=1):
         writing = n
-        marks = {}
+        if n > 1:
+            # The first writing keeps the marks of the head matter.
+            marks = {}
         kind = opinion.get("type") or ""
         body = [child for child in opinion if child.tag != "footnote"]
         notes = [child for child in opinion if child.tag == "footnote"]

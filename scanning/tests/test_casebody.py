@@ -792,6 +792,23 @@ class TestTheSubOpinions(TestCase):
                     expected,
                 )
 
+    def test_concurrent_is_no_role(self):
+        """A closed set of word forms: "Concurrent with ..." after the
+        majority's author line is its text, and the author line stays
+        the majority's."""
+        self.assertEqual(
+            self.types(
+                para("OPINION"),
+                para("Smith, J."),
+                para("Concurrent with the appeal, the State moved to strike."),
+                spans=[span(1, 0, 9, "author")],
+            ),
+            ["majority"],
+        )
+        self.assertIsNone(
+            casebody._type_of("concurrently filed", casebody.OPINION_TYPES)
+        )
+
     def test_a_stage_of_the_case_is_read_from_its_heading(self):
         self.assertEqual(
             self.types(
@@ -921,6 +938,44 @@ class TestTheSubOpinionFootnotes(TestCase):
             [["1", "2"], ["1"]],
         )
 
+    def test_a_mark_that_is_no_sup_keeps_the_notes_in_the_majority(self):
+        """Mark 2 of the majority is no ``sup``: note 2 must not take the
+        dissent's mark 2, and note 3, on a page only the majority holds,
+        stays in the majority."""
+        body = [
+            para("Gerber, J."),
+            sup_para("A.", "1"),
+            para("B.2"),
+            sup_para("C.", "3", pages=(2,)),
+            para("Jones, J., dissenting.", pages=(3,)),
+            sup_para("D.", "1", pages=(3,)),
+            sup_para("E.", "2", pages=(3,)),
+        ]
+        notes = [
+            note("1"),
+            note("2"),
+            note("3", pages=(2,)),
+            note("1", pages=(3,)),
+            note("2", pages=(3,)),
+        ]
+
+        self.assertEqual(
+            casebody.assign_footnotes(body, notes, [0, 4]), [0, 0, 0, 1, 1]
+        )
+
+    def test_a_dissent_that_starts_mid_page_takes_its_note_on_that_page(self):
+        body = [
+            para("Gerber, J.", pages=(0,)),
+            sup_para("We affirm.", "1", pages=(0,)),
+            para("Jones, J., dissenting.", pages=(0,)),
+            sup_para("I would reverse.", "1", pages=(0,)),
+        ]
+
+        self.assertEqual(
+            casebody.assign_footnotes(body, [note("1"), note("1")], [0, 2]),
+            [0, 1],
+        )
+
     def test_a_note_with_no_mark_goes_by_its_page(self):
         self.assertEqual(
             self.opinions(
@@ -960,6 +1015,29 @@ class TestTheSubOpinionFootnotes(TestCase):
             '<a href="#cb-op-2">Dissent — Jones, J., dissenting.</a>', display
         )
         self.assertIn('id="cb-op-1" data-type="majority"', display)
+
+    def test_a_mark_in_the_head_matter_links_to_its_note(self):
+        """A "sitting by designation" note marked on the judges line: the
+        note is the first writing's, and the mark links to it and back."""
+        xml, _root = build(
+            doc(
+                sup_para("Before SMITH, Judge.", "*"),
+                para("Jones, J."),
+                para("We affirm."),
+                para("Brown, J., dissenting."),
+                para("I would reverse."),
+                footnotes=[note("*")],
+            ),
+            span(0, 0, 20, "judges"),
+            span(1, 0, 9, "author"),
+            span(3, 0, 22, "author"),
+        )
+
+        display = casebody.display_html(xml)
+
+        self.assertIn('href="#cb-fn-1-_2a"', display)
+        self.assertIn('<div class="cb-fn" id="cb-fn-1-_2a">', display)
+        self.assertIn('href="#cb-fn-1-_2a-ref-1"', display)
 
     def test_one_writing_has_no_nav(self):
         xml, _root = build(
@@ -1136,9 +1214,9 @@ class TestTheFinalXmlRoutes(_S3Case):
         self.assertContains(response, 'id="pane-xml"')
         self.assertContains(response, 'data-role="parties"')
 
-    def test_a_type_that_is_not_read_is_a_409_that_says_why(self):
-        """The words are the opinion's own, so the answer says them, and
-        the log is an error so that a developer is told (#442)."""
+    def test_a_type_that_is_not_read_is_a_409_and_an_error_log(self):
+        """The words go to the error log, so a developer is told, and no
+        answer repeats an exception's text (#442)."""
         self.tagged()
         with (
             patch.object(
@@ -1151,7 +1229,7 @@ class TestTheFinalXmlRoutes(_S3Case):
             response = self.client.get(self.url("serve_opinion_final_xml"))
 
         self.assertEqual(response.status_code, 409)
-        self.assertIn("brown, j.", response.json()["message"])
+        self.assertNotIn("brown, j.", response.json()["message"])
         self.assertIn("does not read yet", response.json()["message"])
         self.assertIn("brown, j.", logs.output[0])
 
