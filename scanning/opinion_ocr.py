@@ -446,7 +446,7 @@ def _extract_owed_rows(stage, scan: Scan, run) -> list:
     """The rows that say one ``EXTRACT`` read is on its way, last step
     first.
 
-    The rule of both engines a person starts (#245, #368), which read
+    The rule of both engines outside the pipeline (#245, #368), which read
     in two steps: the volume rows, then the rows of the pages a curator
     changed, which the tick creates once the volume is glued. **The
     later step decides**, because the earlier one is already done when
@@ -616,8 +616,8 @@ def engines_owed(scan: Scan, run) -> list[str]:
     An engine whose key on the run is blank while a read of it is on
     its way: a live volume run, or the rows of the run's edited pages,
     with at least one row that is not dead (``DEAD_JOB_STATUSES``). A
-    dead run brings no read, and only a person restarts it, so it does
-    not hold the glue. An engine nobody asked to read is not owed.
+    dead run brings no read, and no tick restarts it, so it does not
+    hold the glue. An engine nobody asked to read is not owed.
 
     :param scan: The scan.
     :param run: The final apply run.
