@@ -196,6 +196,43 @@ body.boundary-pick .opinion-nav.picking {
       </div>
 
       {% if ocr_results %}
+      {% comment %}
+        The pages the bad-page model suspects (#436), worst first. Its
+        own section and not the issue list, because the list is in
+        page order and these are worked by rank: a reviewer opens the
+        worst page, then asks for a rescan or dismisses, and either
+        answer takes the card away. The cards are ``Issue`` rows like
+        the rest, so Dismiss is the same button, and the viewer draws
+        the red border from the same index list.
+      {% endcomment %}
+      {% comment %}
+        A volume the pass has not scored yet looks the same as a clean
+        one, and a reviewer would read the silence as a clean bill. So
+        the wait is said; a finished check with no card says nothing.
+      {% endcomment %}
+      {% if bad_page_state == 'pending' %}
+      <p class="text-[10px] mt-3 mb-1 text-gray-500 dark:text-gray-400">Bad-scan check not yet run. The daemon scores every page once the bitonal copy is made.</p>
+      {% endif %}
+      <div id="bad-pages-section"{% if not bad_pages %} hidden{% endif %}>
+      <h2 class="text-sm font-bold mb-1 pt-3">Possible bad scans (<span id="bad-pages-count">{{ bad_pages|length }}</span>)</h2>
+      <p class="text-[10px] text-gray-500 dark:text-gray-400 mb-1">A model scored every page for the look of a bad scan: blurry, faint, cropped or warped. Worst first. Open each one, then ask for a rescan or dismiss.</p>
+      {% for issue in bad_pages %}
+      <div class="issue-card rounded border px-2 py-1.5 mb-1 cursor-pointer text-xs border-red-300 bg-red-50 hover:bg-red-100 dark:border-red-700 dark:bg-red-900/20 dark:hover:bg-red-900/40"
+           data-message="{{ issue.message }}"
+           data-check="{{ issue.check_name }}"
+           data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)">
+        <div class="flex items-center gap-1.5">
+          <span class="font-bold uppercase text-[10px]">Score {{ issue.metadata.score|floatformat:2 }}</span>
+          <span class="text-gray-500 dark:text-gray-400">PDF p.{{ issue.page_number }}</span>
+        </div>
+        <div class="flex gap-1 mt-1">
+          <button class="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white" onclick="event.stopPropagation(); askForRescan({{ issue.page_number }})" title="Ask a scanner with the book to scan this page again">Ask for a rescan</button>
+          <button class="text-[10px] px-2 py-0.5 rounded bg-green-600 text-white" onclick="event.stopPropagation(); dismissIssue(this, {{ issue.pk }})">Dismiss</button>
+        </div>
+      </div>
+      {% endfor %}
+      </div>
+
       <div id="issues-section"{% if not issues %} hidden{% endif %}>
       <h2 class="text-sm font-bold mb-2 pt-3">Issues (<span id="issues-count">{{ issues|length }}</span>)</h2>
       {% for issue in issues %}
@@ -281,6 +318,13 @@ body.boundary-pick .opinion-nav.picking {
         </span>
         {% if r.type == 'range' %}<span class="text-[9px] text-blue-500">range</span>{% endif %}
         {% if r.zone == 'manual' %}<span class="text-[9px] text-purple-500">manual</span>{% endif %}
+        {% comment %}
+          The bad-page score (#436), right-aligned and unlabelled: a low
+          score is a page worth a look, not a verdict, so the row says
+          the number and nothing more. The card in the ranked section
+          carries the explanation.
+        {% endcomment %}
+        {% if r.bad_score %}<span class="page-score text-[9px] font-semibold {% if r.bad_score >= 0.5 %}text-red-600 dark:text-red-400{% else %}text-amber-600 dark:text-amber-400{% endif %}" title="Bad-page score {{ r.bad_score|floatformat:2 }}: worth checking">{{ r.bad_score|floatformat:2 }}</span>{% endif %}
       </div>
       {% endfor %}
       </div>
