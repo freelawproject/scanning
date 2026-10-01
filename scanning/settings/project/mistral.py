@@ -5,7 +5,10 @@ pages of one shard, uploads them, and submits one batch job per shard
 (see ``scanning/mistral_ocr.py`` and ``scanning/mistral_client.py``).
 
 The read is over the original shard set, the one dots.mocr and YOLO
-read, so a set key is the only thing the stage waits for.
+read, so a set key is the only thing the stage waits for. Since #341
+the daemon's sweep starts the read by itself once review 1 is approved,
+so setting the key starts a read of every such volume that has none,
+newest first.
 
 Two variables, deliberately, and the same two the ai-research runner
 reads (``runpod/mistral/.env.example`` on its ``extraction_align``

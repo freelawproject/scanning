@@ -3363,21 +3363,20 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 class ShardRead:
     """What one engine's start button says, asks and calls.
 
-    The three buttons (#190, #191, #364) are one view: each writes one
+    The two buttons (#190, #364) are one view: each writes one
     ``ExternalJob`` row per original shard, behind the same four gates,
     and each answers the same five messages. Only the words and the
     three functions differ, so they are an entry here rather than a
     copy of the view.
 
     :ivar name: The view's name, for its log line.
-    :ivar label: What a message calls this read ("Mistral OCR").
+    :ivar label: What a message calls this read ("Surya OCR").
     :ivar off_label: What the "not switched on" line calls it. The
         dots.mocr button says "OCR" everywhere else, but naming the
         engine is what makes its two switches findable.
     :ivar cost: What a press spends, in the staff refusal.
     :ivar switches: The environment names an operator must set.
     :ivar dispatch: What the daemon does next, in the success line.
-        Mistral renders the pages itself before it sends them.
     :ivar is_enabled: Whether this stage may be dispatched at all.
     :ivar run_summary: The live run of this engine, or ``None``.
     :ivar create: The row creator. **This is what costs money**, which
@@ -3397,12 +3396,15 @@ class ShardRead:
 
 
 def _shard_reads() -> dict[str, ShardRead]:
-    """Return the three reads over a volume's original shards.
+    """Return the reads a staff button starts over a volume's shards.
+
+    dots.mocr and Surya. Mistral left the table in #341: the daemon's
+    sweep (``mistral_ocr.enqueue_missing_runs``) starts its read.
 
     Rebuilt on each call, and deliberately not cached, for the reason
     ``jobs._runpod_engines`` is: the entries read functions off the
     stage modules at build time, so a test that patches
-    ``mistral_ocr.enabled`` reaches this table too.
+    ``surya.enabled`` reaches this table too.
 
     :returns: The table, keyed by engine.
     :rtype: dict[str, ShardRead]
@@ -3418,19 +3420,6 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
-        ),
-        JobEngine.MISTRAL_OCR: ShardRead(
-            name="start_mistral_ocr",
-            label="Mistral OCR",
-            off_label="Mistral OCR",
-            cost="money",
-            switches="MISTRAL_API_KEY",
-            # The daemon renders every page of the shard before it
-            # uploads it, which is minutes rather than a POST (#191).
-            dispatch="renders and sends them",
-            is_enabled=mistral_ocr.enabled,
-            run_summary=mistral_ocr.run_summary,
-            create=mistral_ocr.ensure_extract_jobs,
         ),
         JobEngine.SURYA: ShardRead(
             name="start_surya_ocr",
@@ -3451,7 +3440,7 @@ def _start_shard_read(
 ) -> HttpResponse:
     """Create one engine's rows over a scan's original shards.
 
-    The body of the three start buttons. Four gates, in this order:
+    The body of the two start buttons. Four gates, in this order:
 
     1. **Staff only.** Every press can start real paid work.
     2. **The stage must be switched on.** An environment that must not
@@ -3560,25 +3549,6 @@ def start_dots_mocr(request: HttpRequest, pk: int) -> HttpResponse:
     :return: See :func:`_start_shard_read`.
     """
     return _start_shard_read(request, pk, _shard_reads()[JobEngine.DOTS_MOCR])
-
-
-@login_required
-@require_POST
-def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start the Mistral OCR read over a scan's shards (#191).
-
-    The only way into this stage until a daemon trigger lands. The read
-    is over the original shards, so the button waits on no review state
-    and on no redacted volume: the set exists from the moment the
-    pipeline cut it.
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: See :func:`_start_shard_read`.
-    """
-    return _start_shard_read(
-        request, pk, _shard_reads()[JobEngine.MISTRAL_OCR]
-    )
 
 
 @login_required
