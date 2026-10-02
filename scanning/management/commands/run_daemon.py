@@ -15,6 +15,7 @@ Current schedule:
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
 - ``build_opinion_pdfs`` every ``DAEMON_OPINION_PDF_INTERVAL`` seconds
+- ``score_bad_pages`` every ``DAEMON_BADPAGE_INTERVAL`` seconds
   (default 5s), last in the tick: one redacted opinion PDF per run
   (#336)
 
@@ -122,8 +123,13 @@ class Command(BaseCommand):
                     settings.PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS
                 ),
             ),
-            # Last, on purpose: the loop walks the list in order, and
-            # this one blocks it for one opinion's write (#336).
+            # Last two, on purpose: the loop walks the list in order, and
+            # these block it, one for a volume's bad-page score (#436)
+            # and one for an opinion's write (#336).
+            ScheduledTask(
+                name="score_bad_pages",
+                interval_seconds=float(settings.DAEMON_BADPAGE_INTERVAL),
+            ),
             ScheduledTask(
                 name="build_opinion_pdfs",
                 interval_seconds=float(settings.DAEMON_OPINION_PDF_INTERVAL),

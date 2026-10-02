@@ -81,6 +81,11 @@ dependencies = [
   # it as a per-crop digit fallback when PaddleOCR cannot read a page number,
   # and blackletter does not declare it itself.
   "pytesseract>=0.3.13",
+  # The bad-page model (#436): scikit-learn at the version the model
+  # was pickled under, and the two libraries its scorer imports itself.
+  "scikit-learn==1.7.2",
+  "joblib>=1.6.0",
+  "numpy",
 ]
 
 [project.optional-dependencies]
@@ -138,8 +143,17 @@ lint.ignore = [
   "SIM108",
 ]
 
+[tool.ruff.format]
+# The bad-page measures are kept line for line with their source (#436),
+# so the formatter leaves the file as the model's training code wrote it.
+exclude = ["scanning/badpage/features.py"]
+
 [tool.ruff.lint.per-file-ignores]
 "scanning/settings/__init__.py" = ["F403"]
+# The bad-page measures, kept line for line with their source in
+# portal-code because the model was trained on them (#436); the style
+# of the source is kept with them.
+"scanning/badpage/features.py" = ["E702", "E741"]
 
 [tool.pytest.ini_options]
 DJANGO_SETTINGS_MODULE = "scanning.settings"

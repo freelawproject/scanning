@@ -43,6 +43,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 
 from scanning import boundaries
+from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
@@ -1441,6 +1442,11 @@ def recalculate_issues(scan: "Scan") -> None:
     _ask_about_front_matter(
         result["issues"], ocr_results, page_edits.deleted_pages(scan)
     )
+    # The pages the bad-page model suspects, one card each (#436).
+    # Derived from the stamp on the scan, before the deletion and
+    # dismissal filters below, so a deleted page answers its card and
+    # a dismissal matches it by check and page like every other.
+    result["issues"].extend(badpage_scoring.issues(scan))
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is

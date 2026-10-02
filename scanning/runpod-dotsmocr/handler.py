@@ -1,6 +1,6 @@
 """RunPod Serverless handler for dots.mocr document parsing.
 
-Runs the rednote-hilab/dots.mocr vision-language model behind a local
+Runs the freelawproject/dots.mocr vision-language model behind a local
 vLLM server (spawned as a subprocess at worker boot) and dispatches on
 ``job["input"]["action"]``:
 
@@ -78,7 +78,7 @@ MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
 
 # ── vLLM server tunables ────────────────────────────────────────────
 # The model lives in the baked HF cache (HF_HOME=/opt/hf, offline).
-DOTSMOCR_MODEL = os.environ.get("DOTSMOCR_MODEL", "rednote-hilab/dots.mocr")
+DOTSMOCR_MODEL = os.environ.get("DOTSMOCR_MODEL", "freelawproject/dots.mocr")
 # Upstream's parser defaults to model_name="model"; we serve under the
 # same alias so their client code works unmodified.
 SERVED_MODEL_NAME = "model"

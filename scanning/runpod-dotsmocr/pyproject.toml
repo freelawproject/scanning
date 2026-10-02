@@ -50,4 +50,4 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-dots-mocr = { git = "https://github.com/rednote-hilab/dots.mocr.git", rev = "23f3e5612fb8066d4034d5ecfc8f33a9243533eb" }
+dots-mocr = { git = "https://github.com/freelawproject/dots.mocr.git", rev = "23f3e5612fb8066d4034d5ecfc8f33a9243533eb" }

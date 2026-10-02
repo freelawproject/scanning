@@ -30,6 +30,7 @@ caller that is not the view cannot skip it.
 import logging
 from datetime import UTC, datetime
 
+from botocore.exceptions import BotoCoreError, ClientError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -385,21 +386,62 @@ def rewrite_text(opinion: Opinion) -> str | None:
         opinion.approved_at.isoformat() if opinion.approved_at else "",
     )
     wrote = _put(key, text)
+    carry = _spans_still_fit(opinion, text)
+    match = {}
+    fields = {"approved_text_key": key}
+    if carry:
+        match["tagged_text_key"] = opinion.tagged_text_key
+        fields["tagged_text_key"] = key
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,
         approved_text_key=opinion.approved_text_key,
-    ).update(approved_text_key=key)
+        **match,
+    ).update(**fields)
     if not moved:
         if wrote:
             _drop_unnamed(opinion, key)
         raise ApprovalRefused(MOVED)
     logger.info(
         "%s of scan %s: the approved text was written again at %s "
-        "(join rule %s)",
+        "(join rule %s)%s",
         opinion,
         opinion.scan_id,
         key,
         paragraphs.JOIN_RULE,
+        "; the spans stay placed" if carry else "",
     )
     return key
+
+
+def _spans_still_fit(opinion: Opinion, text: dict) -> bool:
+    """Return whether the spans of the old text are spans of the new one.
+
+    The tagger reads the body alone and a span addresses a body
+    paragraph (#272), so a new text whose body is the old body holds
+    every span where it was: a rule that changes only the footnotes
+    (#442) keeps the final XML of every tagged opinion. A read fault is
+    no proof, and the spans then wait for the next press.
+
+    :param opinion: The row, before the swap.
+    :param text: The new approved object.
+    :rtype: bool
+    """
+    if not (
+        opinion.tag_key
+        and opinion.approved_text_key
+        and opinion.tagged_text_key == opinion.approved_text_key
+    ):
+        return False
+    try:
+        old = s3_sync.download_json_object(opinion.approved_text_key)
+    except (BotoCoreError, ClientError, ValueError) as exc:
+        logger.warning(
+            "%s of scan %s: the old approved text did not load (%s); "
+            "the spans wait for the next press",
+            opinion,
+            opinion.scan_id,
+            exc,
+        )
+        return False
+    return isinstance(old, dict) and old.get("body") == text.get("body")
