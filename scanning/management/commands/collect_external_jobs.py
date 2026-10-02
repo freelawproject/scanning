@@ -124,6 +124,13 @@ a pass of its own, the twin of pass 7 for a scan. It takes a row
 back to ``PROCESSING`` too, because a re-glue raises the revision and
 leaves the status where it was.
 
+**15. ``final_xml.export_due()`` stores the final XML of the approved
+opinions (#408).** For an opinion whose text review is done and whose
+spans are over the approved text, it writes the build of the review
+page at ``final-xml/{scan}/{opinion}.xml``, the key CourtListener
+reads, and stamps the row. It deletes the object of a row that stopped
+being exportable (a reopen) first. Writes no status.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -176,6 +183,7 @@ class Command(BaseCommand):
             bitonal,
             dots_mocr,
             ensemble,
+            final_xml,
             jobs,
             mistral_ocr,
             opinion_ocr,
@@ -205,6 +213,7 @@ class Command(BaseCommand):
                 glued_opinions = opinion_ocr.glue_due()
                 read_opinions = ensemble.run_tick()
                 ready_opinions = opinions.promote_ready_opinions()
+                exported = final_xml.export_due()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -240,6 +249,7 @@ class Command(BaseCommand):
                 glued_opinions,
                 read_opinions,
                 ready_opinions,
+                exported,
             )
         ):
             self.stdout.write(
@@ -257,5 +267,6 @@ class Command(BaseCommand):
                 f"corrected volume(s), wrote the OCR "
                 f"documents of {glued_opinions} opinion(s), wrote the "
                 f"text of {read_opinions} opinion(s), opened {ready_opinions} "
-                f"text review(s)"
+                f"text review(s), exported or withdrew the final XML of "
+                f"{exported} opinion(s)"
             )

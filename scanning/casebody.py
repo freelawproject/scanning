@@ -39,10 +39,10 @@ writes the characters of ``markup.projected_characters``, the rule of
 the tagger's input, so a word is joined and a paragraph reads as one
 line, and every span and every mark moves through the same map.
 
-The document is computed at each request and stored nowhere: the
-export for CourtListener is #408. Pure standard library plus
-``markup``, on purpose, like ``paragraphs``: a test builds it from two
-dicts. :func:`display_html` and :func:`source_html` are the two views
+The review page computes the document at each request, and the export
+for CourtListener (``final_xml``, #408) stores the same build. Pure
+standard library plus ``markup``, on purpose, like ``paragraphs``: a
+test builds it from two dicts. :func:`display_html` and :func:`source_html` are the two views
 of the review page's display (``views_process.opinion_final_xml``).
 """
 
@@ -73,6 +73,12 @@ ELEMENTS = {
     "author": "author",
     "heading": "heading",
 }
+
+#: The version of the document :func:`build` writes, the ``schema``
+#: attribute of ``<casebody>``. Raise it when the same two inputs give
+#: another XML: the export (``final_xml``, #408) then writes every
+#: stored document again, and CourtListener reads the number.
+SCHEMA = 1
 
 #: The CAP element that holds a run of ``party`` and ``separator``.
 PARTIES = "parties"
@@ -799,11 +805,15 @@ def _comment(text: str) -> str:
     return "<!-- " + re.sub(r"-{2,}", "-", text) + " -->"
 
 
-def build(approved: dict, tags: dict) -> str:
+def build(approved: dict, tags: dict, *, ids: dict | None = None) -> str:
     """Return the final XML of one opinion: one ``opinion`` per writing.
 
     :param approved: The approved object (``paragraphs.approved_document``).
     :param tags: The spans object (``tagger.glue_run``).
+    :param ids: The ``scan-id`` and ``opinion-id`` attributes of
+        ``<casebody>`` (#408): the portal's primary keys, which the
+        approved object does not hold. CourtListener keeps the XML and
+        reads them from it, so the two ids name the redacted PDF later.
     :returns: The XML document, one block element per line.
     :rtype: str
     :raises CasebodyError: When a span does not address the body.
@@ -889,6 +899,8 @@ def build(approved: dict, tags: dict) -> str:
             {
                 "firstpage": opinion.get("first_printed_page"),
                 "lastpage": opinion.get("last_printed_page"),
+                **(ids or {}),
+                "schema": SCHEMA,
             }
         )
         + ">"

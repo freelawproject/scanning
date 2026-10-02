@@ -308,6 +308,67 @@ class ScanAdminDeleteShardSweepTests(TestCase):
         self.assertFalse(Scan.objects.filter(pk=scan.pk).exists())
 
 
+class ScanAdminDeleteFinalXmlSweepTests(TestCase):
+    """The exported final XML goes after the row delete commits (#408).
+
+    ``final-xml/`` is the list CourtListener imports, so the sweep runs
+    once no row is left for an export to stamp.
+    """
+
+    def setUp(self):
+        self.admin = ScanAdmin(Scan, AdminSite())
+
+    def sweep_sees(self):
+        seen = []
+
+        def record(scan_pk):
+            seen.append((scan_pk, Scan.objects.filter(pk=scan_pk).exists()))
+            return 0
+
+        return seen, record
+
+    def test_delete_model_sweeps_after_the_commit(self):
+        scan = ScanFactory()
+        pk = scan.pk
+        seen, record = self.sweep_sees()
+        with patch(
+            "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+        ):
+            with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                self.admin.delete_model(_request_with_messages(), scan)
+            # Nothing ran before the commit.
+            self.assertEqual(seen, [])
+            for callback in callbacks:
+                callback()
+        self.assertEqual(seen, [(pk, False)])
+
+    def test_delete_queryset_sweeps_each_scan_after_the_commit(self):
+        scans = [ScanFactory(), ScanFactory()]
+        queryset = Scan.objects.filter(pk__in=[s.pk for s in scans])
+        seen, record = self.sweep_sees()
+        with (
+            patch(
+                "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+            ),
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.admin.delete_queryset(_request_with_messages(), queryset)
+        self.assertEqual(sorted(seen), sorted((s.pk, False) for s in scans))
+
+    def test_a_failed_sweep_is_an_error(self):
+        scan = ScanFactory()
+        error = ClientError({"Error": {"Code": "SlowDown"}}, "DeleteObjects")
+        with (
+            patch(
+                "scanning.s3_sync.delete_final_xml_objects", side_effect=error
+            ),
+            self.assertLogs("scanning.admin", level="ERROR") as logs,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
+            self.admin.delete_model(_request_with_messages(), scan)
+        self.assertIn("export_final_xml --all", logs.output[0])
+
+
 class ScanAdminDeleteSummaryTests(TestCase):
     """``ScanAdmin.get_deleted_objects``.
 
