@@ -318,6 +318,135 @@ class TestTheHeadMatter(TestCase):
         self.assertEqual([c.tag for c in root], ["court", "opinion"])
 
 
+class TestTheCitations(TestCase):
+    """The citations go first, the case's own before the parallel ones
+    (#435), the place CourtListener's importer reads them."""
+
+    def caption(self, *head):
+        """A caption whose untagged lines are ``head``, then the parties."""
+        body = [
+            *(para(text) for text in head),
+            para("Ann ROE, Appellant,"),
+            para("v."),
+            para("STATE, Appellee."),
+            para("Supreme Court of Wyoming."),
+            para("HIBBEN, District Judge."),
+            para("We affirm."),
+        ]
+        at = len(head)
+        spans = [
+            span(at, 0, 19, "party"),
+            span(at + 1, 0, 2, "separator"),
+            span(at + 2, 0, 16, "party"),
+            span(at + 3, 0, 25, "court"),
+            span(at + 4, 0, 23, "author"),
+        ]
+        return doc(*body), spans
+
+    def citations(self, root):
+        return [c.text for c in root.findall("citation")]
+
+    def test_the_main_citation_is_the_first_element(self):
+        approved, spans = self.caption()
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(root[0].tag, "citation")
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+
+    def test_a_head_line_that_is_a_citation_is_a_parallel_citation(self):
+        approved, spans = self.caption("2025 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30", "2025 WY 115"])
+        self.assertEqual(
+            [c.tag for c in root],
+            ["citation", "citation", "parties", "court", "opinion"],
+        )
+        self.assertIsNone(root.find("p"))
+
+    def test_the_printed_text_is_kept(self):
+        """eyecite judges the line and never rewrites it."""
+        approved, spans = self.caption("578 P. 3d 30.", "2025 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(
+            self.citations(root),
+            ["578 P.3d 30", "578 P. 3d 30.", "2025 WY 115"],
+        )
+        self.assertIsNone(root.find("p"))
+
+    def test_a_line_eyecite_does_not_read_stays_a_paragraph(self):
+        approved, spans = self.caption("2O25 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+        self.assertEqual(root.find("p").text, "2O25 WY 115")
+
+    def test_with_no_main_citation_the_parallel_one_is_first(self):
+        approved, spans = self.caption("2025 WY 115")
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), ["2025 WY 115"])
+
+    def test_a_line_that_holds_a_citation_is_not_one(self):
+        approved, spans = self.caption("Rehearing denied, 2025 WY 115.")
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("p").text, "Rehearing denied, 2025 WY 115.")
+
+    def test_a_tagged_line_is_the_taggers(self):
+        approved, spans = self.caption("2025 WY 115")
+        spans.append(span(0, 0, 11, "history"))
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("history").text, "2025 WY 115")
+
+    def test_a_citation_in_the_opinion_is_text(self):
+        approved, spans = self.caption()
+        approved["body"].append(para("2025 WY 115"))
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("opinion")[-1].text, "2025 WY 115")
+
+    def test_full_citation_reads_the_shapes_of_a_head_line(self):
+        cases = {
+            "2025 WY 115": "2025 WY 115",
+            "254 N.J. Super. 12": "254 N.J. Super. 12",
+            " 578 P. 3d\n30. ": "578 P.3d 30",
+            "See 2025 WY 115.": None,
+            "2025 WY 115; 578 P.3d 30": None,
+            "Supreme Court of Wyoming.": None,
+            "": None,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(casebody.full_citation(text), expected)
+
+    def test_the_main_citation_is_volume_reporter_page(self):
+        self.assertEqual(
+            casebody.main_citation(578, "P.3d", 30), "578 P.3d 30"
+        )
+
+
 class TestTheMarks(TestCase):
     """The marks of the approved text, and their crossings."""
 
@@ -1149,6 +1278,8 @@ class TestTheModuleIsPure(TestCase):
                 "bisect",
                 "dataclasses",
                 "scanning.markup",
+                "eyecite",
+                "eyecite.models",
             },
         )
 
