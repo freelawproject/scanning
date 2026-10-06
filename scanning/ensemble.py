@@ -3813,7 +3813,8 @@ def _drop_superseded(
     document of the stamp before it is read by nothing once the row
     names the new one: the stamps only rise, and no build stamps an old
     revision again. Only a document under the same glue prefix is this
-    function's; a re-glue leaves the old prefix whole, as before #376.
+    function's; the folder of an older glue revision goes whole at the
+    promotion (``opinions.prune_glues``, #452).
 
     :param opinion: The row, with the new stamp.
     :param before: ``(ensemble_revision, ensemble_edit_revision)`` read

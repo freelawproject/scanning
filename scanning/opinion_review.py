@@ -151,8 +151,7 @@ def approved_key(
     stamp = approved_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
     return (
-        f"{prefix}jobs/opinions/{opinion.first_printed_page}."
-        f"{opinion.index_in_page}/approved/r{opinion.glue_revision}."
+        f"{prefix}{opinion.object_prefix}approved/r{opinion.glue_revision}."
         f"e{edit_revision}.j{join_rule}.t{stamp}.json"
     )
 
