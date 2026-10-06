@@ -11,8 +11,9 @@ Two inputs, and nothing else:
 
 :func:`build` merges them into one XML document in the shape of the
 CAP casebody, the shape CourtListener reads (``harvard_opinions.py``,
-#408): the citations (#435), the head matter (``parties``, ``docketnumber``, ``court``,
-``decisiondate``, ``attorneys``, ...) before one ``opinion`` for each
+#408): the citations (#435), the head matter (``parties``,
+``docketnumber``, ``court``, ``decisiondate``, ``attorneys``, ...)
+before one ``opinion`` for each
 writing of the cluster (#442), whose paragraphs carry the marks of the
 approved text, the ``page-number`` of every page the text crosses, and
 the ``footnote`` elements of that writing at its end.
@@ -43,8 +44,9 @@ The document is computed at each request and stored nowhere: the
 export for CourtListener is #408. Pure standard library plus
 ``markup`` and eyecite, on purpose, like ``paragraphs``: a test builds
 it from two dicts. The citation of the case in its own reporter comes
-from the row, so the caller passes it (:func:`main_citation`). :func:`display_html` and :func:`source_html` are the two views
-of the review page's display (``views_process.opinion_final_xml``).
+from the row, so the caller passes it (:func:`main_citation`).
+:func:`display_html` and :func:`source_html` are the two views of the
+review page's display (``views_process.opinion_final_xml``).
 """
 
 from __future__ import annotations
@@ -574,7 +576,10 @@ def citation_paragraphs(
     the head matter the tagger has no label for. A paragraph before
     ``split`` with no span, no list, no table and no quote, whose text
     is one full citation (:func:`full_citation`), is that citation. A
-    line eyecite does not read stays a paragraph of the head matter.
+    line eyecite does not read stays a paragraph of the head matter, and
+    so does a line that starts a page or crosses one: moved to the top,
+    it would take the page's star number above the text of the page
+    before, the rule of ``breaks_of`` in :func:`build`.
 
     :param body: The body paragraphs.
     :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
@@ -583,9 +588,16 @@ def citation_paragraphs(
     :rtype: list[int]
     """
     found = []
+    last_page = None
     for index, paragraph in enumerate(body[:split]):
+        pages = paragraph.get("pages") or []
+        new_page = last_page is not None and pages and pages[0] != last_page
+        if pages:
+            last_page = pages[-1]
         if (
             index in by
+            or new_page
+            or paragraph.get("page_breaks")
             or paragraph.get("blockquote")
             or paragraph.get("kind") in (markup.TABLE, markup.LIST_ITEM)
         ):

@@ -394,6 +394,35 @@ class TestTheCitations(TestCase):
         self.assertEqual(self.citations(root), ["578 P.3d 30"])
         self.assertEqual(root.find("p").text, "2O25 WY 115")
 
+    def test_a_line_that_starts_a_page_stays_a_paragraph(self):
+        """Moved to the top, it would take the star number of its page
+        above the text of the page before."""
+        approved, spans = self.caption("Ann ROE v. STATE", "2025 WY 115")
+        spans.append(span(0, 0, 16, "party"))
+        for paragraph in approved["body"][1:]:
+            paragraph["pages"] = [1]
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+        cite = next(
+            p for p in root.iter("p") if "2025 WY 115" in "".join(p.itertext())
+        )
+        self.assertEqual(cite.find("page-number").get("label"), "503")
+
+    def test_a_line_that_crosses_a_page_stays_a_paragraph(self):
+        approved, spans = self.caption("2025 WY 115")
+        approved["body"][0].update(
+            pages=[0, 1],
+            page_breaks=[{"offset": 8, "page_in_opinion": 1}],
+        )
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+
     def test_with_no_main_citation_the_parallel_one_is_first(self):
         approved, spans = self.caption("2025 WY 115")
 
