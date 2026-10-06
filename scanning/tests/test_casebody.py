@@ -1323,7 +1323,23 @@ class TestTheFinalXmlRoutes(_S3Case):
         self.assertEqual(
             root.find("parties/party").text, "Jane ROE, Appellant,"
         )
+        self.assertEqual(root[0].tag, "citation")
+        self.assertEqual(root[0].text, f"{self.scan.volume} A. 502")
         self.assertNotIn("Content-Disposition", response)
+
+    def test_a_citation_eyecite_does_not_read_is_an_error_log(self):
+        """A reporter missing from ``CITE_MAP`` is spelled from its short
+        name, which CourtListener drops (#435)."""
+        self.tagged()
+        reporter = self.scan.reporter
+        reporter.short_name = "nj-super"
+        reporter.save(update_fields=["short_name"])
+
+        with self.assertLogs("scanning.views_process", level="ERROR") as logs:
+            response = self.client.get(self.url("serve_opinion_final_xml"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("NJ-SUPER", logs.output[0])
 
     def test_the_download_is_a_file(self):
         self.tagged()
