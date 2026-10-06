@@ -433,6 +433,16 @@ def create_rows(
 # ---------------------------------------------------------------------------
 
 
+#: The queued actions of a review-2 approval in flight (#240). From the
+#: approval's read of the rows to the creation of the opinions, a box a
+#: curator writes reaches no opinion, so the writes of review 2 refuse
+#: while a scan holds one of them (``views_api._refuse_closed_review``).
+APPROVAL_ACTIONS = (
+    QueuedAction.CREATE_OPINIONS,
+    QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
+)
+
+
 def queue_create_opinions(scan: Scan) -> str:
     """Close review 2 and ask the daemon for the opinions.
 
@@ -487,12 +497,24 @@ def run(scan_pk: int) -> None:
     :param scan_pk: Primary key of the claimed scan.
     :return: None.
     """
+    from scanning import detections
+    from scanning.services import APPROVAL_NOT_DONE_NOTE
+
     scan = Scan.objects.get(pk=scan_pk)
     status = Status.READY_FOR_REDACTION_REVIEW
     try:
         run_ = review_states.final_run(scan)
         if run_ is None:
             message = "The corrected volume is not built."
+        elif detections.changed_since_compute(scan):
+            # A box written after the approval read the rows and before
+            # the writes refused (#240): the swap of the approval, or a
+            # tab that posted as it landed. It is in no redaction, so
+            # the opinions wait for the next approval, which computes.
+            message = (
+                "The detections changed after the approval. "
+                f"{APPROVAL_NOT_DONE_NOTE}"
+            )
         else:
             printed = apply.load_printed_pages(scan, run_)
             rows = live_boundaries(scan)

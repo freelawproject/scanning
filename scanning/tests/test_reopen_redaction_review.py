@@ -43,7 +43,10 @@ from scanning.tests.test_detection_preview import TestEveryWriteRefuses
 from scanning.tests.test_opinion_approval import ApprovalTestCase
 from scanning.tests.test_views import ScanningTestCase
 from scanning.tests.test_yolo_apply import ComputeMixin, merged_scan
-from scanning.views_api import REVIEW_APPROVED_MESSAGE
+from scanning.views_api import (
+    REVIEW_APPROVED_MESSAGE,
+    REVIEW_APPROVING_MESSAGE,
+)
 from scanning.views_process import (
     REDACTION_REVIEW_APPROVED_MESSAGE,
     REDACTION_REVIEW_COMPUTE_FIRST_MESSAGE,
@@ -628,3 +631,123 @@ class TestTheTextWaitsForReviewTwo(ApprovalTestCase):
 
         self.assertFalse(response.context["can_approve"])
         self.assertContains(response, "review2-open-note")
+
+
+class TestAnApprovalInFlightRefusesWrites(ScanningTestCase):
+    """From the approval's read of the rows to the creation of the
+    opinions, a box reaches no opinion, so the writes refuse."""
+
+    def setUp(self):
+        self.client.force_login(self.make_user(username="reviewer"))
+
+    def _post(self, scan, name="add_redaction"):
+        return self.client.post(
+            reverse(name, kwargs={"pk": scan.pk}),
+            data=json.dumps(
+                {"page_index": 0, "x0": 1, "y0": 2, "x1": 3, "y1": 4}
+            ),
+            content_type="application/json",
+        )
+
+    def test_every_write_refuses_during_the_approval(self):
+        for status in (Status.QUEUED, Status.PROCESSING):
+            for action in opinions.APPROVAL_ACTIONS:
+                scan = ScanFactory(status=status, queued_action=action)
+                for name, body in TestEveryWriteRefuses.WRITES:
+                    with self.subTest(status=status, action=action, name=name):
+                        response = self.client.post(
+                            reverse(name, kwargs={"pk": scan.pk}),
+                            data=json.dumps(body),
+                            content_type="application/json",
+                        )
+
+                        self.assertEqual(response.status_code, 409)
+                        self.assertEqual(
+                            response.json()["message"],
+                            REVIEW_APPROVING_MESSAGE,
+                        )
+
+    def test_a_plain_recompute_is_not_an_approval(self):
+        """A box drawn during a recompute parks with the scan in
+        review 2, where the bar says the approval computes first."""
+        scan = ScanFactory(
+            status=Status.PROCESSING,
+            queued_action=QueuedAction.COMPUTE_REDACTIONS,
+        )
+
+        response = self.client.post(
+            reverse("dismiss_finding", kwargs={"pk": scan.pk}),
+            data=json.dumps({"issue_id": 1}),
+            content_type="application/json",
+        )
+
+        self.assertNotEqual(response.status_code, 409)
+
+
+class TestTheCreationChecksAgain(ComputeMixin, TestCase):
+    """A box that lands between the approval's read and the refusal of
+    the writes waits for the next approval."""
+
+    def claim(self, scan):
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PROCESSING,
+            queued_action=QueuedAction.CREATE_OPINIONS,
+        )
+
+    def test_a_late_box_parks_in_the_review(self):
+        scan, _ = computed_scan()
+        manual_detection(scan)
+        self.claim(scan)
+
+        with patch.object(opinions, "create_rows") as create:
+            opinions.run(scan.pk)
+
+        create.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.READY_FOR_REDACTION_REVIEW)
+        self.assertIn(services.APPROVAL_NOT_DONE_NOTE, scan.progress_message)
+
+    def test_the_chain_passes_the_check(self):
+        """The compute stamps its read time first, so the box it read
+        is no change for the creation."""
+        scan, _ = computed_scan()
+        manual_detection(scan)
+        self.patch_geometry()
+        Scan.objects.filter(pk=scan.pk).update(
+            status=Status.PROCESSING,
+            queued_action=QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
+        )
+        services.run_compute_then_create_opinions(scan.pk)
+        self.claim(scan)
+
+        with patch.object(opinions, "create_rows") as create:
+            create.return_value.message = "created"
+            with (
+                patch.object(opinions, "check_space"),
+                patch.object(apply, "load_printed_pages", return_value={}),
+            ):
+                opinions.run(scan.pk)
+
+        create.assert_called_once()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.REDACTION_REVIEW_DONE)
+
+
+class TestTheTextGateReadsTheTable(ApprovalTestCase):
+    """``OPINION_PDF_STATUSES`` is the one table of the statuses the
+    opinion passes read, and #334 extends it."""
+
+    def test_a_status_the_table_holds_is_approved(self):
+        self.dismiss_blocking()
+        Scan.objects.filter(pk=self.opinion.scan_id).update(
+            status=Status.APPROVED
+        )
+        table = (Status.REDACTION_REVIEW_DONE, Status.APPROVED)
+
+        with patch.object(opinion_review, "OPINION_PDF_STATUSES", table):
+            self.approve()
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )

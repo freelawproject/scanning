@@ -91,6 +91,14 @@ REVIEW_APPROVED_MESSAGE = (
 )
 
 
+#: A write of review 2 while its approval is in flight (#240).
+REVIEW_APPROVING_MESSAGE = (
+    "The redactions of this volume are being approved: the server is "
+    "creating the opinions now, so nothing here can be changed. Wait for "
+    "the page to reload."
+)
+
+
 def _refuse_closed_review(
     scan: Scan, approved_ok: bool = False
 ) -> JsonResponse | None:
@@ -103,7 +111,10 @@ def _refuse_closed_review(
     opinions not built yet and misses the others, and a detection
     written then reaches none: only the compute turns it into a
     redaction, and the compute refuses that status. The way back is the
-    staff reopen (``views_process.reopen_redaction_review``).
+    staff reopen (``views_process.reopen_redaction_review``). A third
+    state is closed for the same reason: an approval in flight
+    (``opinions.APPROVAL_ACTIONS`` under a busy status), whose rows were
+    read already.
 
     The first thing every write of the redaction review does, the twin
     of ``views_process._refuse_locked_edits``, and the gate the preview
@@ -141,8 +152,16 @@ def _refuse_closed_review(
         may proceed.
     :rtype: JsonResponse | None
     """
-    from scanning import review_states
+    from scanning import opinions, review_states
 
+    if (
+        scan.status in (Status.QUEUED, Status.PROCESSING)
+        and scan.queued_action in opinions.APPROVAL_ACTIONS
+    ):
+        return JsonResponse(
+            {"status": "error", "message": REVIEW_APPROVING_MESSAGE},
+            status=409,
+        )
     if scan.status == Status.REDACTION_REVIEW_DONE and not approved_ok:
         return JsonResponse(
             {"status": "error", "message": REVIEW_APPROVED_MESSAGE},

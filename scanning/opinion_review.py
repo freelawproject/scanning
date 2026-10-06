@@ -42,8 +42,8 @@ from scanning.models import (
     Opinion,
     OpinionFinding,
     OpinionReviewStatus,
-    Status,
 )
+from scanning.opinion_pdf import OPINION_PDF_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -244,10 +244,12 @@ def check_gate(
     """
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
         raise ApprovalRefused(CLOSED)
-    if opinion.scan.status != Status.REDACTION_REVIEW_DONE:
+    if opinion.scan.status not in OPINION_PDF_STATUSES:
         # The redaction review is open again (#240). Its next approval
         # builds every opinion whose text is not approved, and never one
         # whose text is: an approval now would keep the old redactions.
+        # The table of the opinion passes, never a literal: #334 extends
+        # it, and the approval must follow.
         raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
@@ -303,7 +305,7 @@ def approve_text(
             moved = Opinion.objects.filter(
                 pk=opinion.pk,
                 status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
-                scan__status=Status.REDACTION_REVIEW_DONE,
+                scan__status__in=OPINION_PDF_STATUSES,
                 glue_revision=opinion.glue_revision,
                 edit_revision=opinion.edit_revision,
                 ensemble_edit_revision=opinion.ensemble_edit_revision,

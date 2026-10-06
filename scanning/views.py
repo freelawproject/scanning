@@ -416,7 +416,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         )
     open_findings = sum(1 for row in findings if row.dismissal_id is None)
     ocr_written = opinion_ocr.is_written(opinion)
-    review2_open = opinion.scan.status != Status.REDACTION_REVIEW_DONE
+    review2_open = opinion.scan.status not in opinion_pdf.OPINION_PDF_STATUSES
     # The dismissal answers a card while the opinion is ready for the
     # text review alone, the gate of the endpoint (#419). A stale card
     # is a fact about the row and takes none.
