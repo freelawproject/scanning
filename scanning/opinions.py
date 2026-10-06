@@ -44,12 +44,13 @@ and this pass writes no chain, no stamp and no queue for it.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from django.db import transaction
 from django.db.models import Case, Count, F, Q, Value, When
 
-from scanning import apply, boundaries, review_states
+from scanning import apply, boundaries, review_states, s3_sync
 from scanning.models import (
     STALE_OPINION_CHECKS,
     Issue,
@@ -623,7 +624,63 @@ def promote_ready(opinion: Opinion) -> bool:
             opinion,
             opinion.scan_id,
         )
+        prune_glues(opinion)
     return bool(moved)
+
+
+#: A glue revision folder under ``Opinion.object_prefix``, and its number.
+#: ``approved/`` and ``tag/`` never match it.
+_REVISION_FOLDER = re.compile(r"r(\d+)/")
+
+
+def prune_glues(opinion: Opinion, dry_run: bool = False) -> list[str] | None:
+    """Delete the glues of every revision below the opinion's live one.
+
+    The glues of a revision (the engine documents, the manifest, the
+    redacted PDF, the ensemble documents) are derived, and a re-glue
+    writes each of them again with no paid read, so nothing reads a
+    revision once the live one is complete (#452). The caller says it
+    is: :func:`promote_ready` after its swap, and the command
+    ``prune_opinion_glues`` over the rows :func:`text_review_ready`
+    accepts. Only ``r{k}/`` with ``k`` below ``glue_revision`` goes:
+    the approved texts (``approved/``), the tagger input (``tag/``) and
+    every paid result outside the opinion's prefix stay. The revision
+    only goes up, so a re-glue during the walk makes no live folder
+    old.
+
+    Best effort, the rule of ``s3_sync.delete_objects``: an orphan
+    costs storage and nothing else, so a failed listing deletes nothing
+    and nothing raises into the tick. The command is the retry.
+
+    :param opinion: The row, with ``scan`` and its reporter.
+    :param dry_run: List the keys and delete nothing.
+    :returns: The keys of the older revisions, or None when the listing
+        failed.
+    :rtype: list[str] | None
+    """
+    root = (
+        f"{s3_sync.s3_processing_prefix(opinion.scan)}{opinion.object_prefix}"
+    )
+    keys = s3_sync.list_keys(root)
+    if keys is None:
+        return None
+    old = []
+    for key in keys:
+        match = _REVISION_FOLDER.match(key[len(root) :])
+        if match and int(match.group(1)) < opinion.glue_revision:
+            old.append(key)
+    if old and not dry_run:
+        deleted = s3_sync.delete_objects(old)
+        logger.info(
+            "%s of scan %s: deleted %d of %d object(s) of the revisions "
+            "below r%d",
+            opinion,
+            opinion.scan_id,
+            deleted,
+            len(old),
+            opinion.glue_revision,
+        )
+    return old
 
 
 def demote_stale(opinion: Opinion) -> bool:
@@ -691,7 +748,7 @@ def promote_ready_opinions(limit: int = PROMOTIONS_PER_TICK) -> int:
         _live_stamps(),
         scan__status__in=OPINION_PDF_STATUSES,
         status=OpinionReviewStatus.PROCESSING,
-    )[:limit]
+    ).select_related("scan", "scan__reporter")[:limit]
     moved = sum(1 for row in ready if promote_ready(row))
     stale = Opinion.objects.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW

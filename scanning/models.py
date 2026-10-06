@@ -2786,16 +2786,30 @@ class Opinion(AbstractDateTimeModel):
         ]
 
     @property
+    def object_prefix(self) -> str:
+        """The S3 prefix of every object of this opinion.
+
+        Keyed by the invariant identity, not the pk (#350). Relative to
+        the scan's processing prefix. It holds one ``r{n}/`` per glue
+        revision, the approved texts under ``approved/`` and the tagger
+        input under ``tag/``.
+        """
+        return f"jobs/opinions/{self.first_printed_page}.{self.index_in_page}/"
+
+    def revision_prefix(self, revision: int) -> str:
+        """The S3 prefix of this opinion's glues at ``revision``.
+
+        Relative to the scan's processing prefix.
+        """
+        return f"{self.object_prefix}r{revision}/"
+
+    @property
     def glue_prefix(self) -> str:
         """The S3 prefix of this opinion's glues, at the live revision.
 
-        Keyed by the invariant identity, not the pk (#350). Relative to
-        the scan's processing prefix.
+        Relative to the scan's processing prefix.
         """
-        return (
-            f"jobs/opinions/{self.first_printed_page}.{self.index_in_page}/"
-            f"r{self.glue_revision}/"
-        )
+        return self.revision_prefix(self.glue_revision)
 
     def __str__(self):
         return f"Opinion {self.first_printed_page}.{self.index_in_page}"
