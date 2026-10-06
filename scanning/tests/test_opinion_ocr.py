@@ -2054,6 +2054,30 @@ class TestThePdfCarry(OpinionOcrTestCase):
         self.assertEqual(self.opinion.redacted_pdf_revision, 0)
         self.assertTrue(self.owes_a_pdf())
 
+    def test_an_approval_during_the_copy_keeps_its_revision(self):
+        """``approve_text`` lands between the read and the swap."""
+        self.write_pdf()
+
+        def copy_while_a_person_approves(source, destination):
+            Opinion.objects.filter(pk=self.opinion.pk).update(
+                status=OpinionReviewStatus.TEXT_REVIEW_DONE
+            )
+            return True
+
+        with patch(
+            "scanning.s3_sync.copy_object",
+            side_effect=copy_while_a_person_approves,
+        ):
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (0, 0))
+        self.assertEqual(self.opinion.glue_revision, 0)
+        self.assertEqual(self.opinion.redacted_pdf_revision, 0)
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
     def test_no_carry_cuts_the_pdf_again(self):
         self.write_pdf()
 

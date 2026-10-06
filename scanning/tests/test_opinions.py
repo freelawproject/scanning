@@ -1155,6 +1155,21 @@ class TestThePruneOfOldGlues(TestCase):
 
         self.assertEqual(sorted(self.deleted), sorted(self.old))
 
+    def test_a_first_revision_is_promoted_with_no_listing(self):
+        """Nothing is older than revision 0, so the tick lists nothing."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            glue_revision=0,
+            redacted_pdf_revision=0,
+            ocr_glue_revision=0,
+            ensemble_revision=0,
+        )
+        self.opinion.refresh_from_db()
+
+        with patch("scanning.s3_sync.list_keys") as list_keys:
+            self.assertTrue(opinions.promote_ready(self.opinion))
+
+        list_keys.assert_not_called()
+
     def test_a_row_that_is_not_promoted_prunes_nothing(self):
         """A live revision that is not complete keeps the last one."""
         Opinion.objects.filter(pk=self.opinion.pk).update(

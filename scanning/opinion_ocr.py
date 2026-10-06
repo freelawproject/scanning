@@ -1582,11 +1582,18 @@ def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:
                 pdf_attempts=0,
                 pdf_attempted_at=None,
             )
-        moved = Opinion.objects.filter(
-            pk=opinion.pk, glue_revision=revision
-        ).update(**fields)
+        # The status again, beside the revision: an approval that landed
+        # during the copy keeps its revision, and an approved row keeps
+        # its glues, the rule the bulk update of #350 held in one
+        # statement.
+        moved = (
+            Opinion.objects.filter(pk=opinion.pk, glue_revision=revision)
+            .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+            .update(**fields)
+        )
         if not moved:
-            # Another writer raised the revision first and owns the row.
+            # Another writer raised the revision first, or a person
+            # approved the row, and it is not this call's any more.
             continue
         summary.moved += 1
         summary.carried += int(carry)

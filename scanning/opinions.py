@@ -624,7 +624,10 @@ def promote_ready(opinion: Opinion) -> bool:
             opinion,
             opinion.scan_id,
         )
-        prune_glues(opinion)
+        if opinion.glue_revision:
+            # Revision 0 is the first: no folder can be older, so the
+            # tick spends no listing on it.
+            prune_glues(opinion)
     return bool(moved)
 
 
