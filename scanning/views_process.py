@@ -2287,12 +2287,18 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
         ) from exc
 
 
+#: The reporters whose citation eyecite did not read, logged once per
+#: process: the final XML is built at every request.
+_UNREAD_REPORTERS: set[str] = set()
+
+
 def _main_citation(opinion: Opinion) -> str:
     """Return the citation of an opinion in its scan's reporter (#435).
 
     A reporter missing from ``Reporter.CITE_MAP`` gives a name eyecite
     does not read, and CourtListener's importer drops the citation, so
-    the miss is logged for a developer to add the abbreviation.
+    the miss is logged for a developer to add the abbreviation, once
+    per reporter (:data:`_UNREAD_REPORTERS`).
 
     :param opinion: The opinion, with ``scan__reporter``.
     :rtype: str
@@ -2301,13 +2307,18 @@ def _main_citation(opinion: Opinion) -> str:
     citation = casebody.main_citation(
         scan.volume, scan.reporter.cite_name, opinion.first_printed_page
     )
-    if casebody.full_citation(citation) is None:
+    short_name = scan.reporter.short_name
+    if (
+        short_name not in _UNREAD_REPORTERS
+        and casebody.full_citation(citation) is None
+    ):
+        _UNREAD_REPORTERS.add(short_name)
         logger.error(
             "%s: eyecite does not read the citation %r; add the reporter "
             "%r to Reporter.CITE_MAP",
             opinion,
             citation,
-            scan.reporter.short_name,
+            short_name,
         )
     return citation
 

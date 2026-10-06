@@ -19,7 +19,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.urls import reverse
 
-from scanning import casebody, markup, tagger
+from scanning import casebody, markup, tagger, views_process
 from scanning.models import OpinionReviewStatus
 from scanning.tests.test_tagger import _S3Case
 
@@ -1387,12 +1387,17 @@ class TestTheFinalXmlRoutes(_S3Case):
         reporter = self.scan.reporter
         reporter.short_name = "nj-super"
         reporter.save(update_fields=["short_name"])
+        views_process._UNREAD_REPORTERS.discard("nj-super")
 
         with self.assertLogs("scanning.views_process", level="ERROR") as logs:
             response = self.client.get(self.url("serve_opinion_final_xml"))
 
         self.assertEqual(response.status_code, 200)
         self.assertIn("NJ-SUPER", logs.output[0])
+
+        # Once per reporter: the XML is built at every request.
+        with self.assertNoLogs("scanning.views_process", level="ERROR"):
+            self.client.get(self.url("serve_opinion_final_xml"))
 
     def test_the_download_is_a_file(self):
         self.tagged()
