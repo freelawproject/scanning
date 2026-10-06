@@ -1104,6 +1104,10 @@ class CheckName(models.TextChoices):
         "low_confidence_headnote_bracket",
         "Headnote bracket under the redaction gate",
     )
+    UNCOVERED_EDITORS_NOTE = (
+        "uncovered_editors_note",
+        "Editor's note not covered by a redaction",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1174,6 +1178,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_HEADNOTE,
         CheckName.MISSING_HEADNOTE_BRACKET,
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+        CheckName.UNCOVERED_EDITORS_NOTE,
     }
 )
 
@@ -2413,6 +2418,99 @@ class BracketReading(AbstractDateTimeModel):
 
     def __str__(self):
         return f"{self.raw} p.{self.page_index + 1}"
+
+
+class EditorialReading(AbstractDateTimeModel):
+    """One editor's note the OCR read, inside one cell (#450).
+
+    West's ``[Editor's Note: ...]`` is the publisher's text and must be
+    redacted, and nothing told a curator that the model had missed one.
+    This row is the reading, stored so that ``findings.rebuild`` can
+    compare it with the redaction and detection rows without an S3
+    read (``editorial.uncovered``).
+
+    A disposable row, the rule of ``BracketReading``: every compute
+    replaces the scan's set (``editorial.write_rows``), and a curator
+    never writes one.
+
+    **The box is the note's band, not the cell.** dots.mocr measures a
+    paragraph and the note is often its first lines, so the box is the
+    cell's width and the note's share of its height
+    (``editorial.note_band``). The address is the source page, the rule
+    of ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="editorial_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="editorial_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="editorial_readings",
+        help_text=(
+            "The page edit whose one-page shard this cell is on. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    x0 = models.FloatField()
+    y0 = models.FloatField()
+    x1 = models.FloatField()
+    y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+
+    text = models.TextField(
+        help_text="The note as dots.mocr wrote it, for the card.",
+    )
+
+    class Meta:
+        ordering = ["page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_editorial_scan_run_page",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float]:
+        """The note's band, in the pixels of the detection render."""
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    def __str__(self):
+        return f"{self.text[:40]} p.{self.page_index + 1}"
 
 
 # ── The third review: the opinions of a volume ────────────────────────
