@@ -579,7 +579,9 @@ def citation_paragraphs(
     line eyecite does not read stays a paragraph of the head matter, and
     so does a line that starts a page or crosses one: moved to the top,
     it would take the page's star number above the text of the page
-    before, the rule of ``breaks_of`` in :func:`build`.
+    before, the rule of ``breaks_of`` in :func:`build`. A line with a
+    ``sup`` mark stays too: a footnote mark after the page number
+    (``2025 WY 115`` and a ``1``) reads as page 1151.
 
     :param body: The body paragraphs.
     :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
@@ -598,6 +600,10 @@ def citation_paragraphs(
             index in by
             or new_page
             or paragraph.get("page_breaks")
+            or any(
+                mark.get("kind") == markup.SUP
+                for mark in paragraph.get("marks") or []
+            )
             or paragraph.get("blockquote")
             or paragraph.get("kind") in (markup.TABLE, markup.LIST_ITEM)
         ):
@@ -891,8 +897,8 @@ def build(approved: dict, tags: dict, citation: str = "") -> str:
     importer reads them, and the first is the case's own (#435): the
     main ``citation``, then every head-matter paragraph that is a
     citation (:func:`citation_paragraphs`), moved there from its place
-    with its printed text: eyecite judges the line and never rewrites
-    it. A printed copy of the main one is kept too; CourtListener adds
+    with its printed characters: eyecite judges the line and never
+    rewrites it. A printed copy of the main one is kept too; CourtListener adds
     a citation its cluster already holds once.
 
     :param approved: The approved object (``paragraphs.approved_document``).
@@ -959,7 +965,12 @@ def build(approved: dict, tags: dict, citation: str = "") -> str:
     split = head_matter_end(body, by)
     cited = citation_paragraphs(body, by, split)
     cites = [_escape(citation)] if citation else []
-    cites.extend(blocks[index][1] for index in cited)
+    # The printed characters alone: a citation is a string the importer
+    # hands eyecite, and a bold or an italic adds nothing to it.
+    cites.extend(
+        _escape(re.sub(r"\s+", " ", body[index].get("text") or "").strip())
+        for index in cited
+    )
     starts = opinion_starts(body, by, split)
     ends = [*starts[1:], len(body)]
     types = [

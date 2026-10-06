@@ -412,6 +412,30 @@ class TestTheCitations(TestCase):
         )
         self.assertEqual(cite.find("page-number").get("label"), "503")
 
+    def test_the_citation_is_the_printed_characters_alone(self):
+        approved, spans = self.caption("2025 WY 115")
+        approved["body"][0]["marks"] = [mark(0, 11, "strong")]
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(
+            ET.tostring(root.find("citation"), encoding="unicode").strip(),
+            "<citation>2025 WY 115</citation>",
+        )
+
+    def test_a_line_with_a_footnote_mark_stays_a_paragraph(self):
+        """``2025 WY 115`` and a mark ``1`` read as page 1151."""
+        approved, spans = self.caption("2025 WY 1151")
+        approved["body"][0]["marks"] = [mark(11, 12, "sup")]
+        approved["footnotes"] = [
+            {"label": "1", "pages": [0], "paragraphs": [para("A note.")]}
+        ]
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("p/footnotemark").text, "1")
+
     def test_a_line_that_crosses_a_page_stays_a_paragraph(self):
         approved, spans = self.caption("2025 WY 115")
         approved["body"][0].update(
