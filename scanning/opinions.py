@@ -433,7 +433,7 @@ def create_rows(
 # ---------------------------------------------------------------------------
 
 
-def queue_create_opinions(scan: Scan) -> bool:
+def queue_create_opinions(scan: Scan) -> str:
     """Close review 2 and ask the daemon for the opinions.
 
     The write of the approve button (``views_process
@@ -442,21 +442,37 @@ def queue_create_opinions(scan: Scan) -> bool:
     ``REDACTION_REVIEW_DONE`` when it is done, and parks the scan back
     in the review on a failure, so the next press is the retry.
 
+    The action is ``CREATE_OPINIONS``, or ``COMPUTE_THEN_CREATE_OPINIONS``
+    when a curator changed the detections after the last compute
+    (``detections.changed_since_compute``, #240): the opinions are cut
+    from the redaction rows, and a detection reaches those rows through
+    the compute alone. The compute then queues the creation itself.
+
     :param scan: The scan the curator approved.
-    :returns: Whether the write won.
-    :rtype: bool
+    :returns: The action queued, or an empty string when the write lost.
+    :rtype: str
     """
-    return bool(
-        Scan.objects.filter(
-            pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-        ).update(
-            status=Status.QUEUED,
-            queued_action=QueuedAction.CREATE_OPINIONS,
-            progress_message="The opinions are queued for creation.",
-            progress_current=0,
-            progress_total=0,
+    from scanning import detections
+
+    action = QueuedAction.CREATE_OPINIONS
+    message = "The opinions are queued for creation."
+    if detections.changed_since_compute(scan):
+        action = QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+        message = (
+            "The detections changed after the last computation. The "
+            "redactions are queued for computation, then the opinions "
+            "for creation."
         )
+    moved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(
+        status=Status.QUEUED,
+        queued_action=action,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
     )
+    return action if moved else ""
 
 
 def run(scan_pk: int) -> None:

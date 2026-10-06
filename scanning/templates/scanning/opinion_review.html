@@ -78,6 +78,9 @@
       {% if approve_not_built %}The last edit is not in the text yet{% elif blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
     </button>
     {% endif %}
+    {% if review2_open and opinion.status == "ready_for_text_review" %}
+    <span class="text-sm text-amber-800 dark:text-amber-200 self-center" id="review2-open-note" title="The approval of the redaction review builds this opinion again">The redaction review of this volume is open again: the text takes no approval until it is approved.</span>
+    {% endif %}
     {% if can_reopen %}
     <button type="button" id="reopen-text" class="btn-outline text-sm"
             title="Take this opinion back to the text review">

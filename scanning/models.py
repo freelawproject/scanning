@@ -224,6 +224,15 @@ class QueuedAction(models.TextChoices):
     # corrected volume. Queued by the review-2 approval; the worker
     # writes ``REDACTION_REVIEW_DONE`` when it is done.
     CREATE_OPINIONS = "create_opinions", "Create Opinions"
+    # Issue #240: the review-2 approval of a volume whose detections a
+    # curator changed after the last compute. The worker computes the
+    # redactions and, on success, queues ``CREATE_OPINIONS`` in place
+    # of the park, so the opinions are cut from the boxes the curator
+    # approved.
+    COMPUTE_THEN_CREATE_OPINIONS = (
+        "compute_then_create_opinions",
+        "Compute Redactions, then Create Opinions",
+    )
 
 
 class UploadAction(models.TextChoices):
