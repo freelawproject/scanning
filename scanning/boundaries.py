@@ -804,7 +804,9 @@ def live(scan: Scan) -> list[OpinionBoundary]:
     return [r for r in standing(scan) if not r.is_dismissed]
 
 
-def shared_first_pages(scan: Scan, rows: list[OpinionBoundary]) -> set[int]:
+def shared_first_pages(
+    scan: Scan, rows: list[OpinionBoundary]
+) -> dict[int, float]:
     """Return the rows whose first page is the last page of the one before.
 
     A row's first page is shared when a live boundary that comes before
@@ -814,25 +816,29 @@ def shared_first_pages(scan: Scan, rows: list[OpinionBoundary]) -> set[int]:
 
     :param scan: The scan.
     :param rows: The boundaries to answer for.
-    :returns: The pks of the rows whose first page is shared.
-    :rtype: set[int]
+    :returns: ``{pk: y}`` for each row whose first page is shared: the
+        lowest end anchor of an earlier opinion on that page, in points.
+        The earlier opinion's notes are printed below it.
+    :rtype: dict[int, float]
     """
     if not rows:
-        return set()
+        return {}
     earlier = live(scan)
     columns = column_boundaries(
         scan, {r.start_page_index for r in [*rows, *earlier]}
     )
-    shared = set()
+    shared: dict[int, float] = {}
     for row in rows:
         key = reading_key(row, columns)
-        if any(
-            other.pk != row.pk
+        ends = [
+            other.end_y
+            for other in earlier
+            if other.pk != row.pk
             and other.end_page_index == row.start_page_index
             and reading_key(other, columns) < key
-            for other in earlier
-        ):
-            shared.add(row.pk)
+        ]
+        if ends:
+            shared[row.pk] = max(ends)
     return shared
 
 
@@ -877,11 +883,11 @@ def outside_rects(
 
     blackletter's masks stop above the footnotes, so on a first page
     the opinion before ends on (:func:`shared_first_pages`), each live
-    ``FOOTNOTES`` box of the page is a mask too, with ``kind``
-    :data:`FOOTNOTES_MASK` (#457): those notes belong to the text the
-    first mask covers. A person who said the notes are the opinion's
-    own (``shared_footnotes.keep``) lifts it, through
-    ``kept_footnotes``. The last page keeps its footnotes.
+    ``FOOTNOTES`` box of the page below the end of the opinion before is
+    a mask too, with ``kind`` :data:`FOOTNOTES_MASK` (#457): those notes
+    belong to the text the first mask covers. A person who said the
+    notes are the opinion's own (``shared_footnotes.keep``) lifts it,
+    through ``kept_footnotes``. The last page keeps its footnotes.
 
     One derivation, two callers. The viewer has no PDF and gets the
     masks unwidened (blackletter's ``_outside_opinion_rects`` with no
@@ -988,6 +994,11 @@ def outside_rects(
                     if det.label != Label.FOOTNOTES:
                         continue
                     box = det.bbox.to_pdf(page.scale_x, page.scale_y)
+                    if box.y1 < shared[row.pk]:
+                        # A box that starts above the end of the opinion
+                        # before is not the foot of the page: a stray
+                        # box over the text would white it out.
+                        continue
                     rect = fitz.Rect(box.x1, box.y1, box.x2, box.y2)
                     if fitz_page is not None:
                         # The side edges grow over a clipped glyph, the

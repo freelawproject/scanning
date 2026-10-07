@@ -435,7 +435,9 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     # notes as the opinion's own, or give back the ones a person kept.
     # Offered where the endpoints take it, the gate of the dismissal.
     if can_dismiss:
-        kept = shared_footnotes.kept(opinion)
+        # The rule of the card: a kept row on a page nobody shares
+        # lifts nothing, and its Give back would be refused.
+        kept = shared_footnotes.kept_on_shared_page(opinion)
         kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
         for row in findings:
             if row.check_name != OpinionCheck.SHARED_FOOTNOTES:

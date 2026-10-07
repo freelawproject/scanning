@@ -16,8 +16,12 @@ person answers it here: :func:`keep` lifts the mask for the opinion,
 ``glue_revision``, so the OCR glue, the PDF and the ensemble are
 written again from the new masks, the rule of ``opinion_ocr.reglue``.
 
-The gate of the status lives in the views, the rule of every refused
-write: this module answers for the rows alone.
+The views refuse an opinion that is not ready for the text review,
+and :func:`keep` and :func:`give_back` read the status again under the
+lock (:class:`FootnotesClosed`): an approval that lands between the two
+would leave a decision on a text nobody wrote again. Each write also
+withdraws a standing dismissal of the card, which named the other
+answer.
 """
 
 from django.db import transaction
@@ -27,9 +31,16 @@ from django.utils import timezone
 from scanning.models import (
     KeptFootnotes,
     Opinion,
+    OpinionCheck,
+    OpinionFinding,
+    OpinionFindingDismissal,
     OpinionReviewStatus,
     Scan,
 )
+
+
+class FootnotesClosed(Exception):
+    """The opinion is not ready for the text review under the lock."""
 
 
 def applies(row: KeptFootnotes, opinion: Opinion) -> bool:
@@ -111,11 +122,41 @@ def kept_boundaries(scan: Scan) -> set[int]:
     return kept_pks
 
 
+def _locked(opinion: Opinion) -> Opinion:
+    """Lock the opinion, and refuse one that is not ready for the review.
+
+    :raises FootnotesClosed: When the status moved since the view read it.
+    """
+    locked = Opinion.objects.select_for_update().get(pk=opinion.pk)
+    if locked.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+        raise FootnotesClosed(locked.status)
+    return locked
+
+
 def _reglue(opinion: Opinion) -> None:
-    """Raise the revision, so every glue is written from the new masks."""
-    Opinion.objects.filter(pk=opinion.pk).exclude(
-        status=OpinionReviewStatus.TEXT_REVIEW_DONE
-    ).update(glue_revision=F("glue_revision") + 1, ocr_glue_attempts=0)
+    """Raise the revision, and reopen the card's dismissal.
+
+    The revision rises so every glue is written from the new masks. A
+    dismissal of the card said "the notes are the opinion before's",
+    and this write changes that answer, so it stands no more: the card
+    the new build writes is open, and an ERROR one holds the approval
+    again.
+    """
+    Opinion.objects.filter(pk=opinion.pk).update(
+        glue_revision=F("glue_revision") + 1, ocr_glue_attempts=0
+    )
+    now = timezone.now()
+    dismissals = OpinionFindingDismissal.objects.filter(
+        opinion=opinion,
+        check_name=OpinionCheck.SHARED_FOOTNOTES,
+        withdrawn_at__isnull=True,
+    )
+    # The rule of ``opinion_findings.restore``: the card loses its FK
+    # too, so the strip counts it open before the next build.
+    OpinionFinding.objects.filter(dismissal__in=dismissals).update(
+        dismissal=None
+    )
+    dismissals.update(withdrawn_at=now, date_modified=now)
 
 
 def keep(opinion: Opinion, user) -> bool:
@@ -128,9 +169,10 @@ def keep(opinion: Opinion, user) -> bool:
     :param user: Who decided.
     :returns: False when a standing row applies already.
     :rtype: bool
+    :raises FootnotesClosed: When the opinion is not ready for the review.
     """
     with transaction.atomic():
-        locked = Opinion.objects.select_for_update().get(pk=opinion.pk)
+        locked = _locked(opinion)
         row = standing(locked)
         if row is not None and applies(row, locked):
             return False
@@ -155,9 +197,10 @@ def give_back(opinion: Opinion, user) -> bool:
     :param user: Who decided.
     :returns: False when no row stands.
     :rtype: bool
+    :raises FootnotesClosed: When the opinion is not ready for the review.
     """
     with transaction.atomic():
-        locked = Opinion.objects.select_for_update().get(pk=opinion.pk)
+        locked = _locked(opinion)
         row = standing(locked)
         if row is None:
             return False

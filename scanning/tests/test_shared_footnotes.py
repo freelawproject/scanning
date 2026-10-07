@@ -7,6 +7,9 @@ its redacted PDF. The later opinion's first page now masks them, a
 card asks a person to look, and "Keep the footnotes" lifts the mask.
 """
 
+from unittest.mock import patch
+
+import fitz
 from blackletter.models import Label
 from django.urls import reverse
 
@@ -14,6 +17,7 @@ from scanning import (
     boundaries,
     ensemble,
     opinion_ocr,
+    opinion_pdf,
     paragraphs,
     shared_footnotes,
 )
@@ -26,10 +30,12 @@ from scanning.models import (
     Issue,
     KeptFootnotes,
     OpinionCheck,
+    OpinionFindingDismissal,
     OpinionReviewStatus,
 )
 from scanning.tests.test_boundaries import IMG_H, IMG_W
 from scanning.tests.test_detections import model_row
+from scanning.tests.test_ensemble import engine_page, read_units, unit
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -139,7 +145,7 @@ class TestTheMask(ScanningTestCase):
         boundaries.dismiss(self.scan, self.before, self.make_user())
 
         self.assertEqual(
-            boundaries.shared_first_pages(self.scan, [self.after]), set()
+            boundaries.shared_first_pages(self.scan, [self.after]), {}
         )
 
     def test_the_opinion_must_come_before_in_reading_order(self):
@@ -148,8 +154,18 @@ class TestTheMask(ScanningTestCase):
             boundaries.shared_first_pages(
                 self.scan, [self.before, self.after]
             ),
-            {self.after.pk},
+            {self.after.pk: 400.0},
         )
+
+    def test_a_footnote_box_above_the_end_of_the_opinion_before_stays(self):
+        """A stray box over the text is not the foot of the page."""
+        detection(self.scan, 1, Label.FOOTNOTES, 900, 300, 1600, 600)
+
+        masks = boundaries.outside_rects(self.scan, [self.after])
+
+        notes = footnote_masks(masks[self.after.pk])
+        self.assertEqual(len(notes), 1)
+        self.assertGreater(notes[0]["y0"], 400.0)
 
 
 class TestTheVerdict(ScanningTestCase):
@@ -240,6 +256,14 @@ class TestTheCard(ScanningTestCase):
 
         self.assertEqual(card.severity, Issue.Severity.WARNING)
 
+    def test_an_opinion_of_one_page_makes_it_an_error(self):
+        self.opinion.page_count = 1
+
+        card = self.card(page_of([NOTE_DROP]))
+
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+        self.assertIn("starts and ends on this page", card.message)
+
     def test_a_kept_page_says_so(self):
         card = self.card(page_of(), kept=True)
 
@@ -306,14 +330,49 @@ class TestKeep(ScanningTestCase):
             1,
         )
 
-    def test_an_approved_opinion_keeps_its_revision(self):
+    def test_the_status_is_read_again_under_the_lock(self):
+        """An approval between the view's check and the write refuses."""
+        stale = type(self.opinion).objects.get(pk=self.opinion.pk)
         self.opinion.status = OpinionReviewStatus.TEXT_REVIEW_DONE
         self.opinion.save(update_fields=["status"])
 
-        shared_footnotes.keep(self.opinion, self.user)
+        with self.assertRaises(shared_footnotes.FootnotesClosed):
+            shared_footnotes.keep(stale, self.user)
+        with self.assertRaises(shared_footnotes.FootnotesClosed):
+            shared_footnotes.give_back(stale, self.user)
 
+        self.assertFalse(KeptFootnotes.objects.exists())
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.glue_revision, 0)
+
+    def test_a_keep_reopens_the_dismissal_of_the_card(self):
+        """A dismissal said the notes are the opinion before's; a keep
+        and a give back change that answer, so the new card is open."""
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.SHARED_FOOTNOTES,
+        )
+        card = self.opinion.findings.create(
+            page_in_opinion=0,
+            check_name=OpinionCheck.SHARED_FOOTNOTES,
+            severity=Issue.Severity.ERROR,
+            dismissal=dismissal,
+        )
+        other = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+
+        shared_footnotes.keep(self.opinion, self.user)
+
+        dismissal.refresh_from_db()
+        card.refresh_from_db()
+        other.refresh_from_db()
+        self.assertIsNotNone(dismissal.withdrawn_at)
+        self.assertIsNone(card.dismissal_id)
+        self.assertIsNone(other.withdrawn_at)
 
     def test_the_viewer_lifts_the_mask_of_a_kept_opinion(self):
         scan = self.opinion.scan
@@ -369,6 +428,31 @@ class TestTheEndpoints(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(shared_footnotes.kept(self.opinion))
+
+    def test_an_approval_under_the_lock_refuses(self):
+        with patch.object(
+            shared_footnotes,
+            "keep",
+            side_effect=shared_footnotes.FootnotesClosed("done"),
+        ):
+            response = self.client.post(self.keep_url)
+
+        self.assertEqual(response.status_code, 409)
+
+    def test_a_kept_row_on_a_page_nobody_shares_offers_no_give_back(self):
+        shared_footnotes.keep(self.opinion, self.user)
+        self.opinion.findings.create(
+            page_in_opinion=0,
+            check_name=OpinionCheck.SHARED_FOOTNOTES,
+            severity=Issue.Severity.WARNING,
+        )
+        boundaries.dismiss(self.scan, self.before, self.user)
+
+        response = self.client.get(
+            reverse("opinion_review", kwargs={"pk": self.opinion.pk})
+        )
+
+        self.assertNotContains(response, self.give_back_url)
 
     def test_an_opinion_not_ready_refuses(self):
         self.opinion.status = OpinionReviewStatus.TEXT_REVIEW_DONE
@@ -442,3 +526,81 @@ class TestTheTakenZone(ScanningTestCase):
         mask = {"x0": 94.9, "y0": 604.7, "x1": 514.6, "y1": 743.5}
 
         self.assertFalse(opinion_ocr._taken(self.ZONE, [mask]))
+
+
+class TestThePdfMasks(ScanningTestCase):
+    """``opinion_pdf._masks`` carries the footnote mask into the PDF."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.scan = ScanFactory(page_count=3)
+        shared_page(self.scan)
+        _, after = two_opinions(self.scan)
+        self.opinion = OpinionFactory(
+            scan=self.scan,
+            boundary=after,
+            start_page_index=1,
+            start_source_page=2,
+            end_page_index=2,
+            end_source_page=3,
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+        )
+        self.volume = fitz.open()
+        for _ in range(3):
+            self.volume.new_page(width=612, height=792)
+
+    def tearDown(self):
+        self.volume.close()
+
+    def test_the_mask_is_on_the_first_page_of_the_small_source(self):
+        notes = footnote_masks(opinion_pdf._masks(self.opinion, self.volume))
+
+        self.assertEqual([n["page_index"] for n in notes], [0])
+
+    def test_a_kept_opinion_has_no_footnote_mask(self):
+        shared_footnotes.keep(self.opinion, self.user)
+
+        notes = footnote_masks(opinion_pdf._masks(self.opinion, self.volume))
+
+        self.assertEqual(notes, [])
+
+
+class TestTheEnsembleZones(ScanningTestCase):
+    """The ensemble hides a taken zone and still sections by it."""
+
+    ZONE = [40.0, 590.0, 580.0, 710.0]
+
+    def test_a_taken_zone_is_not_drawn_and_its_notes_are_dropped(self):
+        units = read_units(((50, 100, 300, 200), "own text")) + [
+            unit(
+                engine,
+                1,
+                (50, 600, 300, 700),
+                "23. note of the opinion before",
+                exclusion={"reason": opinion_ocr.NEIGHBOUR_FOOTNOTES},
+                share=1.0,
+            )
+            for engine in ("dots_mocr", "mistral_ocr")
+        ]
+        pages = {}
+        for engine in ("dots_mocr", "mistral_ocr"):
+            page = engine_page(
+                [u for u in units if u["engine"] == engine], [self.ZONE]
+            )
+            page["zones"][opinion_ocr.TAKEN_FOOTNOTES] = [self.ZONE]
+            pages[engine] = page
+
+        entry = ensemble.build_page(pages, 0)
+
+        self.assertEqual(entry["zones"]["footnotes"], [])
+        self.assertEqual(
+            entry["zones"][opinion_ocr.TAKEN_FOOTNOTES], [self.ZONE]
+        )
+        self.assertEqual(entry["footnotes"], "")
+        drop = next(
+            d
+            for d in entry["dropped"]
+            if d["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
+        )
+        # The zone still sections the drop, so a body join is not cut.
+        self.assertEqual(drop["section"], ensemble.FOOTNOTES)

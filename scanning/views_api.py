@@ -1382,7 +1382,14 @@ def keep_opinion_footnotes(
     opinion = _footnotes_opinion_or_refusal(pk, opinion_pk)
     if isinstance(opinion, JsonResponse):
         return opinion
-    if not shared_footnotes.keep(opinion, request.user):
+    try:
+        written = shared_footnotes.keep(opinion, request.user)
+    except shared_footnotes.FootnotesClosed:
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
+            status=409,
+        )
+    if not written:
         return JsonResponse(
             {"status": "ok", "message": KEPT_FOOTNOTES_ALREADY_MESSAGE}
         )
@@ -1416,7 +1423,14 @@ def give_back_opinion_footnotes(
     opinion = _footnotes_opinion_or_refusal(pk, opinion_pk)
     if isinstance(opinion, JsonResponse):
         return opinion
-    if not shared_footnotes.give_back(opinion, request.user):
+    try:
+        written = shared_footnotes.give_back(opinion, request.user)
+    except shared_footnotes.FootnotesClosed:
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
+            status=409,
+        )
+    if not written:
         return JsonResponse(
             {"status": "ok", "message": GAVE_BACK_FOOTNOTES_ALREADY_MESSAGE}
         )

@@ -188,8 +188,10 @@ logger = logging.getLogger(__name__)
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
-#: and the page its list runs (``lists``, #428).
-SCHEMA_VERSION = 11
+#: and the page its list runs (``lists``, #428). 12 writes the footnote
+#: zones the first-page mask took under ``zones.footnotes_taken`` and
+#: leaves them out of ``zones.footnotes`` (#457).
+SCHEMA_VERSION = 12
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -3411,7 +3413,9 @@ def _shared_footnotes_card(
     one card: a warning, because the earlier opinion's notes are the
     daily shape of it, or an ERROR the approval waits on when the
     opinion's own body text on the page carries a footnote mark, a
-    sign that one of the notes is its own. A person answers it with a
+    sign that one of the notes is its own, or when the opinion starts
+    and ends on that page, whose notes are then likely its own. A
+    person answers it with a
     dismissal (the notes are the earlier opinion's) or with "Keep the
     footnotes" (``shared_footnotes.keep``). A kept page is a warning
     that says so, and carries the way back.
@@ -3452,16 +3456,21 @@ def _shared_footnotes_card(
         "footnote block(s) were taken out of the text and whited out of "
         "the redacted PDF."
     )
-    if marks:
+    if marks or opinion.page_count == 1:
+        why = (
+            f"The text of this opinion on the page carries the footnote "
+            f"mark(s) {', '.join(marks)}, so a note may be its own."
+            if marks
+            else "This opinion starts and ends on this page, so a note "
+            "may be its own."
+        )
         return _card(
             opinion,
             page["page_in_opinion"],
             OpinionCheck.SHARED_FOOTNOTES,
             Issue.Severity.ERROR,
-            f"{message} The text of this opinion on the page carries the "
-            f"footnote mark(s) {', '.join(marks)}, so a note may be its "
-            "own. Keep the footnotes if it is, or dismiss the card if "
-            "every note is the opinion before's.",
+            f"{message} {why} Keep the footnotes if it is, or dismiss the "
+            "card if every note is the opinion before's.",
             standing,
         )
     return _card(
