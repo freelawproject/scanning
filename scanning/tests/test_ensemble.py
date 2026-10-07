@@ -337,6 +337,62 @@ class TestTheAlignment(TestCase):
         self.assertEqual(len(silent), 1)
         self.assertEqual(silent[0]["engines"]["surya"]["ids"], [0])
 
+    def test_a_container_no_other_engine_read_keeps_its_text(self):
+        """The only reading of its place: held out, it would become an
+        empty group and vanish with no card (#451)."""
+        units = [
+            unit("dots_mocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("mistral_ocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("surya", 0, (50, 100, 560, 500), "the list and its head"),
+            unit("surya", 1, (50, 100, 560, 140), "its head"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertIn(
+            "the list and its head",
+            [ensemble.resolve(g)["text"] for g in groups],
+        )
+
+    def test_a_container_over_one_group_links(self):
+        """A paragraph box over a heading box of its own engine chains
+        nothing when the others read only the heading."""
+        units = [
+            unit("dots_mocr", 0, (50, 100, 560, 500), "heading and body"),
+            unit("dots_mocr", 1, (50, 100, 560, 140), "heading"),
+            unit("mistral_ocr", 0, (50, 100, 560, 140), "heading"),
+            unit("surya", 0, (50, 100, 560, 140), "heading"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertEqual(
+            [g["engines"]["dots_mocr"]["ids"] for g in groups], [[0, 1]]
+        )
+
+    def test_a_silenced_container_carries_no_verdict(self):
+        """A drop counts the exclusion and the bracket flag over every
+        member, and a container kept no word to lose."""
+        container = unit(
+            "surya",
+            0,
+            (50, 100, 560, 700),
+            "every word",
+            exclusion={"reason": "redaction"},
+            share=0.2,
+        )
+        container["bracket"] = True
+
+        silenced = ensemble._silenced(container)
+
+        self.assertEqual(silenced["text"], "")
+        self.assertIsNone(silenced["exclusion"])
+        self.assertEqual(silenced["share"], 0.0)
+        self.assertFalse(silenced["bracket"])
+        self.assertEqual(silenced["id"], 0)
+
     def test_a_box_over_another_engines_blocks_still_links(self):
         """The container is a fact of one engine's own blocks: a big
         block over the other engine's paragraphs is their text."""
