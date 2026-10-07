@@ -217,7 +217,7 @@ def ensure_analyze_jobs(
 
 #: ``scan pk -> (retry at, times refused)``: the scans whose shard set
 #: ``committed_manifest`` refused, left alone for
-#: ``yolo.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
+#: ``jobs.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
 #: clear it.
 _REFUSED: dict[int, tuple[float, int]] = {}
 
@@ -255,78 +255,20 @@ def enqueue_missing_runs() -> int:
     :returns: How many runs were started.
     :rtype: int
     """
-    from django.db.models import Exists, OuterRef
-
-    from scanning import sharding, yolo
+    from scanning import yolo
 
     if not enabled() or not s3_sync.s3_active():
         return 0
-
-    now = time.monotonic()
-    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
-
-    read = ExternalJob.objects.filter(
-        scan=OuterRef("pk"),
+    return jobs.enqueue_missing_runs(
         stage=JobStage.ANALYZE,
         engine=JobEngine.DOTS_MOCR,
-        opinion=None,
-        # The volume run only: an apply run's one-page rows (#224)
-        # answer for no shard set.
-        apply_run__isnull=True,
-    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
-    candidates = (
-        Scan.objects.filter(status__in=yolo.SWEEP_STATUSES)
-        .exclude(source_fingerprint="")
-        .exclude(pk__in=skipped)
-        .annotate(read=Exists(read))
-        .filter(read=False)
-        .order_by("-pk")[: settings.DOTS_MOCR_MAX_CONCURRENCY]
+        create=ensure_analyze_jobs,
+        statuses=yolo.SWEEP_STATUSES,
+        cap=settings.DOTS_MOCR_MAX_CONCURRENCY,
+        refused=_REFUSED,
+        label="OCR run",
+        log=logger,
     )
-
-    started = 0
-    for scan in candidates:
-        manifest, reason = sharding.committed_manifest(scan)
-        if manifest is None:
-            _, times = _REFUSED.get(scan.pk, (0.0, 0))
-            _REFUSED[scan.pk] = (now + yolo.REFUSAL_RETRY_SECONDS, times + 1)
-            logger.log(
-                logging.INFO if times == 0 else logging.DEBUG,
-                "Scan %s is not swept for OCR (refusal %d, next look in "
-                "%ds): %s",
-                scan.pk,
-                times + 1,
-                yolo.REFUSAL_RETRY_SECONDS,
-                reason,
-            )
-            continue
-        _REFUSED.pop(scan.pk, None)
-        rows = ensure_analyze_jobs(scan, manifest)
-        blank = [row.pk for row in rows if not row.source_fingerprint]
-        if blank:
-            # A run from before the fingerprint column, handed back
-            # because it still describes today's set. Stamp it, so the
-            # next tick does not pay two S3 calls to learn the same
-            # thing, and does not count a run it did not start.
-            ExternalJob.objects.filter(pk__in=blank).update(
-                source_fingerprint=scan.source_fingerprint
-            )
-            logger.info(
-                "Adopted OCR run %s of scan %s (%d row(s) from before the "
-                "fingerprint column)",
-                rows[0].run,
-                scan.pk,
-                len(blank),
-            )
-            continue
-        logger.info(
-            "Started OCR run %s for scan %s over %d shard(s) (%d carried)",
-            rows[0].run,
-            scan.pk,
-            len(rows),
-            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
-        )
-        started += 1
-    return started
 
 
 def shards_with_holes(rows: list[ExternalJob]) -> list[ExternalJob]:
@@ -1147,8 +1089,8 @@ def reopen_apply_after_read(scan, engine: str) -> bool:
     The hand-back of #351, called by the Mistral and the Surya volume
     glues after they consume a run. The apply fills the pages dots.mocr
     left blank from those documents (``page_numbers.fallback_documents``),
-    but it ran when the dots.mocr run was glued, and a person starts
-    the other engines later than that. So a volume in review 1 is
+    but it ran when the dots.mocr run was glued, and the other engines
+    land later than that. So a volume in review 1 is
     handed back to the pass, which reads the stored documents again on
     the next tick: no GPU time, no new run, and the numbers a curator
     typed survive (:func:`reopen_apply`).

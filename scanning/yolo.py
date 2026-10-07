@@ -248,18 +248,10 @@ def ensure_detect_jobs(
     )
 
 
-#: How long the sweep leaves a scan alone after ``committed_manifest``
-#: refused its shard set. The submit tick is every 5 seconds, and a
-#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
-#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
-#: corpus), so looked at on every tick each such scan would cost two S3
-#: calls and one log line 17,000 times a day. The memo lives in the
-#: daemon process: a restart forgets it, which buys one fresh look per
-#: deploy and nothing worse, because a duplicate run is prevented by
-#: the rows in the database, never by this.
-REFUSAL_RETRY_SECONDS = 3600
-
-#: ``scan pk -> (retry at, times refused)``, see above. Tests clear it.
+#: ``scan pk -> (retry at, times refused)``: the scans whose shard set
+#: ``committed_manifest`` refused, left alone for
+#: ``jobs.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
+#: clear it.
 _REFUSED: dict[int, tuple[float, int]] = {}
 
 
@@ -307,87 +299,26 @@ def enqueue_missing_runs() -> int:
     without a knob nobody would tune: the backlog only takes more
     ticks to turn into rows, and nothing waits on that. A refused set
     is logged once at INFO, then at DEBUG, and left alone for
-    :data:`REFUSAL_RETRY_SECONDS` (see :data:`_REFUSED`), so a
+    ``jobs.REFUSAL_RETRY_SECONDS`` (see :data:`_REFUSED`), so a
     permanent refusal neither fills the log nor holds a place in the
-    batch. The pass makes no call to RunPod.
+    batch. The pass makes no call to RunPod. The body is
+    ``jobs.enqueue_missing_runs``, which the other sweeps share.
 
     :returns: How many runs were started.
     :rtype: int
     """
-    from django.db.models import Exists, OuterRef
-
-    from scanning import sharding
-
     if not enabled() or not s3_sync.s3_active():
         return 0
-
-    now = time.monotonic()
-    skipped = [pk for pk, (retry_at, _) in _REFUSED.items() if retry_at > now]
-
-    detected = ExternalJob.objects.filter(
-        scan=OuterRef("pk"),
+    return jobs.enqueue_missing_runs(
         stage=JobStage.DETECT,
         engine=JobEngine.BLACKLETTER,
-        opinion=None,
-        # The volume run only. An apply run's rows (#224) are one-page
-        # shards of the pages a curator changed, and they answer for
-        # no shard set, so a volume that has them and no run of its
-        # own must still get one.
-        apply_run__isnull=True,
-    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
-    candidates = (
-        Scan.objects.filter(status__in=SWEEP_STATUSES)
-        .exclude(source_fingerprint="")
-        .exclude(pk__in=skipped)
-        .annotate(detected=Exists(detected))
-        .filter(detected=False)
-        .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
+        create=ensure_detect_jobs,
+        statuses=SWEEP_STATUSES,
+        cap=settings.YOLO_MAX_CONCURRENCY,
+        refused=_REFUSED,
+        label="detection run",
+        log=logger,
     )
-
-    started = 0
-    for scan in candidates:
-        manifest, reason = sharding.committed_manifest(scan)
-        if manifest is None:
-            _, times = _REFUSED.get(scan.pk, (0.0, 0))
-            _REFUSED[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
-            logger.log(
-                logging.INFO if times == 0 else logging.DEBUG,
-                "Scan %s is not swept for detection (refusal %d, next look "
-                "in %ds): %s",
-                scan.pk,
-                times + 1,
-                REFUSAL_RETRY_SECONDS,
-                reason,
-            )
-            continue
-        _REFUSED.pop(scan.pk, None)
-        rows = ensure_detect_jobs(scan, manifest)
-        blank = [row.pk for row in rows if not row.source_fingerprint]
-        if blank:
-            # A run from before the column, handed back because it
-            # still describes today's set. Stamp it, so the next tick
-            # does not pay two S3 calls to learn the same thing.
-            ExternalJob.objects.filter(pk__in=blank).update(
-                source_fingerprint=scan.source_fingerprint
-            )
-            logger.info(
-                "Adopted detection run %s of scan %s (%d row(s) from "
-                "before the fingerprint column)",
-                rows[0].run,
-                scan.pk,
-                len(blank),
-            )
-            continue
-        logger.info(
-            "Started detection run %s for scan %s over %d shard(s) "
-            "(%d carried)",
-            rows[0].run,
-            scan.pk,
-            len(rows),
-            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
-        )
-        started += 1
-    return started
 
 
 def live_detect_jobs(scan) -> list[ExternalJob]:

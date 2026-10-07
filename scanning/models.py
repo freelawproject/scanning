@@ -3937,10 +3937,10 @@ class ApplyRun(AbstractDateTimeModel):
         corrected volume must exist before the review opens.
 
         ``extract_key`` and ``surya_key`` are deliberately **not** part
-        of it (#245, #368). A person starts those two reads, and after
-        the reviews rather than before them, so a volume nobody read
-        with Mistral or with Surya would never open review 2 if this
-        waited for them.
+        of it (#245, #368). The daemon's sweep starts the Mistral read
+        (#341) and a person starts Surya's, neither of them waits on
+        review 2, and a volume nobody read with Mistral or with Surya
+        would never open review 2 if this waited for them.
         """
         return self.is_glued and bool(self.detections_key)
 

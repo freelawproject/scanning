@@ -630,6 +630,26 @@ class TestApplyRowsGoFirst(ScanningTestCase):
         self.assertTrue(self._sent(first))
         self.assertFalse(self._sent(second))
 
+    def test_a_reviewed_volume_is_claimed_before_an_unopened_one(self):
+        """The second class of #341: a volume with an apply run, the
+        mark of a review-1 approval, goes before an older volume nobody
+        opened, and after an apply row."""
+        unopened = ScanFactory()
+        older = jobs.ensure_convert_jobs(
+            unopened, make_manifest(shard_count=1)
+        )
+        reviewed = ScanFactory()
+        ApplyRun.objects.create(scan=reviewed, number=1)
+        newer = jobs.ensure_convert_jobs(
+            reviewed, make_manifest(shard_count=1)
+        )
+        self.assertGreater(newer[0].pk, older[0].pk)
+
+        self._tick()
+
+        self.assertTrue(self._sent(newer[0]))
+        self.assertFalse(self._sent(older[0]))
+
     def test_the_cap_still_bounds_the_wave(self):
         """The rank picks who takes a free place; it preempts nothing."""
         scan = ScanFactory()

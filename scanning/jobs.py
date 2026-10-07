@@ -1456,8 +1456,8 @@ def ready_apply_runs(
 
     **A volume nobody read with this engine is never a candidate**,
     which is what keeps a pass over it from starting paid work of its
-    own: the candidate is a glued volume run, and only a person starts
-    one.
+    own: the candidate is a glued volume run, which the sweep starts
+    for Mistral (#341) and a person starts for Surya (#364).
 
     :param target: The engine and its two ``ApplyRun`` fields.
     :param live_rows: The engine's own live-run reader, called per
@@ -2073,6 +2073,139 @@ def _reusable_results(
     return reusable
 
 
+#: How long a sweep leaves a scan alone after ``committed_manifest``
+#: refused its shard set. The submit tick is every 5 seconds, and a
+#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
+#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
+#: corpus), so looked at on every tick each such scan would cost two S3
+#: calls and one log line 17,000 times a day. Each stage's memo lives
+#: in the daemon process: a restart forgets it, which buys one fresh
+#: look per deploy and nothing worse, because a duplicate run is
+#: prevented by the rows in the database, never by the memo.
+REFUSAL_RETRY_SECONDS = 3600
+
+
+def enqueue_missing_runs(
+    *,
+    stage: str,
+    engine: str,
+    create: Callable[[object, dict], list[ExternalJob]],
+    statuses: frozenset,
+    cap: int,
+    refused: dict[int, tuple[float, int]],
+    label: str,
+    log: logging.Logger,
+) -> int:
+    """Start one engine's run over every shard set that has none yet.
+
+    The one body of the submit tick's sweeps: detection (#250),
+    dots.mocr (#327) and Mistral (#341). Each stage module keeps its
+    own switch, cap and refusal memo and passes them here, so the rule
+    lives once. The rationale is in ``yolo.enqueue_missing_runs``.
+
+    **A shard set is read once.** A candidate is a scan in
+    ``statuses`` whose current ``source_fingerprint`` has no
+    volume row of ``stage``/``engine`` at all, alive or dead: a dead
+    run is a staff decision, never a tick's. A run from before the
+    fingerprint column is blank, so its scan is a candidate; when the
+    creator hands that run back unchanged, this stamps it rather than
+    count it. At most ``cap`` scans are looked at, newest first, and a
+    shard set ``sharding.committed_manifest`` refused is left alone for
+    :data:`REFUSAL_RETRY_SECONDS`.
+
+    :param stage: The row stage.
+    :param engine: The row engine.
+    :param create: The stage's creator, ``(scan, manifest) -> rows``.
+    :param statuses: The scan statuses the stage reads in
+        (``yolo.SWEEP_STATUSES``, the one set all three sweeps read:
+        every read is over the original shards, which exist from the
+        upload on).
+    :param cap: Scans looked at on one tick.
+    :param refused: The stage's memo, ``scan pk -> (retry at, times
+        refused)``.
+    :param label: What a log line calls the run ("OCR run").
+    :param log: The stage module's logger.
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    import time
+
+    from django.db.models import Exists, OuterRef
+
+    from scanning.models import Scan
+
+    now = time.monotonic()
+    skipped = [pk for pk, (retry_at, _) in refused.items() if retry_at > now]
+
+    existing = ExternalJob.objects.filter(
+        scan=OuterRef("pk"),
+        stage=stage,
+        engine=engine,
+        opinion=None,
+        # The volume run only. An apply run's rows (#224) are one-page
+        # shards of the pages a curator changed, and they answer for
+        # no shard set, so a volume that has them and no run of its
+        # own must still get one.
+        apply_run__isnull=True,
+    ).filter(source_fingerprint=OuterRef("source_fingerprint"))
+    candidates = (
+        Scan.objects.filter(status__in=statuses)
+        .exclude(source_fingerprint="")
+        .exclude(pk__in=skipped)
+        .annotate(existing=Exists(existing))
+        .filter(existing=False)
+        .order_by("-pk")[:cap]
+    )
+
+    started = 0
+    for scan in candidates:
+        manifest, reason = sharding.committed_manifest(scan)
+        if manifest is None:
+            _, times = refused.get(scan.pk, (0.0, 0))
+            refused[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
+            log.log(
+                logging.INFO if times == 0 else logging.DEBUG,
+                "Scan %s is not swept for its %s (refusal %d, next look "
+                "in %ds): %s",
+                scan.pk,
+                label,
+                times + 1,
+                REFUSAL_RETRY_SECONDS,
+                reason,
+            )
+            continue
+        refused.pop(scan.pk, None)
+        rows = create(scan, manifest)
+        blank = [row.pk for row in rows if not row.source_fingerprint]
+        if blank:
+            # A run from before the column, handed back because it
+            # still describes today's set. Stamp it, so the next tick
+            # does not pay two S3 calls to learn the same thing, and
+            # does not count a run it did not start.
+            ExternalJob.objects.filter(pk__in=blank).update(
+                source_fingerprint=scan.source_fingerprint
+            )
+            log.info(
+                "Adopted %s %s of scan %s (%d row(s) from before the "
+                "fingerprint column)",
+                label,
+                rows[0].run,
+                scan.pk,
+                len(blank),
+            )
+            continue
+        log.info(
+            "Started %s %s for scan %s over %d shard(s) (%d carried)",
+            label,
+            rows[0].run,
+            scan.pk,
+            len(rows),
+            sum(1 for row in rows if row.status == JobStatus.COMPLETED),
+        )
+        started += 1
+    return started
+
+
 def ensure_shard_jobs(
     scan,
     manifest: dict,
@@ -2551,24 +2684,46 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     - The rank decides who takes a free place and **preempts nothing**;
       :func:`_room_for` counts the in-flight rows against the cap.
 
-    The id stays the second key: inside one class the creation order is
-    what keeps the drain fair. The rank reads the row and not
-    ``Scan.status``, which moves under a row that is already waiting.
-    (It would cost no join: the slice already reaches ``scan`` through
+    **A volume shard of a reviewed volume goes next** (issue #341).
+    The Mistral sweep creates a volume run at the upload, and its wave
+    sends one shard per tick, so after the deploy every volume of the
+    corpus queues its shards at once, oldest id first. A volume whose
+    review 1 is approved is further along than one nobody opened: its
+    opinion OCR glue waits on the Mistral read
+    (``opinion_ocr.engines_owed``), and the other's waits on nothing.
+    The mark of that approval is an ``ApplyRun`` row (``apply.py``
+    creates one for every approved volume, the identity run included),
+    so the rank asks for one. The same four properties hold: the apply
+    rows go first, the reviewed set is bounded by the review itself, a
+    row that waits carries no deadline, and nothing is preempted.
+
+    The id stays the last key: inside one class the creation order is
+    what keeps the drain fair. The rank reads the rows and not
+    ``Scan.status``, which moves under a row that is already waiting
+    and names more states than the rank cares about. (It costs one
+    ``EXISTS`` per row: the slice already reaches ``scan`` through
     ``select_related``.)
 
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: The apply rows first, each class in creation order, at
-        most ``room`` of them.
+    :returns: The apply rows first, then the rows of a volume with an
+        apply run, each class in creation order, at most ``room`` of
+        them.
     :rtype: list[ExternalJob]
     """
+    from django.db.models import Exists, OuterRef
+
+    from scanning.models import ApplyRun
+
     return list(
         queryset.filter(status=JobStatus.PENDING)
         # ``s3_job_attempt_key`` reads the apply run's number (#224).
         .select_related("scan", "scan__reporter", "apply_run")
-        .annotate(is_apply=Q(apply_run__isnull=False))
-        .order_by("-is_apply", "id")[:room]
+        .annotate(
+            is_apply=Q(apply_run__isnull=False),
+            reviewed=Exists(ApplyRun.objects.filter(scan=OuterRef("scan"))),
+        )
+        .order_by("-is_apply", "-reviewed", "id")[:room]
     )
 
 

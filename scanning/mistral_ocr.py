@@ -40,17 +40,19 @@ Mistral, and must not be broken:
 - **The two glues run on the collect tick, and never in
   ``apply.glues_due``** (#245). The apply's own trigger takes a scan in
   ``PAGE_COMPLETENESS_REVIEW_DONE`` alone, and this read starts later
-  than that status: by hand today, and after the second review once
-  #336 lands. An arm there would miss the normal case for good.
+  than that status: the sweep (#341) starts it at the upload, and a
+  batch lands when Mistral is done with it, so a volume is read before
+  the build or long after it. An arm there would miss the normal case
+  for good.
 - **No review state waits for an output of this stage.**
   ``ApplyRun.extract_key`` is outside ``is_complete``, and the rows of
   a corrected volume are created outside ``apply._ensure_rows``: an
   environment that does not pay for Mistral must build its corrected
   volumes and open its reviews exactly as it does today.
-- **The corrected volume's rows are created only for a volume somebody
-  chose to read.** :func:`finish_ready_applies` takes a scan whose
-  live volume run is glued, which only a person starts, so the pass
-  mints no paid work of its own.
+- **The corrected volume's rows are created only for a volume the
+  sweep read.** :func:`finish_ready_applies` takes a scan whose live
+  volume run is glued, and :func:`enqueue_missing_runs` is what starts
+  that run (#341), once per shard set.
 - **The render is the branch's, line for line.** RGB, ``zoom = 1700 /
   page width``, a resize to exactly 1700x2200. Every engine of the
   ensemble saw that image, and every bbox of every engine lives in
@@ -151,6 +153,18 @@ MAX_CONCURRENCY = 16
 #: its geometry), waits for a measurement on a real volume.
 MAX_SUBMITS_PER_TICK = 1
 
+#: Volumes the sweep (:func:`enqueue_missing_runs`, #341) looks at on
+#: one submit tick. Each costs two S3 calls and no call to Mistral, and
+#: the wave sends one shard per tick whatever this is, so a larger
+#: batch only queues rows sooner. The queue ceiling is stamped at a
+#: row's first claim (#218), so a backlog of waiting rows expires none.
+SWEEP_SCANS_PER_TICK = 2
+
+#: ``scan pk -> (retry at, times refused)``: the scans whose shard set
+#: ``committed_manifest`` refused, left alone for
+#: ``jobs.REFUSAL_RETRY_SECONDS``. Tests clear it.
+_REFUSED: dict[int, tuple[float, int]] = {}
+
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
 #: uploads the shard's pages again.
@@ -217,9 +231,9 @@ def ensure_extract_jobs(
     """Return the live Mistral jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
-    Idempotent, so a second press of the button is a no-op rather than
-    a second run over pages already read. A run holding a dead row is
-    replaced. A replacement run carries every shard whose identity is
+    Idempotent, so a second sweep of the same shard set is a no-op
+    rather than a second run over pages already read. A run holding a
+    dead row is replaced. A replacement run carries every shard whose identity is
     unchanged and whose result object is still on S3, so a re-cut that
     moved a few page ranges re-pays only the shards that moved.
 
@@ -247,6 +261,59 @@ def ensure_extract_jobs(
         force_new_run=force_new_run,
         carry_stable_holes=False,
         apply_run=apply_run,
+    )
+
+
+def enqueue_missing_runs() -> int:
+    """Start the Mistral read over every shard set that has no run yet
+    (issue #341).
+
+    The third sweep of the submit tick, after detection's (#250) and
+    dots.mocr's (#327), under their rule and over their statuses
+    (``yolo.SWEEP_STATUSES``, from the upload to the end of review 2):
+    a scan whose current shard set has no Mistral volume row at all,
+    alive or dead, gets exactly one run, and a dead run under that
+    fingerprint is not re-run by a tick: ``MAX_ATTEMPTS`` were spent on
+    a shard, and every attempt is paid. The ``enqueue_mistral_ocr``
+    command is that staff decision. This replaced the staff button of
+    #191, so a new upload, the backlog and a volume uploaded while the
+    key was unset all get their read with no press.
+
+    The read starts at the upload, like the other two, because it is
+    over the original shards: a page a curator deletes in review 1 is
+    in the set either way (the run reads every page of the original,
+    and the pages a curator changes are paid again by
+    :func:`finish_ready_applies`), so no later start saves a page, and
+    an early one gives the page-number fill of #351 its Mistral
+    document while review 1 is open. ``REDACTION_REVIEW_DONE`` is out
+    with the other two sweeps: its opinions are glued, and no pass
+    glues them again for a late read, so an approved volume with no
+    run is read by naming it to ``enqueue_mistral_ocr`` and then
+    running ``reglue_opinion_ocr``. A volume a staff reopen (#455) puts
+    back in review 2 is swept like any other, and the re-approval glues
+    its opinions again, so that read is used.
+
+    The pass renders nothing and calls no Mistral endpoint: it writes
+    rows, and the wave (one shard per tick, ``MAX_SUBMITS_PER_TICK``)
+    sends them. An environment that must not spend leaves
+    ``MISTRAL_API_KEY`` unset, and then this starts nothing.
+
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    from scanning import yolo
+
+    if not enabled() or not s3_sync.s3_active():
+        return 0
+    return jobs.enqueue_missing_runs(
+        stage=JobStage.EXTRACT,
+        engine=JobEngine.MISTRAL_OCR,
+        create=ensure_extract_jobs,
+        statuses=yolo.SWEEP_STATUSES,
+        cap=SWEEP_SCANS_PER_TICK,
+        refused=_REFUSED,
+        label="Mistral OCR run",
+        log=logger,
     )
 
 
@@ -1396,10 +1463,9 @@ def ensure_extract_apply_jobs(scan, run) -> list[ExternalJob]:
     (#224). This is where they are read.
 
     Created here rather than in ``apply._ensure_rows`` for two reasons.
-    The read starts long after the build -- by hand today, and after
-    the second review once #336 lands -- so the build usually has no
-    Mistral run to join. And ``_ensure_rows`` refuses the whole
-    corrected volume when a stage it needs is off
+    The read is started by the sweep (#341), outside the build, so the
+    build usually has no Mistral run to join. And ``_ensure_rows``
+    refuses the whole corrected volume when a stage it needs is off
     (``apply.GateClosedError``), which must never happen for a stage
     an environment may simply not pay for.
 
@@ -1601,17 +1667,16 @@ def finish_ready_applies() -> int:
     one-page rows if it has none, and writes the corrected volume's
     document once every row has answered.
 
-    **A volume nobody read with Mistral pays nothing here.** The
-    candidate is the glued volume run, which only a person starts
-    (``views_process.start_mistral_ocr``), so this pass creates a paid
-    row only for a volume somebody chose to read.
+    **A volume with no glued Mistral run pays nothing here.** The
+    candidate is the glued volume run, which the sweep starts
+    (:func:`enqueue_missing_runs`, #341), so this pass reads the edited
+    pages of every volume the sweep read, and of no other.
 
     Not part of ``apply.glues_due`` on purpose (#245). That trigger
     takes a scan in ``PAGE_COMPLETENESS_REVIEW_DONE`` alone, and this
-    read starts later than that status -- by hand today, and after the
-    second review once #336 lands -- so an arm there would miss the
-    normal case. The work is seconds of JSON over stored objects, which
-    is what the collect tick is for.
+    read is started by the sweep (#341), often after the scan has left
+    that status, so an arm there would miss the normal case. The work is seconds of
+    JSON over stored objects, which is what the collect tick is for.
 
     Unlike :func:`finish_ready_runs` this pass does ask
     :func:`enabled`, because it may create a row, and a row is
