@@ -2431,8 +2431,9 @@ class OpinionCheck(models.TextChoices):
     """What an :class:`OpinionFinding` is about (#334).
 
     The first nine are the warnings the review shows on a page. The
-    last three are facts about the opinion row itself. The last one is
-    a human edit the text no longer holds (#376).
+    next three are facts about the opinion row itself. Then a human
+    edit the text no longer holds (#376), and the footnotes of a first
+    page the opinion before ends on (#457).
     """
 
     ENGINES_DISAGREE = "engines_disagree", "The engines do not all agree"
@@ -2456,6 +2457,10 @@ class OpinionCheck(models.TextChoices):
     UNRESOLVED_EDIT = (
         "unresolved_edit",
         "A human edit no longer fits the text",
+    )
+    SHARED_FOOTNOTES = (
+        "shared_footnotes",
+        "Footnotes of a page shared with the opinion before",
     )
 
 
@@ -3311,6 +3316,74 @@ class OpinionEdit(AbstractDateTimeModel):
         return (
             f"{self.kind} edit on {self.opinion} page {self.page_in_opinion}"
         )
+
+
+class KeptFootnotes(AbstractDateTimeModel):
+    """A person's word that the footnotes of a first page are its own (#457).
+
+    On the first page of an opinion that the opinion before ends on,
+    the footnotes are masked as the earlier opinion's
+    (``boundaries.outside_rects``). This row lifts that mask for one
+    opinion: its OCR glue keeps the notes, and its redacted PDF prints
+    them.
+
+    **The address of the first page** is a copy of the opinion's
+    ``start_source_edit`` and ``start_source_page`` when the row was
+    written. A row whose address is not the opinion's first page any
+    more is not applied (``shared_footnotes.applies``): the person
+    judged another page.
+
+    Withdrawn, never deleted. One standing row per opinion. Every write
+    raises ``Opinion.glue_revision``, because the mask is an input of
+    the OCR glue and of the PDF.
+    """
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="kept_footnotes",
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="kept_footnotes",
+        help_text="The durable address of the page; null = the original.",
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="kept_footnotes",
+    )
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    withdrawn_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="withdrawn_kept_footnotes",
+    )
+
+    class Meta:
+        ordering = ["pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["opinion"],
+                condition=models.Q(withdrawn_at__isnull=True),
+                name="unique_standing_kept_footnotes",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Footnotes kept on {self.opinion}"
 
 
 class PageEdit(AbstractDateTimeModel):
