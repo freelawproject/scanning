@@ -47,6 +47,11 @@ ANCHOR_TOLERANCE_PT = 12.0
 
 POINTS_PER_INCH = 72.0
 
+#: The ``kind`` of a mask over the footnotes of the opinion before, on
+#: the first page of an opinion (#457). ``opinion_ocr.verdict`` names
+#: the unit it takes by it, so the card can say what went.
+FOOTNOTES_MASK = "footnotes"
+
 
 class UnaddressableBoundary(ValueError):
     """An anchor was asked on a page no address can be written for.
@@ -785,6 +790,52 @@ def standing(scan: Scan) -> list[OpinionBoundary]:
     return rows
 
 
+def live(scan: Scan) -> list[OpinionBoundary]:
+    """Return the boundaries an opinion is cut from, in reading order.
+
+    :func:`standing` less the dismissed rows. The one rule of which
+    rows are opinions: ``opinions.live_boundaries`` reads it, and so
+    does the first-page footnote mask (#457).
+
+    :param scan: The scan.
+    :returns: The rows.
+    :rtype: list[OpinionBoundary]
+    """
+    return [r for r in standing(scan) if not r.is_dismissed]
+
+
+def shared_first_pages(scan: Scan, rows: list[OpinionBoundary]) -> set[int]:
+    """Return the rows whose first page is the last page of the one before.
+
+    A row's first page is shared when a live boundary that comes before
+    it in reading order ends on that page (#457). The footnotes printed
+    at the foot of such a page are the earlier opinion's: its marks are
+    in the text above them, and they come after its text.
+
+    :param scan: The scan.
+    :param rows: The boundaries to answer for.
+    :returns: The pks of the rows whose first page is shared.
+    :rtype: set[int]
+    """
+    if not rows:
+        return set()
+    earlier = live(scan)
+    columns = column_boundaries(
+        scan, {r.start_page_index for r in [*rows, *earlier]}
+    )
+    shared = set()
+    for row in rows:
+        key = reading_key(row, columns)
+        if any(
+            other.pk != row.pk
+            and other.end_page_index == row.start_page_index
+            and reading_key(other, columns) < key
+            for other in earlier
+        ):
+            shared.add(row.pk)
+    return shared
+
+
 def _page_bounds(
     start_index: int,
     end_index: int,
@@ -815,6 +866,7 @@ def outside_rects(
     scan: Scan,
     rows: list[OpinionBoundary],
     document=None,
+    kept_footnotes: frozenset[int] | set[int] = frozenset(),
 ) -> dict[int, list[dict]]:
     """Return the masks over the neighbours' text on a shared page.
 
@@ -822,6 +874,14 @@ def outside_rects(
     page everything before the caption in reading order is masked, on
     its last page everything after the key. The page geometry comes
     from the rows' render size at ``yolo.DPI``.
+
+    blackletter's masks stop above the footnotes, so on a first page
+    the opinion before ends on (:func:`shared_first_pages`), each live
+    ``FOOTNOTES`` box of the page is a mask too, with ``kind``
+    :data:`FOOTNOTES_MASK` (#457): those notes belong to the text the
+    first mask covers. A person who said the notes are the opinion's
+    own (``shared_footnotes.keep``) lifts it, through
+    ``kept_footnotes``. The last page keeps its footnotes.
 
     One derivation, two callers. The viewer has no PDF and gets the
     masks unwidened (blackletter's ``_outside_opinion_rects`` with no
@@ -834,9 +894,13 @@ def outside_rects(
     :param rows: The boundaries to answer for.
     :param document: The volume the rows are drawn in, open, when the
         caller has it; its pages turn the ink growth on.
+    :param kept_footnotes: The pks of the rows whose first-page
+        footnotes a person kept (``shared_footnotes.kept_boundaries``).
     :returns: ``{boundary pk: [{"page_index", "x0", "y0", "x1", "y1"}]}``
-        in PDF points.
+        in PDF points, plus ``kind`` on a footnote mask.
     """
+    import fitz
+    from blackletter import ink
     from blackletter.models import BBox, Label, Page
     from blackletter.models import Detection as BLDetection
     from blackletter.scanner import _outside_opinion_rects
@@ -893,6 +957,7 @@ def outside_rects(
             bbox=box, label=label, confidence=1.0, page_index=page.index
         )
 
+    shared = shared_first_pages(scan, rows)
     result: dict[int, list[dict]] = {}
     for row in rows:
         rects: list[dict] = []
@@ -917,17 +982,34 @@ def outside_rects(
                 is_last,
                 fitz_page=fitz_page,
             ):
-                rects.append(
-                    {
-                        "page_index": page_index,
-                        "x0": round(rect.x0, 1),
-                        "y0": round(rect.y0, 1),
-                        "x1": round(rect.x1, 1),
-                        "y1": round(rect.y1, 1),
-                    }
-                )
+                rects.append(_mask(page_index, rect))
+            if is_first and row.pk in shared and row.pk not in kept_footnotes:
+                for det in page.detections:
+                    if det.label != Label.FOOTNOTES:
+                        continue
+                    box = det.bbox.to_pdf(page.scale_x, page.scale_y)
+                    rect = fitz.Rect(box.x1, box.y1, box.x2, box.y2)
+                    if fitz_page is not None:
+                        # The side edges grow over a clipped glyph, the
+                        # rule of the other masks; the top stays, so no
+                        # line of the text above is taken.
+                        rect = ink.grow_to_ink(fitz_page, rect, margin_y=0.0)
+                    rects.append(
+                        {**_mask(page_index, rect), "kind": FOOTNOTES_MASK}
+                    )
         result[row.pk] = rects
     return result
+
+
+def _mask(page_index: int, rect) -> dict:
+    """Return one mask in the dict shape of :func:`outside_rects`."""
+    return {
+        "page_index": page_index,
+        "x0": round(rect.x0, 1),
+        "y0": round(rect.y0, 1),
+        "x1": round(rect.x1, 1),
+        "y1": round(rect.y1, 1),
+    }
 
 
 def has_live(scan: Scan) -> bool:
@@ -992,7 +1074,13 @@ def viewer_payload(
         .filter(scan=scan, label="IMAGE")
         .values_list("page_index", flat=True)
     )
-    masks = outside_rects(scan, rows)
+    from scanning import shared_footnotes
+
+    # The masks the redacted PDFs have: a kept first-page footnote mask
+    # is lifted here too (#457).
+    masks = outside_rects(
+        scan, rows, kept_footnotes=shared_footnotes.kept_boundaries(scan)
+    )
     first_page = scan.start_page or 1
     payload = []
     for row in rows:
