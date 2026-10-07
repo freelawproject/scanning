@@ -98,12 +98,14 @@ SHARD_MANIFEST_NAME = "manifest.json"
 # The admin scan deletion sweeps this prefix, since nothing else does.
 PAGE_EDITS_SUBDIR = "page_edits/"
 
-# The top-level prefix of the final XML of every approved opinion, the
-# export CourtListener reads (#408). Outside ``processing/`` on
-# purpose: the key is built from the two ids alone
-# (``final-xml/{scan}/{opinion}.xml``), so the generic sync never sees
-# it. The admin scan deletion sweeps a scan's part of it.
-FINAL_XML_PREFIX = "final-xml/"
+# The top-level prefix of the export CourtListener reads (#408): the
+# final XML of every approved opinion, and later its redacted PDF (see
+# ``final_xml``), and nothing else, so a read-only policy on this prefix
+# reaches no unredacted page. Outside ``processing/`` on purpose: the
+# keys are built from the two ids alone (``export/{scan}/{opinion}.xml``),
+# so the generic sync never sees them. The admin scan deletion sweeps a
+# scan's part of it.
+EXPORT_PREFIX = "export/"
 
 # The bitonal PDF the detect stage runs against. Named because its S3
 # ``LastModified`` is a reference timestamp, not just a filename: see
@@ -1273,18 +1275,18 @@ def delete_page_edit_objects(scan: Scan) -> int:
     return _delete_prefix(scan, prefix, "page edit image")
 
 
-def final_xml_prefix(scan_pk: int) -> str:
-    """Return the prefix of a scan's exported final XML (#408).
+def export_prefix(scan_pk: int) -> str:
+    """Return the prefix of a scan's export (#408).
 
     :param scan_pk: The scan's primary key.
-    :returns: ``final-xml/{pk}/``.
+    :returns: ``export/{pk}/``.
     :rtype: str
     """
-    return f"{FINAL_XML_PREFIX}{scan_pk}/"
+    return f"{EXPORT_PREFIX}{scan_pk}/"
 
 
-def delete_final_xml_objects(scan_pk: int) -> int:
-    """Delete every exported final XML of a scan (#408).
+def delete_export_objects(scan_pk: int) -> int:
+    """Delete every exported object of a scan (#408).
 
     For a scan that is gone: the prefix is outside the processing
     prefix, so no other sweep reaches it. It takes the pk and not the
@@ -1296,7 +1298,7 @@ def delete_final_xml_objects(scan_pk: int) -> int:
     :rtype: int
     :raises ClientError: On an S3 error.
     """
-    return _delete_prefix(scan_pk, final_xml_prefix(scan_pk), "final XML")
+    return _delete_prefix(scan_pk, export_prefix(scan_pk), "export")
 
 
 def _delete_prefix(scan: Scan | int, prefix: str, kind: str) -> int:

@@ -127,7 +127,7 @@ leaves the status where it was.
 **15. ``final_xml.export_due()`` stores the final XML of the approved
 opinions (#408).** For an opinion whose text review is done and whose
 spans are over the approved text, it writes the build of the review
-page at ``final-xml/{scan}/{opinion}.xml``, the key CourtListener
+page at ``export/{scan}/{opinion}.xml``, the key CourtListener
 reads, and stamps the row. It deletes the object of a row that stopped
 being exportable (a reopen) first. Writes no status.
 

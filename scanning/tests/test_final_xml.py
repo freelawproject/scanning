@@ -1,5 +1,5 @@
 """Tests for the export of the final XML (``scanning/final_xml.py``, #408):
-the object at ``final-xml/{scan}/{opinion}.xml``, its ledger on the
+the object at ``export/{scan}/{opinion}.xml``, its ledger on the
 row, the pass of the collect tick that writes and deletes it, the
 command, and the route and the file index entry that show it.
 
@@ -71,7 +71,7 @@ class TestTheKey(_ExportCase):
     def test_the_key_is_built_from_the_two_ids_alone(self):
         self.assertEqual(
             final_xml.key(self.opinion),
-            f"final-xml/{self.scan.pk}/{self.opinion.pk}.xml",
+            f"export/{self.scan.pk}/{self.opinion.pk}.xml",
         )
 
 
@@ -84,9 +84,9 @@ class TestParseKey(_ExportCase):
 
     def test_another_shape_is_none(self):
         for key in (
-            "final-xml/1/2.json",
-            "final-xml/1/x.xml",
-            "final-xml/2.xml",
+            "export/1/2.json",
+            "export/1/x.xml",
+            "export/2.xml",
             "processing/1/2.xml",
         ):
             with self.subTest(key=key):
@@ -510,9 +510,9 @@ class TestTheCommand(_ExportCase):
         self.tagged()
         final_xml.export_due()
         kept = final_xml.key(self.opinion)
-        gone = f"final-xml/{self.scan.pk}/{self.opinion.pk + 1000}.xml"
-        other_scan = f"final-xml/{self.scan.pk + 1}/{self.opinion.pk}.xml"
-        odd = "final-xml/notes.txt"
+        gone = f"export/{self.scan.pk}/{self.opinion.pk + 1000}.xml"
+        other_scan = f"export/{self.scan.pk + 1}/{self.opinion.pk}.xml"
+        odd = "export/notes.txt"
         for key in (gone, other_scan, odd):
             self.xml[key] = b"<casebody/>"
 
@@ -533,7 +533,7 @@ class TestTheCommand(_ExportCase):
     def test_a_named_scan_lists_its_own_prefix(self):
         with patch("scanning.s3_sync.list_keys", return_value=[]) as listing:
             self.run_command(str(self.scan.pk), "--dry-run")
-        listing.assert_called_once_with(f"final-xml/{self.scan.pk}/")
+        listing.assert_called_once_with(f"export/{self.scan.pk}/")
 
     def test_it_refuses_both_or_neither(self):
         with self.assertRaises(CommandError):

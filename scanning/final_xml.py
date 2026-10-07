@@ -6,13 +6,52 @@ request (#432). This module stores the same build, once per approved
 and tagged opinion, at a key CourtListener builds from the two ids
 alone:
 
-    final-xml/{scan pk}/{opinion pk}.xml
+    export/{scan pk}/{opinion pk}.xml
 
 in the private bucket, outside ``processing/``. CourtListener's
-``import_scanned_opinions`` lists ``final-xml/{scan}/`` for a volume
+``import_scanned_opinions`` lists ``export/{scan}/`` for a volume
 and reads one key for an opinion; it copies each file into its own
 storage (``filepath_xml_scan``), so the bucket is read by one read-only
 user and no public URL points at it.
+
+**``export/`` holds the outputs and nothing else.** CourtListener's
+read-only user gets ``s3:GetObject`` on ``export/*`` and ``s3:ListBucket``
+limited to the ``export/`` prefix, so it reaches no unredacted page: the
+original, the shards and the engine results stay under ``processing/``.
+Only this module writes under ``export/``.
+
+**The redacted PDF goes here too, in a later PR.** It is now at
+``opinion_pdf.key``, inside the scan's processing prefix and under a
+revision, so the policy above cannot reach it, and CourtListener cannot
+build its key from the ids. The design:
+
+- The key is ``export/{scan pk}/{opinion pk}.pdf``, beside the XML.
+- The pass copies the PDF server side (``s3_sync.copy_object``) from
+  ``opinion_pdf.key(opinion, redacted_pdf_revision)``. A copy, never a
+  move: a re-glue and the prune of old revisions (#452) must not change
+  the file CourtListener reads.
+- The ledger is a second pair of fields: ``final_pdf_revision`` (the
+  ``redacted_pdf_revision`` the copy holds; null when no object is
+  stored) and ``final_pdf_attempts``. The PDF is owed when the opinion
+  is ``TEXT_REVIEW_DONE``, ``opinion_pdf.is_written`` holds, and the
+  stamp is not ``redacted_pdf_revision``. So every new PDF of an
+  approved opinion is copied again, whatever wrote it.
+- The XML and the PDF are owed apart: the PDF waits for the approval
+  alone, the XML for the tagger too. The pass copies the PDF first, so
+  an XML in the listing has its PDF beside it.
+- A reopen deletes both objects, the rule of the XML. A missing source
+  PDF counts on ``final_pdf_attempts``; an S3 fault counts nothing. The
+  stamp after the copy can be unconditional, because the one exporter
+  (:func:`exporter_lock`) knows which revision it copied; a row that is
+  gone takes its object with it.
+- :func:`parse_key` and :func:`orphan_keys` read both extensions, each
+  against its own stamp. The admin sweep of ``export/{scan}/`` and the
+  command take both with no change.
+
+Today nothing writes a new PDF for an approved opinion
+(``opinions.create_rows`` and the OCR re-glue skip
+``TEXT_REVIEW_DONE``): a redaction change reaches it through a reopen
+and a new approval.
 
 **The key is stable, so the export writes over it.** Every other glue
 of an opinion writes a new key per revision. This one cannot: the
@@ -106,14 +145,14 @@ class TransientFault(Exception):
 def key(opinion: Opinion) -> str:
     """Return the key of an opinion's exported final XML.
 
-    The one rule of the key: ``final-xml/{scan}/{opinion}.xml``, from
+    The one rule of the key: ``export/{scan}/{opinion}.xml``, from
     the two primary keys alone, because CourtListener builds it.
 
     :param opinion: The opinion.
     :returns: The key.
     :rtype: str
     """
-    return f"{s3_sync.FINAL_XML_PREFIX}{opinion.scan_id}/{opinion.pk}.xml"
+    return f"{s3_sync.EXPORT_PREFIX}{opinion.scan_id}/{opinion.pk}.xml"
 
 
 def exportable(opinion: Opinion) -> bool:
@@ -173,12 +212,12 @@ def is_stored(opinion: Opinion) -> bool:
 def parse_key(object_key: str) -> tuple[int, int] | None:
     """Return the scan and opinion pks a key of :func:`key` names.
 
-    :param object_key: A key under ``final-xml/``.
+    :param object_key: A key under ``export/``.
     :returns: ``(scan_pk, opinion_pk)``, or None for a key of another
         shape.
     :rtype: tuple[int, int] | None
     """
-    rest = object_key.removeprefix(s3_sync.FINAL_XML_PREFIX)
+    rest = object_key.removeprefix(s3_sync.EXPORT_PREFIX)
     scan, _, name = rest.partition("/")
     opinion, dot, ext = name.partition(".")
     if rest == object_key or not dot or ext != "xml":
@@ -188,7 +227,7 @@ def parse_key(object_key: str) -> tuple[int, int] | None:
     return int(scan), int(opinion)
 
 
-def orphan_keys(prefix: str = s3_sync.FINAL_XML_PREFIX) -> list[str]:
+def orphan_keys(prefix: str = s3_sync.EXPORT_PREFIX) -> list[str]:
     """Return the objects under the prefix that no stamp names.
 
     The backup of the admin sweep (#408): a key of another shape, of an
@@ -197,7 +236,7 @@ def orphan_keys(prefix: str = s3_sync.FINAL_XML_PREFIX) -> list[str]:
     the review is open again). Read under :func:`exporter_lock`, or an
     export between its PUT and its stamp reads as an orphan.
 
-    :param prefix: ``final-xml/`` or one scan's part of it.
+    :param prefix: ``export/`` or one scan's part of it.
     :returns: The keys.
     :rtype: list[str]
     :raises TransientFault: When the listing failed: a caller deletes

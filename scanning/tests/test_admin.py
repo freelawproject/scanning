@@ -311,7 +311,7 @@ class ScanAdminDeleteShardSweepTests(TestCase):
 class ScanAdminDeleteFinalXmlSweepTests(TestCase):
     """The exported final XML goes after the row delete commits (#408).
 
-    ``final-xml/`` is the list CourtListener imports, so the sweep runs
+    ``export/`` is the list CourtListener imports, so the sweep runs
     once no row is left for an export to stamp.
     """
 
@@ -332,7 +332,7 @@ class ScanAdminDeleteFinalXmlSweepTests(TestCase):
         pk = scan.pk
         seen, record = self.sweep_sees()
         with patch(
-            "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+            "scanning.s3_sync.delete_export_objects", side_effect=record
         ):
             with self.captureOnCommitCallbacks(execute=False) as callbacks:
                 self.admin.delete_model(_request_with_messages(), scan)
@@ -348,7 +348,7 @@ class ScanAdminDeleteFinalXmlSweepTests(TestCase):
         seen, record = self.sweep_sees()
         with (
             patch(
-                "scanning.s3_sync.delete_final_xml_objects", side_effect=record
+                "scanning.s3_sync.delete_export_objects", side_effect=record
             ),
             self.captureOnCommitCallbacks(execute=True),
         ):
@@ -359,9 +359,7 @@ class ScanAdminDeleteFinalXmlSweepTests(TestCase):
         scan = ScanFactory()
         error = ClientError({"Error": {"Code": "SlowDown"}}, "DeleteObjects")
         with (
-            patch(
-                "scanning.s3_sync.delete_final_xml_objects", side_effect=error
-            ),
+            patch("scanning.s3_sync.delete_export_objects", side_effect=error),
             self.assertLogs("scanning.admin", level="ERROR") as logs,
             self.captureOnCommitCallbacks(execute=True),
         ):

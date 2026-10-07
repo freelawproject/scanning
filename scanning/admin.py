@@ -111,7 +111,7 @@ def _sweep_final_xml_after_commit(scan_pk: int) -> None:
     """Delete a deleted scan's exported final XML once the delete commits.
 
     After the row delete, and not before it like the other sweeps
-    (#408): ``final-xml/`` is the list CourtListener imports, so an
+    (#408): ``export/`` is the list CourtListener imports, so an
     orphan there is an import of a deleted scan, not storage. Once the
     rows are gone no export can stamp, and an export whose PUT lands
     later finds no row and deletes its own object. A failure is an
@@ -123,7 +123,7 @@ def _sweep_final_xml_after_commit(scan_pk: int) -> None:
 
     def sweep():
         try:
-            s3_sync.delete_final_xml_objects(scan_pk)
+            s3_sync.delete_export_objects(scan_pk)
         except Exception:
             logger.error(
                 "Could not delete the exported final XML of deleted scan "

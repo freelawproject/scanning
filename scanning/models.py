@@ -2848,7 +2848,7 @@ class Opinion(AbstractDateTimeModel):
         default="",
         help_text=(
             "The ``tag_key`` the exported final XML was built from "
-            "(#408), at ``final-xml/{scan}/{opinion}.xml``. Blank: no "
+            "(#408), at ``export/{scan}/{opinion}.xml``. Blank: no "
             "object is stored. The export is current when it equals "
             "``tag_key`` and ``final_xml_schema`` is ``casebody.SCHEMA`` "
             "(``final_xml.is_written``)."

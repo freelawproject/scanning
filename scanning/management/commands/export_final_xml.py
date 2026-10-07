@@ -10,7 +10,7 @@ It also takes the rows the tick stopped trying at
 ``final_xml.MAX_ATTEMPTS``: their count starts again, so a fault fixed
 in the code is one run of this command.
 
-Last, it deletes the objects under ``final-xml/`` that no stamp names
+Last, it deletes the objects under ``export/`` that no stamp names
 (``final_xml.orphan_keys``): the files of a deleted scan whose admin
 sweep failed. The tick does not list the prefix; this command does.
 
@@ -83,10 +83,10 @@ class Command(BaseCommand):
             if not Scan.objects.filter(pk=pk).exists():
                 raise CommandError(f"scan {pk} does not exist")
         rows = Opinion.objects.all()
-        prefixes = [s3_sync.FINAL_XML_PREFIX]
+        prefixes = [s3_sync.EXPORT_PREFIX]
         if pks:
             rows = rows.filter(scan_id__in=pks)
-            prefixes = [s3_sync.final_xml_prefix(pk) for pk in pks]
+            prefixes = [s3_sync.export_prefix(pk) for pk in pks]
         dry_run = options["dry_run"]
         if not dry_run and not s3_sync.s3_active():
             raise CommandError("S3 is off: nothing can be exported")
