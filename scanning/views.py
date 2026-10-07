@@ -27,6 +27,7 @@ from scanning import (
     opinions,
     repairs,
     s3_sync,
+    shared_footnotes,
     stats,
     tagger,
 )
@@ -36,6 +37,7 @@ from scanning.forms import (
 )
 from scanning.models import (
     Opinion,
+    OpinionCheck,
     OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
@@ -429,6 +431,24 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             }
             row.dismiss_url = reverse("dismiss_opinion_finding", kwargs=kwargs)
             row.restore_url = reverse("restore_opinion_finding", kwargs=kwargs)
+    # The other answer of a ``SHARED_FOOTNOTES`` card (#457): keep the
+    # notes as the opinion's own, or give back the ones a person kept.
+    # Offered where the endpoints take it, the gate of the dismissal.
+    if can_dismiss:
+        kept = shared_footnotes.kept(opinion)
+        kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
+        for row in findings:
+            if row.check_name != OpinionCheck.SHARED_FOOTNOTES:
+                continue
+            row.footnotes_kept = kept
+            row.footnotes_url = reverse(
+                (
+                    "give_back_opinion_footnotes"
+                    if kept
+                    else "keep_opinion_footnotes"
+                ),
+                kwargs=kwargs,
+            )
     # Two lists (#419): the ERROR cards the approval waits on, with the
     # stale ones, and the warnings. A dismissed card goes to the end of
     # its list; the sort is stable, so the page order stays.
