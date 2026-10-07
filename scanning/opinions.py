@@ -434,7 +434,17 @@ def create_rows(
 # ---------------------------------------------------------------------------
 
 
-def queue_create_opinions(scan: Scan) -> bool:
+#: The queued actions of a review-2 approval in flight (#240). From the
+#: approval's read of the rows to the creation of the opinions, a box a
+#: curator writes reaches no opinion, so the writes of review 2 refuse
+#: while a scan holds one of them (``views_api._refuse_closed_review``).
+APPROVAL_ACTIONS = (
+    QueuedAction.CREATE_OPINIONS,
+    QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
+)
+
+
+def queue_create_opinions(scan: Scan) -> str:
     """Close review 2 and ask the daemon for the opinions.
 
     The write of the approve button (``views_process
@@ -443,21 +453,37 @@ def queue_create_opinions(scan: Scan) -> bool:
     ``REDACTION_REVIEW_DONE`` when it is done, and parks the scan back
     in the review on a failure, so the next press is the retry.
 
+    The action is ``CREATE_OPINIONS``, or ``COMPUTE_THEN_CREATE_OPINIONS``
+    when a curator changed the detections after the last compute
+    (``detections.changed_since_compute``, #240): the opinions are cut
+    from the redaction rows, and a detection reaches those rows through
+    the compute alone. The compute then queues the creation itself.
+
     :param scan: The scan the curator approved.
-    :returns: Whether the write won.
-    :rtype: bool
+    :returns: The action queued, or an empty string when the write lost.
+    :rtype: str
     """
-    return bool(
-        Scan.objects.filter(
-            pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-        ).update(
-            status=Status.QUEUED,
-            queued_action=QueuedAction.CREATE_OPINIONS,
-            progress_message="The opinions are queued for creation.",
-            progress_current=0,
-            progress_total=0,
+    from scanning import detections
+
+    action = QueuedAction.CREATE_OPINIONS
+    message = "The opinions are queued for creation."
+    if detections.changed_since_compute(scan):
+        action = QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+        message = (
+            "The detections changed after the last computation. The "
+            "redactions are queued for computation, then the opinions "
+            "for creation."
         )
+    moved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(
+        status=Status.QUEUED,
+        queued_action=action,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
     )
+    return action if moved else ""
 
 
 def run(scan_pk: int) -> None:
@@ -472,12 +498,24 @@ def run(scan_pk: int) -> None:
     :param scan_pk: Primary key of the claimed scan.
     :return: None.
     """
+    from scanning import detections
+    from scanning.services import APPROVAL_NOT_DONE_NOTE
+
     scan = Scan.objects.get(pk=scan_pk)
     status = Status.READY_FOR_REDACTION_REVIEW
     try:
         run_ = review_states.final_run(scan)
         if run_ is None:
             message = "The corrected volume is not built."
+        elif detections.changed_since_compute(scan):
+            # A box written after the approval read the rows and before
+            # the writes refused (#240): the swap of the approval, or a
+            # tab that posted as it landed. It is in no redaction, so
+            # the opinions wait for the next approval, which computes.
+            message = (
+                "The detections changed after the approval. "
+                f"{APPROVAL_NOT_DONE_NOTE}"
+            )
         else:
             printed = apply.load_printed_pages(scan, run_)
             rows = live_boundaries(scan)

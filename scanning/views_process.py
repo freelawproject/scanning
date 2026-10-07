@@ -33,6 +33,7 @@ from django.views.decorators.http import require_POST
 from scanning import (
     boundaries,
     casebody,
+    detections,
     dots_mocr,
     findings,
     jobs,
@@ -64,6 +65,7 @@ from scanning.models import (
     JobStatus,
     Opinion,
     OpinionBoundary,
+    OpinionReviewStatus,
     OpinionScan,
     PageEdit,
     PageRepairRequest,
@@ -132,6 +134,22 @@ REDACTION_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the redaction review. The redactions "
     "are computed after the page completeness approval, and this page "
     "shows them when they are there."
+)
+#: The approval of a volume whose detections changed after the last
+#: compute (#240): the compute runs first, then the opinions.
+REDACTION_REVIEW_COMPUTE_FIRST_MESSAGE = (
+    "Thank you. The detections changed after the last computation, so "
+    "the redactions are computed again on the server first, then the "
+    "opinions are created. This page reloads when they are ready."
+)
+REDACTION_REVIEW_REOPENED_MESSAGE = (
+    "The redaction review is open again. Make the corrections, then "
+    "approve the redactions once more. Each opinion whose text is not "
+    "approved is built again from them."
+)
+REDACTION_REVIEW_NOT_REOPENABLE_MESSAGE = (
+    "Only an approved redaction review can be reopened, and this "
+    "volume's is not approved."
 )
 LEGACY_OCR_RECOMPUTE_MESSAGE = (
     "The old OCR engine that read this scan no longer runs here. Run "
@@ -3083,6 +3101,33 @@ def _review_flags(
         # ``opinion_count``, which the step-2 sidebar already uses for
         # the boundaries of the volume.
         "review3_opinions": Opinion.objects.filter(scan=scan).count(),
+        # The reopen of review 2 (#240): a staff button in the approved
+        # status alone, the compare-and-swap it writes.
+        "redaction_review_reopenable": (
+            scan.status == Status.REDACTION_REVIEW_DONE
+        ),
+        # The opinions a new approval of review 2 does not build again
+        # (#240): an approved text keeps its PDF and its text, so the
+        # bar names them, around the reopen and before the approval.
+        "approved_opinions": (
+            list(
+                Opinion.objects.filter(
+                    scan=scan, status=OpinionReviewStatus.TEXT_REVIEW_DONE
+                ).order_by("first_printed_page", "index_in_page")
+            )
+            if scan.status
+            in (
+                Status.REDACTION_REVIEW_DONE,
+                Status.READY_FOR_REDACTION_REVIEW,
+            )
+            else []
+        ),
+        # Whether the approval computes first (#240), so the bar says so
+        # before the press. Read where the button is offered alone.
+        "review2_compute_owed": (
+            scan.status == Status.READY_FOR_REDACTION_REVIEW
+            and detections.changed_since_compute(scan, detect_rows)
+        ),
         **page_edits.pending_edit_flags(scan, run),
     }
 
@@ -3770,6 +3815,55 @@ def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_POST
+def reopen_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Open the redaction review again, after its approval (#240).
+
+    The way back for a redaction found after the approval. A staff
+    button, the rule of :func:`reopen_page_review`: one
+    compare-and-swap from ``REDACTION_REVIEW_DONE`` to
+    ``READY_FOR_REDACTION_REVIEW``, and no other write. A scan whose
+    opinions are being created is not in that status, so the worker of
+    the approval is never cut off.
+
+    The status is all that must move. The opinion passes read
+    ``REDACTION_REVIEW_DONE`` alone, so they stop for this volume, and
+    a tick in flight cannot write over the next approval: each stamp is
+    a compare-and-swap on ``glue_revision``. The ``Opinion`` rows stay;
+    the next approval matches them by key, keeps every human field and
+    builds each one whose text is not approved again. An approved text
+    is never built again (``opinions.create_rows``), so the bar lists
+    those opinions, and a staff member reopens the ones the change
+    touches before the next approval.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 2 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    step_two = reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
+    if not request.user.is_staff:
+        messages.warning(request, "Only a staff member can reopen a review.")
+        return redirect(step_two)
+    reopened = Scan.objects.filter(
+        pk=scan.pk, status=Status.REDACTION_REVIEW_DONE
+    ).update(
+        status=Status.READY_FOR_REDACTION_REVIEW,
+        progress_message="The redaction review was reopened.",
+    )
+    if reopened:
+        logger.info(
+            "reopen_redaction_review: scan=%s reopened by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, REDACTION_REVIEW_REOPENED_MESSAGE)
+    else:
+        messages.warning(request, REDACTION_REVIEW_NOT_REOPENABLE_MESSAGE)
+    return redirect(step_two)
+
+
+@login_required
+@require_POST
 def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Record that a person reviewed the redactions of this scan.
 
@@ -3794,6 +3888,11 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     is the judge of the geometry, exactly as they are the judge of a
     page-completeness suspicion (#151).
 
+    A volume whose detections a curator changed after the last compute
+    is queued with ``COMPUTE_THEN_CREATE_OPINIONS`` instead (#240): the
+    compute turns the boxes into redaction rows, then queues the
+    opinions itself.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to step 2 of the scan processing page.
@@ -3801,22 +3900,32 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     from scanning import opinions
 
     scan = get_object_or_404(Scan, pk=pk)
-    if opinions.queue_create_opinions(scan):
+    action = opinions.queue_create_opinions(scan)
+    if action:
         logger.info(
-            "approve_redaction_review: scan=%s approved by user=%s",
+            "approve_redaction_review: scan=%s approved by user=%s (%s)",
             scan.pk,
             request.user.pk,
+            action,
         )
-        messages.success(request, REDACTION_REVIEW_APPROVED_MESSAGE)
+        messages.success(
+            request,
+            REDACTION_REVIEW_COMPUTE_FIRST_MESSAGE
+            if action == QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+            else REDACTION_REVIEW_APPROVED_MESSAGE,
+        )
     else:
         # The write lost, so the fetch above is stale. Re-read the row
         # so the message describes it as it is.
         scan.refresh_from_db()
         if scan.status == Status.REDACTION_REVIEW_DONE:
             messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
-        elif (
-            scan.status in (Status.QUEUED, Status.PROCESSING)
-            and scan.queued_action == QueuedAction.CREATE_OPINIONS
+        elif scan.status in (
+            Status.QUEUED,
+            Status.PROCESSING,
+        ) and scan.queued_action in (
+            QueuedAction.CREATE_OPINIONS,
+            QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
         ):
             messages.info(request, REDACTION_REVIEW_QUEUED_MESSAGE)
         else:
