@@ -1850,6 +1850,7 @@ def run_compute_redactions(
         apply,
         brackets,
         columns,
+        editorial,
         findings,
         redactions,
         review_states,
@@ -2020,6 +2021,9 @@ def run_compute_redactions(
         # the document already in memory and renders nothing.
         with _log_stage("Bracket readings"):
             brackets.write_rows(scan, ocr_document, run)
+        # The editor's notes, the same way (#450).
+        with _log_stage("Editor's note readings"):
+            editorial.write_rows(scan, ocr_document, run)
 
         if importing:
             # Only after an import: the correction converges, so it is
