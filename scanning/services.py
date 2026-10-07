@@ -41,6 +41,7 @@ from blackletter.validate import (
 )
 from django.conf import settings
 from django.db.models import Case, F, Value, When
+from django.utils import timezone
 
 from scanning import boundaries
 from scanning.badpage import scoring as badpage_scoring
@@ -1789,7 +1790,9 @@ def geometry_pdf_path(scan: "Scan", run=_UNSET_RUN) -> str:
     return str(apply.local_copy(scan, run.bitonal_key))
 
 
-def run_compute_redactions(scan_pk: int) -> None:
+def run_compute_redactions(
+    scan_pk: int, then_create_opinions: bool = False
+) -> None:
     """Turn a merged detection run into the geometry review 2 reads.
 
     The apply step of issue #196, dispatched by ``process_next_scan``
@@ -1833,13 +1836,21 @@ def run_compute_redactions(scan_pk: int) -> None:
     runs the whole pipeline again. A failure is counted on the run
     instead (``yolo.record_apply_failure``), which bounds the retries.
 
+    **A review-2 approval can ask for the opinions next** (#240,
+    ``then_create_opinions``): a success then queues
+    ``CREATE_OPINIONS`` in place of the park, and every other exit
+    parks as usual, with a message that asks for the approval again.
+
     :param scan_pk: Primary key of the scan to compute redactions for.
+    :param then_create_opinions: Whether a review-2 approval queued
+        this compute (``QueuedAction.COMPUTE_THEN_CREATE_OPINIONS``).
     :return: None.
     """
     from scanning import (
         apply,
         brackets,
         columns,
+        editorial,
         findings,
         redactions,
         review_states,
@@ -1887,6 +1898,18 @@ def run_compute_redactions(scan_pk: int) -> None:
             return Status.READY_FOR_REDACTION_REVIEW
         return Status.PAGE_COMPLETENESS_REVIEW_DONE
 
+    def unapproved(message: str) -> str:
+        """Add to a park message that the approval did not go through.
+
+        :param message: The message of the park.
+        :returns: The message, and the sentence when an approval
+            queued this compute.
+        :rtype: str
+        """
+        if not then_create_opinions:
+            return message
+        return f"{message} {APPROVAL_NOT_DONE_NOTE}"
+
     if not merged and not has_rows:
         # Nothing to measure: no merged run, and no detections from an
         # earlier one. Park the scan back rather than fail it -- the
@@ -1898,8 +1921,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "No detections to work from. The detection run has not "
-            "reached this volume yet.",
+            unapproved(
+                "No detections to work from. The detection run has not "
+                "reached this volume yet."
+            ),
             park(),
         )
         return
@@ -1922,8 +1947,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "The corrected volume is not built yet. The redactions are "
-            "computed when it is.",
+            unapproved(
+                "The corrected volume is not built yet. The redactions "
+                "are computed when it is."
+            ),
             park(),
         )
         return
@@ -1934,6 +1961,11 @@ def run_compute_redactions(scan_pk: int) -> None:
     # a legacy volume whose rows the old pipeline wrote.
     importing = merged and not yolo.redactions_current(rows, run)
     started = time.monotonic()
+    # Before the first read of the rows (#240): a curator's write after
+    # this moment may be missing from the geometry, and one before it is
+    # in it. A time too early costs one more compute; a time too late
+    # would miss a box.
+    read_at = timezone.now()
     try:
         detections = []
         page_numbers = None
@@ -1989,6 +2021,9 @@ def run_compute_redactions(scan_pk: int) -> None:
         # the document already in memory and renders nothing.
         with _log_stage("Bracket readings"):
             brackets.write_rows(scan, ocr_document, run)
+        # The editor's notes, the same way (#450).
+        with _log_stage("Editor's note readings"):
+            editorial.write_rows(scan, ocr_document, run)
 
         if importing:
             # Only after an import: the correction converges, so it is
@@ -2108,7 +2143,7 @@ def run_compute_redactions(scan_pk: int) -> None:
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
-        _park_after_redactions(scan_pk, message, park())
+        _park_after_redactions(scan_pk, unapproved(message), park())
         return
 
     if merged:
@@ -2122,10 +2157,18 @@ def run_compute_redactions(scan_pk: int) -> None:
         # page the moment the scan parks, and a park in the approved
         # status would show the curator a step 2 whose approve button
         # appears a tick later, from nothing they did.
-        yolo.record_apply_success(rows, run)
-    _park_after_redactions(
-        scan_pk, "Detection review is ready: check the redactions.", park()
-    )
+        yolo.record_apply_success(rows, run, read_at=read_at)
+    destination = park()
+    if then_create_opinions and destination == (
+        Status.READY_FOR_REDACTION_REVIEW
+    ):
+        _queue_opinions_after_compute(scan_pk, open_findings)
+    else:
+        _park_after_redactions(
+            scan_pk,
+            unapproved("Detection review is ready: check the redactions."),
+            destination,
+        )
     logger.info(
         "compute_redactions: scan %s: %d detection(s), %d opinion(s), "
         "%d page(s) with rects, %d page(s) with margins, in %.1fs",
@@ -2147,7 +2190,7 @@ def run_compute_redactions(scan_pk: int) -> None:
 #: before the #154 statuses existed. A busy scan is refused: it holds a
 #: claim already. ``REDACTION_REVIEW_DONE`` is deliberately absent: a
 #: closed review is not recomputed under the person who closed it, and
-#: the way back is the admin re-queue.
+#: the way back is the staff reopen (#240).
 REDACTION_COMPUTE_STATUSES = (
     Status.PAGE_COMPLETENESS_REVIEW_DONE,
     Status.READY_FOR_REDACTION_REVIEW,
@@ -2190,6 +2233,63 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         return False, "This volume is busy. Wait for the current work."
     return False, (
         "This volume is not in a state that can compute redactions."
+    )
+
+
+#: The sentence a compute queued by a review-2 approval adds to a park
+#: that is not the opinions (#240): the approval was not recorded, and
+#: the next press is the retry, the rule of a failed creation (#336).
+APPROVAL_NOT_DONE_NOTE = (
+    "The approval of the redactions did not go through: approve again."
+)
+
+
+def run_compute_then_create_opinions(scan_pk: int) -> None:
+    """Compute the redactions, then create the opinions (#240).
+
+    The worker behind ``QueuedAction.COMPUTE_THEN_CREATE_OPINIONS``,
+    which the review-2 approval writes when a curator changed the
+    detections after the last compute
+    (``detections.changed_since_compute``). The opinions are cut from
+    the redaction rows, and only the compute turns a detection into
+    those rows.
+
+    :param scan_pk: Primary key of the claimed scan.
+    :return: None.
+    """
+    run_compute_redactions(scan_pk, then_create_opinions=True)
+
+
+def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
+    """Hand a computed scan to the opinion creation, in place of the park.
+
+    A compare-and-swap over the busy statuses, the guard of
+    :func:`_park_after_redactions`, so an admin who moved the scan
+    during the compute keeps their decision. The person who approved is
+    in the log line of the approval.
+
+    :param scan_pk: Primary key of the scan.
+    :param open_findings: The open review-2 findings the compute wrote,
+        for the message: the compute can write a card the curator did
+        not see before the approval.
+    :return: None.
+    """
+    message = (
+        "The redactions are computed. The opinions are queued for creation."
+    )
+    if open_findings:
+        message = (
+            f"The redactions are computed, with {open_findings} open "
+            "finding(s). The opinions are queued for creation."
+        )
+    Scan.objects.filter(
+        pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
+    ).update(
+        status=Status.QUEUED,
+        queued_action=QueuedAction.CREATE_OPINIONS,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
     )
 
 

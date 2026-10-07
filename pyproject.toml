@@ -86,6 +86,11 @@ dependencies = [
   "scikit-learn==1.7.2",
   "joblib>=1.6.0",
   "numpy",
+  # The citations of the final XML (#435): CourtListener's importer reads
+  # every `<citation>` with eyecite and drops what is not a full case
+  # citation, so the head-matter paragraph we write as one is read by the
+  # same parser.
+  "eyecite",
 ]
 
 [project.optional-dependencies]

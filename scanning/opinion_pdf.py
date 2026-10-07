@@ -183,8 +183,8 @@ class TransientFault(Exception):
 # ---------------------------------------------------------------------------
 
 
-def key(opinion: Opinion) -> str:
-    """Return the S3 key of the opinion's redacted PDF at the live revision.
+def key(opinion: Opinion, revision: int | None = None) -> str:
+    """Return the S3 key of the opinion's redacted PDF at a revision.
 
     The one rule for the key: the scan's processing prefix, the
     opinion's glue prefix (``jobs/opinions/{first}.{index}/r{n}/``, the
@@ -193,11 +193,15 @@ def key(opinion: Opinion) -> str:
     admin deletion sweeps it.
 
     :param opinion: The opinion.
+    :param revision: The glue revision; None is the live one. The OCR
+        re-glue names the next one, where it carries the PDF (#452).
     :returns: The key.
     :rtype: str
     """
+    if revision is None:
+        revision = opinion.glue_revision
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
-    return f"{prefix}{opinion.glue_prefix}{REDACTED_NAME}"
+    return f"{prefix}{opinion.revision_prefix(revision)}{REDACTED_NAME}"
 
 
 def download_name(opinion: Opinion) -> str:

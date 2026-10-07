@@ -1560,18 +1560,92 @@ def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
     return written
 
 
-def reglue(scan: Scan) -> int:
+@dataclass
+class ReglueSummary:
+    """What one :func:`reglue` of a scan did.
+
+    :param moved: Rows whose revision was raised.
+    :param carried: Of those, rows whose redacted PDF was copied to the
+        new revision and stamped there.
+    """
+
+    moved: int = 0
+    carried: int = 0
+
+
+def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:
     """Raise the revision of every row of ``scan`` that is not approved.
 
     The body of ``reglue_opinion_ocr``: the pass finds the rows due on
     the next tick. A ``TEXT_REVIEW_DONE`` row keeps its glues.
 
+    **The redacted PDF is carried, not cut again** (#452). The PDF reads
+    the bitonal copy, the page map, the boundaries and the redactions,
+    and no OCR, so a re-glue moves none of its inputs. A row whose PDF
+    is written at revision ``n`` gets a server-side copy of it at
+    ``n + 1``, and one compare-and-swap raises the revision and stamps
+    the PDF together: a swap first and a copy after would leave a
+    moment in which the PDF pass takes the row and cuts it. A row whose
+    PDF is not written, or whose copy fails, owes its PDF, as before.
+    An object the copy wrote and no swap stamped is harmless: the stamp
+    decides, never the bucket, and the next writer of that revision
+    writes it again.
+
+    ``carry_pdf=False`` cuts every PDF again, for a change of the
+    redaction logic itself (a blackletter upgrade). The review-2
+    approval (``opinions.create_rows``) never carries: the redactions
+    and the boundaries may have moved under the key.
+
     :param scan: The scan.
-    :returns: How many rows moved.
-    :rtype: int
+    :param carry_pdf: Whether to copy a written PDF to the new revision.
+    :returns: How many rows moved, and how many PDFs were carried.
+    :rtype: ReglueSummary
     """
-    return (
+    from scanning import opinion_pdf
+
+    summary = ReglueSummary()
+    rows = (
         Opinion.objects.filter(scan=scan)
         .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
-        .update(glue_revision=F("glue_revision") + 1, ocr_glue_attempts=0)
+        .select_related("scan", "scan__reporter")
+        .order_by("first_printed_page", "index_in_page")
     )
+    for opinion in rows:
+        revision = opinion.glue_revision
+        fields = {"glue_revision": revision + 1, "ocr_glue_attempts": 0}
+        carry = (
+            carry_pdf
+            and opinion_pdf.is_written(opinion)
+            and s3_sync.copy_object(
+                opinion_pdf.key(opinion),
+                opinion_pdf.key(opinion, revision + 1),
+            )
+        )
+        if carry:
+            fields.update(
+                redacted_pdf_revision=revision + 1,
+                pdf_attempts=0,
+                pdf_attempted_at=None,
+            )
+        # The status again, beside the revision: an approval that landed
+        # during the copy keeps its revision, and an approved row keeps
+        # its glues, the rule the bulk update of #350 held in one
+        # statement.
+        moved = (
+            Opinion.objects.filter(pk=opinion.pk, glue_revision=revision)
+            .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+            .update(**fields)
+        )
+        if not moved:
+            # Another writer raised the revision first, or a person
+            # approved the row, and it is not this call's any more.
+            continue
+        summary.moved += 1
+        summary.carried += int(carry)
+    logger.info(
+        "scan %s: %d opinion(s) due again, %d PDF(s) carried",
+        scan.pk,
+        summary.moved,
+        summary.carried,
+    )
+    return summary

@@ -44,6 +44,7 @@ RETRY_BACKOFF_SECONDS = 0.5
 CLAIM_PRIORITY = (
     "full_pipeline",
     "compute_redactions",
+    "compute_then_create_opinions",
     "create_opinions",
     "apply_page_edits",
 )
@@ -226,6 +227,11 @@ class Command(BaseCommand):
             # Issue #336. Rows and one JSON read; parks the scan itself
             # and raises nothing.
             QueuedAction.CREATE_OPINIONS: services.run_create_opinions,
+            # Issue #240. The compute of a review-2 approval, which
+            # queues CREATE_OPINIONS itself on success.
+            QueuedAction.COMPUTE_THEN_CREATE_OPINIONS: (
+                services.run_compute_then_create_opinions
+            ),
         }
 
         # Legacy actions whose pipelines were disconnected (issue #173).

@@ -44,12 +44,13 @@ and this pass writes no chain, no stamp and no queue for it.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 
 from django.db import transaction
 from django.db.models import Case, Count, F, Q, Value, When
 
-from scanning import apply, boundaries, review_states
+from scanning import apply, boundaries, review_states, s3_sync
 from scanning.models import (
     STALE_OPINION_CHECKS,
     Issue,
@@ -433,7 +434,17 @@ def create_rows(
 # ---------------------------------------------------------------------------
 
 
-def queue_create_opinions(scan: Scan) -> bool:
+#: The queued actions of a review-2 approval in flight (#240). From the
+#: approval's read of the rows to the creation of the opinions, a box a
+#: curator writes reaches no opinion, so the writes of review 2 refuse
+#: while a scan holds one of them (``views_api._refuse_closed_review``).
+APPROVAL_ACTIONS = (
+    QueuedAction.CREATE_OPINIONS,
+    QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
+)
+
+
+def queue_create_opinions(scan: Scan) -> str:
     """Close review 2 and ask the daemon for the opinions.
 
     The write of the approve button (``views_process
@@ -442,21 +453,37 @@ def queue_create_opinions(scan: Scan) -> bool:
     ``REDACTION_REVIEW_DONE`` when it is done, and parks the scan back
     in the review on a failure, so the next press is the retry.
 
+    The action is ``CREATE_OPINIONS``, or ``COMPUTE_THEN_CREATE_OPINIONS``
+    when a curator changed the detections after the last compute
+    (``detections.changed_since_compute``, #240): the opinions are cut
+    from the redaction rows, and a detection reaches those rows through
+    the compute alone. The compute then queues the creation itself.
+
     :param scan: The scan the curator approved.
-    :returns: Whether the write won.
-    :rtype: bool
+    :returns: The action queued, or an empty string when the write lost.
+    :rtype: str
     """
-    return bool(
-        Scan.objects.filter(
-            pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-        ).update(
-            status=Status.QUEUED,
-            queued_action=QueuedAction.CREATE_OPINIONS,
-            progress_message="The opinions are queued for creation.",
-            progress_current=0,
-            progress_total=0,
+    from scanning import detections
+
+    action = QueuedAction.CREATE_OPINIONS
+    message = "The opinions are queued for creation."
+    if detections.changed_since_compute(scan):
+        action = QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+        message = (
+            "The detections changed after the last computation. The "
+            "redactions are queued for computation, then the opinions "
+            "for creation."
         )
+    moved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(
+        status=Status.QUEUED,
+        queued_action=action,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
     )
+    return action if moved else ""
 
 
 def run(scan_pk: int) -> None:
@@ -471,12 +498,24 @@ def run(scan_pk: int) -> None:
     :param scan_pk: Primary key of the claimed scan.
     :return: None.
     """
+    from scanning import detections
+    from scanning.services import APPROVAL_NOT_DONE_NOTE
+
     scan = Scan.objects.get(pk=scan_pk)
     status = Status.READY_FOR_REDACTION_REVIEW
     try:
         run_ = review_states.final_run(scan)
         if run_ is None:
             message = "The corrected volume is not built."
+        elif detections.changed_since_compute(scan):
+            # A box written after the approval read the rows and before
+            # the writes refused (#240): the swap of the approval, or a
+            # tab that posted as it landed. It is in no redaction, so
+            # the opinions wait for the next approval, which computes.
+            message = (
+                "The detections changed after the approval. "
+                f"{APPROVAL_NOT_DONE_NOTE}"
+            )
         else:
             printed = apply.load_printed_pages(scan, run_)
             rows = live_boundaries(scan)
@@ -623,7 +662,66 @@ def promote_ready(opinion: Opinion) -> bool:
             opinion,
             opinion.scan_id,
         )
+        if opinion.glue_revision:
+            # Revision 0 is the first: no folder can be older, so the
+            # tick spends no listing on it.
+            prune_glues(opinion)
     return bool(moved)
+
+
+#: A glue revision folder under ``Opinion.object_prefix``, and its number.
+#: ``approved/`` and ``tag/`` never match it.
+_REVISION_FOLDER = re.compile(r"r(\d+)/")
+
+
+def prune_glues(opinion: Opinion, dry_run: bool = False) -> list[str] | None:
+    """Delete the glues of every revision below the opinion's live one.
+
+    The glues of a revision (the engine documents, the manifest, the
+    redacted PDF, the ensemble documents) are derived, and a re-glue
+    writes each of them again with no paid read, so nothing reads a
+    revision once the live one is complete (#452). The caller says it
+    is: :func:`promote_ready` after its swap, and the command
+    ``prune_opinion_glues`` over the rows :func:`text_review_ready`
+    accepts. Only ``r{k}/`` with ``k`` below ``glue_revision`` goes:
+    the approved texts (``approved/``), the tagger input (``tag/``) and
+    every paid result outside the opinion's prefix stay. The revision
+    only goes up, so a re-glue during the walk makes no live folder
+    old.
+
+    Best effort, the rule of ``s3_sync.delete_objects``: an orphan
+    costs storage and nothing else, so a failed listing deletes nothing
+    and nothing raises into the tick. The command is the retry.
+
+    :param opinion: The row, with ``scan`` and its reporter.
+    :param dry_run: List the keys and delete nothing.
+    :returns: The keys of the older revisions, or None when the listing
+        failed.
+    :rtype: list[str] | None
+    """
+    root = (
+        f"{s3_sync.s3_processing_prefix(opinion.scan)}{opinion.object_prefix}"
+    )
+    keys = s3_sync.list_keys(root)
+    if keys is None:
+        return None
+    old = []
+    for key in keys:
+        match = _REVISION_FOLDER.match(key[len(root) :])
+        if match and int(match.group(1)) < opinion.glue_revision:
+            old.append(key)
+    if old and not dry_run:
+        deleted = s3_sync.delete_objects(old)
+        logger.info(
+            "%s of scan %s: deleted %d of %d object(s) of the revisions "
+            "below r%d",
+            opinion,
+            opinion.scan_id,
+            deleted,
+            len(old),
+            opinion.glue_revision,
+        )
+    return old
 
 
 def demote_stale(opinion: Opinion) -> bool:
@@ -691,7 +789,7 @@ def promote_ready_opinions(limit: int = PROMOTIONS_PER_TICK) -> int:
         _live_stamps(),
         scan__status__in=OPINION_PDF_STATUSES,
         status=OpinionReviewStatus.PROCESSING,
-    )[:limit]
+    ).select_related("scan", "scan__reporter")[:limit]
     moved = sum(1 for row in ready if promote_ready(row))
     stale = Opinion.objects.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW

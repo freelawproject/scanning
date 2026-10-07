@@ -948,6 +948,72 @@ class TestDeleteObjects(SimpleTestCase):
         client.assert_not_called()
 
 
+@override_settings(
+    AWS_PRIVATE_STORAGE_BUCKET_NAME="bucket",
+    TESTING=False,
+    DEVELOPMENT=False,
+)
+class TestCopyAndListKeys(SimpleTestCase):
+    """The server-side copy and the listing of the prune (#452)."""
+
+    def run_with(self, client, call, *args):
+        with patch("scanning.s3_sync.has_s3_credentials", return_value=True):
+            with patch("scanning.s3_sync._s3_client", return_value=client):
+                return call(*args)
+
+    def test_the_copy_stays_in_the_bucket_and_keeps_the_metadata(self):
+        client = MagicMock()
+
+        self.assertTrue(
+            self.run_with(
+                client, s3_sync.copy_object, "a/r0/x.pdf", "a/r1/x.pdf"
+            )
+        )
+        client.copy_object.assert_called_once_with(
+            Bucket="bucket",
+            Key="a/r1/x.pdf",
+            CopySource={"Bucket": "bucket", "Key": "a/r0/x.pdf"},
+            MetadataDirective="COPY",
+        )
+
+    def test_a_failed_copy_is_logged_not_raised(self):
+        client = MagicMock()
+        client.copy_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey"}}, "CopyObject"
+        )
+        with self.assertLogs("scanning.s3_sync", level="WARNING"):
+            self.assertFalse(
+                self.run_with(client, s3_sync.copy_object, "a", "b")
+            )
+
+    def test_the_listing_walks_every_page(self):
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.return_value = [
+            {"Contents": [{"Key": "p/a"}, {"Key": "p/b"}]},
+            {},
+            {"Contents": [{"Key": "p/c"}]},
+        ]
+
+        keys = self.run_with(client, s3_sync.list_keys, "p/")
+
+        self.assertEqual(keys, ["p/a", "p/b", "p/c"])
+
+    def test_a_failed_listing_is_none(self):
+        client = MagicMock()
+        client.get_paginator.return_value.paginate.side_effect = ClientError(
+            {"Error": {"Code": "AccessDenied"}}, "ListObjectsV2"
+        )
+        with self.assertLogs("scanning.s3_sync", level="WARNING"):
+            self.assertIsNone(self.run_with(client, s3_sync.list_keys, "p/"))
+
+    @override_settings(TESTING=True)
+    def test_nothing_is_called_without_s3(self):
+        with patch("scanning.s3_sync._s3_client") as client:
+            self.assertFalse(s3_sync.copy_object("a", "b"))
+            self.assertEqual(s3_sync.list_keys("p/"), [])
+        client.assert_not_called()
+
+
 @override_settings(TESTING=False)
 class TestS3EnabledWithDoctor(SimpleTestCase):
     """A doctor-only dev environment still needs the sync (issue #176).
