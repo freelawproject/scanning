@@ -35,7 +35,13 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    most, as a silent engine, so a reader still learns that one engine
    read nothing there. The size of a unit decides nothing: a block
    over the whole body **is** the text of that body, and held apart it
-   would write the page a second time.
+   would write the page a second time. **A unit that holds a unit of
+   its own engine does not link either** (#451): an engine's blocks
+   tile the page, so a box over the engine's own blocks is not the
+   place of its text. Surya draws a list group from its first item to
+   the last line of a footnote that runs into the next column, and
+   that box held every block of the page in one group. It is attached
+   as a silent engine, the rule of a box that reads nothing.
 2. **Order.** Three bands: the running heads, the body, the foot. The
    body splits at a column boundary taken from the **left edges** of
    the body boxes, which survives what a hunt for the gutter does not.
@@ -1180,6 +1186,10 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     picture box of Mistral an empty text (#404), and a document older
     than the parse had its placeholder taken off in :func:`_units_of`.
 
+    **A unit that holds a unit of its own engine does not link** and is
+    silent too (:func:`_containers`, #451): it reads, but its box is
+    not where its text lies, and it would chain the page.
+
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
         ``exclusion`` and ``share``.
@@ -1203,6 +1213,9 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         # reads nothing must not link, whatever it wrote in place of
         # the reading.
         (speaking if plain(unit["text"]) else quiet).append(unit)
+    containers = _containers(speaking)
+    speaking = [u for u in speaking if not any(u is c for c in containers)]
+    quiet.extend(_silenced(unit) for unit in containers)
 
     union = _Union(len(speaking))
     for left, right in combinations(range(len(speaking)), 2):
@@ -1226,6 +1239,45 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         groups.append(_group(by_engine, line_band, page_area, boundary, width))
     _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
     return groups
+
+
+def _containers(speaking: list[dict]) -> list[dict]:
+    """Return the units whose box holds a unit of their own engine.
+
+    An engine's blocks tile the page, so a box that holds
+    :data:`OVERLAP` of another block of the same engine is not the
+    place of its text, and linked by containment it chains every
+    block of the other engines under it into one group (#451). The
+    bigger box of the pair is the container; two boxes of one size are
+    two readings of one block, which chain nothing, and stay.
+
+    :param speaking: The units of the page that read something.
+    :returns: The containers, in the order of ``speaking``.
+    :rtype: list[dict]
+    """
+    found: list[dict] = []
+    for unit in speaking:
+        size = area(unit["box_pt"])
+        if any(
+            other is not unit
+            and other["engine"] == unit["engine"]
+            and area(other["box_pt"]) < size
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+            for other in speaking
+        ):
+            found.append(unit)
+    return found
+
+
+def _silenced(unit: dict) -> dict:
+    """Return a copy of a container that reads nothing.
+
+    Its reading has no place on the page, so it votes in no group: the
+    group it covers most names its engine in ``silent``, and the
+    groups the others read stay apart. The copy keeps the ``id``, so
+    the group still says which block of the engine it was.
+    """
+    return {**unit, "text": "", "marks": []}
 
 
 def _ranked(engines) -> list[str]:
