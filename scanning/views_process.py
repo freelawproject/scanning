@@ -2234,7 +2234,7 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
     The spans must be over the approved text the row names now
     (``tagger.is_written``), the one rule of the tagger's ledger.
 
-    :param opinion: The opinion, with ``scan``.
+    :param opinion: The opinion, with ``scan__reporter``.
     :returns: The XML, and the spans object for the legend.
     :rtype: tuple[str, dict]
     :raises _FinalXmlRefused: 404 before the spans exist, 409 when an
@@ -2255,7 +2255,8 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
             raise casebody.CasebodyError(
                 f"{opinion.tag_key} is not a spans object"
             )
-        return casebody.build(approved, tags), tags
+        citation = _main_citation(opinion)
+        return casebody.build(approved, tags, citation), tags
     except (
         tagger.TaggerInputError,
         casebody.CasebodyError,
@@ -2286,6 +2287,42 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
         ) from exc
 
 
+#: The reporters whose citation eyecite did not read, logged once per
+#: process: the final XML is built at every request.
+_UNREAD_REPORTERS: set[str] = set()
+
+
+def _main_citation(opinion: Opinion) -> str:
+    """Return the citation of an opinion in its scan's reporter (#435).
+
+    A reporter missing from ``Reporter.CITE_MAP`` gives a name eyecite
+    does not read, and CourtListener's importer drops the citation, so
+    the miss is logged for a developer to add the abbreviation, once
+    per reporter (:data:`_UNREAD_REPORTERS`).
+
+    :param opinion: The opinion, with ``scan__reporter``.
+    :rtype: str
+    """
+    scan = opinion.scan
+    citation = casebody.main_citation(
+        scan.volume, scan.reporter.cite_name, opinion.first_printed_page
+    )
+    short_name = scan.reporter.short_name
+    if (
+        short_name not in _UNREAD_REPORTERS
+        and casebody.full_citation(citation) is None
+    ):
+        _UNREAD_REPORTERS.add(short_name)
+        logger.error(
+            "%s: eyecite does not read the citation %r; add the reporter "
+            "%r to Reporter.CITE_MAP",
+            opinion,
+            citation,
+            short_name,
+        )
+    return citation
+
+
 def _final_xml_name(opinion: Opinion) -> str:
     return (
         f"scan-{opinion.scan_id}-opinion-{opinion.first_printed_page}."
@@ -2306,7 +2343,11 @@ def serve_opinion_final_xml(
     :return: The XML, or a JSON 404 or 409.
     """
     scan = get_object_or_404(Scan, pk=pk)
-    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan__reporter"),
+        pk=opinion_pk,
+        scan=scan,
+    )
     try:
         xml, _tags = _final_xml(opinion)
     except _FinalXmlRefused as refused:
