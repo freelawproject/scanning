@@ -673,6 +673,8 @@ class ScanInputs:
         rows of every :data:`ZONES` label in the run (#399, #411), in
         render pixels. They become the page's zones in points once the
         page size is known.
+    :param shared_pages: ``boundaries.shared_first_pages`` over every
+        live boundary (#457), read once for the rows of the tick.
     """
 
     run: object
@@ -681,6 +683,7 @@ class ScanInputs:
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
     zones: dict[str, dict[int, list]] = field(default_factory=dict)
+    shared_pages: dict[int, float] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -748,6 +751,10 @@ def load_inputs(scan: Scan) -> ScanInputs:
         name = by_label[row.label]
         if ZONES[name].counts(row):
             inputs.zones[name].setdefault(row.page_index, []).append(row)
+    # The shared first pages of every opinion (#457), once per scan and
+    # not once per row: the rule walks every live boundary.
+    live = boundaries.live(scan)
+    inputs.shared_pages = boundaries.shared_first_pages(scan, live, live)
     return inputs
 
 
@@ -1382,7 +1389,10 @@ def write(opinion: Opinion, inputs: ScanInputs) -> list[str]:
     # (#457); the PDF pass reads the same rule.
     kept = {boundary.pk} if shared_footnotes.kept(opinion) else set()
     for rect in boundaries.outside_rects(
-        opinion.scan, [boundary], kept_footnotes=kept
+        opinion.scan,
+        [boundary],
+        kept_footnotes=kept,
+        shared=inputs.shared_pages,
     ).get(boundary.pk, []):
         masks.setdefault(rect["page_index"], []).append(rect)
 

@@ -805,7 +805,9 @@ def live(scan: Scan) -> list[OpinionBoundary]:
 
 
 def shared_first_pages(
-    scan: Scan, rows: list[OpinionBoundary]
+    scan: Scan,
+    rows: list[OpinionBoundary],
+    earlier: list[OpinionBoundary] | None = None,
 ) -> dict[int, float]:
     """Return the rows whose first page is the last page of the one before.
 
@@ -816,6 +818,7 @@ def shared_first_pages(
 
     :param scan: The scan.
     :param rows: The boundaries to answer for.
+    :param earlier: :func:`live`, when the caller holds it.
     :returns: ``{pk: y}`` for each row whose first page is shared: the
         lowest end anchor of an earlier opinion on that page, in points.
         The earlier opinion's notes are printed below it.
@@ -823,7 +826,8 @@ def shared_first_pages(
     """
     if not rows:
         return {}
-    earlier = live(scan)
+    if earlier is None:
+        earlier = live(scan)
     columns = column_boundaries(
         scan, {r.start_page_index for r in [*rows, *earlier]}
     )
@@ -873,6 +877,7 @@ def outside_rects(
     rows: list[OpinionBoundary],
     document=None,
     kept_footnotes: frozenset[int] | set[int] = frozenset(),
+    shared: dict[int, float] | None = None,
 ) -> dict[int, list[dict]]:
     """Return the masks over the neighbours' text on a shared page.
 
@@ -902,6 +907,8 @@ def outside_rects(
         caller has it; its pages turn the ink growth on.
     :param kept_footnotes: The pks of the rows whose first-page
         footnotes a person kept (``shared_footnotes.kept_boundaries``).
+    :param shared: :func:`shared_first_pages`, when the caller computed
+        it once for a scan whose rows it walks one by one.
     :returns: ``{boundary pk: [{"page_index", "x0", "y0", "x1", "y1"}]}``
         in PDF points, plus ``kind`` on a footnote mask.
     """
@@ -963,7 +970,8 @@ def outside_rects(
             bbox=box, label=label, confidence=1.0, page_index=page.index
         )
 
-    shared = shared_first_pages(scan, rows)
+    if shared is None:
+        shared = shared_first_pages(scan, rows)
     result: dict[int, list[dict]] = {}
     for row in rows:
         rects: list[dict] = []

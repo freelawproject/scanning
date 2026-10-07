@@ -282,6 +282,10 @@ GAVE_BACK_FOOTNOTES_MESSAGE = (
     "text and the redacted PDF are written again in a minute or two."
 )
 GAVE_BACK_FOOTNOTES_ALREADY_MESSAGE = "No kept footnotes stand."
+GAVE_BACK_STALE_FOOTNOTES_MESSAGE = (
+    "The kept footnotes named another first page, so they kept nothing "
+    "here. They are withdrawn, and nothing is written again."
+)
 FOOTNOTES_CLOSED_MESSAGE = (
     "This opinion is not ready for the text review, so its footnotes "
     "cannot change now."
@@ -1477,22 +1481,27 @@ def give_back_opinion_footnotes(
     if isinstance(opinion, JsonResponse):
         return opinion
     try:
-        written = shared_footnotes.give_back(opinion, request.user)
+        outcome = shared_footnotes.give_back(opinion, request.user)
     except shared_footnotes.FootnotesClosed:
         return JsonResponse(
             {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
             status=409,
         )
-    if not written:
+    if outcome == shared_footnotes.NOTHING_STANDING:
         return JsonResponse(
             {"status": "ok", "message": GAVE_BACK_FOOTNOTES_ALREADY_MESSAGE}
         )
     logger.info(
-        "%s of scan %s: %s gave the footnotes of the first page back",
+        "%s of scan %s: %s gave the footnotes of the first page back (%s)",
         opinion,
         pk,
         request.user,
+        outcome,
     )
+    if outcome == shared_footnotes.WITHDREW_STALE:
+        return JsonResponse(
+            {"status": "ok", "message": GAVE_BACK_STALE_FOOTNOTES_MESSAGE}
+        )
     return JsonResponse(
         {"status": "ok", "message": GAVE_BACK_FOOTNOTES_MESSAGE}
     )

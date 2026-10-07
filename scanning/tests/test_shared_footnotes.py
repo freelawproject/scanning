@@ -132,6 +132,20 @@ class TestTheMask(ScanningTestCase):
         # The mask over the earlier opinion's text stays.
         self.assertTrue(masks[self.after.pk])
 
+    def test_a_map_computed_once_gives_the_same_masks(self):
+        """The OCR glue reads the map once per scan (#457)."""
+        live = boundaries.live(self.scan)
+        shared = boundaries.shared_first_pages(self.scan, live, live)
+
+        with self.assertNumQueries(1):
+            masks = boundaries.outside_rects(
+                self.scan, [self.after], shared=shared
+            )
+
+        self.assertEqual(
+            masks, boundaries.outside_rects(self.scan, [self.after])
+        )
+
     def test_a_first_page_nobody_shares_has_no_footnote_mask(self):
         scan = ScanFactory(page_count=3)
         shared_page(scan, page_index=0)
@@ -307,8 +321,14 @@ class TestKeep(ScanningTestCase):
     def test_a_give_back_withdraws_the_row_and_raises_the_revision(self):
         shared_footnotes.keep(self.opinion, self.user)
 
-        self.assertTrue(shared_footnotes.give_back(self.opinion, self.user))
-        self.assertFalse(shared_footnotes.give_back(self.opinion, self.user))
+        self.assertEqual(
+            shared_footnotes.give_back(self.opinion, self.user),
+            shared_footnotes.GAVE_BACK,
+        )
+        self.assertEqual(
+            shared_footnotes.give_back(self.opinion, self.user),
+            shared_footnotes.NOTHING_STANDING,
+        )
 
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.glue_revision, 2)
@@ -329,6 +349,18 @@ class TestKeep(ScanningTestCase):
             KeptFootnotes.objects.filter(withdrawn_at__isnull=True).count(),
             1,
         )
+
+    def test_a_give_back_of_another_first_page_writes_nothing_again(self):
+        shared_footnotes.keep(self.opinion, self.user)
+        self.opinion.start_source_page = 5
+        self.opinion.save(update_fields=["start_source_page"])
+
+        outcome = shared_footnotes.give_back(self.opinion, self.user)
+
+        self.assertEqual(outcome, shared_footnotes.WITHDREW_STALE)
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertIsNone(shared_footnotes.standing(self.opinion))
 
     def test_the_status_is_read_again_under_the_lock(self):
         """An approval between the view's check and the write refuses."""

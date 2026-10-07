@@ -43,6 +43,14 @@ class FootnotesClosed(Exception):
     """The opinion is not ready for the text review under the lock."""
 
 
+#: What :func:`give_back` did. A row of another first page lifted no
+#: mask, so its withdrawal writes nothing again, and the answer must
+#: not say a rewrite is coming.
+GAVE_BACK = "gave_back"
+WITHDREW_STALE = "withdrew_stale"
+NOTHING_STANDING = "nothing_standing"
+
+
 def applies(row: KeptFootnotes, opinion: Opinion) -> bool:
     """Return whether a kept row names the opinion's first page now.
 
@@ -190,23 +198,29 @@ def keep(opinion: Opinion, user) -> bool:
     return True
 
 
-def give_back(opinion: Opinion, user) -> bool:
+def give_back(opinion: Opinion, user) -> str:
     """Withdraw the kept row: the mask takes the footnotes again.
+
+    A row of another first page lifted nothing, so it is withdrawn and
+    nothing is written again.
 
     :param opinion: The opinion.
     :param user: Who decided.
-    :returns: False when no row stands.
-    :rtype: bool
+    :returns: :data:`GAVE_BACK` when the glues are written again,
+        :data:`WITHDREW_STALE` for a row of another first page, or
+        :data:`NOTHING_STANDING`.
+    :rtype: str
     :raises FootnotesClosed: When the opinion is not ready for the review.
     """
     with transaction.atomic():
         locked = _locked(opinion)
         row = standing(locked)
         if row is None:
-            return False
+            return NOTHING_STANDING
         row.withdrawn_at = timezone.now()
         row.withdrawn_by = user
         row.save(update_fields=["withdrawn_at", "withdrawn_by"])
-        if applies(row, locked):
-            _reglue(locked)
-    return True
+        if not applies(row, locked):
+            return WITHDREW_STALE
+        _reglue(locked)
+    return GAVE_BACK
