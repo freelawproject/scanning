@@ -40,7 +40,7 @@ Examples:
 
 from django.core.management.base import BaseCommand, CommandError
 
-from scanning import mistral_ocr, sharding
+from scanning import mistral_ocr, sharding, yolo
 from scanning.models import DEAD_JOB_STATUSES, JobStatus, Scan
 
 
@@ -108,7 +108,7 @@ class Command(BaseCommand):
                 "unset); a new run would only park its rows in the queue."
             )
 
-        scans = Scan.objects.filter(status__in=mistral_ocr.SWEEP_STATUSES)
+        scans = Scan.objects.filter(status__in=yolo.SWEEP_STATUSES)
         if wanted:
             scans = Scan.objects.filter(pk__in=wanted)
         scans = list(scans.order_by("pk"))

@@ -27,7 +27,7 @@ from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 
-from scanning import jobs, mistral_client, mistral_ocr
+from scanning import jobs, mistral_client, mistral_ocr, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
@@ -1076,15 +1076,14 @@ class TestEnqueueMissingRuns(ScanningTestCase):
         self.committed.assert_not_called()
 
     def test_a_status_outside_the_sweep_is_left_alone(self):
-        # Review 1 included: the read waits for its approval (#341). An
-        # approved volume too: its opinions are glued, and no pass
-        # glues them again for a late read.
+        # The detection sweep's rule (#250): the pipeline owns a QUEUED
+        # or PROCESSING scan and may re-cut its set; ERROR and every
+        # status past review 2 come back through the re-queue. An
+        # approved volume's opinions are glued, and no pass glues them
+        # again for a late read.
         for status in (
             Status.QUEUED,
             Status.PROCESSING,
-            Status.AWAITING,
-            Status.AWAITING_VALIDATION,
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
             Status.REDACTION_REVIEW_DONE,
             Status.ERROR,
             Status.APPROVED,
@@ -1095,11 +1094,11 @@ class TestEnqueueMissingRuns(ScanningTestCase):
                 self.assertEqual(extract_jobs(scan), [])
 
     def test_every_sweep_status_is_swept(self):
-        # Between the review-1 approval and the review-2 approval.
-        for status in (
-            Status.PAGE_COMPLETENESS_REVIEW_DONE,
-            Status.READY_FOR_REDACTION_REVIEW,
-        ):
+        # From the upload to the end of review 2, the detection sweep's
+        # set: the read is over the original shards, which exist from
+        # the moment the pipeline cut them, and a page deleted in
+        # review 1 is in that set either way.
+        for status in sorted(yolo.SWEEP_STATUSES):
             with self.subTest(status=status):
                 scan = self._scan(status=status)
                 self.assertEqual(self._sweep(), 1)

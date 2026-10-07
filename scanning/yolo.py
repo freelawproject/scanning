@@ -248,18 +248,10 @@ def ensure_detect_jobs(
     )
 
 
-#: How long the sweep leaves a scan alone after ``committed_manifest``
-#: refused its shard set. The submit tick is every 5 seconds, and a
-#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
-#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
-#: corpus), so looked at on every tick each such scan would cost two S3
-#: calls and one log line 17,000 times a day. The memo lives in the
-#: daemon process: a restart forgets it, which buys one fresh look per
-#: deploy and nothing worse, because a duplicate run is prevented by
-#: the rows in the database, never by this.
-REFUSAL_RETRY_SECONDS = 3600
-
-#: ``scan pk -> (retry at, times refused)``, see above. Tests clear it.
+#: ``scan pk -> (retry at, times refused)``: the scans whose shard set
+#: ``committed_manifest`` refused, left alone for
+#: ``jobs.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
+#: clear it.
 _REFUSED: dict[int, tuple[float, int]] = {}
 
 
@@ -307,7 +299,7 @@ def enqueue_missing_runs() -> int:
     without a knob nobody would tune: the backlog only takes more
     ticks to turn into rows, and nothing waits on that. A refused set
     is logged once at INFO, then at DEBUG, and left alone for
-    :data:`REFUSAL_RETRY_SECONDS` (see :data:`_REFUSED`), so a
+    ``jobs.REFUSAL_RETRY_SECONDS`` (see :data:`_REFUSED`), so a
     permanent refusal neither fills the log nor holds a place in the
     batch. The pass makes no call to RunPod. The body is
     ``jobs.enqueue_missing_runs``, which the other sweeps share.

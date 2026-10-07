@@ -126,9 +126,8 @@ class TestEnqueueMistralOcr(TestCase):
         self.assertEqual(len(mistral_ocr.live_extract_jobs(scan)), 2)
 
     def test_a_volume_out_of_the_sweep_is_out_of_dead_runs(self):
-        # Review 1, an approved volume and a legacy status alike.
+        # An approved volume and a legacy status alike.
         for status in (
-            Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
             Status.REDACTION_REVIEW_DONE,
             Status.APPROVED,
         ):

@@ -2073,6 +2073,18 @@ def _reusable_results(
     return reusable
 
 
+#: How long a sweep leaves a scan alone after ``committed_manifest``
+#: refused its shard set. The submit tick is every 5 seconds, and a
+#: refusal lasts until an admin re-queue re-cuts the set (a re-uploaded
+#: or missing original, a ``MANIFEST_VERSION`` bump over the whole
+#: corpus), so looked at on every tick each such scan would cost two S3
+#: calls and one log line 17,000 times a day. Each stage's memo lives
+#: in the daemon process: a restart forgets it, which buys one fresh
+#: look per deploy and nothing worse, because a duplicate run is
+#: prevented by the rows in the database, never by the memo.
+REFUSAL_RETRY_SECONDS = 3600
+
+
 def enqueue_missing_runs(
     *,
     stage: str,
@@ -2099,13 +2111,15 @@ def enqueue_missing_runs(
     creator hands that run back unchanged, this stamps it rather than
     count it. At most ``cap`` scans are looked at, newest first, and a
     shard set ``sharding.committed_manifest`` refused is left alone for
-    ``yolo.REFUSAL_RETRY_SECONDS``.
+    :data:`REFUSAL_RETRY_SECONDS`.
 
     :param stage: The row stage.
     :param engine: The row engine.
     :param create: The stage's creator, ``(scan, manifest) -> rows``.
-    :param statuses: The scan statuses the stage reads in:
-        ``yolo.SWEEP_STATUSES``, or ``mistral_ocr.SWEEP_STATUSES``.
+    :param statuses: The scan statuses the stage reads in
+        (``yolo.SWEEP_STATUSES``, the one set all three sweeps read:
+        every read is over the original shards, which exist from the
+        upload on).
     :param cap: Scans looked at on one tick.
     :param refused: The stage's memo, ``scan pk -> (retry at, times
         refused)``.
@@ -2118,7 +2132,6 @@ def enqueue_missing_runs(
 
     from django.db.models import Exists, OuterRef
 
-    from scanning import yolo
     from scanning.models import Scan
 
     now = time.monotonic()
@@ -2149,7 +2162,7 @@ def enqueue_missing_runs(
         manifest, reason = sharding.committed_manifest(scan)
         if manifest is None:
             _, times = refused.get(scan.pk, (0.0, 0))
-            refused[scan.pk] = (now + yolo.REFUSAL_RETRY_SECONDS, times + 1)
+            refused[scan.pk] = (now + REFUSAL_RETRY_SECONDS, times + 1)
             log.log(
                 logging.INFO if times == 0 else logging.DEBUG,
                 "Scan %s is not swept for its %s (refusal %d, next look "
@@ -2157,7 +2170,7 @@ def enqueue_missing_runs(
                 scan.pk,
                 label,
                 times + 1,
-                yolo.REFUSAL_RETRY_SECONDS,
+                REFUSAL_RETRY_SECONDS,
                 reason,
             )
             continue
@@ -2671,24 +2684,46 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     - The rank decides who takes a free place and **preempts nothing**;
       :func:`_room_for` counts the in-flight rows against the cap.
 
-    The id stays the second key: inside one class the creation order is
-    what keeps the drain fair. The rank reads the row and not
-    ``Scan.status``, which moves under a row that is already waiting.
-    (It would cost no join: the slice already reaches ``scan`` through
+    **A volume shard of a reviewed volume goes next** (issue #341).
+    The Mistral sweep creates a volume run at the upload, and its wave
+    sends one shard per tick, so after the deploy every volume of the
+    corpus queues its shards at once, oldest id first. A volume whose
+    review 1 is approved is further along than one nobody opened: its
+    opinion OCR glue waits on the Mistral read
+    (``opinion_ocr.engines_owed``), and the other's waits on nothing.
+    The mark of that approval is an ``ApplyRun`` row (``apply.py``
+    creates one for every approved volume, the identity run included),
+    so the rank asks for one. The same four properties hold: the apply
+    rows go first, the reviewed set is bounded by the review itself, a
+    row that waits carries no deadline, and nothing is preempted.
+
+    The id stays the last key: inside one class the creation order is
+    what keeps the drain fair. The rank reads the rows and not
+    ``Scan.status``, which moves under a row that is already waiting
+    and names more states than the rank cares about. (It costs one
+    ``EXISTS`` per row: the slice already reaches ``scan`` through
     ``select_related``.)
 
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: The apply rows first, each class in creation order, at
-        most ``room`` of them.
+    :returns: The apply rows first, then the rows of a volume with an
+        apply run, each class in creation order, at most ``room`` of
+        them.
     :rtype: list[ExternalJob]
     """
+    from django.db.models import Exists, OuterRef
+
+    from scanning.models import ApplyRun
+
     return list(
         queryset.filter(status=JobStatus.PENDING)
         # ``s3_job_attempt_key`` reads the apply run's number (#224).
         .select_related("scan", "scan__reporter", "apply_run")
-        .annotate(is_apply=Q(apply_run__isnull=False))
-        .order_by("-is_apply", "id")[:room]
+        .annotate(
+            is_apply=Q(apply_run__isnull=False),
+            reviewed=Exists(ApplyRun.objects.filter(scan=OuterRef("scan"))),
+        )
+        .order_by("-is_apply", "-reviewed", "id")[:room]
     )
 
 

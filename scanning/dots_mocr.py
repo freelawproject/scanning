@@ -217,7 +217,7 @@ def ensure_analyze_jobs(
 
 #: ``scan pk -> (retry at, times refused)``: the scans whose shard set
 #: ``committed_manifest`` refused, left alone for
-#: ``yolo.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
+#: ``jobs.REFUSAL_RETRY_SECONDS`` (its rationale is there). Tests
 #: clear it.
 _REFUSED: dict[int, tuple[float, int]] = {}
 
@@ -1089,8 +1089,8 @@ def reopen_apply_after_read(scan, engine: str) -> bool:
     The hand-back of #351, called by the Mistral and the Surya volume
     glues after they consume a run. The apply fills the pages dots.mocr
     left blank from those documents (``page_numbers.fallback_documents``),
-    but it ran when the dots.mocr run was glued, and a person starts
-    the other engines later than that. So a volume in review 1 is
+    but it ran when the dots.mocr run was glued, and the other engines
+    land later than that. So a volume in review 1 is
     handed back to the pass, which reads the stored documents again on
     the next tick: no GPU time, no new run, and the numbers a curator
     typed survive (:func:`reopen_apply`).
