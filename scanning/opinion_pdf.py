@@ -97,7 +97,14 @@ from django.conf import settings
 from django.db.models import F, QuerySet
 from django.utils import timezone
 
-from scanning import apply, boundaries, review_states, s3_sync, sharding
+from scanning import (
+    apply,
+    boundaries,
+    review_states,
+    s3_sync,
+    sharding,
+    shared_footnotes,
+)
 from scanning.models import (
     Detection,
     Opinion,
@@ -609,7 +616,9 @@ def _masks(opinion: Opinion, volume: fitz.Document) -> list[dict]:
 
     ``boundaries.outside_rects`` with the volume, so each mask grows
     over the ink that continues past its side edges, which the viewer's
-    unwidened masks do not. The page indexes come back in the volume's
+    unwidened masks do not. The footnote mask of a shared first page
+    whites out the earlier opinion's notes, unless a person kept them
+    (#457). The page indexes come back in the volume's
     space and go out in the small source's.
 
     :param opinion: The opinion.
@@ -625,8 +634,9 @@ def _masks(opinion: Opinion, volume: fitz.Document) -> list[dict]:
             "The boundary of this opinion is gone. Approve the redaction "
             "review again."
         )
+    kept = {boundary.pk} if shared_footnotes.kept(opinion) else set()
     rects = boundaries.outside_rects(
-        opinion.scan, [boundary], document=volume
+        opinion.scan, [boundary], document=volume, kept_footnotes=kept
     ).get(boundary.pk, [])
     masks = []
     for rect in rects:
