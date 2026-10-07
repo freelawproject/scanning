@@ -19,7 +19,7 @@ from unittest.mock import patch
 from django.test import TestCase
 from django.urls import reverse
 
-from scanning import casebody, markup, tagger
+from scanning import casebody, final_xml, markup, tagger
 from scanning.models import OpinionReviewStatus
 from scanning.tests.test_tagger import _S3Case
 
@@ -316,6 +316,188 @@ class TestTheHeadMatter(TestCase):
         )
 
         self.assertEqual([c.tag for c in root], ["court", "opinion"])
+
+
+class TestTheCitations(TestCase):
+    """The citations go first, the case's own before the parallel ones
+    (#435), the place CourtListener's importer reads them."""
+
+    def caption(self, *head):
+        """A caption whose untagged lines are ``head``, then the parties."""
+        body = [
+            *(para(text) for text in head),
+            para("Ann ROE, Appellant,"),
+            para("v."),
+            para("STATE, Appellee."),
+            para("Supreme Court of Wyoming."),
+            para("HIBBEN, District Judge."),
+            para("We affirm."),
+        ]
+        at = len(head)
+        spans = [
+            span(at, 0, 19, "party"),
+            span(at + 1, 0, 2, "separator"),
+            span(at + 2, 0, 16, "party"),
+            span(at + 3, 0, 25, "court"),
+            span(at + 4, 0, 23, "author"),
+        ]
+        return doc(*body), spans
+
+    def citations(self, root):
+        return [c.text for c in root.findall("citation")]
+
+    def test_the_main_citation_is_the_first_element(self):
+        approved, spans = self.caption()
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(root[0].tag, "citation")
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+
+    def test_a_head_line_that_is_a_citation_is_a_parallel_citation(self):
+        approved, spans = self.caption("2025 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30", "2025 WY 115"])
+        self.assertEqual(
+            [c.tag for c in root],
+            ["citation", "citation", "parties", "court", "opinion"],
+        )
+        self.assertIsNone(root.find("p"))
+
+    def test_the_printed_text_is_kept(self):
+        """eyecite judges the line and never rewrites it."""
+        approved, spans = self.caption("578 P. 3d 30.", "2025 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(
+            self.citations(root),
+            ["578 P.3d 30", "578 P. 3d 30.", "2025 WY 115"],
+        )
+        self.assertIsNone(root.find("p"))
+
+    def test_a_line_eyecite_does_not_read_stays_a_paragraph(self):
+        approved, spans = self.caption("2O25 WY 115")
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+        self.assertEqual(root.find("p").text, "2O25 WY 115")
+
+    def test_a_line_that_starts_a_page_stays_a_paragraph(self):
+        """Moved to the top, it would take the star number of its page
+        above the text of the page before."""
+        approved, spans = self.caption("Ann ROE v. STATE", "2025 WY 115")
+        spans.append(span(0, 0, 16, "party"))
+        for paragraph in approved["body"][1:]:
+            paragraph["pages"] = [1]
+
+        root = ET.fromstring(
+            casebody.build(approved, {"spans": spans}, "578 P.3d 30")
+        )
+
+        self.assertEqual(self.citations(root), ["578 P.3d 30"])
+        cite = next(
+            p for p in root.iter("p") if "2025 WY 115" in "".join(p.itertext())
+        )
+        self.assertEqual(cite.find("page-number").get("label"), "503")
+
+    def test_the_citation_is_the_printed_characters_alone(self):
+        approved, spans = self.caption("2025 WY 115")
+        approved["body"][0]["marks"] = [mark(0, 11, "strong")]
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(
+            ET.tostring(root.find("citation"), encoding="unicode").strip(),
+            "<citation>2025 WY 115</citation>",
+        )
+
+    def test_a_line_with_a_footnote_mark_stays_a_paragraph(self):
+        """``2025 WY 115`` and a mark ``1`` read as page 1151."""
+        approved, spans = self.caption("2025 WY 1151")
+        approved["body"][0]["marks"] = [mark(11, 12, "sup")]
+        approved["footnotes"] = [
+            {"label": "1", "pages": [0], "paragraphs": [para("A note.")]}
+        ]
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("p/footnotemark").text, "1")
+
+    def test_a_line_that_crosses_a_page_stays_a_paragraph(self):
+        approved, spans = self.caption("2025 WY 115")
+        approved["body"][0].update(
+            pages=[0, 1],
+            page_breaks=[{"offset": 8, "page_in_opinion": 1}],
+        )
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+
+    def test_with_no_main_citation_the_parallel_one_is_first(self):
+        approved, spans = self.caption("2025 WY 115")
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), ["2025 WY 115"])
+
+    def test_a_line_that_holds_a_citation_is_not_one(self):
+        approved, spans = self.caption("Rehearing denied, 2025 WY 115.")
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("p").text, "Rehearing denied, 2025 WY 115.")
+
+    def test_a_tagged_line_is_the_taggers(self):
+        approved, spans = self.caption("2025 WY 115")
+        spans.append(span(0, 0, 11, "history"))
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("history").text, "2025 WY 115")
+
+    def test_a_citation_in_the_opinion_is_text(self):
+        approved, spans = self.caption()
+        approved["body"].append(para("2025 WY 115"))
+
+        root = ET.fromstring(casebody.build(approved, {"spans": spans}))
+
+        self.assertEqual(self.citations(root), [])
+        self.assertEqual(root.find("opinion")[-1].text, "2025 WY 115")
+
+    def test_full_citation_reads_the_shapes_of_a_head_line(self):
+        cases = {
+            "2025 WY 115": "2025 WY 115",
+            "254 N.J. Super. 12": "254 N.J. Super. 12",
+            " 578 P. 3d\n30. ": "578 P.3d 30",
+            "See 2025 WY 115.": None,
+            "2025 WY 115; 578 P.3d 30": None,
+            "Supreme Court of Wyoming.": None,
+            "": None,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(casebody.full_citation(text), expected)
+
+    def test_the_main_citation_is_volume_reporter_page(self):
+        self.assertEqual(
+            casebody.main_citation(578, "P.3d", 30), "578 P.3d 30"
+        )
 
 
 class TestTheMarks(TestCase):
@@ -1149,6 +1331,8 @@ class TestTheModuleIsPure(TestCase):
                 "bisect",
                 "dataclasses",
                 "scanning.markup",
+                "eyecite",
+                "eyecite.models",
             },
         )
 
@@ -1192,7 +1376,28 @@ class TestTheFinalXmlRoutes(_S3Case):
         self.assertEqual(
             root.find("parties/party").text, "Jane ROE, Appellant,"
         )
+        self.assertEqual(root[0].tag, "citation")
+        self.assertEqual(root[0].text, f"{self.scan.volume} A. 502")
         self.assertNotIn("Content-Disposition", response)
+
+    def test_a_citation_eyecite_does_not_read_is_an_error_log(self):
+        """A reporter missing from ``CITE_MAP`` is spelled from its short
+        name, which CourtListener drops (#435)."""
+        self.tagged()
+        reporter = self.scan.reporter
+        reporter.short_name = "nj-super"
+        reporter.save(update_fields=["short_name"])
+        final_xml._UNREAD_REPORTERS.discard("nj-super")
+
+        with self.assertLogs("scanning.final_xml", level="ERROR") as logs:
+            response = self.client.get(self.url("serve_opinion_final_xml"))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("NJ-SUPER", logs.output[0])
+
+        # Once per reporter: the XML is built at every request.
+        with self.assertNoLogs("scanning.final_xml", level="ERROR"):
+            self.client.get(self.url("serve_opinion_final_xml"))
 
     def test_the_download_is_a_file(self):
         self.tagged()

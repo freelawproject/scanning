@@ -43,6 +43,7 @@ from scanning.models import (
     OpinionFinding,
     OpinionReviewStatus,
 )
+from scanning.opinion_pdf import OPINION_PDF_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ OLD_DOCUMENT = "old_document"
 NO_PAGE_NUMBERS = "no_page_numbers"
 BUCKET = "bucket"
 MOVED = "moved"
+REVIEW2_OPEN = "review2_open"
 
 
 class ApprovalRefused(Exception):
@@ -151,8 +153,7 @@ def approved_key(
     stamp = approved_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
     return (
-        f"{prefix}jobs/opinions/{opinion.first_printed_page}."
-        f"{opinion.index_in_page}/approved/r{opinion.glue_revision}."
+        f"{prefix}{opinion.object_prefix}approved/r{opinion.glue_revision}."
         f"e{edit_revision}.j{join_rule}.t{stamp}.json"
     )
 
@@ -242,6 +243,13 @@ def check_gate(
     """
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
         raise ApprovalRefused(CLOSED)
+    if opinion.scan.status not in OPINION_PDF_STATUSES:
+        # The redaction review is open again (#240). Its next approval
+        # builds every opinion whose text is not approved, and never one
+        # whose text is: an approval now would keep the old redactions.
+        # The table of the opinion passes, never a literal: #334 extends
+        # it, and the approval must follow.
+        raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
     if opinion.edit_revision != opinion.ensemble_edit_revision:
@@ -296,6 +304,7 @@ def approve_text(
             moved = Opinion.objects.filter(
                 pk=opinion.pk,
                 status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                scan__status__in=OPINION_PDF_STATUSES,
                 glue_revision=opinion.glue_revision,
                 edit_revision=opinion.edit_revision,
                 ensemble_edit_revision=opinion.ensemble_edit_revision,

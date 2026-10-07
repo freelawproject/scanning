@@ -1,6 +1,6 @@
 """Tests for the OCR documents of one opinion (issue #350).
 
-Seven groups:
+Eight groups:
 
 - the cut (``opinion_ocr.build_document``): the pages, their order,
   a page nobody read;
@@ -13,7 +13,8 @@ Seven groups:
 - the ledger (``opinion_ocr.is_written``): the stamp and the bump;
 - the pass (``opinion_ocr.glue_due``): the cap, the order, the holds
   and the attempts;
-- the route, the command and the prefix.
+- the route, the command and the prefix;
+- the carry of the redacted PDF in a re-glue (#452).
 """
 
 import json
@@ -29,7 +30,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import markup, opinion_ocr, opinions, yolo
+from scanning import markup, opinion_ocr, opinion_pdf, opinions, yolo
 from scanning.factories import (
     ExternalJobFactory,
     OpinionBoundaryFactory,
@@ -1945,6 +1946,214 @@ class TestReglueCommand(OpinionOcrTestCase):
         for args in (("--all", str(self.scan.pk)), ()):
             with self.assertRaises(CommandError):
                 self.run_command(*args)
+
+
+# ── the carry of the redacted PDF (#452) ─────────────────────────────
+class TestThePdfCarry(OpinionOcrTestCase):
+    """An OCR re-glue moves no input of the PDF, so it copies it."""
+
+    def setUp(self):
+        super().setUp()
+        self.copies: list[tuple[str, str]] = []
+        self.copy_lands = True
+        patcher = patch(
+            "scanning.s3_sync.copy_object", side_effect=self.copy_object
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_object(self, source, destination):
+        self.copies.append((source, destination))
+        return self.copy_lands
+
+    def write_pdf(self):
+        """Stamp the PDF at the live revision, as the PDF pass does."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=F("glue_revision"), pdf_attempts=1
+        )
+        self.opinion.refresh_from_db()
+
+    def owes_a_pdf(self) -> bool:
+        return opinion_pdf.owed().filter(pk=self.opinion.pk).exists()
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("reglue_opinion_ocr", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_a_written_pdf_is_copied_and_stamped_at_the_new_revision(self):
+        self.write_pdf()
+        before = opinion_pdf.key(self.opinion)
+
+        summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (1, 1))
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertEqual(self.opinion.redacted_pdf_revision, 1)
+        self.assertEqual(self.opinion.pdf_attempts, 0)
+        self.assertTrue(opinion_pdf.is_written(self.opinion))
+        self.assertEqual(
+            self.copies, [(before, opinion_pdf.key(self.opinion))]
+        )
+        self.assertIn("/r0/", before)
+        self.assertIn("/r1/", opinion_pdf.key(self.opinion))
+        self.assertFalse(self.owes_a_pdf())
+        self.assertFalse(opinion_ocr.is_written(self.opinion))
+
+    def test_a_pdf_that_is_not_written_stays_owed(self):
+        summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (1, 0))
+        self.assertEqual(self.copies, [])
+        self.assertIsNone(self.opinion.redacted_pdf_revision)
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_a_pdf_of_an_older_revision_is_not_carried(self):
+        """Only the live revision's PDF describes the live inputs."""
+        self.write_pdf()
+        Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=1)
+
+        opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.copies, [])
+        self.assertEqual(self.opinion.glue_revision, 2)
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_a_failed_copy_leaves_the_pdf_owed(self):
+        self.write_pdf()
+        self.copy_lands = False
+
+        summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (1, 0))
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertEqual(self.opinion.redacted_pdf_revision, 0)
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_a_revision_that_moved_during_the_copy_wins(self):
+        """The other writer owns the row; nothing is stamped."""
+        self.write_pdf()
+
+        def copy_while_the_approval_lands(source, destination):
+            Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=1)
+            return True
+
+        with patch(
+            "scanning.s3_sync.copy_object",
+            side_effect=copy_while_the_approval_lands,
+        ):
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (0, 0))
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertEqual(self.opinion.redacted_pdf_revision, 0)
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_an_approval_during_the_copy_keeps_its_revision(self):
+        """``approve_text`` lands between the read and the swap."""
+        self.write_pdf()
+
+        def copy_while_a_person_approves(source, destination):
+            Opinion.objects.filter(pk=self.opinion.pk).update(
+                status=OpinionReviewStatus.TEXT_REVIEW_DONE
+            )
+            return True
+
+        with patch(
+            "scanning.s3_sync.copy_object",
+            side_effect=copy_while_a_person_approves,
+        ):
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (0, 0))
+        self.assertEqual(self.opinion.glue_revision, 0)
+        self.assertEqual(self.opinion.redacted_pdf_revision, 0)
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+    def test_no_carry_cuts_the_pdf_again(self):
+        self.write_pdf()
+
+        summary = opinion_ocr.reglue(self.scan, carry_pdf=False)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual((summary.moved, summary.carried), (1, 0))
+        self.assertEqual(self.copies, [])
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_an_approved_row_keeps_its_pdf(self):
+        self.write_pdf()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        summary = opinion_ocr.reglue(self.scan)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(summary.moved, 0)
+        self.assertEqual(self.copies, [])
+        self.assertEqual(self.opinion.glue_revision, 0)
+
+    def test_the_command_carries_and_counts(self):
+        self.write_pdf()
+
+        output = self.run_command(str(self.scan.pk))
+
+        self.assertIn("1 opinion(s) due again, 1 PDF(s) carried", output)
+        self.assertIn("Moved 1 opinion(s), carried 1 PDF(s)", output)
+        self.assertFalse(self.owes_a_pdf())
+
+    def test_the_command_recuts_on_request(self):
+        self.write_pdf()
+
+        output = self.run_command(str(self.scan.pk), "--recut-pdf")
+
+        self.assertIn("carried 0 PDF(s)", output)
+        self.assertEqual(self.copies, [])
+        self.assertTrue(self.owes_a_pdf())
+
+    def test_a_dry_run_counts_the_pdfs_it_would_carry(self):
+        self.write_pdf()
+
+        output = self.run_command(str(self.scan.pk), "--dry-run")
+
+        self.assertIn("would glue 1 opinion(s) again, carry 1 PDF(s)", output)
+        self.assertEqual(self.copies, [])
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 0)
+
+    def test_the_review_2_approval_still_cuts_the_pdf(self):
+        """The redactions may have moved: ``create_rows`` never carries."""
+        self.write_pdf()
+        printed = {
+            "pages": [
+                {
+                    "final_page": i + 1,
+                    "printed": str(501 + i),
+                    "type": "single",
+                }
+                for i in range(PAGES)
+            ]
+        }
+
+        opinions.create_rows(
+            self.scan,
+            self.apply_run,
+            opinions.live_boundaries(self.scan),
+            printed,
+        )
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.copies, [])
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertTrue(self.owes_a_pdf())
 
 
 # ── the footnote zone (#399) ─────────────────────────────────────────

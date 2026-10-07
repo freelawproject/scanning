@@ -1,10 +1,12 @@
-"""Write the bracket readings of the volumes already computed (issue #328).
+"""Write the OCR readings of the volumes already computed (#328, #450).
 
 The compute stores one ``BracketReading`` row per headnote bracket the
 reader found (``brackets.write_rows``), but only from this deploy on.
 The volumes already in review 2 have no readings, so the new finding
 would never be raised for them. This command reads the glued OCR volume
-of each one and writes the rows.
+of each one and writes the rows. The editor's notes (``EditorialReading``,
+``editorial.write_rows``, #450) are read from the same document and
+written beside them.
 
 It reads the database and one JSON object per volume. It renders
 nothing, it pulls no PDF and it spends no GPU time. It writes no scan
@@ -24,7 +26,7 @@ Examples:
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from scanning import brackets, detections, findings, text_fit
+from scanning import brackets, detections, editorial, findings, text_fit
 from scanning.models import CheckName, Issue, Scan, Status
 
 #: The statuses whose volumes are read by default: the two the
@@ -38,8 +40,8 @@ DEFAULT_STATUSES = (
 
 class Command(BaseCommand):
     help = (
-        "Write the headnote bracket readings of every volume in the "
-        "redaction review, and rebuild its findings."
+        "Write the headnote bracket and editor's note readings of every "
+        "volume in the redaction review, and rebuild its findings."
     )
 
     def add_arguments(self, parser):
@@ -79,7 +81,7 @@ class Command(BaseCommand):
             self.stdout.write("No volume to read.")
             return
 
-        readings = findings_written = volumes = 0
+        readings = findings_written = notes = uncovered = volumes = 0
         for scan in scans:
             counts = self._stamp(scan, dry_run)
             if counts is None:
@@ -87,10 +89,13 @@ class Command(BaseCommand):
             volumes += 1
             readings += counts[0]
             findings_written += counts[1]
+            notes += counts[2]
+            uncovered += counts[3]
         self.stdout.write("")
         self.stdout.write(
             f"{volumes} volume(s) read of {len(scans)}: {readings} "
-            f"reading(s), {findings_written} missed bracket(s)."
+            f"reading(s), {findings_written} missed bracket(s), {notes} "
+            f"editor's note(s), {uncovered} uncovered."
         )
         if dry_run:
             self.stdout.write(self.style.WARNING("Dry run: nothing written."))
@@ -115,9 +120,9 @@ class Command(BaseCommand):
 
         :param scan: The scan.
         :param dry_run: Whether to roll the writes back.
-        :returns: ``(readings, findings)``, or None when the volume has
-            no OCR document.
-        :rtype: tuple[int, int] | None
+        :returns: ``(readings, findings, notes, uncovered notes)``, or
+            None when the volume has no OCR document.
+        :rtype: tuple[int, int, int, int] | None
         """
         run = detections.measured_run(scan)
         document = text_fit.load_document(scan, run)
@@ -133,14 +138,20 @@ class Command(BaseCommand):
         # that volume whole.
         with transaction.atomic():
             written = brackets.write_rows(scan, document, run)
+            notes = editorial.write_rows(scan, document, run)
             findings.rebuild(scan, run=run)
             missed = Issue.objects.filter(
                 scan=scan,
                 check_name=CheckName.MISSING_HEADNOTE_BRACKET,
             ).count()
+            uncovered = Issue.objects.filter(
+                scan=scan,
+                check_name=CheckName.UNCOVERED_EDITORS_NOTE,
+            ).count()
             if dry_run:
                 transaction.set_rollback(True)
         self.stdout.write(
-            f"scan {scan.pk}: {written} reading(s), {missed} missed bracket(s)"
+            f"scan {scan.pk}: {written} reading(s), {missed} missed "
+            f"bracket(s), {notes} editor's note(s), {uncovered} uncovered"
         )
-        return written, missed
+        return written, missed, notes, uncovered

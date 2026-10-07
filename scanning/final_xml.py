@@ -200,8 +200,13 @@ def orphan_keys(prefix: str = s3_sync.FINAL_XML_PREFIX) -> list[str]:
     :param prefix: ``final-xml/`` or one scan's part of it.
     :returns: The keys.
     :rtype: list[str]
+    :raises TransientFault: When the listing failed: a caller deletes
+        what this returns, so a fault is never "nothing there".
     """
-    named = {k: parse_key(k) for k in s3_sync.list_keys(prefix)}
+    keys = s3_sync.list_keys(prefix)
+    if keys is None:
+        raise TransientFault(f"could not list {prefix}")
+    named = {k: parse_key(k) for k in keys}
     stamped = {
         (scan_id, pk)
         for pk, scan_id in Opinion.objects.filter(
@@ -225,6 +230,42 @@ def _read(object_key: str):
         raise TransientFault(f"could not read {object_key}: {exc}") from exc
     except ValueError as exc:
         raise FinalXmlError(f"{object_key} is not JSON: {exc}") from exc
+
+
+#: The reporters whose citation eyecite did not read, logged once per
+#: process: the final XML is built at every request and every export.
+_UNREAD_REPORTERS: set[str] = set()
+
+
+def main_citation(opinion: Opinion) -> str:
+    """Return the citation of an opinion in its scan's reporter (#435).
+
+    A reporter missing from ``Reporter.CITE_MAP`` gives a name eyecite
+    does not read, and CourtListener's importer drops the citation, so
+    the miss is logged for a developer to add the abbreviation, once
+    per reporter (:data:`_UNREAD_REPORTERS`).
+
+    :param opinion: The opinion, with ``scan__reporter``.
+    :rtype: str
+    """
+    scan = opinion.scan
+    citation = casebody.main_citation(
+        scan.volume, scan.reporter.cite_name, opinion.first_printed_page
+    )
+    short_name = scan.reporter.short_name
+    if (
+        short_name not in _UNREAD_REPORTERS
+        and casebody.full_citation(citation) is None
+    ):
+        _UNREAD_REPORTERS.add(short_name)
+        logger.error(
+            "%s: eyecite does not read the citation %r; add the reporter "
+            "%r to Reporter.CITE_MAP",
+            opinion,
+            citation,
+            short_name,
+        )
+    return citation
 
 
 def render(opinion: Opinion) -> tuple[str, dict]:
@@ -253,6 +294,7 @@ def render(opinion: Opinion) -> tuple[str, dict]:
         xml = casebody.build(
             approved,
             tags,
+            main_citation(opinion),
             ids={"scan-id": opinion.scan_id, "opinion-id": opinion.pk},
         )
     except casebody.CasebodyError as exc:
@@ -518,7 +560,7 @@ def export_rows(limit: int | None, opinions: QuerySet | None) -> int:
     left = None if limit is None else limit - done
     if left is not None and left <= 0:
         return done
-    for opinion in due_rows(opinions)[:left]:
+    for opinion in due_rows(opinions).select_related("scan__reporter")[:left]:
         try:
             wrote = export(opinion)
         except TransientFault as exc:

@@ -16,6 +16,7 @@ from scanning.models import (
     BracketReading,
     Detection,
     DetectionDecision,
+    EditorialReading,
     ExternalJob,
     Issue,
     JobStage,
@@ -387,6 +388,7 @@ class ScanAdmin(admin.ModelAdmin):
             (PageEdit, "scan_id"),
             (OpinionBoundary, "scan_id"),
             (BracketReading, "scan_id"),
+            (EditorialReading, "scan_id"),
             (Opinion, "scan_id"),
             (WithdrawnOpinion, "scan_id"),
             (OpinionText, "opinion__scan_id"),
@@ -912,6 +914,32 @@ class BracketReadingAdmin(admin.ModelAdmin):
     search_fields = ["raw"]
     raw_id_fields = ["scan", "source_edit", "apply_run"]
     readonly_fields = [f.name for f in BracketReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(EditorialReading)
+class EditorialReadingAdmin(admin.ModelAdmin):
+    """One editor's note the OCR read (issue #450).
+
+    Read-only, the rule of ``BracketReadingAdmin``: the compute writes
+    every row and replaces the set at each compute.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "text",
+        "apply_run",
+        "date_created",
+    ]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in EditorialReading._meta.fields]
 
     def has_add_permission(self, request):
         return False

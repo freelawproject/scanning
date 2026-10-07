@@ -81,8 +81,40 @@ REVIEW_NOT_OPEN_MESSAGE = (
 )
 
 
-def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
-    """Refuse a write of review 2 while the volume is still in review 1.
+#: A write of review 2 after its approval (#240). The passes that
+#: build the opinions read the redaction rows when they run, so a row
+#: written now reaches the opinions not built yet and misses the others.
+REVIEW_APPROVED_MESSAGE = (
+    "The redaction review of this volume is approved, so nothing here "
+    "can be changed. Ask a staff member to reopen the redaction review "
+    "first."
+)
+
+
+#: A write of review 2 while its approval is in flight (#240).
+REVIEW_APPROVING_MESSAGE = (
+    "The redactions of this volume are being approved: the server is "
+    "creating the opinions now, so nothing here can be changed. Wait for "
+    "the page to reload."
+)
+
+
+def _refuse_closed_review(
+    scan: Scan, approved_ok: bool = False
+) -> JsonResponse | None:
+    """Refuse a write of review 2 while the review is not open.
+
+    Two closed states. The volume is still in review 1, below; or its
+    review 2 is approved (``REDACTION_REVIEW_DONE``, #240). The opinion
+    passes read the redaction rows when they run and build each opinion
+    once per revision, so a write after the approval reaches the
+    opinions not built yet and misses the others, and a detection
+    written then reaches none: only the compute turns it into a
+    redaction, and the compute refuses that status. The way back is the
+    staff reopen (``views_process.reopen_redaction_review``). A third
+    state is closed for the same reason: an approval in flight
+    (``opinions.APPROVAL_ACTIONS`` under a busy status), whose rows were
+    read already.
 
     The first thing every write of the redaction review does, the twin
     of ``views_process._refuse_locked_edits``, and the gate the preview
@@ -101,8 +133,8 @@ def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
     open. ``add_redaction`` accepted such a box until this.
 
     Out of it, deliberately: the legacy ``PENDING_REVIEW`` step 2,
-    whose rows the old pipeline wrote, and the two #263 statuses, which
-    are review 2 itself. Their own rules (the compare-and-swap of
+    whose rows the old pipeline wrote, and ``READY_FOR_REDACTION_REVIEW``,
+    which is review 2 itself. Its own rules (the compare-and-swap of
     ``approve_redaction_review``, ``REDACTION_COMPUTE_STATUSES``) stand
     where they already did. So is every read: ``export_pdf`` builds the
     corrected volume from the page edits and hands it over, which is
@@ -113,12 +145,28 @@ def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
     view refuses a direct POST.
 
     :param scan: The scan the write is about.
+    :param approved_ok: Whether the write may run after the approval.
+        True for :func:`rebuild_findings` alone, which writes the cards
+        again from the rows and reaches no opinion (#305).
     :returns: A 409 answer naming the reason, or None when the write
         may proceed.
     :rtype: JsonResponse | None
     """
-    from scanning import review_states
+    from scanning import opinions, review_states
 
+    if (
+        scan.status in (Status.QUEUED, Status.PROCESSING)
+        and scan.queued_action in opinions.APPROVAL_ACTIONS
+    ):
+        return JsonResponse(
+            {"status": "error", "message": REVIEW_APPROVING_MESSAGE},
+            status=409,
+        )
+    if scan.status == Status.REDACTION_REVIEW_DONE and not approved_ok:
+        return JsonResponse(
+            {"status": "error", "message": REVIEW_APPROVED_MESSAGE},
+            status=409,
+        )
     if scan.status not in review_states.PREVIEW_STATUSES:
         return None
     return JsonResponse(
@@ -375,6 +423,11 @@ APPROVE_REFUSED_MESSAGES = {
         "approved text was not written."
     ),
     "bucket": ENSEMBLE_BUCKET_MESSAGE,
+    "review2_open": (
+        "The redaction review of this volume is open again, so no text "
+        "takes an approval until it is approved. Its approval builds "
+        "this opinion again with the new redactions."
+    ),
     "moved": (
         "The text or the findings of this opinion changed during the "
         "approval. The page was loaded again: look and approve again."
@@ -2587,9 +2640,10 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     needs :func:`compute_redactions_api` instead.
 
     Every logged-in user may press it: review 2 is a curator's step,
-    not a staff one (#151). No review gate either: the rebuild is
-    derived from the rows and is idempotent, so a volume whose rows
-    cannot change gets the findings it already had.
+    not a staff one (#151). No gate after the approval either (#240
+    closes the other writes there): the rebuild is derived from the
+    rows and is idempotent, so a volume whose rows cannot change gets
+    the findings it already had.
 
     **A busy volume is refused.** The compute writes the findings
     itself, against the run it measured in, and stamps that run on the
@@ -2606,7 +2660,7 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
-    if (refusal := _refuse_closed_review(scan)) is not None:
+    if (refusal := _refuse_closed_review(scan, approved_ok=True)) is not None:
         return refusal
     if scan.status in BUSY_STATUSES:
         return JsonResponse(

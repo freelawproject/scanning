@@ -147,8 +147,8 @@ def prefix(opinion: Opinion) -> str:
     :rtype: str
     """
     return (
-        f"{s3_sync.s3_processing_prefix(opinion.scan)}jobs/opinions/"
-        f"{opinion.first_printed_page}.{opinion.index_in_page}/tag/"
+        f"{s3_sync.s3_processing_prefix(opinion.scan)}"
+        f"{opinion.object_prefix}tag/"
     )
 
 

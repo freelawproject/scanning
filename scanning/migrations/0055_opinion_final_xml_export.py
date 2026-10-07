@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('scanning', '0052_scan_page_scores'),
+        ('scanning', '0054_editorialreading'),
     ]
 
     operations = [

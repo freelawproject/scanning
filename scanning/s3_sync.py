@@ -476,6 +476,64 @@ def delete_objects(keys: list[str]) -> int:
     return deleted
 
 
+def copy_object(source: str, destination: str) -> bool:
+    """Copy one object to another key inside the private bucket.
+
+    A server-side copy: nothing is downloaded, and the object keeps its
+    content type and metadata (``MetadataDirective="COPY"``). For a
+    derived object whose inputs did not move when its revision did: the
+    redacted PDF an OCR re-glue carries (#452).
+
+    :param source: The key to copy.
+    :param destination: The key to write.
+    :returns: Whether the copy landed. False when S3 is off or the copy
+        failed; the caller then makes the object again.
+    :rtype: bool
+    """
+    if not _s3_enabled():
+        return False
+    bucket = settings.AWS_PRIVATE_STORAGE_BUCKET_NAME
+    try:
+        _s3_client().copy_object(
+            Bucket=bucket,
+            Key=destination,
+            CopySource={"Bucket": bucket, "Key": source},
+            MetadataDirective="COPY",
+        )
+    except (BotoCoreError, ClientError):
+        logger.warning(
+            "Could not copy %s to %s", source, destination, exc_info=True
+        )
+        return False
+    return True
+
+
+def list_keys(prefix: str) -> list[str] | None:
+    """Return every key under ``prefix``, paginating the listing.
+
+    :param prefix: Full S3 prefix to list.
+    :returns: The keys; an empty list when S3 is off; None when the
+        listing failed, so a caller that deletes what it lists deletes
+        nothing.
+    :rtype: list[str] | None
+    """
+    if not _s3_enabled():
+        return []
+    paginator = _s3_client().get_paginator("list_objects_v2")
+    keys: list[str] = []
+    try:
+        for page in paginator.paginate(
+            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Prefix=prefix
+        ):
+            keys.extend(obj["Key"] for obj in page.get("Contents", []))
+    except (BotoCoreError, ClientError):
+        logger.warning(
+            "Could not list the keys under %s", prefix, exc_info=True
+        )
+        return None
+    return keys
+
+
 def download_object(key: str, dest_path: Path) -> None:
     """Download one object by key to a local path.
 
@@ -1213,27 +1271,6 @@ def delete_page_edit_objects(scan: Scan) -> int:
     """
     prefix = f"{s3_processing_prefix(scan)}{PAGE_EDITS_SUBDIR}"
     return _delete_prefix(scan, prefix, "page edit image")
-
-
-def list_keys(prefix: str) -> list[str]:
-    """Return every key under a prefix of the private bucket.
-
-    :param prefix: Full S3 prefix.
-    :returns: The keys; empty when S3 sync is disabled.
-    :rtype: list[str]
-    :raises ClientError: On an S3 error: a caller that deletes what the
-        listing misses must not read a fault as "nothing there".
-    """
-    if not _s3_enabled():
-        return []
-    paginator = _s3_client().get_paginator("list_objects_v2")
-    return [
-        obj["Key"]
-        for page in paginator.paginate(
-            Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Prefix=prefix
-        )
-        for obj in page.get("Contents", [])
-    ]
 
 
 def final_xml_prefix(scan_pk: int) -> str:

@@ -11,8 +11,9 @@ Two inputs, and nothing else:
 
 :func:`build` merges them into one XML document in the shape of the
 CAP casebody, the shape CourtListener reads (``harvard_opinions.py``,
-#408): the head matter (``parties``, ``docketnumber``, ``court``,
-``decisiondate``, ``attorneys``, ...) before one ``opinion`` for each
+#408): the citations (#435), the head matter (``parties``,
+``docketnumber``, ``court``, ``decisiondate``, ``attorneys``, ...)
+before one ``opinion`` for each
 writing of the cluster (#442), whose paragraphs carry the marks of the
 approved text, the ``page-number`` of every page the text crosses, and
 the ``footnote`` elements of that writing at its end.
@@ -41,9 +42,12 @@ line, and every span and every mark moves through the same map.
 
 The review page computes the document at each request, and the export
 for CourtListener (``final_xml``, #408) stores the same build. Pure
-standard library plus ``markup``, on purpose, like ``paragraphs``: a
-test builds it from two dicts. :func:`display_html` and :func:`source_html` are the two views
-of the review page's display (``views_process.opinion_final_xml``).
+standard library plus ``markup`` and eyecite, on purpose, like
+``paragraphs``: a test builds it from two dicts. The citation of the
+case in its own reporter comes from the row, so the caller passes it
+(:func:`main_citation`). :func:`display_html` and :func:`source_html`
+are the two views of the review page's display
+(``views_process.opinion_final_xml``).
 """
 
 from __future__ import annotations
@@ -94,6 +98,9 @@ HEAD_MATTER_LABELS = frozenset({
     "otherdate", "attorneys", "history",
 })  # fmt: skip
 
+#: The element of a citation of the case (#435), the one CourtListener's
+#: importer reads (``import_scanned_opinions.get_citation_strings``).
+CITATION = "citation"
 #: The element of a ``sup`` mark whose text is a footnote label.
 FOOTNOTE_MARK = "footnotemark"
 PAGE_NUMBER = "page-number"
@@ -528,6 +535,91 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     return max(run, caption[-1] + 1) if caption else run
 
 
+def main_citation(volume, cite_name: str, first_page) -> str:
+    """Return the citation of an opinion in its own reporter (#435).
+
+    :param volume: The volume number of the scan.
+    :param cite_name: The reporter's abbreviation (``Reporter.cite_name``).
+    :param first_page: The printed number of the opinion's first page.
+    :rtype: str
+    """
+    return f"{volume} {cite_name} {first_page}"
+
+
+def full_citation(text: str) -> str | None:
+    """Return the one full case citation that is ``text`` whole, or None.
+
+    The rule of "this line is a citation" (#435): eyecite, the parser
+    CourtListener's importer reads every ``citation`` element with,
+    finds exactly one full case citation, and it covers the text less
+    :data:`_EDGE`. A sentence that holds a citation is not one.
+
+    :param text: The text of one line.
+    :returns: The citation as eyecite corrects it, or None.
+    :rtype: str | None
+    """
+    # Imported here: eyecite takes half a second to import, and only the
+    # final XML reads it.
+    from eyecite import get_citations
+    from eyecite.models import FullCaseCitation
+
+    clean = re.sub(r"\s+", " ", text).strip(_EDGE)
+    if not clean:
+        return None
+    found = get_citations(clean)
+    if len(found) != 1 or not isinstance(found[0], FullCaseCitation):
+        return None
+    if not _covers(clean, *found[0].span()):
+        return None
+    return found[0].corrected_citation()
+
+
+def citation_paragraphs(
+    body: list[dict], by: dict[int, list[dict]], split: int
+) -> list[int]:
+    """Return the head-matter paragraphs that are a citation (#435).
+
+    A parallel citation (``2025 WY 115`` above a P.3d case) is a line of
+    the head matter the tagger has no label for. A paragraph before
+    ``split`` with no span, no list, no table and no quote, whose text
+    is one full citation (:func:`full_citation`), is that citation. A
+    line eyecite does not read stays a paragraph of the head matter, and
+    so does a line that starts a page or crosses one: moved to the top,
+    it would take the page's star number above the text of the page
+    before, the rule of ``breaks_of`` in :func:`build`. A line with a
+    ``sup`` mark stays too: a footnote mark after the page number
+    (``2025 WY 115`` and a ``1``) reads as page 1151.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
+    :param split: The first paragraph of the opinion (:func:`head_matter_end`).
+    :returns: The indexes, in body order.
+    :rtype: list[int]
+    """
+    found = []
+    last_page = None
+    for index, paragraph in enumerate(body[:split]):
+        pages = paragraph.get("pages") or []
+        new_page = last_page is not None and pages and pages[0] != last_page
+        if pages:
+            last_page = pages[-1]
+        if (
+            index in by
+            or new_page
+            or paragraph.get("page_breaks")
+            or any(
+                mark.get("kind") == markup.SUP
+                for mark in paragraph.get("marks") or []
+            )
+            or paragraph.get("blockquote")
+            or paragraph.get("kind") in (markup.TABLE, markup.LIST_ITEM)
+        ):
+            continue
+        if full_citation(paragraph.get("text") or ""):
+            found.append(index)
+    return found
+
+
 def _starts_paragraph(text: str, span: dict) -> bool:
     """Return whether a span starts at the first word of its paragraph."""
     return not text[: span["start"]].strip(_EDGE)
@@ -805,11 +897,27 @@ def _comment(text: str) -> str:
     return "<!-- " + re.sub(r"-{2,}", "-", text) + " -->"
 
 
-def build(approved: dict, tags: dict, *, ids: dict | None = None) -> str:
+def build(
+    approved: dict,
+    tags: dict,
+    citation: str = "",
+    *,
+    ids: dict | None = None,
+) -> str:
     """Return the final XML of one opinion: one ``opinion`` per writing.
+
+    The citations go first in ``casebody``, the place CourtListener's
+    importer reads them, and the first is the case's own (#435): the
+    main ``citation``, then every head-matter paragraph that is a
+    citation (:func:`citation_paragraphs`), moved there from its place
+    with its printed characters: eyecite judges the line and never
+    rewrites it. A printed copy of the main one is kept too; CourtListener adds
+    a citation its cluster already holds once.
 
     :param approved: The approved object (``paragraphs.approved_document``).
     :param tags: The spans object (``tagger.glue_run``).
+    :param citation: The citation in the scan's reporter
+        (:func:`main_citation`), or ``""`` for none.
     :param ids: The ``scan-id`` and ``opinion-id`` attributes of
         ``<casebody>`` (#408): the portal's primary keys, which the
         approved object does not hold. CourtListener keeps the XML and
@@ -872,6 +980,14 @@ def build(approved: dict, tags: dict, *, ids: dict | None = None) -> str:
         return out
 
     split = head_matter_end(body, by)
+    cited = citation_paragraphs(body, by, split)
+    cites = [_escape(citation)] if citation else []
+    # The printed characters alone: a citation is a string the importer
+    # hands eyecite, and a bold or an italic adds nothing to it.
+    cites.extend(
+        _escape(re.sub(r"\s+", " ", body[index].get("text") or "").strip())
+        for index in cited
+    )
     starts = opinion_starts(body, by, split)
     ends = [*starts[1:], len(body)]
     types = [
@@ -905,7 +1021,17 @@ def build(approved: dict, tags: dict, *, ids: dict | None = None) -> str:
         )
         + ">"
     )
-    out.extend(lines(blocks[:split], "  "))
+    out.extend(f"  <{CITATION}>{cite}</{CITATION}>" for cite in cites)
+    out.extend(
+        lines(
+            [
+                block
+                for at, block in enumerate(blocks[:split])
+                if at not in cited
+            ],
+            "  ",
+        )
+    )
     for at, (start, end) in enumerate(zip(starts, ends, strict=True)):
         out.append(f"  <opinion{_attrs({'type': types[at]})}>")
         out.extend(lines(blocks[start:end], "    "))
