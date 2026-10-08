@@ -400,6 +400,7 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
         row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
         row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
         row.approve_url = reverse("approve_opinion_text", kwargs=kwargs)
+        row.withdraw_url = reverse("withdraw_opinion_edit", kwargs=kwargs)
         row.review_url = reverse("opinion_review", kwargs={"pk": row.pk})
     list_query = {
         key: value

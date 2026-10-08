@@ -92,7 +92,13 @@
         this.pdfUrlEndpoint = node.dataset.pdfUrlEndpoint;
         this.editTextUrl = node.dataset.editTextUrl;
         this.approveUrl = node.dataset.approveUrl;
+        this.withdrawUrl = node.dataset.withdrawUrl;
         this.reviewUrl = node.dataset.reviewUrl;
+        /** What was answered here, each with the card it answered and
+         *  its undo, the review page's own: the edit withdrawn, the card
+         *  reopened. The card stays on the page, greyed, in its place,
+         *  with the Undo on it. */
+        this.answers = [];
         this.cardsNode = node.querySelector('[data-role="cards"]');
         this.metaNode = node.querySelector('[data-role="meta"]');
         this.approveButton = node.querySelector('[data-role="approve"]');
@@ -138,15 +144,23 @@
         } else if (!this.cards.length) {
             nodes.push(note('No blocking card is open. The text can be approved.', 'ok'));
         } else {
-            this.cards.forEach(function (card, index) {
-                nodes.push(cardNode(self, card, index + 1, self.cards.length));
+            // The open cards and the answered ones together, in the
+            // order of the page: an answered card keeps its place.
+            var entries = this.cards.map(function (card) { return { card: card, answer: null }; })
+                .concat(this.answers.map(function (answer) { return { card: answer.card, answer: answer }; }));
+            entries.sort(function (a, b) {
+                return (a.card.page_in_opinion - b.card.page_in_opinion)
+                    || ((a.card.start || 0) - (b.card.start || 0));
+            });
+            entries.forEach(function (entry, index) {
+                nodes.push(cardNode(self, entry.card, index + 1, entries.length, entry.answer));
             });
         }
         this.cardsNode.replaceChildren.apply(this.cardsNode, nodes);
         this.metaNode.textContent = (this.opinion ? this.opinion.page_count + ' pages · ' : '')
             + this.open().length + ' card(s) open';
         this.approveButton.disabled = this.approved || this.cards.length > 0;
-        this.cards.forEach(function (card) {
+        this.cards.concat(this.answers.map(function (a) { return a.card; })).forEach(function (card) {
             if (card.kind !== 'link' && card.crop) { drawCrop(self, card); }
         });
         countAll();
@@ -174,6 +188,13 @@
                 return;
             }
             self.answered += 1;
+            if (answer.data.edit_id) {
+                self.answers.push({
+                    card: card,
+                    label: 'written as "' + shorten(text) + '"',
+                    undo: { url: self.withdrawUrl, body: { edit_id: answer.data.edit_id } }
+                });
+            }
             return self.reload();
         });
     };
@@ -194,6 +215,38 @@
                 return;
             }
             self.answered += 1;
+            if (card.restore_url) {
+                self.answers.push({
+                    card: card,
+                    label: 'kept as shown, the page\'s card closed',
+                    undo: { url: card.restore_url, body: {} },
+                    finding_pk: card.finding_pk
+                });
+            }
+            return self.reload();
+        });
+    };
+
+    /** Take one answer back: the review page's own undo, or a kept
+     *  word released before its card closed. The cards are asked for
+     *  again either way. */
+    Section.prototype.undo = function (entry) {
+        var self = this;
+        var index = this.answers.indexOf(entry);
+        if (index >= 0) { this.answers.splice(index, 1); }
+        if (entry.finding_pk) {
+            // The card reopens with every word of its page: none is kept.
+            Object.keys(this.kept).forEach(function (key) {
+                if (key.split(':').pop() === String(entry.finding_pk)) { delete self.kept[key]; }
+            });
+        }
+        return postJson(entry.undo.url, entry.undo.body).then(function (answer) {
+            if (!answer.ok) {
+                self.answers.push(entry);
+                self.cardsNode.insertBefore(note(answer.data.message || 'The undo was refused.', 'error'), self.cardsNode.firstChild);
+                return;
+            }
+            self.answered = Math.max(0, self.answered - 1);
             return self.reload();
         });
     };
@@ -215,190 +268,25 @@
         var allKept = siblings.every(function (other) { return self.kept[keyOf(other)]; });
         if (allKept) { return this.dismiss(card, node); }
         node.querySelector('.bk-state').textContent = 'kept as shown; the page\'s card closes once its other cards are answered';
+        this.render();
         countAll();
         focusNextCard();
         return Promise.resolve();
     };
 
-    /** Whether the opinion can be approved from here: loaded, not
-     *  approved yet, and no card left, link cards included. */
-    Section.prototype.ready = function () {
-        return !!this.opinion && !this.approved && this.cards.length === 0;
+    /** Release a card kept or skipped here, before anything was
+     *  written: it is open again. */
+    Section.prototype.release = function (card) {
+        delete this.kept[keyOf(card)];
+        delete this.skipped[keyOf(card)];
+        this.render();
+        countAll();
+        var node = this.cardsNode.querySelector('[data-key="' + keyOf(card) + '"]');
+        if (node) { setActive(node); }
     };
 
-    Section.prototype.approve = function () {
-        var self = this;
-        if (!this.opinion) { return Promise.resolve(); }
-        this.approveButton.disabled = true;
-        return postJson(this.approveUrl, {
-            glue_revision: this.opinion.glue_revision,
-            edit_revision: this.opinion.edit_revision
-        }).then(function (answer) {
-            if (!answer.ok) {
-                self.cardsNode.replaceChildren(note(answer.data.message || 'The approval was refused.', 'error'));
-                self.approveButton.disabled = false;
-                return;
-            }
-            self.approved = true;
-            self.node.classList.add('bk-approved');
-            self.cardsNode.replaceChildren(note(answer.data.message || 'Approved.', 'ok'));
-            self.metaNode.textContent = 'approved';
-            countAll();
-            focusNextCard();
-        });
-    };
-
-    // ── the ready list ───────────────────────────────────────────────
-    /** One opinion of the filter with nothing open, listed under the
-     *  cards: the server rendered its approval address and the two
-     *  revisions of its text. */
-    function Ready(node) {
-        this.node = node;
-        this.approveUrl = node.dataset.approveUrl;
-        this.glueRevision = parseInt(node.dataset.glueRevision, 10);
-        this.editRevision = parseInt(node.dataset.editRevision, 10);
-        this.state = node.querySelector('[data-role="state"]');
-        this.button = node.querySelector('[data-role="approve-one"]');
-        this.approved = false;
-        var self = this;
-        this.button.addEventListener('click', function () { self.approve().then(countAll); });
-    }
-
-    Ready.prototype.ready = function () { return !this.approved; };
-
-    Ready.prototype.approve = function () {
-        var self = this;
-        this.button.disabled = true;
-        this.state.textContent = 'approving…';
-        return postJson(this.approveUrl, {
-            glue_revision: this.glueRevision,
-            edit_revision: this.editRevision
-        }).then(function (answer) {
-            if (!answer.ok) {
-                self.state.textContent = answer.data.message || 'The approval was refused.';
-                self.state.classList.add('bk-error');
-                self.button.disabled = false;
-                return;
-            }
-            self.approved = true;
-            self.node.classList.add('bk-approved');
-            self.state.textContent = 'approved';
-            self.state.classList.add('bk-ok');
-        });
-    };
-
-    var readyRows = [];
-
-    /** Approve every section and every ready row that is ready, one
-     *  after the next: one request at a time, each judged by the
-     *  server's own gate. */
-    function approveAllReady() {
-        var button = root.querySelector('[data-role="approve-all"]');
-        var ready = sections.filter(function (section) { return section.ready(); })
-            .concat(readyRows.filter(function (row) { return row.ready(); }));
-        if (button) { button.disabled = true; }
-        ready.reduce(function (chain, item) {
-            return chain.then(function () { return item.approve(); });
-        }, Promise.resolve()).then(countAll);
-    }
-
-    // ── the PDF ──────────────────────────────────────────────────────
-    Section.prototype.getPdf = function () {
-        if (!this.pdf) {
-            this.pdf = getJson(this.pdfUrlEndpoint).then(function (answer) {
-                if (!answer.ok || !answer.data.url) {
-                    throw new Error(answer.data.message || 'no PDF');
-                }
-                return pdfjsLib.getDocument({ url: answer.data.url }).promise;
-            });
-        }
-        return this.pdf;
-    };
-
-    /** The whole page drawn once at SCALE, cached per section. */
-    Section.prototype.getPage = function (number) {
-        if (!this.pages[number]) {
-            this.pages[number] = this.getPdf().then(function (pdf) {
-                return pdf.getPage(number);
-            }).then(function (page) {
-                var viewport = page.getViewport({ scale: SCALE });
-                var canvas = document.createElement('canvas');
-                canvas.width = Math.ceil(viewport.width);
-                canvas.height = Math.ceil(viewport.height);
-                return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise
-                    .then(function () { return canvas; });
-            });
-        }
-        return this.pages[number];
-    };
-
-    function drawCrop(section, card) {
-        var wrap = section.cardsNode.querySelector('[data-key="' + keyOf(card) + '"] .bk-cropwrap');
-        if (!wrap) { return; }
-        var canvas = wrap.querySelector('canvas');
-        var box = card.crop.crop;
-        section.getPage(card.page_in_opinion + 1).then(function (pageCanvas) {
-            var x0 = Math.max(0, Math.floor(box[0] * SCALE));
-            var y0 = Math.max(0, Math.floor(box[1] * SCALE));
-            var x1 = Math.min(pageCanvas.width, Math.ceil(box[2] * SCALE));
-            var y1 = Math.min(pageCanvas.height, Math.ceil(box[3] * SCALE));
-            var width = Math.max(1, x1 - x0);
-            var height = Math.max(1, y1 - y0);
-            canvas.width = width;
-            canvas.height = height;
-            canvas.getContext('2d').drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
-        }).catch(function (error) {
-            wrap.replaceChildren(note('The scan did not load: ' + error.message, 'error'));
-        });
-    }
-
-    // ── the cards ────────────────────────────────────────────────────
-    var ENGINE_ROWS = ['r0', 'r1', 'r2'];
-
-    function cardNode(section, card, index, total) {
-        var node = el('article', 'bk-card bk-' + card.kind + (card.kind === 'block' ? ' bk-single' : ''));
-        node.dataset.key = keyOf(card);
-        var header = el('header');
-        header.appendChild(el('span', 'bk-step', 'Fix ' + index + ' of ' + total));
-        header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
-        node.appendChild(header);
-        if (card.kind === 'link') {
-            node.appendChild(note(card.message));
-        } else {
-            // The crop alone, no highlight: the line is a guess from the
-            // word's place in the block's text, and a box drawn on a
-            // guess points at the wrong words more often than not.
-            var wrap = el('div', 'bk-cropwrap');
-            wrap.appendChild(el('canvas'));
-            node.appendChild(wrap);
-            if (card.kind === 'word') { node.appendChild(snippet(card)); }
-            node.appendChild(stack(section, card, node));
-        }
-        var footer = el('footer');
-        var kept = section.kept[keyOf(card)];
-        var skipped = section.skipped[keyOf(card)];
-        var state = el('span', 'bk-state', kept ? 'kept as shown' : (skipped ? 'skipped' : 'not yet decided'));
-        footer.appendChild(state);
-        footer.appendChild(el('span', 'bk-grow'));
-        var open = el('a', 'btn-ghost text-xs', 'Open in the document');
-        // The review page names its page containers ``op-page-{index}``,
-        // 0-based, and jumps to the one in the hash (viewer_step3.js).
-        open.href = section.reviewUrl + '#op-page-' + card.page_in_opinion;
-        footer.appendChild(open);
-        if (card.kind !== 'link') {
-            var skip = el('button', 'btn-outline text-xs', 'Skip');
-            skip.type = 'button';
-            skip.addEventListener('click', function () {
-                section.skipped[keyOf(card)] = true;
-                state.textContent = 'skipped';
-                node.classList.add('bk-done');
-                focusNextCard();
-            });
-            footer.appendChild(skip);
-        }
-        node.appendChild(footer);
-        if (kept || skipped) { node.classList.add('bk-done'); }
-        return node;
+    function shorten(text) {
+        return text.length > 60 ? text.slice(0, 57) + '…' : text;
     }
 
     function describe(card) {

@@ -2004,13 +2004,17 @@ def opinion_blocking_cards(
     cards = blocking_review.cards(document, findings)
     for card in cards:
         if card.get("finding_pk"):
+            kwargs = {
+                "pk": pk,
+                "opinion_pk": opinion.pk,
+                "finding_pk": card["finding_pk"],
+            }
             card["dismiss_url"] = reverse(
-                "dismiss_opinion_finding",
-                kwargs={
-                    "pk": pk,
-                    "opinion_pk": opinion.pk,
-                    "finding_pk": card["finding_pk"],
-                },
+                "dismiss_opinion_finding", kwargs=kwargs
+            )
+            # The way back from a dismissal, the review page's Undo.
+            card["restore_url"] = reverse(
+                "restore_opinion_finding", kwargs=kwargs
             )
     return JsonResponse(
         {

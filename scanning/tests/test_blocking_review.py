@@ -410,6 +410,57 @@ class TestTheCardsEndpoint(EditTestCase, ScanningTestCase):
         self.assertTrue(words[0]["dismiss_url"].endswith("/dismiss/"))
         self.assertIn("crop", words[0]["crop"])
 
+    def test_a_card_carries_the_way_back_from_its_dismissal(self):
+        data = self.client.get(self.url()).json()
+
+        word = next(c for c in data["cards"] if c["kind"] == "word")
+        self.assertTrue(word["restore_url"].endswith("/restore/"))
+        self.assertEqual(
+            word["restore_url"],
+            reverse(
+                "restore_opinion_finding",
+                kwargs={
+                    "pk": self.scan.pk,
+                    "opinion_pk": self.opinion.pk,
+                    "finding_pk": word["finding_pk"],
+                },
+            ),
+        )
+
+    def test_a_written_word_answers_its_edit_id_for_the_undo(self):
+        """The page keeps the id to withdraw the edit with, the review
+        page's own Undo, so a wrong pick is taken back the same way."""
+        import json
+
+        data = self.client.get(self.url()).json()
+        word = next(c for c in data["cards"] if c["kind"] == "word")
+        text = word["text"]
+        body = {
+            "page_in_opinion": word["page_in_opinion"],
+            "group_id": word["group_id"],
+            "text": text[: word["start"]]
+            + "typed"
+            + text[word["start"] + word["length"] :],
+            "glue_revision": data["opinion"]["glue_revision"],
+            "edit_revision": data["opinion"]["edit_revision"],
+        }
+        kwargs = {"pk": self.scan.pk, "opinion_pk": self.opinion.pk}
+
+        written = self.client.post(
+            reverse("edit_opinion_text", kwargs=kwargs),
+            json.dumps(body),
+            content_type="application/json",
+        ).json()
+
+        self.assertEqual(written["status"], "ok")
+        self.assertIsInstance(written["edit_id"], int)
+        taken_back = self.client.post(
+            reverse("withdraw_opinion_edit", kwargs=kwargs),
+            json.dumps({"edit_id": written["edit_id"]}),
+            content_type="application/json",
+        ).json()
+        self.assertEqual(taken_back["status"], "ok")
+
     def test_an_opinion_of_another_scan_is_404(self):
         answer = self.client.get(self.url(scan=ScanFactory()))
 
@@ -468,6 +519,13 @@ class TestTheBlockingPage(ScanningTestCase):
             answer,
             reverse(
                 "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
+            ),
+        )
+        self.assertContains(
+            answer,
+            reverse(
+                "withdraw_opinion_edit",
                 kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
             ),
         )

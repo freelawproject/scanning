@@ -33,6 +33,7 @@
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
     ↓ and ↑ move down and up the rows of the card in view, Return chooses; click works too; type and Return.
     A choice writes the text of the block, the way "Edit text" does on the review page, and a word kept as shown dismisses the page's card once every open word of the page is answered.
+    Every answer is listed under its opinion with an Undo, the review page's own: the edit is withdrawn, or the card reopened.
     The crop is a guess at the line, from the word's place in the block.
     <a href="{{ list_url }}" class="text-blue-600 dark:text-blue-400 hover:underline">Back to the list</a>.
   </p>
@@ -44,6 +45,7 @@
            data-pdf-url-endpoint="{{ opinion.pdf_url_endpoint }}"
            data-edit-text-url="{{ opinion.edit_text_url }}"
            data-approve-url="{{ opinion.approve_url }}"
+           data-withdraw-url="{{ opinion.withdraw_url }}"
            data-review-url="{{ opinion.review_url }}">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">

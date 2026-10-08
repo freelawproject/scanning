@@ -1748,3 +1748,5 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-note.bk-ok { color: #2e7d32; font-weight: 600; }
 .bk-single .bk-val { font-size: 15px; line-height: 1.45; max-height: 9em; overflow: auto; }
 .bk-opinion.bk-approved { opacity: 0.6; }
+.bk-card.bk-answered { opacity: 0.7; border-left: 6px solid #2e7d32; }
+.bk-card.bk-answered .bk-state { color: #2e7d32; font-weight: 600; }
