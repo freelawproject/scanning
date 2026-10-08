@@ -299,6 +299,115 @@ class TestTheAlignment(TestCase):
             "left one left two right one right two",
         )
 
+    def test_a_box_over_its_own_engines_blocks_chains_nothing(self):
+        """Surya draws a list group from its first item to the last
+        line of a footnote that runs into the right column, and reads
+        that column again as blocks of its own (#451). Linked, the box
+        held every block of the page in one group."""
+        units = [
+            unit("dots_mocr", 0, (99, 91, 300, 518), "the list"),
+            unit("dots_mocr", 1, (87, 621, 300, 726), "the footnote"),
+            unit("dots_mocr", 2, (312, 63, 531, 600), "the right column"),
+            unit("mistral_ocr", 0, (98, 91, 301, 518), "the list"),
+            unit("mistral_ocr", 1, (87, 621, 301, 727), "the footnote"),
+            unit("mistral_ocr", 2, (310, 62, 532, 600), "the right column"),
+            unit(
+                "surya",
+                0,
+                (89, 61, 532, 725),
+                "the list the footnote",
+                label="ListGroup",
+            ),
+            unit("surya", 1, (310, 61, 532, 600), "the right column"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(
+            sorted(ensemble.resolve(g)["text"] for g in groups),
+            ["the footnote", "the list", "the right column"],
+        )
+        right = next(
+            g
+            for g in groups
+            if g["engines"]["dots_mocr"]["text"] == "the right column"
+        )
+        self.assertEqual(right["engines"]["surya"]["ids"], [1])
+        silent = [g for g in groups if ensemble.resolve(g)["silent"]]
+        self.assertEqual(len(silent), 1)
+        self.assertEqual(silent[0]["engines"]["surya"]["ids"], [0])
+
+    def test_a_container_no_other_engine_read_keeps_its_text(self):
+        """The only reading of its place: held out, it would become an
+        empty group and vanish with no card (#451)."""
+        units = [
+            unit("dots_mocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("mistral_ocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("surya", 0, (50, 100, 560, 500), "the list and its head"),
+            unit("surya", 1, (50, 100, 560, 140), "its head"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertIn(
+            "the list and its head",
+            [ensemble.resolve(g)["text"] for g in groups],
+        )
+
+    def test_a_container_over_one_group_links(self):
+        """A paragraph box over a heading box of its own engine chains
+        nothing when the others read only the heading."""
+        units = [
+            unit("dots_mocr", 0, (50, 100, 560, 500), "heading and body"),
+            unit("dots_mocr", 1, (50, 100, 560, 140), "heading"),
+            unit("mistral_ocr", 0, (50, 100, 560, 140), "heading"),
+            unit("surya", 0, (50, 100, 560, 140), "heading"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertEqual(
+            [g["engines"]["dots_mocr"]["ids"] for g in groups], [[0, 1]]
+        )
+
+    def test_a_silenced_container_carries_no_verdict(self):
+        """A drop counts the exclusion and the bracket flag over every
+        member, and a container kept no word to lose."""
+        container = unit(
+            "surya",
+            0,
+            (50, 100, 560, 700),
+            "every word",
+            exclusion={"reason": "redaction"},
+            share=0.2,
+        )
+        container["bracket"] = True
+
+        silenced = ensemble._silenced(container)
+
+        self.assertEqual(silenced["text"], "")
+        self.assertIsNone(silenced["exclusion"])
+        self.assertEqual(silenced["share"], 0.0)
+        self.assertFalse(silenced["bracket"])
+        self.assertEqual(silenced["id"], 0)
+
+    def test_a_box_over_another_engines_blocks_still_links(self):
+        """The container is a fact of one engine's own blocks: a big
+        block over the other engine's paragraphs is their text."""
+        units = [
+            unit("dots_mocr", 0, (50, 100, 560, 700), "left right"),
+            unit("dots_mocr", 1, (50, 720, 560, 760), "footer"),
+            unit("mistral_ocr", 0, (50, 100, 290, 700), "left"),
+            unit("mistral_ocr", 1, (320, 100, 560, 700), "right"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(ensemble._containers(units), [])
+
     def test_a_picture_box_links_nothing(self):
         """Mistral writes a picture box as an image placeholder, and
         the parse of the OCR glue leaves it an empty text (#404)."""

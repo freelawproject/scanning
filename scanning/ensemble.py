@@ -35,7 +35,14 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    most, as a silent engine, so a reader still learns that one engine
    read nothing there. The size of a unit decides nothing: a block
    over the whole body **is** the text of that body, and held apart it
-   would write the page a second time.
+   would write the page a second time. **A unit that holds a unit of
+   its own engine and bridges groups of the others does not link
+   either** (#451): an engine's blocks tile the page, so a box over
+   the engine's own blocks is not the place of its text. Surya draws
+   a list group from its first item to the last line of a footnote
+   that runs into the next column, and that box held every block of
+   the page in one group. It is attached as a silent engine, the rule
+   of a box that reads nothing.
 2. **Order.** Three bands: the running heads, the body, the foot. The
    body splits at a column boundary taken from the **left edges** of
    the body boxes, which survives what a hunt for the gutter does not.
@@ -1180,6 +1187,11 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     picture box of Mistral an empty text (#404), and a document older
     than the parse had its placeholder taken off in :func:`_units_of`.
 
+    **A unit that holds a unit of its own engine and bridges groups of
+    the other engines does not link** and is silent too
+    (:func:`_containers`, #451): it reads, but its box is not where its
+    text lies, and it would chain the page.
+
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
         ``exclusion`` and ``share``.
@@ -1203,14 +1215,11 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         # reads nothing must not link, whatever it wrote in place of
         # the reading.
         (speaking if plain(unit["text"]) else quiet).append(unit)
+    containers = {id(unit) for unit in _containers(speaking)}
+    quiet.extend(_silenced(u) for u in speaking if id(u) in containers)
+    speaking = [u for u in speaking if id(u) not in containers]
 
-    union = _Union(len(speaking))
-    for left, right in combinations(range(len(speaking)), 2):
-        if speaking[left]["engine"] == speaking[right]["engine"]:
-            continue
-        share = contained(speaking[left]["box_pt"], speaking[right]["box_pt"])
-        if share >= OVERLAP:
-            union.join(left, right)
+    union = _link(speaking)
 
     buckets: dict[int, list[int]] = {}
     for index in range(len(speaking)):
@@ -1226,6 +1235,99 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         groups.append(_group(by_engine, line_band, page_area, boundary, width))
     _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
     return groups
+
+
+def _link(speaking: list[dict]) -> _Union:
+    """Return the links of the units of a page that read something.
+
+    Two units of different engines link when the intersection covers
+    :data:`OVERLAP` of the smaller box.
+
+    :param speaking: The units of the page that read something.
+    :returns: The union-find over ``speaking``, by index.
+    :rtype: _Union
+    """
+    union = _Union(len(speaking))
+    for left, right in combinations(range(len(speaking)), 2):
+        if speaking[left]["engine"] == speaking[right]["engine"]:
+            continue
+        share = contained(speaking[left]["box_pt"], speaking[right]["box_pt"])
+        if share >= OVERLAP:
+            union.join(left, right)
+    return union
+
+
+def _containers(speaking: list[dict]) -> list[dict]:
+    """Return the units whose box would chain the page (#451).
+
+    A container is a unit whose box holds :data:`OVERLAP` of a smaller
+    unit of its own engine. An engine's blocks tile the page, so such
+    a box is not the place of its text: Surya draws a list group from
+    its first item to the last line of a footnote that runs into the
+    next column. The bigger box of the pair is the container; two
+    boxes of one size are two readings of one block and stay.
+
+    **It is held out only when it bridges**: the units of the other
+    engines it would link fall into two groups or more when it is
+    left out. A container over one group links as any big block does,
+    and a container no other engine read is the only reading of its
+    place, which held out would vanish with no card.
+
+    :param speaking: The units of the page that read something.
+    :returns: The containers that bridge, in the order of ``speaking``.
+    :rtype: list[dict]
+    """
+    nested = [
+        unit
+        for unit in speaking
+        if any(
+            other is not unit
+            and other["engine"] == unit["engine"]
+            and area(other["box_pt"]) < area(unit["box_pt"])
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+            for other in speaking
+        )
+    ]
+    if not nested:
+        return []
+    held = {id(unit) for unit in nested}
+    rest = [unit for unit in speaking if id(unit) not in held]
+    union = _link(rest)
+    return [
+        unit
+        for unit in nested
+        if len(
+            {
+                union.find(index)
+                for index, other in enumerate(rest)
+                if other["engine"] != unit["engine"]
+                and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+            }
+        )
+        >= 2
+    ]
+
+
+def _silenced(unit: dict) -> dict:
+    """Return a copy of a container that reads nothing.
+
+    Its reading has no place on the page, so it votes in no group: the
+    group it covers most names its engine in ``silent``, and the
+    groups the others read stay apart. The copy keeps the ``id``, so
+    the group still says which block of the engine it was, and drops
+    the verdict and the bracket flag of the OCR glue with the text,
+    because a drop counts them over every member
+    (``PARTIAL_REDACTION``, ``partial_bracket``) and this one kept no
+    word.
+    """
+    return {
+        **unit,
+        "text": "",
+        "marks": [],
+        "exclusion": None,
+        "share": 0.0,
+        "bracket": False,
+    }
 
 
 def _ranked(engines) -> list[str]:
