@@ -725,7 +725,10 @@ def _shard_of(
 
 @contextmanager
 def image_source(
-    opinion: Opinion, run, small: fitz.Document, images: dict
+    opinion: Opinion,
+    run,
+    page_rect: Callable[[int], fitz.Rect],
+    images: dict,
 ) -> Iterator[Callable[[int, fitz.Rect], bytes | None] | None]:
     """Yield the ``image_for`` callable of one ``generate`` call.
 
@@ -737,11 +740,13 @@ def image_source(
     callable then renders the clip and answers JPEG bytes. It is
     called per rect and opens nothing.
 
-    The rect is in the small source's space, cut from the bitonal
-    copy, whose page box may differ from the shard page's. So the
-    callable scales the rect by the ratio of the two page boxes before
-    it clips: a picture from the wrong part of the page is the one
-    thing the output must never show.
+    The rect is in the space of a page whose box ``page_rect`` gives:
+    the small source's page, cut from the bitonal copy, for the PDF;
+    the volume page of the ensemble's boxes, for the cut of a picture
+    of the text (``opinion_figures``, #463). That box may differ from
+    the shard page's, so the callable scales the rect by the ratio of
+    the two page boxes before it clips: a picture from the wrong part
+    of the page is the one thing the output must never show.
 
     Every fault answers ``None``, logged: a shard that does not pull or
     open, a page past the end, a clip that fails. A raise inside the
@@ -751,8 +756,10 @@ def image_source(
 
     :param opinion: The opinion.
     :param run: The apply run whose space the opinion is in.
-    :param small: The small source, open.
-    :param images: The ``images`` of the payload.
+    :param page_rect: The box of the page each rect is drawn on, by the
+        0-based page of the opinion.
+    :param images: ``{page of the opinion: ...}``, the pages that hold a
+        picture: the ``images`` of the payload.
     :yields: The callable, or None.
     """
     if not images:
@@ -836,7 +843,7 @@ def image_source(
             if doc is not None and 0 <= page_in_shard < doc.page_count:
                 try:
                     source_page = doc[page_in_shard]
-                    small_rect = small[page_index].rect
+                    small_rect = page_rect(page_index)
                     sx = source_page.rect.width / (small_rect.width or 1.0)
                     sy = source_page.rect.height / (small_rect.height or 1.0)
                     clip = fitz.Rect(
@@ -939,7 +946,9 @@ def write_one(opinion: Opinion) -> dict:
             try:
                 data = payload(opinion, volume, small)
                 images = data.get("images") or {}
-                with image_source(opinion, run, small, images) as image_for:
+                with image_source(
+                    opinion, run, lambda index: small[index].rect, images
+                ) as image_for:
                     result = generate(
                         pdf_path=source_path,
                         redactions=data,
