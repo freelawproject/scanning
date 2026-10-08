@@ -443,7 +443,14 @@ def cards(document: dict, findings: list) -> list[dict]:
                 "box_pt": group["box_pt"],
                 "text": group["text"],
             }
+            # A block is a card only while the finding of its page is
+            # open: the finding is what the approval waits on, and a
+            # dismissed one leaves its blocks in the document as they
+            # were. A card with no finding would offer an answer with
+            # nothing to close.
             if group.get("agreement") == ensemble.SINGLE:
+                if single_card is None:
+                    continue
                 out.append(
                     {
                         **common,
@@ -456,6 +463,8 @@ def cards(document: dict, findings: list) -> list[dict]:
                         "finding_pk": single_card.pk if single_card else None,
                     }
                 )
+                continue
+            if word_card is None:
                 continue
             words = open_words(group)
             if (

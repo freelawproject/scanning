@@ -303,11 +303,34 @@ class TestCards(TestCase):
         )
         document = {"pages": [{"page_in_opinion": 0, "groups": [alone]}]}
 
-        cards = blocking_review.cards(document, [])
+        cards = blocking_review.cards(
+            document, [finding(0, OpinionCheck.SINGLE_ENGINE, 12)]
+        )
 
         self.assertEqual(
             (cards[0]["kind"], cards[0]["table"]), ("single", True)
         )
+
+    def test_a_block_whose_page_card_is_closed_is_no_card(self):
+        """A dismissed ``NO_MAJORITY`` card leaves its blocks in the
+        document as they were, and the approval no longer waits on
+        them: no card, or it would offer an answer with nothing to
+        close."""
+        split = read(
+            "the court held that", "the court heId that", "the court hold that"
+        )
+        split.update(
+            {
+                "id": 3,
+                "level": ensemble.BLOCKING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        document = {"pages": [{"page_in_opinion": 0, "groups": [split]}]}
+
+        self.assertEqual(blocking_review.cards(document, []), [])
 
     def test_a_block_with_many_open_words_is_one_card(self):
         many = read(
@@ -326,7 +349,9 @@ class TestCards(TestCase):
         )
         document = {"pages": [{"page_in_opinion": 0, "groups": [many]}]}
 
-        cards = blocking_review.cards(document, [])
+        cards = blocking_review.cards(
+            document, [finding(0, OpinionCheck.NO_MAJORITY, 11)]
+        )
 
         self.assertEqual([c["kind"] for c in cards], ["block"])
         self.assertEqual((cards[0]["table"], cards[0]["open"]), (False, 10))
