@@ -41,13 +41,22 @@ approved is ``ERROR``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 
 import fitz
 from django.db.models import F, QuerySet
 from django.utils import timezone
 
-from scanning import boundaries, ensemble, opinion_pdf, redactions, s3_sync
+from scanning import (
+    apply,
+    boundaries,
+    ensemble,
+    opinion_pdf,
+    redactions,
+    s3_sync,
+)
 from scanning.models import Opinion, OpinionReviewStatus
 
 logger = logging.getLogger(__name__)
@@ -162,7 +171,7 @@ def due() -> QuerySet:
     )
 
 
-def covers(opinion: Opinion) -> dict[int, list[dict]]:
+def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
     """Return what must never show on a picture, by volume page.
 
     The visible redactions of the scan, each with its ``fill``, and the
@@ -170,7 +179,14 @@ def covers(opinion: Opinion) -> dict[int, list[dict]]:
     white, the two sets the OCR glue judges a unit by. Points of the
     volume page, the space of the ensemble's boxes.
 
+    Given the volume, the masks grow over the ink past their side
+    edges, the masks the PDF pass paints (``opinion_pdf._masks``): a
+    mask a little inside the printed text would leave the first or the
+    last character of a neighbour's line on the picture.
+
     :param opinion: The row, with ``boundary``.
+    :param volume: The run's bitonal copy, open, for the cut; None for
+        the ledger, which reads the rows alone.
     :returns: ``{page_index: [{"x0", "y0", "x1", "y1", "fill"}]}``.
     :rtype: dict[int, list[dict]]
     :raises FigureError: When the opinion's boundary is gone.
@@ -180,13 +196,66 @@ def covers(opinion: Opinion) -> dict[int, list[dict]]:
     found: dict[int, list[dict]] = {}
     for entry in redactions.visible_by_page(opinion.scan):
         found.setdefault(entry["page_index"], []).extend(entry["rects"])
-    for rect in boundaries.outside_rects(opinion.scan, [opinion.boundary]).get(
-        opinion.boundary.pk, []
-    ):
+    for rect in boundaries.outside_rects(
+        opinion.scan, [opinion.boundary], document=volume
+    ).get(opinion.boundary.pk, []):
         found.setdefault(rect["page_index"], []).append(
             {**rect, "fill": "white"}
         )
     return found
+
+
+def _touching(box: list[float], rects: list[dict]) -> list[dict]:
+    """Return the rects that overlap a box, both in points."""
+    return [
+        rect
+        for rect in rects
+        if rect["x0"] < box[2]
+        and rect["x1"] > box[0]
+        and rect["y0"] < box[3]
+        and rect["y1"] > box[1]
+    ]
+
+
+def ledger_digest(opinion: Opinion, document: dict) -> str:
+    """Return the digest the row is stamped with, or blank (#463).
+
+    **The one rule** of ``Opinion.figure_digest``: the place of every
+    picture (``ensemble.figure_digest``) and every redaction and
+    neighbour mask that touches one (:func:`covers`). A redaction added
+    over a picture once the review of the redactions is open again
+    moves no box, and a digest of the boxes alone would keep a cut
+    that shows what it hides; so the boxes over the pictures are part
+    of the ledger, and a new one is a new cut. A box elsewhere on the
+    page changes nothing. The rows alone, unwidened, so the ensemble's
+    write computes it with no PDF.
+
+    :param opinion: The row, with ``scan`` and ``boundary``.
+    :param document: The ensemble document.
+    :returns: A hex digest, or "" when the text holds no picture.
+    :rtype: str
+    """
+    place = ensemble.figure_digest(document)
+    if not place:
+        return ""
+    try:
+        hidden = covers(opinion)
+    except FigureError:
+        # No boundary: the cut refuses the row, and no mask is known.
+        hidden = {}
+    over = sorted(
+        (
+            figure["page_index"],
+            [round(rect[side], 1) for side in ("x0", "y0", "x1", "y1")],
+            rect.get("fill") or "",
+        )
+        for figure in ensemble.figures_of(document)
+        for rect in _touching(
+            figure["box_pt"], hidden.get(figure["page_index"], [])
+        )
+    )
+    raw = json.dumps([place, over])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def paint(data: bytes, box: list[float], rects: list[dict]) -> bytes:
@@ -202,14 +271,7 @@ def paint(data: bytes, box: list[float], rects: list[dict]) -> bytes:
     :returns: The JPEG, painted; the bytes given when no rect touches it.
     :rtype: bytes
     """
-    touching = [
-        rect
-        for rect in rects
-        if rect["x0"] < box[2]
-        and rect["x1"] > box[0]
-        and rect["y0"] < box[3]
-        and rect["y1"] > box[1]
-    ]
+    touching = _touching(box, rects)
     if not touching:
         return data
     pix = fitz.Pixmap(data)
@@ -258,9 +320,10 @@ def cut_one(opinion: Opinion) -> int:
         raise TransientFault(str(exc)) from exc
     except ensemble.EnsembleError as exc:
         raise FigureError(str(exc)) from exc
-    digest = ensemble.figure_digest(document)
+    digest = ledger_digest(opinion, document)
     if digest != opinion.figure_digest:
-        # The ensemble wrote another text since the row was read.
+        # The ensemble wrote another text since the row was read, or a
+        # redaction over a picture moved without a new text.
         logger.info(
             "%s of scan %s: the pictures moved during the cut; it is due "
             "again",
@@ -277,7 +340,12 @@ def cut_one(opinion: Opinion) -> int:
                 f"the page map names no source for page "
                 f"{figure['page_index'] + 1}"
             )
-    hidden = covers(opinion)
+    try:
+        bitonal = apply.local_copy(opinion.scan, run.bitonal_key)
+    except apply.ApplyError as exc:
+        raise TransientFault(str(exc)) from exc
+    with fitz.open(str(bitonal)) as volume:
+        hidden = covers(opinion, volume)
     pages = {
         page.get("page_in_opinion"): page.get("frame") or {}
         for page in document.get("pages") or []

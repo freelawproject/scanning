@@ -155,7 +155,7 @@ from itertools import combinations
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
 from scanning import detections, markup, opinion_ocr, s3_sync
@@ -4209,6 +4209,9 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :raises RevisionMoved: When the OCR glue wrote again during this
         write, which keeps nothing.
     """
+    # A function-level import: ``opinion_figures`` reads this module.
+    from scanning import opinion_figures
+
     # The revision first and the edits second (#376): an edit written
     # between the two reads is in the build and raises the revision, so
     # the swap below fails and the next build holds both.
@@ -4240,6 +4243,7 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
+            digest = opinion_figures.ledger_digest(opinion, document)
             stamped = Opinion.objects.filter(
                 pk=opinion.pk,
                 ocr_glue_revision=opinion.ocr_glue_revision,
@@ -4249,10 +4253,22 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
                 ensemble_edit_revision=edit_revision,
                 ensemble_attempts=0,
                 # The pictures the text holds (#463): the ledger the
-                # cut of ``opinion_figures`` answers, with a clean count
-                # of its faults.
-                figure_digest=figure_digest(document),
-                figure_attempts=0,
+                # cut of ``opinion_figures`` answers. A new digest is a
+                # new cut, with a clean count of its faults and no
+                # cooldown of the old one; the same digest keeps both,
+                # so a rebuild does not reset a cut that fails.
+                figure_digest=digest,
+                figure_attempts=Case(
+                    When(figure_digest=digest, then=F("figure_attempts")),
+                    default=Value(0),
+                ),
+                figures_attempted_at=Case(
+                    When(
+                        figure_digest=digest,
+                        then=F("figures_attempted_at"),
+                    ),
+                    default=Value(None, output_field=DateTimeField()),
+                ),
             )
             if not stamped:
                 # The glue wrote the documents again while this ran, or
