@@ -14,10 +14,11 @@ Current schedule:
   (default 15s)
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
-- ``build_opinion_pdfs`` every ``DAEMON_OPINION_PDF_INTERVAL`` seconds
 - ``score_bad_pages`` every ``DAEMON_BADPAGE_INTERVAL`` seconds
+  (default 30s): the bad-page score of one volume (#436)
 - ``cut_opinion_figures`` every ``DAEMON_OPINION_FIGURE_INTERVAL``
   seconds (default 10s): the pictures of one opinion's text (#463)
+- ``build_opinion_pdfs`` every ``DAEMON_OPINION_PDF_INTERVAL`` seconds
   (default 5s), last in the tick: one redacted opinion PDF per run
   (#336)
 
