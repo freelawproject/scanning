@@ -1405,13 +1405,21 @@ def column_boundary(
     :rtype: float | None
     """
     _, body, _ = _split_bands(boxes, height)
-    # A box across the middle of the page is no column's (#463): a
+    # A box across the middle of the text is no column's (#463): a
     # picture or a centered line sits on both sides, and its left edge
-    # would split the left column from its own text.
+    # would split the left column from its own text. The middle of the
+    # text and not of the page: a scan of a bound book sets the text
+    # off the page's middle, and a column must not cross it there.
+    middle = (
+        (min(b["box_pt"][0] for b in body) + max(b["box_pt"][2] for b in body))
+        / 2
+        if body
+        else width / 2
+    )
     edges = sorted(
         box["box_pt"][0]
         for box in body
-        if not _straddles(box["box_pt"], width / 2, width)
+        if not _straddles(box["box_pt"], middle, width)
     )
     if len(edges) < MIN_BODY_BOXES:
         return None
