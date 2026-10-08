@@ -66,7 +66,11 @@ PARAGRAPH = "paragraph"
 HEADING = "heading"
 LIST_ITEM = "list_item"
 TABLE = "table"
-BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE)
+#: A picture (#463): the box an engine draws over a photograph, a map
+#: or a diagram. It reads no text; the daemon cuts it from the original
+#: scan and the final XML embeds it.
+FIGURE = "figure"
+BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE, FIGURE)
 
 #: The order the tags nest in :func:`serialize`, outermost first, and
 #: the order :func:`marks_of` sorts marks that start together.

@@ -175,8 +175,9 @@ logger = logging.getLogger(__name__)
 #: beside the footnote zone (#411); 6 keeps a ``manual`` bracket box
 #: out of the verdict of the unit whose bracket token it deleted
 #: (#419); 7 takes the bullet of a list item off its text and marks
-#: every item with an ``li`` mark (#428).
-SCHEMA_VERSION = 7
+#: every item with an ``li`` mark (#428); 8 gives a picture unit the
+#: ``figure`` kind (#463).
+SCHEMA_VERSION = 8
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -361,7 +362,9 @@ class EngineSpec:
         kind (a ``Section-header`` is a heading whether or not the
         engine wrote ``##``), each mapped to a ``markup.BLOCK_KINDS``
         value. Mistral's ``title`` names the caption's party names
-        too; the ensemble's majority answers that, not this table.
+        too; the ensemble's majority answers that, not this table. A
+        picture's label is ``markup.FIGURE`` (#463): the ensemble aligns
+        the pictures apart from the text.
     """
 
     name: str
@@ -494,6 +497,7 @@ ENGINES: dict[str, EngineSpec] = {
             "Section-header": markup.HEADING,
             "List-item": markup.LIST_ITEM,
             "Table": markup.TABLE,
+            "Picture": markup.FIGURE,
         },
     ),
     "mistral_ocr": EngineSpec(
@@ -518,6 +522,7 @@ ENGINES: dict[str, EngineSpec] = {
             "title": markup.HEADING,
             "list": markup.LIST_ITEM,
             "table": markup.TABLE,
+            "image": markup.FIGURE,
         },
     ),
     "surya": EngineSpec(
@@ -543,6 +548,8 @@ ENGINES: dict[str, EngineSpec] = {
             "SectionHeader": markup.HEADING,
             "ListGroup": markup.LIST_ITEM,
             "Table": markup.TABLE,
+            "Picture": markup.FIGURE,
+            "Figure": markup.FIGURE,
         },
     ),
 }
@@ -1154,6 +1161,7 @@ def build_document(
         "headings": 0,
         "list_items": 0,
         "tables": 0,
+        "figures": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -1238,6 +1246,8 @@ def build_document(
                 counts["list_items"] += 1
             elif parsed.kind == markup.TABLE:
                 counts["tables"] += 1
+            elif parsed.kind == markup.FIGURE:
+                counts["figures"] += 1
             label = unit.get(spec.type_key) or ""
             # The ``manual`` box that is the bracket token this unit
             # lost does not take the unit (#419); every other box does.
