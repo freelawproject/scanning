@@ -68,6 +68,31 @@ class TestOpenWords(TestCase):
             ["b", blocking_review.READ_NOTHING, "d"],
         )
 
+    def test_each_word_of_an_inserted_run_is_its_own_card(self):
+        """Two engines read two words the base did not. The run goes in
+        as two low-confidence tokens, and each card shows the engine's
+        word at that place of the run, never the run whole: the answer
+        goes into one word's place of the text."""
+        words = blocking_review.open_words(
+            # The third reading differs at the end too, or two readings
+            # alike would be a majority and no vote.
+            read(
+                "the court held today",
+                "the court plainly and held today",
+                "the court plainly and held todey",
+            )
+        )
+
+        self.assertEqual([w["token"] for w in words], ["plainly", "and"])
+        self.assertEqual(
+            [[r["word"] for r in w["readings"]] for w in words],
+            [
+                [blocking_review.READ_NOTHING, "plainly", "plainly"],
+                [blocking_review.READ_NOTHING, "and", "and"],
+            ],
+        )
+        self.assertEqual([w["start"] for w in words], [10, 18])
+
     def test_a_block_with_two_open_words_has_two_cards_in_order(self):
         words = blocking_review.open_words(
             read(
@@ -191,6 +216,7 @@ class TestCards(TestCase):
         # the second by the estimate.
         self.assertEqual(word["crop"]["line"], 2)
         self.assertEqual(single["where"], "page 1, footnote, right column")
+        self.assertFalse(single["table"])
         self.assertEqual(
             (single["engine"], single["finding_pk"]), ("mistral_ocr", 12)
         )
@@ -231,6 +257,27 @@ class TestCards(TestCase):
         self.assertEqual(card["readings"][1]["text"], "x y z")
         self.assertEqual(card["finding_pk"], 11)
         self.assertIsNone(card["crop"]["highlight"])
+
+    def test_a_table_one_engine_read_says_so(self):
+        alone = group_of(unit("mistral_ocr", 0, BODY_A_PT, "a | b"))
+        alone.update(ensemble.resolve(alone))
+        alone.update(
+            {
+                "id": 4,
+                "kind": "table",
+                "level": ensemble.BLOCKING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        document = {"pages": [{"page_in_opinion": 0, "groups": [alone]}]}
+
+        cards = blocking_review.cards(document, [])
+
+        self.assertEqual(
+            (cards[0]["kind"], cards[0]["table"]), ("single", True)
+        )
 
     def test_a_block_with_many_open_words_is_one_card(self):
         many = read(

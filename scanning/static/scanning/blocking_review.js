@@ -40,12 +40,18 @@
         return el('p', 'bk-note' + (tone ? ' bk-' + tone : ''), text);
     }
 
+    /** A rejected request answers like a refused one, so a chain of
+     *  writes goes on past it and the page shows the reason. */
+    function failed(error) {
+        return { ok: false, data: { message: 'The request did not reach the server: ' + error.message } };
+    }
+
     function getJson(url) {
         return fetch(url, { credentials: 'same-origin' }).then(function (response) {
             return response.json().then(function (data) {
                 return { ok: response.ok, data: data };
             });
-        });
+        }).catch(failed);
     }
 
     function postJson(url, body) {
@@ -61,7 +67,7 @@
             return response.json().catch(function () { return {}; }).then(function (data) {
                 return { ok: response.ok, data: data };
             });
-        });
+        }).catch(failed);
     }
 
     function fold(text) {
@@ -192,19 +198,23 @@
         });
     };
 
-    /** A word kept as shown. The page's card counts every open word of
-     *  the page, so it is dismissed once every one of them is kept. */
+    /** A card kept as shown: the word, the block or the single-engine
+     *  block reads right. The page's finding counts every such card
+     *  of the page (one ``NO_MAJORITY`` row for its word and block
+     *  cards, one ``SINGLE_ENGINE`` row for its single cards), so it
+     *  is dismissed once every card of that finding is kept, never
+     *  before: a dismissal closes them all. */
     Section.prototype.keep = function (card, node) {
         var self = this;
         this.kept[keyOf(card)] = true;
         node.classList.add('bk-done');
         node.querySelector('.bk-state').textContent = 'kept as shown';
         var siblings = this.cards.filter(function (other) {
-            return (other.kind === 'word' || other.kind === 'block')
-                && other.page_in_opinion === card.page_in_opinion;
+            return other.finding_pk === card.finding_pk;
         });
         var allKept = siblings.every(function (other) { return self.kept[keyOf(other)]; });
         if (allKept) { return this.dismiss(card, node); }
+        node.querySelector('.bk-state').textContent = 'kept as shown; the page\'s card closes once its other cards are answered';
         countAll();
         focusNextCard();
         return Promise.resolve();
@@ -377,7 +387,9 @@
         footer.appendChild(state);
         footer.appendChild(el('span', 'bk-grow'));
         var open = el('a', 'btn-ghost text-xs', 'Open in the document');
-        open.href = section.reviewUrl + '#page-' + (card.page_in_opinion + 1);
+        // The review page names its page containers ``op-page-{index}``,
+        // 0-based, and jumps to the one in the hash (viewer_step3.js).
+        open.href = section.reviewUrl + '#op-page-' + card.page_in_opinion;
         footer.appendChild(open);
         if (card.kind !== 'link') {
             var skip = el('button', 'btn-outline text-xs', 'Skip');
@@ -423,6 +435,11 @@
             var row = option(section, card, node, card.engine, card.text, 'r0', '', '');
             row.title = 'The block reads right as shown: dismiss the card of this page';
             list.appendChild(row);
+            if (card.table) {
+                // A table takes no text edit (the review page's rule).
+                list.appendChild(note('A table takes no text edit here; open the document to change it.'));
+                return list;
+            }
         } else if (card.kind === 'block') {
             card.readings.forEach(function (reading, index) {
                 var whole = option(section, card, node, reading.engine, reading.text, ENGINE_ROWS[index] || 'r2', '', '');
@@ -462,9 +479,9 @@
         button.appendChild(val);
         button.addEventListener('click', function () {
             markChosen(node, button);
-            if (card.kind === 'single') { section.dismiss(card, node); return; }
-            if (card.kind === 'block' && fold(value) === fold(card.text)) {
-                section.dismiss(card, node);
+            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))) {
+                // Right as shown: the page's card waits for its siblings.
+                section.keep(card, node);
                 return;
             }
             choose(section, card, node, value);
@@ -552,11 +569,23 @@
         return best;
     }
 
+    /** Where the curator is: the section and the place of the active
+     *  card in it. It outlives the card, which a reload redraws and an
+     *  answer takes out, so the next card is the one below it and the
+     *  page never jumps back to its first open card. */
+    var cursor = null;
+
     function focusNextCard() {
-        var cards = openCards();
-        var current = root.querySelector('.bk-card.bk-active');
-        var index = current ? cards.indexOf(current) : -1;
-        var next = cards[index + 1] || cards[0] || null;
+        var all = Array.prototype.slice.call(root.querySelectorAll('.bk-opinion'));
+        var start = cursor ? all.indexOf(cursor.section) : 0;
+        var next = null;
+        for (var s = Math.max(0, start); s < all.length && !next; s++) {
+            var cards = Array.prototype.slice.call(all[s].querySelectorAll('.bk-card'));
+            var from = (cursor && s === start) ? cursor.index : 0;
+            for (var i = from; i < cards.length; i++) {
+                if (!cards[i].classList.contains('bk-done')) { next = cards[i]; break; }
+            }
+        }
         setActive(next);
         if (next) {
             window.setTimeout(function () { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 120);
@@ -565,7 +594,13 @@
 
     function setActive(card) {
         root.querySelectorAll('.bk-card.bk-active').forEach(function (other) { other.classList.remove('bk-active'); });
-        if (card) { card.classList.add('bk-active'); }
+        if (!card) { return; }
+        card.classList.add('bk-active');
+        var section = card.closest('.bk-opinion');
+        cursor = {
+            section: section,
+            index: Array.prototype.indexOf.call(section.querySelectorAll('.bk-card'), card)
+        };
     }
 
     function optionsOf(card) {

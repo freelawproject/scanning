@@ -74,19 +74,26 @@ def _present(group: dict) -> list[str]:
     ]
 
 
-def _reading(at: dict, inserted: dict, position: int, is_run: bool) -> str:
+def _reading(
+    at: dict, inserted: dict, position: int, run_index: int | None
+) -> str:
     """Return one other engine's word at a base position.
 
     :param at: ``_candidates``'s first answer for that engine.
     :param inserted: Its second answer.
     :param position: The base position of the token.
-    :param is_run: Whether the token is of a run the base did not read.
+    :param run_index: For a token of a run the base did not read, the
+        token's place in that run; None for a word the base read. A
+        run of two words is two cards, and each shows its own word of
+        the engine's run, never the run whole: the card's answer goes
+        into one word's place of the text.
     :returns: The word as the engine wrote it, or :data:`READ_NOTHING`.
     :rtype: str
     """
-    if is_run:
+    if run_index is not None:
         runs = inserted.get(position) or []
-        return " ".join(word for run in runs for _, word in run)
+        words = [word for _, word in runs[0]] if runs else []
+        return words[run_index] if run_index < len(words) else READ_NOTHING
     entries = at.get(position) or []
     if not entries:
         return READ_NOTHING
@@ -134,21 +141,28 @@ def open_words(group: dict) -> list[dict]:
     words: list[dict] = []
     offset = 0
     index = 0
+    run_index: int | None = None
     for token in tokens:
         if not token["text"]:
             continue
         start = offset
         offset += len(token["text"]) + 1
         index += 1
+        # The tokens of one inserted run follow each other at one
+        # position: the first is 0, the next 1, and a word the base
+        # read ends the run.
+        if token.get("inserted"):
+            run_index = 0 if run_index is None else run_index + 1
+        else:
+            run_index = None
         if not token.get("low_confidence"):
             continue
         position = token["position"]
-        is_run = bool(token.get("inserted"))
         readings = [
             {
                 "engine": base,
                 "word": READ_NOTHING
-                if is_run or position >= len(base_pairs)
+                if run_index is not None or position >= len(base_pairs)
                 else base_pairs[position][1],
             }
         ]
@@ -157,7 +171,7 @@ def open_words(group: dict) -> list[dict]:
             readings.append(
                 {
                     "engine": name,
-                    "word": _reading(at, inserted, position, is_run),
+                    "word": _reading(at, inserted, position, run_index),
                 }
             )
         words.append(
@@ -316,6 +330,9 @@ def cards(document: dict, findings: list) -> list[dict]:
                         **common,
                         "kind": SINGLE,
                         "engine": group.get("source"),
+                        # A table takes no text edit (the review page's
+                        # rule), so the card offers none.
+                        "table": group.get("kind") == markup.TABLE,
                         "crop": block_crop(group["box_pt"]),
                         "finding_pk": single_card.pk if single_card else None,
                     }
