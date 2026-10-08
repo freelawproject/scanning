@@ -405,8 +405,10 @@ def rewrite_text(opinion: Opinion) -> str | None:
         # The spans stay, so the stored final XML still reads as current
         # (``final_xml.is_written`` compares the spans key). Its text is
         # the old object: mark the content unknown, and the export writes
-        # the new footnotes (#408).
+        # the new footnotes (#408). The new text is a new input, so a
+        # row the pass stopped trying is tried again.
         fields["final_xml_schema"] = None
+        fields["final_xml_attempts"] = 0
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,
