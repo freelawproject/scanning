@@ -71,7 +71,20 @@ A reopen keeps both keys (#375), so the deletion reads the status. A
 behind, and the object it keeps is still a whole document: the text the
 curator approved, under the old join rule, and the spans over that
 text. It stays until a tagger run of the new text writes the new one. A
-listing of the prefix is then the list of what CourtListener may import.
+rewrite that keeps the body carries the spans with the key
+(``opinion_review.rewrite_text``), and the spans key alone would then
+read the old object as current: the rewrite sets ``final_xml_schema``
+to None, so the pass writes the new footnotes. A listing of the prefix
+is then the list of what CourtListener may import.
+
+**The window of a reopen.** The deletion runs on the tick, so a reopen,
+an edit and a new approval inside one blocked tick (the Mistral wave
+holds the loop for minutes) leave the old object listed: the status is
+``TEXT_REVIEW_DONE`` again, and the spans are over the old text, the
+state of a rewrite that dropped the spans. The ledger cannot tell the
+two apart, so the object stays until the tagger press places the spans
+on the new text, which writes it over. CourtListener may import the
+old text in that window; the next import reads the new one.
 
 **A stamp names every object.** ``final_xml_tag_key`` is not blank
 whenever an object may be at the key, so no object is left with no row

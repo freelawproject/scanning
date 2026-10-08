@@ -21,7 +21,7 @@ from django.urls import reverse
 
 from scanning import casebody, final_xml, tagger
 from scanning.models import Opinion, OpinionReviewStatus
-from scanning.tests.test_tagger import _S3Case
+from scanning.tests.test_tagger import _S3Case, approved, paragraph
 
 
 class _ExportCase(_S3Case):
@@ -208,6 +208,36 @@ class TestThePass(_ExportCase):
         self.assertEqual(self.xml[final_xml.key(opinion)], before)
         self.assertTrue(final_xml.is_stored(opinion))
         self.assertFalse(final_xml.is_written(opinion))
+
+    def test_a_rewrite_that_carries_the_spans_writes_the_new_text(self):
+        """The spans key does not move when the body stays (#442), so
+        the rewrite marks the content unknown and the pass writes the
+        new footnotes over the old object."""
+        self.tagged()
+        final_xml.export_due()
+        old = self.refresh().approved_text_key
+        new = old + ".2"
+        self.stored[new] = approved(
+            *(p["text"] for p in self.stored[old]["body"]),
+            footnotes=[
+                {
+                    "label": "1",
+                    "pages": [0],
+                    "paragraphs": [paragraph("A new footnote.")],
+                }
+            ],
+        )
+        # What ``opinion_review.rewrite_text`` writes when the spans fit.
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=new, tagged_text_key=new, final_xml_schema=None
+        )
+
+        self.assertEqual(final_xml.export_due(), 1)
+
+        self.assertTrue(final_xml.is_written(self.refresh()))
+        self.assertIn(
+            b"A new footnote.", self.xml[final_xml.key(self.opinion)]
+        )
 
     def test_the_tagger_run_after_a_rewrite_writes_the_new_text(self):
         self.tagged()
