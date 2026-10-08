@@ -2825,3 +2825,58 @@ class TestReglueOpinions(OpinionOcrTestCase):
 
         self.assertIn("would glue 2 opinion(s) again", dry)
         self.assertIn("2 opinion(s) due again", real)
+
+
+class TestTheReglueLog(OpinionOcrTestCase):
+    """Every scan whose rows moved is logged, and so is an empty one."""
+
+    def test_a_fault_on_a_later_scan_keeps_the_line_of_an_earlier_one(self):
+        other = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        run = self.make_run(other)
+        second = self.make_opinion(
+            other, run, self.make_boundary(other, run, 1, 2), 700
+        )
+        real = opinion_ocr._reglue_row
+
+        def fail_on_the_second_scan(opinion, carry_pdf):
+            if opinion.pk == second.pk:
+                raise RuntimeError("the bucket went away")
+            return real(opinion, carry_pdf)
+
+        with (
+            patch.object(
+                opinion_ocr, "_reglue_row", side_effect=fail_on_the_second_scan
+            ),
+            self.assertLogs("scanning.opinion_ocr", "INFO") as logs,
+            self.assertRaises(RuntimeError),
+        ):
+            opinion_ocr.reglue_opinions(
+                [self.opinion, second], carry_pdf=False
+            )
+
+        self.assertIn(
+            f"scan {self.scan.pk}: 1 opinion(s) due again", logs.output[0]
+        )
+        self.assertIn(
+            f"scan {other.pk}: 0 opinion(s) due again", logs.output[1]
+        )
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 1)
+
+    def test_a_volume_with_nothing_to_move_still_logs(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        with self.assertLogs("scanning.opinion_ocr", "INFO") as logs:
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.assertEqual(summary.moved, 0)
+        self.assertIn(
+            f"scan {self.scan.pk}: 0 opinion(s) due again, 0 PDF(s) carried",
+            logs.output[0],
+        )
