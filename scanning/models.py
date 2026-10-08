@@ -2900,6 +2900,15 @@ class Opinion(AbstractDateTimeModel):
             "(#463). At opinion_figures.MAX_ATTEMPTS the row goes to ERROR."
         ),
     )
+    figures_attempted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the cut of this row's pictures last failed, of either "
+            "kind (#463). The row is not due again before "
+            "opinion_pdf.retry_after() has passed."
+        ),
+    )
     notes = models.TextField(blank=True, default="")
 
     class Meta:

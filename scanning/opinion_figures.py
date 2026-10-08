@@ -22,10 +22,21 @@ alike. A re-glue or an edit that leaves the pictures where they were
 keeps the digest, so the cut is not paid again; that is why the
 objects live under the opinion's prefix and not under a revision.
 
-**A fault is the PDF pass's.** A fault of the bucket costs no attempt
-and the row is due again on the next tick; a fault the rows explain,
-or an unexpected one, spends one of :data:`MAX_ATTEMPTS`, and at the
-cap a row that is not approved is ``ERROR``.
+**No redacted pixel leaves the cut.** A picture a redaction covers by
+``opinion_ocr.EXCLUDE_SHARE`` or more is dropped by the ensemble, but a
+smaller box (a name inside a map, a margin redaction over a corner)
+leaves the picture in the text. The cut is taken from the unredacted
+original, so every redaction the PDF paints, and every mask over the
+neighbour opinions, is painted on it before it is stored
+(:func:`paint`).
+
+**A fault is the PDF pass's.** Every fault stamps
+``figures_attempted_at``, and the row waits ``opinion_pdf.retry_after``
+before it is due again, so a stuck row never holds the pass and a
+bucket blip does not spend the cap in seconds. A fault of the bucket
+costs no attempt; a fault the rows explain, or an unexpected one,
+spends one of :data:`MAX_ATTEMPTS`, and at the cap a row that is not
+approved is ``ERROR``.
 """
 
 from __future__ import annotations
@@ -34,8 +45,9 @@ import logging
 
 import fitz
 from django.db.models import F, QuerySet
+from django.utils import timezone
 
-from scanning import ensemble, opinion_pdf, s3_sync
+from scanning import boundaries, ensemble, opinion_pdf, redactions, s3_sync
 from scanning.models import Opinion, OpinionReviewStatus
 
 logger = logging.getLogger(__name__)
@@ -130,9 +142,96 @@ def owed() -> QuerySet:
                 OpinionReviewStatus.ERROR,
             )
         )
-        .select_related("scan", "scan__reporter", "apply_run")
+        .select_related("scan", "scan__reporter", "apply_run", "boundary")
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
+
+
+def due() -> QuerySet:
+    """Return the rows a tick may cut now, newest scan first.
+
+    :func:`owed` less the rows under their cooldown: a row whose last
+    fault is younger than ``opinion_pdf.retry_after`` waits, the rule
+    of the PDF pass.
+
+    :returns: The queryset, ordered.
+    :rtype: QuerySet
+    """
+    return owed().exclude(
+        figures_attempted_at__gt=timezone.now() - opinion_pdf.retry_after()
+    )
+
+
+def covers(opinion: Opinion) -> dict[int, list[dict]]:
+    """Return what must never show on a picture, by volume page.
+
+    The visible redactions of the scan, each with its ``fill``, and the
+    masks over the neighbour opinions (``boundaries.outside_rects``),
+    white, the two sets the OCR glue judges a unit by. Points of the
+    volume page, the space of the ensemble's boxes.
+
+    :param opinion: The row, with ``boundary``.
+    :returns: ``{page_index: [{"x0", "y0", "x1", "y1", "fill"}]}``.
+    :rtype: dict[int, list[dict]]
+    :raises FigureError: When the opinion's boundary is gone.
+    """
+    if opinion.boundary is None:
+        raise FigureError("the boundary of this opinion is gone")
+    found: dict[int, list[dict]] = {}
+    for entry in redactions.visible_by_page(opinion.scan):
+        found.setdefault(entry["page_index"], []).extend(entry["rects"])
+    for rect in boundaries.outside_rects(opinion.scan, [opinion.boundary]).get(
+        opinion.boundary.pk, []
+    ):
+        found.setdefault(rect["page_index"], []).append(
+            {**rect, "fill": "white"}
+        )
+    return found
+
+
+def paint(data: bytes, box: list[float], rects: list[dict]) -> bytes:
+    """Paint the rects of a page over one cut picture.
+
+    The cut is the clip of ``box`` (points of the volume page), so a
+    rect in the same points lands at its offset in the clip, scaled to
+    the pixels. A rect that misses the box paints nothing.
+
+    :param data: The JPEG of the cut.
+    :param box: The picture's box, in points.
+    :param rects: The rects of its page, in points, each with ``fill``.
+    :returns: The JPEG, painted; the bytes given when no rect touches it.
+    :rtype: bytes
+    """
+    touching = [
+        rect
+        for rect in rects
+        if rect["x0"] < box[2]
+        and rect["x1"] > box[0]
+        and rect["y0"] < box[3]
+        and rect["y1"] > box[1]
+    ]
+    if not touching:
+        return data
+    pix = fitz.Pixmap(data)
+    sx = pix.width / max(box[2] - box[0], 1e-6)
+    sy = pix.height / max(box[3] - box[1], 1e-6)
+    for rect in touching:
+        # Outwards to the pixel on every side: a redaction never leaves
+        # a sliver of what it covers.
+        area = (
+            fitz.IRect(
+                int((max(rect["x0"], box[0]) - box[0]) * sx),
+                int((max(rect["y0"], box[1]) - box[1]) * sy),
+                int((min(rect["x1"], box[2]) - box[0]) * sx + 0.999),
+                int((min(rect["y1"], box[3]) - box[1]) * sy + 0.999),
+            )
+            & pix.irect
+        )
+        if area.is_empty:
+            continue
+        shade = 0 if rect.get("fill") == "black" else 255
+        pix.set_rect(area, (shade,) * pix.n)
+    return pix.tobytes("jpeg", jpg_quality=opinion_pdf.IMAGE_JPEG_QUALITY)
 
 
 def cut_one(opinion: Opinion) -> int:
@@ -170,6 +269,15 @@ def cut_one(opinion: Opinion) -> int:
         )
         return 0
     figures = ensemble.figures_of(document)
+    for figure in figures:
+        # A page the map gives no source is a fact of the run, not of
+        # the bucket: the cut would fail the same way every time.
+        if opinion_pdf._source_of(run, figure["page_index"]) is None:
+            raise FigureError(
+                f"the page map names no source for page "
+                f"{figure['page_index'] + 1}"
+            )
+    hidden = covers(opinion)
     pages = {
         page.get("page_in_opinion"): page.get("frame") or {}
         for page in document.get("pages") or []
@@ -190,16 +298,27 @@ def cut_one(opinion: Opinion) -> int:
                 figure["page_in_opinion"], fitz.Rect(*figure["box_pt"])
             )
             if not data:
+                # A shard that did not pull or open, or a clip that did
+                # not render: ``image_source`` logged which. It counts,
+                # spaced by the cooldown, so a blip of the bucket must
+                # last three cooldowns to end the row.
                 raise FigureError(
-                    f"no source for the picture on page "
-                    f"{figure['page_index'] + 1}"
+                    f"the picture on page {figure['page_index'] + 1} did "
+                    "not render from the original"
                 )
+            data = paint(
+                data, figure["box_pt"], hidden.get(figure["page_index"], [])
+            )
             target = key(opinion, document.get("apply_run") or "", figure)
             if not s3_sync.upload_bytes_object(target, data, CONTENT_TYPE):
                 raise TransientFault(f"the upload to {target} failed")
     stamped = Opinion.objects.filter(
         pk=opinion.pk, figure_digest=digest
-    ).update(figures_cut_digest=digest, figure_attempts=0)
+    ).update(
+        figures_cut_digest=digest,
+        figure_attempts=0,
+        figures_attempted_at=None,
+    )
     if stamped:
         logger.info(
             "%s of scan %s: %d picture(s) cut",
@@ -210,23 +329,38 @@ def cut_one(opinion: Opinion) -> int:
     return len(figures)
 
 
-def _fail(opinion: Opinion, message: str) -> None:
-    """Spend one attempt on the row, and end it at the cap.
+def _fail(opinion: Opinion, message: str, counted: bool = True) -> None:
+    """Record one failed cut on the row, and end it at the cap.
 
+    Every fault stamps ``figures_attempted_at``, so the row leaves
+    :func:`due` for ``opinion_pdf.retry_after``. A counted fault also
+    spends one of :data:`MAX_ATTEMPTS`; a fault of the bucket does not.
     Scoped to the digest the tick read, so a new text spends nothing of
     the new set. At the cap a row that is not approved goes to
-    ``ERROR``, the rule of the PDF pass.
+    ``ERROR`` with the message; below it the row's ``error_message``,
+    which another pass may own, is left alone.
 
     :param opinion: The row, as read at the start of the tick.
     :param message: What failed.
+    :param counted: Whether the fault spends an attempt.
     :return: None.
     """
+    values = {"figures_attempted_at": timezone.now()}
+    if counted:
+        values["figure_attempts"] = F("figure_attempts") + 1
     Opinion.objects.filter(
         pk=opinion.pk, figure_digest=opinion.figure_digest
-    ).update(
-        figure_attempts=F("figure_attempts") + 1,
-        error_message=f"Pictures: {message}"[:2000],
-    )
+    ).update(**values)
+    if not counted:
+        logger.warning(
+            "%s of scan %s: the pictures wait for the bucket; due again in "
+            "%s: %s",
+            opinion,
+            opinion.scan_id,
+            opinion_pdf.retry_after(),
+            message,
+        )
+        return
     attempts = (
         Opinion.objects.filter(pk=opinion.pk)
         .values_list("figure_attempts", flat=True)
@@ -238,7 +372,10 @@ def _fail(opinion: Opinion, message: str) -> None:
                 OpinionReviewStatus.TEXT_REVIEW_DONE,
                 OpinionReviewStatus.ERROR,
             )
-        ).update(status=OpinionReviewStatus.ERROR)
+        ).update(
+            status=OpinionReviewStatus.ERROR,
+            error_message=f"Pictures: {message}"[:2000],
+        )
         logger.error(
             "%s of scan %s: the pictures failed %d times: %s",
             opinion,
@@ -261,25 +398,22 @@ def run_tick() -> int:
     """Cut the pictures of up to :data:`FIGURES_PER_TICK` opinions.
 
     The body of the ``cut_opinion_figures`` command. A fault never
-    raises out of the tick. After each row, the scan's local mirror is
-    released when neither this pass nor the PDF pass owes it anything:
-    the cut pulls the shards into the same tree the PDF pass keeps.
+    raises out of the tick, and every fault puts the row under its
+    cooldown, so the next tick takes another row. After each row, the
+    scan's local mirror is released when neither this pass nor the PDF
+    pass owes it anything: the cut pulls the shards into the same tree
+    the PDF pass keeps.
 
     :returns: How many opinions were cut.
     :rtype: int
     """
     done = 0
-    for opinion in owed()[:FIGURES_PER_TICK]:
+    for opinion in due()[:FIGURES_PER_TICK]:
         try:
             cut_one(opinion)
             done += 1
         except TransientFault as exc:
-            logger.warning(
-                "%s of scan %s: the pictures wait for the bucket: %s",
-                opinion,
-                opinion.scan_id,
-                exc,
-            )
+            _fail(opinion, str(exc), counted=False)
         except FigureError as exc:
             _fail(opinion, str(exc))
         except Exception as exc:
