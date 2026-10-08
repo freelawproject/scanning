@@ -716,7 +716,9 @@ def project(body: list[dict]) -> Projection:
         offsets.extend([None] * len(tag))
 
     for index, paragraph in enumerate(body):
-        if paragraph.get("kind") == TABLE:
+        if paragraph.get("kind") in (TABLE, FIGURE):
+            # A picture holds no text (#463), and it is left out like a
+            # table, so the index of every other paragraph holds.
             continue
         source = paragraph.get("text") or ""
         # A list group holds one ``li`` mark per item (#428), with a

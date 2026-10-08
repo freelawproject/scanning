@@ -432,6 +432,10 @@ APPROVE_REFUSED_MESSAGES = {
         "The text or the findings of this opinion changed during the "
         "approval. The page was loaded again: look and approve again."
     ),
+    "figures": (
+        "A picture of this opinion is not cut yet, so the approved text "
+        "was not written. Wait a minute and approve again."
+    ),
 }
 REOPENED_TEXT_MESSAGE = (
     "The text review of this opinion is open again. The approved text "
