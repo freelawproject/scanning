@@ -377,16 +377,10 @@ function approveDetection(btn) {
             // approval makes the box the curator's own (#414), which
             // the next pairing reads at 1.0, and the card stays (its
             // chip reads 1.0 and loses the check mark) until that
-            // pairing runs. A bracket card (#410) goes at once: the
-            // hand-drawn row reads 1.0, over the gate, so the rebuild
-            // has already written it out. The page's box follows the
-            // row that holds it now, and the section is fetched again
-            // (#240 PR D).
+            // pairing runs. The page's box follows the row that holds
+            // it now, and the section is fetched again (#240 PR D).
             if (window.adoptDetection) {
                 window.adoptDetection(data.replaced_id, data.detection_id);
-            }
-            if (btn.closest('[data-check="low_confidence_headnote_bracket"]')) {
-                _dropFindingCard(btn);
             }
             showSaved(data);
             refreshFindings();
@@ -425,8 +419,6 @@ function deleteUnmatchedDetection(btn) {
                 );
                 return;
             }
-            // The row is no longer live, so no finding names it.
-            _dropFindingCard(btn);
             showSaved(data);
             refreshFindings();
         })
@@ -442,14 +434,6 @@ function deleteUnmatchedDetection(btn) {
 // again after every write: the endpoints rebuild the findings, so the
 // cards are true the moment the answer comes back. The action bar is
 // refreshed with it, because the approve button carries the open count.
-
-// Take a card out the moment its write succeeds. The endpoint has
-// already rebuilt the findings without it, and the refresh that swaps
-// the section (and its counts) in comes a whole fragment later.
-function _dropFindingCard(btn) {
-    var card = btn.closest(".finding-card");
-    if (card) card.remove();
-}
 
 function _applyFindings(data) {
     var section = document.getElementById("review-findings");
