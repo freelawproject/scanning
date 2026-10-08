@@ -1173,7 +1173,55 @@ def _attach_quiet(
         groups[index]["present"] = _ranked(groups[index]["engines"])
 
 
-def align_page(units: list[dict], width: float, height: float) -> list[dict]:
+def _across_the_zone(
+    a: dict, b: dict, units: list[dict], zones: list[list[float]]
+) -> bool:
+    """Say whether a footnote unit and a block over the body must not
+    link.
+
+    :func:`section` puts a group whole on one side of the footnote
+    zone, by the share of the group's box inside it, so a block that
+    spans a column's body and its footnotes takes the footnotes with
+    it into the body, and the page has none; and a footnote merged
+    into a block of the body that a mask excludes is dropped with it,
+    the first half of a footnote of 178 F.4th 66. The two sides are
+    read by :data:`FOOTNOTE_SHARE`, the rule of :func:`section`. The
+    guard holds only against a block that also holds a body unit of
+    another engine: two readings of one footnote that the zone's edge
+    cuts differently still link, or the footnote would be written
+    twice.
+
+    :param a: One unit.
+    :param b: A unit of another engine that overlaps it.
+    :param units: Every speaking unit of the page.
+    :param zones: The page's footnote zones, in points.
+    :returns: Whether the two must not link.
+    :rtype: bool
+    """
+    if not zones:
+        return False
+    a_in = zone_share(a["box_pt"], zones) >= FOOTNOTE_SHARE
+    b_in = zone_share(b["box_pt"], zones) >= FOOTNOTE_SHARE
+    if a_in == b_in:
+        return False
+    out = b if a_in else a
+    out_box = out["box_pt"]
+    return any(
+        unit is not out
+        and unit["engine"] != out["engine"]
+        and area(unit["box_pt"]) < area(out_box)
+        and zone_share(unit["box_pt"], zones) < FOOTNOTE_SHARE
+        and contained(unit["box_pt"], out_box) >= OVERLAP
+        for unit in units
+    )
+
+
+def align_page(
+    units: list[dict],
+    width: float,
+    height: float,
+    zones: list[list[float]] = (),
+) -> list[dict]:
     """Return the aligned groups of one page, unordered.
 
     **A unit that reads nothing does not link.** The guard exists so
@@ -1192,11 +1240,17 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     (:func:`_containers`, #451): it reads, but its box is not where its
     text lies, and it would chain the page.
 
+    **A unit inside the footnote zone does not link to a block over
+    the body** that also holds a body unit of another engine
+    (:func:`_across_the_zone`): the group would go whole to one
+    section, and the footnote with it.
+
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
         ``exclusion`` and ``share``.
     :param width: The page width, in points.
     :param height: The page height, in points.
+    :param zones: The page's footnote zones, in points.
     :returns: The groups, each with ``engines``, ``present``,
         ``box_pt``, ``page_scale``, ``alignment_iou``, ``weak`` and the
         exclusion of its members.
@@ -1219,7 +1273,7 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     quiet.extend(_silenced(u) for u in speaking if id(u) in containers)
     speaking = [u for u in speaking if id(u) not in containers]
 
-    union = _link(speaking)
+    union = _link(speaking, zones)
 
     buckets: dict[int, list[int]] = {}
     for index in range(len(speaking)):
@@ -1237,23 +1291,28 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     return groups
 
 
-def _link(speaking: list[dict]) -> _Union:
+def _link(speaking: list[dict], zones: list[list[float]] = ()) -> _Union:
     """Return the links of the units of a page that read something.
 
     Two units of different engines link when the intersection covers
-    :data:`OVERLAP` of the smaller box.
+    :data:`OVERLAP` of the smaller box, unless the footnote zone holds
+    them apart (:func:`_across_the_zone`).
 
     :param speaking: The units of the page that read something.
+    :param zones: The page's footnote zones, in points.
     :returns: The union-find over ``speaking``, by index.
     :rtype: _Union
     """
     union = _Union(len(speaking))
     for left, right in combinations(range(len(speaking)), 2):
-        if speaking[left]["engine"] == speaking[right]["engine"]:
+        a, b = speaking[left], speaking[right]
+        if a["engine"] == b["engine"]:
             continue
-        share = contained(speaking[left]["box_pt"], speaking[right]["box_pt"])
-        if share >= OVERLAP:
-            union.join(left, right)
+        if contained(a["box_pt"], b["box_pt"]) < OVERLAP:
+            continue
+        if _across_the_zone(a, b, speaking, zones):
+            continue
+        union.join(left, right)
     return union
 
 
@@ -2630,7 +2689,7 @@ def build_page(
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
     entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
-    groups = align_page(units, width, height)
+    groups = align_page(units, width, height, zones)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
     # too, and a page with two footnotes has too few boxes of its own

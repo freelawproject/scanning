@@ -223,6 +223,49 @@ class TestTheAlignment(TestCase):
         )
         self.assertTrue(groups[0]["page_scale"])
 
+    def test_a_footnote_does_not_link_to_a_block_over_the_body(self):
+        """One engine reads a column's body and its footnote as one
+        block, and no sibling of its own makes it a container. The
+        other engine's footnote keeps its own group, or the page has
+        none."""
+        zone = [40, 600, 570, 720]
+        units = [
+            unit("surya", 0, (50, 60, 290, 720), "body one body two 1. note"),
+            unit("dots_mocr", 0, (50, 60, 290, 300), "body one"),
+            unit("dots_mocr", 1, (50, 320, 290, 580), "body two"),
+            unit("dots_mocr", 2, (50, 610, 290, 700), "1. note"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT, zones=[zone])
+
+        self.assertEqual(len(groups), 2)
+        note = next(g for g in groups if "surya" not in g["engines"])
+        self.assertEqual(note["engines"]["dots_mocr"]["ids"], [2])
+        body = next(g for g in groups if "surya" in g["engines"])
+        self.assertEqual(body["engines"]["dots_mocr"]["ids"], [0, 1])
+
+    def test_two_readings_of_one_footnote_link_across_the_zone_edge(self):
+        """A footnote cell the zone's edge cuts differently still links
+        to the other engine's reading of it: the guard is against a
+        block that also holds the body, never against a box a few
+        points out, or the footnote would be written twice."""
+        zone = [40, 600, 570, 720]
+        units = [
+            unit("dots_mocr", 0, (50, 100, 290, 580), "body"),
+            unit("dots_mocr", 1, (50, 610, 290, 700), "1. note"),
+            unit("mistral_ocr", 0, (50, 100, 290, 580), "body"),
+            # 100 of its 220 points are in the zone: under the share.
+            unit("mistral_ocr", 1, (50, 480, 290, 700), "1. note"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT, zones=[zone])
+
+        self.assertEqual(len(groups), 2)
+        note = next(
+            g for g in groups if g["engines"]["dots_mocr"]["ids"] == [1]
+        )
+        self.assertEqual(note["engines"]["mistral_ocr"]["ids"], [1])
+
     def test_a_box_that_reads_nothing_and_covers_nothing_is_dropped(self):
         units = [
             unit("dots_mocr", 0, (0, 0, 100, 60), "", label="Picture"),
