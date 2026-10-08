@@ -506,6 +506,30 @@ class TestTheXml(SimpleTestCase):
         self.assertLess(xml.index("The court held."), xml.index("<figure>"))
         self.assertLess(xml.index("</figure>"), xml.index("So ordered."))
 
+    def test_a_page_that_starts_at_the_picture_is_numbered_in_it(self):
+        """The star number is a citation anchor, and a page that starts
+        at a picture must not lose it: it opens the ``figure``."""
+        body = body_with_picture()
+        body[1]["pages"] = [1]
+        body[2]["pages"] = [1]
+        approved = {
+            "opinion": {},
+            "pages": [
+                {"page_in_opinion": 0, "printed": "256"},
+                {"page_in_opinion": 1, "printed": "257"},
+            ],
+            "footnotes": [],
+            "body": body,
+        }
+
+        xml = casebody.build(approved, {"spans": []})
+
+        self.assertIn(
+            '<figure><page-number label="257">*257</page-number><img ',
+            xml,
+        )
+        self.assertEqual(xml.count("*257"), 1)
+
     def test_a_picture_with_no_image_writes_no_img(self):
         for data in (None, 'x" onerror="alert(1)'):
             xml = self.build(body_with_picture(data=data))
@@ -853,6 +877,50 @@ class TestTheCard(FigureTestCase):
 
 
 class TestTheApproval(FigureTestCase):
+    def test_the_approved_picture_reaches_the_final_xml(self):
+        """The chain a curator runs: the cut, the approval, the XML.
+
+        The picture's own bytes, as base64, sit in the XML between the
+        two paragraphs around it, at its printed size, and nothing of
+        the cut's box is left in the approved object.
+        """
+        self.ready()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=F("glue_revision")
+        )
+        self.opinion.refresh_from_db()
+        jpeg = white_jpeg(40, 30)
+        with self.fake_source(answer=jpeg):
+            opinion_figures.cut_one(self.opinion)
+        self.opinion.refresh_from_db()
+        self.assertTrue(opinions.text_review_ready(self.opinion))
+
+        with patch(
+            "scanning.s3_sync.download_bytes_object",
+            side_effect=lambda key: self.cuts[key],
+        ):
+            key = opinion_review.approve_text(
+                self.opinion, get_user_model().objects.create(username="c")
+            )
+
+        approved = self.uploads[key]
+        figure = next(
+            p for p in approved["body"] if p["kind"] == markup.FIGURE
+        )
+        self.assertNotIn("box_pt", figure["figure"])
+        xml = casebody.build(approved, {"spans": []})
+        data = base64.b64encode(jpeg).decode("ascii")
+        width_pt = figure["figure"]["width_pt"]
+        self.assertIn(
+            f'<img src="data:image/jpeg;base64,{data}" alt="" '
+            f'width="{round(width_pt * casebody.PIXELS_PER_POINT)}"',
+            xml,
+        )
+        # In its place: after the text of the page above it, before the
+        # text of the next page.
+        self.assertLess(xml.index("body B 2"), xml.index("<figure>"))
+        self.assertLess(xml.index("</figure>"), xml.index("body A 3"))
+
     def test_the_approval_embeds_the_cut(self):
         self.run_ensemble()
         document = self.stored()
