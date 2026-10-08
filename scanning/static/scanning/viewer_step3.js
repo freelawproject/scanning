@@ -805,9 +805,15 @@
             + '&box=' + encodeURIComponent((group.box_pt || []).join(','));
         fetch(address + query, { credentials: 'same-origin' })
             .then(function (response) {
-                return response.json().then(function (data) {
+                // A server fault can answer a page and no JSON: the line
+                // is then ours, never the parser's.
+                return response.json().catch(function () {
+                    return {};
+                }).then(function (data) {
                     if (!response.ok || !data.url) {
-                        throw new Error(data.error || 'no picture');
+                        throw new Error(
+                            data.error || 'The picture could not be loaded.'
+                        );
                     }
                     image.src = data.url;
                 });
