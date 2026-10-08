@@ -347,14 +347,6 @@
             canvas.width = width;
             canvas.height = height;
             canvas.getContext('2d').drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
-            var hl = wrap.querySelector('.bk-hl');
-            if (hl && card.crop.highlight) {
-                var h = card.crop.highlight;
-                hl.style.left = ((h[0] * SCALE - x0) / width * 100) + '%';
-                hl.style.top = ((h[1] * SCALE - y0) / height * 100) + '%';
-                hl.style.width = ((h[2] - h[0]) * SCALE / width * 100) + '%';
-                hl.style.height = ((h[3] - h[1]) * SCALE / height * 100) + '%';
-            }
         }).catch(function (error) {
             wrap.replaceChildren(note('The scan did not load: ' + error.message, 'error'));
         });
@@ -373,9 +365,11 @@
         if (card.kind === 'link') {
             node.appendChild(note(card.message));
         } else {
+            // The crop alone, no highlight: the line is a guess from the
+            // word's place in the block's text, and a box drawn on a
+            // guess points at the wrong words more often than not.
             var wrap = el('div', 'bk-cropwrap');
             wrap.appendChild(el('canvas'));
-            if (card.crop && card.crop.highlight) { wrap.appendChild(el('div', 'bk-hl')); }
             node.appendChild(wrap);
             if (card.kind === 'word') { node.appendChild(snippet(card)); }
             node.appendChild(stack(section, card, node));

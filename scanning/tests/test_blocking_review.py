@@ -93,6 +93,36 @@ class TestOpenWords(TestCase):
         )
         self.assertEqual([w["start"] for w in words], [10, 18])
 
+    def test_a_span_the_engines_joined_is_one_card_over_the_span(self):
+        """dots.mocr writes ``Ill. Adm. Code`` as three words and the
+        others as one, and Surya glues the section number on too. The
+        vote aligns them at ``Ill.``, where no two engines agree. One
+        card covers the four words, with each engine's reading of
+        them, so the answer replaces the span and never one word."""
+        words = blocking_review.open_words(
+            read(
+                "under 20 Ill. Adm. Code 501,30(a) which",
+                "under 20 Ill.Adm.Code 501,30(a) which",
+                "under 20 Ill.Adm.Code501,30(a) which",
+            )
+        )
+
+        self.assertEqual(len(words), 1)
+        word = words[0]
+        self.assertEqual(word["token"], "Ill. Adm. Code 501,30(a)")
+        self.assertEqual((word["start"], word["length"]), (9, 24))
+        self.assertEqual(
+            [r["word"] for r in word["readings"]],
+            [
+                "Ill. Adm. Code 501,30(a)",
+                "Ill.Adm.Code 501,30(a)",
+                "Ill.Adm.Code501,30(a)",
+            ],
+        )
+        self.assertEqual(
+            (word["before"], word["after"]), ("under 20", "which")
+        )
+
     def test_a_block_with_two_open_words_has_two_cards_in_order(self):
         words = blocking_review.open_words(
             read(

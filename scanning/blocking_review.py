@@ -106,8 +106,53 @@ def _reading(
     return entry[1]
 
 
+def _span_ends(at: dict) -> dict[int, int]:
+    """Return ``{head: last position}`` of every span one engine joined.
+
+    ``_candidates`` records an engine's reading of several base words
+    as one at the first of them and marks the rest ``Carried`` (#391).
+
+    :param at: ``_candidates``'s first answer for one engine.
+    :returns: The last base position of each span, by its head.
+    :rtype: dict[int, int]
+    """
+    ends: dict[int, int] = {}
+    for position, entries in at.items():
+        for entry in entries:
+            if isinstance(entry, ensemble.Carried):
+                ends[entry.head] = max(
+                    ends.get(entry.head, entry.head), position
+                )
+    return ends
+
+
+def _span_at(at: dict, ends: dict[int, int], position: int) -> tuple[int, int]:
+    """Return the base positions one engine's reading at ``position``
+    covers: the span it joined, or the position alone."""
+    for entry in at.get(position) or []:
+        if isinstance(entry, ensemble.Carried):
+            return entry.head, ends[entry.head]
+    if position in ends:
+        return position, ends[position]
+    return position, position
+
+
+def _span_reading(at: dict, first: int, last: int) -> str:
+    """Return one engine's words over the base positions ``first`` to
+    ``last``: a joined span once, at its head, and a word per position
+    elsewhere."""
+    words = []
+    for position in range(first, last + 1):
+        for entry in at.get(position) or []:
+            if isinstance(entry, ensemble.Carried):
+                continue
+            if entry[1]:
+                words.append(entry[1])
+    return " ".join(words)
+
+
 def open_words(group: dict) -> list[dict]:
-    """Return the words of one voted group no two engines agree on.
+    """Return the places of one voted group no two engines agree on.
 
     The vote is run again over the group's own readings, the inputs
     the build had, so the tokens are the ones the document holds and
@@ -116,10 +161,21 @@ def open_words(group: dict) -> list[dict]:
     (``ensemble._candidates``), so the rows of the card are the votes
     that were cast.
 
+    **A card covers the span the engines joined.** dots.mocr writes
+    ``Ill. Adm. Code`` as three words and the others as one, so the
+    vote aligns them at the first word and the other engines' reading
+    there is the whole span. A card per word would put that span into
+    one word's place of the text, and the row for the one engine that
+    split the span would show a word while the others show three. So
+    every open position is widened to the span any engine joined over
+    it, the spans that touch are one card, and each row is that
+    engine's words over the whole span: the answer replaces the span.
+    A word of a run the base did not read is a card of its own.
+
     :param group: One group of a stamped ensemble document.
-    :returns: One entry per open word: ``{start, length, token,
+    :returns: One entry per open place: ``{start, length, token,
         before, after, readings: [{engine, word}]}``, with ``start`` an
-        offset into the group's ``text``.
+        offset into the group's ``text`` and ``token`` the text there.
     :rtype: list[dict]
     """
     if group.get("agreement") != ensemble.VOTED:
@@ -137,55 +193,118 @@ def open_words(group: dict) -> list[dict]:
     candidates = {
         name: ensemble._candidates(base_pairs, pairs) for name, pairs in others
     }
+    ends = {name: _span_ends(at) for name, (at, _) in candidates.items()}
     shown = [token["text"] for token in tokens if token["text"]]
-    words: list[dict] = []
+
+    # Every token with its offset, its index among the shown words and
+    # its place in an inserted run.
+    placed: list[dict] = []
     offset = 0
-    index = 0
     run_index: int | None = None
     for token in tokens:
         if not token["text"]:
             continue
-        start = offset
-        offset += len(token["text"]) + 1
-        index += 1
-        # The tokens of one inserted run follow each other at one
-        # position: the first is 0, the next 1, and a word the base
-        # read ends the run.
         if token.get("inserted"):
             run_index = 0 if run_index is None else run_index + 1
         else:
             run_index = None
-        if not token.get("low_confidence"):
+        placed.append(
+            {
+                "token": token,
+                "start": offset,
+                "end": offset + len(token["text"]),
+                "index": len(placed),
+                "run_index": run_index,
+            }
+        )
+        offset += len(token["text"]) + 1
+
+    def context(first_index: int, last_index: int) -> tuple[str, str]:
+        return (
+            " ".join(shown[max(0, first_index - CONTEXT_WORDS) : first_index]),
+            " ".join(shown[last_index + 1 : last_index + 1 + CONTEXT_WORDS]),
+        )
+
+    words: list[dict] = []
+    # The open positions the base read, widened to the spans the
+    # engines joined over them, then merged where they touch.
+    spans: list[list[int]] = []
+    for entry in placed:
+        token = entry["token"]
+        if not token.get("low_confidence") or entry["run_index"] is not None:
             continue
-        position = token["position"]
+        first = last = token["position"]
+        for name, (at, _) in candidates.items():
+            lo, hi = _span_at(at, ends[name], token["position"])
+            first, last = min(first, lo), max(last, hi)
+        # Spans that overlap are one card; two open words that merely
+        # stand side by side are two decisions.
+        if spans and first <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], last)
+        else:
+            spans.append([first, last])
+    for first, last in spans:
+        covered = [
+            e
+            for e in placed
+            if e["run_index"] is None
+            and first <= e["token"]["position"] <= last
+        ]
+        if not covered:
+            continue
+        before, after = context(covered[0]["index"], covered[-1]["index"])
         readings = [
             {
                 "engine": base,
-                "word": READ_NOTHING
-                if run_index is not None or position >= len(base_pairs)
-                else base_pairs[position][1],
+                "word": " ".join(
+                    base_pairs[p][1]
+                    for p in range(first, last + 1)
+                    if p < len(base_pairs)
+                ),
             }
         ]
-        for name, _ in others:
-            at, inserted = candidates[name]
+        for name, (at, _) in candidates.items():
+            readings.append(
+                {"engine": name, "word": _span_reading(at, first, last)}
+            )
+        words.append(
+            {
+                "start": covered[0]["start"],
+                "length": covered[-1]["end"] - covered[0]["start"],
+                "token": " ".join(e["token"]["text"] for e in covered),
+                "before": before,
+                "after": after,
+                "readings": readings,
+            }
+        )
+    # The words of a run the base did not read, one card each.
+    for entry in placed:
+        token = entry["token"]
+        if not token.get("low_confidence") or entry["run_index"] is None:
+            continue
+        position = token["position"]
+        before, after = context(entry["index"], entry["index"])
+        readings = [{"engine": base, "word": READ_NOTHING}]
+        for name, (at, inserted) in candidates.items():
             readings.append(
                 {
                     "engine": name,
-                    "word": _reading(at, inserted, position, run_index),
+                    "word": _reading(
+                        at, inserted, position, entry["run_index"]
+                    ),
                 }
             )
         words.append(
             {
-                "start": start,
-                "length": len(token["text"]),
+                "start": entry["start"],
+                "length": entry["end"] - entry["start"],
                 "token": token["text"],
-                "before": " ".join(
-                    shown[max(0, index - 1 - CONTEXT_WORDS) : index - 1]
-                ),
-                "after": " ".join(shown[index : index + CONTEXT_WORDS]),
+                "before": before,
+                "after": after,
                 "readings": readings,
             }
         )
+    words.sort(key=lambda w: w["start"])
     return words
 
 
