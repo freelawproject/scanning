@@ -1388,7 +1388,9 @@ def column_boundary(
     """Return the x that separates the two columns, or None.
 
     Only the body boxes vote: a running head and a footer straddle the
-    gutter and would hide it. The boundary is the right cluster's first
+    gutter and would hide it. A body box across the middle of the page
+    does not vote either (#463): a picture or a centered line is on
+    both sides. The boundary is the right cluster's first
     edge less a pad, not the middle of the gap, because the left
     column's text runs up to the gutter.
 
@@ -1403,7 +1405,14 @@ def column_boundary(
     :rtype: float | None
     """
     _, body, _ = _split_bands(boxes, height)
-    edges = sorted(box["box_pt"][0] for box in body)
+    # A box across the middle of the page is no column's (#463): a
+    # picture or a centered line sits on both sides, and its left edge
+    # would split the left column from its own text.
+    edges = sorted(
+        box["box_pt"][0]
+        for box in body
+        if not _straddles(box["box_pt"], width / 2, width)
+    )
     if len(edges) < MIN_BODY_BOXES:
         return None
     gap, right_edge = 0.0, None
