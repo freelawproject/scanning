@@ -756,7 +756,9 @@ class TestTheVote(TestCase):
         for token in answer["tokens"]:
             self.assertNotIn("<", token["text"])
             self.assertIn("text", token)
-            self.assertLessEqual(set(token), {"text", "low_confidence"})
+            self.assertLessEqual(
+                set(token), {"text", "low_confidence", "position"}
+            )
 
     def test_typography_is_not_a_disagreement(self):
         """The engines differ about the quotes on almost every page of
@@ -814,13 +816,15 @@ class TestTheVote(TestCase):
         self.assertEqual(
             tokens,
             [
-                {"text": "alpha"},
+                {"text": "alpha", "position": 0},
                 {
                     "text": "beta",
                     "low_confidence": True,
                     "inserted": True,
+                    # The run went in before the base's second word.
+                    "position": 1,
                 },
-                {"text": "gamma"},
+                {"text": "gamma", "position": 1},
             ],
         )
         self.assertEqual(disputed, 1)

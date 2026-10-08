@@ -13,6 +13,7 @@ from scanning.views import (
     legacy_opinion_upload,
     login_view,
     logout_view,
+    opinion_blocking_review,
     opinion_list,
     opinion_review,
     password_change,
@@ -79,6 +80,7 @@ from scanning.views_process import (
     dismiss_page_repair,
     glued_output_index,
     move_page,
+    opinion_blocking_cards,
     opinion_ensemble_url,
     opinion_file_index,
     opinion_final_xml,
@@ -128,6 +130,11 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
+    path(
+        "opinions/blocking/",
+        opinion_blocking_review,
+        name="opinion_blocking_review",
+    ),
     path(
         "opinions/<int:pk>/review/",
         opinion_review,
@@ -324,6 +331,11 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/pdf-url/",
         opinion_pdf_url,
         name="opinion_pdf_url",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/blocking-cards/",
+        opinion_blocking_cards,
+        name="opinion_blocking_cards",
     ),
     path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
