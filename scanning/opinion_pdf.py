@@ -1007,7 +1007,8 @@ def write_one(opinion: Opinion) -> dict:
 
 
 def _release_if_done(scan: Scan) -> bool:
-    """Release the scan's local mirror when no row of it owes a PDF.
+    """Release the scan's local mirror when no row of it owes a PDF,
+    and no row owes the cut of its pictures (#463).
 
     :func:`owed` and not :func:`due`: a row under its cooldown still
     owes its PDF. Reading the cooldown here would free the tree of a
@@ -1019,7 +1020,12 @@ def _release_if_done(scan: Scan) -> bool:
     :returns: Whether a tree was removed.
     :rtype: bool
     """
+    from scanning import opinion_figures
+
     if owed().filter(scan=scan).exists():
+        return False
+    # The cut of the pictures pulls the shards into the same tree (#463).
+    if opinion_figures.owed().filter(scan=scan).exists():
         return False
     return s3_sync.release_local_processing(scan)
 
