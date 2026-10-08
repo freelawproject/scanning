@@ -2564,6 +2564,10 @@ class OpinionCheck(models.TextChoices):
         "unresolved_edit",
         "A human edit no longer fits the text",
     )
+    FIGURE_ONE_ENGINE = (
+        "figure_one_engine",
+        "One engine alone drew a picture",
+    )
 
 
 #: The checks a curator may dismiss. The two stale checks are facts
@@ -2868,6 +2872,32 @@ class Opinion(AbstractDateTimeModel):
             "(#336). The row is not due again before "
             "opinion_pdf.retry_after() has passed. Cleared when the PDF "
             "is written."
+        ),
+    )
+    figure_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "A digest of the pictures of the ensemble document (#463), "
+            "stamped by the ensemble: blank when the text holds none."
+        ),
+    )
+    figures_cut_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The figure_digest the pictures were cut at (#463). Equal to "
+            "figure_digest, or a blank figure_digest: every picture is "
+            "cut, the one rule opinion_figures.is_written reads."
+        ),
+    )
+    figure_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed cuts of this row's pictures that the rows explain "
+            "(#463). At opinion_figures.MAX_ATTEMPTS the row goes to ERROR."
         ),
     )
     notes = models.TextField(blank=True, default="")
