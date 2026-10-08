@@ -135,6 +135,8 @@ button of the review page waive the gate for it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import time
@@ -181,8 +183,9 @@ logger = logging.getLogger(__name__)
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
-#: and the page its list runs (``lists``, #428).
-SCHEMA_VERSION = 11
+#: and the page its list runs (``lists``, #428). 12 writes a picture
+#: as a ``figure`` group with no text, its size under ``figure`` (#463).
+SCHEMA_VERSION = 12
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -314,6 +317,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.UNRESOLVED_EDIT,
+        OpinionCheck.FIGURE_ONE_ENGINE,
     }
 )
 
@@ -1196,8 +1200,13 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     # group can span the gutter, and the members inside it read by
     # column like everything else (:func:`reading_order`).
     boundary = column_boundary(units, width, height)
-    speaking, quiet = [], []
+    speaking, quiet, pictures = [], [], []
     for unit in units:
+        if unit.get("kind") == markup.FIGURE:
+            # A picture links with the pictures alone (#463), so it
+            # never takes the text around it into its group.
+            pictures.append(unit)
+            continue
         # :func:`plain` and never ``compare_text``: a lone heading
         # mark is text to a comparison and no reading. A box that
         # reads nothing must not link, whatever it wrote in place of
@@ -1225,6 +1234,54 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
             )
         groups.append(_group(by_engine, line_band, page_area, boundary, width))
     _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
+    return groups + _figure_groups(
+        pictures, line_band, page_area, boundary, width
+    )
+
+
+def _figure_groups(
+    pictures: list[dict],
+    line_band: float,
+    page_area: float,
+    boundary: float | None,
+    width: float,
+) -> list[dict]:
+    """Return the picture groups of one page (#463).
+
+    The engines' picture boxes link by the rule of the text,
+    :data:`OVERLAP` of the smaller box, and never with a text unit: a
+    picture reads nothing, and a box that reads nothing must not chain
+    the text of a page. The group is flagged ``figure``; its box is the
+    union of the engines' boxes, the rule of every group.
+
+    :param pictures: The units of the ``figure`` kind.
+    :param line_band: The height of one line band, in points.
+    :param page_area: The area of the page, in square points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
+    :returns: The groups.
+    :rtype: list[dict]
+    """
+    union = _Union(len(pictures))
+    for left, right in combinations(range(len(pictures)), 2):
+        if pictures[left]["engine"] == pictures[right]["engine"]:
+            continue
+        share = contained(pictures[left]["box_pt"], pictures[right]["box_pt"])
+        if share >= OVERLAP:
+            union.join(left, right)
+    buckets: dict[int, list[int]] = {}
+    for index in range(len(pictures)):
+        buckets.setdefault(union.find(index), []).append(index)
+    groups = []
+    for indices in buckets.values():
+        by_engine: dict[str, list[dict]] = {}
+        for index in indices:
+            by_engine.setdefault(pictures[index]["engine"], []).append(
+                pictures[index]
+            )
+        group = _group(by_engine, line_band, page_area, boundary, width)
+        group["figure"] = True
+        groups.append(group)
     return groups
 
 
@@ -2138,6 +2195,7 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
     :rtype: tuple[list[dict], list[dict]]
     """
     placed, unplaced = [], []
+    spec = opinion_ocr.ENGINES.get(engine)
     for unit in page.get("units") or []:
         if not isinstance(unit, dict):
             continue
@@ -2160,13 +2218,32 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
             # A document of the glue before #404 has none of these,
             # and reads as plain paragraphs.
             "marks": unit.get("marks") or [],
-            "kind": unit.get("kind") or markup.PARAGRAPH,
+            "kind": _unit_kind(unit, spec),
             "table": unit.get("table"),
             # The glue deleted a bracket token of this unit (#373).
             "bracket": bool(unit.get("removed")),
         }
         (placed if box else unplaced).append(entry)
     return placed, unplaced
+
+
+def _unit_kind(unit: dict, spec) -> str:
+    """Return the kind of one unit, a picture by its label too (#463).
+
+    The glue gives a picture unit the ``figure`` kind from the engine's
+    label (``EngineSpec.kind_types``). A document glued before that
+    reads the label here, so a picture needs a run of the ensemble and
+    no new glue.
+
+    :param unit: One unit of an opinion document.
+    :param spec: The engine's ``opinion_ocr.EngineSpec``, or None.
+    :returns: A ``markup.BLOCK_KINDS`` value.
+    :rtype: str
+    """
+    label = unit.get("type") or ""
+    if spec is not None and spec.kind_types.get(label) == markup.FIGURE:
+        return markup.FIGURE
+    return unit.get("kind") or markup.PARAGRAPH
 
 
 def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
@@ -2225,6 +2302,10 @@ def _counts() -> dict:
         "blockquote_lists": 0,
         "lists": 0,
         "unresolved_edits": 0,
+        # The pictures of the page (#463), and those one engine alone
+        # drew in a document of more engines.
+        "figures": 0,
+        "figure_single": 0,
     }
 
 
@@ -2538,20 +2619,30 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
+    # A picture takes no edit of its text, its section or its quote
+    # (#463): the views refuse them, and a box copy must not land one.
+    texts = [group for group in groups if not group.get("figure")]
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
         (OpinionEdit.Kind.TEXT, "_text_edit"),
         (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], groups)
+        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
         for here, edit in enumerate(wanted):
             if here in landed:
-                groups[landed[here]][key] = edit
+                texts[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
+        if group.get("figure"):
+            # A picture is body text in its place (#463): no zone moves
+            # it to the footnotes and none makes it a quote.
+            group["section"], group["footnote_doubt"] = BODY, False
+            group["blockquote"] = group["_zone_blockquote"] = False
+            by_section[BODY].append(group)
+            continue
         group["section"], group["footnote_doubt"] = section(group, zones)
         placed = group.get("_section_edit")
         if placed and placed["section"] in by_section:
@@ -2592,6 +2683,15 @@ def build_page(
     # still parts two quotes.
     sequence: list[dict] = []
     for group in ordered:
+        if group.get("figure") and not group["excluded"]:
+            entry["groups"].append(
+                _figure_entry(group, len(entry["groups"]), offsets[BODY])
+            )
+            sequence.append(entry["groups"][-1])
+            entry["counts"]["figures"] += 1
+            if len(group["engines"]) == 1 and len(pages) > 1:
+                entry["counts"]["figure_single"] += 1
+            continue
         read_back = resolve(group)
         if group["excluded"] or not read_back["text"]:
             # A redaction or a mask took the block, or no engine reads
@@ -2736,9 +2836,12 @@ def build_page(
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
-    for group in entry["groups"]:
+    # A picture never goes to the footnotes (#463), so it is in no
+    # block's ``below`` and has none of its own.
+    texts = [g for g in entry["groups"] if g["kind"] != markup.FIGURE]
+    for group in texts:
         if group["section"] == BODY:
-            group["below"] = blocks_below(entry["groups"], group)
+            group["below"] = blocks_below(texts, group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
@@ -2765,6 +2868,69 @@ def build_page(
     entry["unresolved_edits"] = unresolved
     entry["counts"]["unresolved_edits"] = len(unresolved)
     return entry
+
+
+def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
+    """Return the document entry of one picture group (#463).
+
+    The shape of a text group, so every reader of the groups reads it,
+    with no text: ``start`` and ``end`` are the place in the body text
+    the picture sits at, and the body text takes no paragraph for it.
+    ``figure`` holds the box and the size the picture has on the page,
+    which the cut and the approved text read. It has no ``level``: the
+    engines vote on no text here.
+
+    :param group: The picture group of :func:`align_page`.
+    :param group_id: Its id in the page.
+    :param offset: The body offset it sits at.
+    :returns: The entry.
+    :rtype: dict
+    """
+    box = group["box_pt"]
+    engines = _ranked(group["engines"])
+    return {
+        "id": group_id,
+        "band": group["band"],
+        "column": group["column"],
+        "section": BODY,
+        "footnote_doubt": False,
+        "footnote_by": [],
+        "blockquote": False,
+        "quote_span": None,
+        "quote_edit": None,
+        "list_by": [],
+        "box_pt": box,
+        "start": offset,
+        "end": offset,
+        "agreement": UNANIMOUS if len(engines) > 1 else SINGLE,
+        "source": engines[0],
+        "agreeing": engines,
+        "alignment_iou": group["alignment_iou"],
+        "weak": group["weak"],
+        "page_scale": group["page_scale"],
+        "silent": [],
+        "n_low_confidence": 0,
+        "level": None,
+        "human": None,
+        "section_edit": None,
+        "tokens": [],
+        "text": "",
+        "kind": markup.FIGURE,
+        "list": None,
+        "marks": [],
+        "figure": {
+            "width_pt": round(box[2] - box[0], 2),
+            "height_pt": round(box[3] - box[1], 2),
+        },
+        "engines": {
+            name: {
+                "ids": unit["ids"],
+                "box_pt": unit["box_pt"],
+                "text": "",
+            }
+            for name, unit in group["engines"].items()
+        },
+    }
 
 
 def _no_group(entry: dict, edits: list[dict]) -> None:
@@ -3361,6 +3527,17 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("figure_single"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.FIGURE_ONE_ENGINE,
+                    Issue.Severity.WARNING,
+                    _figure_message(page),
+                    standing,
+                )
+            )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
 
@@ -3373,6 +3550,26 @@ _REASON_WORDS = {
     "outside": "the mask of the opinion before",
     opinion_ocr.PAGE_NUMBER: "the page number",
 }
+
+
+def _figure_message(page: dict) -> str:
+    """Return the line of one ``FIGURE_ONE_ENGINE`` card (#463).
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    lonely = [
+        group
+        for group in page["groups"]
+        if group.get("kind") == markup.FIGURE
+        and len(group.get("engines") or {}) == 1
+    ]
+    named = ", ".join(_ranked({g["source"] for g in lonely})) or "One engine"
+    return (
+        f"{named} alone drew {len(lonely)} picture(s) on this page. Check "
+        "the picture against the PDF: the final text embeds it."
+    )
 
 
 def _unread_message(page: dict) -> str:
@@ -3658,6 +3855,55 @@ def _read(key: str, code: str = UNREADABLE) -> dict:
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
 
+def figures_of(document: dict) -> list[dict]:
+    """Return the pictures of an ensemble document, in reading order (#463).
+
+    **The one reader** of the pictures of a text: the cut, the approval
+    and the review page walk the same list.
+
+    :param document: The ensemble document.
+    :returns: ``{"page_in_opinion", "page_index", "group", "box_pt",
+        "width_pt", "height_pt"}`` per picture.
+    :rtype: list[dict]
+    """
+    figures = []
+    for page in document.get("pages") or []:
+        for group in page.get("groups") or []:
+            if group.get("kind") != markup.FIGURE:
+                continue
+            figures.append(
+                {
+                    "page_in_opinion": page.get("page_in_opinion"),
+                    "page_index": page.get("page_index"),
+                    "group": group.get("id"),
+                    "box_pt": list(group["box_pt"]),
+                    **(group.get("figure") or {}),
+                }
+            )
+    return figures
+
+
+def figure_digest(document: dict) -> str:
+    """Return the digest of the pictures of a document, or blank (#463).
+
+    Over the run and the place of each picture, and nothing else: a
+    rebuild that moves a block, or a glue that reads the same pictures,
+    keeps the digest, so the cut is not paid again.
+
+    :param document: The ensemble document.
+    :returns: A hex digest, or "" when the text holds no picture.
+    :rtype: str
+    """
+    places = sorted(
+        (figure["page_index"], [round(v, 1) for v in figure["box_pt"]])
+        for figure in figures_of(document)
+    )
+    if not places:
+        return ""
+    raw = json.dumps([document.get("apply_run") or "", places])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def read_document(opinion: Opinion) -> dict:
     """Read the stamped ensemble document of one opinion off S3.
 
@@ -3766,6 +4012,11 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
                 ensemble_revision=opinion.ocr_glue_revision,
                 ensemble_edit_revision=edit_revision,
                 ensemble_attempts=0,
+                # The pictures the text holds (#463): the ledger the
+                # cut of ``opinion_figures`` answers, with a clean count
+                # of its faults.
+                figure_digest=figure_digest(document),
+                figure_attempts=0,
             )
             if not stamped:
                 # The glue wrote the documents again while this ran, or
