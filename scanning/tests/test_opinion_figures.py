@@ -19,8 +19,10 @@ import pathlib
 from contextlib import contextmanager
 from unittest.mock import patch
 
+import fitz
 from botocore.exceptions import ClientError
 from django.contrib.auth import get_user_model
+from django.db.models import F
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 
@@ -29,6 +31,7 @@ from scanning import (
     ensemble,
     markup,
     opinion_figures,
+    opinion_pdf,
     opinion_review,
     opinions,
     paragraphs,
@@ -185,6 +188,23 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertNotIn(figures(page)[0]["id"], above["below"])
         self.assertNotIn("below", figures(page)[0])
 
+    def test_a_picture_at_the_head_of_the_page_is_body_text(self):
+        """The approved text reads the body band alone, so a picture in
+        the head band must not fall out of it."""
+        top = [100.0, 10.0, 500.0, 60.0]
+        page = page_of(
+            {
+                name: [picture(name, 0, top), unit(name, 1, BELOW_PT, "Text.")]
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+        )
+
+        self.assertEqual(figures(page)[0]["band"], "body")
+        body = paragraphs.body({"pages": [{"page_in_opinion": 0, **page}]})
+        self.assertEqual(
+            [p["kind"] for p in body], [markup.FIGURE, markup.PARAGRAPH]
+        )
+
     def test_a_document_glued_before_the_kind_reads_the_label(self):
         """A document of the glue before #463 has no ``figure`` kind;
         the label of the engine names the picture."""
@@ -242,6 +262,24 @@ class TestTheColumnBoundary(SimpleTestCase):
         self.assertAlmostEqual(
             boundary, 313.0 - ensemble.EDGE_PAD * self.WIDTH
         )
+
+    def test_a_page_set_off_the_middle_keeps_its_gutter(self):
+        """A scan of a bound book sets the text off the page's middle.
+        The columns of a page shifted either way keep their gutter, the
+        one the rule gave before #463, with no picture on the page."""
+        for shift in (-40.0, -25.0, 25.0, 40.0):
+            boxes = [
+                {"box_pt": [b[0] + shift, b[1], b[2] + shift, b[3]]}
+                for b in (box["box_pt"] for box in self.boxes())
+            ]
+
+            boundary = ensemble.column_boundary(boxes, self.WIDTH, self.HEIGHT)
+
+            self.assertAlmostEqual(
+                boundary,
+                313.0 + shift - ensemble.EDGE_PAD * self.WIDTH,
+                msg=f"shift {shift}",
+            )
 
     def test_a_heading_inside_a_column_still_votes(self):
         """A centered heading of one column ("A. Empaneling Jurors")
@@ -485,6 +523,59 @@ class TestTheXml(SimpleTestCase):
         )
 
 
+def white_jpeg(width: int, height: int) -> bytes:
+    """A white JPEG of the size given."""
+    pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, width, height), False)
+    pix.clear_with(255)
+    return pix.tobytes("jpeg")
+
+
+class TestThePaint(SimpleTestCase):
+    """``opinion_figures.paint``: the rects of a page over a cut."""
+
+    BOX = [100.0, 200.0, 300.0, 300.0]
+
+    def test_a_black_rect_lands_at_its_place_in_the_cut(self):
+        data = white_jpeg(400, 200)
+        rect = {"x0": 150.0, "y0": 250.0, "x1": 200.0, "y1": 275.0}
+
+        painted = fitz.Pixmap(
+            opinion_figures.paint(data, self.BOX, [{**rect, "fill": "black"}])
+        )
+
+        # Points 150-200 x 250-275 are pixels 100-200 x 100-150.
+        self.assertLess(sum(painted.pixel(150, 125)) / 3, 60)
+        self.assertGreater(sum(painted.pixel(50, 50)) / 3, 200)
+        self.assertGreater(sum(painted.pixel(250, 125)) / 3, 200)
+
+    def test_a_rect_off_the_picture_changes_nothing(self):
+        data = white_jpeg(400, 200)
+        rect = {
+            "x0": 10.0,
+            "y0": 10.0,
+            "x1": 50.0,
+            "y1": 50.0,
+            "fill": "black",
+        }
+
+        self.assertEqual(opinion_figures.paint(data, self.BOX, [rect]), data)
+
+    def test_a_rect_over_the_edge_is_clipped_to_the_picture(self):
+        data = white_jpeg(400, 200)
+        rect = {
+            "x0": 0.0,
+            "y0": 0.0,
+            "x1": 120.0,
+            "y1": 600.0,
+            "fill": "black",
+        }
+
+        painted = fitz.Pixmap(opinion_figures.paint(data, self.BOX, [rect]))
+
+        self.assertLess(sum(painted.pixel(20, 100)) / 3, 60)
+        self.assertGreater(sum(painted.pixel(60, 100)) / 3, 200)
+
+
 # ── the ledger and the cut ───────────────────────────────────────────
 class FigureTestCase(EnsembleTestCase):
     """The fixture of the OCR glue, with a picture on page 2 of the
@@ -611,15 +702,23 @@ class TestTheLedger(FigureTestCase):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.figures_cut_digest, "")
 
-    def test_a_picture_with_no_source_spends_attempts_then_ends(self):
+    @override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=0)
+    def test_a_picture_that_does_not_render_spends_attempts_then_ends(self):
         self.run_ensemble()
         Opinion.objects.filter(pk=self.opinion.pk).update(
-            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+            error_message="another pass said this",
         )
 
         with self.fake_source(answer=None):
-            for _ in range(opinion_figures.MAX_ATTEMPTS):
+            for tick in range(opinion_figures.MAX_ATTEMPTS):
                 self.assertEqual(opinion_figures.run_tick(), 0)
+                if tick == 0:
+                    # Below the cap the message is another pass's.
+                    self.opinion.refresh_from_db()
+                    self.assertEqual(
+                        self.opinion.error_message, "another pass said this"
+                    )
 
         self.opinion.refresh_from_db()
         self.assertEqual(
@@ -644,9 +743,83 @@ class TestTheLedger(FigureTestCase):
 
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.figure_attempts, 0)
+        self.assertIsNotNone(self.opinion.figures_attempted_at)
         self.assertTrue(
             opinion_figures.owed().filter(pk=self.opinion.pk).exists()
         )
+        # The row waits its cooldown, so the next tick takes another.
+        self.assertFalse(
+            opinion_figures.due().filter(pk=self.opinion.pk).exists()
+        )
+
+    def test_a_fault_waits_the_cooldown_of_the_pdf_pass(self):
+        self.run_ensemble()
+
+        with self.fake_source(answer=None):
+            opinion_figures.run_tick()
+            self.assertEqual(opinion_figures.run_tick(), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.figure_attempts, 1)
+        self.assertFalse(
+            opinion_figures.due().filter(pk=self.opinion.pk).exists()
+        )
+        with override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=0):
+            self.assertTrue(
+                opinion_figures.due().filter(pk=self.opinion.pk).exists()
+            )
+
+    def test_a_page_with_no_source_is_a_fact_of_the_run(self):
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+
+        with (
+            self.fake_source(),
+            patch("scanning.opinion_pdf._source_of", return_value=None),
+            self.assertRaises(opinion_figures.FigureError),
+        ):
+            opinion_figures.cut_one(self.opinion)
+
+        self.assertEqual(self.cuts, {})
+
+    def test_the_cut_hides_a_redaction_over_part_of_the_picture(self):
+        """A box too small to drop the picture (a name inside a map) is
+        painted on the cut: the original under it never leaves."""
+        box = to_pt(self.PICTURE)
+        name = [box[0] + 10, box[1] + 10, box[0] + 40, box[1] + 20]
+        self.redact(2, name, fill="black")
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        self.assertEqual(len(ensemble.figures_of(self.stored())), 1)
+        width = round((box[2] - box[0]) * 2)
+        height = round((box[3] - box[1]) * 2)
+
+        with self.fake_source(answer=white_jpeg(width, height)):
+            opinion_figures.cut_one(self.opinion)
+
+        cut = fitz.Pixmap(next(iter(self.cuts.values())))
+        self.assertLess(sum(cut.pixel(40, 30)) / 3, 60)
+        self.assertGreater(sum(cut.pixel(width - 10, height - 10)) / 3, 200)
+
+    def test_the_mirror_waits_for_the_cut(self):
+        """The PDF pass frees the local tree only when the cut of the
+        pictures owes nothing of the scan either."""
+        self.run_ensemble()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=F("glue_revision")
+        )
+
+        with patch(
+            "scanning.s3_sync.release_local_processing", return_value=True
+        ) as release:
+            self.assertFalse(opinion_pdf._release_if_done(self.scan))
+
+            self.opinion.refresh_from_db()
+            with self.fake_source():
+                opinion_figures.cut_one(self.opinion)
+            self.assertTrue(opinion_pdf._release_if_done(self.scan))
+
+        release.assert_called_once_with(self.scan)
 
     def test_an_approved_row_is_never_cut(self):
         self.run_ensemble()
