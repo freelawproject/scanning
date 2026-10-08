@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% comment %}
+  The blocking review: every open blocking card of the list's filters,
+  one after the next. One section per opinion, with the addresses the
+  script needs; the cards come from opinion_blocking_cards, the crops
+  from the redacted PDF through pdf.js, and every write goes to the
+  review page's own endpoints (the text edit, the dismissal, the
+  approval), so the two pages hold one set of rules.
+{% endcomment %}
+
+{% block title %}Blocking review - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
+
+{% block content %}
+<div id="blocking-review">
+  {% csrf_token %}
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
+    <h1 class="text-2xl font-bold">Blocking review</h1>
+    <span class="flex items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
+      <span>
+        {{ page_obj.paginator.count }} opinion(s) with an open blocking card{% if current_scan %} in scan #{{ current_scan }}{% endif %}
+        · <b data-role="total">…</b> card(s) · <b data-role="done">0</b> answered
+      </span>
+      <button type="button" class="btn-primary text-sm" data-role="approve-all" disabled
+              title="Approve every opinion on this page that has no open blocking card left">Approve all ready (<span data-role="ready">0</span>)</button>
+    </span>
+  </div>
+  <p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
+    ↓ and ↑ move down and up the rows of the card in view, Return chooses; click works too; type and Return.
+    A choice writes the text of the block, the way "Edit text" does on the review page, and a word kept as shown dismisses the page's card once every open word of the page is answered.
+    The crop is a guess at the line, from the word's place in the block.
+    <a href="{{ list_url }}" class="text-blue-600 dark:text-blue-400 hover:underline">Back to the list</a>.
+  </p>
+
+  {% for opinion in page_obj %}
+  <section class="bk-opinion card mb-6" id="opinion-{{ opinion.pk }}"
+           data-opinion="{{ opinion.pk }}"
+           data-cards-url="{{ opinion.cards_url }}"
+           data-pdf-url-endpoint="{{ opinion.pdf_url_endpoint }}"
+           data-edit-text-url="{{ opinion.edit_text_url }}"
+           data-approve-url="{{ opinion.approve_url }}"
+           data-review-url="{{ opinion.review_url }}">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">
+        {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}{% if opinion.index_in_page %}
+        <span class="text-sm font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
+      </h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400" data-role="meta">{{ opinion.page_count }} pages · {{ opinion.blocking_findings }} blocking card(s)</span>
+      <span class="flex items-center gap-2">
+        <a href="{{ opinion.review_url }}" class="btn-ghost text-xs">Open the review page</a>
+        <button type="button" class="btn-primary text-sm" data-role="approve" disabled title="Enabled once no blocking card of this opinion is open">Approve</button>
+      </span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading the cards…</p></div>
+  </section>
+  {% empty %}
+  <div class="card">
+    <p class="text-sm text-gray-600 dark:text-gray-300">No opinion in this filter waits on a blocking card.</p>
+  </div>
+  {% endfor %}
+
+  {% if ready %}
+  <section class="card mb-6" id="ready-to-approve">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Ready to approve <span class="text-sm font-normal text-gray-500 dark:text-gray-400">({{ ready|length }} with no open blocking card)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A warning does not block; "Approve all ready" approves each of these in turn.</span>
+    </header>
+    <ul class="divide-y divide-gray-200 dark:divide-gray-700">
+      {% for opinion in ready %}
+      <li class="bk-ready flex flex-wrap items-center gap-3 py-2 text-sm" id="ready-{{ opinion.pk }}"
+          data-approve-url="{{ opinion.approve_url }}"
+          data-glue-revision="{{ opinion.glue_revision }}"
+          data-edit-revision="{{ opinion.ensemble_edit_revision }}">
+        <a href="{{ opinion.review_url }}" class="font-medium text-gray-900 dark:text-gray-100 hover:text-blue-600 dark:hover:text-blue-400">
+          {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}{% if opinion.index_in_page %} ({{ opinion.index_in_page|add:1 }} of that page){% endif %}
+        </a>
+        <span class="text-xs text-gray-500 dark:text-gray-400">{{ opinion.page_count }} pages{% if opinion.open_findings %} · {{ opinion.open_findings }} warning(s){% endif %}</span>
+        <span class="bk-grow"></span>
+        <span class="bk-state" data-role="state"></span>
+        <button type="button" class="btn-outline text-xs" data-role="approve-one">Approve</button>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+
+  {% if page_obj.has_other_pages %}
+  <div class="flex items-center justify-between mt-6 text-sm">
+    {% if page_obj.has_previous %}
+    <a href="?page={{ page_obj.previous_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Previous</a>
+    {% else %}<span></span>{% endif %}
+    <span class="text-gray-500 dark:text-gray-400">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
+    {% if page_obj.has_next %}
+    <a href="?page={{ page_obj.next_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Next</a>
+    {% else %}<span></span>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
+<script src="{% static 'scanning/blocking_review.js' %}"></script>
+{% endblock %}

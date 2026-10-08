@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -36,6 +36,7 @@ from scanning.forms import (
 )
 from scanning.models import (
     Opinion,
+    OpinionFinding,
     OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
@@ -50,7 +51,7 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
-from scanning.opinion_review import MIN_DOCUMENT_SCHEMA
+from scanning.opinion_review import MIN_DOCUMENT_SCHEMA, blocking_filter
 from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
@@ -205,23 +206,16 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
-@login_required
-def opinion_list(request: HttpRequest) -> HttpResponse:
-    """List the opinions of the third review (#334).
+def _filtered_opinions(request: HttpRequest):
+    """Return the opinions of the list's filters, and the filters.
 
-    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
-    writes after the review-2 approval. The four filters are the shape
-    of the scan list, and the step-3 tab of a volume sends ``scan``.
-
-    The warning count is stamped after the pagination, so one grouped
-    query answers the 50 rows of this page and the size of the corpus
-    never reaches it. This is the badge rule of the scan list (#266).
-
-    The opinions of the legacy pipeline are on their own page
-    (:func:`legacy_opinion_list`), linked from this one.
+    The four filters of ``/opinions/`` (scan, reporter, status, volume)
+    and the ``blocking`` switch, in the list's order, for the list and
+    for the blocking review, which reads the same query string.
 
     :param request: The current HTTP request.
-    :return: The rendered opinion list page.
+    :returns: ``(queryset, {"scan", "reporter", "status", "volume",
+        "blocking"})``, the current values as the form shows them.
     """
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
@@ -261,7 +255,74 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
+    blocking_only = request.GET.get("blocking") == "1"
+    if blocking_only:
+        opinions_qs = _with_open_blocking_card(opinions_qs)
+    return opinions_qs, {
+        "scan": scan_filter,
+        "reporter": reporter_filter,
+        "status": status_filter or "",
+        "volume": volume_filter or "",
+        "blocking": blocking_only,
+    }
 
+
+def _with_open_blocking_card(opinions_qs):
+    """Keep the opinions whose approval waits on an open card.
+
+    ``opinion_review.blocking_filter`` is the rule, the one the badge
+    counts by (#375).
+    """
+    return opinions_qs.filter(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                blocking_filter()
+            )
+        )
+    )
+
+
+#: The blocking review takes one volume at a time.
+BLOCKING_REVIEW_SCOPE_MESSAGE = (
+    "Filter the list to one scan or one volume first: the blocking review "
+    "takes one volume at a time."
+)
+
+
+def _blocking_review_url(current: dict) -> str | None:
+    """Return the blocking review of the list's current filters, or
+    None when the filters name no volume (the page would walk the
+    corpus)."""
+    if not (current["scan"] or current["volume"]):
+        return None
+    query = {
+        key: value
+        for key, value in current.items()
+        if key in ("scan", "reporter", "volume") and value
+    }
+    address = reverse("opinion_blocking_review")
+    return f"{address}?{urlencode(query)}" if query else address
+
+
+@login_required
+def opinion_list(request: HttpRequest) -> HttpResponse:
+    """List the opinions of the third review (#334).
+
+    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
+    writes after the review-2 approval. The four filters are the shape
+    of the scan list, and the step-3 tab of a volume sends ``scan``.
+
+    The warning count is stamped after the pagination, so one grouped
+    query answers the 50 rows of this page and the size of the corpus
+    never reaches it. This is the badge rule of the scan list (#266).
+
+    The opinions of the legacy pipeline are on their own page
+    (:func:`legacy_opinion_list`), linked from this one.
+
+    :param request: The current HTTP request.
+    :return: The rendered opinion list page.
+    """
+    opinions_qs, current = _filtered_opinions(request)
     paginator = Paginator(opinions_qs, 50)
     page_obj = paginator.get_page(request.GET.get("page"))
 
@@ -283,10 +344,79 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
-            "current_scan": scan_filter,
-            "current_reporter": reporter_filter,
-            "current_status": status_filter or "",
-            "current_volume": volume_filter or "",
+            "current_scan": current["scan"],
+            "current_reporter": current["reporter"],
+            "current_status": current["status"],
+            "current_volume": current["volume"],
+            "current_blocking": current["blocking"],
+            "blocking_review_url": _blocking_review_url(current),
+        },
+    )
+
+
+@login_required
+def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
+    """Review every open blocking card of a filter, one after the next.
+
+    The opinions of the list's filters (scan, reporter, volume) that
+    are in the text review and hold an open blocking card, in the
+    list's order, fifty to a page. **The page writes nothing of its
+    own**: the browser asks ``opinion_blocking_cards`` for each
+    opinion's cards and answers them through the review page's own
+    endpoints, the text edit, the dismissal and the approval, so the
+    two pages hold one set of rules (``blocking_review``).
+
+    :param request: The current HTTP request.
+    :return: The rendered page.
+    """
+    opinions_qs, current = _filtered_opinions(request)
+    if not (current["scan"] or current["volume"]):
+        # One volume at a time: the page is for finishing a volume,
+        # not for walking the corpus.
+        messages.error(request, BLOCKING_REVIEW_SCOPE_MESSAGE)
+        return redirect("opinion_list")
+    in_review = opinions_qs.filter(
+        status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+    )
+    paginator = Paginator(_with_open_blocking_card(in_review), 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    # The opinions of the filter with nothing open: every card answered
+    # here or on the review page, waiting on the approval alone. A
+    # volume holds a few dozen, so the list is whole and not paged.
+    ready = list(
+        in_review.exclude(
+            pk__in=_with_open_blocking_card(in_review).values("pk")
+        )[:200]
+    )
+    counts = opinions.finding_counts(
+        [row.pk for row in page_obj] + [row.pk for row in ready]
+    )
+    for row in list(page_obj) + ready:
+        row.open_findings, _stale, row.blocking_findings = counts.get(
+            row.pk, (0, 0, 0)
+        )
+        kwargs = {"pk": row.scan_id, "opinion_pk": row.pk}
+        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs)
+        row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
+        row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
+        row.approve_url = reverse("approve_opinion_text", kwargs=kwargs)
+        row.review_url = reverse("opinion_review", kwargs={"pk": row.pk})
+    list_query = {
+        key: value
+        for key, value in current.items()
+        if key in ("scan", "reporter", "volume") and value
+    }
+    query = urlencode(list_query)
+    return render(
+        request,
+        "scanning/opinion_blocking_review.html",
+        {
+            "page_obj": page_obj,
+            "ready": ready,
+            "current_scan": current["scan"],
+            "list_url": reverse("opinion_list")
+            + (f"?{query}" if query else ""),
+            "query": query,
         },
     )
 

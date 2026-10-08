@@ -1845,6 +1845,19 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
     "writes one per tick after the redaction review is approved."
 )
 
+#: The blocking review asks for the cards of an opinion whose text is
+#: not written yet.
+OPINION_TEXT_NOT_WRITTEN_MESSAGE = (
+    'The text of this opinion is not written yet. Press "Read the OCR '
+    'documents again" on its review page, or wait for the daemon.'
+)
+
+#: The blocking review asks for the cards with no bucket to read.
+OPINION_BUCKET_OFF_MESSAGE = (
+    "The text of this opinion is in the bucket, and this server has no "
+    "bucket to read it from."
+)
+
 #: The 404 of ``opinion_ensemble_url`` before the pass has written the
 #: ensemble document at the live revision (#365).
 OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE = (
@@ -1931,6 +1944,87 @@ def opinion_pdf_url(
         # minutes, the size of one download, and a range after it would
         # be a 403 on a page that shows no reason.
         ttl=settings.ORIGINAL_VIEW_PRESIGN_TTL,
+    )
+
+
+@login_required
+def opinion_blocking_cards(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return the cards of the blocking review of one opinion.
+
+    ``blocking_review.cards`` over the stamped ensemble document and
+    the open blocking findings (``opinion_review.blocking_findings``,
+    the rule of the gate). The answer carries the two revisions the
+    document was drawn at, which every write of the review page asks
+    for, and the dismissal URL of each card that has one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, opinion, cards}``; 404 for an opinion of
+        another scan, 409 while the text is not written or the bucket
+        is off.
+    """
+    from scanning import blocking_review, ensemble, opinion_review, s3_sync
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan", "apply_run"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    if not ensemble.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.read_document(opinion)
+    except ensemble.TransientFault:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    findings = list(
+        opinion_review.blocking_findings(opinion).order_by(
+            "page_in_opinion", "pk"
+        )
+    )
+    cards = blocking_review.cards(document, findings)
+    for card in cards:
+        if card.get("finding_pk"):
+            card["dismiss_url"] = reverse(
+                "dismiss_opinion_finding",
+                kwargs={
+                    "pk": pk,
+                    "opinion_pk": opinion.pk,
+                    "finding_pk": card["finding_pk"],
+                },
+            )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "opinion": {
+                "pk": opinion.pk,
+                "label": str(opinion),
+                "status": opinion.status,
+                "page_count": opinion.page_count,
+                "glue_revision": opinion.glue_revision,
+                "edit_revision": opinion.ensemble_edit_revision,
+            },
+            "cards": cards,
+        }
     )
 
 

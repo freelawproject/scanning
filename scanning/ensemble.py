@@ -2097,6 +2097,12 @@ def vote_words(
       two. They are different faults and they read differently, so the
       viewer must not name one of them for both (#380).
 
+    Every token carries ``position``, the base position it answers for,
+    or the one an inserted run was put in before: the blocking review
+    asks each engine what it read there (``blocking_review.open_words``
+    over :func:`_candidates`), and a token answers for one position of
+    the base read alone.
+
     A word the base engine did not read is put in, marked and counted
     when the engines that read it are a majority or a tie: the base is
     the engine this module believes, so a word it did not read is a
@@ -2146,7 +2152,12 @@ def vote_words(
                 continue
             words = next(words for other, words in runs if other == keys)
             tokens += [
-                {"text": word, "low_confidence": True, "inserted": True}
+                {
+                    "text": word,
+                    "low_confidence": True,
+                    "inserted": True,
+                    "position": position,
+                }
                 for word in words
             ]
             # A word the base did not read is marked, so it is counted
@@ -2170,7 +2181,8 @@ def vote_words(
                 token = {
                     "text": next(
                         word for key, word in readings if key == winner
-                    )
+                    ),
+                    "position": position,
                 }
                 if count < total:
                     # Short of every engine of the group, and not short
@@ -2182,7 +2194,13 @@ def vote_words(
         else:
             chosen[position] = base[position][0]
             disputed += 1
-            tokens.append({"text": base[position][1], "low_confidence": True})
+            tokens.append(
+                {
+                    "text": base[position][1],
+                    "low_confidence": True,
+                    "position": position,
+                }
+            )
     return tokens, disputed
 
 
