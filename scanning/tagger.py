@@ -240,6 +240,19 @@ def load_approved(key: str) -> dict:
         approved = s3_sync.download_json_object(key)
     except (BotoCoreError, ClientError, ValueError) as exc:
         raise TaggerInputError(f"could not read {key}: {exc}") from exc
+    return check_approved(approved, key)
+
+
+def check_approved(approved, key: str) -> dict:
+    """Refuse an approved text of a shape this module does not know.
+
+    :param approved: The object read at ``key``.
+    :param key: An ``approved_text_key``, for the message.
+    :returns: The object.
+    :rtype: dict
+    :raises TaggerInputError: When it is not an object of
+        ``APPROVED_SCHEMA``.
+    """
     if not isinstance(approved, dict):
         raise TaggerInputError(f"{key} is not an approved text")
     if approved.get("schema") != paragraphs.APPROVED_SCHEMA:
@@ -507,8 +520,10 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
         raise TaggerGlueError(
             f"{opinion} run {row.run}: could not write {key}"
         )
+    # New spans are new inputs of the export (#408): its fault count
+    # starts again.
     Opinion.objects.filter(pk=opinion.pk).update(
-        tag_key=key, tagged_text_key=approved_key
+        tag_key=key, tagged_text_key=approved_key, final_xml_attempts=0
     )
     opinion.tag_key = key
     opinion.tagged_text_key = approved_key
@@ -593,7 +608,8 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
     moved (:class:`TextMoved`) is consumed without a stamp, because the
     result still describes the text it read. Writes no scan status and
     no opinion status: the spans are the output, and what reads them is
-    the assembly step (#408), not the review flow.
+    the export of the final XML (``final_xml``, #408), not the review
+    flow.
 
     :param limit: The most rows this call glues.
     :returns: How many rows were glued and consumed.

@@ -35,7 +35,14 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    most, as a silent engine, so a reader still learns that one engine
    read nothing there. The size of a unit decides nothing: a block
    over the whole body **is** the text of that body, and held apart it
-   would write the page a second time.
+   would write the page a second time. **A unit that holds a unit of
+   its own engine and bridges groups of the others does not link
+   either** (#451): an engine's blocks tile the page, so a box over
+   the engine's own blocks is not the place of its text. Surya draws
+   a list group from its first item to the last line of a footnote
+   that runs into the next column, and that box held every block of
+   the page in one group. It is attached as a silent engine, the rule
+   of a box that reads nothing.
 2. **Order.** Three bands: the running heads, the body, the foot. The
    body splits at a column boundary taken from the **left edges** of
    the body boxes, which survives what a hunt for the gutter does not.
@@ -289,10 +296,11 @@ EDIT_BASE_CHANGED = "base_changed"
 EDIT_IN_FOOTNOTES = "in_footnotes"
 
 #: The risk of a group the engines did not read alike (#419). A
-#: ``BLOCKING`` group is a place no majority of the engines read, or a
-#: place one engine alone read: its card is an ERROR, and the approval
-#: waits for a person. A ``WARNING`` group is a place a majority read.
-#: A group every engine read alike has no level.
+#: ``BLOCKING`` group holds a word no two engines agree on, or was
+#: read by one engine alone: its card is an ERROR, and the approval
+#: waits for a person. A ``WARNING`` group is a place a majority read,
+#: word for word at the least. A group every engine read alike has no
+#: level.
 BLOCKING = "blocking"
 WARNING = "warning"
 
@@ -498,9 +506,39 @@ def compare_word(word: str) -> str:
     return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
 
 
+#: A word that is dots alone: one of a spaced ellipsis.
+_LONE_DOTS = re.compile(r"^\.+$")
+
+
 def _pairs(text: str) -> list[tuple[str, str]]:
-    """Return ``[(key, the word as it is shown)]`` for one read."""
-    return [(compare_word(word), word) for word in text.split()]
+    """Return ``[(key, the word as it is shown)]`` for one read.
+
+    A run of two or more words that are dots alone is one word: Surya
+    writes the spaced ellipsis of the page (``. . .``) where Mistral
+    writes ``...``, and :func:`compare_text` reads them alike already
+    (``_DOT_RUN``). Split on whitespace first, they are three words
+    against one, and a block that agrees to the letter goes to a vote.
+    The shown word keeps the engine's own spacing.
+
+    :param text: One engine's read.
+    :returns: The pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    words = text.split()
+    pairs: list[tuple[str, str]] = []
+    index = 0
+    while index < len(words):
+        end = index
+        while end < len(words) and _LONE_DOTS.match(words[end]):
+            end += 1
+        if end - index >= 2:
+            shown = " ".join(words[index:end])
+            pairs.append((compare_word(shown), shown))
+            index = end
+            continue
+        pairs.append((compare_word(words[index]), words[index]))
+        index += 1
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -1170,7 +1208,55 @@ def _attach_quiet(
         groups[index]["present"] = _ranked(groups[index]["engines"])
 
 
-def align_page(units: list[dict], width: float, height: float) -> list[dict]:
+def _across_the_zone(
+    a: dict, b: dict, units: list[dict], zones: list[list[float]]
+) -> bool:
+    """Say whether a footnote unit and a block over the body must not
+    link.
+
+    :func:`section` puts a group whole on one side of the footnote
+    zone, by the share of the group's box inside it, so a block that
+    spans a column's body and its footnotes takes the footnotes with
+    it into the body, and the page has none; and a footnote merged
+    into a block of the body that a mask excludes is dropped with it,
+    the first half of a footnote of 178 F.4th 66. The two sides are
+    read by :data:`FOOTNOTE_SHARE`, the rule of :func:`section`. The
+    guard holds only against a block that also holds a body unit of
+    another engine: two readings of one footnote that the zone's edge
+    cuts differently still link, or the footnote would be written
+    twice.
+
+    :param a: One unit.
+    :param b: A unit of another engine that overlaps it.
+    :param units: Every speaking unit of the page.
+    :param zones: The page's footnote zones, in points.
+    :returns: Whether the two must not link.
+    :rtype: bool
+    """
+    if not zones:
+        return False
+    a_in = zone_share(a["box_pt"], zones) >= FOOTNOTE_SHARE
+    b_in = zone_share(b["box_pt"], zones) >= FOOTNOTE_SHARE
+    if a_in == b_in:
+        return False
+    out = b if a_in else a
+    out_box = out["box_pt"]
+    return any(
+        unit is not out
+        and unit["engine"] != out["engine"]
+        and area(unit["box_pt"]) < area(out_box)
+        and zone_share(unit["box_pt"], zones) < FOOTNOTE_SHARE
+        and contained(unit["box_pt"], out_box) >= OVERLAP
+        for unit in units
+    )
+
+
+def align_page(
+    units: list[dict],
+    width: float,
+    height: float,
+    zones: list[list[float]] = (),
+) -> list[dict]:
     """Return the aligned groups of one page, unordered.
 
     **A unit that reads nothing does not link.** The guard exists so
@@ -1184,11 +1270,22 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
     picture box of Mistral an empty text (#404), and a document older
     than the parse had its placeholder taken off in :func:`_units_of`.
 
+    **A unit that holds a unit of its own engine and bridges groups of
+    the other engines does not link** and is silent too
+    (:func:`_containers`, #451): it reads, but its box is not where its
+    text lies, and it would chain the page.
+
+    **A unit inside the footnote zone does not link to a block over
+    the body** that also holds a body unit of another engine
+    (:func:`_across_the_zone`): the group would go whole to one
+    section, and the footnote with it.
+
     :param units: Every engine's units of the page, each with
         ``engine``, ``id``, ``box_pt``, ``text``, ``type``,
         ``exclusion`` and ``share``.
     :param width: The page width, in points.
     :param height: The page height, in points.
+    :param zones: The page's footnote zones, in points.
     :returns: The groups, each with ``engines``, ``present``,
         ``box_pt``, ``page_scale``, ``alignment_iou``, ``weak`` and the
         exclusion of its members.
@@ -1212,14 +1309,11 @@ def align_page(units: list[dict], width: float, height: float) -> list[dict]:
         # reads nothing must not link, whatever it wrote in place of
         # the reading.
         (speaking if plain(unit["text"]) else quiet).append(unit)
+    containers = {id(unit) for unit in _containers(speaking)}
+    quiet.extend(_silenced(u) for u in speaking if id(u) in containers)
+    speaking = [u for u in speaking if id(u) not in containers]
 
-    union = _Union(len(speaking))
-    for left, right in combinations(range(len(speaking)), 2):
-        if speaking[left]["engine"] == speaking[right]["engine"]:
-            continue
-        share = contained(speaking[left]["box_pt"], speaking[right]["box_pt"])
-        if share >= OVERLAP:
-            union.join(left, right)
+    union = _link(speaking, zones)
 
     buckets: dict[int, list[int]] = {}
     for index in range(len(speaking)):
@@ -1283,6 +1377,104 @@ def _figure_groups(
         group["figure"] = True
         groups.append(group)
     return groups
+
+
+def _link(speaking: list[dict], zones: list[list[float]] = ()) -> _Union:
+    """Return the links of the units of a page that read something.
+
+    Two units of different engines link when the intersection covers
+    :data:`OVERLAP` of the smaller box, unless the footnote zone holds
+    them apart (:func:`_across_the_zone`).
+
+    :param speaking: The units of the page that read something.
+    :param zones: The page's footnote zones, in points.
+    :returns: The union-find over ``speaking``, by index.
+    :rtype: _Union
+    """
+    union = _Union(len(speaking))
+    for left, right in combinations(range(len(speaking)), 2):
+        a, b = speaking[left], speaking[right]
+        if a["engine"] == b["engine"]:
+            continue
+        if contained(a["box_pt"], b["box_pt"]) < OVERLAP:
+            continue
+        if _across_the_zone(a, b, speaking, zones):
+            continue
+        union.join(left, right)
+    return union
+
+
+def _containers(speaking: list[dict]) -> list[dict]:
+    """Return the units whose box would chain the page (#451).
+
+    A container is a unit whose box holds :data:`OVERLAP` of a smaller
+    unit of its own engine. An engine's blocks tile the page, so such
+    a box is not the place of its text: Surya draws a list group from
+    its first item to the last line of a footnote that runs into the
+    next column. The bigger box of the pair is the container; two
+    boxes of one size are two readings of one block and stay.
+
+    **It is held out only when it bridges**: the units of the other
+    engines it would link fall into two groups or more when it is
+    left out. A container over one group links as any big block does,
+    and a container no other engine read is the only reading of its
+    place, which held out would vanish with no card.
+
+    :param speaking: The units of the page that read something.
+    :returns: The containers that bridge, in the order of ``speaking``.
+    :rtype: list[dict]
+    """
+    nested = [
+        unit
+        for unit in speaking
+        if any(
+            other is not unit
+            and other["engine"] == unit["engine"]
+            and area(other["box_pt"]) < area(unit["box_pt"])
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+            for other in speaking
+        )
+    ]
+    if not nested:
+        return []
+    held = {id(unit) for unit in nested}
+    rest = [unit for unit in speaking if id(unit) not in held]
+    union = _link(rest)
+    return [
+        unit
+        for unit in nested
+        if len(
+            {
+                union.find(index)
+                for index, other in enumerate(rest)
+                if other["engine"] != unit["engine"]
+                and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+            }
+        )
+        >= 2
+    ]
+
+
+def _silenced(unit: dict) -> dict:
+    """Return a copy of a container that reads nothing.
+
+    Its reading has no place on the page, so it votes in no group: the
+    group it covers most names its engine in ``silent``, and the
+    groups the others read stay apart. The copy keeps the ``id``, so
+    the group still says which block of the engine it was, and drops
+    the verdict and the bracket flag of the OCR glue with the text,
+    because a drop counts them over every member
+    (``PARTIAL_REDACTION``, ``partial_bracket``) and this one kept no
+    word.
+    """
+    return {
+        **unit,
+        "text": "",
+        "marks": [],
+        "exclusion": None,
+        "share": 0.0,
+        "bracket": False,
+    }
 
 
 def _ranked(engines) -> list[str]:
@@ -1979,6 +2171,12 @@ def vote_words(
       two. They are different faults and they read differently, so the
       viewer must not name one of them for both (#380).
 
+    Every token carries ``position``, the base position it answers for,
+    or the one an inserted run was put in before: the blocking review
+    asks each engine what it read there (``blocking_review.open_words``
+    over :func:`_candidates`), and a token answers for one position of
+    the base read alone.
+
     A word the base engine did not read is put in, marked and counted
     when the engines that read it are a majority or a tie: the base is
     the engine this module believes, so a word it did not read is a
@@ -2028,7 +2226,12 @@ def vote_words(
                 continue
             words = next(words for other, words in runs if other == keys)
             tokens += [
-                {"text": word, "low_confidence": True, "inserted": True}
+                {
+                    "text": word,
+                    "low_confidence": True,
+                    "inserted": True,
+                    "position": position,
+                }
                 for word in words
             ]
             # A word the base did not read is marked, so it is counted
@@ -2052,7 +2255,8 @@ def vote_words(
                 token = {
                     "text": next(
                         word for key, word in readings if key == winner
-                    )
+                    ),
+                    "position": position,
                 }
                 if count < total:
                     # Short of every engine of the group, and not short
@@ -2064,7 +2268,13 @@ def vote_words(
         else:
             chosen[position] = base[position][0]
             disputed += 1
-            tokens.append({"text": base[position][1], "low_confidence": True})
+            tokens.append(
+                {
+                    "text": base[position][1],
+                    "low_confidence": True,
+                    "position": position,
+                }
+            )
     return tokens, disputed
 
 
@@ -2310,6 +2520,7 @@ def _counts() -> dict:
         WARNING: 0,
         BLOCKING: 0,
         "single_engine": 0,
+        "no_majority": 0,
         "low_confidence": 0,
         "partial": 0,
         "partial_bracket": 0,
@@ -2626,7 +2837,7 @@ def build_page(
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
     entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
-    groups = align_page(units, width, height)
+    groups = align_page(units, width, height, zones)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
     # too, and a page with two footnotes has too few boxes of its own
@@ -2848,6 +3059,8 @@ def build_page(
             entry["counts"][level] += 1
         if level == BLOCKING and read_back["agreement"] == SINGLE:
             entry["counts"]["single_engine"] += 1
+        if level == BLOCKING and read_back["agreement"] == VOTED:
+            entry["counts"]["no_majority"] += 1
         if name == FOOTNOTES:
             entry["counts"]["footnote_groups"] += 1
         if group["footnote_doubt"]:
@@ -2993,11 +3206,15 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     badge of the review page, which reads ``level`` off the group and
     derives nothing (#419).
 
-    A place no majority of the engines read alike (``VOTED``) blocks,
-    also when the word vote settled every word of it, and so does a
-    place one engine alone read (``SINGLE``): nothing confirms its
-    words. Every other place :func:`_differs` answers for is a place a
-    majority read alike, a warning.
+    **The word is the unit.** A place one engine alone read
+    (``SINGLE``) blocks: nothing confirms its words. A place no full
+    reading of which held a majority (``VOTED``) blocks only where the
+    word vote left a word no two engines agree on
+    (``n_low_confidence``): a block of a hundred words that the engines
+    split three ways over one spelling and one quote mark is settled
+    word for word, and a block whose every word a majority settled is
+    the same fact as a block a majority read whole. Every other place
+    :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -3006,7 +3223,9 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     """
     if not _differs(group, engines):
         return None
-    if group["agreement"] in (VOTED, SINGLE):
+    if group["agreement"] == SINGLE:
+        return BLOCKING
+    if group["agreement"] == VOTED and group.get("n_low_confidence"):
         return BLOCKING
     return WARNING
 
@@ -3490,7 +3709,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
-        if counts[VOTED]:
+        if counts.get("no_majority"):
             cards.append(
                 _card(
                     opinion,
@@ -3498,7 +3717,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     OpinionCheck.NO_MAJORITY,
                     Issue.Severity.ERROR,
                     _no_majority_message(
-                        counts[VOTED], counts["low_confidence"]
+                        counts["no_majority"], counts["low_confidence"]
                     ),
                     standing,
                 )
@@ -3698,18 +3917,15 @@ def _blockquote_list_message(page: dict) -> str:
 def _no_majority_message(blocks: int, words: int) -> str:
     """Return the line of one ``NO_MAJORITY`` card (#419).
 
-    :param blocks: How many groups no majority of the engines read.
-    :param words: How many words of them no majority settled.
+    :param blocks: How many groups hold a word no two engines agree on.
+    :param words: How many words of the page's voted groups no
+        majority settled.
     :returns: The message.
     :rtype: str
     """
-    said = (
-        f"{blocks} block(s) on this page have no reading that a majority "
-        "of the engines share"
-    )
-    if words:
-        said += f", and {words} word(s) in them have no majority"
-    return said + ". Read them against the PDF."
+    said = f"{blocks} block(s) on this page hold "
+    said += f"{words} word(s)" if words else "a word"
+    return said + " no two engines agree on. Read them against the PDF."
 
 
 def _single_message(page: dict) -> str:

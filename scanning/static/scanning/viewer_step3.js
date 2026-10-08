@@ -2943,6 +2943,12 @@
             loadPdf();
         }
         loadText();
+        // A link from the blocking review names a page in the hash
+        // (``#op-page-{index}``, the id of the page's container). The
+        // jump is kept until both loads are in, the rule of a card's
+        // jump, and a stored place of a reload still wins over it.
+        var jump = /^#op-page-(\d+)$/.exec(window.location.hash || '');
+        if (jump) { goToPage(parseInt(jump[1], 10)); }
         if (pagesColumn && textColumn) { bindPointers(); }
         // A resize changes the width of a column, and the scale
         // follows that width, so the pages are drawn again. A page

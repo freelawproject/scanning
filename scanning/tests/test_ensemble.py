@@ -223,6 +223,49 @@ class TestTheAlignment(TestCase):
         )
         self.assertTrue(groups[0]["page_scale"])
 
+    def test_a_footnote_does_not_link_to_a_block_over_the_body(self):
+        """One engine reads a column's body and its footnote as one
+        block, and no sibling of its own makes it a container. The
+        other engine's footnote keeps its own group, or the page has
+        none."""
+        zone = [40, 600, 570, 720]
+        units = [
+            unit("surya", 0, (50, 60, 290, 720), "body one body two 1. note"),
+            unit("dots_mocr", 0, (50, 60, 290, 300), "body one"),
+            unit("dots_mocr", 1, (50, 320, 290, 580), "body two"),
+            unit("dots_mocr", 2, (50, 610, 290, 700), "1. note"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT, zones=[zone])
+
+        self.assertEqual(len(groups), 2)
+        note = next(g for g in groups if "surya" not in g["engines"])
+        self.assertEqual(note["engines"]["dots_mocr"]["ids"], [2])
+        body = next(g for g in groups if "surya" in g["engines"])
+        self.assertEqual(body["engines"]["dots_mocr"]["ids"], [0, 1])
+
+    def test_two_readings_of_one_footnote_link_across_the_zone_edge(self):
+        """A footnote cell the zone's edge cuts differently still links
+        to the other engine's reading of it: the guard is against a
+        block that also holds the body, never against a box a few
+        points out, or the footnote would be written twice."""
+        zone = [40, 600, 570, 720]
+        units = [
+            unit("dots_mocr", 0, (50, 100, 290, 580), "body"),
+            unit("dots_mocr", 1, (50, 610, 290, 700), "1. note"),
+            unit("mistral_ocr", 0, (50, 100, 290, 580), "body"),
+            # 100 of its 220 points are in the zone: under the share.
+            unit("mistral_ocr", 1, (50, 480, 290, 700), "1. note"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT, zones=[zone])
+
+        self.assertEqual(len(groups), 2)
+        note = next(
+            g for g in groups if g["engines"]["dots_mocr"]["ids"] == [1]
+        )
+        self.assertEqual(note["engines"]["mistral_ocr"]["ids"], [1])
+
     def test_a_box_that_reads_nothing_and_covers_nothing_is_dropped(self):
         units = [
             unit("dots_mocr", 0, (0, 0, 100, 60), "", label="Picture"),
@@ -298,6 +341,115 @@ class TestTheAlignment(TestCase):
             groups[0]["engines"]["dots_mocr"]["text"],
             "left one left two right one right two",
         )
+
+    def test_a_box_over_its_own_engines_blocks_chains_nothing(self):
+        """Surya draws a list group from its first item to the last
+        line of a footnote that runs into the right column, and reads
+        that column again as blocks of its own (#451). Linked, the box
+        held every block of the page in one group."""
+        units = [
+            unit("dots_mocr", 0, (99, 91, 300, 518), "the list"),
+            unit("dots_mocr", 1, (87, 621, 300, 726), "the footnote"),
+            unit("dots_mocr", 2, (312, 63, 531, 600), "the right column"),
+            unit("mistral_ocr", 0, (98, 91, 301, 518), "the list"),
+            unit("mistral_ocr", 1, (87, 621, 301, 727), "the footnote"),
+            unit("mistral_ocr", 2, (310, 62, 532, 600), "the right column"),
+            unit(
+                "surya",
+                0,
+                (89, 61, 532, 725),
+                "the list the footnote",
+                label="ListGroup",
+            ),
+            unit("surya", 1, (310, 61, 532, 600), "the right column"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(
+            sorted(ensemble.resolve(g)["text"] for g in groups),
+            ["the footnote", "the list", "the right column"],
+        )
+        right = next(
+            g
+            for g in groups
+            if g["engines"]["dots_mocr"]["text"] == "the right column"
+        )
+        self.assertEqual(right["engines"]["surya"]["ids"], [1])
+        silent = [g for g in groups if ensemble.resolve(g)["silent"]]
+        self.assertEqual(len(silent), 1)
+        self.assertEqual(silent[0]["engines"]["surya"]["ids"], [0])
+
+    def test_a_container_no_other_engine_read_keeps_its_text(self):
+        """The only reading of its place: held out, it would become an
+        empty group and vanish with no card (#451)."""
+        units = [
+            unit("dots_mocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("mistral_ocr", 0, (50, 600, 560, 700), "elsewhere"),
+            unit("surya", 0, (50, 100, 560, 500), "the list and its head"),
+            unit("surya", 1, (50, 100, 560, 140), "its head"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertIn(
+            "the list and its head",
+            [ensemble.resolve(g)["text"] for g in groups],
+        )
+
+    def test_a_container_over_one_group_links(self):
+        """A paragraph box over a heading box of its own engine chains
+        nothing when the others read only the heading."""
+        units = [
+            unit("dots_mocr", 0, (50, 100, 560, 500), "heading and body"),
+            unit("dots_mocr", 1, (50, 100, 560, 140), "heading"),
+            unit("mistral_ocr", 0, (50, 100, 560, 140), "heading"),
+            unit("surya", 0, (50, 100, 560, 140), "heading"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(ensemble._containers(units), [])
+        self.assertEqual(
+            [g["engines"]["dots_mocr"]["ids"] for g in groups], [[0, 1]]
+        )
+
+    def test_a_silenced_container_carries_no_verdict(self):
+        """A drop counts the exclusion and the bracket flag over every
+        member, and a container kept no word to lose."""
+        container = unit(
+            "surya",
+            0,
+            (50, 100, 560, 700),
+            "every word",
+            exclusion={"reason": "redaction"},
+            share=0.2,
+        )
+        container["bracket"] = True
+
+        silenced = ensemble._silenced(container)
+
+        self.assertEqual(silenced["text"], "")
+        self.assertIsNone(silenced["exclusion"])
+        self.assertEqual(silenced["share"], 0.0)
+        self.assertFalse(silenced["bracket"])
+        self.assertEqual(silenced["id"], 0)
+
+    def test_a_box_over_another_engines_blocks_still_links(self):
+        """The container is a fact of one engine's own blocks: a big
+        block over the other engine's paragraphs is their text."""
+        units = [
+            unit("dots_mocr", 0, (50, 100, 560, 700), "left right"),
+            unit("dots_mocr", 1, (50, 720, 560, 760), "footer"),
+            unit("mistral_ocr", 0, (50, 100, 290, 700), "left"),
+            unit("mistral_ocr", 1, (320, 100, 560, 700), "right"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(ensemble._containers(units), [])
 
     def test_a_picture_box_links_nothing(self):
         """Mistral writes a picture box as an image placeholder, and
@@ -604,7 +756,9 @@ class TestTheVote(TestCase):
         for token in answer["tokens"]:
             self.assertNotIn("<", token["text"])
             self.assertIn("text", token)
-            self.assertLessEqual(set(token), {"text", "low_confidence"})
+            self.assertLessEqual(
+                set(token), {"text", "low_confidence", "position"}
+            )
 
     def test_typography_is_not_a_disagreement(self):
         """The engines differ about the quotes on almost every page of
@@ -662,13 +816,15 @@ class TestTheVote(TestCase):
         self.assertEqual(
             tokens,
             [
-                {"text": "alpha"},
+                {"text": "alpha", "position": 0},
                 {
                     "text": "beta",
                     "low_confidence": True,
                     "inserted": True,
+                    # The run went in before the base's second word.
+                    "position": 1,
                 },
-                {"text": "gamma"},
+                {"text": "gamma", "position": 1},
             ],
         )
         self.assertEqual(disputed, 1)
@@ -815,6 +971,36 @@ class TestTheVote(TestCase):
 
         self.assertEqual(answer["source"], "dots_mocr")
         self.assertEqual(list(opinion_ocr.ENGINES)[0], "dots_mocr")
+
+    def test_a_spaced_ellipsis_is_one_word(self):
+        """Surya writes the ``. . .`` of the page where Mistral writes
+        ``...``, and the block key reads them alike; the word vote must
+        too, or a block that agrees to the letter goes to a vote."""
+        self.assertEqual(
+            ensemble._pairs("sentence . . . must"),
+            [("sentence", "sentence"), ("...", ". . ."), ("must", "must")],
+        )
+        self.assertEqual(
+            ensemble._pairs("end ."), [("end", "end"), (".", ".")]
+        )
+
+        # Three readings that differ pairwise, so the block is voted
+        # word by word; the ellipsis is the one word every engine read.
+        answer = ensemble.resolve(
+            self.read(
+                "sentence ... must be",
+                "sentence ... must bee",
+                "sentenze . . . must be",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        self.assertEqual(answer["n_low_confidence"], 0)
+        self.assertEqual(
+            [token.get("majority", False) for token in answer["tokens"]],
+            [True, False, False, True],
+        )
+        self.assertEqual(answer["text"], "sentence ... must be")
 
 
 # ── the document ─────────────────────────────────────────────────────
@@ -1189,6 +1375,8 @@ class TestTheRows(EnsembleTestCase):
                         "start": 0,
                         "end": 10,
                         "agreement": ensemble.VOTED,
+                        # Two engines, one word apart: no two agree on it.
+                        "n_low_confidence": 1,
                         "engines": {
                             "dots_mocr": {"text": "alpha beta"},
                             "mistral_ocr": {"text": "alpha peta"},
@@ -1264,25 +1452,39 @@ class TestTheFindings(EnsembleTestCase):
         """No reading of the block held a majority, so the approval
         waits for a person (#419). With two engines every split is
         voted."""
-        cards = self.rebuild(voted=2, differing=2, blocking=2)
+        cards = self.rebuild(
+            voted=2, differing=2, blocking=2, no_majority=2, low_confidence=2
+        )
 
         self.assertEqual(
             [c.check_name for c in cards], [OpinionCheck.NO_MAJORITY]
         )
         self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
         self.assertIn("2 block(s)", cards[0].message)
+        self.assertIn("2 word(s) no two engines agree on", cards[0].message)
 
-    def test_a_voted_group_blocks_when_every_word_is_settled(self):
-        """The word vote settled every word, and the block still holds
-        no reading a majority shares (#419)."""
-        cards = self.rebuild(voted=1, differing=1, blocking=1)
+    def test_a_voted_group_every_word_settled_is_an_engines_disagree_card(
+        self,
+    ):
+        """No full reading held a majority, and the word vote settled
+        every word: a majority read each place, so the block is the
+        warning of a majority block, and the approval does not wait."""
+        cards = self.rebuild(voted=1, differing=1, warning=1)
 
-        self.assertEqual(cards[0].check_name, OpinionCheck.NO_MAJORITY)
-        self.assertNotIn("word(s)", cards[0].message)
+        self.assertEqual(
+            [c.check_name for c in cards], [OpinionCheck.ENGINES_DISAGREE]
+        )
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
 
     def test_the_cards_count_what_the_row_calls_a_disagreement(self):
         cards = self.rebuild(
-            majority=1, voted=1, differing=2, warning=1, blocking=1
+            majority=1,
+            voted=1,
+            differing=2,
+            warning=1,
+            blocking=1,
+            no_majority=1,
+            low_confidence=1,
         )
 
         by_check = {c.check_name: c for c in cards}
@@ -1297,7 +1499,7 @@ class TestTheFindings(EnsembleTestCase):
 
     def test_the_no_majority_card_counts_the_words(self):
         cards = self.rebuild(
-            voted=1, differing=1, blocking=1, low_confidence=3
+            voted=1, differing=1, blocking=1, no_majority=1, low_confidence=3
         )
 
         self.assertEqual(cards[0].check_name, OpinionCheck.NO_MAJORITY)
@@ -3625,13 +3827,26 @@ class TestTheLevel(TestCase):
             ensemble.WARNING,
         )
 
-    def test_a_voted_group_blocks(self):
+    def test_a_voted_group_with_an_open_word_blocks(self):
         self.assertEqual(
             self.level(
                 ensemble.VOTED,
                 engines=("dots_mocr", "mistral_ocr", "surya"),
+                n_low_confidence=1,
             ),
             ensemble.BLOCKING,
+        )
+
+    def test_a_voted_group_every_word_settled_is_a_warning(self):
+        """The full readings split three ways, and two engines agreed
+        on every word: the word is the unit, and no word is open."""
+        self.assertEqual(
+            self.level(
+                ensemble.VOTED,
+                engines=("dots_mocr", "mistral_ocr", "surya"),
+                n_low_confidence=0,
+            ),
+            ensemble.WARNING,
         )
 
     def test_a_block_one_engine_read_blocks(self):
@@ -3662,6 +3877,60 @@ class TestTheLevel(TestCase):
         self.assertEqual(page["counts"]["single_engine"], 2)
         self.assertEqual(page["counts"][ensemble.BLOCKING], 2)
         self.assertEqual(page["counts"]["differing"], 2)
+
+    def test_a_voted_block_every_word_settled_counts_a_warning(self):
+        """Three readings that each differ in one word hold a majority
+        for every word: the block counts with the majority blocks, and
+        no card blocks."""
+        box = (36, 108, 288, 200)
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [unit("dots_mocr", 0, box, "alpha beta gamma")]
+                ),
+                "mistral_ocr": engine_page(
+                    [unit("mistral_ocr", 0, box, "alpha beta gamna")]
+                ),
+                "surya": engine_page(
+                    [unit("surya", 0, box, "alpha bela gamma")]
+                ),
+            },
+            0,
+        )
+
+        group = page["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.VOTED)
+        self.assertEqual(group["n_low_confidence"], 0)
+        self.assertEqual(group["level"], ensemble.WARNING)
+        self.assertEqual(page["counts"]["no_majority"], 0)
+        self.assertEqual(page["counts"][ensemble.BLOCKING], 0)
+        self.assertEqual(page["counts"][ensemble.WARNING], 1)
+
+    def test_a_voted_block_with_an_open_word_counts_a_no_majority(self):
+        """Three readings of one word: no two engines agree on it, and
+        the block blocks."""
+        box = (36, 108, 288, 200)
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [unit("dots_mocr", 0, box, "alpha beta gamma")]
+                ),
+                "mistral_ocr": engine_page(
+                    [unit("mistral_ocr", 0, box, "alpha beta gamna")]
+                ),
+                "surya": engine_page(
+                    [unit("surya", 0, box, "alpha beta gamme")]
+                ),
+            },
+            0,
+        )
+
+        group = page["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.VOTED)
+        self.assertEqual(group["n_low_confidence"], 1)
+        self.assertEqual(group["level"], ensemble.BLOCKING)
+        self.assertEqual(page["counts"]["no_majority"], 1)
+        self.assertEqual(page["counts"][ensemble.BLOCKING], 1)
 
     def test_a_page_read_alike_has_no_level(self):
         box = (36, 108, 288, 200)

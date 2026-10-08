@@ -13,6 +13,7 @@ from scanning.views import (
     legacy_opinion_upload,
     login_view,
     logout_view,
+    opinion_blocking_review,
     opinion_list,
     opinion_review,
     password_change,
@@ -79,6 +80,7 @@ from scanning.views_process import (
     dismiss_page_repair,
     glued_output_index,
     move_page,
+    opinion_blocking_cards,
     opinion_ensemble_url,
     opinion_figure_url,
     opinion_file_index,
@@ -104,6 +106,7 @@ from scanning.views_process import (
     serve_glued_shard,
     serve_glued_volume,
     serve_opinion_approved_text,
+    serve_opinion_exported_xml,
     serve_opinion_final_xml,
     serve_opinion_ocr,
     serve_opinion_pdf,
@@ -128,6 +131,11 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
+    path(
+        "opinions/blocking/",
+        opinion_blocking_review,
+        name="opinion_blocking_review",
+    ),
     path(
         "opinions/<int:pk>/review/",
         opinion_review,
@@ -326,6 +334,11 @@ urlpatterns = [
         name="opinion_pdf_url",
     ),
     path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/blocking-cards/",
+        opinion_blocking_cards,
+        name="opinion_blocking_cards",
+    ),
+    path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
         opinion_ensemble_url,
         name="opinion_ensemble_url",
@@ -364,6 +377,12 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/final.xml",
         serve_opinion_final_xml,
         name="serve_opinion_final_xml",
+    ),
+    # The same document as stored for CourtListener (#408).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/exported/",
+        serve_opinion_exported_xml,
+        name="serve_opinion_exported_xml",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.

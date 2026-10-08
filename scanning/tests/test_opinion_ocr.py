@@ -612,7 +612,12 @@ class TestTheVerdict(OpinionOcrTestCase):
 
         unit = self.unit(document, 1, "body B")
         self.assertIsNone(unit["exclusion"])
-        self.assertAlmostEqual(unit["share"], 0.05, places=2)
+        # The core of the cell starts ``EDGE_PT`` inside the top, and
+        # the strip covers what is left of its touch above that.
+        height = (y1 - y0) - 2 * opinion_ocr.EDGE_PT
+        touch = (y1 - y0) * 0.05 - opinion_ocr.EDGE_PT
+        self.assertAlmostEqual(unit["share"], touch / height, places=3)
+        self.assertLess(unit["share"], opinion_ocr.EXCLUDE_SHARE)
 
     def test_a_cell_a_box_covers_by_a_third_is_partial(self):
         x0, y0, x1, y1 = to_pt(BODY_A)
@@ -793,7 +798,10 @@ class TestTheVerdict(OpinionOcrTestCase):
 
         self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
 
-    def test_the_share_is_the_maximum_and_not_the_sum(self):
+    def test_the_share_is_the_union_of_the_boxes(self):
+        """Two boxes that each take under a tenth of the cell's core
+        are two redactions in it, and together they exclude it: the
+        measure is the union, never the largest box alone."""
         x0, y0, x1, y1 = to_pt(BODY_A)
         height = y1 - y0
         self.redact(2, [x0, y0, x1, y0 + height * 0.08])
@@ -802,8 +810,11 @@ class TestTheVerdict(OpinionOcrTestCase):
         document = self.write()
 
         unit = self.unit(document, 1, "body A")
-        self.assertIsNone(unit["exclusion"])
-        self.assertAlmostEqual(unit["share"], 0.08, places=2)
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        core = height - 2 * opinion_ocr.EDGE_PT
+        each = height * 0.08 - opinion_ocr.EDGE_PT
+        self.assertAlmostEqual(unit["share"], 2 * each / core, places=3)
+        self.assertGreaterEqual(unit["share"], opinion_ocr.EXCLUDE_SHARE)
 
     def test_a_redaction_wins_over_a_mask_it_matches(self):
         row = self.redact(1, to_pt(HEADER))
@@ -2615,6 +2626,70 @@ class TestTheBracketToken(OpinionOcrTestCase):
 
         self.assertEqual(unit["exclusion"]["rect_type"], "headnote")
         self.assertEqual(unit["text"], "The court held.")
+
+
+class TestTheCoveredShare(TestCase):
+    """The share a cell is covered by: the union of the boxes over
+    the core of the cell, ``EDGE_PT`` inside each edge."""
+
+    def test_a_box_that_starts_inside_the_padding_covers_the_cell(self):
+        """A headnote key line: the engine's cell has three points of
+        air above the letters, and the box drawn over the headnote
+        hugs the ink. The cell is covered, not partial."""
+        rect = {"x0": 0, "y0": 3, "x1": 100, "y1": 12}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 12], [rect])
+
+        self.assertEqual(share, 1.0)
+        self.assertIs(hit, rect)
+
+    def test_two_boxes_with_a_seam_between_them_cover_the_cell(self):
+        """A two-key headnote header straddles the boxes of two
+        headnotes with a white seam of a point and a half between
+        them. Each box alone covers under half of it."""
+        upper = {"x0": 0, "y0": 0, "x1": 100, "y1": 14}
+        lower = {"x0": 0, "y0": 15.5, "x1": 100, "y1": 30}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 30], [upper, lower])
+
+        self.assertGreaterEqual(share, opinion_ocr.FULL_SHARE)
+        self.assertIs(hit, lower)
+
+    def test_a_strip_that_grazes_the_edge_covers_nothing(self):
+        """The bottom margin strip of a page overlaps the last cell of
+        a footnote by two points: the footnote keeps its last word."""
+        strip = {"x0": 0, "y0": 11, "x1": 100, "y1": 40}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 13], [strip])
+
+        self.assertEqual(share, 0.0)
+        self.assertIsNone(hit)
+
+    def test_two_boxes_inside_a_line_add_up(self):
+        """Two names redacted in one line, each under a tenth of it,
+        are two redactions in the line, and the line is excluded."""
+        first = {"x0": 20, "y0": 0, "x1": 40, "y1": 12}
+        second = {"x0": 100, "y0": 0, "x1": 120, "y1": 12}
+
+        share, _ = opinion_ocr.covered_share([0, 0, 200, 12], [first, second])
+
+        self.assertAlmostEqual(share, 2 * 20 / (200 - 6), places=4)
+        self.assertGreaterEqual(share, opinion_ocr.EXCLUDE_SHARE)
+
+    def test_a_small_cell_keeps_half_of_itself(self):
+        """A page number eight points tall is measured over its middle
+        half, never over nothing."""
+        rect = {"x0": 0, "y0": 0, "x1": 8, "y1": 4}
+
+        share, _ = opinion_ocr.covered_share([0, 0, 8, 8], [rect])
+
+        self.assertEqual(opinion_ocr.core_box([0, 0, 8, 8]), [2, 2, 6, 6])
+        self.assertAlmostEqual(share, 0.5, places=4)
+
+    def test_the_union_counts_an_overlap_once(self):
+        boxes = [[0, 0, 10, 10], [5, 5, 15, 15]]
+
+        self.assertEqual(opinion_ocr.union_area(boxes), 175.0)
 
 
 class TestTheBracketBox(TestCase):

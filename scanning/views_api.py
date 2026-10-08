@@ -1497,7 +1497,12 @@ def _edit_target(
     return page, group, address
 
 
-def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
+def _build_after_edit(
+    request: HttpRequest,
+    opinion: Opinion,
+    saved: str,
+    extra: dict | None = None,
+):
     """Write the text again after an edit, and answer the curator.
 
     The build runs here, the rule of the "Read the OCR documents again"
@@ -1509,6 +1514,8 @@ def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
     :param request: The HTTP request.
     :param opinion: The opinion.
     :param saved: The line of the success.
+    :param extra: More keys for the answer: the id of the edit written,
+        so a page can take it back (``withdraw_opinion_edit``).
     :returns: The answer.
     """
     from scanning import ensemble
@@ -1546,10 +1553,12 @@ def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
             break
         else:
             messages.success(request, saved)
-            return JsonResponse({"status": "ok", "message": saved})
+            return JsonResponse(
+                {"status": "ok", "message": saved, **(extra or {})}
+            )
     warning = EDIT_NOT_BUILT_MESSAGE.format(reason=reason)
     messages.warning(request, warning)
-    return JsonResponse({"status": "ok", "message": warning})
+    return JsonResponse({"status": "ok", "message": warning, **(extra or {})})
 
 
 @login_required
@@ -1603,7 +1612,7 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
-    opinion_edits.supersede(
+    edit = opinion_edits.supersede(
         opinion,
         request.user,
         kind=OpinionEdit.Kind.TEXT,
@@ -1624,7 +1633,9 @@ def edit_opinion_text(
         group["id"],
         page["page_in_opinion"],
     )
-    return _build_after_edit(request, opinion, EDIT_TEXT_SAVED_MESSAGE)
+    return _build_after_edit(
+        request, opinion, EDIT_TEXT_SAVED_MESSAGE, {"edit_id": edit.pk}
+    )
 
 
 @login_required
