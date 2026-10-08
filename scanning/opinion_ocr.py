@@ -266,6 +266,18 @@ EXCLUDE_SHARE = 0.10
 #: the ``PARTIAL_REDACTION`` card of #334 asks a human to look.
 FULL_SHARE = 0.90
 
+#: How far inside each edge of a cell the share is measured, in
+#: points. An engine's cell carries air around its letters and a
+#: redaction box hugs the ink, so the box starts a few points inside
+#: the cell on every headnote key line and every running head of a
+#: volume, and the margin strip of a page grazes the last cell of a
+#: footnote by two points. Measured over the whole cell, the first
+#: reads as a partial cover on 880 blocks of one volume and the second
+#: drops a footnote's last word; measured over the core, neither is
+#: anything. A cell narrower than four times this on an axis keeps
+#: half of itself on that axis.
+EDGE_PT = 3.0
+
 #: How many rows one tick writes, all of one scan. One row is a cut of
 #: about four pages, a geometry over about 800 units and 30 boxes and
 #: two PUTs, about a third of a second; ten hold the serial scheduler
@@ -859,32 +871,93 @@ def intersection(a: list[float], b: list[float]) -> float:
     return width * height
 
 
+def core_box(box: list[float]) -> list[float]:
+    """Return the core of a cell: the box inset by :data:`EDGE_PT`.
+
+    The inset on an axis is at most a quarter of the extent, so a
+    small cell (a page number, a bracket) keeps half of itself.
+
+    :param box: ``[x0, y0, x1, y1]`` in points.
+    :returns: The inset box.
+    :rtype: list[float]
+    """
+    dx = min(EDGE_PT, (box[2] - box[0]) / 4)
+    dy = min(EDGE_PT, (box[3] - box[1]) / 4)
+    return [box[0] + dx, box[1] + dy, box[2] - dx, box[3] - dy]
+
+
+def union_area(boxes: list[list[float]]) -> float:
+    """Return the area the union of ``boxes`` covers.
+
+    Over the grid of every edge: a cell of the grid is in the union
+    when its centre is in any box. The boxes over one unit are few.
+
+    :param boxes: ``[x0, y0, x1, y1]`` boxes, in one space.
+    :returns: The area.
+    :rtype: float
+    """
+    xs = sorted({b[0] for b in boxes} | {b[2] for b in boxes})
+    ys = sorted({b[1] for b in boxes} | {b[3] for b in boxes})
+    area = 0.0
+    for x0, x1 in zip(xs, xs[1:]):
+        cx = (x0 + x1) / 2
+        columns = [b for b in boxes if b[0] <= cx <= b[2]]
+        if not columns:
+            continue
+        for y0, y1 in zip(ys, ys[1:]):
+            cy = (y0 + y1) / 2
+            if any(b[1] <= cy <= b[3] for b in columns):
+                area += (x1 - x0) * (y1 - y0)
+    return area
+
+
 def covered_share(
     box: list[float], rects: list[dict]
 ) -> tuple[float, dict | None]:
-    """Return the largest share of ``box`` one of ``rects`` covers.
+    """Return the share of ``box`` that ``rects`` cover together.
 
-    The maximum over the boxes, not the sum: the rule of the
-    experiment's ``covered`` (#317). Two boxes that each touch a tenth
-    do not make an exclusion between them.
+    **The core of the cell, under the union of the boxes.** The share
+    is measured inside :data:`EDGE_PT` of every edge (:func:`core_box`),
+    because the air an engine draws around its letters is no text: a
+    box that starts a few points inside the cell covers it, and a strip
+    that grazes its edge does not. It is the union of the boxes and not
+    the largest one, because a cell that straddles two headnote boxes
+    is covered by both, and because two boxes that each take a tenth of
+    a line are two redactions in it, not none. The experiment's
+    ``covered`` (#317) took the largest box over the whole cell, and on
+    a real volume that read every headnote key line as a partial cover.
 
     :param box: ``[x0, y0, x1, y1]`` in points.
     :param rects: Dicts with ``x0``, ``y0``, ``x1``, ``y1`` in points.
-    :returns: ``(share, the rect)``, or ``(0.0, None)``.
+    :returns: ``(share, the rect that covers most)``, or ``(0.0,
+        None)``.
     :rtype: tuple[float, dict | None]
     """
-    area = (box[2] - box[0]) * (box[3] - box[1])
+    core = core_box(box)
+    area = (core[2] - core[0]) * (core[3] - core[1])
     if area <= 0:
         return 0.0, None
     best, hit = 0.0, None
+    clipped: list[list[float]] = []
     for rect in rects:
         other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
         if other is None:
             continue
-        share = intersection(box, other) / area
+        clip = [
+            max(core[0], other[0]),
+            max(core[1], other[1]),
+            min(core[2], other[2]),
+            min(core[3], other[3]),
+        ]
+        if clip[2] <= clip[0] or clip[3] <= clip[1]:
+            continue
+        clipped.append(clip)
+        share = (clip[2] - clip[0]) * (clip[3] - clip[1]) / area
         if share > best:
             best, hit = share, rect
-    return best, hit
+    if not clipped:
+        return 0.0, None
+    return min(1.0, union_area(clipped) / area), hit
 
 
 def is_bracket_box(rect: dict, box: list[float]) -> bool:
