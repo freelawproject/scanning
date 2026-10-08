@@ -25,8 +25,10 @@ from django.contrib.auth import get_user_model
 from django.db.models import F
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from scanning import (
+    boundaries,
     casebody,
     ensemble,
     markup,
@@ -48,7 +50,7 @@ from scanning.tests.test_ensemble import (
     engine_page,
     unit,
 )
-from scanning.tests.test_opinion_ocr import block, cell, to_pt
+from scanning.tests.test_opinion_ocr import PAGES, block, cell, to_pt
 
 #: A picture between the two body blocks of the fixture, in points.
 PICTURE_PT = [40.0, 420.0, 280.0, 560.0]
@@ -618,6 +620,15 @@ class FigureTestCase(EnsembleTestCase):
                 *self.PICTURE, text="![img-0.jpeg](img-0.jpeg)", kind="image"
             )
         )
+        # The run's bitonal copy, under the processing prefix, for the
+        # masks the cut widens over its ink.
+        self.apply_run.bitonal_key = f"{self.prefix}jobs/apply/a1/bitonal.pdf"
+        self.apply_run.save(update_fields=["bitonal_key"])
+        volume = fitz.open()
+        for _ in range(PAGES):
+            volume.new_page(width=612, height=792)
+        self.objects[self.apply_run.bitonal_key] = volume.tobytes()
+        volume.close()
         self.cuts: dict[str, bytes] = {}
         upload = patch(
             "scanning.s3_sync.upload_bytes_object",
@@ -665,7 +676,8 @@ class TestTheLedger(FigureTestCase):
         self.assertEqual(figure["page_in_opinion"], 1)
         self.assertEqual(figure["box_pt"], to_pt(self.PICTURE))
         self.assertEqual(
-            self.opinion.figure_digest, ensemble.figure_digest(self.stored())
+            self.opinion.figure_digest,
+            opinion_figures.ledger_digest(self.opinion, self.stored()),
         )
         self.assertFalse(opinion_figures.is_written(self.opinion))
         self.assertTrue(
@@ -824,6 +836,81 @@ class TestTheLedger(FigureTestCase):
         cut = fitz.Pixmap(next(iter(self.cuts.values())))
         self.assertLess(sum(cut.pixel(40, 30)) / 3, 60)
         self.assertGreater(sum(cut.pixel(width - 10, height - 10)) / 3, 200)
+
+    def test_a_redaction_added_over_a_picture_cuts_it_again(self):
+        """Review 2 open again, a name inside the map: no box moves, so
+        a digest of the boxes alone would keep the cut that shows it."""
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        with self.fake_source():
+            opinion_figures.cut_one(self.opinion)
+        self.opinion.refresh_from_db()
+        self.assertTrue(opinion_figures.is_written(self.opinion))
+        cut_at = self.opinion.figure_digest
+        box = to_pt(self.PICTURE)
+
+        # A box elsewhere on the page touches no picture: no new cut.
+        self.redact(2, [box[0], 20.0, box[0] + 30, 30.0], fill="black")
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.figure_digest, cut_at)
+        self.assertTrue(opinion_figures.is_written(self.opinion))
+
+        # A box over the picture is a new cut.
+        self.redact(2, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.figure_digest, cut_at)
+        self.assertFalse(opinion_figures.is_written(self.opinion))
+        self.assertTrue(
+            opinion_figures.owed().filter(pk=self.opinion.pk).exists()
+        )
+
+    def test_a_new_digest_clears_the_faults_of_the_old_one(self):
+        """A cut that failed at the old pictures leaves no cooldown and
+        no count on the new ones; the same pictures keep both, so a
+        rebuild does not reset a cut that fails."""
+        self.run_ensemble()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            figure_attempts=2, figures_attempted_at=timezone.now()
+        )
+
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.figure_attempts, 2)
+        self.assertIsNotNone(self.opinion.figures_attempted_at)
+
+        box = to_pt(self.PICTURE)
+        self.redact(2, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.figure_attempts, 0)
+        self.assertIsNone(self.opinion.figures_attempted_at)
+        self.assertTrue(
+            opinion_figures.due().filter(pk=self.opinion.pk).exists()
+        )
+
+    def test_the_cut_widens_the_masks_over_the_volume(self):
+        """The masks the PDF pass paints: grown over the ink of the
+        run's bitonal copy, never the unwidened ones of the viewer."""
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        real = boundaries.outside_rects
+        documents = []
+
+        def record(scan, rows, document=None, **kwargs):
+            # The page count while the cut holds the volume open.
+            documents.append(None if document is None else document.page_count)
+            return real(scan, rows, document=document, **kwargs)
+
+        with (
+            self.fake_source(),
+            patch("scanning.boundaries.outside_rects", side_effect=record),
+        ):
+            opinion_figures.cut_one(self.opinion)
+
+        self.assertTrue(documents)
+        self.assertEqual(documents[-1], PAGES)
 
     def test_the_mirror_waits_for_the_cut(self):
         """The PDF pass frees the local tree only when the cut of the
