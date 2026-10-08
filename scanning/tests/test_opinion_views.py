@@ -716,12 +716,14 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "approved.json",
                 "tags.json",
                 "final.xml",
+                "exported.xml",
             ],
         )
         # The approved text and the tagger's spans over it are outside
         # the glue prefix (#272, #431), and blank before they exist; the
-        # final XML (#432) is built at each request and has no key.
-        for entry in body["files"][:-3]:
+        # final XML (#432) is built at each request and has no key, and
+        # its export (#408) is at a key of the two ids.
+        for entry in body["files"][:-4]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"

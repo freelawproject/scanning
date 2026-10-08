@@ -1021,8 +1021,12 @@ class TestTheTextReviewPromotion(TestCase):
         """The collect tick is serial, the rule of the other passes."""
         self.ready()
         for index in range(3):
+            # The page of ``self.opinion`` at another index: a fixed
+            # page number can meet the factory's sequence.
             other = OpinionFactory(
-                scan=self.scan, first_printed_page=700 + index
+                scan=self.scan,
+                first_printed_page=self.opinion.first_printed_page,
+                index_in_page=self.opinion.index_in_page + 1 + index,
             )
             Opinion.objects.filter(pk=other.pk).update(
                 redacted_pdf_revision=other.glue_revision,

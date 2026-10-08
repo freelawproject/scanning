@@ -40,13 +40,14 @@ writes the characters of ``markup.projected_characters``, the rule of
 the tagger's input, so a word is joined and a paragraph reads as one
 line, and every span and every mark moves through the same map.
 
-The document is computed at each request and stored nowhere: the
-export for CourtListener is #408. Pure standard library plus
-``markup`` and eyecite, on purpose, like ``paragraphs``: a test builds
-it from two dicts. The citation of the case in its own reporter comes
-from the row, so the caller passes it (:func:`main_citation`).
-:func:`display_html` and :func:`source_html` are the two views of the
-review page's display (``views_process.opinion_final_xml``).
+The review page computes the document at each request, and the export
+for CourtListener (``final_xml``, #408) stores the same build. Pure
+standard library plus ``markup`` and eyecite, on purpose, like
+``paragraphs``: a test builds it from two dicts. The citation of the
+case in its own reporter comes from the row, so the caller passes it
+(:func:`main_citation`). :func:`display_html` and :func:`source_html`
+are the two views of the review page's display
+(``views_process.opinion_final_xml``).
 """
 
 from __future__ import annotations
@@ -76,6 +77,12 @@ ELEMENTS = {
     "author": "author",
     "heading": "heading",
 }
+
+#: The version of the document :func:`build` writes, the ``schema``
+#: attribute of ``<casebody>``. Raise it when the same two inputs give
+#: another XML: the export (``final_xml``, #408) then writes every
+#: stored document again, and CourtListener reads the number.
+SCHEMA = 1
 
 #: The CAP element that holds a run of ``party`` and ``separator``.
 PARTIES = "parties"
@@ -890,7 +897,13 @@ def _comment(text: str) -> str:
     return "<!-- " + re.sub(r"-{2,}", "-", text) + " -->"
 
 
-def build(approved: dict, tags: dict, citation: str = "") -> str:
+def build(
+    approved: dict,
+    tags: dict,
+    citation: str = "",
+    *,
+    ids: dict | None = None,
+) -> str:
     """Return the final XML of one opinion: one ``opinion`` per writing.
 
     The citations go first in ``casebody``, the place CourtListener's
@@ -905,6 +918,10 @@ def build(approved: dict, tags: dict, citation: str = "") -> str:
     :param tags: The spans object (``tagger.glue_run``).
     :param citation: The citation in the scan's reporter
         (:func:`main_citation`), or ``""`` for none.
+    :param ids: The ``scan-id`` and ``opinion-id`` attributes of
+        ``<casebody>`` (#408): the portal's primary keys, which the
+        approved object does not hold. CourtListener keeps the XML and
+        reads them from it, so the two ids name the redacted PDF later.
     :returns: The XML document, one block element per line.
     :rtype: str
     :raises CasebodyError: When a span does not address the body.
@@ -998,6 +1015,8 @@ def build(approved: dict, tags: dict, citation: str = "") -> str:
             {
                 "firstpage": opinion.get("first_printed_page"),
                 "lastpage": opinion.get("last_printed_page"),
+                **(ids or {}),
+                "schema": SCHEMA,
             }
         )
         + ">"

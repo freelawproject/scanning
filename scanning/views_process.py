@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
-from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -35,6 +34,7 @@ from scanning import (
     casebody,
     detections,
     dots_mocr,
+    final_xml,
     findings,
     jobs,
     mistral_ocr,
@@ -2250,7 +2250,8 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
     """Build the final XML of an opinion from its two objects (#432).
 
     The spans must be over the approved text the row names now
-    (``tagger.is_written``), the one rule of the tagger's ledger.
+    (``tagger.is_written``), the one rule of the tagger's ledger. The
+    build is ``final_xml.render``, the one the export stores (#408).
 
     :param opinion: The opinion, with ``scan__reporter``.
     :returns: The XML, and the spans object for the legend.
@@ -2267,34 +2268,19 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
             )
         )
     try:
-        approved = tagger.load_approved(opinion.approved_text_key)
-        tags = s3_sync.download_json_object(opinion.tag_key)
-        if not isinstance(tags, dict):
-            raise casebody.CasebodyError(
-                f"{opinion.tag_key} is not a spans object"
-            )
-        citation = _main_citation(opinion)
-        return casebody.build(approved, tags, citation), tags
-    except (
-        tagger.TaggerInputError,
-        casebody.CasebodyError,
-        BotoCoreError,
-        ClientError,
-        ValueError,
-    ) as exc:
+        return final_xml.render(opinion)
+    except (final_xml.FinalXmlError, final_xml.TransientFault) as exc:
         # The reason goes to the log alone: an S3 fault's text is the
         # client library's, and no answer of this route repeats it. A
         # writing whose type is not read is an error, so Sentry tells a
         # developer to add its words to ``casebody.OPINION_TYPES`` (#442).
-        log = (
-            logger.error
-            if isinstance(exc, casebody.OpinionTypeError)
-            else logger.warning
-        )
+        # ``final_xml.render`` wraps it, so the cause names it.
+        unread_type = isinstance(exc.__cause__, casebody.OpinionTypeError)
+        log = logger.error if unread_type else logger.warning
         log("%s: the final XML was not built: %s", opinion, exc)
         message = (
             FINAL_XML_TYPE_MESSAGE.format(opinion=opinion)
-            if isinstance(exc, casebody.OpinionTypeError)
+            if unread_type
             else FINAL_XML_REFUSED_MESSAGE.format(opinion=opinion)
         )
         raise _FinalXmlRefused(
@@ -2303,42 +2289,6 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
                 status=409,
             )
         ) from exc
-
-
-#: The reporters whose citation eyecite did not read, logged once per
-#: process: the final XML is built at every request.
-_UNREAD_REPORTERS: set[str] = set()
-
-
-def _main_citation(opinion: Opinion) -> str:
-    """Return the citation of an opinion in its scan's reporter (#435).
-
-    A reporter missing from ``Reporter.CITE_MAP`` gives a name eyecite
-    does not read, and CourtListener's importer drops the citation, so
-    the miss is logged for a developer to add the abbreviation, once
-    per reporter (:data:`_UNREAD_REPORTERS`).
-
-    :param opinion: The opinion, with ``scan__reporter``.
-    :rtype: str
-    """
-    scan = opinion.scan
-    citation = casebody.main_citation(
-        scan.volume, scan.reporter.cite_name, opinion.first_printed_page
-    )
-    short_name = scan.reporter.short_name
-    if (
-        short_name not in _UNREAD_REPORTERS
-        and casebody.full_citation(citation) is None
-    ):
-        _UNREAD_REPORTERS.add(short_name)
-        logger.error(
-            "%s: eyecite does not read the citation %r; add the reporter "
-            "%r to Reporter.CITE_MAP",
-            opinion,
-            citation,
-            short_name,
-        )
-    return citation
 
 
 def _final_xml_name(opinion: Opinion) -> str:
@@ -2379,14 +2329,53 @@ def serve_opinion_final_xml(
 
 
 @login_required
+def serve_opinion_exported_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the stored final XML of one opinion (#408).
+
+    The object CourtListener reads, at ``final_xml.key``. A developer's
+    route, so it redirects (#243/#262). A 404 while no object is stored
+    (``final_xml.is_stored``). The object may be older than the row:
+    after a rewrite of the approved text it holds the text approved
+    before, until a tagger run of the new one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not final_xml.is_stored(opinion):
+        return _json_404(
+            f"The final XML of {opinion} is not exported.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    object_key = final_xml.key(opinion)
+    return _redirect_to_object(
+        scan,
+        "opinion-exported-xml",
+        object_key,
+        filename=_final_xml_name(opinion),
+        missing_message=(
+            f"The final XML of {opinion} is stamped, but {object_key} is "
+            "not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
 def opinion_final_xml(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> HttpResponse:
     """Show the final XML of one opinion, for display and debugging (#432).
 
     Two views of one document: every element drawn as a box with its
-    name, and the XML text. Nothing is stored; the export for
-    CourtListener is #408.
+    name, and the XML text. Built at this request; the export for
+    CourtListener stores the same build (``final_xml``, #408).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -2557,6 +2546,23 @@ def opinion_file_index(
             "key": None,
             "url": reverse(
                 "serve_opinion_final_xml",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    # The same build, stored for CourtListener (#408) at a key of the
+    # two ids, outside the glue prefix.
+    files.append(
+        {
+            "name": "exported.xml",
+            "output": "opinion-exported-xml",
+            "written": final_xml.is_stored(opinion),
+            # False while the object holds older inputs than the row:
+            # the pass writes it again, or a tagger run is owed.
+            "current": final_xml.is_written(opinion),
+            "key": final_xml.key(opinion),
+            "url": reverse(
+                "serve_opinion_exported_xml",
                 kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
             ),
         }
