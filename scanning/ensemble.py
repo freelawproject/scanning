@@ -293,10 +293,11 @@ EDIT_BASE_CHANGED = "base_changed"
 EDIT_IN_FOOTNOTES = "in_footnotes"
 
 #: The risk of a group the engines did not read alike (#419). A
-#: ``BLOCKING`` group is a place no majority of the engines read, or a
-#: place one engine alone read: its card is an ERROR, and the approval
-#: waits for a person. A ``WARNING`` group is a place a majority read.
-#: A group every engine read alike has no level.
+#: ``BLOCKING`` group holds a word no two engines agree on, or was
+#: read by one engine alone: its card is an ERROR, and the approval
+#: waits for a person. A ``WARNING`` group is a place a majority read,
+#: word for word at the least. A group every engine read alike has no
+#: level.
 BLOCKING = "blocking"
 WARNING = "warning"
 
@@ -501,9 +502,39 @@ def compare_word(word: str) -> str:
     return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
 
 
+#: A word that is dots alone: one of a spaced ellipsis.
+_LONE_DOTS = re.compile(r"^\.+$")
+
+
 def _pairs(text: str) -> list[tuple[str, str]]:
-    """Return ``[(key, the word as it is shown)]`` for one read."""
-    return [(compare_word(word), word) for word in text.split()]
+    """Return ``[(key, the word as it is shown)]`` for one read.
+
+    A run of two or more words that are dots alone is one word: Surya
+    writes the spaced ellipsis of the page (``. . .``) where Mistral
+    writes ``...``, and :func:`compare_text` reads them alike already
+    (``_DOT_RUN``). Split on whitespace first, they are three words
+    against one, and a block that agrees to the letter goes to a vote.
+    The shown word keeps the engine's own spacing.
+
+    :param text: One engine's read.
+    :returns: The pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    words = text.split()
+    pairs: list[tuple[str, str]] = []
+    index = 0
+    while index < len(words):
+        end = index
+        while end < len(words) and _LONE_DOTS.match(words[end]):
+            end += 1
+        if end - index >= 2:
+            shown = " ".join(words[index:end])
+            pairs.append((compare_word(shown), shown))
+            index = end
+            continue
+        pairs.append((compare_word(words[index]), words[index]))
+        index += 1
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -2318,6 +2349,7 @@ def _counts() -> dict:
         WARNING: 0,
         BLOCKING: 0,
         "single_engine": 0,
+        "no_majority": 0,
         "low_confidence": 0,
         "partial": 0,
         "partial_bracket": 0,
@@ -2833,6 +2865,8 @@ def build_page(
             entry["counts"][level] += 1
         if level == BLOCKING and read_back["agreement"] == SINGLE:
             entry["counts"]["single_engine"] += 1
+        if level == BLOCKING and read_back["agreement"] == VOTED:
+            entry["counts"]["no_majority"] += 1
         if name == FOOTNOTES:
             entry["counts"]["footnote_groups"] += 1
         if group["footnote_doubt"]:
@@ -2909,11 +2943,15 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     badge of the review page, which reads ``level`` off the group and
     derives nothing (#419).
 
-    A place no majority of the engines read alike (``VOTED``) blocks,
-    also when the word vote settled every word of it, and so does a
-    place one engine alone read (``SINGLE``): nothing confirms its
-    words. Every other place :func:`_differs` answers for is a place a
-    majority read alike, a warning.
+    **The word is the unit.** A place one engine alone read
+    (``SINGLE``) blocks: nothing confirms its words. A place no full
+    reading of which held a majority (``VOTED``) blocks only where the
+    word vote left a word no two engines agree on
+    (``n_low_confidence``): a block of a hundred words that the engines
+    split three ways over one spelling and one quote mark is settled
+    word for word, and a block whose every word a majority settled is
+    the same fact as a block a majority read whole. Every other place
+    :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -2922,7 +2960,9 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     """
     if not _differs(group, engines):
         return None
-    if group["agreement"] in (VOTED, SINGLE):
+    if group["agreement"] == SINGLE:
+        return BLOCKING
+    if group["agreement"] == VOTED and group.get("n_low_confidence"):
         return BLOCKING
     return WARNING
 
@@ -3406,7 +3446,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
-        if counts[VOTED]:
+        if counts.get("no_majority"):
             cards.append(
                 _card(
                     opinion,
@@ -3414,7 +3454,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     OpinionCheck.NO_MAJORITY,
                     Issue.Severity.ERROR,
                     _no_majority_message(
-                        counts[VOTED], counts["low_confidence"]
+                        counts["no_majority"], counts["low_confidence"]
                     ),
                     standing,
                 )
@@ -3583,18 +3623,15 @@ def _blockquote_list_message(page: dict) -> str:
 def _no_majority_message(blocks: int, words: int) -> str:
     """Return the line of one ``NO_MAJORITY`` card (#419).
 
-    :param blocks: How many groups no majority of the engines read.
-    :param words: How many words of them no majority settled.
+    :param blocks: How many groups hold a word no two engines agree on.
+    :param words: How many words of the page's voted groups no
+        majority settled.
     :returns: The message.
     :rtype: str
     """
-    said = (
-        f"{blocks} block(s) on this page have no reading that a majority "
-        "of the engines share"
-    )
-    if words:
-        said += f", and {words} word(s) in them have no majority"
-    return said + ". Read them against the PDF."
+    said = f"{blocks} block(s) on this page hold "
+    said += f"{words} word(s)" if words else "a word"
+    return said + " no two engines agree on. Read them against the PDF."
 
 
 def _single_message(page: dict) -> str:
