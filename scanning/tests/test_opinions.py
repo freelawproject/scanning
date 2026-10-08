@@ -8,15 +8,18 @@ Four groups:
   and the two stale cards;
 - the worker (``opinions.run``): where it parks the scan;
 - the approval and the daemon: the queue and the dispatch;
-- the promotion to the text review (#365).
+- the promotion to the text review (#365);
+- the deletion of the glues of the old revisions (#452).
 """
 
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
 
-from scanning import apply, opinions, review_states
+from scanning import apply, opinions, review_states, s3_sync
 from scanning.factories import (
     OpinionBoundaryFactory,
     OpinionFactory,
@@ -1018,8 +1021,12 @@ class TestTheTextReviewPromotion(TestCase):
         """The collect tick is serial, the rule of the other passes."""
         self.ready()
         for index in range(3):
+            # The page of ``self.opinion`` at another index: a fixed
+            # page number can meet the factory's sequence.
             other = OpinionFactory(
-                scan=self.scan, first_printed_page=700 + index
+                scan=self.scan,
+                first_printed_page=self.opinion.first_printed_page,
+                index_in_page=self.opinion.index_in_page + 1 + index,
             )
             Opinion.objects.filter(pk=other.pk).update(
                 redacted_pdf_revision=other.glue_revision,
@@ -1079,3 +1086,129 @@ class TestTheTextReviewPromotion(TestCase):
 
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+
+class TestThePruneOfOldGlues(TestCase):
+    """The glues of a revision below the live one are deleted (#452).
+
+    The bucket is a list of keys; ``list_keys`` and ``delete_objects``
+    are the two calls the prune makes.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        self.opinion = OpinionFactory(scan=self.scan)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            glue_revision=2,
+            redacted_pdf_revision=2,
+            ocr_glue_revision=2,
+            ensemble_revision=2,
+        )
+        self.opinion.refresh_from_db()
+        self.root = (
+            f"{s3_sync.s3_processing_prefix(self.scan)}"
+            f"{self.opinion.object_prefix}"
+        )
+        self.old = [
+            f"{self.root}r0/redacted.pdf",
+            f"{self.root}r0/dots_mocr.json",
+            f"{self.root}r1/manifest.json",
+            f"{self.root}r1/ensemble.e3.json",
+        ]
+        self.kept = [
+            f"{self.root}r2/redacted.pdf",
+            f"{self.root}r2/ensemble.json",
+            f"{self.root}r10/redacted.pdf",
+            f"{self.root}approved/r0.e0.j1.t20261001T000000000000Z.json",
+            f"{self.root}tag/input-abc.json",
+        ]
+        self.listing: list[str] | None = self.old + self.kept
+        self.deleted: list[str] = []
+        for target, side in (
+            ("scanning.s3_sync.list_keys", lambda prefix: self.listing),
+            ("scanning.s3_sync.delete_objects", self.delete_objects),
+        ):
+            patcher = patch(target, side_effect=side)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def delete_objects(self, keys):
+        self.deleted.extend(keys)
+        return len(keys)
+
+    def test_the_older_revisions_go_and_nothing_else(self):
+        keys = opinions.prune_glues(self.opinion)
+
+        self.assertEqual(sorted(keys), sorted(self.old))
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_a_dry_run_deletes_nothing(self):
+        keys = opinions.prune_glues(self.opinion, dry_run=True)
+
+        self.assertEqual(sorted(keys), sorted(self.old))
+        self.assertEqual(self.deleted, [])
+
+    def test_a_failed_listing_deletes_nothing(self):
+        self.listing = None
+
+        self.assertIsNone(opinions.prune_glues(self.opinion))
+        self.assertEqual(self.deleted, [])
+
+    def test_the_promotion_prunes(self):
+        self.assertTrue(opinions.promote_ready(self.opinion))
+
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_a_first_revision_is_promoted_with_no_listing(self):
+        """Nothing is older than revision 0, so the tick lists nothing."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            glue_revision=0,
+            redacted_pdf_revision=0,
+            ocr_glue_revision=0,
+            ensemble_revision=0,
+        )
+        self.opinion.refresh_from_db()
+
+        with patch("scanning.s3_sync.list_keys") as list_keys:
+            self.assertTrue(opinions.promote_ready(self.opinion))
+
+        list_keys.assert_not_called()
+
+    def test_a_row_that_is_not_promoted_prunes_nothing(self):
+        """A live revision that is not complete keeps the last one."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=1
+        )
+        self.opinion.refresh_from_db()
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+        self.assertEqual(self.deleted, [])
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("prune_opinion_glues", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_the_command_prunes_a_complete_row_and_an_approved_one(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        output = self.run_command(str(self.scan.pk))
+
+        self.assertIn("deleted 4 object(s)", output)
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_the_command_skips_a_row_whose_revision_is_not_complete(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(ensemble_revision=1)
+
+        output = self.run_command("--all")
+
+        self.assertIn("Deleted 0 object(s)", output)
+        self.assertEqual(self.deleted, [])
+
+    def test_the_command_dry_run_counts(self):
+        output = self.run_command(str(self.scan.pk), "--dry-run")
+
+        self.assertIn("would delete 4 object(s)", output)
+        self.assertEqual(self.deleted, [])

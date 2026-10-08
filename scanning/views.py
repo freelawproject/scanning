@@ -416,6 +416,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         )
     open_findings = sum(1 for row in findings if row.dismissal_id is None)
     ocr_written = opinion_ocr.is_written(opinion)
+    review2_open = opinion.scan.status not in opinion_pdf.OPINION_PDF_STATUSES
     # The dismissal answers a card while the opinion is ready for the
     # text review alone, the gate of the endpoint (#419). A stale card
     # is a fact about the row and takes none.
@@ -503,7 +504,11 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "can_approve": (
                 opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
                 and ensemble.is_written(opinion)
+                and not review2_open
             ),
+            # The redaction review of the volume is open again (#240):
+            # the approval refuses, so the page says why it offers none.
+            "review2_open": review2_open,
             "blocking_count": sum(
                 1
                 for row, block in zip(findings, blocking)

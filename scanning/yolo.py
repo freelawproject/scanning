@@ -840,7 +840,9 @@ def apply_state(detect_jobs: list[ExternalJob]) -> dict:
     ``ApplyRun`` the geometry was measured against (#269). The compute
     reads the run's corrected volume, so a stamp names the run it
     measured, and a later run makes it stale
-    (:func:`redactions_current`).
+    (:func:`redactions_current`). ``rows_read_at`` is when that compute
+    read the detection rows (#240): a human detection write after it is
+    not in the geometry (``detections.changed_since_compute``).
 
     :param detect_jobs: The live run's rows, ordered by shard index.
     :returns: The stored state; empty when the apply never ran.
@@ -907,19 +909,31 @@ def record_apply_start(detect_jobs: list[ExternalJob]) -> None:
     write_apply_state(detect_jobs, state)
 
 
-def record_apply_success(detect_jobs: list[ExternalJob], run) -> None:
+def record_apply_success(
+    detect_jobs: list[ExternalJob], run, read_at=None
+) -> None:
     """Stamp the run as applied against ``run``, so nothing queues it again.
 
     :param detect_jobs: The live run's rows, ordered by shard index.
     :param run: The ``ApplyRun`` whose corrected volume the geometry
         was measured on (#269). The compute reaches this line only
         with a complete standing run, so it is never ``None``.
+    :param read_at: When the compute started to read the detection
+        rows, stored as ``rows_read_at`` (#240). ``applied_at`` is the
+        end of the compute, a render later, and a box a curator drew
+        during the render is newer than the read and older than that
+        stamp. ``detections.changed_since_compute`` reads this one.
+        None stamps nothing, and the earlier read time goes with it.
     :return: None.
     """
     state = apply_state(detect_jobs)
     state.pop("queued_at", None)
     state["applied_at"] = timezone.now().isoformat()
     state["apply_run"] = run.pk
+    if read_at is None:
+        state.pop("rows_read_at", None)
+    else:
+        state["rows_read_at"] = read_at.isoformat()
     write_apply_state(detect_jobs, state)
 
 

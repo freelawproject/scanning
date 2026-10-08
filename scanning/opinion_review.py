@@ -43,6 +43,7 @@ from scanning.models import (
     OpinionFinding,
     OpinionReviewStatus,
 )
+from scanning.opinion_pdf import OPINION_PDF_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ OLD_DOCUMENT = "old_document"
 NO_PAGE_NUMBERS = "no_page_numbers"
 BUCKET = "bucket"
 MOVED = "moved"
+REVIEW2_OPEN = "review2_open"
 
 
 class ApprovalRefused(Exception):
@@ -151,8 +153,7 @@ def approved_key(
     stamp = approved_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
     return (
-        f"{prefix}jobs/opinions/{opinion.first_printed_page}."
-        f"{opinion.index_in_page}/approved/r{opinion.glue_revision}."
+        f"{prefix}{opinion.object_prefix}approved/r{opinion.glue_revision}."
         f"e{edit_revision}.j{join_rule}.t{stamp}.json"
     )
 
@@ -242,6 +243,13 @@ def check_gate(
     """
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
         raise ApprovalRefused(CLOSED)
+    if opinion.scan.status not in OPINION_PDF_STATUSES:
+        # The redaction review is open again (#240). Its next approval
+        # builds every opinion whose text is not approved, and never one
+        # whose text is: an approval now would keep the old redactions.
+        # The table of the opinion passes, never a literal: #334 extends
+        # it, and the approval must follow.
+        raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
     if opinion.edit_revision != opinion.ensemble_edit_revision:
@@ -296,6 +304,7 @@ def approve_text(
             moved = Opinion.objects.filter(
                 pk=opinion.pk,
                 status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                scan__status__in=OPINION_PDF_STATUSES,
                 glue_revision=opinion.glue_revision,
                 edit_revision=opinion.edit_revision,
                 ensemble_edit_revision=opinion.ensemble_edit_revision,
@@ -360,7 +369,8 @@ def rewrite_text(opinion: Opinion) -> str | None:
     joins them otherwise. That document stays in the bucket, because an
     approved row is never built again. The new object keeps who
     approved and when, and the row moves to it by a compare-and-swap
-    over the key it held.
+    over the key it held. When the spans carry, the stored final XML is
+    marked for the export to write again (``final_xml_schema`` None).
 
     :param opinion: An approved row, with ``scan`` and ``apply_run``.
     :returns: The new key, or None when the row holds it already.
@@ -392,6 +402,13 @@ def rewrite_text(opinion: Opinion) -> str | None:
     if carry:
         match["tagged_text_key"] = opinion.tagged_text_key
         fields["tagged_text_key"] = key
+        # The spans stay, so the stored final XML still reads as current
+        # (``final_xml.is_written`` compares the spans key). Its text is
+        # the old object: mark the content unknown, and the export writes
+        # the new footnotes (#408). The new text is a new input, so a
+        # row the pass stopped trying is tried again.
+        fields["final_xml_schema"] = None
+        fields["final_xml_attempts"] = 0
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,

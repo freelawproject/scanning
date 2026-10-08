@@ -89,6 +89,7 @@ from scanning.views_process import (
     recalculate,
     remove_page_insert,
     reopen_page_review,
+    reopen_redaction_review,
     replace_page,
     reprocess,
     request_page_repair,
@@ -102,6 +103,7 @@ from scanning.views_process import (
     serve_glued_shard,
     serve_glued_volume,
     serve_opinion_approved_text,
+    serve_opinion_exported_xml,
     serve_opinion_final_xml,
     serve_opinion_ocr,
     serve_opinion_pdf,
@@ -357,6 +359,12 @@ urlpatterns = [
         serve_opinion_final_xml,
         name="serve_opinion_final_xml",
     ),
+    # The same document as stored for CourtListener (#408).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/exported/",
+        serve_opinion_exported_xml,
+        name="serve_opinion_exported_xml",
+    ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
     path(
@@ -408,6 +416,11 @@ urlpatterns = [
         "scans/<int:pk>/reopen-pages/",
         reopen_page_review,
         name="reopen_page_review",
+    ),
+    path(
+        "scans/<int:pk>/reopen-redactions/",
+        reopen_redaction_review,
+        name="reopen_redaction_review",
     ),
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
