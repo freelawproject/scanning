@@ -1388,9 +1388,9 @@ def column_boundary(
     """Return the x that separates the two columns, or None.
 
     Only the body boxes vote: a running head and a footer straddle the
-    gutter and would hide it. A body box across the middle of the page
-    does not vote either (#463): a picture or a centered line is on
-    both sides. The boundary is the right cluster's first
+    gutter and would hide it. A body box across the middle of the text
+    block does not vote either (#463): a picture or a centered line is
+    on both sides. The boundary is the right cluster's first
     edge less a pad, not the middle of the gap, because the left
     column's text runs up to the gutter.
 
@@ -2907,7 +2907,10 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
     engines = _ranked(group["engines"])
     return {
         "id": group_id,
-        "band": group["band"],
+        # Body text whatever band it sits in: the approved text reads
+        # the body band alone, and a picture at the head or the foot of
+        # a page is still a picture of the opinion, cut and paid for.
+        "band": "body",
         "column": group["column"],
         "section": BODY,
         "footnote_doubt": False,
