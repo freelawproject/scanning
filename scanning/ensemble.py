@@ -1283,6 +1283,9 @@ def _merge(
         ),
         # The reading is out when the verdict took every word of it.
         "excluded": bool(excluded) and not clean,
+        # The fold of the words the verdict took (``compare_text``),
+        # for :func:`_dropped_alike`: a key and never the words.
+        "hidden_key": compare_text(" ".join(plain(m["text"]) for m in out)),
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
@@ -2647,6 +2650,9 @@ def _counts() -> dict:
         # The groups dropped where the detections drew nothing
         # (``opinion_ocr.UNDETECTED``), the ``UNDETECTED_TEXT`` card.
         "undetected": 0,
+        # The undetected drops a majority of the engines read alike:
+        # the shape of a column the detections missed, an ERROR card.
+        "undetected_agreed": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
         "blockquotes": 0,
@@ -3072,6 +3078,11 @@ def build_page(
                         unit.get("bracket")
                         for unit in group["engines"].values()
                     ),
+                    # Whether a majority of the engines read the words
+                    # the verdict took alike (``_dropped_alike``): on a
+                    # drop where the detections drew nothing, the sign
+                    # of a column they missed rather than bleed-through.
+                    "agreed": _dropped_alike(group),
                     # The edit that took the block out, for its Undo.
                     "edit": (
                         {
@@ -3227,6 +3238,11 @@ def build_page(
         1
         for drop in entry["dropped"]
         if drop["reason"] == opinion_ocr.UNDETECTED
+    )
+    entry["counts"]["undetected_agreed"] = sum(
+        1
+        for drop in entry["dropped"]
+        if drop["reason"] == opinion_ocr.UNDETECTED and drop.get("agreed")
     )
     entry["unresolved_edits"] = unresolved
     entry["counts"]["unresolved_edits"] = len(unresolved)
@@ -3812,15 +3828,20 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
         if counts.get("undetected"):
-            # A warning: the glue left text out on the detections'
-            # word, and a person looks at the page in the warnings
-            # review, which gates no approval.
+            # The glue left text out on the detections' word. Where the
+            # engines each read something else there, it is the
+            # bleed-through of the page behind, a warning for the
+            # warnings review; where a majority read a dropped block
+            # alike, it has the shape of a column the detections
+            # missed, and the approval waits until a person has looked.
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.UNDETECTED_TEXT,
-                    Issue.Severity.WARNING,
+                    Issue.Severity.ERROR
+                    if counts.get("undetected_agreed")
+                    else Issue.Severity.WARNING,
                     _undetected_message(page),
                     standing,
                 )
@@ -3878,12 +3899,43 @@ def _undetected_message(page: dict) -> str:
     :rtype: str
     """
     count = page["counts"]["undetected"]
+    agreed = page["counts"].get("undetected_agreed", 0)
+    if agreed:
+        return (
+            f"{count} block(s) on this page lie where the detections drew "
+            f"nothing, and were left out; the engines read {agreed} of "
+            "them alike, the shape of a column the detections missed. "
+            "Look at the page before approving: text there is lost."
+        )
     return (
         f"{count} block(s) on this page lie where the detections drew "
         "nothing, and were left out: the bleed-through of the page "
         "behind, as the engines read it. Check that no column of print "
         "is among them."
     )
+
+
+def _dropped_alike(group: dict) -> bool:
+    """Say whether a majority of the engines read a dropped group alike.
+
+    Over the fold of the words the verdict took from each engine's
+    reading (``hidden_key`` of :func:`_merge`), never the words. Two
+    engines inventing the same text from bleed-through is rare; three
+    reading a column the detections missed alike is the rule.
+
+    :param group: The aligned group.
+    :returns: Whether a majority of the readings share one key.
+    :rtype: bool
+    """
+    keys = [
+        unit.get("hidden_key")
+        for unit in group["engines"].values()
+        if unit.get("hidden_key")
+    ]
+    if len(keys) < 2:
+        return False
+    best = max(keys.count(key) for key in set(keys))
+    return best >= 2 and best * 2 > len(keys)
 
 
 def _unread_message(page: dict) -> str:

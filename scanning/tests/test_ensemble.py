@@ -1785,6 +1785,15 @@ class TestTheFindings(EnsembleTestCase):
         self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
         self.assertIn("2 block(s)", cards[0].message)
 
+    def test_an_undetected_block_the_engines_read_alike_blocks(self):
+        """A column the detections missed: the approval waits until a
+        person has looked at the page."""
+        cards = self.rebuild(undetected=2, undetected_agreed=1)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
+        self.assertIn("1 of them alike", cards[0].message)
+
     def test_a_page_the_engines_agree_on_makes_no_card(self):
         self.assertEqual(self.rebuild(unanimous=4), [])
 
@@ -4244,7 +4253,41 @@ class TestTheUndetectedDrop(TestCase):
         )
         self.assertFalse(page["dropped"][0]["partial"])
         self.assertEqual(page["counts"]["undetected"], 1)
+        self.assertEqual(page["counts"]["undetected_agreed"], 0)
         self.assertEqual(page["counts"]["partial"], 0)
+
+    def test_an_undetected_group_the_engines_read_alike_is_counted_apart(
+        self,
+    ):
+        """Two engines reading the same words where the detections drew
+        nothing is the shape of a column they missed."""
+        box = (36, 500, 288, 700)
+        ghost = {"reason": opinion_ocr.UNDETECTED}
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [unit("dots_mocr", 0, box, "The court held.", ghost, 1.0)]
+                ),
+                "mistral_ocr": engine_page(
+                    [
+                        unit(
+                            "mistral_ocr",
+                            0,
+                            box,
+                            "The court held.",
+                            ghost,
+                            1.0,
+                        )
+                    ]
+                ),
+            },
+            0,
+        )
+
+        self.assertEqual(page["counts"]["undetected"], 1)
+        self.assertEqual(page["counts"]["undetected_agreed"], 1)
+        self.assertTrue(page["dropped"][0]["agreed"])
+        self.assertNotIn("held", json.dumps(page))
 
 
 class TestTheBracketDrop(TestCase):
