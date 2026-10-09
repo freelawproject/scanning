@@ -55,12 +55,22 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    same way is ``unanimous``; a group a majority reads the same way is
    ``majority``; a group with no majority is voted word by word; a
    group one engine saw is ``single``.
-4. **Exclude.** A group any of whose units carries an ``exclusion`` is
-   dropped, **after** the alignment and never before it. The ensemble
-   experiment of #317 measured that: the engines' boxes differ, so a
-   drop before the alignment leaves one-engine regions behind. The
-   group goes whole, so a reading inside it that no exclusion covers
-   is text the reader loses, and that is what the
+4. **Exclude.** A unit that carries an ``exclusion`` says nothing: it
+   is out of its engine's reading of the group, **after** the
+   alignment and never before it. The ensemble experiment of #317
+   measured that: the engines' boxes differ, so a drop before the
+   alignment leaves one-engine regions behind. A group is dropped
+   when no engine read a clean word in it. **A reading a box covers
+   in part keeps what the box did not hide** when the other engines
+   say what it hid: dots.mocr folds the sequence number above a
+   caption into the caption's block, and the mask of the opinion
+   before, which ends at the caption's top edge, takes a seventh of
+   that block; Mistral and Surya draw the number its own box, covered
+   whole, so the "2" is known, comes out of the dots.mocr reading
+   (:func:`_uncover`), and the three engines vote on the caption. An
+   engine whose covered reading nobody can uncover is silent in the
+   group, and the vote names it. A dropped group a box covered in
+   part is text the reader loses, and that is what the
    ``PARTIAL_REDACTION`` card counts.
 
 **A fifth step, the section (#399).** The ``FOOTNOTES`` detection of a
@@ -1014,11 +1024,125 @@ class _Union:
 # ---------------------------------------------------------------------------
 
 
+def _covered_things(
+    engine: str, by_engine: dict[str, list[dict]]
+) -> list[list[str]]:
+    """Return what the other engines read under the boxes of a group.
+
+    One entry per thing under a box: a unit of another engine that a
+    box covers whole (``share`` at :data:`opinion_ocr.FULL_SHARE` or
+    more), with the units of the other engines over the same place,
+    which are readings of the same thing. Each entry is the texts
+    those engines read there, in the order of the engines, without a
+    repeat.
+
+    :param engine: The engine whose reading asks.
+    :param by_engine: ``{engine: its units of this group}``.
+    :returns: The things, each as its readings.
+    :rtype: list[list[str]]
+    """
+    units = [
+        unit
+        for other, members in by_engine.items()
+        if other != engine
+        for unit in members
+        if unit["exclusion"]
+        and unit["share"] >= opinion_ocr.FULL_SHARE
+        and plain(unit["text"])
+    ]
+    things: list[list[dict]] = []
+    for unit in units:
+        for thing in things:
+            if any(
+                contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+                for other in thing
+            ):
+                thing.append(unit)
+                break
+        else:
+            things.append([unit])
+    return [
+        list(dict.fromkeys(plain(unit["text"]) for unit in thing))
+        for thing in things
+    ]
+
+
+def _uncover(
+    text: str, marks: list[dict], things: list[list[str]]
+) -> tuple[str, list[dict], list[str]] | None:
+    """Take what a box hid out of a reading the box covers in part.
+
+    Every thing under the box must be found in the text, as a run of
+    words under one of its readings (compared by :func:`compare_word`,
+    the fold of the vote), and the text must keep a word. Else None,
+    and the reading stays silent: a box that hid a thing nobody named
+    may hide more, and no reader sees the text under a redaction. A
+    run goes with the whitespace after it (before it at the end), and
+    the marks move over the deletions (``markup.shift``).
+
+    :param text: The reading, as the engine wrote it.
+    :param marks: Its marks.
+    :param things: :func:`_covered_things`.
+    :returns: ``(the text, its marks, the readings taken out)``, or
+        None.
+    :rtype: tuple[str, list[dict], list[str]] | None
+    """
+    words = [
+        (match.start(), match.end(), compare_word(match.group()))
+        for match in _WORD.finditer(text)
+    ]
+    keys = [key for _, _, key in words]
+    taken: set[int] = set()
+    removed: list[str] = []
+    for readings in things:
+        hit = None
+        for reading in readings:
+            wanted = [key for key in map(compare_word, reading.split()) if key]
+            if not wanted:
+                continue
+            for start in range(len(keys) - len(wanted) + 1):
+                stop = start + len(wanted)
+                if keys[start:stop] == wanted and not any(
+                    index in taken for index in range(start, stop)
+                ):
+                    hit = range(start, stop)
+                    break
+            if hit is not None:
+                removed.append(reading)
+                break
+        if hit is None:
+            return None
+        taken.update(hit)
+    if not taken or all(
+        index in taken for index, (_, _, key) in enumerate(words) if key
+    ):
+        return None
+    deleted: list[tuple[int, int]] = []
+    for index in sorted(taken):
+        start, end, _ = words[index]
+        if index + 1 < len(words):
+            deleted.append((start, words[index + 1][0]))
+        else:
+            deleted.append((words[index - 1][1] if index else start, end))
+    gone: set[int] = set()
+    for start, end in deleted:
+        gone.update(range(start, end))
+    kept = "".join(char for at, char in enumerate(text) if at not in gone)
+    moved: list[dict] = []
+    for mark in marks:
+        for shifted in markup.shift(
+            [markup.Mark(mark["start"], mark["end"], mark["kind"])], deleted
+        ):
+            moved.append({**mark, "start": shifted.start, "end": shifted.end})
+    return kept, moved, removed
+
+
 def _merge(
     members: list[dict],
     line_band: float,
     boundary: float | None,
     width: float,
+    things: list[list[str]] = (),
 ) -> dict:
     """Merge one engine's members of a group into one unit.
 
@@ -1033,13 +1157,39 @@ def _merge(
     :param line_band: The height of one line band, in points.
     :param boundary: The column boundary of the page, or None.
     :param width: The page width, in points.
+    :param things: What the other engines read under the boxes of the
+        group (:func:`_covered_things`), for :func:`_uncover`.
     :returns: The merged unit.
     :rtype: dict
     """
     ordered = reading_order(members, line_band, boundary, width)
+    # The verdict is per unit (``opinion_ocr.verdict``), so the reading
+    # is the clean members alone: a member under a redaction, a mask
+    # or the page number says nothing here, and the engine is silent
+    # in the group when it has no other. A member a box covers in
+    # part keeps what the box did not hide when the other engines say
+    # what it hid (``_uncover``); a page-number unit is taken whole.
+    kept: list[dict] = []
+    out: list[dict] = []
+    uncovered: list[str] = []
+    for member in ordered:
+        if not member["exclusion"]:
+            kept.append(member)
+            continue
+        found = None
+        if things and member["share"] < opinion_ocr.FULL_SHARE:
+            found = _uncover(member["text"], member.get("marks") or [], things)
+        if found is None:
+            out.append(member)
+            continue
+        text, marks, removed = found
+        kept.append(
+            {**member, "text": text, "marks": marks, "exclusion": None}
+        )
+        uncovered.extend(removed)
     texts: list[str] = []
     marks: list[dict] = []
-    for member in ordered:
+    for member in kept:
         text = plain(member["text"])
         if not text:
             continue
@@ -1054,27 +1204,37 @@ def _merge(
                 )
             )
         texts.append(text)
-    kind = _kind_of(ordered)
-    excluded = [m for m in ordered if m["exclusion"]]
+    # The kind, the labels and the table are the kept members' too: a
+    # silent engine has no say, and an excluded member of a reading
+    # that goes on without it is a label of text that is not there.
+    judged = kept or ordered
+    kind = _kind_of(judged)
+    excluded = out
     partial = [
         m
         for m in excluded
         if (m["exclusion"] or {}).get("reason") == "redaction"
         and m["share"] < opinion_ocr.FULL_SHARE
     ]
+    # Whether this engine read a word here that no exclusion covers.
+    clean = any(plain(m["text"]) for m in kept)
     return {
         "ids": [m["id"] for m in ordered],
-        "types": [m["type"] for m in ordered],
+        "types": [m["type"] for m in judged],
+        # The box is the members' union, excluded ones included: the
+        # group is the place the alignment found, and a human edit
+        # lands on it by IoU (``land_edits``).
         "box_pt": _round_box(_union_box([m["box_pt"] for m in ordered])),
         "text": " ".join(texts),
         "marks": marks,
         "kind": kind,
         "table": (
-            [row for m in ordered if m.get("table") for row in m["table"]]
+            [row for m in judged if m.get("table") for row in m["table"]]
             if kind == markup.TABLE
             else None
         ),
-        "excluded": bool(excluded),
+        # The reading is out when the verdict took every word of it.
+        "excluded": bool(excluded) and not clean,
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
@@ -1083,11 +1243,10 @@ def _merge(
         # (``removed``, #373). A drop of such a group writes no
         # ``PARTIAL_REDACTION`` card (#419).
         "bracket": any(m.get("bracket") for m in ordered),
-        # Whether this engine read a word here that no exclusion
-        # covers. A group is dropped whole, so a clean reading beside
-        # an excluded one is text the reader loses, and that is what
-        # the ``PARTIAL_REDACTION`` card counts (#365).
-        "clean": any(plain(m["text"]) for m in ordered if not m["exclusion"]),
+        "clean": clean,
+        # The readings of the other engines this reading lost under a
+        # box (``_uncover``).
+        "uncovered": uncovered,
     }
 
 
@@ -1114,7 +1273,13 @@ def _group(
     :rtype: dict
     """
     merged = {
-        engine: _merge(members, line_band, boundary, width)
+        engine: _merge(
+            members,
+            line_band,
+            boundary,
+            width,
+            _covered_things(engine, by_engine),
+        )
         for engine, members in by_engine.items()
     }
     boxes = [unit["box_pt"] for unit in merged.values()]
@@ -1122,6 +1287,7 @@ def _group(
         min((iou(a, b) for a, b in combinations(boxes, 2)), default=1.0), 3
     )
     excluded = [unit for unit in merged.values() if unit["excluded"]]
+    clean = [unit for unit in merged.values() if unit["clean"]]
     box = _round_box(_union_box(boxes))
     return {
         "engines": merged,
@@ -1130,17 +1296,17 @@ def _group(
         "page_scale": area(box) >= MAX_AREA * page_area,
         "alignment_iou": worst,
         "weak": len(boxes) > 1 and worst < WEAK_IOU,
-        "excluded": bool(excluded),
+        # The group goes when no engine read a clean word in it. The
+        # redaction over one cell of a page-wide block is the daily
+        # shape of it: the block is out, the cell is out, and the
+        # other cells of the engine that drew them are the text, with
+        # the block's engine silent in the group, which the vote
+        # names. The whole group went before, body and all.
+        "excluded": bool(excluded) and not clean,
         "reason": excluded[0]["reason"] if excluded else "",
-        # A group is dropped whole, so a reading no exclusion covers
-        # beside an excluded one is text the reader loses, and the
-        # card must say so (#365). The redaction over one cell of a
-        # page-wide block is the daily shape of it: the cell is
-        # covered whole, so the unit's own ``partial`` is false, and
-        # the page would lose its body with no card at all.
-        "partial": any(unit["partial"] for unit in merged.values())
-        or bool(excluded)
-        and any(unit["clean"] for unit in merged.values()),
+        # A dropped group a box covered in part is text the reader
+        # loses, and the ``PARTIAL_REDACTION`` card says so (#365).
+        "partial": any(unit["partial"] for unit in merged.values()),
     }
 
 
@@ -2923,6 +3089,17 @@ def build_page(
                         "ids": unit["ids"],
                         "box_pt": unit["box_pt"],
                         "text": unit["text"],
+                        # Why a silent engine is silent, when the
+                        # verdict took its reading: the viewer's note
+                        # tells it from an engine that read nothing.
+                        "excluded": (
+                            (unit["reason"] or DROP_EXCLUDED)
+                            if unit["excluded"]
+                            else None
+                        ),
+                        # What a box hid in this reading, taken out
+                        # as the other engines read it (``_uncover``).
+                        "uncovered": unit.get("uncovered") or [],
                     }
                     for name, unit in group["engines"].items()
                 },
@@ -3613,9 +3790,9 @@ def _partial_message(page: dict) -> str:
     """Return the line of one ``PARTIAL_REDACTION`` card.
 
     The reason is read off the drops the count came from: a group goes
-    whole, and what took it is a redaction, the mask of the opinion
-    before or the page number (``opinion_ocr.verdict`` writes the
-    three).
+    when no engine read it clean, and what took it is a redaction, the
+    mask of the opinion before or the page number
+    (``opinion_ocr.verdict`` writes the three).
 
     :param page: One page of the document.
     :returns: The message.

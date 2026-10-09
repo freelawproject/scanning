@@ -249,11 +249,15 @@ class TestTheTextEdit(TestCase):
         )
 
     def test_an_edit_never_puts_back_a_redacted_block(self):
+        """Both engines are under the box: a block one engine read
+        clean is kept on that reading, and is no redacted block."""
         excluded = {"reason": "redaction", "rect_type": "text"}
         dots = [
             unit("dots_mocr", 0, BODY_A_PT, "Name", exclusion=excluded),
         ]
-        mistral = [unit("mistral_ocr", 0, BODY_A_PT, "Name")]
+        mistral = [
+            unit("mistral_ocr", 0, BODY_A_PT, "Name", exclusion=excluded),
+        ]
 
         page = page_with(
             dots,
