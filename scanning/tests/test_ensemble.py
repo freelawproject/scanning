@@ -705,18 +705,48 @@ class TestTheAlignment(TestCase):
         em = {"start": 2, "end": 6, "kind": "em"}
 
         self.assertEqual(
-            ensemble._uncover("2\nCITY v. COSME", [em], [["2"]]),
+            ensemble._uncover("2\nCITY v. COSME", [em], [{"readings": ["2"]}]),
             ("CITY v. COSME", [{"start": 0, "end": 4, "kind": "em"}], ["2"]),
         )
         self.assertEqual(
-            ensemble._uncover("CITY v. COSME 944", [], [["944"]]),
+            ensemble._uncover(
+                "CITY v. COSME 944", [], [{"readings": ["944"]}]
+            ),
             ("CITY v. COSME", [], ["944"]),
         )
         self.assertEqual(
-            ensemble._uncover("a b c", [], [["b"]]), ("a c", [], ["b"])
+            ensemble._uncover("a b c", [], [{"readings": ["b"]}]),
+            ("a c", [], ["b"]),
         )
-        self.assertIsNone(ensemble._uncover("a b", [], [["b"], ["c"]]))
-        self.assertIsNone(ensemble._uncover("a b", [], [["a b"]]))
+        self.assertIsNone(
+            ensemble._uncover(
+                "a b", [], [{"readings": ["b"]}, {"readings": ["c"]}]
+            )
+        )
+        self.assertIsNone(
+            ensemble._uncover("a b", [], [{"readings": ["a b"]}])
+        )
+
+    def test_a_run_that_occurs_twice_is_taken_by_the_place_of_its_box(self):
+        """The sequence number is a word of the caption too: the thing
+        at the top of the reading's box takes the first run, one at the
+        bottom the last, and with no box the first."""
+        box = [0.0, 0.0, 100.0, 100.0]
+        top = {"readings": ["2"], "box_pt": [40.0, 2.0, 60.0, 10.0]}
+        bottom = {"readings": ["2"], "box_pt": [40.0, 90.0, 60.0, 98.0]}
+
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [top], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("STATE v. 2 BROTHERS 2", [], [bottom], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [bottom])[0],
+            "STATE v. 2 BROTHERS",
+        )
 
 
 # ── the reading order ────────────────────────────────────────────────

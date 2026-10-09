@@ -1026,20 +1026,21 @@ class _Union:
 
 def _covered_things(
     engine: str, by_engine: dict[str, list[dict]]
-) -> list[list[str]]:
+) -> list[dict]:
     """Return what the other engines read under the boxes of a group.
 
     One entry per thing under a box: a unit of another engine that a
     box covers whole (``share`` at :data:`opinion_ocr.FULL_SHARE` or
     more), with the units of the other engines over the same place,
-    which are readings of the same thing. Each entry is the texts
+    which are readings of the same thing. Each entry carries the texts
     those engines read there, in the order of the engines, without a
-    repeat.
+    repeat, and the box of the thing, for its place in a reading that
+    holds the same words twice.
 
     :param engine: The engine whose reading asks.
     :param by_engine: ``{engine: its units of this group}``.
-    :returns: The things, each as its readings.
-    :rtype: list[list[str]]
+    :returns: The things, each ``{"readings", "box_pt"}``.
+    :rtype: list[dict]
     """
     units = [
         unit
@@ -1062,13 +1063,21 @@ def _covered_things(
         else:
             things.append([unit])
     return [
-        list(dict.fromkeys(plain(unit["text"]) for unit in thing))
+        {
+            "readings": list(
+                dict.fromkeys(plain(unit["text"]) for unit in thing)
+            ),
+            "box_pt": _union_box([unit["box_pt"] for unit in thing]),
+        }
         for thing in things
     ]
 
 
 def _uncover(
-    text: str, marks: list[dict], things: list[list[str]]
+    text: str,
+    marks: list[dict],
+    things: list[dict],
+    box: list[float] | None = None,
 ) -> tuple[str, list[dict], list[str]] | None:
     """Take what a box hid out of a reading the box covers in part.
 
@@ -1080,9 +1089,16 @@ def _uncover(
     run goes with the whitespace after it (before it at the end), and
     the marks move over the deletions (``markup.shift``).
 
+    **A run that occurs twice is taken by place.** A sequence number
+    above a caption can be a word of the caption too. The thing's box
+    sits at some height of the reading's box, and the run nearest that
+    height in the text is the hidden one: at the top, the first; at
+    the bottom, the last. With no box the first unclaimed run is taken.
+
     :param text: The reading, as the engine wrote it.
     :param marks: Its marks.
     :param things: :func:`_covered_things`.
+    :param box: The reading's box in points, for the place of a thing.
     :returns: ``(the text, its marks, the readings taken out)``, or
         None.
     :rtype: tuple[str, list[dict], list[str]] | None
@@ -1094,22 +1110,36 @@ def _uncover(
     keys = [key for _, _, key in words]
     taken: set[int] = set()
     removed: list[str] = []
-    for readings in things:
+    for thing in things:
+        at = None
+        place = thing.get("box_pt")
+        if box and place and box[3] > box[1]:
+            centre = (place[1] + place[3]) / 2
+            at = min(1.0, max(0.0, (centre - box[1]) / (box[3] - box[1])))
         hit = None
-        for reading in readings:
+        for reading in thing["readings"]:
             wanted = [key for key in map(compare_word, reading.split()) if key]
             if not wanted:
                 continue
-            for start in range(len(keys) - len(wanted) + 1):
-                stop = start + len(wanted)
-                if keys[start:stop] == wanted and not any(
-                    index in taken for index in range(start, stop)
-                ):
-                    hit = range(start, stop)
-                    break
-            if hit is not None:
-                removed.append(reading)
-                break
+            runs = [
+                range(start, start + len(wanted))
+                for start in range(len(keys) - len(wanted) + 1)
+                if keys[start : start + len(wanted)] == wanted
+                and not any(
+                    index in taken
+                    for index in range(start, start + len(wanted))
+                )
+            ]
+            if not runs:
+                continue
+            if at is None or len(runs) == 1:
+                hit = runs[0]
+            else:
+                hit = min(
+                    runs, key=lambda run: abs(run.start / len(keys) - at)
+                )
+            removed.append(reading)
+            break
         if hit is None:
             return None
         taken.update(hit)
@@ -1142,7 +1172,7 @@ def _merge(
     line_band: float,
     boundary: float | None,
     width: float,
-    things: list[list[str]] = (),
+    things: list[dict] = (),
 ) -> dict:
     """Merge one engine's members of a group into one unit.
 
@@ -1178,7 +1208,12 @@ def _merge(
             continue
         found = None
         if things and member["share"] < opinion_ocr.FULL_SHARE:
-            found = _uncover(member["text"], member.get("marks") or [], things)
+            found = _uncover(
+                member["text"],
+                member.get("marks") or [],
+                things,
+                member["box_pt"],
+            )
         if found is None:
             out.append(member)
             continue
