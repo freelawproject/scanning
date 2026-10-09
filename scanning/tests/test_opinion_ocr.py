@@ -2732,3 +2732,238 @@ class TestTheBracketBox(TestCase):
         self.assertFalse(
             self.check(36.0, 110.0, 50.0, 120.0, rect_type="headnote")
         )
+
+
+# ── the re-glue of named opinions (#462) ─────────────────────────────
+class TestReglueOpinions(OpinionOcrTestCase):
+    """``reglue_opinion_ocr --opinion``: the rows a person names."""
+
+    def setUp(self):
+        super().setUp()
+        self.sibling = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 4, 5),
+            505,
+        )
+        self.copies: list[tuple[str, str]] = []
+        patcher = patch(
+            "scanning.s3_sync.copy_object", side_effect=self.copy_object
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_object(self, source, destination):
+        self.copies.append((source, destination))
+        return True
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("reglue_opinion_ocr", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def revisions(self):
+        return [
+            Opinion.objects.get(pk=row.pk).glue_revision
+            for row in (self.opinion, self.sibling)
+        ]
+
+    def write_pdf(self, row):
+        Opinion.objects.filter(pk=row.pk).update(
+            redacted_pdf_revision=F("glue_revision")
+        )
+
+    def test_the_named_opinion_moves_alone(self):
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.revisions(), [1, 0])
+        self.assertIn(f"opinion {self.opinion.pk} (", output)
+        self.assertIn("due again, its PDF is owed", output)
+        self.assertIn("Moved 1 opinion(s), carried 0 PDF(s)", output)
+        self.assertTrue(opinion_ocr.due().filter(pk=self.opinion.pk).exists())
+
+    def test_the_two_spellings_name_the_same_rows(self):
+        self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+        )
+        self.assertEqual(self.revisions(), [1, 1])
+
+        self.run_command(
+            "--opinion",
+            str(self.opinion.pk),
+            "--opinion",
+            str(self.sibling.pk),
+        )
+        self.assertEqual(self.revisions(), [2, 2])
+
+    def test_a_pk_named_twice_moves_once(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.opinion.pk)
+        )
+
+        self.assertEqual(self.revisions(), [1, 0])
+        self.assertIn("Moved 1 opinion(s)", output)
+
+    def test_a_dry_run_moves_nothing_and_names_the_opinion(self):
+        self.write_pdf(self.opinion)
+
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--dry-run"
+        )
+
+        self.assertEqual(self.revisions(), [0, 0])
+        self.assertEqual(self.copies, [])
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan "
+            f"{self.scan.pk}: would glue again, carry its PDF",
+            output,
+        )
+        self.assertIn("Would move 1 opinion(s), would carry 1 PDF(s)", output)
+
+    def test_a_written_pdf_is_carried_unless_recut(self):
+        self.write_pdf(self.opinion)
+
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("due again, its PDF carried", output)
+        self.assertEqual(len(self.copies), 1)
+        row = Opinion.objects.get(pk=self.opinion.pk)
+        self.assertEqual(row.redacted_pdf_revision, 1)
+
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--recut-pdf"
+        )
+
+        self.assertIn("due again, its PDF is owed", output)
+        self.assertEqual(len(self.copies), 1)
+        self.assertTrue(opinion_pdf.owed().filter(pk=self.opinion.pk).exists())
+
+    def test_an_approved_opinion_refuses_and_nothing_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        with self.assertRaisesMessage(CommandError, str(self.sibling.pk)):
+            self.run_command(
+                "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+            )
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_an_errored_opinion_refuses_and_nothing_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.ERROR
+        )
+
+        with self.assertRaisesMessage(CommandError, str(self.sibling.pk)):
+            self.run_command(
+                "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+            )
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_a_missing_opinion_refuses_and_nothing_moves(self):
+        with self.assertRaisesMessage(CommandError, "999999"):
+            self.run_command("--opinion", str(self.opinion.pk), "999999")
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_one_selector_per_call(self):
+        for args in (
+            (str(self.scan.pk), "--opinion", str(self.opinion.pk)),
+            ("--all", "--opinion", str(self.opinion.pk)),
+            (),
+        ):
+            with self.assertRaises(CommandError):
+                self.run_command(*args)
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_a_swap_another_writer_won_is_reported(self):
+        self.write_pdf(self.opinion)
+
+        def copy_while_another_writer_moves(source, destination):
+            Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=5)
+            return True
+
+        with patch(
+            "scanning.s3_sync.copy_object",
+            side_effect=copy_while_another_writer_moves,
+        ):
+            output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("taken by another writer", output)
+        self.assertIn("Moved 0 opinion(s)", output)
+        self.assertEqual(self.revisions(), [5, 0])
+
+    def test_the_dry_run_counts_the_rows_the_run_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 2, 3),
+            503,
+            status=OpinionReviewStatus.ERROR,
+        )
+
+        dry = self.run_command(str(self.scan.pk), "--dry-run")
+        real = self.run_command(str(self.scan.pk))
+
+        self.assertIn("would glue 2 opinion(s) again", dry)
+        self.assertIn("2 opinion(s) due again", real)
+
+
+class TestTheReglueLog(OpinionOcrTestCase):
+    """Every scan whose rows moved is logged, and so is an empty one."""
+
+    def test_a_fault_on_a_later_scan_keeps_the_line_of_an_earlier_one(self):
+        other = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        run = self.make_run(other)
+        second = self.make_opinion(
+            other, run, self.make_boundary(other, run, 1, 2), 700
+        )
+        real = opinion_ocr._reglue_row
+
+        def fail_on_the_second_scan(opinion, carry_pdf):
+            if opinion.pk == second.pk:
+                raise RuntimeError("the bucket went away")
+            return real(opinion, carry_pdf)
+
+        with (
+            patch.object(
+                opinion_ocr, "_reglue_row", side_effect=fail_on_the_second_scan
+            ),
+            self.assertLogs("scanning.opinion_ocr", "INFO") as logs,
+            self.assertRaises(RuntimeError),
+        ):
+            opinion_ocr.reglue_opinions(
+                [self.opinion, second], carry_pdf=False
+            )
+
+        self.assertIn(
+            f"scan {self.scan.pk}: 1 opinion(s) due again", logs.output[0]
+        )
+        self.assertIn(
+            f"scan {other.pk}: 0 opinion(s) due again", logs.output[1]
+        )
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 1)
+
+    def test_a_volume_with_nothing_to_move_still_logs(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        with self.assertLogs("scanning.opinion_ocr", "INFO") as logs:
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.assertEqual(summary.moved, 0)
+        self.assertIn(
+            f"scan {self.scan.pk}: 0 opinion(s) due again, 0 PDF(s) carried",
+            logs.output[0],
+        )

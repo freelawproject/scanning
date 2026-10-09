@@ -139,7 +139,7 @@ from dataclasses import dataclass, field
 
 from blackletter.models import Label
 from django.conf import settings
-from django.db.models import F, Q
+from django.db.models import F, Q, QuerySet
 from django.utils import timezone
 
 from scanning import (
@@ -1588,24 +1588,79 @@ def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
     return written
 
 
+#: What a re-glue did with one row (#462): the revision rose, the
+#: revision rose and the PDF was carried, or another writer had the row
+#: first (a revision raised, or a person approved it).
+REGLUE_MOVED = "moved"
+REGLUE_CARRIED = "carried"
+REGLUE_LOST = "lost"
+
+
 @dataclass
 class ReglueSummary:
-    """What one :func:`reglue` of a scan did.
+    """What one re-glue did.
 
     :param moved: Rows whose revision was raised.
     :param carried: Of those, rows whose redacted PDF was copied to the
         new revision and stamped there.
+    :param outcomes: ``{opinion pk: REGLUE_*}`` for every row the call
+        moved or lost.
     """
 
     moved: int = 0
     carried: int = 0
+    outcomes: dict[int, str] = field(default_factory=dict)
+
+
+def reglue_rows(scan: Scan | None = None) -> QuerySet:
+    """Return the rows a re-glue moves, in the order it moves them.
+
+    **The one rule** of which rows a re-glue takes (#462): every row
+    that is not ``TEXT_REVIEW_DONE``, of one scan or of all of them.
+    The dry run of ``reglue_opinion_ocr`` counts these rows, so it can
+    never count a row the real run would leave.
+
+    :param scan: The scan, or None for every scan.
+    :returns: The rows.
+    :rtype: QuerySet
+    """
+    rows = Opinion.objects.exclude(
+        status=OpinionReviewStatus.TEXT_REVIEW_DONE
+    ).select_related("scan", "scan__reporter")
+    if scan is not None:
+        rows = rows.filter(scan=scan)
+    return rows.order_by("scan_id", "first_printed_page", "index_in_page")
 
 
 def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:
     """Raise the revision of every row of ``scan`` that is not approved.
 
-    The body of ``reglue_opinion_ocr``: the pass finds the rows due on
-    the next tick. A ``TEXT_REVIEW_DONE`` row keeps its glues.
+    The body of ``reglue_opinion_ocr`` for a volume: the pass finds the
+    rows due on the next tick. A ``TEXT_REVIEW_DONE`` row keeps its
+    glues. :func:`reglue_opinions` over :func:`reglue_rows`.
+
+    :param scan: The scan.
+    :param carry_pdf: Whether to copy a written PDF to the new revision.
+    :returns: How many rows moved, and how many PDFs were carried.
+    :rtype: ReglueSummary
+    """
+    rows = list(reglue_rows(scan))
+    if not rows:
+        # A volume with nothing to move still says so, the line every
+        # re-glue of a scan writes.
+        _log_reglue(scan.pk, 0, 0)
+        return ReglueSummary()
+    return reglue_opinions(rows, carry_pdf=carry_pdf)
+
+
+def reglue_opinions(
+    opinions: list[Opinion], carry_pdf: bool = True
+) -> ReglueSummary:
+    """Raise the revision of each row, and carry its PDF.
+
+    **The one writer** of a re-glue: a volume (:func:`reglue`) and the
+    rows a person names (``reglue_opinion_ocr --opinion``, #462) both
+    come through here, so both keep the same swap.
 
     **The redacted PDF is carried, not cut again** (#452). The PDF reads
     the bitonal copy, the page map, the boundaries and the redactions,
@@ -1624,56 +1679,86 @@ def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:
     approval (``opinions.create_rows``) never carries: the redactions
     and the boundaries may have moved under the key.
 
-    :param scan: The scan.
+    A ``TEXT_REVIEW_DONE`` row never moves: the swap excludes it, so a
+    row approved after the caller read it is :data:`REGLUE_LOST`.
+
+    :param opinions: The rows, with ``scan`` and ``scan__reporter``
+        selected, for the PDF keys.
     :param carry_pdf: Whether to copy a written PDF to the new revision.
-    :returns: How many rows moved, and how many PDFs were carried.
+    :returns: How many rows moved, how many PDFs were carried, and what
+        happened to each row.
     :rtype: ReglueSummary
+    """
+    summary = ReglueSummary()
+    by_scan: dict[int, list[Opinion]] = {}
+    for opinion in opinions:
+        by_scan.setdefault(opinion.scan_id, []).append(opinion)
+    for scan_pk, rows in by_scan.items():
+        moved = carried = 0
+        # Every row commits on its own swap, so the line of a scan is
+        # written when its rows are done, and on the way out of a
+        # fault too: a row that moved is never left out of the log.
+        try:
+            for opinion in rows:
+                outcome = _reglue_row(opinion, carry_pdf)
+                summary.outcomes[opinion.pk] = outcome
+                if outcome != REGLUE_LOST:
+                    moved += 1
+                    carried += int(outcome == REGLUE_CARRIED)
+        finally:
+            summary.moved += moved
+            summary.carried += carried
+            _log_reglue(scan_pk, moved, carried)
+    return summary
+
+
+def _reglue_row(opinion: Opinion, carry_pdf: bool) -> str:
+    """Raise the revision of one row, and carry its PDF.
+
+    :param opinion: The row.
+    :param carry_pdf: Whether to copy a written PDF to the new revision.
+    :returns: :data:`REGLUE_MOVED`, :data:`REGLUE_CARRIED` or
+        :data:`REGLUE_LOST`.
+    :rtype: str
     """
     from scanning import opinion_pdf
 
-    summary = ReglueSummary()
-    rows = (
-        Opinion.objects.filter(scan=scan)
-        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
-        .select_related("scan", "scan__reporter")
-        .order_by("first_printed_page", "index_in_page")
+    revision = opinion.glue_revision
+    fields = {"glue_revision": revision + 1, "ocr_glue_attempts": 0}
+    carry = (
+        carry_pdf
+        and opinion_pdf.is_written(opinion)
+        and s3_sync.copy_object(
+            opinion_pdf.key(opinion),
+            opinion_pdf.key(opinion, revision + 1),
+        )
     )
-    for opinion in rows:
-        revision = opinion.glue_revision
-        fields = {"glue_revision": revision + 1, "ocr_glue_attempts": 0}
-        carry = (
-            carry_pdf
-            and opinion_pdf.is_written(opinion)
-            and s3_sync.copy_object(
-                opinion_pdf.key(opinion),
-                opinion_pdf.key(opinion, revision + 1),
-            )
+    if carry:
+        fields.update(
+            redacted_pdf_revision=revision + 1,
+            pdf_attempts=0,
+            pdf_attempted_at=None,
         )
-        if carry:
-            fields.update(
-                redacted_pdf_revision=revision + 1,
-                pdf_attempts=0,
-                pdf_attempted_at=None,
-            )
-        # The status again, beside the revision: an approval that landed
-        # during the copy keeps its revision, and an approved row keeps
-        # its glues, the rule the bulk update of #350 held in one
-        # statement.
-        moved = (
-            Opinion.objects.filter(pk=opinion.pk, glue_revision=revision)
-            .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
-            .update(**fields)
-        )
-        if not moved:
-            # Another writer raised the revision first, or a person
-            # approved the row, and it is not this call's any more.
-            continue
-        summary.moved += 1
-        summary.carried += int(carry)
+    # The status again, beside the revision: an approval that landed
+    # during the copy keeps its revision, and an approved row keeps its
+    # glues, the rule the bulk update of #350 held in one statement.
+    moved = (
+        Opinion.objects.filter(pk=opinion.pk, glue_revision=revision)
+        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .update(**fields)
+    )
+    if not moved:
+        # Another writer raised the revision first, or a person approved
+        # the row, and it is not this call's any more.
+        return REGLUE_LOST
+    return REGLUE_CARRIED if carry else REGLUE_MOVED
+
+
+def _log_reglue(scan_pk: int, moved: int, carried: int) -> None:
+    """Write the log line of one scan's re-glue."""
     logger.info(
         "scan %s: %d opinion(s) due again, %d PDF(s) carried",
-        scan.pk,
-        summary.moved,
-        summary.carried,
+        scan_pk,
+        moved,
+        carried,
     )
-    return summary
