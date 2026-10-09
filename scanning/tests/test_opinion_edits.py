@@ -399,6 +399,87 @@ class TestTheTextEdit(TestCase):
         )
 
 
+class TestTheDropEdit(TestCase):
+    """A ``DROP`` edit takes a block out of the text: the bleed-through
+    of the page behind, a stray mark, which the engines read as words
+    and no redaction covers."""
+
+    def test_a_block_a_person_took_out_is_dropped_with_the_edit(self):
+        dots, mistral = alike(
+            (BODY_A_PT, "The court held."),
+            (BODY_B_PT, "Ghost of the page behind."),
+        )
+
+        page = page_with(
+            dots, mistral, [entry(OpinionEdit.Kind.DROP, BODY_B_PT, id=7)]
+        )
+
+        self.assertEqual(
+            [g["text"] for g in page["groups"]], ["The court held."]
+        )
+        self.assertEqual(page["text"], "The court held.")
+        drop = page["dropped"][0]
+        self.assertEqual(drop["reason"], ensemble.DROP_HUMAN)
+        self.assertEqual(drop["box_pt"], BODY_B_PT)
+        self.assertFalse(drop["partial"])
+        self.assertEqual(drop["edit"], {"id": 7, "by": "curator", "at": ""})
+        self.assertEqual(page["unresolved_edits"], [])
+        self.assertEqual(page["counts"]["partial"], 0)
+
+    def test_the_other_edits_of_the_block_wait_on_the_drop(self):
+        """A text edit of a block a person took out is not unresolved:
+        the Undo of the drop brings it back into effect."""
+        dots, mistral = alike((BODY_A_PT, "The court held."))
+
+        page = page_with(
+            dots,
+            mistral,
+            [
+                entry(
+                    OpinionEdit.Kind.TEXT,
+                    BODY_A_PT,
+                    id=1,
+                    base_text="The court held.",
+                    text="The court held!",
+                ),
+                entry(OpinionEdit.Kind.DROP, BODY_A_PT, id=2),
+            ],
+        )
+
+        self.assertEqual(page["groups"], [])
+        self.assertEqual(page["unresolved_edits"], [])
+        self.assertEqual(page["dropped"][0]["edit"]["id"], 2)
+
+    def test_a_drop_on_no_block_is_unresolved(self):
+        dots, mistral = alike((BODY_A_PT, "The court held."))
+
+        page = page_with(
+            dots, mistral, [entry(OpinionEdit.Kind.DROP, BODY_C_PT, id=3)]
+        )
+
+        self.assertEqual(
+            [e["reason"] for e in page["unresolved_edits"]],
+            [ensemble.EDIT_NO_GROUP],
+        )
+        self.assertEqual(len(page["groups"]), 1)
+
+    def test_a_block_a_box_took_goes_for_the_box(self):
+        """The exclusion comes first: the drop names the box and not
+        the person, and the edit is neither applied nor unresolved."""
+        excluded = {"reason": "redaction", "rect_type": "text"}
+        dots = [unit("dots_mocr", 0, BODY_A_PT, "Headnote.", excluded)]
+        mistral = [unit("mistral_ocr", 0, BODY_A_PT, "Headnote.", excluded)]
+
+        page = page_with(
+            dots, mistral, [entry(OpinionEdit.Kind.DROP, BODY_A_PT, id=4)]
+        )
+
+        drop = page["dropped"][0]
+        self.assertEqual(drop["reason"], "redaction")
+        self.assertIsNone(drop["edit"])
+        self.assertEqual(page["unresolved_edits"], [])
+
+
 class TestTheSectionEdit(TestCase):
     """A ``SECTION`` edit puts a block in the body or the footnotes."""
 
@@ -991,6 +1072,37 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         self.assertEqual(len(said), 1, said)
         self.assertEqual(said[0][0], level)
         self.assertEqual(said[0][1], response.json()["message"])
+
+    def test_a_block_is_taken_out_as_not_text_and_back_with_the_undo(self):
+        group = self.alike_group()
+
+        response = self.post(
+            "edit_opinion_drop", page_in_opinion=0, group_id=group["id"]
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        self.assertEqual(
+            response.json()["message"], views_api.EDIT_DROP_SAVED_MESSAGE
+        )
+        edit = OpinionEdit.objects.get(kind=OpinionEdit.Kind.DROP)
+        self.assertEqual(response.json()["edit_id"], edit.pk)
+        self.assertEqual(edit.box_pt, group["box_pt"])
+        page = self.page()
+        self.assertNotIn(
+            group["box_pt"], [g["box_pt"] for g in page["groups"]]
+        )
+        drop = next(
+            d for d in page["dropped"] if d["reason"] == ensemble.DROP_HUMAN
+        )
+        self.assertEqual(drop["edit"]["id"], edit.pk)
+        self.assertNotIn(group["text"], page["text"])
+
+        response = self.undo(edit.pk)
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        self.assertIn(
+            group["box_pt"], [g["box_pt"] for g in self.page()["groups"]]
+        )
 
     def test_a_text_edit_is_saved_and_written(self):
         group = self.split_group()

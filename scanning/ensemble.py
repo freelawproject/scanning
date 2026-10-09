@@ -314,6 +314,8 @@ WARNING = "warning"
 #: Why a group is not in the text.
 DROP_EXCLUDED = "excluded"
 DROP_EMPTY = "empty"
+#: The reason of a block a person took out of the text (``DROP``).
+DROP_HUMAN = "human"
 
 #: The ``error`` of a page no engine measured. A page nobody read
 #: carries the engine's own reason instead, and both write the one
@@ -328,6 +330,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.NO_MAJORITY,
         OpinionCheck.SINGLE_ENGINE,
         OpinionCheck.PARTIAL_REDACTION,
+        OpinionCheck.UNDETECTED_TEXT,
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
@@ -1024,6 +1027,10 @@ class _Union:
 # ---------------------------------------------------------------------------
 
 
+#: The reasons of ``opinion_ocr.verdict`` that are a box over the unit.
+_BOX_REASONS = frozenset({"redaction", "outside", opinion_ocr.PAGE_NUMBER})
+
+
 def _covered_things(
     engine: str, by_engine: dict[str, list[dict]]
 ) -> list[dict]:
@@ -1042,12 +1049,16 @@ def _covered_things(
     :returns: The things, each ``{"readings", "box_pt"}``.
     :rtype: list[dict]
     """
+    # A thing a box hid, and never a unit the detections drew nothing
+    # under (``opinion_ocr.UNDETECTED``): that is no box, and its text
+    # is what an engine made of the bleed-through.
     units = [
         unit
         for other, members in by_engine.items()
         if other != engine
         for unit in members
         if unit["exclusion"]
+        and unit["exclusion"].get("reason") in _BOX_REASONS
         and unit["share"] >= opinion_ocr.FULL_SHARE
         and plain(unit["text"])
     ]
@@ -1272,6 +1283,9 @@ def _merge(
         ),
         # The reading is out when the verdict took every word of it.
         "excluded": bool(excluded) and not clean,
+        # The fold of the words the verdict took (``compare_text``),
+        # for :func:`_dropped_alike`: a key and never the words.
+        "hidden_key": compare_text(" ".join(plain(m["text"]) for m in out)),
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
@@ -2633,6 +2647,12 @@ def _counts() -> dict:
         "low_confidence": 0,
         "partial": 0,
         "partial_bracket": 0,
+        # The groups dropped where the detections drew nothing
+        # (``opinion_ocr.UNDETECTED``), the ``UNDETECTED_TEXT`` card.
+        "undetected": 0,
+        # The undetected drops a majority of the engines read alike:
+        # the shape of a column the detections missed, an ERROR card.
+        "undetected_agreed": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
         "blockquotes": 0,
@@ -2921,6 +2941,7 @@ def build_page(
                     or DROP_EXCLUDED,
                     "partial": False,
                     "bracket": unit.get("bracket", False),
+                    "edit": None,
                 }
             )
     if size is None:
@@ -2956,6 +2977,7 @@ def build_page(
         (OpinionEdit.Kind.SECTION, "_section_edit"),
         (OpinionEdit.Kind.TEXT, "_text_edit"),
         (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
+        (OpinionEdit.Kind.DROP, "_drop_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
         landed = land_edits([edit["box_pt"] for edit in wanted], groups)
@@ -3007,12 +3029,19 @@ def build_page(
     sequence: list[dict] = []
     for group in ordered:
         read_back = resolve(group)
-        if group["excluded"] or not read_back["text"]:
-            # A redaction or a mask took the block, or no engine reads
-            # a word there now: two causes, and the card names the one.
+        # A person said the block is not text: the bleed-through of
+        # the page behind, a stray mark. It goes like a block a box
+        # took, with the edit on the drop, where the page offers its
+        # Undo; the other edits of the block wait on it and are not
+        # unresolved, because the Undo brings them back into effect.
+        # A block a box took goes for the box, whatever a person said.
+        by_hand = None if group["excluded"] else group.get("_drop_edit")
+        if group["excluded"] or by_hand or not read_back["text"]:
+            # A redaction or a mask took the block, a person did, or no
+            # engine reads a word there now: the card names the one.
             gone = EDIT_DROPPED if group["excluded"] else EDIT_EMPTY
             for key in ("_section_edit", "_text_edit", "_quote_edit"):
-                if group.get(key):
+                if group.get(key) and not by_hand:
                     unresolved.append(_unresolved(group[key], gone))
             sequence.append(
                 {
@@ -3040,14 +3069,29 @@ def build_page(
                     },
                     "box_pt": group["box_pt"],
                     "reason": (
-                        group["reason"] or DROP_EXCLUDED
+                        (group["reason"] or DROP_EXCLUDED)
                         if group["excluded"]
-                        else DROP_EMPTY
+                        else (DROP_HUMAN if by_hand else DROP_EMPTY)
                     ),
-                    "partial": group["partial"],
+                    "partial": group["partial"] and not by_hand,
                     "bracket": any(
                         unit.get("bracket")
                         for unit in group["engines"].values()
+                    ),
+                    # Whether a majority of the engines read the words
+                    # the verdict took alike (``_dropped_alike``): on a
+                    # drop where the detections drew nothing, the sign
+                    # of a column they missed rather than bleed-through.
+                    "agreed": _dropped_alike(group),
+                    # The edit that took the block out, for its Undo.
+                    "edit": (
+                        {
+                            "id": by_hand["id"],
+                            "by": by_hand["by"],
+                            "at": by_hand["at"],
+                        }
+                        if by_hand
+                        else None
                     ),
                 }
             )
@@ -3189,6 +3233,16 @@ def build_page(
     )
     entry["counts"]["partial_bracket"] = sum(
         1 for drop in entry["dropped"] if drop["partial"] and drop["bracket"]
+    )
+    entry["counts"]["undetected"] = sum(
+        1
+        for drop in entry["dropped"]
+        if drop["reason"] == opinion_ocr.UNDETECTED
+    )
+    entry["counts"]["undetected_agreed"] = sum(
+        1
+        for drop in entry["dropped"]
+        if drop["reason"] == opinion_ocr.UNDETECTED and drop.get("agreed")
     )
     entry["unresolved_edits"] = unresolved
     entry["counts"]["unresolved_edits"] = len(unresolved)
@@ -3773,6 +3827,23 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("undetected"):
+            # The glue left text out on the detections' word, and the
+            # approval waits until a person has looked at the page and
+            # dismissed the card: a column the detections missed would
+            # be text lost in silence otherwise. The message says when
+            # a majority of the engines read a dropped block alike,
+            # the shape of such a column rather than of bleed-through.
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.UNDETECTED_TEXT,
+                    Issue.Severity.ERROR,
+                    _undetected_message(page),
+                    standing,
+                )
+            )
         if counts.get("footnote_doubt"):
             cards.append(
                 _card(
@@ -3806,7 +3877,64 @@ _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
     opinion_ocr.PAGE_NUMBER: "the page number",
+    opinion_ocr.UNDETECTED: "no detection",
+    DROP_HUMAN: "a person",
 }
+
+
+def _undetected_message(page: dict) -> str:
+    """Return the line of one ``UNDETECTED_TEXT`` card.
+
+    The engines read words where the detections drew no column, no
+    footnote band and no picture, and the glue left them out
+    (``opinion_ocr.UNDETECTED``): the bleed-through of the page
+    behind, most days. The card is an ERROR the approval waits on,
+    because a column the detections missed is text lost the same way,
+    and only the page tells the two apart; it says when the engines
+    read a dropped block alike, the sign of such a column.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    count = page["counts"]["undetected"]
+    agreed = page["counts"].get("undetected_agreed", 0)
+    if agreed:
+        return (
+            f"{count} block(s) on this page lie where the detections drew "
+            f"nothing, and were left out; the engines read {agreed} of "
+            "them alike, the shape of a column the detections missed. "
+            "Look at the page before approving: text there is lost."
+        )
+    return (
+        f"{count} block(s) on this page lie where the detections drew "
+        "nothing, and were left out: the bleed-through of the page "
+        "behind, as the engines read it. Check that no column of print "
+        "is among them."
+    )
+
+
+def _dropped_alike(group: dict) -> bool:
+    """Say whether a majority of the engines read a dropped group alike.
+
+    Over the fold of the words the verdict took from each engine's
+    reading (``hidden_key`` of :func:`_merge`), never the words. Two
+    engines inventing the same text from bleed-through is rare; three
+    reading a column the detections missed alike is the rule.
+
+    :param group: The aligned group.
+    :returns: Whether a majority of the readings share one key.
+    :rtype: bool
+    """
+    keys = [
+        unit.get("hidden_key")
+        for unit in group["engines"].values()
+        if unit.get("hidden_key")
+    ]
+    if len(keys) < 2:
+        return False
+    best = max(keys.count(key) for key in set(keys))
+    return best >= 2 and best * 2 > len(keys)
 
 
 def _unread_message(page: dict) -> str:

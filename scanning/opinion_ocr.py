@@ -253,6 +253,23 @@ ZONES: dict[str, Zone] = {
     ),
 }
 
+#: The verdict of a unit where the detections drew nothing: the
+#: bleed-through of the page behind, which the engines read as words.
+#: A page's columns, its footnote band, its head and its pictures are
+#: all detections, so a unit that lies in none of them is on no part
+#: of the page the print holds. Judged on a page with a text column
+#: alone: a page the detections missed whole keeps every unit.
+UNDETECTED = "undetected"
+
+#: A unit the detections cover less of than this is :data:`UNDETECTED`.
+#: More than :data:`EXCLUDE_SHARE`, because an engine draws one box
+#: from the last line of print down through the ghost below it, and
+#: that line is a tenth of the box: Mistral read the tail of a footnote
+#: and the bleed-through under it as one block on 158 F.4th 502, and
+#: the other two engines drew the tail its own box. A column box that
+#: ends a line early still covers most of the last cell.
+UNDETECTED_SHARE = 0.25
+
 #: The file that says a revision is glued, written last.
 MANIFEST = "manifest.json"
 
@@ -675,6 +692,9 @@ class ScanInputs:
     documents: dict[str, dict] = field(default_factory=dict)
     redactions: dict[int, list[dict]] = field(default_factory=dict)
     renders: dict[int, tuple[int, int]] = field(default_factory=dict)
+    #: ``{page_index: [row]}``, every live detection of the run, for
+    #: the frame of the page (:data:`UNDETECTED`).
+    detected: dict[int, list] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
     zones: dict[str, dict[int, list]] = field(default_factory=dict)
 
@@ -733,16 +753,30 @@ def load_inputs(scan: Scan) -> ScanInputs:
     ):
         inputs.renders.setdefault(page_index, (width, height))
     # The zones of every page, the run's space alone again (#399,
-    # #411), one query for every label of the table.
+    # #411), and the frame of every page, every live detection of the
+    # run whatever its label: one query, and the zones are read out of
+    # it by the labels of the table.
     by_label = {zone.label: name for name, zone in ZONES.items()}
     inputs.zones = {name: {} for name in ZONES}
     for row in (
         Detection.objects.live()
-        .filter(scan=scan, apply_run=run, label__in=list(by_label))
+        .filter(scan=scan, apply_run=run)
+        .only(
+            "page_index",
+            "label",
+            "confidence",
+            "x0",
+            "y0",
+            "x1",
+            "y1",
+            "img_width",
+            "img_height",
+        )
         .order_by("page_index", "y0", "x0")
     ):
-        name = by_label[row.label]
-        if ZONES[name].counts(row):
+        inputs.detected.setdefault(row.page_index, []).append(row)
+        name = by_label.get(row.label)
+        if name is not None and ZONES[name].counts(row):
             inputs.zones[name].setdefault(row.page_index, []).append(row)
     return inputs
 
@@ -831,6 +865,29 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
         if box is not None:
             zones.append([round(v, 2) for v in box])
     return zones
+
+
+def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
+    """Return the frame of one page, in points, or None.
+
+    The union of every detection of the page, in the shape
+    :func:`covered_share` measures: a unit that lies in none of them
+    is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
+    detection, because the rule needs the detections to have read the
+    page: a page they missed whole keeps every unit, and the vote
+    says what it says.
+
+    :param rows: The page's live detections.
+    :param size: The page size in points.
+    :returns: The rects, or None.
+    :rtype: list[dict] | None
+    """
+    if not any(row.label == Label.TEXT_COLUMN.name for row in rows):
+        return None
+    return [
+        {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
+        for box in zones_pt(rows, size)
+    ]
 
 
 def as_box(value) -> list[float] | None:
@@ -1071,6 +1128,7 @@ def verdict(
     printed: str | None = None,
     height_pt: float | None = None,
     label: str = "",
+    frame: list[dict] | None = None,
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
@@ -1078,9 +1136,12 @@ def verdict(
     names itself; else a neighbour's mask that does; else the printed
     page number, when the unit sits in the head or the foot zone and
     one of its lines ends in the approved number of its page (#396);
-    else nothing. The share is the larger of the two boxes' shares,
-    so a partial verdict is read off the file as ``share <
-    FULL_SHARE``; a page-number unit is taken whole and carries 1.0.
+    else the frame, when the detections of the page cover less than
+    :data:`UNDETECTED_SHARE` of the unit (:data:`UNDETECTED`); else
+    nothing. The share is the larger of the two boxes' shares, so a
+    partial verdict is read off the file as ``share < FULL_SHARE``; a
+    page-number unit and an undetected one are taken whole and carry
+    1.0.
 
     A unit with no box, or on a page with no size, cannot be judged.
     It carries the third verdict, :data:`UNJUDGED`, so a reader tells
@@ -1098,6 +1159,8 @@ def verdict(
     :param height_pt: The page's height in points, the space of
         ``box_pt``; None leaves the band unread.
     :param label: The unit's label, as the engine wrote it.
+    :param frame: The page's detections (:func:`page_frame`), or None
+        for a page the rule does not judge.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
@@ -1121,6 +1184,12 @@ def verdict(
         exclusion = {"reason": "outside"}
     elif is_page_number(box_pt, text, printed, height_pt, label):
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
+        share = 1.0
+    elif (
+        frame is not None
+        and covered_share(box_pt, frame)[0] < UNDETECTED_SHARE
+    ):
+        exclusion = {"reason": UNDETECTED}
         share = 1.0
     else:
         exclusion = None
@@ -1221,6 +1290,7 @@ def build_document(
         "partial": 0,
         "unjudged": 0,
         "page_number": 0,
+        "undetected": 0,
         **{zone.count_key: 0 for zone in ZONES.values()},
         "brackets_removed": 0,
         "marks": 0,
@@ -1279,6 +1349,11 @@ def build_document(
         ]
         page_masks = masks.get(page_index, [])
         printed = inputs.printed.get(page_index)
+        frame_rects = (
+            page_frame(inputs.detected.get(page_index, []), size)
+            if size
+            else None
+        )
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -1324,6 +1399,7 @@ def build_document(
                 printed,
                 size[1] if size else None,
                 label,
+                frame_rects,
             )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
@@ -1332,6 +1408,8 @@ def build_document(
                 counts["excluded"] += 1
                 if exclusion["reason"] == PAGE_NUMBER:
                     counts["page_number"] += 1
+                if exclusion["reason"] == UNDETECTED:
+                    counts["undetected"] += 1
                 if share < FULL_SHARE:
                     counts["partial"] += 1
             out = {

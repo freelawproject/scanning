@@ -325,6 +325,10 @@ EDIT_QUOTE_SAVED_MESSAGE = {
     "none": "The block is not a blockquote now.",
     "span": "The selected text is a blockquote now.",
 }
+EDIT_DROP_SAVED_MESSAGE = (
+    "The block was taken out of the text. Its Undo is in the list of "
+    "the blocks taken out, under the page's label."
+)
 EDIT_MOVE_SAVED_MESSAGE = {
     "up": "The block was moved up.",
     "down": "The block was moved down.",
@@ -1789,6 +1793,67 @@ def edit_opinion_blockquote(
         span or "",
     )
     return _build_after_edit(request, opinion, EDIT_QUOTE_SAVED_MESSAGE[said])
+
+
+@login_required
+@require_POST
+def edit_opinion_drop(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Say that one block of an opinion is not text.
+
+    The bleed-through of the page behind, a stray mark, the label of a
+    picture: the engines read words there, no redaction covers them,
+    and the vote cannot settle what no page prints. A person takes the
+    block out. The build drops it with a reason of its own
+    (``ensemble.DROP_HUMAN``) and the edit on the drop, the approved
+    text leaves it out, and the Undo is the one of every edit
+    (``withdraw_opinion_edit``), offered on the page's list of the
+    blocks taken out, because a dropped block has no node to lock. One
+    standing edit per block.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    row = opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.DROP,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=group.get("section") or ensemble.BODY,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s took block %s of page %s out of the text as "
+        "not text: %r",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        (group.get("text") or "")[:80],
+    )
+    # The id, for the Undo of the blocking review, the rule of the
+    # text edit.
+    return _build_after_edit(
+        request, opinion, EDIT_DROP_SAVED_MESSAGE, {"edit_id": row.pk}
+    )
 
 
 @login_required

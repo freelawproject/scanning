@@ -359,7 +359,13 @@ class OpinionOcrTestCase(TestCase):
         return rows
 
     def columns(self, scan, page_index, run=None):
-        """The two text columns of one page, for the outside masks."""
+        """The two text columns of one page, for the outside masks.
+
+        They start above the running head: the frame of the page
+        (``opinion_ocr.page_frame``) is every detection, and a page of
+        print carries a header detection over its head, which this
+        fixture leaves out because the neighbour mask reads one.
+        """
         for x0, x1 in ((100, 800), (900, 1600)):
             model_row(
                 scan,
@@ -369,7 +375,7 @@ class OpinionOcrTestCase(TestCase):
                 page_index=page_index,
                 source_page=page_index + 1,
                 x0=x0,
-                y0=100,
+                y0=40,
                 x1=x1,
                 y1=2100,
                 img_width=IMG_W,
@@ -575,6 +581,63 @@ class TestTheFrame(OpinionOcrTestCase):
 
 # ── the verdict ──────────────────────────────────────────────────────
 class TestTheVerdict(OpinionOcrTestCase):
+    def columns_end_at(self, page_index, y1):
+        """Cut the text columns of one page short, in render pixels."""
+        Detection.objects.filter(
+            scan=self.scan, page_index=page_index, label="TEXT_COLUMN"
+        ).update(y1=y1)
+
+    def test_a_cell_where_the_detections_drew_nothing_is_undetected(self):
+        """The bleed-through of the page behind: the engines read words
+        below the last line of print, where no detection lies."""
+        self.columns_end_at(2, 950)
+
+        document = self.write()
+
+        unit = self.unit(document, 1, "body B")
+        self.assertEqual(unit["exclusion"], {"reason": opinion_ocr.UNDETECTED})
+        self.assertEqual(unit["share"], 1.0)
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 1)
+        self.assertEqual(document["counts"]["partial"], 0)
+
+    def test_a_cell_the_column_cuts_short_is_kept(self):
+        """A column box that ends in the middle of a cell covers half of
+        it, and the rule takes a cell only when the detections cover
+        less than a quarter."""
+        self.columns_end_at(2, 1200)
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 0)
+
+    def test_a_page_with_no_column_keeps_every_unit(self):
+        """A page the detections missed whole is not judged by them."""
+        Detection.objects.filter(
+            scan=self.scan, page_index=2, label="TEXT_COLUMN"
+        ).delete()
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+        self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 0)
+
+    def test_the_redaction_and_the_page_number_come_first(self):
+        """A unit under a box names the box, where the detections drew
+        nothing or not."""
+        self.columns_end_at(2, 950)
+        self.redact(2, to_pt(BODY_B), rect_type="headnote", fill="black")
+
+        document = self.write()
+
+        self.assertEqual(
+            self.unit(document, 1, "body B")["exclusion"]["reason"],
+            "redaction",
+        )
+        self.assertEqual(document["counts"]["undetected"], 0)
+
     def test_a_cell_under_a_redaction_is_excluded_with_the_row(self):
         row = self.redact(2, to_pt(BODY_A), rect_type="headnote", fill="black")
 
