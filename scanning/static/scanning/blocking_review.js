@@ -524,6 +524,18 @@
             });
             footer.appendChild(fine);
         } else if (card.kind !== 'link') {
+            // The plain way to bless a card: the text stays as shown,
+            // and the page's card closes once every open word of the
+            // page is kept, the rule of ``keep``.
+            var right = el('button', 'btn-outline text-xs', 'Right as shown');
+            right.type = 'button';
+            right.title = 'Keep the text as shown; the page\'s card closes'
+                + ' once every open word of the page is answered';
+            right.addEventListener('click', function () {
+                right.disabled = true;
+                section.keep(card, node);
+            });
+            footer.appendChild(right);
             var junk = el('button', 'btn-outline text-xs', 'Not text');
             junk.type = 'button';
             junk.title = 'Take the whole block out of the text: it is not'

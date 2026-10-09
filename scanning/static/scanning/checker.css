@@ -1744,7 +1744,6 @@ div.ensemble-group[data-kind="list_item"] {
    the script's (blocking_review.js); the colours follow the review
    page's red for a block the approval waits on. */
 .bk-card { border: 1px solid #d6d3cd; border-radius: 6px; padding: 12px 14px; margin: 0 0 14px; background: #fff; }
-.dark .bk-card { background: #1f2937; border-color: #374151; }
 .bk-card.bk-done { opacity: 0.55; }
 .bk-card.bk-active { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.18); }
 .bk-card > header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12.5px; color: #6b7280; margin-bottom: 8px; }
@@ -1754,7 +1753,6 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-hl { position: absolute; border: 2px solid #b3261e; background: rgba(179, 38, 30, 0.14); border-radius: 3px; box-sizing: border-box; pointer-events: none; }
 .bk-snippet { font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.5; margin: 0 0 8px; color: #6b7280; }
 .bk-snippet mark { background: rgba(179, 38, 30, 0.14); color: inherit; border-bottom: 2px solid #b3261e; font-weight: 600; padding: 0 2px; }
-.dark .bk-snippet mark { color: #f3f4f6; }
 .bk-stack { display: grid; gap: 6px; max-width: 760px; }
 .bk-opt { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: center; text-align: left; font: inherit; padding: 8px 12px 8px 10px; border: 2px solid #d6d3cd; border-left-width: 6px; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
 .bk-opt:hover { border-color: #2f5d8a; }
@@ -1770,7 +1768,16 @@ div.ensemble-group[data-kind="list_item"] {
    reviewer sees what was selected before blessing or correcting it. */
 .bk-opt.bk-shown { background: rgba(46, 125, 50, 0.07); }
 .bk-opt .bk-shown-tag { margin-left: 10px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; color: #2e7d32; white-space: nowrap; }
-.dark .bk-opt.bk-shown { background: rgba(46, 125, 50, 0.18); }
+/* Dark mode follows the system setting (Tailwind's ``darkMode:
+   'media'``), so these go under the media query and never under a
+   class nothing sets: a white card under light text is unreadable. */
+@media (prefers-color-scheme: dark) {
+    .bk-card { background: #1f2937; border-color: #374151; }
+    .bk-snippet mark { color: #f3f4f6; }
+    .bk-opt { border-color: #4b5563; }
+    .bk-opt.bk-shown { background: rgba(46, 125, 50, 0.18); }
+    .bk-opt .bk-shown-tag { color: #86efac; }
+}
 .bk-opt.bk-focus { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.25); }
 .bk-opt.bk-typed { cursor: text; border-left-color: #d6d3cd; }
 .bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }
