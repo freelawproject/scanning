@@ -652,7 +652,7 @@
         if (shown) {
             button.classList.add('bk-shown');
             button.title = 'This reading is in the text now; choosing it keeps the text as shown';
-            val.appendChild(el('span', 'bk-shown-tag', 'in the text'));
+            val.appendChild(el('span', 'bk-shown-tag', '\u2713'));
         }
         button.appendChild(val);
         button.addEventListener('click', function () {
