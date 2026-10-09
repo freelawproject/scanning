@@ -28,9 +28,9 @@ back is the next approval, the rule of every terminal status.
 their review page (``/opinions/<pk>/review/``): to check a change on
 one opinion before a volume, or to answer a report about one opinion
 without rebuilding its neighbours. Every named opinion is checked
-before any moves: one that does not exist, or one a person approved,
-stops the call, because an opinion named on purpose is never skipped
-without a word.
+before any moves: one that does not exist, one a person approved, or
+one in ``ERROR``, which the glue pass does not take, stops the call,
+because an opinion named on purpose is never skipped without a word.
 
 Examples:
 
@@ -119,7 +119,7 @@ class Command(BaseCommand):
         :return: None.
         :raises CommandError: If the call names no selector or more than
             one, if a named scan or opinion does not exist, or if a named
-            opinion is approved.
+            opinion is approved or in ``ERROR``.
         """
         dry_run = options["dry_run"]
         carry_pdf = not options["recut_pdf"]
@@ -180,7 +180,8 @@ class Command(BaseCommand):
         :param dry_run: Report and change nothing.
         :param carry_pdf: Copy a written PDF to the new revision.
         :return: None.
-        :raises CommandError: If an opinion does not exist or is approved.
+        :raises CommandError: If an opinion does not exist, is approved,
+            or is in ``ERROR``.
         """
         found = {
             row.pk: row
@@ -202,6 +203,18 @@ class Command(BaseCommand):
             raise CommandError(
                 f"opinion(s) {_listed(approved)} are approved and keep their "
                 "glues; nothing moved"
+            )
+        # The glue pass takes no ERROR row (``opinion_ocr.due``), so a
+        # raised revision would say "due again" and glue nothing. Its
+        # way back is the next approval of review 2.
+        errored = [
+            pk for pk in pks if found[pk].status == OpinionReviewStatus.ERROR
+        ]
+        if errored:
+            raise CommandError(
+                f"opinion(s) {_listed(errored)} are in ERROR, which the glue "
+                "pass does not take; approve review 2 again to bring them "
+                "back; nothing moved"
             )
         rows = [found[pk] for pk in pks]
         if dry_run:

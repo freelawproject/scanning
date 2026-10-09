@@ -1531,7 +1531,7 @@ class ReglueSummary:
     :param carried: Of those, rows whose redacted PDF was copied to the
         new revision and stamped there.
     :param outcomes: ``{opinion pk: REGLUE_*}`` for every row the call
-        moved or lost, grouped by scan.
+        moved or lost.
     """
 
     moved: int = 0

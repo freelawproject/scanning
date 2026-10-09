@@ -2775,6 +2775,18 @@ class TestReglueOpinions(OpinionOcrTestCase):
 
         self.assertEqual(self.revisions(), [0, 0])
 
+    def test_an_errored_opinion_refuses_and_nothing_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.ERROR
+        )
+
+        with self.assertRaisesMessage(CommandError, str(self.sibling.pk)):
+            self.run_command(
+                "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+            )
+
+        self.assertEqual(self.revisions(), [0, 0])
+
     def test_a_missing_opinion_refuses_and_nothing_moves(self):
         with self.assertRaisesMessage(CommandError, "999999"):
             self.run_command("--opinion", str(self.opinion.pk), "999999")
