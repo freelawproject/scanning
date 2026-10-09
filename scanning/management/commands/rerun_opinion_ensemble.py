@@ -59,7 +59,7 @@ Examples:
 
 from django.core.management.base import BaseCommand, CommandError
 
-from scanning import ensemble, opinion_ocr
+from scanning import ensemble, opinion_ocr, s3_sync
 from scanning.models import Opinion, OpinionReviewStatus, Scan
 
 #: The least ``ocr_engine_count`` of an opinion ``--all`` reads (#419).
@@ -69,11 +69,12 @@ ALL_MIN_ENGINES = 2
 def readable(least: int):
     """Return the filter of the opinions a run reads.
 
-    **The one rule** of the command (#465): an opinion a person has not
-    approved, read by ``least`` engines or more. A volume run applies it
-    as a filter and a named opinion as a refusal, with
+    **The one rule** of a volume run (#465): an opinion a person has not
+    approved, read by ``least`` engines or more, with
     :func:`opinion_ocr.is_written`, which is read off the row and is no
-    filter of the database.
+    filter of the database. A named opinion meets the same conditions
+    as refusals, each with its own message, and the gate of the engines
+    waived.
 
     :param least: The least ``ocr_engine_count``; 0 waives the gate.
     :returns: The queryset of every such opinion, of every scan.
@@ -120,7 +121,9 @@ class Command(BaseCommand):
             metavar="PK",
             help=(
                 "Opinions read again, by the pk of their review page. Takes "
-                "one or more, and can be repeated."
+                "one or more, and can be repeated. It takes every number "
+                "after it, so a scan number written after it is read as an "
+                "opinion: name scans and opinions in separate calls."
             ),
         )
         parser.add_argument(
@@ -147,13 +150,22 @@ class Command(BaseCommand):
             raise CommandError(
                 "pass --opinion alone, without scans and without --all"
             )
+        if not opinion_pks:
+            if options["all"] and pks:
+                raise CommandError("name the scans or pass --all, not both")
+            if not options["all"] and not pks:
+                raise CommandError(
+                    "name the scans, or pass --all or --opinion"
+                )
+        if not dry_run and not s3_sync.s3_active():
+            # The refusal of the button: every read is a read of the
+            # bucket, and a call that cannot read says so once.
+            raise CommandError(
+                "the file store is off, so no OCR document can be read"
+            )
         if opinion_pks:
             self._opinions(opinion_pks, dry_run)
             return
-        if options["all"] and pks:
-            raise CommandError("name the scans or pass --all, not both")
-        if not options["all"] and not pks:
-            raise CommandError("name the scans, or pass --all or --opinion")
         least = ALL_MIN_ENGINES if options["all"] else 0
         if options["all"]:
             pks = list(
@@ -212,10 +224,11 @@ class Command(BaseCommand):
             raise CommandError(
                 f"opinion(s) {_listed(missing)} do not exist; nothing was read"
             )
-        allowed = set(
-            readable(0).filter(pk__in=pks).values_list("pk", flat=True)
-        )
-        approved = [pk for pk in pks if pk not in allowed]
+        approved = [
+            pk
+            for pk in pks
+            if found[pk].status == OpinionReviewStatus.TEXT_REVIEW_DONE
+        ]
         if approved:
             raise CommandError(
                 f"opinion(s) {_listed(approved)} are approved and keep their "
@@ -248,9 +261,9 @@ class Command(BaseCommand):
         """Read one opinion's documents and write its text again.
 
         **The one read of a row**, for a volume and for a named opinion.
-        A glue that wrote again during the read (``RevisionMoved``) wrote
-        nothing and is not a failure: the row is due at the new revision,
-        the answer of the button. A fault of the bucket counts nothing on
+        A row that moved during the read (``RevisionMoved``: a re-glue,
+        or an edit of a reviewer) wrote nothing and is not a failure: the
+        row is due at its new revision, the answer of the button. A fault of the bucket counts nothing on
         the row; a fault of the row is recorded on it.
 
         :param opinion: The row.
@@ -263,8 +276,8 @@ class Command(BaseCommand):
             document = ensemble.rerun(opinion)
         except ensemble.RevisionMoved:
             self.stdout.write(
-                f"{name}: the OCR glue wrote again during the read; "
-                "nothing written"
+                f"{name}: the opinion moved during the read (a re-glue or an "
+                "edit); nothing written"
             )
             return MOVED
         except ensemble.TransientFault as exc:
@@ -289,7 +302,7 @@ class Command(BaseCommand):
             f"{failed} failed"
         )
         if moved:
-            line += f", {moved} moved by the OCR glue"
+            line += f", {moved} moved during the read"
         self.stdout.write(line)
 
 
