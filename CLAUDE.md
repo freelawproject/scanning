@@ -50,6 +50,9 @@ docker exec scanning-daemon python manage.py score_bad_pages 2845
 # Write the approved texts again after a change of the join rule (#375)
 docker exec scanning-daemon python manage.py rewrite_approved_text --all --dry-run
 
+# Write the text of named opinions again, by the pk of their review page (#465)
+docker exec scanning-daemon python manage.py rerun_opinion_ensemble --opinion 1234 1235 --dry-run
+
 # Write the text of every volume's opinions again, after a change of the ensemble document; --all skips a one-engine opinion (#419)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble --all --dry-run
 
