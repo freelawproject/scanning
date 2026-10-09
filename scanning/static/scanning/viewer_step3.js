@@ -1610,8 +1610,20 @@
         } else if (group.agreement === 'majority') {
             parts.push((group.agreeing || []).join(', ') + ' agree');
         }
-        if (silent.length) {
-            parts.push(silent.join(', ') + ' read nothing here');
+        // A silent engine read nothing here, or read it only under a
+        // redaction or a mask, which the ensemble took out of its
+        // reading: the entry says which (``excluded``).
+        var covered = silent.filter(function (name) {
+            return !!((group.engines || {})[name] || {}).excluded;
+        });
+        var quiet = silent.filter(function (name) {
+            return covered.indexOf(name) < 0;
+        });
+        if (quiet.length) {
+            parts.push(quiet.join(', ') + ' read nothing here');
+        }
+        if (covered.length) {
+            parts.push(covered.join(', ') + ' read it only under a box');
         }
         if (absent.length) {
             parts.push('no box from ' + absent.join(', '));

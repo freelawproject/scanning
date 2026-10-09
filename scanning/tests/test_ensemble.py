@@ -500,7 +500,25 @@ class TestTheAlignment(TestCase):
         self.assertTrue(groups[0]["weak"])
         self.assertLess(groups[0]["alignment_iou"], ensemble.WEAK_IOU)
 
-    def test_a_group_carries_the_exclusion_of_its_members(self):
+    def test_a_group_is_out_when_no_engine_read_it_clean(self):
+        excluded = {"reason": "redaction"}
+        units = [
+            unit("dots_mocr", 0, (36, 108, 288, 324), "alpha", excluded, 1.0),
+            unit(
+                "mistral_ocr", 0, (36, 108, 288, 324), "alpha", excluded, 0.5
+            ),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(groups[0]["excluded"])
+        self.assertEqual(groups[0]["reason"], "redaction")
+        self.assertTrue(groups[0]["partial"])
+
+    def test_a_reading_the_verdict_took_is_silent_beside_a_clean_one(self):
+        """One engine's unit is under a box and the other's is clean.
+        The group stays on the clean reading, and the excluded engine
+        has no word in it: the vote names it silent."""
         units = [
             unit("dots_mocr", 0, (36, 108, 288, 324), "alpha"),
             unit(
@@ -515,9 +533,220 @@ class TestTheAlignment(TestCase):
 
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
-        self.assertTrue(groups[0]["excluded"])
+        self.assertFalse(groups[0]["excluded"])
         self.assertEqual(groups[0]["reason"], "redaction")
-        self.assertTrue(groups[0]["partial"])
+        self.assertTrue(groups[0]["engines"]["mistral_ocr"]["excluded"])
+        self.assertEqual(groups[0]["engines"]["mistral_ocr"]["text"], "")
+        self.assertEqual(groups[0]["engines"]["dots_mocr"]["text"], "alpha")
+        self.assertEqual(
+            ensemble.resolve(groups[0])["silent"], ["mistral_ocr"]
+        )
+
+    def test_the_clean_members_of_an_engine_are_its_reading(self):
+        """Mistral draws the sequence number its own box, covered
+        whole, and the caption beside it: its reading is the caption,
+        with the number out of it."""
+        outside = {"reason": "outside"}
+        units = [
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+            unit("dots_mocr", 0, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        # The number's box touches no other, so it is a group of its
+        # own, excluded; the caption is the other, read alike.
+        self.assertEqual(
+            sorted(group["excluded"] for group in groups), [False, True]
+        )
+        caption = next(group for group in groups if not group["excluded"])
+        mistral = caption["engines"]["mistral_ocr"]
+        self.assertEqual(mistral["text"], "CITY v. COSME")
+        self.assertEqual(mistral["ids"], [1])
+        self.assertEqual(
+            ensemble.resolve(caption)["agreement"], ensemble.UNANIMOUS
+        )
+
+    def test_a_reading_a_box_covers_in_part_keeps_what_it_did_not_hide(self):
+        """dots.mocr folds the "2" into the caption block and the mask
+        takes the "2". Mistral and Surya drew it its own box, covered
+        whole, so the thing under the box is known: it comes out of the
+        dots.mocr reading, and the three engines vote on the caption."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME\nNo. 1",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit(
+                "mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME\nNo. 1"
+            ),
+            unit("surya", 0, (148, 106, 172, 120), "2", outside, 1.0),
+            unit("surya", 1, (36, 120, 288, 200), "CITY v. COSME\nNo. 1"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(dots["text"], "CITY v. COSME No. 1")
+        self.assertEqual(dots["uncovered"], 1)
+        self.assertFalse(dots["excluded"])
+        read = ensemble.resolve(groups[0])
+        self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(read["silent"], [])
+
+    def test_a_thing_under_the_box_is_found_under_any_reading_of_it(self):
+        """Surya read the "2" as "Z": one thing, two readings, and the
+        one Mistral gave is in the dots.mocr text."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+            unit("surya", 0, (148, 106, 172, 120), "Z", outside, 1.0),
+            unit("surya", 1, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(dots["text"], "CITY v. COSME")
+        self.assertEqual(dots["uncovered"], 1)
+
+    def test_a_thing_the_reading_does_not_hold_keeps_it_silent(self):
+        """The other engine read "7" under the box and the dots.mocr
+        text holds no "7": nothing says what else the box hid, so the
+        reading stays out, and the group stays on the clean one."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "7", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertTrue(dots["excluded"])
+        self.assertEqual(dots["uncovered"], 0)
+        self.assertFalse(groups[0]["excluded"])
+
+    def test_a_block_over_a_covered_cell_keeps_its_other_cells(self):
+        """One engine reads two paragraphs as one block, and a
+        redaction covers the first whole in the other engine: the
+        block's reading loses that paragraph and votes on the second."""
+        redaction = {"reason": "redaction"}
+        units = [
+            unit(
+                "mistral_ocr",
+                0,
+                (36, 108, 288, 324),
+                "The first.\nThe second.",
+                redaction,
+                0.5,
+            ),
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "The first.",
+                redaction,
+                1.0,
+            ),
+            unit("dots_mocr", 1, (36, 210, 288, 324), "The second."),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        mistral = groups[0]["engines"]["mistral_ocr"]
+        self.assertEqual(mistral["text"], "The second.")
+        self.assertEqual(mistral["uncovered"], 1)
+        read = ensemble.resolve(groups[0])
+        self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(read["text"], "The second.")
+
+    def test_a_reading_the_box_hid_whole_stays_out(self):
+        outside = {"reason": "outside"}
+        units = [
+            unit("dots_mocr", 0, (150, 100, 170, 120), "2", outside, 0.5),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(groups[0]["excluded"])
+        self.assertEqual(groups[0]["engines"]["dots_mocr"]["uncovered"], 0)
+
+    def test_uncover_takes_the_run_with_its_whitespace_and_moves_the_marks(
+        self,
+    ):
+        em = {"start": 2, "end": 6, "kind": "em"}
+
+        self.assertEqual(
+            ensemble._uncover("2\nCITY v. COSME", [em], [{"readings": ["2"]}]),
+            ("CITY v. COSME", [{"start": 0, "end": 4, "kind": "em"}], ["2"]),
+        )
+        self.assertEqual(
+            ensemble._uncover(
+                "CITY v. COSME 944", [], [{"readings": ["944"]}]
+            ),
+            ("CITY v. COSME", [], ["944"]),
+        )
+        self.assertEqual(
+            ensemble._uncover("a b c", [], [{"readings": ["b"]}]),
+            ("a c", [], ["b"]),
+        )
+        self.assertIsNone(
+            ensemble._uncover(
+                "a b", [], [{"readings": ["b"]}, {"readings": ["c"]}]
+            )
+        )
+        self.assertIsNone(
+            ensemble._uncover("a b", [], [{"readings": ["a b"]}])
+        )
+
+    def test_a_run_that_occurs_twice_is_taken_by_the_place_of_its_box(self):
+        """The sequence number is a word of the caption too: the thing
+        at the top of the reading's box takes the first run, one at the
+        bottom the last, and with no box the first."""
+        box = [0.0, 0.0, 100.0, 100.0]
+        top = {"readings": ["2"], "box_pt": [40.0, 2.0, 60.0, 10.0]}
+        bottom = {"readings": ["2"], "box_pt": [40.0, 90.0, 60.0, 98.0]}
+
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [top], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("STATE v. 2 BROTHERS 2", [], [bottom], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [bottom])[0],
+            "STATE v. 2 BROTHERS",
+        )
 
 
 # ── the reading order ────────────────────────────────────────────────
@@ -1141,20 +1370,31 @@ class TestTheDocument(EnsembleTestCase):
         makes the other (#396)."""
         return next(d for d in page["dropped"] if d["reason"] == "redaction")
 
-    def test_a_box_over_one_cell_of_a_block_is_a_partial_drop(self):
+    def test_a_box_over_one_cell_of_a_block_keeps_the_other_cells(self):
         """The daily shape of it: one engine reads the body as one
-        block, a redaction covers one cell of the other engine whole,
-        and the group is dropped whole. The reader loses a clean
-        reading, so the page says ``partial``."""
+        block, and a redaction covers one cell of the other engine
+        whole. The block is out, the covered cell is out, and the clean
+        cell is the text, with the block's engine silent in the group.
+        Nothing is lost that was not under the box, so no partial drop
+        is counted; the one reading left is the card."""
         self.one_body_block()
         self.redact(2, BODY_A_PT)
 
         built = self.run_ensemble()
 
         page = built["pages"][1]
-        self.assertNotIn("body", page["text"])
-        self.assertTrue(self.redaction_drop(page)["partial"])
-        self.assertEqual(page["counts"]["partial"], 1)
+        self.assertEqual(page["text"], "body B 2")
+        group = page["groups"][0]
+        self.assertEqual(group["silent"], ["mistral_ocr"])
+        self.assertEqual(
+            group["engines"]["mistral_ocr"]["excluded"], "redaction"
+        )
+        self.assertEqual(group["engines"]["dots_mocr"]["excluded"], None)
+        self.assertEqual(group["level"], ensemble.BLOCKING)
+        self.assertEqual(
+            [d["reason"] for d in page["dropped"]], [opinion_ocr.PAGE_NUMBER]
+        )
+        self.assertEqual(page["counts"]["partial"], 0)
 
     def test_a_block_only_one_engine_saw_is_a_disagreement(self):
         """The other engine drew no box there. Nothing votes, and the
@@ -3950,7 +4190,8 @@ class TestTheLevel(TestCase):
 
 class TestTheBracketDrop(TestCase):
     """A partial drop of a group that lost a bracket token writes no
-    ``PARTIAL_REDACTION`` card (#419)."""
+    ``PARTIAL_REDACTION`` card (#419). Both engines are under the box,
+    or the group would stay on the clean reading and drop nothing."""
 
     def page(self, removed):
         box = (36, 108, 288, 200)
@@ -3964,7 +4205,16 @@ class TestTheBracketDrop(TestCase):
             {
                 "dots_mocr": dots,
                 "mistral_ocr": engine_page(
-                    [unit("mistral_ocr", 0, box, "The court held.")]
+                    [
+                        unit(
+                            "mistral_ocr",
+                            0,
+                            box,
+                            "The court held.",
+                            excluded,
+                            0.3,
+                        )
+                    ]
                 ),
             },
             0,
