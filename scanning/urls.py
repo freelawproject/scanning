@@ -49,6 +49,8 @@ from scanning.views_api import (
     edit_opinion_text,
     export_pdf,
     generate_files,
+    give_back_opinion_footnotes,
+    keep_opinion_footnotes,
     move_opinion_block,
     move_redaction,
     rebuild_findings,
@@ -273,6 +275,17 @@ urlpatterns = [
         "<int:finding_pk>/restore/",
         restore_opinion_finding,
         name="restore_opinion_finding",
+    ),
+    # The footnotes of a first page the opinion before ends on (#457).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/footnotes/keep/",
+        keep_opinion_footnotes,
+        name="keep_opinion_footnotes",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/footnotes/give-back/",
+        give_back_opinion_footnotes,
+        name="give_back_opinion_footnotes",
     ),
     # The human edits of an opinion's text (#376).
     path(

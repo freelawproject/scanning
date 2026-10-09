@@ -270,6 +270,30 @@ OPINION_FINDING_CLOSED_MESSAGE = (
     "This opinion is not ready for the text review, so its findings "
     "take no dismissal now."
 )
+#: The footnotes of a shared first page (#457). The keep and its way
+#: back raise the glue revision, so the page is written again.
+KEPT_FOOTNOTES_MESSAGE = (
+    "The footnotes of the first page are kept as this opinion's own. The "
+    "text and the redacted PDF are written again in a minute or two."
+)
+KEPT_FOOTNOTES_ALREADY_MESSAGE = "The footnotes were kept already."
+GAVE_BACK_FOOTNOTES_MESSAGE = (
+    "The footnotes of the first page are the opinion before's again. The "
+    "text and the redacted PDF are written again in a minute or two."
+)
+GAVE_BACK_FOOTNOTES_ALREADY_MESSAGE = "No kept footnotes stand."
+GAVE_BACK_STALE_FOOTNOTES_MESSAGE = (
+    "The kept footnotes named another first page, so they kept nothing "
+    "here. They are withdrawn, and nothing is written again."
+)
+FOOTNOTES_CLOSED_MESSAGE = (
+    "This opinion is not ready for the text review, so its footnotes "
+    "cannot change now."
+)
+FOOTNOTES_NOT_SHARED_MESSAGE = (
+    "The opinion before does not end on this opinion's first page, so "
+    "no footnote of it was taken out."
+)
 #: The two stale checks of review 3 are facts about the row (#336).
 OPINION_FINDING_UNDISMISSABLE_MESSAGE = (
     "This finding cannot be dismissed. It says the opinion row no "
@@ -1357,6 +1381,133 @@ def restore_opinion_finding(
                 else STANDING_FINDING_MESSAGE
             ),
         }
+    )
+
+
+def _footnotes_opinion_or_refusal(
+    pk: int, opinion_pk: int
+) -> Opinion | JsonResponse:
+    """Return the opinion whose footnotes may change, or the refusal.
+
+    The gate of the dismissal (#419): an opinion that is not ready for
+    the text review refuses with 409, and so does an opinion whose
+    first page the opinion before does not end on (#457).
+
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :returns: The opinion, or the refusal.
+    """
+    from scanning import boundaries
+    from scanning.models import OpinionReviewStatus
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("boundary"), pk=opinion_pk, scan=scan
+    )
+    if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
+            status=409,
+        )
+    boundary = opinion.boundary
+    if boundary is None or boundary.pk not in boundaries.shared_first_pages(
+        scan, [boundary]
+    ):
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_NOT_SHARED_MESSAGE},
+            status=409,
+        )
+    return opinion
+
+
+@login_required
+@require_POST
+def keep_opinion_footnotes(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Keep the footnotes of a shared first page as the opinion's (#457).
+
+    The answer to a ``SHARED_FOOTNOTES`` card whose notes are the
+    opinion's own: the mask over them is lifted, and the glue revision
+    rises, so the OCR glue, the PDF and the ensemble are written again.
+    Any logged-in user may press it, the rule of the dismissal.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 409 for a closed opinion or a first
+        page nobody shares.
+    """
+    from scanning import shared_footnotes
+
+    opinion = _footnotes_opinion_or_refusal(pk, opinion_pk)
+    if isinstance(opinion, JsonResponse):
+        return opinion
+    try:
+        written = shared_footnotes.keep(opinion, request.user)
+    except shared_footnotes.FootnotesClosed:
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
+            status=409,
+        )
+    if not written:
+        return JsonResponse(
+            {"status": "ok", "message": KEPT_FOOTNOTES_ALREADY_MESSAGE}
+        )
+    logger.info(
+        "%s of scan %s: %s kept the footnotes of the first page",
+        opinion,
+        pk,
+        request.user,
+    )
+    return JsonResponse({"status": "ok", "message": KEPT_FOOTNOTES_MESSAGE})
+
+
+@login_required
+@require_POST
+def give_back_opinion_footnotes(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Give the footnotes of a shared first page back (#457).
+
+    The way back of :func:`keep_opinion_footnotes`: the kept row is
+    withdrawn, and the mask takes the notes again.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 409 for a closed opinion or a first
+        page nobody shares.
+    """
+    from scanning import shared_footnotes
+
+    opinion = _footnotes_opinion_or_refusal(pk, opinion_pk)
+    if isinstance(opinion, JsonResponse):
+        return opinion
+    try:
+        outcome = shared_footnotes.give_back(opinion, request.user)
+    except shared_footnotes.FootnotesClosed:
+        return JsonResponse(
+            {"status": "error", "message": FOOTNOTES_CLOSED_MESSAGE},
+            status=409,
+        )
+    if outcome == shared_footnotes.NOTHING_STANDING:
+        return JsonResponse(
+            {"status": "ok", "message": GAVE_BACK_FOOTNOTES_ALREADY_MESSAGE}
+        )
+    logger.info(
+        "%s of scan %s: %s gave the footnotes of the first page back (%s)",
+        opinion,
+        pk,
+        request.user,
+        outcome,
+    )
+    if outcome == shared_footnotes.WITHDREW_STALE:
+        return JsonResponse(
+            {"status": "ok", "message": GAVE_BACK_STALE_FOOTNOTES_MESSAGE}
+        )
+    return JsonResponse(
+        {"status": "ok", "message": GAVE_BACK_FOOTNOTES_MESSAGE}
     )
 
 

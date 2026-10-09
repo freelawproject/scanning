@@ -2020,15 +2020,21 @@
                 });
             }
         );
-        // The dismissal of a card, and its undo (#419). The template
-        // writes the address; the answer's line survives the reload,
-        // because the counts of the strip are the server's.
-        document.querySelectorAll('.finding-dismiss, .finding-restore')
+        // The dismissal of a card, and its undo (#419), and the keep of
+        // the footnotes of a shared first page, and its way back
+        // (#457). The template writes the address; the answer's line
+        // survives the reload, because the counts of the strip are the
+        // server's.
+        document.querySelectorAll(
+            '.finding-dismiss, .finding-restore, .finding-footnotes'
+        )
             .forEach(function (button) {
                 button.addEventListener('click', function (event) {
                     event.stopPropagation();
                     postAndReload(
-                        button.dataset.dismissUrl || button.dataset.restoreUrl,
+                        button.dataset.dismissUrl
+                            || button.dataset.restoreUrl
+                            || button.dataset.footnotesUrl,
                         button
                     );
                 });
