@@ -1782,12 +1782,11 @@ class TestTheFindings(EnsembleTestCase):
         cards = self.rebuild(undetected=2)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)
-        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
         self.assertIn("2 block(s)", cards[0].message)
 
-    def test_an_undetected_block_the_engines_read_alike_blocks(self):
-        """A column the detections missed: the approval waits until a
-        person has looked at the page."""
+    def test_an_undetected_block_the_engines_read_alike_says_so(self):
+        """A column the detections missed: the card names it."""
         cards = self.rebuild(undetected=2, undetected_agreed=1)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)

@@ -3828,20 +3828,18 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
         if counts.get("undetected"):
-            # The glue left text out on the detections' word. Where the
-            # engines each read something else there, it is the
-            # bleed-through of the page behind, a warning for the
-            # warnings review; where a majority read a dropped block
-            # alike, it has the shape of a column the detections
-            # missed, and the approval waits until a person has looked.
+            # The glue left text out on the detections' word, and the
+            # approval waits until a person has looked at the page and
+            # dismissed the card: a column the detections missed would
+            # be text lost in silence otherwise. The message says when
+            # a majority of the engines read a dropped block alike,
+            # the shape of such a column rather than of bleed-through.
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.UNDETECTED_TEXT,
-                    Issue.Severity.ERROR
-                    if counts.get("undetected_agreed")
-                    else Issue.Severity.WARNING,
+                    Issue.Severity.ERROR,
                     _undetected_message(page),
                     standing,
                 )
@@ -3890,9 +3888,10 @@ def _undetected_message(page: dict) -> str:
     The engines read words where the detections drew no column, no
     footnote band and no picture, and the glue left them out
     (``opinion_ocr.UNDETECTED``): the bleed-through of the page
-    behind, most days. The card asks for a look, because a column the
-    detections missed is text lost the same way, and only the page
-    tells the two apart.
+    behind, most days. The card is an ERROR the approval waits on,
+    because a column the detections missed is text lost the same way,
+    and only the page tells the two apart; it says when the engines
+    read a dropped block alike, the sign of such a column.
 
     :param page: One page of the document.
     :returns: The message.
