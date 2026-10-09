@@ -472,6 +472,14 @@
             placeOver(zone, box, scale);
             wrapper.appendChild(zone);
         });
+        handDropped(page).forEach(function (drop) {
+            if (!drop.box_pt) { return; }
+            var junk = document.createElement('div');
+            junk.className = 'ensemble-junk';
+            junk.title = 'Taken out of the text as not text';
+            placeOver(junk, drop.box_pt, scale);
+            wrapper.appendChild(junk);
+        });
         (page.groups || []).forEach(function (group) {
             var box = group.box_pt;
             if (!box) { return; }
@@ -653,6 +661,10 @@
             block.appendChild(label);
             if ((page.unresolved_edits || []).length) {
                 block.appendChild(unresolvedList(page.unresolved_edits));
+            }
+            var junk = handDropped(page);
+            if (junk.length) {
+                block.appendChild(droppedList(junk));
             }
 
             if (page.error) {
@@ -1610,8 +1622,20 @@
         } else if (group.agreement === 'majority') {
             parts.push((group.agreeing || []).join(', ') + ' agree');
         }
-        if (silent.length) {
-            parts.push(silent.join(', ') + ' read nothing here');
+        // A silent engine read nothing here, or read it only under a
+        // redaction or a mask, which the ensemble took out of its
+        // reading: the entry says which (``excluded``).
+        var covered = silent.filter(function (name) {
+            return !!((group.engines || {})[name] || {}).excluded;
+        });
+        var quiet = silent.filter(function (name) {
+            return covered.indexOf(name) < 0;
+        });
+        if (quiet.length) {
+            parts.push(quiet.join(', ') + ' read nothing here');
+        }
+        if (covered.length) {
+            parts.push(covered.join(', ') + ' read it only under a box');
         }
         if (absent.length) {
             parts.push('no box from ' + absent.join(', '));
@@ -2265,6 +2289,70 @@
             ));
         }
         quoteButtons(bar, page, group);
+        bar.appendChild(barButton(
+            'Not text',
+            'Take this block out of the text: it is not text of the'
+                + ' opinion (the bleed-through of the page behind, a'
+                + ' stray mark)',
+            function (button) {
+                if (!window.confirm('Take this block out of the text? It'
+                        + ' is left out of the opinion until the edit is'
+                        + ' undone from the list under the page\'s'
+                        + ' label.')) { return; }
+                postEdit(endpoint('editDropUrl'), {
+                    page_in_opinion: page.page_in_opinion,
+                    group_id: group.id
+                }, button);
+            }
+        ));
+    }
+
+    /**
+     * Return the blocks of a page a person took out of the text: the
+     * drops that carry an edit (``ensemble.DROP_HUMAN``).
+     *
+     * @param {Object} page - The page entry.
+     * @returns {Array} The drops.
+     */
+    function handDropped(page) {
+        return (page.dropped || []).filter(function (drop) {
+            return !!(drop.edit && drop.edit.id);
+        });
+    }
+
+    /**
+     * Build the list of the blocks a person took out of one page, each
+     * with its Undo. A dropped block has no node to lock, so this list
+     * is the one place its Undo lives, the rule of the unresolved
+     * edits.
+     *
+     * @param {Array} drops - The drops of :func:`handDropped`.
+     * @returns {HTMLElement} The list.
+     */
+    function droppedList(drops) {
+        var list = document.createElement('div');
+        list.className = 'ensemble-dropped';
+        drops.forEach(function (drop) {
+            var line = document.createElement('div');
+            line.className = 'ensemble-dropped-line';
+            var said = document.createElement('span');
+            said.textContent = 'A block taken out of the text as not text'
+                + ' by ' + (drop.edit.by || 'a person');
+            line.appendChild(said);
+            if (canEdit()) {
+                line.appendChild(barButton(
+                    'Undo',
+                    'Put the block back in the text',
+                    function (button) {
+                        if (!window.confirm('Put this block back in the'
+                                + ' text?')) { return; }
+                        withdrawEdit(drop.edit.id, button);
+                    }
+                ));
+            }
+            list.appendChild(line);
+        });
+        return list;
     }
 
     /**
@@ -2879,6 +2967,12 @@
             loadPdf();
         }
         loadText();
+        // A link from the blocking review names a page in the hash
+        // (``#op-page-{index}``, the id of the page's container). The
+        // jump is kept until both loads are in, the rule of a card's
+        // jump, and a stored place of a reload still wins over it.
+        var jump = /^#op-page-(\d+)$/.exec(window.location.hash || '');
+        if (jump) { goToPage(parseInt(jump[1], 10)); }
         if (pagesColumn && textColumn) { bindPointers(); }
         // A resize changes the width of a column, and the scale
         // follows that width, so the pages are drawn again. A page

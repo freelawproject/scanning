@@ -54,10 +54,19 @@
       </div>
     </div>
     <div class="flex items-center justify-between gap-2 mt-3">
-      <span class="text-xs text-gray-500 dark:text-gray-400">
-        {% if current_scan %}One volume only (scan #{{ current_scan }}).{% endif %}
+      <span class="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-4">
+        {% if current_scan %}<span>One volume only (scan #{{ current_scan }}).</span>{% endif %}
+        <label class="inline-flex items-center gap-1 cursor-pointer" title="Only the opinions whose approval waits on an open card">
+          <input type="checkbox" name="blocking" value="1" {% if current_blocking %}checked{% endif %} class="rounded">
+          Blocking only
+        </label>
       </span>
       <div class="flex items-center gap-2">
+        {% if blocking_review_url %}
+        <a href="{{ blocking_review_url }}" class="btn-primary text-sm" title="Answer every open blocking card of this volume, one after the next"><i class="fa-solid fa-list-check"></i> Review all blocking</a>
+        {% else %}
+        <span class="btn-primary text-sm opacity-50 cursor-not-allowed" title="Filter to one scan or one volume first: the blocking review takes one volume at a time"><i class="fa-solid fa-list-check"></i> Review all blocking</span>
+        {% endif %}
         <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
         <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
       </div>
@@ -113,6 +122,9 @@
           {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-right">
+          {% if opinion.final_xml_ready %}
+          <a href="{% url 'opinion_final_xml' pk=opinion.scan.pk opinion_pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1 mr-1" title="Open the final XML of this opinion"><i class="fa-solid fa-code"></i> XML</a>
+          {% endif %}
           <a href="{% url 'opinion_review' pk=opinion.pk %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" class="btn-outline text-xs px-2 py-1">Review</a>
         </td>
       </tr>
@@ -125,7 +137,7 @@
 {% if page_obj.has_other_pages %}
 <nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
   {% if page_obj.has_previous %}
-  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}"
      class="btn-outline text-sm">&laquo; Previous</a>
   {% endif %}
 
@@ -134,7 +146,7 @@
   </span>
 
   {% if page_obj.has_next %}
-  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}"
+  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}"
      class="btn-outline text-sm">Next &raquo;</a>
   {% endif %}
 </nav>

@@ -4,7 +4,7 @@ from blackletter.models import Label
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
 from django.core.paginator import Paginator
-from django.db import connection
+from django.db import connection, transaction
 from django.urls import NoReverseMatch, reverse
 from django.utils.functional import cached_property
 from django.utils.html import format_html
@@ -105,6 +105,35 @@ def _release_scan_external_work(scan):
                 scan.pk,
                 exc_info=True,
             )
+
+
+def _sweep_final_xml_after_commit(scan_pk: int) -> None:
+    """Delete a deleted scan's exported final XML once the delete commits.
+
+    After the row delete, and not before it like the other sweeps
+    (#408): ``export/`` is the list CourtListener imports, so an
+    orphan there is an import of a deleted scan, not storage. Once the
+    rows are gone no export can stamp, and an export whose PUT lands
+    later finds no row and deletes its own object. A failure is an
+    error, for Sentry: ``export_final_xml --all`` deletes what it left.
+
+    :param scan_pk: The pk of the scan being deleted.
+    """
+    from scanning import s3_sync
+
+    def sweep():
+        try:
+            s3_sync.delete_export_objects(scan_pk)
+        except Exception:
+            logger.error(
+                "Could not delete the exported final XML of deleted scan "
+                "%s; CourtListener can still list it. Run "
+                "export_final_xml --all to delete it",
+                scan_pk,
+                exc_info=True,
+            )
+
+    transaction.on_commit(sweep)
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -420,8 +449,12 @@ class ScanAdmin(admin.ModelAdmin):
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
+        scan_pk = obj.pk
         _release_scan_external_work(obj)
         super().delete_model(request, obj)
+        # Registered after the delete: outside a transaction, on_commit
+        # runs at once.
+        _sweep_final_xml_after_commit(scan_pk)
         if volume is not None:
             refresh_volume_queue_status(volume)
 
@@ -439,9 +472,13 @@ class ScanAdmin(admin.ModelAdmin):
             .values_list("volume_obj_id", flat=True)
             .distinct()
         )
+        scan_pks = []
         for scan in queryset:
             _release_scan_external_work(scan)
+            scan_pks.append(scan.pk)
         super().delete_queryset(request, queryset)
+        for scan_pk in scan_pks:
+            _sweep_final_xml_after_commit(scan_pk)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
 

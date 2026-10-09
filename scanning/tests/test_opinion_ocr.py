@@ -359,7 +359,13 @@ class OpinionOcrTestCase(TestCase):
         return rows
 
     def columns(self, scan, page_index, run=None):
-        """The two text columns of one page, for the outside masks."""
+        """The two text columns of one page, for the outside masks.
+
+        They start above the running head: the frame of the page
+        (``opinion_ocr.page_frame``) is every detection, and a page of
+        print carries a header detection over its head, which this
+        fixture leaves out because the neighbour mask reads one.
+        """
         for x0, x1 in ((100, 800), (900, 1600)):
             model_row(
                 scan,
@@ -369,7 +375,7 @@ class OpinionOcrTestCase(TestCase):
                 page_index=page_index,
                 source_page=page_index + 1,
                 x0=x0,
-                y0=100,
+                y0=40,
                 x1=x1,
                 y1=2100,
                 img_width=IMG_W,
@@ -575,6 +581,63 @@ class TestTheFrame(OpinionOcrTestCase):
 
 # ── the verdict ──────────────────────────────────────────────────────
 class TestTheVerdict(OpinionOcrTestCase):
+    def columns_end_at(self, page_index, y1):
+        """Cut the text columns of one page short, in render pixels."""
+        Detection.objects.filter(
+            scan=self.scan, page_index=page_index, label="TEXT_COLUMN"
+        ).update(y1=y1)
+
+    def test_a_cell_where_the_detections_drew_nothing_is_undetected(self):
+        """The bleed-through of the page behind: the engines read words
+        below the last line of print, where no detection lies."""
+        self.columns_end_at(2, 950)
+
+        document = self.write()
+
+        unit = self.unit(document, 1, "body B")
+        self.assertEqual(unit["exclusion"], {"reason": opinion_ocr.UNDETECTED})
+        self.assertEqual(unit["share"], 1.0)
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 1)
+        self.assertEqual(document["counts"]["partial"], 0)
+
+    def test_a_cell_the_column_cuts_short_is_kept(self):
+        """A column box that ends in the middle of a cell covers half of
+        it, and the rule takes a cell only when the detections cover
+        less than a quarter."""
+        self.columns_end_at(2, 1200)
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 0)
+
+    def test_a_page_with_no_column_keeps_every_unit(self):
+        """A page the detections missed whole is not judged by them."""
+        Detection.objects.filter(
+            scan=self.scan, page_index=2, label="TEXT_COLUMN"
+        ).delete()
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+        self.assertIsNone(self.unit(document, 1, "body B")["exclusion"])
+        self.assertEqual(document["counts"]["undetected"], 0)
+
+    def test_the_redaction_and_the_page_number_come_first(self):
+        """A unit under a box names the box, where the detections drew
+        nothing or not."""
+        self.columns_end_at(2, 950)
+        self.redact(2, to_pt(BODY_B), rect_type="headnote", fill="black")
+
+        document = self.write()
+
+        self.assertEqual(
+            self.unit(document, 1, "body B")["exclusion"]["reason"],
+            "redaction",
+        )
+        self.assertEqual(document["counts"]["undetected"], 0)
+
     def test_a_cell_under_a_redaction_is_excluded_with_the_row(self):
         row = self.redact(2, to_pt(BODY_A), rect_type="headnote", fill="black")
 
@@ -612,7 +675,12 @@ class TestTheVerdict(OpinionOcrTestCase):
 
         unit = self.unit(document, 1, "body B")
         self.assertIsNone(unit["exclusion"])
-        self.assertAlmostEqual(unit["share"], 0.05, places=2)
+        # The core of the cell starts ``EDGE_PT`` inside the top, and
+        # the strip covers what is left of its touch above that.
+        height = (y1 - y0) - 2 * opinion_ocr.EDGE_PT
+        touch = (y1 - y0) * 0.05 - opinion_ocr.EDGE_PT
+        self.assertAlmostEqual(unit["share"], touch / height, places=3)
+        self.assertLess(unit["share"], opinion_ocr.EXCLUDE_SHARE)
 
     def test_a_cell_a_box_covers_by_a_third_is_partial(self):
         x0, y0, x1, y1 = to_pt(BODY_A)
@@ -793,7 +861,10 @@ class TestTheVerdict(OpinionOcrTestCase):
 
         self.assertIsNone(self.unit(document, 1, "878")["exclusion"])
 
-    def test_the_share_is_the_maximum_and_not_the_sum(self):
+    def test_the_share_is_the_union_of_the_boxes(self):
+        """Two boxes that each take under a tenth of the cell's core
+        are two redactions in it, and together they exclude it: the
+        measure is the union, never the largest box alone."""
         x0, y0, x1, y1 = to_pt(BODY_A)
         height = y1 - y0
         self.redact(2, [x0, y0, x1, y0 + height * 0.08])
@@ -802,8 +873,11 @@ class TestTheVerdict(OpinionOcrTestCase):
         document = self.write()
 
         unit = self.unit(document, 1, "body A")
-        self.assertIsNone(unit["exclusion"])
-        self.assertAlmostEqual(unit["share"], 0.08, places=2)
+        self.assertEqual(unit["exclusion"]["reason"], "redaction")
+        core = height - 2 * opinion_ocr.EDGE_PT
+        each = height * 0.08 - opinion_ocr.EDGE_PT
+        self.assertAlmostEqual(unit["share"], 2 * each / core, places=3)
+        self.assertGreaterEqual(unit["share"], opinion_ocr.EXCLUDE_SHARE)
 
     def test_a_redaction_wins_over_a_mask_it_matches(self):
         row = self.redact(1, to_pt(HEADER))
@@ -2617,6 +2691,70 @@ class TestTheBracketToken(OpinionOcrTestCase):
         self.assertEqual(unit["text"], "The court held.")
 
 
+class TestTheCoveredShare(TestCase):
+    """The share a cell is covered by: the union of the boxes over
+    the core of the cell, ``EDGE_PT`` inside each edge."""
+
+    def test_a_box_that_starts_inside_the_padding_covers_the_cell(self):
+        """A headnote key line: the engine's cell has three points of
+        air above the letters, and the box drawn over the headnote
+        hugs the ink. The cell is covered, not partial."""
+        rect = {"x0": 0, "y0": 3, "x1": 100, "y1": 12}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 12], [rect])
+
+        self.assertEqual(share, 1.0)
+        self.assertIs(hit, rect)
+
+    def test_two_boxes_with_a_seam_between_them_cover_the_cell(self):
+        """A two-key headnote header straddles the boxes of two
+        headnotes with a white seam of a point and a half between
+        them. Each box alone covers under half of it."""
+        upper = {"x0": 0, "y0": 0, "x1": 100, "y1": 14}
+        lower = {"x0": 0, "y0": 15.5, "x1": 100, "y1": 30}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 30], [upper, lower])
+
+        self.assertGreaterEqual(share, opinion_ocr.FULL_SHARE)
+        self.assertIs(hit, lower)
+
+    def test_a_strip_that_grazes_the_edge_covers_nothing(self):
+        """The bottom margin strip of a page overlaps the last cell of
+        a footnote by two points: the footnote keeps its last word."""
+        strip = {"x0": 0, "y0": 11, "x1": 100, "y1": 40}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 13], [strip])
+
+        self.assertEqual(share, 0.0)
+        self.assertIsNone(hit)
+
+    def test_two_boxes_inside_a_line_add_up(self):
+        """Two names redacted in one line, each under a tenth of it,
+        are two redactions in the line, and the line is excluded."""
+        first = {"x0": 20, "y0": 0, "x1": 40, "y1": 12}
+        second = {"x0": 100, "y0": 0, "x1": 120, "y1": 12}
+
+        share, _ = opinion_ocr.covered_share([0, 0, 200, 12], [first, second])
+
+        self.assertAlmostEqual(share, 2 * 20 / (200 - 6), places=4)
+        self.assertGreaterEqual(share, opinion_ocr.EXCLUDE_SHARE)
+
+    def test_a_small_cell_keeps_half_of_itself(self):
+        """A page number eight points tall is measured over its middle
+        half, never over nothing."""
+        rect = {"x0": 0, "y0": 0, "x1": 8, "y1": 4}
+
+        share, _ = opinion_ocr.covered_share([0, 0, 8, 8], [rect])
+
+        self.assertEqual(opinion_ocr.core_box([0, 0, 8, 8]), [2, 2, 6, 6])
+        self.assertAlmostEqual(share, 0.5, places=4)
+
+    def test_the_union_counts_an_overlap_once(self):
+        boxes = [[0, 0, 10, 10], [5, 5, 15, 15]]
+
+        self.assertEqual(opinion_ocr.union_area(boxes), 175.0)
+
+
 class TestTheBracketBox(TestCase):
     """``opinion_ocr.is_bracket_box`` on its limits (#373)."""
 
@@ -2656,4 +2794,239 @@ class TestTheBracketBox(TestCase):
     def test_another_type_never_counts(self):
         self.assertFalse(
             self.check(36.0, 110.0, 50.0, 120.0, rect_type="headnote")
+        )
+
+
+# ── the re-glue of named opinions (#462) ─────────────────────────────
+class TestReglueOpinions(OpinionOcrTestCase):
+    """``reglue_opinion_ocr --opinion``: the rows a person names."""
+
+    def setUp(self):
+        super().setUp()
+        self.sibling = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 4, 5),
+            505,
+        )
+        self.copies: list[tuple[str, str]] = []
+        patcher = patch(
+            "scanning.s3_sync.copy_object", side_effect=self.copy_object
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def copy_object(self, source, destination):
+        self.copies.append((source, destination))
+        return True
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("reglue_opinion_ocr", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def revisions(self):
+        return [
+            Opinion.objects.get(pk=row.pk).glue_revision
+            for row in (self.opinion, self.sibling)
+        ]
+
+    def write_pdf(self, row):
+        Opinion.objects.filter(pk=row.pk).update(
+            redacted_pdf_revision=F("glue_revision")
+        )
+
+    def test_the_named_opinion_moves_alone(self):
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.revisions(), [1, 0])
+        self.assertIn(f"opinion {self.opinion.pk} (", output)
+        self.assertIn("due again, its PDF is owed", output)
+        self.assertIn("Moved 1 opinion(s), carried 0 PDF(s)", output)
+        self.assertTrue(opinion_ocr.due().filter(pk=self.opinion.pk).exists())
+
+    def test_the_two_spellings_name_the_same_rows(self):
+        self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+        )
+        self.assertEqual(self.revisions(), [1, 1])
+
+        self.run_command(
+            "--opinion",
+            str(self.opinion.pk),
+            "--opinion",
+            str(self.sibling.pk),
+        )
+        self.assertEqual(self.revisions(), [2, 2])
+
+    def test_a_pk_named_twice_moves_once(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.opinion.pk)
+        )
+
+        self.assertEqual(self.revisions(), [1, 0])
+        self.assertIn("Moved 1 opinion(s)", output)
+
+    def test_a_dry_run_moves_nothing_and_names_the_opinion(self):
+        self.write_pdf(self.opinion)
+
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--dry-run"
+        )
+
+        self.assertEqual(self.revisions(), [0, 0])
+        self.assertEqual(self.copies, [])
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan "
+            f"{self.scan.pk}: would glue again, carry its PDF",
+            output,
+        )
+        self.assertIn("Would move 1 opinion(s), would carry 1 PDF(s)", output)
+
+    def test_a_written_pdf_is_carried_unless_recut(self):
+        self.write_pdf(self.opinion)
+
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("due again, its PDF carried", output)
+        self.assertEqual(len(self.copies), 1)
+        row = Opinion.objects.get(pk=self.opinion.pk)
+        self.assertEqual(row.redacted_pdf_revision, 1)
+
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--recut-pdf"
+        )
+
+        self.assertIn("due again, its PDF is owed", output)
+        self.assertEqual(len(self.copies), 1)
+        self.assertTrue(opinion_pdf.owed().filter(pk=self.opinion.pk).exists())
+
+    def test_an_approved_opinion_refuses_and_nothing_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        with self.assertRaisesMessage(CommandError, str(self.sibling.pk)):
+            self.run_command(
+                "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+            )
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_an_errored_opinion_refuses_and_nothing_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.ERROR
+        )
+
+        with self.assertRaisesMessage(CommandError, str(self.sibling.pk)):
+            self.run_command(
+                "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+            )
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_a_missing_opinion_refuses_and_nothing_moves(self):
+        with self.assertRaisesMessage(CommandError, "999999"):
+            self.run_command("--opinion", str(self.opinion.pk), "999999")
+
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_one_selector_per_call(self):
+        for args in (
+            (str(self.scan.pk), "--opinion", str(self.opinion.pk)),
+            ("--all", "--opinion", str(self.opinion.pk)),
+            (),
+        ):
+            with self.assertRaises(CommandError):
+                self.run_command(*args)
+        self.assertEqual(self.revisions(), [0, 0])
+
+    def test_a_swap_another_writer_won_is_reported(self):
+        self.write_pdf(self.opinion)
+
+        def copy_while_another_writer_moves(source, destination):
+            Opinion.objects.filter(pk=self.opinion.pk).update(glue_revision=5)
+            return True
+
+        with patch(
+            "scanning.s3_sync.copy_object",
+            side_effect=copy_while_another_writer_moves,
+        ):
+            output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("taken by another writer", output)
+        self.assertIn("Moved 0 opinion(s)", output)
+        self.assertEqual(self.revisions(), [5, 0])
+
+    def test_the_dry_run_counts_the_rows_the_run_moves(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 2, 3),
+            503,
+            status=OpinionReviewStatus.ERROR,
+        )
+
+        dry = self.run_command(str(self.scan.pk), "--dry-run")
+        real = self.run_command(str(self.scan.pk))
+
+        self.assertIn("would glue 2 opinion(s) again", dry)
+        self.assertIn("2 opinion(s) due again", real)
+
+
+class TestTheReglueLog(OpinionOcrTestCase):
+    """Every scan whose rows moved is logged, and so is an empty one."""
+
+    def test_a_fault_on_a_later_scan_keeps_the_line_of_an_earlier_one(self):
+        other = ScanFactory(
+            page_count=PAGES,
+            status=Status.REDACTION_REVIEW_DONE,
+            source_fingerprint="fp2",
+        )
+        run = self.make_run(other)
+        second = self.make_opinion(
+            other, run, self.make_boundary(other, run, 1, 2), 700
+        )
+        real = opinion_ocr._reglue_row
+
+        def fail_on_the_second_scan(opinion, carry_pdf):
+            if opinion.pk == second.pk:
+                raise RuntimeError("the bucket went away")
+            return real(opinion, carry_pdf)
+
+        with (
+            patch.object(
+                opinion_ocr, "_reglue_row", side_effect=fail_on_the_second_scan
+            ),
+            self.assertLogs("scanning.opinion_ocr", "INFO") as logs,
+            self.assertRaises(RuntimeError),
+        ):
+            opinion_ocr.reglue_opinions(
+                [self.opinion, second], carry_pdf=False
+            )
+
+        self.assertIn(
+            f"scan {self.scan.pk}: 1 opinion(s) due again", logs.output[0]
+        )
+        self.assertIn(
+            f"scan {other.pk}: 0 opinion(s) due again", logs.output[1]
+        )
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 1)
+
+    def test_a_volume_with_nothing_to_move_still_logs(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        with self.assertLogs("scanning.opinion_ocr", "INFO") as logs:
+            summary = opinion_ocr.reglue(self.scan)
+
+        self.assertEqual(summary.moved, 0)
+        self.assertIn(
+            f"scan {self.scan.pk}: 0 opinion(s) due again, 0 PDF(s) carried",
+            logs.output[0],
         )

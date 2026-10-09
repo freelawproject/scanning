@@ -369,7 +369,8 @@ def rewrite_text(opinion: Opinion) -> str | None:
     joins them otherwise. That document stays in the bucket, because an
     approved row is never built again. The new object keeps who
     approved and when, and the row moves to it by a compare-and-swap
-    over the key it held.
+    over the key it held. When the spans carry, the stored final XML is
+    marked for the export to write again (``final_xml_schema`` None).
 
     :param opinion: An approved row, with ``scan`` and ``apply_run``.
     :returns: The new key, or None when the row holds it already.
@@ -401,6 +402,13 @@ def rewrite_text(opinion: Opinion) -> str | None:
     if carry:
         match["tagged_text_key"] = opinion.tagged_text_key
         fields["tagged_text_key"] = key
+        # The spans stay, so the stored final XML still reads as current
+        # (``final_xml.is_written`` compares the spans key). Its text is
+        # the old object: mark the content unknown, and the export writes
+        # the new footnotes (#408). The new text is a new input, so a
+        # row the pass stopped trying is tried again.
+        fields["final_xml_schema"] = None
+        fields["final_xml_attempts"] = 0
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,

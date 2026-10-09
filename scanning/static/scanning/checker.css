@@ -1707,3 +1707,76 @@ div.ensemble-group[data-kind="list_item"] {
     line-height: 1.4;
     padding: 2px 0;
 }
+/* A block a person took out of the text as not text: its box stays
+   on the page, hatched and grey, so the reader sees what went, and no
+   ``ensemble-box`` class, so the hit test never finds it. The list
+   under the page's label holds its Undo. */
+.ensemble-junk {
+    position: absolute;
+    border: 1px dashed rgba(107, 114, 128, 0.8);
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(107, 114, 128, 0.14) 0 6px,
+        transparent 6px 12px
+    );
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ensemble-dropped {
+    margin: 4px 0 8px;
+    padding: 4px 6px;
+    border-left: 2px solid #6b7280;
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-dropped-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
+
+/* ── The blocking review ───────────────────────────────────────────
+   One card per open word (or block), in a row: the crop of the scan,
+   the sentence, one row per engine and a row to type. The classes are
+   the script's (blocking_review.js); the colours follow the review
+   page's red for a block the approval waits on. */
+.bk-card { border: 1px solid #d6d3cd; border-radius: 6px; padding: 12px 14px; margin: 0 0 14px; background: #fff; }
+.dark .bk-card { background: #1f2937; border-color: #374151; }
+.bk-card.bk-done { opacity: 0.55; }
+.bk-card.bk-active { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.18); }
+.bk-card > header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12.5px; color: #6b7280; margin-bottom: 8px; }
+.bk-card > header .bk-step { font-weight: 600; color: #b3261e; }
+.bk-cropwrap { position: relative; border: 1px solid #e5e7eb; background: #fff; overflow: hidden; border-radius: 4px; max-width: 760px; margin-bottom: 8px; }
+.bk-cropwrap canvas { width: 100%; height: auto; display: block; }
+.bk-hl { position: absolute; border: 2px solid #b3261e; background: rgba(179, 38, 30, 0.14); border-radius: 3px; box-sizing: border-box; pointer-events: none; }
+.bk-snippet { font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.5; margin: 0 0 8px; color: #6b7280; }
+.bk-snippet mark { background: rgba(179, 38, 30, 0.14); color: inherit; border-bottom: 2px solid #b3261e; font-weight: 600; padding: 0 2px; }
+.dark .bk-snippet mark { color: #f3f4f6; }
+.bk-stack { display: grid; gap: 6px; max-width: 760px; }
+.bk-opt { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: center; text-align: left; font: inherit; padding: 8px 12px 8px 10px; border: 2px solid #d6d3cd; border-left-width: 6px; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+.bk-opt:hover { border-color: #2f5d8a; }
+.bk-opt .bk-who { font-size: 12px; color: #6b7280; font-family: ui-monospace, Menlo, monospace; }
+.bk-opt .bk-val { font-family: Georgia, "Times New Roman", serif; font-size: 18px; line-height: 1.3; word-break: break-word; min-width: 0; }
+.bk-opt .bk-ctx { color: #9ca3af; font-size: 14px; }
+.bk-opt .bk-nothing { color: #9ca3af; font-style: italic; font-size: 14px; }
+.bk-opt.r0 { border-left-color: #2f5d8a; }
+.bk-opt.r1 { border-left-color: #b7791f; }
+.bk-opt.r2 { border-left-color: #7a5c99; }
+.bk-opt.bk-chosen { border-color: #2e7d32; box-shadow: inset 0 0 0 2px #2e7d32; }
+.bk-opt.bk-focus { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.25); }
+.bk-opt.bk-typed { cursor: text; border-left-color: #d6d3cd; }
+.bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }
+.bk-card > footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.bk-state { font-size: 12.5px; color: #6b7280; }
+.bk-card.bk-done .bk-state { color: #2e7d32; font-weight: 600; }
+.bk-grow { flex: 1; }
+.bk-note { font-size: 13px; color: #6b7280; margin: 4px 0; }
+.bk-note.bk-error { color: #b3261e; }
+.bk-note.bk-ok { color: #2e7d32; font-weight: 600; }
+.bk-single .bk-val { font-size: 15px; line-height: 1.45; max-height: 9em; overflow: auto; }
+.bk-opinion.bk-approved { opacity: 0.6; }
+.bk-card.bk-answered { opacity: 0.7; border-left: 6px solid #2e7d32; }
+.bk-card.bk-answered .bk-state { color: #2e7d32; font-weight: 600; }
