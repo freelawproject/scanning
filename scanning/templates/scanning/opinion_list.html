@@ -122,6 +122,9 @@
           {% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-right">
+          {% if opinion.final_xml_ready %}
+          <a href="{% url 'opinion_final_xml' pk=opinion.scan.pk opinion_pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1 mr-1" title="Open the final XML of this opinion"><i class="fa-solid fa-code"></i> XML</a>
+          {% endif %}
           <a href="{% url 'opinion_review' pk=opinion.pk %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" class="btn-outline text-xs px-2 py-1">Review</a>
         </td>
       </tr>
