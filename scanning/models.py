@@ -2551,6 +2551,10 @@ class OpinionCheck(models.TextChoices):
         "partial_redaction",
         "A redaction covers part of a cell",
     )
+    UNDETECTED_TEXT = (
+        "undetected_text",
+        "Text where the detections drew nothing",
+    )
     PAGE_NOT_READ = "page_not_read", "This page has no text"
     FOOTNOTE_UNSURE = (
         "footnote_unsure",
@@ -3317,11 +3321,14 @@ class OpinionFinding(AbstractDateTimeModel):
 class OpinionEdit(AbstractDateTimeModel):
     """One human edit of the text of one opinion (#376).
 
-    Four kinds: the text of one block (``TEXT``), the section of one
+    Five kinds: the text of one block (``TEXT``), the section of one
     block (``SECTION``: the body or the footnotes), the order of the
-    blocks of one section of one page (``ORDER``), and the blockquote of
+    blocks of one section of one page (``ORDER``), the blockquote of
     one block (``BLOCKQUOTE``, #419): the whole block, or one span of
-    its text.
+    its text, and a block that is not text (``DROP``): the bleed-through
+    of the page behind, a stray mark, the label of a picture, which the
+    engines read as words and no redaction covers, so a person takes it
+    out and the build leaves it out.
 
     **The address plus a copy of the box, never the group id.** The id
     of a group in the ensemble document is its place on the page, and
@@ -3348,6 +3355,7 @@ class OpinionEdit(AbstractDateTimeModel):
         SECTION = "section", "Section of a block"
         ORDER = "order", "Order of the blocks of a page"
         BLOCKQUOTE = "blockquote", "Blockquote of a block"
+        DROP = "drop", "Block that is not text"
 
     opinion = models.ForeignKey(
         Opinion,
@@ -3375,8 +3383,8 @@ class OpinionEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "TEXT and SECTION: a copy of the block's box, in the points "
-            "of the volume page."
+            "TEXT, SECTION, BLOCKQUOTE and DROP: a copy of the block's "
+            "box, in the points of the volume page."
         ),
     )
     section = models.CharField(

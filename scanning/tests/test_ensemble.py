@@ -1778,6 +1778,13 @@ class TestTheFindings(EnsembleTestCase):
 
         self.assertEqual(cards[0].check_name, OpinionCheck.PARTIAL_REDACTION)
 
+    def test_blocks_where_the_detections_drew_nothing_are_a_card(self):
+        cards = self.rebuild(undetected=2)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertIn("2 block(s)", cards[0].message)
+
     def test_a_page_the_engines_agree_on_makes_no_card(self):
         self.assertEqual(self.rebuild(unanimous=4), [])
 
@@ -4186,6 +4193,58 @@ class TestTheLevel(TestCase):
 
         self.assertIsNone(page["groups"][0]["level"])
         self.assertEqual(page["counts"]["differing"], 0)
+
+
+class TestTheUndetectedDrop(TestCase):
+    """A group of units the detections drew nothing under is dropped
+    whole, counted apart, and is no partial drop."""
+
+    def test_an_undetected_group_is_dropped_and_counted(self):
+        box = (36, 500, 288, 700)
+        ghost = {"reason": opinion_ocr.UNDETECTED}
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [
+                        unit(
+                            "dots_mocr", 0, (36, 108, 288, 200), "The court."
+                        ),
+                        unit(
+                            "dots_mocr",
+                            1,
+                            box,
+                            "Section 1921 provides",
+                            ghost,
+                            1.0,
+                        ),
+                    ]
+                ),
+                "mistral_ocr": engine_page(
+                    [
+                        unit(
+                            "mistral_ocr", 0, (36, 108, 288, 200), "The court."
+                        ),
+                        unit(
+                            "mistral_ocr",
+                            1,
+                            box,
+                            "A major business",
+                            ghost,
+                            1.0,
+                        ),
+                    ]
+                ),
+            },
+            0,
+        )
+
+        self.assertEqual(page["text"], "The court.")
+        self.assertEqual(
+            [d["reason"] for d in page["dropped"]], [opinion_ocr.UNDETECTED]
+        )
+        self.assertFalse(page["dropped"][0]["partial"])
+        self.assertEqual(page["counts"]["undetected"], 1)
+        self.assertEqual(page["counts"]["partial"], 0)
 
 
 class TestTheBracketDrop(TestCase):
