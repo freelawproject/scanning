@@ -1996,12 +1996,22 @@ def opinion_blocking_cards(
             {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
             status=409,
         )
-    findings = list(
-        opinion_review.blocking_findings(opinion).order_by(
-            "page_in_opinion", "pk"
-        )
+    # The warnings review asks for its own cards (``?level=warning``),
+    # over the open warning findings; the blocking review is the
+    # default. ``blocking_open`` goes with either, so the page keeps
+    # the approval to the gate whatever it walks.
+    level = (
+        ensemble.WARNING
+        if request.GET.get("level") == ensemble.WARNING
+        else ensemble.BLOCKING
     )
-    cards = blocking_review.cards(document, findings)
+    open_findings = (
+        opinion_review.warning_findings
+        if level == ensemble.WARNING
+        else opinion_review.blocking_findings
+    )
+    findings = list(open_findings(opinion).order_by("page_in_opinion", "pk"))
+    cards = blocking_review.cards(document, findings, level)
     for card in cards:
         if card.get("finding_pk"):
             kwargs = {
@@ -2019,6 +2029,8 @@ def opinion_blocking_cards(
     return JsonResponse(
         {
             "status": "ok",
+            "level": level,
+            "blocking_open": opinion_review.blocking_findings(opinion).count(),
             "opinion": {
                 "pk": opinion.pk,
                 "label": str(opinion),

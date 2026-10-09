@@ -1766,6 +1766,11 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-opt.r1 { border-left-color: #b7791f; }
 .bk-opt.r2 { border-left-color: #7a5c99; }
 .bk-opt.bk-chosen { border-color: #2e7d32; box-shadow: inset 0 0 0 2px #2e7d32; }
+/* The reading that is in the text now: a tint and a tag, so the
+   reviewer sees what was selected before blessing or correcting it. */
+.bk-opt.bk-shown { background: rgba(46, 125, 50, 0.07); }
+.bk-opt .bk-shown-tag { margin-left: 10px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; color: #2e7d32; white-space: nowrap; }
+.dark .bk-opt.bk-shown { background: rgba(46, 125, 50, 0.18); }
 .bk-opt.bk-focus { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.25); }
 .bk-opt.bk-typed { cursor: text; border-left-color: #d6d3cd; }
 .bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }

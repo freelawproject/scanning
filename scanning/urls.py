@@ -137,6 +137,12 @@ urlpatterns = [
         name="opinion_blocking_review",
     ),
     path(
+        "opinions/warnings/",
+        opinion_blocking_review,
+        {"level": "warning"},
+        name="opinion_warning_review",
+    ),
+    path(
         "opinions/<int:pk>/review/",
         opinion_review,
         name="opinion_review",

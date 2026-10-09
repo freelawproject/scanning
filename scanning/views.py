@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef
+from django.db.models import Count, Exists, OuterRef, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -52,7 +52,11 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
-from scanning.opinion_review import MIN_DOCUMENT_SCHEMA, blocking_filter
+from scanning.opinion_review import (
+    MIN_DOCUMENT_SCHEMA,
+    blocking_filter,
+    warning_filter,
+)
 from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
@@ -268,19 +272,24 @@ def _filtered_opinions(request: HttpRequest):
     }
 
 
+def _with_open_card(opinions_qs, open_card: Q):
+    """Keep the opinions that hold an open card of ``open_card``."""
+    return opinions_qs.filter(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                open_card
+            )
+        )
+    )
+
+
 def _with_open_blocking_card(opinions_qs):
     """Keep the opinions whose approval waits on an open card.
 
     ``opinion_review.blocking_filter`` is the rule, the one the badge
     counts by (#375).
     """
-    return opinions_qs.filter(
-        Exists(
-            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
-                blocking_filter()
-            )
-        )
-    )
+    return _with_open_card(opinions_qs, blocking_filter())
 
 
 #: The blocking review takes one volume at a time.
@@ -290,10 +299,10 @@ BLOCKING_REVIEW_SCOPE_MESSAGE = (
 )
 
 
-def _blocking_review_url(current: dict) -> str | None:
-    """Return the blocking review of the list's current filters, or
-    None when the filters name no volume (the page would walk the
-    corpus)."""
+def _review_url(current: dict, route: str) -> str | None:
+    """Return the blocking or the warnings review of the list's current
+    filters, or None when the filters name no volume (the page would
+    walk the corpus)."""
     if not (current["scan"] or current["volume"]):
         return None
     query = {
@@ -301,7 +310,7 @@ def _blocking_review_url(current: dict) -> str | None:
         for key, value in current.items()
         if key in ("scan", "reporter", "volume") and value
     }
-    address = reverse("opinion_blocking_review")
+    address = reverse(route)
     return f"{address}?{urlencode(query)}" if query else address
 
 
@@ -352,14 +361,28 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             "current_status": current["status"],
             "current_volume": current["volume"],
             "current_blocking": current["blocking"],
-            "blocking_review_url": _blocking_review_url(current),
+            "blocking_review_url": _review_url(
+                current, "opinion_blocking_review"
+            ),
+            "warning_review_url": _review_url(
+                current, "opinion_warning_review"
+            ),
         },
     )
 
 
 @login_required
-def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
+def opinion_blocking_review(
+    request: HttpRequest, level: str = "blocking"
+) -> HttpResponse:
     """Review every open blocking card of a filter, one after the next.
+
+    With ``level`` ``"warning"`` (``/opinions/warnings/``), every open
+    warning card instead, in the same format: the words a majority
+    settled over one engine, to bless or to correct, and the cards
+    that point at the page, to dismiss. A warning gates nothing, so
+    the page lists no opinion as ready, and the approval it offers
+    stays behind the gate (``blocking_open`` in the cards' answer).
 
     The opinions of the list's filters (scan, reporter, volume) that
     are in the text review and hold an open blocking card, in the
@@ -381,15 +404,22 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
     in_review = opinions_qs.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
     )
-    paginator = Paginator(_with_open_blocking_card(in_review), 50)
+    warnings = level == "warning"
+    open_card = warning_filter() if warnings else blocking_filter()
+    paginator = Paginator(_with_open_card(in_review, open_card), 50)
     page_obj = paginator.get_page(request.GET.get("page"))
     # The opinions of the filter with nothing open: every card answered
     # here or on the review page, waiting on the approval alone. A
     # volume holds a few dozen, so the list is whole and not paged.
-    ready = list(
-        in_review.exclude(
-            pk__in=_with_open_blocking_card(in_review).values("pk")
-        )[:200]
+    # The warnings review lists none: a warning holds no approval.
+    ready = (
+        []
+        if warnings
+        else list(
+            in_review.exclude(
+                pk__in=_with_open_blocking_card(in_review).values("pk")
+            )[:200]
+        )
     )
     counts = opinions.finding_counts(
         [row.pk for row in page_obj] + [row.pk for row in ready]
@@ -399,7 +429,9 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
             row.pk, (0, 0, 0)
         )
         kwargs = {"pk": row.scan_id, "opinion_pk": row.pk}
-        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs)
+        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs) + (
+            "?level=warning" if warnings else ""
+        )
         row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
         row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
         row.edit_drop_url = reverse("edit_opinion_drop", kwargs=kwargs)
@@ -418,6 +450,11 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
         {
             "page_obj": page_obj,
             "ready": ready,
+            "level": level,
+            "review_name": "Warnings review"
+            if warnings
+            else "Blocking review",
+            "card_word": "warning" if warnings else "blocking",
             "current_scan": current["scan"],
             "list_url": reverse("opinion_list")
             + (f"?{query}" if query else ""),

@@ -63,6 +63,12 @@ MANY_OPEN_WORDS = 8
 #: What an engine's reading says when it read nothing at the word.
 READ_NOTHING = ""
 
+#: The flags of ``ensemble.vote_words`` a card opens: the words no two
+#: engines agree on in the blocking review, the words a majority
+#: settled over one engine in the warnings review.
+LOW_CONFIDENCE = "low_confidence"
+MAJORITY = "majority"
+
 
 def _present(group: dict) -> list[str]:
     """Return the engines that read the group, ranked."""
@@ -151,8 +157,13 @@ def _span_reading(at: dict, first: int, last: int) -> str:
     return " ".join(words)
 
 
-def open_words(group: dict) -> list[dict]:
+def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     """Return the places of one voted group no two engines agree on.
+
+    With ``flag`` :data:`MAJORITY`, the places a majority settled over
+    one engine instead, in a voted group or in a group a majority read
+    alike: the warnings review opens those, so a person blesses the
+    majority's word or picks the other reading.
 
     The vote is run again over the group's own readings, the inputs
     the build had, so the tokens are the ones the document holds and
@@ -173,12 +184,18 @@ def open_words(group: dict) -> list[dict]:
     A word of a run the base did not read is a card of its own.
 
     :param group: One group of a stamped ensemble document.
+    :param flag: The flag of the tokens to open.
     :returns: One entry per open place: ``{start, length, token,
         before, after, readings: [{engine, word}]}``, with ``start`` an
         offset into the group's ``text`` and ``token`` the text there.
     :rtype: list[dict]
     """
-    if group.get("agreement") != ensemble.VOTED:
+    agreements = (
+        (ensemble.VOTED, ensemble.MAJORITY)
+        if flag == MAJORITY
+        else (ensemble.VOTED,)
+    )
+    if group.get("agreement") not in agreements:
         return []
     present = _present(group)
     if len(present) < 2:
@@ -231,7 +248,7 @@ def open_words(group: dict) -> list[dict]:
     spans: list[list[int]] = []
     for entry in placed:
         token = entry["token"]
-        if not token.get("low_confidence") or entry["run_index"] is not None:
+        if not token.get(flag) or entry["run_index"] is not None:
             continue
         first = last = token["position"]
         for name, (at, _) in candidates.items():
@@ -280,7 +297,7 @@ def open_words(group: dict) -> list[dict]:
     # The words of a run the base did not read, one card each.
     for entry in placed:
         token = entry["token"]
-        if not token.get("low_confidence") or entry["run_index"] is None:
+        if not token.get(flag) or entry["run_index"] is None:
             continue
         position = token["position"]
         before, after = context(entry["index"], entry["index"])
@@ -388,8 +405,14 @@ def _place(page: dict, group: dict) -> str:
     )
 
 
-def cards(document: dict, findings: list) -> list[dict]:
+def cards(
+    document: dict, findings: list, level: str = ensemble.BLOCKING
+) -> list[dict]:
     """Return the cards of one opinion, in the order of the pages.
+
+    With ``level`` ``ensemble.WARNING``, the cards of the warnings
+    review instead (:func:`_warning_cards`), over the open warning
+    findings: a page of the same format that gates nothing.
 
     One ``word`` card per open word of a voted block that blocks, or
     one ``block`` card for the whole of a table or of a block with more
@@ -404,7 +427,8 @@ def cards(document: dict, findings: list) -> list[dict]:
     every open word of the page is answered, and dismisses then.
 
     :param document: The stamped ensemble document.
-    :param findings: The open blocking ``OpinionFinding`` rows.
+    :param findings: The open ``OpinionFinding`` rows of the level.
+    :param level: ``ensemble.BLOCKING`` or ``ensemble.WARNING``.
     :returns: The cards.
     :rtype: list[dict]
     """
@@ -417,6 +441,9 @@ def cards(document: dict, findings: list) -> list[dict]:
     for page in document.get("pages") or []:
         number = page["page_in_opinion"]
         page_findings = by_page.pop(number, [])
+        if level == ensemble.WARNING:
+            out.extend(_warning_cards(page, number, page_findings))
+            continue
         single_card = next(
             (
                 f
@@ -519,6 +546,87 @@ def cards(document: dict, findings: list) -> list[dict]:
             out.append(_link_card(finding))
     for leftover in by_page.values():
         out.extend(_link_card(f) for f in leftover)
+    return out
+
+
+def _warning_cards(page: dict, number: int, page_findings: list) -> list:
+    """Return the warning cards of one page.
+
+    One ``word`` card per place a majority settled over one engine in
+    a WARNING group, while the page's ``ENGINES_DISAGREE`` card is
+    open; a ``block`` card for a WARNING group with no such place (a
+    silent engine, a box one engine did not draw), whose rows all read
+    alike, so choosing one is "looks right"; and a ``link`` card for
+    every other open warning of the page, with its dismissal. A
+    BLOCKING group is no card here: the blocking review holds it.
+
+    :param page: The page of the document.
+    :param number: Its ``page_in_opinion``.
+    :param page_findings: The open warning findings of the page.
+    :returns: The cards.
+    :rtype: list[dict]
+    """
+    from scanning.models import OpinionCheck
+
+    disagree = next(
+        (
+            f
+            for f in page_findings
+            if f.check_name == OpinionCheck.ENGINES_DISAGREE
+        ),
+        None,
+    )
+    out: list[dict] = []
+    answered: set = set()
+    for group in page.get("groups") or []:
+        if group.get("level") != ensemble.WARNING or disagree is None:
+            continue
+        common = {
+            "page_in_opinion": number,
+            "group_id": group["id"],
+            "where": _place(page, group),
+            "box_pt": group["box_pt"],
+            "text": group["text"],
+            "level": ensemble.WARNING,
+            "finding_pk": disagree.pk,
+        }
+        answered.add(disagree.pk)
+        table = group.get("kind") == markup.TABLE
+        words = [] if table else open_words(group, MAJORITY)
+        if words and len(words) <= MANY_OPEN_WORDS:
+            for word in words:
+                out.append(
+                    {
+                        **common,
+                        "kind": WORD,
+                        **word,
+                        "crop": crop_of(
+                            group["box_pt"],
+                            len(group["text"]),
+                            word["start"],
+                            word["length"],
+                        ),
+                    }
+                )
+            continue
+        out.append(
+            {
+                **common,
+                "kind": BLOCK,
+                "table": table,
+                "open": len(words),
+                "silent": list(group.get("silent") or []),
+                "readings": [
+                    {"engine": name, "text": group["engines"][name]["text"]}
+                    for name in _present(group)
+                ],
+                "crop": block_crop(group["box_pt"]),
+            }
+        )
+    for finding in page_findings:
+        if finding.pk in answered:
+            continue
+        out.append({**_link_card(finding), "level": ensemble.WARNING})
     return out
 
 
