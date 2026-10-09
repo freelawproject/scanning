@@ -41,6 +41,7 @@ Examples:
     # Write the text of every volume again.
     docker exec scanning-daemon python manage.py \\
         rerun_opinion_ensemble --all --dry-run
+
 """
 
 from django.core.management.base import BaseCommand, CommandError
@@ -50,6 +51,25 @@ from scanning.models import Opinion, OpinionReviewStatus, Scan
 
 #: The least ``ocr_engine_count`` of an opinion ``--all`` reads (#419).
 ALL_MIN_ENGINES = 2
+
+
+def readable(least: int):
+    """Return the filter of the opinions a run reads.
+
+    **The one rule** of the command (#465): an opinion a person has not
+    approved, read by ``least`` engines or more, with
+    :func:`opinion_ocr.is_written`, which is read off the row and is no
+    filter of the database.
+
+    :param least: The least ``ocr_engine_count``; 0 waives the gate.
+    :returns: The queryset of every such opinion, of every scan.
+    :rtype: QuerySet
+    """
+    return (
+        Opinion.objects.filter(ocr_engine_count__gte=least)
+        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .select_related("scan", "apply_run")
+    )
 
 
 class Command(BaseCommand):
@@ -105,18 +125,15 @@ class Command(BaseCommand):
                 .values_list("scan_id", flat=True)
                 .distinct()
             )
-        written = failed = 0
+        written = failed = moved = 0
         for pk in pks:
             scan = Scan.objects.filter(pk=pk).first()
             if scan is None:
                 raise CommandError(f"scan {pk} does not exist")
             rows = [
                 opinion
-                for opinion in Opinion.objects.filter(
-                    scan=scan, ocr_engine_count__gte=least
-                )
-                .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
-                .select_related("scan", "apply_run")
+                for opinion in readable(least)
+                .filter(scan=scan)
                 .order_by("first_printed_page", "index_in_page")
                 if opinion_ocr.is_written(opinion)
             ]
@@ -129,25 +146,62 @@ class Command(BaseCommand):
                 written += len(rows)
                 continue
             for opinion in rows:
-                try:
-                    document = ensemble.rerun(opinion)
-                except ensemble.TransientFault as exc:
-                    # The bucket, not the row: nothing is counted.
-                    failed += 1
-                    self.stderr.write(f"{opinion}: {exc}")
-                    continue
-                except ensemble.EnsembleError as exc:
-                    ensemble.record_failure(opinion, str(exc))
-                    failed += 1
-                    self.stderr.write(f"{opinion}: {exc}")
-                    continue
-                written += 1
-                self.stdout.write(
-                    f"{opinion}: {document['counts']['groups']} block(s), "
-                    f"{document['counts']['low_confidence']} word(s) with "
-                    "no majority"
-                )
+                outcome = self._read(opinion)
+                written += outcome == WRITTEN
+                failed += outcome == FAILED
+                moved += outcome == MOVED
+        self._total(dry_run, written, failed, moved)
+
+    def _read(self, opinion: Opinion, name: str | None = None) -> str:
+        """Read one opinion's documents and write its text again.
+
+        **The one read of a row** of the command.
+        A glue that wrote again during the read (``RevisionMoved``) wrote
+        nothing and is not a failure: the row is due at the new revision,
+        the answer of the button. A fault of the bucket counts nothing on
+        the row; a fault of the row is recorded on it.
+
+        :param opinion: The row.
+        :param name: The head of its line, or the row's own name.
+        :returns: :data:`WRITTEN`, :data:`FAILED` or :data:`MOVED`.
+        :rtype: str
+        """
+        name = name or str(opinion)
+        try:
+            document = ensemble.rerun(opinion)
+        except ensemble.RevisionMoved:
+            self.stdout.write(
+                f"{name}: the OCR glue wrote again during the read; "
+                "nothing written"
+            )
+            return MOVED
+        except ensemble.TransientFault as exc:
+            # The bucket, not the row: nothing is counted.
+            self.stderr.write(f"{name}: {exc}")
+            return FAILED
+        except ensemble.EnsembleError as exc:
+            ensemble.record_failure(opinion, str(exc))
+            self.stderr.write(f"{name}: {exc}")
+            return FAILED
         self.stdout.write(
+            f"{name}: {document['counts']['groups']} block(s), "
+            f"{document['counts']['low_confidence']} word(s) with "
+            "no majority"
+        )
+        return WRITTEN
+
+    def _total(self, dry_run: bool, written: int, failed: int, moved: int):
+        """Write the last line of the call."""
+        line = (
             f"{'Would read' if dry_run else 'Wrote'} {written} opinion(s), "
             f"{failed} failed"
         )
+        if moved:
+            line += f", {moved} moved by the OCR glue"
+        self.stdout.write(line)
+
+
+#: What :meth:`Command._read` did with one row.
+WRITTEN = "written"
+FAILED = "failed"
+MOVED = "moved"
