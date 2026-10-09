@@ -22,6 +22,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     ensemble,
+    final_xml,
     opinion_ocr,
     opinion_pdf,
     opinions,
@@ -333,6 +334,8 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             row.stale_findings,
             row.blocking_findings,
         ) = counts.get(row.pk, (0, 0, 0))
+        # The rule of the review page's XML link, read off the row.
+        row.final_xml_ready = final_xml.exportable(row)
 
     return render(
         request,
