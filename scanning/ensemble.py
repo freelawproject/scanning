@@ -4123,6 +4123,7 @@ _EDIT_KIND_WORDS = {
     OpinionEdit.Kind.SECTION: "the section of a block",
     OpinionEdit.Kind.ORDER: "the order of the blocks",
     OpinionEdit.Kind.BLOCKQUOTE: "the blockquote of a block",
+    OpinionEdit.Kind.DROP: "a block taken out as not text",
 }
 
 

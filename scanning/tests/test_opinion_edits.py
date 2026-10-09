@@ -463,6 +463,11 @@ class TestTheDropEdit(TestCase):
         )
         self.assertEqual(len(page["groups"]), 1)
 
+    def test_every_edit_kind_has_its_words_on_the_unresolved_line(self):
+        """A kind the table lacks reaches the page as its raw value."""
+        for kind in OpinionEdit.Kind:
+            self.assertIn(kind, ensemble._EDIT_KIND_WORDS)
+
     def test_a_block_a_box_took_goes_for_the_box(self):
         """The exclusion comes first: the drop names the box and not
         the person, and the edit is neither applied nor unresolved."""
