@@ -611,6 +611,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             # open tab.
             "pdf_url_endpoint": address("opinion_pdf_url"),
             "ensemble_url_endpoint": address("opinion_ensemble_url"),
+            "figure_url_endpoint": address("opinion_figure_url"),
             "rerun_url": address("rerun_opinion_ensemble"),
             # What the page draws, and what it says instead.
             "ensemble_written": ensemble.is_written(opinion),

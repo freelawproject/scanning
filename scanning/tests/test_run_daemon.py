@@ -48,8 +48,12 @@ class TestRunDaemonSchedule(TestCase):
         # The loop walks the list in order each round, so the passes
         # that block it for a whole write or score come after every
         # fast tick (#336, #436). Their order among themselves is no rule.
-        blocking = {"build_opinion_pdfs", "score_bad_pages"}
-        self.assertEqual(set(names[-2:]), blocking)
+        blocking = {
+            "build_opinion_pdfs",
+            "cut_opinion_figures",
+            "score_bad_pages",
+        }
+        self.assertEqual(set(names[-3:]), blocking)
         intervals = {t.name: t.interval_seconds for t in schedule}
         self.assertEqual(intervals["submit_external_jobs"], 5.0)
         self.assertEqual(intervals["collect_external_jobs"], 15.0)

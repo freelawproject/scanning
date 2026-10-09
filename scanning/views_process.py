@@ -2067,6 +2067,67 @@ def opinion_ensemble_url(
     )
 
 
+#: The 404 of ``opinion_figure_url`` before the daemon cut the pictures
+#: of the text (#463), and its 400 for an address the page did not send.
+OPINION_FIGURE_NOT_CUT_MESSAGE = (
+    "The pictures of this opinion are not cut yet. The daemon cuts them "
+    "from the original after the text is written."
+)
+OPINION_FIGURE_BAD_REQUEST_MESSAGE = "Name the picture by its page and box."
+
+
+@login_required
+def opinion_figure_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read one picture of the text from (#463).
+
+    The review page draws each picture of the text in its place. It
+    names the picture as the ensemble document does, by its volume page
+    (``page``) and its box (``box``, four numbers), and the key is
+    built here by ``opinion_figures.key``, the one rule for it, so the
+    browser spells no path. ``opinion_figures.is_written`` is the one
+    rule for "the pictures exist".
+
+    :param request: The HTTP request, with ``page`` and ``box``.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, a 400 for an address
+        the page did not send, or a 404.
+    """
+    from scanning import opinion_figures
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("apply_run"), pk=opinion_pk, scan=scan
+    )
+    try:
+        page_index = int(request.GET.get("page", ""))
+        box = [float(value) for value in request.GET.get("box", "").split(",")]
+    except ValueError:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if page_index < 0 or len(box) != 4:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if not opinion.figure_digest or not opinion_figures.is_written(opinion):
+        return _json_404(
+            OPINION_FIGURE_NOT_CUT_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    run_label = opinion.apply_run.label if opinion.apply_run else ""
+    return _presigned_opinion_object(
+        opinion_figures.key(
+            opinion, run_label, {"page_index": page_index, "box_pt": box}
+        ),
+        opinion.glue_revision,
+        opinion.pk,
+    )
+
+
 def _presigned_opinion_object(
     key: str,
     revision: int | None,

@@ -83,6 +83,7 @@ from scanning.views_process import (
     move_page,
     opinion_blocking_cards,
     opinion_ensemble_url,
+    opinion_figure_url,
     opinion_file_index,
     opinion_final_xml,
     opinion_pdf_url,
@@ -347,6 +348,12 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
         opinion_ensemble_url,
         name="opinion_ensemble_url",
+    ),
+    # One picture of the text (#463), cut from the original.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/figure-url/",
+        opinion_figure_url,
+        name="opinion_figure_url",
     ),
     # The glued objects of one opinion (#334), the twin of the volume's
     # own index: which object exists, and where it is.

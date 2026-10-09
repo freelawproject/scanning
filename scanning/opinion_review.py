@@ -27,6 +27,7 @@ every refused write: :func:`approve_text` refuses on its own, so a
 caller that is not the view cannot skip it.
 """
 
+import base64
 import logging
 from datetime import UTC, datetime
 
@@ -63,6 +64,7 @@ OLD_DOCUMENT = "old_document"
 NO_PAGE_NUMBERS = "no_page_numbers"
 BUCKET = "bucket"
 MOVED = "moved"
+FIGURES = "figures"
 REVIEW2_OPEN = "review2_open"
 
 
@@ -197,6 +199,52 @@ def _document(opinion: Opinion) -> dict:
     return document
 
 
+def _embed_figures(opinion: Opinion, document: dict, text: dict) -> None:
+    """Put each picture of the approved body in its paragraph (#463).
+
+    The cut of ``opinion_figures``, as base64 JPEG, beside the size it
+    has on the page, so the approved object holds the picture and the
+    final XML is built from it and the spans alone. The box found the
+    cut and leaves the object: the approved text holds no geometry.
+
+    :param opinion: The row, with ``scan``.
+    :param document: The stamped ensemble document the text came from.
+    :param text: The approved object; its ``body`` is changed in place.
+    :raises ApprovalRefused: When a cut is missing, or the bucket did
+        not answer.
+    """
+    from scanning import opinion_figures
+
+    index_of = {
+        page.get("page_in_opinion"): page.get("page_index")
+        for page in document.get("pages") or []
+    }
+    run_label = document.get("apply_run") or ""
+    for paragraph in text.get("body") or []:
+        if paragraph.get("kind") != paragraphs.FIGURE:
+            continue
+        figure = paragraph.get("figure") or {}
+        place = {
+            "page_index": index_of.get((paragraph.get("pages") or [None])[0]),
+            "box_pt": figure.pop("box_pt", None) or [],
+        }
+        if place["page_index"] is None or len(place["box_pt"]) != 4:
+            raise ApprovalRefused(FIGURES, "a picture has no place")
+        key = opinion_figures.key(opinion, run_label, place)
+        try:
+            data = s3_sync.download_bytes_object(key)
+        except ClientError as exc:
+            code = str((exc.response.get("Error") or {}).get("Code", ""))
+            if code in {"NoSuchKey", "404"}:
+                raise ApprovalRefused(FIGURES, f"{key} is missing") from exc
+            raise ApprovalRefused(BUCKET, f"the read of {key}: {exc}") from exc
+        except BotoCoreError as exc:
+            raise ApprovalRefused(BUCKET, f"the read of {key}: {exc}") from exc
+        figure["content_type"] = opinion_figures.CONTENT_TYPE
+        figure["data"] = base64.b64encode(data).decode("ascii")
+        paragraph["figure"] = figure
+
+
 def _put(key: str, text: dict) -> bool:
     """Write the approved text once, and say whether this call wrote it.
 
@@ -292,6 +340,7 @@ def approve_text(
         getattr(user, "username", "") or "",
         now.isoformat(),
     )
+    _embed_figures(opinion, document, text)
     key = approved_key(opinion, opinion.ensemble_edit_revision, now)
     wrote = _put(key, text)
 
@@ -395,6 +444,7 @@ def rewrite_text(opinion: Opinion) -> str | None:
         opinion.approved_by.username if opinion.approved_by else "",
         opinion.approved_at.isoformat() if opinion.approved_at else "",
     )
+    _embed_figures(opinion, document, text)
     wrote = _put(key, text)
     carry = _spans_still_fit(opinion, text)
     match = {}
