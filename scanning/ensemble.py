@@ -1171,7 +1171,7 @@ def _merge(
     # what it hid (``_uncover``); a page-number unit is taken whole.
     kept: list[dict] = []
     out: list[dict] = []
-    uncovered: list[str] = []
+    uncovered = 0
     for member in ordered:
         if not member["exclusion"]:
             kept.append(member)
@@ -1186,7 +1186,9 @@ def _merge(
         kept.append(
             {**member, "text": text, "marks": marks, "exclusion": None}
         )
-        uncovered.extend(removed)
+        # A count and never the words: a thing under a box is redacted
+        # text, and the document goes to every reader's browser.
+        uncovered += len(removed)
     texts: list[str] = []
     marks: list[dict] = []
     for member in kept:
@@ -1244,8 +1246,8 @@ def _merge(
         # ``PARTIAL_REDACTION`` card (#419).
         "bracket": any(m.get("bracket") for m in ordered),
         "clean": clean,
-        # The readings of the other engines this reading lost under a
-        # box (``_uncover``).
+        # How many things under a box this reading lost (``_uncover``).
+        # Never their words: they are the text under a redaction.
         "uncovered": uncovered,
     }
 
@@ -3097,9 +3099,10 @@ def build_page(
                             if unit["excluded"]
                             else None
                         ),
-                        # What a box hid in this reading, taken out
-                        # as the other engines read it (``_uncover``).
-                        "uncovered": unit.get("uncovered") or [],
+                        # How many things a box hid in this reading
+                        # were taken out (``_uncover``): a count, never
+                        # the words, which are under a redaction.
+                        "uncovered": unit.get("uncovered") or 0,
                     }
                     for name, unit in group["engines"].items()
                 },

@@ -596,7 +596,7 @@ class TestTheAlignment(TestCase):
         self.assertEqual(len(groups), 1)
         dots = groups[0]["engines"]["dots_mocr"]
         self.assertEqual(dots["text"], "CITY v. COSME No. 1")
-        self.assertEqual(dots["uncovered"], ["2"])
+        self.assertEqual(dots["uncovered"], 1)
         self.assertFalse(dots["excluded"])
         read = ensemble.resolve(groups[0])
         self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
@@ -625,7 +625,7 @@ class TestTheAlignment(TestCase):
 
         dots = groups[0]["engines"]["dots_mocr"]
         self.assertEqual(dots["text"], "CITY v. COSME")
-        self.assertEqual(dots["uncovered"], ["2"])
+        self.assertEqual(dots["uncovered"], 1)
 
     def test_a_thing_the_reading_does_not_hold_keeps_it_silent(self):
         """The other engine read "7" under the box and the dots.mocr
@@ -649,7 +649,7 @@ class TestTheAlignment(TestCase):
 
         dots = groups[0]["engines"]["dots_mocr"]
         self.assertTrue(dots["excluded"])
-        self.assertEqual(dots["uncovered"], [])
+        self.assertEqual(dots["uncovered"], 0)
         self.assertFalse(groups[0]["excluded"])
 
     def test_a_block_over_a_covered_cell_keeps_its_other_cells(self):
@@ -682,7 +682,7 @@ class TestTheAlignment(TestCase):
         self.assertEqual(len(groups), 1)
         mistral = groups[0]["engines"]["mistral_ocr"]
         self.assertEqual(mistral["text"], "The second.")
-        self.assertEqual(mistral["uncovered"], ["The first."])
+        self.assertEqual(mistral["uncovered"], 1)
         read = ensemble.resolve(groups[0])
         self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
         self.assertEqual(read["text"], "The second.")
@@ -697,7 +697,7 @@ class TestTheAlignment(TestCase):
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
         self.assertTrue(groups[0]["excluded"])
-        self.assertEqual(groups[0]["engines"]["dots_mocr"]["uncovered"], [])
+        self.assertEqual(groups[0]["engines"]["dots_mocr"]["uncovered"], 0)
 
     def test_uncover_takes_the_run_with_its_whitespace_and_moves_the_marks(
         self,
