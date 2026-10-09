@@ -22,6 +22,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     ensemble,
+    final_xml,
     opinion_ocr,
     opinion_pdf,
     opinions,
@@ -333,6 +334,8 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             row.stale_findings,
             row.blocking_findings,
         ) = counts.get(row.pk, (0, 0, 0))
+        # The rule of the review page's XML link, read off the row.
+        row.final_xml_ready = final_xml.exportable(row)
 
     return render(
         request,
@@ -399,6 +402,7 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
         row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs)
         row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
         row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
+        row.edit_drop_url = reverse("edit_opinion_drop", kwargs=kwargs)
         row.approve_url = reverse("approve_opinion_text", kwargs=kwargs)
         row.withdraw_url = reverse("withdraw_opinion_edit", kwargs=kwargs)
         row.review_url = reverse("opinion_review", kwargs={"pk": row.pk})
@@ -628,6 +632,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "edit_text_url": address("edit_opinion_text"),
             "edit_section_url": address("edit_opinion_section"),
             "edit_blockquote_url": address("edit_opinion_blockquote"),
+            "edit_drop_url": address("edit_opinion_drop"),
             "edit_move_url": address("move_opinion_block"),
             "edit_withdraw_url": address("withdraw_opinion_edit"),
             # The approval (#375): offered where the endpoint takes it,

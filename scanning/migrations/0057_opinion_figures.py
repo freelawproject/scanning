@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("scanning", "0055_opinion_final_xml_export"),
+        ("scanning", "0056_not_text"),
     ]
 
     operations = [
@@ -57,6 +57,10 @@ class Migration(migrations.Migration):
                     ("reading_order", "The reading order needs a check"),
                     ("column_edge", "A column starts or ends here"),
                     ("partial_redaction", "A redaction covers part of a cell"),
+                    (
+                        "undetected_text",
+                        "Text where the detections drew nothing",
+                    ),
                     ("page_not_read", "This page has no text"),
                     (
                         "footnote_unsure",
@@ -87,6 +91,10 @@ class Migration(migrations.Migration):
                     ("reading_order", "The reading order needs a check"),
                     ("column_edge", "A column starts or ends here"),
                     ("partial_redaction", "A redaction covers part of a cell"),
+                    (
+                        "undetected_text",
+                        "Text where the detections drew nothing",
+                    ),
                     ("page_not_read", "This page has no text"),
                     (
                         "footnote_unsure",

@@ -1081,6 +1081,7 @@ class TestTheEndpoints(FigureTestCase):
             ("edit_opinion_text", {"text": "words"}),
             ("edit_opinion_section", {"section": ensemble.FOOTNOTES}),
             ("edit_opinion_blockquote", {"quoted": True}),
+            ("edit_opinion_drop", {}),
         ):
             response = self.client.post(
                 self.url(name),
@@ -1142,7 +1143,7 @@ VIEWER = (
 class TestTheViewer(TestCase):
     def test_a_picture_takes_a_move_alone(self):
         """The toolbar of a picture stops after the two moves and the
-        Undo of the order: the three other edits refuse it."""
+        Undo of the order: the four other edits refuse it."""
         source = VIEWER.read_text()
         bar = source[source.index("function fillBar(") :]
         bar = bar[: bar.index("\n    }\n")]

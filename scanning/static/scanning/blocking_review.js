@@ -91,6 +91,7 @@
         this.cardsUrl = node.dataset.cardsUrl;
         this.pdfUrlEndpoint = node.dataset.pdfUrlEndpoint;
         this.editTextUrl = node.dataset.editTextUrl;
+        this.editDropUrl = node.dataset.editDropUrl;
         this.approveUrl = node.dataset.approveUrl;
         this.withdrawUrl = node.dataset.withdrawUrl;
         this.reviewUrl = node.dataset.reviewUrl;
@@ -192,6 +193,36 @@
                 self.answers.push({
                     card: card,
                     label: 'written as "' + shorten(text) + '"',
+                    undo: { url: self.withdrawUrl, body: { edit_id: answer.data.edit_id } }
+                });
+            }
+            return self.reload();
+        });
+    };
+
+    /** Take the whole block out of the text: it is not text of the
+     *  opinion (the bleed-through of the page behind, a stray mark).
+     *  The ``DROP`` edit of the review page, with the same Undo. */
+    Section.prototype.drop = function (card, node) {
+        var self = this;
+        var state = node.querySelector('.bk-state');
+        state.textContent = 'taking the block out…';
+        return postJson(this.editDropUrl, {
+            page_in_opinion: card.page_in_opinion,
+            group_id: card.group_id,
+            glue_revision: this.opinion.glue_revision,
+            edit_revision: this.opinion.edit_revision
+        }).then(function (answer) {
+            if (!answer.ok) {
+                state.textContent = answer.data.message || 'The edit was refused.';
+                state.classList.add('bk-error');
+                return;
+            }
+            self.answered += 1;
+            if (answer.data.edit_id) {
+                self.answers.push({
+                    card: card,
+                    label: 'taken out of the text as not text',
                     undo: { url: self.withdrawUrl, body: { edit_id: answer.data.edit_id } }
                 });
             }
@@ -472,6 +503,19 @@
             release.addEventListener('click', function () { section.release(card); });
             footer.appendChild(release);
         } else if (card.kind !== 'link') {
+            var junk = el('button', 'btn-outline text-xs', 'Not text');
+            junk.type = 'button';
+            junk.title = 'Take the whole block out of the text: it is not'
+                + ' text of the opinion (the bleed-through of the page'
+                + ' behind, a stray mark)';
+            junk.addEventListener('click', function () {
+                if (!window.confirm('Take this whole block out of the text?'
+                        + ' Every card of the block closes with it; the'
+                        + ' Undo puts it back.')) { return; }
+                junk.disabled = true;
+                section.drop(card, node);
+            });
+            footer.appendChild(junk);
             var skip = el('button', 'btn-outline text-xs', 'Skip');
             skip.type = 'button';
             skip.addEventListener('click', function () {

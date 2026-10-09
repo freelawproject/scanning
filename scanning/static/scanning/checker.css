@@ -1723,6 +1723,36 @@ div.ensemble-group[data-kind="list_item"] {
     line-height: 1.4;
     padding: 2px 0;
 }
+/* A block a person took out of the text as not text: its box stays
+   on the page, hatched and grey, so the reader sees what went, and no
+   ``ensemble-box`` class, so the hit test never finds it. The list
+   under the page's label holds its Undo. */
+.ensemble-junk {
+    position: absolute;
+    border: 1px dashed rgba(107, 114, 128, 0.8);
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(107, 114, 128, 0.14) 0 6px,
+        transparent 6px 12px
+    );
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ensemble-dropped {
+    margin: 4px 0 8px;
+    padding: 4px 6px;
+    border-left: 2px solid #6b7280;
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-dropped-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
 
 /* ── The blocking review ───────────────────────────────────────────
    One card per open word (or block), in a row: the crop of the scan,

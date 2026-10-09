@@ -486,6 +486,44 @@ class TestTheCardsEndpoint(EditTestCase, ScanningTestCase):
         ).json()
         self.assertEqual(taken_back["status"], "ok")
 
+    def test_a_block_taken_out_answers_its_edit_id_and_loses_its_cards(self):
+        """The "Not text" button of a card: the whole block goes, every
+        card of it with it, and the id withdraws the edit."""
+        import json
+
+        data = self.client.get(self.url()).json()
+        card = next(c for c in data["cards"] if c["kind"] != "link")
+        kwargs = {"pk": self.scan.pk, "opinion_pk": self.opinion.pk}
+        written = self.client.post(
+            reverse("edit_opinion_drop", kwargs=kwargs),
+            json.dumps(
+                {
+                    "page_in_opinion": card["page_in_opinion"],
+                    "group_id": card["group_id"],
+                    "glue_revision": data["opinion"]["glue_revision"],
+                    "edit_revision": data["opinion"]["edit_revision"],
+                }
+            ),
+            content_type="application/json",
+        ).json()
+        self.assertEqual(written["status"], "ok")
+        self.assertIsInstance(written["edit_id"], int)
+        after = self.client.get(self.url()).json()
+        self.assertEqual(
+            [c for c in after["cards"] if c.get("box_pt") == card["box_pt"]],
+            [],
+        )
+        taken_back = self.client.post(
+            reverse("withdraw_opinion_edit", kwargs=kwargs),
+            json.dumps({"edit_id": written["edit_id"]}),
+            content_type="application/json",
+        ).json()
+        self.assertEqual(taken_back["status"], "ok")
+        back = self.client.get(self.url()).json()
+        self.assertTrue(
+            any(c.get("box_pt") == card["box_pt"] for c in back["cards"])
+        )
+
     def test_an_opinion_of_another_scan_is_404(self):
         answer = self.client.get(self.url(scan=ScanFactory()))
 
@@ -544,6 +582,13 @@ class TestTheBlockingPage(ScanningTestCase):
             answer,
             reverse(
                 "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
+            ),
+        )
+        self.assertContains(
+            answer,
+            reverse(
+                "edit_opinion_drop",
                 kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
             ),
         )

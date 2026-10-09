@@ -72,6 +72,7 @@ REVIEW3_WRITE_VIEWS = (
 #: of the success, so the pin reads the answers of that helper.
 REVIEW3_EDIT_VIEWS = (
     "edit_opinion_blockquote",
+    "edit_opinion_drop",
     "edit_opinion_section",
     "edit_opinion_text",
     "move_opinion_block",
