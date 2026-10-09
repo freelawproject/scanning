@@ -2349,6 +2349,144 @@ class TestTheCommand(EnsembleTestCase):
             self.run_command()
 
 
+class TestTheCommandByOpinion(EnsembleTestCase):
+    """``rerun_opinion_ensemble --opinion``: the rows a person names (#465)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sibling = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 4, 5),
+            505,
+        )
+        self.glue()
+        self.glue(self.sibling)
+
+    def run_command(self, *args) -> str:
+        out = StringIO()
+        call_command("rerun_opinion_ensemble", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def written(self) -> list[bool]:
+        """Whether each of the two opinions has its text written."""
+        return [
+            ensemble.is_written(Opinion.objects.get(pk=row.pk))
+            for row in (self.opinion, self.sibling)
+        ]
+
+    def test_the_named_opinion_is_read_alone(self):
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.written(), [True, False])
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan", output
+        )
+        self.assertIn("Wrote 1 opinion(s), 0 failed", output)
+
+    def test_the_two_spellings_read_the_same_rows_once(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+        )
+        self.assertIn("Wrote 2 opinion(s)", output)
+
+        output = self.run_command(
+            "--opinion",
+            str(self.opinion.pk),
+            "--opinion",
+            str(self.sibling.pk),
+            "--opinion",
+            str(self.opinion.pk),
+        )
+        self.assertIn("Wrote 2 opinion(s)", output)
+        self.assertEqual(self.written(), [True, True])
+
+    def test_a_dry_run_names_the_opinion_and_reads_nothing(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--dry-run"
+        )
+
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan "
+            f"{self.scan.pk}: would read, 2 engine(s)",
+            output,
+        )
+        self.assertIn("Would read 1 opinion(s)", output)
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_refused_opinion_stops_the_call_and_nothing_is_read(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        unglued = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 0, 0),
+            501,
+        )
+        for named, said in (
+            (self.sibling.pk, "approved"),
+            (99999, "do not exist"),
+            (unglued.pk, "no OCR documents"),
+        ):
+            with self.assertRaisesMessage(CommandError, said) as refused:
+                self.run_command("--opinion", str(self.opinion.pk), str(named))
+            self.assertIn(str(named), str(refused.exception))
+
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_named_opinion_keeps_the_waiver_of_every_count(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_engine_count=1)
+
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("Wrote 1 opinion(s)", output)
+
+    def test_an_error_opinion_is_read_and_comes_back(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.ERROR,
+            error_message=f"{ensemble.MESSAGE_PREFIX}the bucket was gone",
+        )
+
+        self.run_command("--opinion", str(self.opinion.pk))
+
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.status, OpinionReviewStatus.ERROR)
+        self.assertTrue(ensemble.is_written(self.opinion))
+
+    def test_a_glue_that_moved_is_reported_and_not_a_failure(self):
+        with patch(
+            "scanning.ensemble.rerun",
+            side_effect=ensemble.RevisionMoved("the glue wrote again"),
+        ):
+            output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("the OCR glue wrote again during the read", output)
+        self.assertIn(
+            "Wrote 0 opinion(s), 0 failed, 1 moved by the OCR glue", output
+        )
+
+    def test_a_scan_read_reports_a_moved_glue_too(self):
+        with patch(
+            "scanning.ensemble.rerun",
+            side_effect=ensemble.RevisionMoved("the glue wrote again"),
+        ):
+            output = self.run_command(str(self.scan.pk))
+
+        self.assertIn("0 failed, 2 moved by the OCR glue", output)
+
+    def test_opinion_with_another_selector_is_refused(self):
+        for args in (
+            (str(self.scan.pk), "--opinion", str(self.opinion.pk)),
+            ("--all", "--opinion", str(self.opinion.pk)),
+        ):
+            with self.assertRaisesMessage(
+                CommandError, "pass --opinion alone"
+            ):
+                self.run_command(*args)
+        self.assertEqual(self.written(), [False, False])
+
+
 # ── the section (#399) ───────────────────────────────────────────────
 #: The left and the right column of a test page, and a footnote band
 #: across both, in points.
