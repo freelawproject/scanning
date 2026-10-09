@@ -2461,9 +2461,9 @@ class TestTheCommandByOpinion(EnsembleTestCase):
         ):
             output = self.run_command("--opinion", str(self.opinion.pk))
 
-        self.assertIn("the OCR glue wrote again during the read", output)
+        self.assertIn("the opinion moved during the read", output)
         self.assertIn(
-            "Wrote 0 opinion(s), 0 failed, 1 moved by the OCR glue", output
+            "Wrote 0 opinion(s), 0 failed, 1 moved during the read", output
         )
 
     def test_a_scan_read_reports_a_moved_glue_too(self):
@@ -2473,7 +2473,44 @@ class TestTheCommandByOpinion(EnsembleTestCase):
         ):
             output = self.run_command(str(self.scan.pk))
 
-        self.assertIn("0 failed, 2 moved by the OCR glue", output)
+        self.assertIn("0 failed, 2 moved during the read", output)
+
+    def test_the_opinions_are_read_in_the_order_of_the_call(self):
+        output = self.run_command(
+            "--opinion",
+            str(self.sibling.pk),
+            str(self.opinion.pk),
+            str(self.sibling.pk),
+        )
+
+        first = output.index(f"opinion {self.sibling.pk} (")
+        second = output.index(f"opinion {self.opinion.pk} (")
+        self.assertLess(first, second)
+        self.assertEqual(output.count(f"opinion {self.sibling.pk} ("), 1)
+
+    def test_a_scan_number_after_opinion_is_read_as_an_opinion(self):
+        """``--opinion`` takes every number after it, so a scan written
+        after it names an opinion, and a pk that is no opinion stops the
+        call before anything is read. The help says so."""
+        with self.assertRaisesMessage(CommandError, "do not exist"):
+            self.run_command("--opinion", str(self.opinion.pk), "99999")
+
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_call_with_no_file_store_is_refused_once(self):
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=False),
+            self.assertRaisesMessage(CommandError, "the file store is off"),
+        ):
+            self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.written(), [False, False])
+        # A dry run reads nothing from the bucket.
+        with patch("scanning.s3_sync.s3_active", return_value=False):
+            output = self.run_command(
+                "--opinion", str(self.opinion.pk), "--dry-run"
+            )
+        self.assertIn("Would read 1 opinion(s)", output)
 
     def test_opinion_with_another_selector_is_refused(self):
         for args in (
