@@ -514,7 +514,7 @@
             // A card that only points at the page: once the page was
             // looked at, the dismissal closes it, with the Undo of
             // every dismissal.
-            var fine = el('button', 'btn-outline text-xs', 'Looks right');
+            var fine = el('button', 'btn-outline text-xs', 'Looks good');
             fine.type = 'button';
             fine.title = 'Dismiss this card: the page was looked at and'
                 + ' reads right';
@@ -527,7 +527,7 @@
             // The plain way to bless a card: the text stays as shown,
             // and the page's card closes once every open word of the
             // page is kept, the rule of ``keep``.
-            var right = el('button', 'btn-outline text-xs', 'Right as shown');
+            var right = el('button', 'btn-outline text-xs', 'Looks good');
             right.type = 'button';
             right.title = 'Keep the text as shown; the page\'s card closes'
                 + ' once every open word of the page is answered';
