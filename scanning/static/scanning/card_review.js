@@ -53,13 +53,20 @@
         caption: 'caption the model missed',
         bracket: 'bracket the model missed',
         faint: 'bracket box under the gate',
-        image: 'image box',
-        link: 'caption the model missed'
+        image: 'image box'
     };
+    /** What a card is, in words: a link card reads by its group, since
+     *  a bracket finding with no guess is a link too. */
+    function kindText(card) {
+        if (card.kind === 'link') {
+            return card.group === 'bracket' ? 'bracket the model missed' : 'caption the model missed';
+        }
+        return KINDS[card.kind] || card.kind;
+    }
     /** The buttons of a card that holds a box to add: the first adds
      *  it, the second says there is nothing there. */
     function addVerbs(card) {
-        if (card.kind === 'bracket') {
+        if (card.group === 'bracket') {
             return { add: 'Add bracket', none: 'No bracket', added: 'bracket added' };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
@@ -472,7 +479,7 @@
 
     // ── the cards ────────────────────────────────────────────────────
     function describe(card) {
-        var text = KINDS[card.kind] || card.kind;
+        var text = kindText(card);
         if (card.confidence !== null && card.confidence !== undefined) {
             text += ' at ' + card.confidence.toFixed(2);
         }
@@ -704,8 +711,10 @@
     }
 
     function dismiss(card, node) {
-        write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function () {
-            return { url: cfg.urls.restore_finding, body: { issue_id: card.issue_id } };
+        write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
+            // The finding's pk dies at the next rebuild, which any later
+            // write runs; the dismissal row outlives every rebuild.
+            return { url: cfg.urls.restore_finding, body: { dismissal_id: data.dismissal_id } };
         });
     }
 
@@ -864,6 +873,25 @@
         countAll();
     }
 
+    /** The server's cards, with every card this page answered kept in
+     *  its place: an answer removes the card's finding or row from the
+     *  server's list, and the card stays here, with its Undo, until the
+     *  page is left. */
+    function merge(fresh) {
+        var keys = {};
+        fresh.forEach(function (card) { keys[card.key] = true; });
+        cards.forEach(function (card) {
+            if (answers[card.key] && !keys[card.key]) { fresh.push(card); }
+        });
+        var order = {};
+        GROUPS.forEach(function (group, i) { order[group] = i; });
+        fresh.sort(function (a, b) {
+            return (order[a.group] - order[b.group]) || (a.page_index - b.page_index) ||
+                (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
+        });
+        return fresh;
+    }
+
     function load() {
         var holder = root.querySelector('[data-role="cards-note"]');
         return getJson(cfg.cards_url).then(function (answer) {
@@ -872,7 +900,7 @@
                 return;
             }
             holder.replaceChildren();
-            cards = answer.data.cards;
+            cards = merge(answer.data.cards);
             render();
         }).catch(function (error) {
             holder.replaceChildren(note('The cards did not load: ' + error.message, 'error'));

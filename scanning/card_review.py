@@ -473,9 +473,12 @@ def cards(scan: Scan) -> list[dict]:
         )
         for card in faint:
             card["confidence"] = confidences.get(card["detection_id"])
+    # A live model row with a standing decision carries an approval
+    # written before #414, which left the model row live at 1.0: it
+    # was judged, and makes no card.
     rows = (
         Detection.objects.live()
-        .filter(scan=scan, label=Label.IMAGE.name)
+        .filter(scan=scan, label=Label.IMAGE.name, decision__isnull=True)
         .exclude(model_name=Detection.ModelName.MANUAL)
         .order_by("page_index", "y0", "pk")
     )

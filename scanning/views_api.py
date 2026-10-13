@@ -41,6 +41,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionScan,
     Redaction,
+    ReviewDismissal,
     Scan,
     Stage,
     Status,
@@ -237,6 +238,12 @@ DETECTION_NOT_DISMISSED_MESSAGE = (
 RESTORE_MODEL_ONLY_MESSAGE = (
     "Only a dismissed model box comes back this way. A box you drew is "
     "withdrawn and drawn again."
+)
+#: ``restore_detection`` on a model box a move or an approval replaced
+#: (409): the box the curator sees holds it now.
+RESTORE_REPLACED_MESSAGE = (
+    "This box was moved or approved, so the box you see holds it now. "
+    "Withdraw that box and the model's comes back."
 )
 ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
 MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
@@ -2609,7 +2616,14 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
 def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """Take back the dismissal of a finding: the card comes back.
 
-    :param request: The HTTP request (JSON body with ``issue_id``).
+    By ``issue_id``, the card as the page holds it, or by
+    ``dismissal_id``, the row ``dismiss_finding`` answered: a finding's
+    pk dies at the next rebuild, which every later write runs, while a
+    dismissal is never deleted, so a page that keeps an Undo across
+    other writes (the card review) sends the dismissal.
+
+    :param request: The HTTP request (JSON body with ``issue_id`` or
+        ``dismissal_id``).
     :param pk: Scan primary key.
     :return: ``{status, restored, message}``.
     """
@@ -2621,10 +2635,21 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    row = _finding_or_404(scan, data)
-    if isinstance(row, JsonResponse):
-        return row
-    restored = findings.restore(scan, row, request.user)
+    if data.get("dismissal_id") is not None:
+        rows = ReviewDismissal.objects.filter(
+            pk=data["dismissal_id"], scan=scan
+        )
+        if not rows.exists():
+            return JsonResponse(
+                {"status": "error", "message": "Dismissal not found"},
+                status=404,
+            )
+        restored = bool(findings.withdraw(rows, request.user))
+    else:
+        row = _finding_or_404(scan, data)
+        if isinstance(row, JsonResponse):
+            return row
+        restored = findings.restore(scan, row, request.user)
     return JsonResponse(
         {
             "status": "ok",
@@ -2874,15 +2899,27 @@ def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
             {"status": "error", "message": RESTORE_MODEL_ONLY_MESSAGE},
             status=409,
         )
-    decision = detections.standing_decision(row)
     restored = 0
-    if (
-        decision is not None
-        and decision.kind == DetectionDecision.Kind.DEACTIVATE
-    ):
-        restored = detections.withdraw(
-            DetectionDecision.objects.filter(pk=decision.pk), request.user
-        )
+    with transaction.atomic():
+        # The lock first, the decision after it, in its own query
+        # (``detections.standing_decision``).
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        decision = detections.standing_decision(row)
+        if (
+            decision is not None
+            and decision.kind == DetectionDecision.Kind.DEACTIVATE
+        ):
+            # A move or an approval is a dismiss plus a hand-drawn row
+            # that names it (#414): withdrawing the dismiss alone would
+            # put the model's box back beside that row.
+            if Detection.objects.live().filter(replaces=decision).exists():
+                return JsonResponse(
+                    {"status": "error", "message": RESTORE_REPLACED_MESSAGE},
+                    status=409,
+                )
+            restored = detections.withdraw(
+                DetectionDecision.objects.filter(pk=decision.pk), request.user
+            )
     _rebuild_findings(scan)
     return JsonResponse(
         {

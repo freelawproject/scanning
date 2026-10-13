@@ -193,6 +193,29 @@ class TestTheCards(ScanningTestCase):
         )
         self.assertEqual([o["id"] for o in cards[2]["others"]], [column.pk])
 
+    def test_a_model_image_row_an_approval_stands_on_makes_no_card(self):
+        """An approval written before #414 left the model row live at
+        1.0 with the decision on it: judged, so no card."""
+        row = make_detection(self.scan, "IMAGE", 0, label_id=int(Label.IMAGE))
+        decision = DetectionDecision.objects.create(
+            scan=self.scan,
+            kind=DetectionDecision.Kind.APPROVE,
+            source_page=1,
+            source_fingerprint=self.scan.source_fingerprint,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            target_x0=row.x0,
+            target_y0=row.y0,
+            target_x1=row.x1,
+            target_y1=row.y1,
+            img_width=1700,
+            img_height=2200,
+        )
+        Detection.objects.filter(pk=row.pk).update(
+            decision=decision, confidence=1.0
+        )
+        self.assertEqual(card_review.cards(self.scan), [])
+
     def test_a_hand_drawn_image_row_makes_no_card(self):
         make_detection(
             self.scan,
@@ -263,6 +286,58 @@ class TestTheEndpoints(ScanningTestCase):
         )
         answer = self._post("restore_detection", {"detection_id": row.pk})
         self.assertEqual(answer.status_code, 409)
+
+    def test_restore_refuses_a_model_box_a_move_replaced(self):
+        """A move is a dismiss plus a hand-drawn row that names it: the
+        dismiss alone taken back would put the model's box beside that
+        row."""
+        row = make_detection(self.scan, "IMAGE", 0, label_id=int(Label.IMAGE))
+        moved = self._post(
+            "update_detection",
+            {"detection_id": row.pk, "new_bbox": [120.0, 120.0, 220.0, 220.0]},
+        )
+        self.assertEqual(moved.status_code, 200)
+        row.refresh_from_db()
+        self.assertFalse(row.active)
+
+        answer = self._post("restore_detection", {"detection_id": row.pk})
+
+        self.assertEqual(answer.status_code, 409)
+        row.refresh_from_db()
+        self.assertFalse(row.active)
+        self.assertEqual(
+            Detection.objects.live()
+            .filter(scan=self.scan, label="IMAGE")
+            .count(),
+            1,
+        )
+
+    def test_a_dismissal_is_taken_back_by_its_own_id_after_a_rebuild(self):
+        """The finding's pk dies at the next rebuild; the dismissal's
+        does not."""
+        from scanning import findings
+
+        issue = finding(
+            self.scan,
+            CheckName.MISSING_HEADNOTE_BRACKET,
+            {
+                "bbox": [200.0, 1000.0, 800.0, 1400.0],
+                "guess": [236.0, 1000.0, 290.0, 1033.0],
+                "label": "HEADNOTE_BRACKET",
+                "source_page": 1,
+            },
+        )
+        gone = self._post("dismiss_finding", {"issue_id": issue.pk})
+        self.assertEqual(gone.status_code, 200)
+        dismissal_id = gone.json()["dismissal_id"]
+        findings.rebuild(self.scan)
+        self.assertFalse(Issue.objects.filter(pk=issue.pk).exists())
+
+        stale = self._post("restore_finding", {"issue_id": issue.pk})
+        self.assertEqual(stale.status_code, 404)
+        back = self._post("restore_finding", {"dismissal_id": dismissal_id})
+        self.assertEqual(back.status_code, 200)
+        self.assertEqual(back.json()["restored"], True)
 
     def test_restore_on_a_live_model_box_says_so(self):
         row = make_detection(self.scan, "IMAGE", 0, label_id=int(Label.IMAGE))
