@@ -169,6 +169,38 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
+def key_icon_rows(rows: list[Detection], bl_warm: bool) -> list[Detection]:
+    """Return the rows of ``rows`` that are key icons.
+
+    blackletter's rule for "this box is a key icon"
+    (``blackletter.scanner.key_icons``: the gate for the family and the
+    size filter over the whole volume) over ``Detection`` rows, for a
+    reader that has no document: each row is lifted into a blackletter
+    detection in its own pixels, and the gate and the size filter are
+    scale-free, so the answer is the pairing's.
+
+    :param rows: ``KEY_ICON`` rows of one scan, every one of them, so
+        the median is the volume's.
+    :param bl_warm: Whether bl-warm alone drew them.
+    :returns: The rows that are key icons, in the order given.
+    """
+    from blackletter.models import BBox, Label
+    from blackletter.models import Detection as BLDetection
+    from blackletter.scanner import key_icons
+
+    lifted = {}
+    for row in rows:
+        det = BLDetection(
+            bbox=BBox(x1=row.x0, y1=row.y0, x2=row.x1, y2=row.y1),
+            label=Label.KEY_ICON,
+            confidence=row.confidence,
+            page_index=row.page_index,
+        )
+        lifted[id(det)] = (det, row)
+    kept = key_icons([det for det, _ in lifted.values()], bl_warm)
+    return [lifted[id(det)][1] for det in kept]
+
+
 def write_computed(
     scan: Scan,
     document,

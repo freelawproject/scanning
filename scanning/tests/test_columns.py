@@ -370,3 +370,91 @@ class TestSeparateDocument(TestCase):
         self.assertEqual(
             columns.separate_document(SimpleNamespace(pages=[]), {}), 0
         )
+
+
+class TestTheImportShapesTheRowsFirst(TestCase):
+    """A decision is made on the shaped row, so the import shapes the
+    new rows before the decisions land on them.
+
+    The trim writes a smaller box, and a curator's decision copies that
+    box. The next import writes the model's untrimmed rows; landed on
+    those by IoU, a decision on a column the trim had cut by more than
+    half would miss, and the model's box would come back.
+    """
+
+    def _scan_with_a_trimmed_column(self):
+        from blackletter.models import Label
+
+        from scanning.models import DetectionDecision
+        from scanning.tests.test_findings import make_detection, make_scan
+
+        scan = make_scan()
+        # The print ends at 800; the model's box runs to 2100.
+        cells = {0: cells_of(cell(100, 100, 800, 800))}
+        row = make_detection(
+            scan,
+            "TEXT_COLUMN",
+            0,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=100.0,
+            y0=100.0,
+            x1=800.0,
+            y1=2100.0,
+        )
+        columns.trim_feet(scan, cells)
+        row.refresh_from_db()
+        self.assertEqual(row.y1, 800.0)
+        # The curator takes the trimmed column out: the decision copies
+        # the box as the curator saw it.
+        DetectionDecision.objects.create(
+            scan=scan,
+            kind=DetectionDecision.Kind.DEACTIVATE,
+            source_page=1,
+            source_fingerprint=scan.source_fingerprint,
+            label="TEXT_COLUMN",
+            label_id=int(Label.TEXT_COLUMN),
+            target_x0=100.0,
+            target_y0=100.0,
+            target_x1=800.0,
+            target_y1=800.0,
+            img_width=1700,
+            img_height=2200,
+        )
+        entry = {
+            "page_index": 0,
+            "label": "TEXT_COLUMN",
+            "label_id": int(Label.TEXT_COLUMN),
+            "confidence": 0.9,
+            "bbox": [100.0, 100.0, 800.0, 2100.0],
+            "img_width": 1700,
+            "img_height": 2200,
+            "found_by": [{"model": "bl_warm", "confidence": 0.9}],
+            "pdf_page": 1,
+        }
+        return scan, cells, entry
+
+    def test_the_decision_lands_on_the_shaped_row(self):
+        from scanning import services
+        from scanning.models import Detection
+
+        scan, cells, entry = self._scan_with_a_trimmed_column()
+
+        services._import_detections(scan.pk, [entry], cells=cells)
+
+        row = Detection.objects.get(scan=scan, label="TEXT_COLUMN")
+        self.assertEqual(row.y1, 800.0)
+        self.assertFalse(row.active)
+
+    def test_without_the_cells_the_decision_misses_the_unshaped_row(self):
+        """What the shaping is for: the same decision against the
+        untrimmed box is under the IoU floor, and the box comes back."""
+        from scanning import services
+        from scanning.models import Detection
+
+        scan, _cells, entry = self._scan_with_a_trimmed_column()
+
+        services._import_detections(scan.pk, [entry])
+
+        row = Detection.objects.get(scan=scan, label="TEXT_COLUMN")
+        self.assertEqual(row.y1, 2100.0)
+        self.assertTrue(row.active)

@@ -929,6 +929,67 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
+    # An opinion the pairing could not start. A key icon inside a
+    # computed span closes an opinion whose caption box the model did
+    # not draw (``missing_caption``, ``findings._unmatched_findings``),
+    # so the opinion before it runs on to the next key and the list
+    # shows one card where there are two opinions. Each such finding
+    # goes under the card that runs on past it, as a row of its own:
+    # the pages the missing opinion holds (from the card's guess of the
+    # caption's page to the next missing key, or the span's end), and
+    # the guess box to flash, so the curator knows where to draw. The
+    # card names that opinion (``runs_on``, the boundary pk the rule
+    # found by reading order); a match by page would list it under
+    # every opinion of a page that holds several.
+    missing_count = 0
+    if opinions and not preview:
+        open_missing = [
+            row
+            for row in Issue.objects.filter(
+                scan=scan, check_name=CheckName.MISSING_CAPTION
+            ).order_by("page_number", "pk")
+            if not row.is_dismissed and row.metadata.get("bbox")
+        ]
+        for op in opinions:
+            op["missing"] = []
+            if op["dismissed"]:
+                continue
+            ep = op.get(
+                "end_page", op.get("key_page", op.get("caption_page", 0))
+            )
+            inside = [
+                row
+                for row in open_missing
+                if row.metadata.get("runs_on") == op["id"]
+            ]
+            for pos, row in enumerate(inside):
+                md = row.metadata
+                idx = md["page_index"]
+                end = (
+                    inside[pos + 1].metadata.get(
+                        "key_page_index",
+                        inside[pos + 1].metadata["page_index"],
+                    )
+                    if pos + 1 < len(inside)
+                    else ep
+                )
+                op["missing"].append(
+                    {
+                        "issue_pk": row.pk,
+                        "idx": idx,
+                        "num": idx_to_logical.get(idx, idx + 1),
+                        "end_num": idx_to_logical.get(end, end + 1),
+                        "key_num": idx_to_logical.get(
+                            md.get("key_page_index", idx),
+                            md.get("key_page_index", idx) + 1,
+                        ),
+                        "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
+                        "img_w": md["img_width"],
+                        "img_h": md["img_height"],
+                    }
+                )
+            missing_count += len(op["missing"])
+
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -1010,6 +1071,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             ),
             "opinions": opinions,
             "opinion_count": opinion_count,
+            "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,

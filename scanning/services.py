@@ -1799,6 +1799,7 @@ def _import_detections(
     detections: list,
     run: "ApplyRun | None" = None,
     detect_run: int | None = None,
+    cells: dict | None = None,
 ) -> int:
     """Replace a scan's model detections with the ones just merged.
 
@@ -1829,8 +1830,18 @@ def _import_detections(
     :param run: The apply run whose final space the list is in; None
         for the original's space.
     :param detect_run: The ``ExternalJob.run`` of the detection run.
+    :param cells: The cells of each page (``text_fit.page_cells``), or
+        None for a caller with no OCR read. The new model rows are
+        shaped by them before the decisions land: the gutter
+        (``columns.separate_rows``) and the foot trim
+        (``columns.trim_feet``) write the rows a curator decides on,
+        so a decision's copy of the box is of the shaped row, and a
+        decision landed on the unshaped row by IoU would miss a column
+        the trim had cut by more than half, and the model's box would
+        come back.
     :return: How many rows were created.
     """
+    from scanning import columns
     from scanning import detections as decisions
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1876,6 +1887,10 @@ def _import_detections(
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
+    if cells:
+        # The rows the decisions were made on are the shaped rows.
+        columns.separate_rows(scan, cells)
+        columns.trim_feet(scan, cells)
     landed, stale = decisions.resolve(scan)
     moved = 0
     if run is not None and kept:
@@ -2135,23 +2150,32 @@ def run_compute_redactions(
             ensure_output_dir(scan)
             pdf_path = geometry_pdf_path(scan, None)
 
+        # One read of the cells serves the import, the gutter, the
+        # trim, the readings and the text fit further down (#279).
+        ocr_document = text_fit.load_document(scan, run)
+        cells = text_fit.page_cells(ocr_document)
+
         if importing:
             with _log_stage("Import detections"):
                 _import_detections(
-                    scan_pk, detections, run=run, detect_run=rows[0].run
+                    scan_pk,
+                    detections,
+                    run=run,
+                    detect_run=rows[0].run,
+                    cells=cells,
                 )
 
         # The two column boxes of a page share an edge, because the
         # model cuts one text block in half, and a headnote box then
         # grows across the gutter onto the facing column's text (#308).
         # This runs before the ink snap below, which reads the pair and
-        # has no gutter to stop its own walk at either. One read of the
-        # cells serves it and the text fit further down (#279).
+        # has no gutter to stop its own walk at either.
         _update_progress(scan_pk, "Measuring the column gutter...")
         with _log_stage("Column gutter"):
-            ocr_document = text_fit.load_document(scan, run)
-            cells = text_fit.page_cells(ocr_document)
             columns.separate_rows(scan, cells)
+            # A column box the model ran to the foot of the facing
+            # column ends at its own last line of print.
+            columns.trim_feet(scan, cells)
 
         # The brackets the reader saw, stored as rows so that the
         # findings can be rebuilt from the rows alone (#328). It reads
@@ -2173,6 +2197,7 @@ def run_compute_redactions(
             # gutter goes back in after it (#308).
             with _log_stage("Column gutter"):
                 columns.separate_rows(scan, cells)
+                columns.trim_feet(scan, cells)
 
         # One corrected document for the pairing and the geometry, and
         # one pairing (#240 PR C): the boundaries are rows written from

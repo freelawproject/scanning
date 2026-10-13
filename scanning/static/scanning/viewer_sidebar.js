@@ -295,6 +295,19 @@ function goToPage(elOrNum) {
             setTimeout(function () {
                 pel.style.outline = "";
             }, 2000);
+            // A row that carries boxes (the missing-caption row's guess
+            // of where the caption is) flashes them on the page.
+            if (elOrNum.dataset.boxes) {
+                var boxes = elOrNum.dataset.boxes.split(";").map(function (s) {
+                    return s.split(",").map(parseFloat);
+                });
+                _flashBoxes(
+                    pel,
+                    boxes,
+                    parseInt(elOrNum.dataset.imgW, 10),
+                    parseInt(elOrNum.dataset.imgH, 10)
+                );
+            }
         }
         return;
     }
@@ -315,11 +328,6 @@ function highlightDetection(el) {
     var d = _getDetectionData(el);
     if (!d) return;
     holdAside();
-
-    document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
-        e.remove();
-    });
-
     // Resolve by pdf index: logical page numbers can repeat (e.g.
     // unnumbered front matter colliding with the real pages), so
     // 'pv-page-<logical>' ids are ambiguous.
@@ -332,33 +340,52 @@ function highlightDetection(el) {
     setTimeout(function () {
         container.style.outline = "";
     }, 2000);
+    _flashBoxes(container, [d.bbox], d.imgW, d.imgH);
+}
 
+// Pulse one or more boxes over a page for a few seconds: the box a
+// finding card names, or the guess a missing-caption row carries. The
+// boxes are in the detection's image pixels. The page is drawn lazily,
+// so the draw waits for its canvas, up to a few seconds: a page far
+// from the one in view is fetched and rendered after the scroll.
+function _flashBoxes(container, boxes, imgW, imgH, attempt) {
+    attempt = attempt || 0;
+    if (!attempt) {
+        document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
+            e.remove();
+        });
+    }
     setTimeout(function () {
         var wrapper = container.querySelector(".canvas-wrapper");
         var canvas = container.querySelector(".pdf-canvas");
-        if (!wrapper || !canvas) return;
+        if (!wrapper || !canvas || !canvas.offsetWidth) {
+            if (attempt < 15) _flashBoxes(container, boxes, imgW, imgH, attempt + 1);
+            return;
+        }
 
-        var sx = canvas.offsetWidth / (d.imgW || 1);
-        var sy = canvas.offsetHeight / (d.imgH || 1);
+        var sx = canvas.offsetWidth / (imgW || 1);
+        var sy = canvas.offsetHeight / (imgH || 1);
 
-        var div = document.createElement("div");
-        div.className = "unmatched-highlight";
-        div.style.position = "absolute";
-        div.style.left = d.bbox[0] * sx + "px";
-        div.style.top = d.bbox[1] * sy + "px";
-        div.style.width = (d.bbox[2] - d.bbox[0]) * sx + "px";
-        div.style.height = (d.bbox[3] - d.bbox[1]) * sy + "px";
-        div.style.border = "3px solid #f59e0b";
-        div.style.background = "rgba(245, 158, 11, 0.15)";
-        div.style.zIndex = "20";
-        div.style.pointerEvents = "none";
-        div.style.borderRadius = "2px";
-        div.style.animation = "unmatched-pulse 1s ease-in-out 3";
-        wrapper.appendChild(div);
+        boxes.forEach(function (bbox) {
+            var div = document.createElement("div");
+            div.className = "unmatched-highlight";
+            div.style.position = "absolute";
+            div.style.left = bbox[0] * sx + "px";
+            div.style.top = bbox[1] * sy + "px";
+            div.style.width = (bbox[2] - bbox[0]) * sx + "px";
+            div.style.height = (bbox[3] - bbox[1]) * sy + "px";
+            div.style.border = "3px solid #f59e0b";
+            div.style.background = "rgba(245, 158, 11, 0.15)";
+            div.style.zIndex = "20";
+            div.style.pointerEvents = "none";
+            div.style.borderRadius = "2px";
+            div.style.animation = "unmatched-pulse 1s ease-in-out 3";
+            wrapper.appendChild(div);
 
-        setTimeout(function () {
-            div.remove();
-        }, 5000);
+            setTimeout(function () {
+                div.remove();
+            }, 5000);
+        });
     }, 400);
 }
 
