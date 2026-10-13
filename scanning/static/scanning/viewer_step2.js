@@ -2091,6 +2091,22 @@ document.addEventListener('DOMContentLoaded', function () {
         if (adoptDetection(replacedId, newId)) refreshOverlays();
     };
 
+
+    // A row the sidebar drew (the "add" of a missed-bracket card): one
+    // entry, drawn on its page the way the drawer's own add is.
+    window.addDetectionRow = function (det) {
+        if (!allDetections) allDetections = [];
+        det.page_number = _pageNumForIndex(det.page_index);
+        det.manual = true;
+        allDetections.push(det);
+        var pageDiv = _pageDivForIndex(det.page_index);
+        if (pageDiv) {
+            detectionsVisible[det.page_index] = true;
+            var btn = pageDiv.querySelector('.detect-btn');
+            if (btn) btn.classList.add('active');
+            drawDetectionOverlay(pageDiv, det.page_index);
+        }
+    };
     function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;

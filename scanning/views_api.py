@@ -227,6 +227,17 @@ DISMISSED_DETECTION_MESSAGE = (
 WITHDRAWN_DETECTION_MESSAGE = (
     "The detection was withdrawn. Nothing was deleted."
 )
+#: The Undo of a dismissal of a model box (``restore_detection``).
+RESTORED_DETECTION_MESSAGE = "The box is back. Nothing was deleted."
+#: ``restore_detection`` on a box no dismissal stands on.
+DETECTION_NOT_DISMISSED_MESSAGE = (
+    "This box was not dismissed, so there is nothing to take back."
+)
+#: ``restore_detection`` on a hand-drawn row (409).
+RESTORE_MODEL_ONLY_MESSAGE = (
+    "Only a dismissed model box comes back this way. A box you drew is "
+    "withdrawn and drawn again."
+)
 ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
 MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
 DISMISSED_BOUNDARY_MESSAGE = (
@@ -2689,7 +2700,9 @@ def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
     """
     from scanning import findings
 
-    context = findings.viewer_groups(scan)
+    # The scan rides along for the link to the card review
+    # (``card_review``), which the page's own context carries already.
+    context = {**findings.viewer_groups(scan), "scan": scan}
     return {
         "html": render_to_string(
             "scanning/_review_findings.html", context, request=request
@@ -2818,6 +2831,67 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 WITHDRAWN_DETECTION_MESSAGE
                 if manual
                 else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a model box: the box is live again.
+
+    The Undo of :func:`delete_detection` on a model row, which the card
+    review offers on a box it took out (``card_review``). The standing
+    ``deactivate`` decision is withdrawn (``detections.withdraw``), the
+    row gets its own value back, and the findings are written again. A
+    hand-drawn row has no dismissal to take back: it is withdrawn and
+    drawn again, so the request is refused.
+
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
+    :param pk: Scan primary key.
+    :return: ``{status, restored, message}``; 404 when the row is gone,
+        409 for a hand-drawn row.
+    """
+    from scanning import detections
+
+    scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = Detection.objects.filter(
+        pk=data.get("detection_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    if row.model_name == Detection.ModelName.MANUAL:
+        return JsonResponse(
+            {"status": "error", "message": RESTORE_MODEL_ONLY_MESSAGE},
+            status=409,
+        )
+    decision = detections.standing_decision(row)
+    restored = 0
+    if (
+        decision is not None
+        and decision.kind == DetectionDecision.Kind.DEACTIVATE
+    ):
+        restored = detections.withdraw(
+            DetectionDecision.objects.filter(pk=decision.pk), request.user
+        )
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_DETECTION_MESSAGE
+                if restored
+                else DETECTION_NOT_DISMISSED_MESSAGE
             ),
         }
     )

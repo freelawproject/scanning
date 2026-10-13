@@ -31,6 +31,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     boundaries,
+    card_review,
     casebody,
     detections,
     dots_mocr,
@@ -5232,3 +5233,81 @@ def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
         return
     if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
         services.recalculate_issues(scan)
+
+
+#: The writes the card review answers through (``card_review``), by URL
+#: name: step 2's own, so the two pages hold one set of rules.
+CARD_REVIEW_WRITES = (
+    "add_single_detection",
+    "approve_detection",
+    "update_detection",
+    "delete_detection",
+    "restore_detection",
+    "dismiss_finding",
+    "restore_finding",
+    "compute_redactions_api",
+)
+
+
+@login_required
+def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Review the boxes of a volume one after the next (``card_review``).
+
+    The brackets the reader saw, the captions the model missed and the
+    image boxes it drew, each a crop of the page with the box on it
+    and two or three buttons. **The page writes nothing of its own**:
+    the browser asks :func:`scan_review_cards` for the cards and
+    answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
+    so the viewer and this page hold one set of rules. The crops are
+    cut from the PDF step 2 draws, chosen by the rule step 2 reads
+    (``final_space``).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: The rendered page.
+    """
+    from blackletter.models import Label
+
+    scan = get_object_or_404(Scan, pk=pk)
+    flags = _review_flags(scan)
+    kwargs = {"pk": scan.pk}
+    pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
+    review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
+    config = {
+        "scan": scan.pk,
+        # The labels a drawn box may take: the server's own table, so
+        # the page keeps no copy of ``LABEL_IDS`` (#343).
+        "labels": [{"name": label.name, "id": label.value} for label in Label],
+        "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        "cards_url": reverse("scan_review_cards", kwargs=kwargs),
+        "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
+        "review_open": review_open,
+        "urls": {
+            name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
+        },
+    }
+    return render(
+        request,
+        "scanning/scan_card_review.html",
+        {
+            "scan": scan,
+            "config": config,
+            "review_open": review_open,
+            "step2_url": config["step2_url"],
+        },
+    )
+
+
+@login_required
+def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the cards of the card review of one volume.
+
+    ``card_review.cards`` over the open findings and the live model
+    image rows: rows alone, no S3 read and no render.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, cards}``.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})

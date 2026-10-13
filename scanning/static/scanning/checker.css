@@ -1793,3 +1793,59 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-opinion.bk-approved { opacity: 0.6; }
 .bk-card.bk-answered { opacity: 0.7; border-left: 6px solid #2e7d32; }
 .bk-card.bk-answered .bk-state { color: #2e7d32; font-weight: 600; }
+
+/* ── The card review of review 2 (card_review.js) ────────────────────
+   The cards reuse the blocking review's .bk-* rules; these are the box
+   on the crop, movable at its edges, and the key hints. */
+.cr-cropwrap { max-width: 900px; }
+.cr-cropwrap.cr-fullpage { max-width: none; }
+/* The opened card takes the window: the whole page at the window's
+   width, scrolled inside the card, the box still movable. */
+.bk-card.cr-expanded { position: fixed; inset: 0; z-index: 90; margin: 0; overflow: auto; border-radius: 0; background: #fff; padding: 12px 24px 24px; }
+.bk-card.cr-expanded > header { position: sticky; top: 0; background: #fff; padding: 6px 0; z-index: 1; }
+.bk-card.cr-expanded > footer { position: sticky; bottom: 0; background: #fff; padding: 8px 0; }
+@media (prefers-color-scheme: dark) {
+  .bk-card.cr-expanded, .bk-card.cr-expanded > header, .bk-card.cr-expanded > footer { background: #1f2937; }
+}
+.cr-full-btn { font: inherit; font-size: 12px; color: #2f5d8a; background: none; border: 1px solid #d6d3cd; border-radius: 4px; padding: 0 6px; cursor: pointer; }
+.cr-full-btn:hover { border-color: #2f5d8a; }
+.cr-layer { position: absolute; inset: 0; }
+.cr-box { position: absolute; box-sizing: border-box; border: 2px solid #22c55e; background: rgba(34, 197, 94, 0.10); cursor: move; color: #22c55e; }
+.cr-box.cr-image { border-color: #2f5d8a; background: rgba(47, 93, 138, 0.10); color: #2f5d8a; }
+.cr-box.cr-faint { border-color: #b7791f; background: rgba(183, 121, 31, 0.12); color: #b7791f; }
+.cr-box.cr-frozen { cursor: default; opacity: 0.6; }
+.cr-anchor { position: absolute; box-sizing: border-box; border: 2px dashed #6b7280; pointer-events: none; }
+.cr-other { position: absolute; box-sizing: border-box; border: 1px solid rgba(107, 114, 128, 0.55); pointer-events: none; }
+.cr-other.cr-own { border-color: rgba(46, 125, 50, 0.7); }
+.cr-other.cr-mine { border-width: 2px; border-color: #2e7d32; }
+.cr-other-tag { position: absolute; left: 0; top: 0; font: 10px ui-monospace, Menlo, monospace; color: #fff; background: rgba(107, 114, 128, 0.7); padding: 0 3px; line-height: 13px; white-space: nowrap; }
+/* The label of an outline is the handle that opens the box for editing. */
+.cr-other .cr-other-tag { pointer-events: auto; cursor: pointer; }
+.cr-other .cr-other-tag:hover { background: #2563eb; }
+.cr-layer.cr-drawing .cr-other-tag { pointer-events: none; }
+/* A box of the page under edit: the handles of the card's own box, in blue, over a frozen own box. */
+.cr-box.cr-edit { border-color: #2563eb; background: rgba(37, 99, 235, 0.08); color: #2563eb; z-index: 4; }
+.cr-box.cr-edit .cr-other-tag { background: #2563eb; pointer-events: none; }
+.cr-layer.cr-editing .cr-box:not(.cr-edit) { pointer-events: none; }
+.cr-other.cr-own .cr-other-tag { background: rgba(46, 125, 50, 0.75); }
+.cr-other-x { position: absolute; z-index: 3; right: -8px; top: -8px; width: 18px; height: 18px; border-radius: 9px; border: 1px solid #2e7d32; background: #fff; color: #2e7d32; font: 13px/16px sans-serif; cursor: pointer; pointer-events: auto; padding: 0; }
+.cr-layer.cr-drawing { cursor: crosshair; }
+/* While drawing, the card's own box and its handles let the mouse through to the surface. */
+.cr-layer.cr-drawing .cr-box, .cr-layer.cr-drawing .cr-box .cr-handle { pointer-events: none; }
+.cr-new { position: absolute; box-sizing: border-box; border: 2px dashed #2e7d32; background: rgba(46, 125, 50, 0.08); pointer-events: none; }
+.cr-draw-popup { position: absolute; z-index: 5; display: flex; gap: 6px; align-items: center; background: #fff; border: 1px solid #d6d3cd; border-radius: 6px; padding: 6px 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15); }
+.cr-draw-select { font: 13px sans-serif; max-width: 180px; }
+.cr-full-btn.cr-on { color: #fff; background: #2e7d32; border-color: #2e7d32; }
+.cr-box.cr-frozen .cr-handle { display: none; }
+.cr-handle { position: absolute; width: 10px; height: 10px; background: #fff; border: 2px solid currentColor; border-radius: 2px; box-sizing: border-box; }
+.cr-handle.nw { top: -5px; left: -5px; cursor: nw-resize; }
+.cr-handle.n  { top: -5px; left: calc(50% - 5px); cursor: n-resize; }
+.cr-handle.ne { top: -5px; right: -5px; cursor: ne-resize; }
+.cr-handle.w  { top: calc(50% - 5px); left: -5px; cursor: w-resize; }
+.cr-handle.e  { top: calc(50% - 5px); right: -5px; cursor: e-resize; }
+.cr-handle.sw { bottom: -5px; left: -5px; cursor: sw-resize; }
+.cr-handle.s  { bottom: -5px; left: calc(50% - 5px); cursor: s-resize; }
+.cr-handle.se { bottom: -5px; right: -5px; cursor: se-resize; }
+.bk-card.cr-skipped { opacity: 0.7; }
+.bk-card.cr-skipped .bk-state { color: #b7791f; }
+.cr-keys kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid #d6d3cd; border-radius: 3px; padding: 0 4px; }
