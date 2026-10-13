@@ -10,27 +10,30 @@
   approval), so the two pages hold one set of rules.
 {% endcomment %}
 
-{% block title %}Blocking review - FLP Scanning Portal{% endblock %}
+{% block title %}{{ review_name }} - FLP Scanning Portal{% endblock %}
 
 {% block head %}
 <link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
 {% endblock %}
 
 {% block content %}
-<div id="blocking-review">
+<div id="blocking-review" data-level="{{ level }}">
   {% csrf_token %}
   <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
-    <h1 class="text-2xl font-bold">Blocking review</h1>
+    <h1 class="text-2xl font-bold">{{ review_name }}</h1>
     <span class="flex items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
       <span>
-        {{ page_obj.paginator.count }} opinion(s) with an open blocking card{% if current_scan %} in scan #{{ current_scan }}{% endif %}
+        {{ page_obj.paginator.count }} opinion(s) with an open {{ card_word }} card{% if current_scan %} in scan #{{ current_scan }}{% endif %}
         · <b data-role="total">…</b> card(s) · <b data-role="done">0</b> answered
       </span>
+      {% if level != "warning" %}
       <button type="button" class="btn-primary text-sm" data-role="approve-all" disabled
               title="Approve every opinion on this page that has no open blocking card left">Approve all ready (<span data-role="ready">0</span>)</button>
+      {% endif %}
     </span>
   </div>
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
+    {% if level == "warning" %}A warning gates no approval. This page walks them anyway: a word a majority of the engines settled over one engine is blessed as shown or given the other reading, and a card that only points at the page is dismissed once the page was looked at.{% endif %}
     ↓ and ↑ move down and up the rows of the card in view, Return chooses; click works too; type and Return.
     A choice writes the text of the block, the way "Edit text" does on the review page, and a word kept as shown dismisses the page's card once every open word of the page is answered.
     Every answer is listed under its opinion with an Undo, the review page's own: the edit is withdrawn, or the card reopened.
@@ -63,7 +66,7 @@
   </section>
   {% empty %}
   <div class="card">
-    <p class="text-sm text-gray-600 dark:text-gray-300">No opinion in this filter waits on a blocking card.</p>
+    <p class="text-sm text-gray-600 dark:text-gray-300">No opinion in this filter has an open {{ card_word }} card.</p>
   </div>
   {% endfor %}
 

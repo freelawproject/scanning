@@ -1092,6 +1092,7 @@ class CheckName(models.TextChoices):
         "Caption not matched to an opinion",
     )
     UNCOVERED_PAGES = "uncovered_pages", "Pages not covered by an opinion"
+    MISSING_CAPTION = ("missing_caption", "Opinion starts with no caption box")
     UNCOVERED_HEADNOTE = (
         "uncovered_headnote",
         "Headnote not covered by a redaction",
@@ -1175,6 +1176,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNMATCHED_KEY_ICON,
         CheckName.UNMATCHED_CAPTION,
         CheckName.UNCOVERED_PAGES,
+        CheckName.MISSING_CAPTION,
         CheckName.UNCOVERED_HEADNOTE,
         CheckName.MISSING_HEADNOTE_BRACKET,
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,

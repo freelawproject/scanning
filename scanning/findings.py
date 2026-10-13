@@ -1,13 +1,16 @@
 """The findings of review 2: one rebuild from the rows, and the dismissals.
 
 A finding of review 2 is an ``Issue`` row whose ``check_name`` is in
-``models.REVIEW2_CHECKS`` (issue #240, PR D). Ten checks, in three
+``models.REVIEW2_CHECKS`` (issue #240, PR D). Eleven checks, in three
 groups:
 
-- **about detections**: a key icon or a caption no opinion boundary
-  names (``unmatched_key_icon``, ``unmatched_caption``), and a headnote
-  bracket the reader saw and the model did not
-  (``missing_headnote_bracket``, ``brackets.missing``, #328);
+- **about detections and opinions**: a key icon or a caption no opinion
+  boundary names (``unmatched_key_icon``, ``unmatched_caption``), a
+  headnote bracket the reader saw and the model did not
+  (``missing_headnote_bracket``, ``brackets.missing``, #328), and a key
+  icon with no caption box after it, so the opinion it closes runs on
+  (``missing_caption``, the one error card: an opinion starts at a
+  caption box, and a miss is shown, never covered);
 - **about redactions and pages**: a confident headnote box no black
   redaction covers (``uncovered_headnote``), a headnote bracket box
   under blackletter's redaction gate (``low_confidence_headnote_bracket``,
@@ -55,7 +58,7 @@ from typing import Any
 
 from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.models import Label
-from blackletter.scanner import label_confidence
+from blackletter.scanner import HEAD_MATTER_LABELS, label_confidence
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
@@ -75,6 +78,10 @@ from scanning.models import (
     Scan,
 )
 from scanning.utils import compute_coverage_gaps
+
+#: The head-matter labels of blackletter's pairing, by name, the form a
+#: ``Detection`` row carries.
+HEAD_MATTER_NAMES = frozenset(label.name for label in HEAD_MATTER_LABELS)
 
 logger = logging.getLogger(__name__)
 
@@ -151,9 +158,10 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
     found = list(_stale_findings(scan, run))
     if OpinionBoundary.objects.computed().filter(scan=scan).exists():
         rows = boundaries.standing(scan)
-        found.extend(_unmatched_findings(scan, rows))
+        read = read_ids(scan)
+        found.extend(_unmatched_findings(scan, rows, read))
         found.extend(_uncovered_pages_findings(scan, rows, run))
-        found.extend(_uncovered_headnote_findings(scan))
+        found.extend(_uncovered_headnote_findings(scan, read))
         found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
         found.extend(editorial.uncovered(scan, run))
@@ -174,7 +182,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
             [
                 Issue(
                     scan=scan,
-                    severity=Issue.Severity.WARNING,
+                    severity=f.get("severity", Issue.Severity.WARNING),
                     check_name=f["check_name"],
                     target=f["target"],
                     page_number=f.get("page_number"),
@@ -394,10 +402,50 @@ def _caption_is_continuation(
     return False
 
 
-def _unmatched_findings(scan: Scan, rows: list[OpinionBoundary]):
-    """Yield the key icons and captions no live boundary names."""
+def read_ids(scan: Scan) -> set[int]:
+    """Return the ids of the live rows the compute read.
+
+    ``services.detection_entries`` is the one list the compute pairs
+    and measures, and blackletter's junk pass has run over it: a key
+    icon or a headnote on the blot along a page edge, an image box
+    that is a text box's twin and a key that is the show-through of
+    the leaf's other side are not in it. A finding about a box takes
+    its candidates from this set, never from a raw query over the live
+    rows, or a box the compute never saw is a card about an opinion it
+    was never part of. The rows themselves stay live: only the list
+    changes.
+
+    :param scan: The scan.
+    :returns: The ``Detection`` pks of the entries.
+    :rtype: set[int]
+    """
+    from scanning.services import detection_entries
+
+    return {
+        entry["id"]
+        for entry in detection_entries(scan.pk, page_numbers={})
+        if entry.get("id") is not None
+    }
+
+
+def _unmatched_findings(
+    scan: Scan, rows: list[OpinionBoundary], read: set[int] | None = None
+):
+    """Yield the key icons and captions no live boundary names.
+
+    A key no boundary ends is one of three things. Inside a computed
+    opinion it is the key after which the model boxed no caption:
+    ``blackletter.scanner._pair_on_keys_before`` let the opinion that closed last run
+    on to the next key rather than invent a start, and the miss is the
+    ``missing_caption`` error, placed where the caption is likely to be
+    (``_caption_guess``). Before the first computed opinion it is the
+    first key of the volume with no caption before it, the same error,
+    on the key. Any other (a second box over one icon, a key past the
+    last caption) is the ``unmatched_key_icon`` warning.
+    """
     paired_captions = set()
     paired_keys = set()
+    spans: list[OpinionBoundary] = []
     for row in rows:
         if row.is_dismissed:
             continue
@@ -405,22 +453,106 @@ def _unmatched_findings(scan: Scan, rows: list[OpinionBoundary]):
             paired_captions.add(row.start_detection_id)
         if row.end_detection_id:
             paired_keys.add(row.end_detection_id)
-    for det in (
+        if row.origin == OpinionBoundary.Origin.COMPUTED:
+            spans.append(row)
+    # The keys the compute read (:func:`read_ids`): the blot along a
+    # page edge is left out of that list, and it makes no card either.
+    if read is None:
+        read = read_ids(scan)
+    # Of those, the ones the pairing read as keys (``blackletter.scanner.key_icons``,
+    # the gate and the size filter over the volume at once): a sliver
+    # along a page edge closed no opinion, so it is no card either.
+    candidates = list(
         Detection.objects.live()
-        .filter(scan=scan, label="KEY_ICON")
-        .exclude(pk__in=paired_keys)
+        .filter(scan=scan, label="KEY_ICON", pk__in=read)
         .order_by("page_index", "y0")
-    ):
-        yield _detection_finding(
-            CheckName.UNMATCHED_KEY_ICON,
-            Issue.Target.DETECTION,
-            det,
-            f"A key icon (confidence {det.confidence:.2f}) is not matched "
-            "to any opinion.",
+    )
+    read_keys = boundaries.key_icon_rows(
+        candidates, _model_rows_are_bl_warm(scan)
+    )
+    keys = [det for det in read_keys if det.pk not in paired_keys]
+    paired_rows = {
+        row.pk: row for row in Detection.objects.filter(pk__in=paired_keys)
+    }
+    by_page: dict[int, list[Detection]] = {}
+    if keys:
+        pages = (
+            {k.page_index for k in keys}
+            | {k.page_index + 1 for k in keys}
+            | {k.page_index - 1 for k in keys}
         )
+        # The column and synopsis boxes place the guess; the head matter
+        # and the caption boxes say whether a caption is drawn already.
+        for det in Detection.objects.live().filter(
+            scan=scan,
+            page_index__in=pages,
+            label__in=[
+                Label.TEXT_COLUMN.name,
+                Label.CASE_CAPTION.name,
+                *HEAD_MATTER_NAMES,
+            ],
+        ):
+            by_page.setdefault(det.page_index, []).append(det)
+        # The keys the pairing read, paired or not: the next one down
+        # a column ends the guess, because a caption never runs past
+        # the key that closes its own opinion. Never a box the size
+        # filter rejected: a sliver between the key and a drawn
+        # caption would end the place before the caption.
+        for det in read_keys:
+            by_page.setdefault(det.page_index, []).append(det)
+    for det in keys:
+        mid_pt, _ = boundaries.to_points(
+            det.img_width / 2, 0, det.img_width, det.img_height
+        )
+        pos = _reading_position(det, mid_pt)
+        if _over_a_paired_key(det, paired_rows):
+            # A second box over one icon: the warning, as for a key
+            # past the last caption, never the error of a missed
+            # caption, which it is not.
+            yield _detection_finding(
+                CheckName.UNMATCHED_KEY_ICON,
+                Issue.Target.DETECTION,
+                det,
+                f"A key icon (confidence {det.confidence:.2f}) is not matched "
+                "to any opinion.",
+            )
+            continue
+        starts = [
+            (r.start_page_index, r.start_x >= mid_pt, r.start_y) for r in spans
+        ]
+        # A span ends at its key's own reading position, the key's
+        # top, not the bottom the boundary stores: a box over the end
+        # key compares as inside against the bottom.
+        ends = [
+            _reading_position(paired_rows[r.end_detection_id], mid_pt)
+            if r.end_detection_id in paired_rows
+            else (r.end_page_index, r.end_x >= mid_pt, r.end_y)
+            for r in spans
+        ]
+        holder = next(
+            (
+                span
+                for span, start, end in zip(spans, starts, ends)
+                if start < pos < end
+            ),
+            None,
+        )
+        if holder is not None:
+            if _caption_drawn_after(det, by_page, mid_pt):
+                continue
+            yield _missing_caption_finding(det, by_page, holder)
+        elif starts and pos < min(starts):
+            yield _first_key_finding(det)
+        else:
+            yield _detection_finding(
+                CheckName.UNMATCHED_KEY_ICON,
+                Issue.Target.DETECTION,
+                det,
+                f"A key icon (confidence {det.confidence:.2f}) is not matched "
+                "to any opinion.",
+            )
     paired_key_positions = sorted(
-        (d.page_index, d.x0, d.y0)
-        for d in Detection.objects.filter(pk__in=paired_keys)
+        (d.page_index, d.x0, d.y0) for d in paired_rows.values()
     )
     for det in (
         Detection.objects.live()
@@ -437,6 +569,290 @@ def _unmatched_findings(scan: Scan, rows: list[OpinionBoundary]):
             f"A case caption (confidence {det.confidence:.2f}) is not "
             "matched to any opinion, and it is not inside one.",
         )
+
+
+def _over_a_paired_key(det: Detection, paired_rows: dict) -> bool:
+    """Return whether a key box overlaps a key a boundary ends at.
+
+    Two boxes over one icon are one key, and the pairing skipped the
+    second; it is the unmatched-key warning here, never the error of a
+    caption nobody missed.
+    """
+    return any(
+        row.page_index == det.page_index
+        and min(det.x1, row.x1) > max(det.x0, row.x0)
+        and min(det.y1, row.y1) > max(det.y0, row.y0)
+        for row in paired_rows.values()
+    )
+
+
+def _model_rows_are_bl_warm(scan: Scan) -> bool:
+    """Return whether bl-warm alone drew the scan's live model rows.
+
+    The family picks blackletter's confidence gates, so every reader of
+    a gate asks this and never copies the number: the bracket card and
+    the key icons of the pairing's rule (``blackletter.scanner.key_icons``).
+
+    :param scan: The scan.
+    :returns: ``rows_are_bl_warm`` over the live model rows' ``found_by``.
+    """
+    return rows_are_bl_warm(
+        [
+            {"found_by": found_by}
+            for found_by in Detection.objects.live()
+            .filter(scan=scan)
+            .exclude(model_name=Detection.ModelName.MANUAL)
+            .exclude(found_by=[])
+            .values_list("found_by", flat=True)
+        ]
+    )
+
+
+def _caption_drawn_after(
+    key: Detection, by_page: dict[int, list[Detection]], mid_pt: float
+) -> bool:
+    """Return whether a live caption box sits in the caption's place.
+
+    The place is the pairing's (``blackletter.scanner._pair_on_keys_before``): after
+    the key in reading order, before the first box of the head matter
+    after it or the next key read, and inside a column box of its page
+    (a faint box below the column is a footnote the model called a
+    caption, and the pairing takes it for nothing). A box there is the
+    one the next compute starts the opinion on, so the card is answered
+    the moment a curator draws it, like a bracket box answers
+    ``brackets.missing``; a caption past the synopsis is a box over the
+    body, and the card stays.
+
+    :param key: The key icon with no caption boxed after it.
+    :param by_page: The live rows of the key's pages, the set
+        ``_unmatched_findings`` reads: the columns, the captions, the
+        head matter and the keys read.
+    :param mid_pt: The page's middle, in points.
+    :returns: Whether a caption is drawn in the place.
+    """
+    pos = _reading_position(key, mid_pt)
+    after = [
+        (_reading_position(d, mid_pt), d)
+        for page in (key.page_index, key.page_index + 1)
+        for d in by_page.get(page, ())
+        if d.pk != key.pk
+    ]
+    after = [(p, d) for p, d in after if p > pos]
+    limit = min(
+        (
+            p
+            for p, d in after
+            if d.label in HEAD_MATTER_NAMES or d.label == Label.KEY_ICON.name
+        ),
+        default=None,
+    )
+    columns = {}
+    for page in (key.page_index, key.page_index + 1):
+        columns[page] = [
+            d
+            for d in by_page.get(page, ())
+            if d.label == Label.TEXT_COLUMN.name
+        ]
+    return any(
+        d.label == Label.CASE_CAPTION.name
+        and (limit is None or p < limit)
+        and _in_a_column(d, columns.get(d.page_index))
+        for p, d in after
+    )
+
+
+def _in_a_column(det: Detection, columns: list[Detection] | None) -> bool:
+    """Return whether a box's centre lies in one of its page's column boxes.
+
+    The pairing's own test (``blackletter.scanner.in_a_column``) over
+    rows: a page with no column box vouches for every box.
+    """
+    if not columns:
+        return True
+    cx = (det.x0 + det.x1) / 2
+    cy = (det.y0 + det.y1) / 2
+    return any(c.x0 <= cx <= c.x1 and c.y0 <= cy <= c.y1 for c in columns)
+
+
+def _reading_position(
+    det: Detection, mid_pt: float
+) -> tuple[int, bool, float]:
+    """Return where a box sits in reading order, in a boundary's terms.
+
+    The page, the column (the right one when the box's centre is past
+    the page's middle, in points) and the top, in points: the order the
+    start and end points of an ``OpinionBoundary`` sort by.
+    """
+    x, y = boundaries.to_points(
+        (det.x0 + det.x1) / 2, det.y0, det.img_width, det.img_height
+    )
+    return det.page_index, x >= mid_pt, y
+
+
+#: The space a caption guess leaves under the key icon, as a share of
+#: the key's height: the next title starts a line or two under it.
+_CAPTION_GAP = 0.5
+
+#: A column with less than this many key heights left under the key
+#: holds no caption: the guess moves to the next column.
+_CAPTION_MIN_KEY_HEIGHTS = 2.0
+
+#: How far a guess with no column box to end it runs, in key heights.
+_CAPTION_FALLBACK_KEY_HEIGHTS = 4.0
+
+
+def _caption_guess(
+    key: Detection, by_page: dict[int, list[Detection]]
+) -> tuple[int, list[float], Detection]:
+    """Guess the place of a caption the model did not box, after ``key``.
+
+    The caption starts in the first column after the key with room
+    under it, some space down (``_CAPTION_GAP``): the key's own column
+    when its text column box runs on at least ``_CAPTION_MIN_KEY_HEIGHTS``
+    key heights below the key, else the facing column, else a column of
+    the next page. The first synopsis (``BACKGROUND``) box or the next
+    key icon of that column under the start ends it (the orders of a
+    S.Ct. volume are a column of captions, each closed by a key), else
+    the column's foot. A caption
+    that runs on into the next column is boxed in its first column
+    alone. A key's page with no column box of its own (the washed-out
+    page 792 of scan 3579, whose keys were real and whose print the
+    model could not read) borrows the column boxes of the page before
+    or after it, because the pages of a volume share their geometry,
+    and the guess stays on the key's page, keyed by the key's own
+    address; a guess that moved to the next page named a spot three
+    cards shared, and the caption drawn there answered none of them.
+    With no column box anywhere, a few key heights under the key.
+
+    :param key: The key icon the caption follows.
+    :param by_page: The live ``TEXT_COLUMN`` and ``BACKGROUND`` rows and
+        the read ``KEY_ICON`` rows of the key's page, the one before and
+        the next, by page index.
+    :returns: The page index, the box in that page's pixels, and the
+        row whose page address the dismissal is keyed by.
+    """
+    key_height = key.y1 - key.y0
+    gap = _CAPTION_GAP * key_height
+    left = (key.x0 + key.x1) / 2 < key.img_width / 2
+    columns: list[tuple[int, bool, float | None]] = [
+        (key.page_index, left, key.y1 + gap)
+    ]
+    if left:
+        columns.append((key.page_index, False, None))
+    columns.append((key.page_index + 1, True, None))
+    columns.append((key.page_index + 1, False, None))
+    for page_index, is_left, top in columns:
+        dets = [
+            d
+            for d in by_page.get(page_index, ())
+            if ((d.x0 + d.x1) / 2 < d.img_width / 2) == is_left
+        ]
+        boxes = [d for d in dets if d.label == Label.TEXT_COLUMN.name]
+        anchor = boxes[0] if boxes else key
+        if not boxes and page_index == key.page_index:
+            boxes = _neighbour_columns(key.page_index, is_left, by_page)
+        if not boxes:
+            continue
+        start = top if top is not None else min(d.y0 for d in boxes)
+        foot = max(d.y1 for d in boxes)
+        if foot - start < _CAPTION_MIN_KEY_HEIGHTS * key_height:
+            continue
+        ends = [
+            d.y0
+            for d in dets
+            if d.label in (Label.BACKGROUND.name, Label.KEY_ICON.name)
+            and d.y0 >= start
+        ]
+        bottom = max(min(ends) if ends else foot, start + key_height)
+        box = [
+            min(d.x0 for d in boxes),
+            start,
+            max(d.x1 for d in boxes),
+            bottom,
+        ]
+        return page_index, box, anchor
+    top = key.y1 + gap
+    bottom = min(
+        key.img_height, top + _CAPTION_FALLBACK_KEY_HEIGHTS * key_height
+    )
+    return key.page_index, [key.x0, top, key.x1, bottom], key
+
+
+def _neighbour_columns(
+    page_index: int, is_left: bool, by_page: dict[int, list[Detection]]
+) -> list[Detection]:
+    """Return the column boxes of the page before, else after, on one side."""
+    for neighbour in (page_index - 1, page_index + 1):
+        boxes = [
+            d
+            for d in by_page.get(neighbour, ())
+            if d.label == Label.TEXT_COLUMN.name
+            and ((d.x0 + d.x1) / 2 < d.img_width / 2) == is_left
+        ]
+        if boxes:
+            return boxes
+    return []
+
+
+def _missing_caption_finding(
+    key: Detection, by_page: dict[int, list[Detection]], span: OpinionBoundary
+) -> dict:
+    """Build the error of a caption the model did not box after ``key``.
+
+    The card is placed where the caption is likely to be
+    (``_caption_guess``), on that page, and carries no
+    ``detection_id``: there is no box to approve or delete, and the
+    dismissal is keyed by the page address plus the guessed box. It
+    names the computed opinion that runs on past the key (``runs_on``,
+    the pk of ``span``, the one row whose start and end enclose the
+    key in reading order), so the sidebar lists it under that opinion
+    alone and never under every opinion of the key's page.
+    """
+    page_index, box, row = _caption_guess(key, by_page)
+    return {
+        "check_name": CheckName.MISSING_CAPTION,
+        "target": Issue.Target.BOUNDARY,
+        "severity": Issue.Severity.ERROR,
+        "page_number": page_index + 1,
+        "message": (
+            "No caption box was found after the key icon that closes the "
+            f"opinion before (page {key.page_index + 1}), so no opinion "
+            "starts there and that opinion runs on to the next key. The "
+            "box is where the caption is likely to be. Draw the caption "
+            "box; the next compute splits the opinion on it."
+        ),
+        "metadata": {
+            "page_index": page_index,
+            "label": Label.CASE_CAPTION.name,
+            "label_id": Label.CASE_CAPTION.value,
+            "bbox": box,
+            "img_width": row.img_width,
+            "img_height": row.img_height,
+            "source_edit": row.source_edit_id,
+            "source_page": row.source_page,
+            "key_page_index": key.page_index,
+            # The key the caption follows, for the crop of the card
+            # review (``card_review.caption_card``).
+            "key_bbox": [key.x0, key.y0, key.x1, key.y1],
+            "runs_on": span.pk,
+        },
+    }
+
+
+def _first_key_finding(key: Detection) -> dict:
+    """Build the error of the volume's first key icon with no caption before it."""
+    finding = _detection_finding(
+        CheckName.MISSING_CAPTION,
+        Issue.Target.BOUNDARY,
+        key,
+        "No caption box was found before this key icon, the first of the "
+        "volume, so the pages before it belong to no opinion. Draw the "
+        "caption box of the first opinion; the next compute pairs it on "
+        "the box.",
+    )
+    finding["severity"] = Issue.Severity.ERROR
+    del finding["metadata"]["detection_id"]
+    return finding
 
 
 def _uncovered_pages_findings(
@@ -489,7 +905,7 @@ def _uncovered_pages_findings(
         }
 
 
-def _uncovered_headnote_findings(scan: Scan):
+def _uncovered_headnote_findings(scan: Scan, read: set[int] | None = None):
     """Yield one finding per confident headnote box no headnote box covers.
 
     The detections are in the render's pixels and the redactions in
@@ -509,10 +925,18 @@ def _uncovered_headnote_findings(scan: Scan):
         boxes.setdefault(row.page_index, []).append(
             (row.x0, row.y0, row.x1, row.y1)
         )
+    # The headnote boxes the compute read (:func:`read_ids`): a box on
+    # the blot along the page edge had no redaction because it was
+    # never in the document, and it is no card.
+    if read is None:
+        read = read_ids(scan)
     for det in (
         Detection.objects.live()
         .filter(
-            scan=scan, label="HEADNOTE", confidence__gte=HEADNOTE_CONFIDENCE
+            scan=scan,
+            label="HEADNOTE",
+            confidence__gte=HEADNOTE_CONFIDENCE,
+            pk__in=read,
         )
         .order_by("page_index", "y0")
     ):
@@ -576,15 +1000,7 @@ def _low_confidence_bracket_findings(scan: Scan):
     )
     if not weak:
         return
-    bl_warm = rows_are_bl_warm(
-        [
-            {"found_by": found_by}
-            for found_by in model_rows.exclude(found_by=[]).values_list(
-                "found_by", flat=True
-            )
-        ]
-    )
-    gate = gates[bl_warm]
+    gate = gates[_model_rows_are_bl_warm(scan)]
     for det in weak:
         if det.confidence >= gate:
             continue

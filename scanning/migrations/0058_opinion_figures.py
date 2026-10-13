@@ -5,7 +5,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("scanning", "0056_not_text"),
+        ("scanning", "0057_missing_caption_check"),
     ]
 
     operations = [

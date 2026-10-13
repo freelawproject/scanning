@@ -55,6 +55,7 @@ from scanning.views_api import (
     reopen_opinion_text,
     rerun_opinion_ensemble,
     restore_boundary,
+    restore_detection,
     restore_finding,
     restore_opinion_finding,
     restore_redaction,
@@ -98,9 +99,11 @@ from scanning.views_process import (
     reprocess,
     request_page_repair,
     rotate_page,
+    scan_card_review,
     scan_ocr_text_url,
     scan_original_url,
     scan_process_view,
+    scan_review_cards,
     serve_apply_output,
     serve_apply_shard,
     serve_final_pdf,
@@ -136,6 +139,12 @@ urlpatterns = [
         "opinions/blocking/",
         opinion_blocking_review,
         name="opinion_blocking_review",
+    ),
+    path(
+        "opinions/warnings/",
+        opinion_blocking_review,
+        {"level": "warning"},
+        name="opinion_warning_review",
     ),
     path(
         "opinions/<int:pk>/review/",
@@ -594,6 +603,24 @@ urlpatterns = [
         "scans/<int:pk>/ocr-results/",
         serve_ocr_results,
         name="serve_ocr_results",
+    ),
+    # The card review of review 2 (``card_review``): the page, its
+    # cards, and the Undo of a dismissed model box. Every other answer
+    # of the page goes to the step-2 writes below.
+    path(
+        "scans/<int:pk>/cards/",
+        scan_card_review,
+        name="scan_card_review",
+    ),
+    path(
+        "scans/<int:pk>/cards/list/",
+        scan_review_cards,
+        name="scan_review_cards",
+    ),
+    path(
+        "scans/<int:pk>/restore-detection/",
+        restore_detection,
+        name="restore_detection",
     ),
     path(
         "scans/<int:pk>/add-single-detection/",

@@ -258,6 +258,86 @@ class TestCards(TestCase):
         self.assertEqual(link["where"], "page 2")
         self.assertEqual(link["check_label"], OpinionCheck.PAGE_NOT_READ.label)
 
+    def test_the_warnings_review_opens_the_words_a_majority_settled(self):
+        """The same page in the warnings mode: the WARNING group's
+        settled word is a card against the page's ENGINES_DISAGREE
+        finding, every other open warning is a link, and the BLOCKING
+        group is no card here."""
+        split = read(
+            "the court held that", "the court heId that", "the court hold that"
+        )
+        split.update(
+            {
+                "id": 3,
+                "level": ensemble.BLOCKING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        settled = read("a b c", "a b c", "a x c")
+        settled.update(
+            {
+                "id": 5,
+                "level": ensemble.WARNING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 140, 288, 151],
+            }
+        )
+        document = {
+            "pages": [{"page_in_opinion": 0, "groups": [split, settled]}]
+        }
+        findings = [
+            finding(0, OpinionCheck.ENGINES_DISAGREE, 14),
+            finding(0, OpinionCheck.UNDETECTED_TEXT, 15),
+        ]
+
+        cards = blocking_review.cards(document, findings, ensemble.WARNING)
+
+        self.assertEqual([c["kind"] for c in cards], ["word", "link"])
+        word, link = cards
+        self.assertEqual((word["group_id"], word["finding_pk"]), (5, 14))
+        self.assertEqual(word["token"], "b")
+        self.assertEqual(word["level"], ensemble.WARNING)
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in word["readings"]],
+            [("dots_mocr", "b"), ("mistral_ocr", "b"), ("surya", "x")],
+        )
+        self.assertEqual(
+            (link["check"], link["finding_pk"], link["level"]),
+            (OpinionCheck.UNDETECTED_TEXT, 15, ensemble.WARNING),
+        )
+
+    def test_a_warning_group_with_no_settled_word_is_a_block_card(self):
+        """A silent engine makes a WARNING group with every reading
+        alike: one block card whose rows all read as shown."""
+        quiet = read("a b c", "a b c")
+        quiet.update(
+            {
+                "id": 6,
+                "level": ensemble.WARNING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 140, 288, 151],
+                "silent": ["surya"],
+            }
+        )
+        document = {"pages": [{"page_in_opinion": 0, "groups": [quiet]}]}
+
+        cards = blocking_review.cards(
+            document,
+            [finding(0, OpinionCheck.ENGINES_DISAGREE, 14)],
+            ensemble.WARNING,
+        )
+
+        self.assertEqual([c["kind"] for c in cards], ["block"])
+        self.assertEqual(cards[0]["silent"], ["surya"])
+        self.assertEqual(cards[0]["open"], 0)
+        self.assertEqual(
+            [r["text"] for r in cards[0]["readings"]], ["a b c", "a b c"]
+        )
+
     def test_a_table_is_one_block_card_with_every_reading(self):
         table = read("a b c", "x y z", "p q r")
         table.update(
@@ -524,6 +604,18 @@ class TestTheCardsEndpoint(EditTestCase, ScanningTestCase):
             any(c.get("box_pt") == card["box_pt"] for c in back["cards"])
         )
 
+    def test_the_level_of_the_cards_is_read_off_the_query(self):
+        data = self.client.get(self.url() + "?level=warning").json()
+
+        self.assertEqual(data["level"], ensemble.WARNING)
+        self.assertIsInstance(data["blocking_open"], int)
+        self.assertTrue(
+            all(c["level"] == ensemble.WARNING for c in data["cards"])
+        )
+        self.assertEqual(
+            self.client.get(self.url()).json()["level"], ensemble.BLOCKING
+        )
+
     def test_an_opinion_of_another_scan_is_404(self):
         answer = self.client.get(self.url(scan=ScanFactory()))
 
@@ -598,6 +690,31 @@ class TestTheBlockingPage(ScanningTestCase):
                 "withdraw_opinion_edit",
                 kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
             ),
+        )
+
+    def test_the_warnings_page_lists_the_opinions_with_a_warning(self):
+        """The one with a warning alone is listed, the one with a
+        blocking card alone is not, nothing is ready, and the cards
+        are asked for at the warning level."""
+        answer = self.client.get(
+            reverse("opinion_warning_review") + f"?scan={self.scan.pk}"
+        )
+
+        self.assertEqual(answer.status_code, 200)
+        self.assertContains(answer, f'id="opinion-{self.clean.pk}"')
+        self.assertNotContains(answer, f'id="opinion-{self.waiting.pk}"')
+        self.assertNotContains(answer, 'id="ready-')
+        self.assertContains(answer, 'data-level="warning"')
+        self.assertContains(answer, "?level=warning")
+        self.assertContains(answer, "Warnings review")
+
+    def test_the_list_offers_the_warnings_review_of_a_volume(self):
+        answer = self.client.get(
+            reverse("opinion_list") + f"?scan={self.scan.pk}"
+        )
+
+        self.assertContains(
+            answer, reverse("opinion_warning_review") + f"?scan={self.scan.pk}"
         )
 
     def test_an_approved_opinion_is_not_listed(self):

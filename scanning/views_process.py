@@ -31,6 +31,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     boundaries,
+    card_review,
     casebody,
     detections,
     dots_mocr,
@@ -929,6 +930,67 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
+    # An opinion the pairing could not start. A key icon inside a
+    # computed span closes an opinion whose caption box the model did
+    # not draw (``missing_caption``, ``findings._unmatched_findings``),
+    # so the opinion before it runs on to the next key and the list
+    # shows one card where there are two opinions. Each such finding
+    # goes under the card that runs on past it, as a row of its own:
+    # the pages the missing opinion holds (from the card's guess of the
+    # caption's page to the next missing key, or the span's end), and
+    # the guess box to flash, so the curator knows where to draw. The
+    # card names that opinion (``runs_on``, the boundary pk the rule
+    # found by reading order); a match by page would list it under
+    # every opinion of a page that holds several.
+    missing_count = 0
+    if opinions and not preview:
+        open_missing = [
+            row
+            for row in Issue.objects.filter(
+                scan=scan, check_name=CheckName.MISSING_CAPTION
+            ).order_by("page_number", "pk")
+            if not row.is_dismissed and row.metadata.get("bbox")
+        ]
+        for op in opinions:
+            op["missing"] = []
+            if op["dismissed"]:
+                continue
+            ep = op.get(
+                "end_page", op.get("key_page", op.get("caption_page", 0))
+            )
+            inside = [
+                row
+                for row in open_missing
+                if row.metadata.get("runs_on") == op["id"]
+            ]
+            for pos, row in enumerate(inside):
+                md = row.metadata
+                idx = md["page_index"]
+                end = (
+                    inside[pos + 1].metadata.get(
+                        "key_page_index",
+                        inside[pos + 1].metadata["page_index"],
+                    )
+                    if pos + 1 < len(inside)
+                    else ep
+                )
+                op["missing"].append(
+                    {
+                        "issue_pk": row.pk,
+                        "idx": idx,
+                        "num": idx_to_logical.get(idx, idx + 1),
+                        "end_num": idx_to_logical.get(end, end + 1),
+                        "key_num": idx_to_logical.get(
+                            md.get("key_page_index", idx),
+                            md.get("key_page_index", idx) + 1,
+                        ),
+                        "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
+                        "img_w": md["img_width"],
+                        "img_h": md["img_height"],
+                    }
+                )
+            missing_count += len(op["missing"])
+
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -1010,6 +1072,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             ),
             "opinions": opinions,
             "opinion_count": opinion_count,
+            "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
@@ -1996,12 +2059,22 @@ def opinion_blocking_cards(
             {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
             status=409,
         )
-    findings = list(
-        opinion_review.blocking_findings(opinion).order_by(
-            "page_in_opinion", "pk"
-        )
+    # The warnings review asks for its own cards (``?level=warning``),
+    # over the open warning findings; the blocking review is the
+    # default. ``blocking_open`` goes with either, so the page keeps
+    # the approval to the gate whatever it walks.
+    level = (
+        ensemble.WARNING
+        if request.GET.get("level") == ensemble.WARNING
+        else ensemble.BLOCKING
     )
-    cards = blocking_review.cards(document, findings)
+    open_findings = (
+        opinion_review.warning_findings
+        if level == ensemble.WARNING
+        else opinion_review.blocking_findings
+    )
+    findings = list(open_findings(opinion).order_by("page_in_opinion", "pk"))
+    cards = blocking_review.cards(document, findings, level)
     for card in cards:
         if card.get("finding_pk"):
             kwargs = {
@@ -2019,6 +2092,8 @@ def opinion_blocking_cards(
     return JsonResponse(
         {
             "status": "ok",
+            "level": level,
+            "blocking_open": opinion_review.blocking_findings(opinion).count(),
             "opinion": {
                 "pk": opinion.pk,
                 "label": str(opinion),
@@ -5219,3 +5294,81 @@ def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
         return
     if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
         services.recalculate_issues(scan)
+
+
+#: The writes the card review answers through (``card_review``), by URL
+#: name: step 2's own, so the two pages hold one set of rules.
+CARD_REVIEW_WRITES = (
+    "add_single_detection",
+    "approve_detection",
+    "update_detection",
+    "delete_detection",
+    "restore_detection",
+    "dismiss_finding",
+    "restore_finding",
+    "compute_redactions_api",
+)
+
+
+@login_required
+def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Review the boxes of a volume one after the next (``card_review``).
+
+    The brackets the reader saw, the captions the model missed and the
+    image boxes it drew, each a crop of the page with the box on it
+    and two or three buttons. **The page writes nothing of its own**:
+    the browser asks :func:`scan_review_cards` for the cards and
+    answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
+    so the viewer and this page hold one set of rules. The crops are
+    cut from the PDF step 2 draws, chosen by the rule step 2 reads
+    (``final_space``).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: The rendered page.
+    """
+    from blackletter.models import Label
+
+    scan = get_object_or_404(Scan, pk=pk)
+    flags = _review_flags(scan)
+    kwargs = {"pk": scan.pk}
+    pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
+    review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
+    config = {
+        "scan": scan.pk,
+        # The labels a drawn box may take: the server's own table, so
+        # the page keeps no copy of ``LABEL_IDS`` (#343).
+        "labels": [{"name": label.name, "id": label.value} for label in Label],
+        "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        "cards_url": reverse("scan_review_cards", kwargs=kwargs),
+        "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
+        "review_open": review_open,
+        "urls": {
+            name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
+        },
+    }
+    return render(
+        request,
+        "scanning/scan_card_review.html",
+        {
+            "scan": scan,
+            "config": config,
+            "review_open": review_open,
+            "step2_url": config["step2_url"],
+        },
+    )
+
+
+@login_required
+def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the cards of the card review of one volume.
+
+    ``card_review.cards`` over the open findings and the live model
+    image rows: rows alone, no S3 read and no render.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, cards}``.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})
