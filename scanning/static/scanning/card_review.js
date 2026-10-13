@@ -46,13 +46,14 @@
     var DPR = Math.min(2, window.devicePixelRatio || 1);
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
-    var GROUPS = ['caption', 'bracket', 'image'];
+    var GROUPS = ['caption', 'bracket', 'text', 'image'];
     var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
         bracket: 'bracket the model missed',
         faint: 'bracket box under the gate',
+        text: 'text in no box',
         image: 'image box'
     };
     /** What a card is, in words: a link card reads by its group, since
@@ -68,6 +69,9 @@
     function addVerbs(card) {
         if (card.group === 'bracket') {
             return { add: 'Add bracket', none: 'No bracket', added: 'bracket added' };
+        }
+        if (card.kind === 'text') {
+            return { add: 'Add column', none: 'Not text', added: 'column added' };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
     }

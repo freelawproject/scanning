@@ -80,6 +80,10 @@
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Draw a headnote bracket box where the reader saw the bracket, the box the card flashes. The card goes now, and the next compute redacts the box."
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
     {% endif %}
+    {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Draw a {{ issue.metadata.label }} box over the block of text, the box the card flashes. The card goes now, and the next compute reads the text."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
+    {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
     {% if issue.metadata.conf < 1 %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="{% if issue.check_name == 'low_confidence_headnote_bracket' %}Approve the detection (confidence 1.0). The card goes now, and the next compute redacts the box.{% else %}Approve the detection (confidence 1.0). The card stays until the opinions are paired again.{% endif %}"

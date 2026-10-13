@@ -43,7 +43,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
-from scanning import boundaries
+from scanning import boundaries, undetected
 from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
@@ -2185,6 +2185,10 @@ def run_compute_redactions(
         # The editor's notes, the same way (#450).
         with _log_stage("Editor's note readings"):
             editorial.write_rows(scan, ocr_document, run)
+        # The text cells of every page, the same way, for the card of a
+        # block no box covers (``undetected``).
+        with _log_stage("Text readings"):
+            undetected.write_rows(scan, ocr_document, run)
 
         if importing:
             # Only after an import: the correction converges, so it is
