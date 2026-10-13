@@ -200,12 +200,21 @@ def write_computed(
     :param run: The apply run whose space the document is in; None for
         the original's space.
     :param detect_run: The ``ExternalJob.run`` the rows came from.
-    :returns: The ``(caption, key)`` pairs, as ``_pair_opinions`` gives
-        them.
+    :returns: The ``(caption, key)`` pairs, as blackletter's
+        ``_pair_opinions`` gives them, in reading order: the gate
+        pairing, then the keys it left unmatched paired on the key
+        before them (``_pair_on_keys_before``).
     """
+    from blackletter.models import CaptionMarker
     from blackletter.scanner import _pair_opinions
 
     pairs = _pair_opinions(document) if document.pages else []
+    # An opinion paired on the key before starts at a marker under that
+    # key, one pixel tall, that names the caption box it was paired on:
+    # the boundary's start FK names the box's row.
+    for caption, _ in pairs:
+        if isinstance(caption, CaptionMarker) and id(caption.box) in row_ids:
+            row_ids[id(caption)] = row_ids[id(caption.box)]
     pages_by_index = {p.index: p for p in document.pages}
     scan.refresh_from_db(fields=["source_fingerprint"])
     rows = []

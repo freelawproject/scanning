@@ -693,6 +693,79 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
+def drop_junk_entries(entries: list) -> tuple[set[int], int]:
+    """Take the junk boxes out of a list of detection dicts, in place.
+
+    **blackletter's rule, over the portal's dicts.** The three rules of
+    ``blackletter.junk`` (the blot in an edge band, the image box that
+    is a text box's twin, the key that is the show-through of the
+    leaf's other side) and its cut of a box that runs onto the blot are
+    run by ``blackletter.junk.drop_junk`` over a document lifted from
+    the dicts, and the answer is written back: a dropped entry leaves
+    the list and a cut entry's foot moves. Three readers call it, the
+    compute (:func:`detection_entries`), the viewer
+    (``views_api.serve_detections``) and the image chips
+    (``views_process``), so all three see the boxes blackletter's own
+    geometry would.
+
+    A hand-added entry (no ``found_by``) is lifted at confidence 1.0,
+    which is a person's box to blackletter, so it is never judged.
+
+    :param entries: Dicts with ``id``, ``label_id`` (or ``label``),
+        ``bbox``, ``confidence``, ``page_index``, ``img_width``,
+        ``img_height`` and ``found_by``, the page's boxes together.
+    :returns: The ids dropped, and how many boxes were cut.
+    :rtype: tuple[set[int], int]
+    """
+    from blackletter.junk import drop_junk
+    from blackletter.models import BBox, Document, Label, Page
+    from blackletter.models import Detection as BLDetection
+
+    by_page: dict[int, list[dict]] = {}
+    for entry in entries:
+        by_page.setdefault(entry["page_index"], []).append(entry)
+    pages = []
+    lifted: dict[int, dict] = {}
+    for index in sorted(by_page):
+        group = by_page[index]
+        page = Page(
+            index=index,
+            pdf_width=612.0,
+            pdf_height=792.0,
+            img_width=int(group[0].get("img_width") or 0),
+            img_height=int(group[0].get("img_height") or 0),
+        )
+        for entry in group:
+            bbox = entry.get("bbox")
+            if not isinstance(bbox, list | tuple) or len(bbox) != 4:
+                continue
+            label = (
+                Label(entry["label_id"])
+                if entry.get("label_id") is not None
+                else Label[entry["label"]]
+            )
+            det = BLDetection(
+                bbox=BBox(*(float(v) for v in bbox)),
+                label=label,
+                confidence=(
+                    1.0
+                    if not entry.get("found_by")
+                    else float(entry.get("confidence") or 0.0)
+                ),
+                page_index=index,
+            )
+            page.detections.append(det)
+            lifted[id(det)] = entry
+        pages.append(page)
+    report = drop_junk(Document(pdf_path="", pages=pages))
+    dropped = {lifted[id(d)].get("id") for d in report.dropped}
+    for before, after in report.cut:
+        lifted[id(before)]["bbox"][3] = after.bbox.y2
+    if dropped:
+        entries[:] = [e for e in entries if e.get("id") not in dropped]
+    return dropped, len(report.cut)
+
+
 def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     """The live detections of a scan, in the shape blackletter reads.
 
@@ -755,6 +828,29 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
             if pn[1] is not None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
+    # The blot along the top or the bottom edge that the model boxes as
+    # a key icon or a headnote, the image box that is a text box's twin
+    # and the key that is the show-through of the leaf's other side are
+    # left out here, and a box that runs from the text down onto the
+    # blot is cut at the band top (blackletter's ``drop_junk``, through
+    # :func:`drop_junk_entries`), so that every reader of this list (the
+    # pairing, the key stamps, the margin strips) stops seeing them at
+    # once. The rows stay; only the list the compute reads changes.
+    dropped, cut = drop_junk_entries(det_data)
+    if dropped:
+        logger.info(
+            "Scan %s: %d model box(es) left out of the document "
+            "(an edge band, an image twin or a show-through)",
+            scan_pk,
+            len(dropped),
+        )
+    if cut:
+        logger.info(
+            "Scan %s: %d model box(es) running into the bottom band cut at "
+            "the band top",
+            scan_pk,
+            cut,
+        )
     return det_data
 
 
