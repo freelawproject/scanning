@@ -27,11 +27,29 @@ var _opinions = [];
         cards.forEach(function (c, i) {
             if (i === idx) {
                 c.classList.add("selected");
-                c.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                if (_pastFindings(c)) {
+                    c.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                }
             } else {
                 c.classList.remove("selected");
             }
         });
+    }
+
+    // The findings sit above the opinion cards in the aside. The
+    // selected card scrolls into view only when the reader is already
+    // past them: a click on a finding card moves the PDF pane, the
+    // scroll tracking selects the opinion under it, and a scroll here
+    // would carry the findings off the top of the aside, out from
+    // under the reader's hand.
+    function _pastFindings(card) {
+        var findings = document.getElementById("review-findings");
+        var aside = card.closest("aside");
+        if (!findings || !aside) return true;
+        return (
+            findings.getBoundingClientRect().bottom <=
+            aside.getBoundingClientRect().top
+        );
     }
 
     window.selectOpinion = function (el, pageNum) {

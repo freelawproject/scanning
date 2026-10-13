@@ -1014,11 +1014,11 @@ document.addEventListener('DOMContentLoaded', function () {
         wrapper.querySelectorAll('.detection-box').forEach(function (el) { el.remove(); });
 
         // The labels that affect the pipeline (pairing, redaction,
-        // headnotes, layout), plus HEADING and BLOCKQUOTE. Those two
-        // affect no redaction: they are opinion-body structure and they
-        // feed the opinion model (#335). They are drawn so a curator can
-        // see what the model read before drawing the box it missed, so
-        // do not take them out as "unused" (#343).
+        // headnotes, layout). HEADING and BLOCKQUOTE affect no
+        // redaction: they are opinion-body structure for the opinion
+        // model (#335), and the model's boxes of them crowd the page, so
+        // they are not drawn. A curator's own box of either still draws
+        // (``d.manual``), and the drawer still offers both.
         var USED_LABELS = {
             CASE_CAPTION: true, KEY_ICON: true,
             STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
@@ -1026,7 +1026,6 @@ document.addEventListener('DOMContentLoaded', function () {
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
             FOOTNOTES: true, IMAGE: true, TEXT_COLUMN: true,
             BACKGROUND: true, SYLLABUS: true, JUDGES: true,
-            HEADING: true, BLOCKQUOTE: true,
         };
         // A column box is the full height of its column, so it would cover the
         // detections inside it and take their clicks. Draw those first, and the
@@ -1222,8 +1221,10 @@ document.addEventListener('DOMContentLoaded', function () {
 
         var preview = document.createElement('div');
         preview.className = 'det-draw-preview';
-        _updatePreviewPos();
+        // The positioner reads the variable, so it is set first: set
+        // after, the ghost had no place or size until it was dragged.
         detDrawPreview = preview;
+        _updatePreviewPos();
 
         // 8 resize handles
         ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'].forEach(function (hName) {
@@ -1621,8 +1622,9 @@ document.addEventListener('DOMContentLoaded', function () {
             clearOverlaysByClass('margin-overlay-box');
             clearOverlaysByClass('opinion-bounds-overlay');
         }
-        // The masks of the selected opinion live in the bounds mode
-        // alone, so every other step of the cycle removes them (#311).
+        // The masks of the selected opinion follow the mode (dim in the
+        // bounds mode, white on a shared page in the solid mode, none
+        // otherwise), so every step of the cycle draws them again (#311).
         drawOpinionDim();
         _showOverlayMode();
     };
@@ -2326,12 +2328,15 @@ document.addEventListener('DOMContentLoaded', function () {
     /**
      * Draw the masks of the selected opinion on one page.
      *
-     * A page outside the opinion is covered whole; a page the opinion
-     * shares with a neighbour gets one mask per outside rect. Both are
-     * dim, and both draw in the bounds mode alone: that mode is the one
-     * the opinion boundaries are the subject of. The redaction modes
-     * show the page as the output has it, so an opinion mask has no
-     * place there, and an opaque white page even less (#311).
+     * In the bounds mode, the mode the opinion boundaries are the
+     * subject of, a page outside the opinion is covered whole and a
+     * page the opinion shares with a neighbour gets one dim mask per
+     * outside rect. In the solid mode the shared page shows what the
+     * opinion's own PDF has: the neighbour's share painted white, the
+     * mask ``opinion_pdf`` cuts. The pages outside the opinion stay as
+     * they are there, because an opaque white page over every other
+     * page read as a whiteout of the volume (#311). The two other modes
+     * draw no mask.
      *
      * @param {HTMLElement} pageDiv - The .page-container element.
      */
@@ -2339,10 +2344,13 @@ document.addEventListener('DOMContentLoaded', function () {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
         if (!wrapper) return;
         wrapper.querySelectorAll('.opinion-dim-overlay').forEach(function(el) { el.remove(); });
-        if (!_dimSpan || overlayMode !== 'bounds') return;
+        if (!_dimSpan) return;
+        var solid = overlayMode === 'solid';
+        if (!solid && overlayMode !== 'bounds') return;
 
         var num = parseInt(pageDiv.dataset.pdfIndex);
         if (num < _dimSpan.start || num > _dimSpan.end) {
+            if (solid) return;
             var cover = document.createElement('div');
             cover.className = 'opinion-dim-overlay';
             cover.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.3);z-index:15;pointer-events:none;';
@@ -2369,7 +2377,7 @@ document.addEventListener('DOMContentLoaded', function () {
             dim.style.top = (r.y0 * dsy) + 'px';
             dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
             dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-            dim.style.background = 'rgba(0,0,0,0.25)';
+            dim.style.background = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
             dim.style.zIndex = '15';
             dim.style.pointerEvents = 'none';
             wrapper.appendChild(dim);
