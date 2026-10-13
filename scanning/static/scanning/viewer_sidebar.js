@@ -10,6 +10,18 @@
 var _currentOpinionIdx = -1;
 var _opinions = [];
 
+// A click on a finding card moves the PDF pane, the scroll tracking
+// selects the opinion under it, and the selected card would scroll
+// into view, carrying the findings off the top of the aside out from
+// under the reader's hand. The click holds the aside still for the
+// moment the pane takes to settle, and no longer: an arrow step or the
+// reader's own scroll brings the selected card into view as before.
+var _asideHeldUntil = 0;
+var ASIDE_HOLD_MS = 1500;
+function holdAside() {
+    _asideHeldUntil = Date.now() + ASIDE_HOLD_MS;
+}
+
 (function () {
     var cfg = window.SCAN_CONFIG;
     if (!cfg || cfg.step < 2) return;
@@ -27,29 +39,13 @@ var _opinions = [];
         cards.forEach(function (c, i) {
             if (i === idx) {
                 c.classList.add("selected");
-                if (_pastFindings(c)) {
+                if (Date.now() >= _asideHeldUntil) {
                     c.scrollIntoView({ behavior: "smooth", block: "nearest" });
                 }
             } else {
                 c.classList.remove("selected");
             }
         });
-    }
-
-    // The findings sit above the opinion cards in the aside. The
-    // selected card scrolls into view only when the reader is already
-    // past them: a click on a finding card moves the PDF pane, the
-    // scroll tracking selects the opinion under it, and a scroll here
-    // would carry the findings off the top of the aside, out from
-    // under the reader's hand.
-    function _pastFindings(card) {
-        var findings = document.getElementById("review-findings");
-        var aside = card.closest("aside");
-        if (!findings || !aside) return true;
-        return (
-            findings.getBoundingClientRect().bottom <=
-            aside.getBoundingClientRect().top
-        );
     }
 
     window.selectOpinion = function (el, pageNum) {
@@ -283,6 +279,9 @@ var _opinions = [];
 // --- Global functions (called from template onclick handlers) ---
 
 function goToPage(elOrNum) {
+    if (typeof elOrNum === "object" && elOrNum.classList && elOrNum.classList.contains("finding-card")) {
+        holdAside();
+    }
     // Opinion image/headnote badges carry data-pdf-index: resolve to that
     // exact page. Logical page numbers can repeat (e.g. unnumbered front
     // matter borrowing the real pages' numbers), so pdf_index is unambiguous.
@@ -315,6 +314,7 @@ function goToPage(elOrNum) {
 function highlightDetection(el) {
     var d = _getDetectionData(el);
     if (!d) return;
+    holdAside();
 
     document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
         e.remove();

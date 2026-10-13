@@ -2379,7 +2379,11 @@ document.addEventListener('DOMContentLoaded', function () {
             dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
             dim.style.background = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
             dim.style.zIndex = '15';
-            dim.style.pointerEvents = 'none';
+            // The white mask is opaque and sits above the boxes, so it
+            // takes the pointer too: a box nobody can see must not take
+            // a click or a drag. The dim mask is see-through, and the
+            // boxes under it stay in reach.
+            dim.style.pointerEvents = solid ? 'auto' : 'none';
             wrapper.appendChild(dim);
         });
     }
