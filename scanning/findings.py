@@ -151,9 +151,10 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
     found = list(_stale_findings(scan, run))
     if OpinionBoundary.objects.computed().filter(scan=scan).exists():
         rows = boundaries.standing(scan)
-        found.extend(_unmatched_findings(scan, rows))
+        read = read_ids(scan)
+        found.extend(_unmatched_findings(scan, rows, read))
         found.extend(_uncovered_pages_findings(scan, rows, run))
-        found.extend(_uncovered_headnote_findings(scan))
+        found.extend(_uncovered_headnote_findings(scan, read))
         found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
         found.extend(editorial.uncovered(scan, run))
@@ -394,8 +395,42 @@ def _caption_is_continuation(
     return False
 
 
-def _unmatched_findings(scan: Scan, rows: list[OpinionBoundary]):
-    """Yield the key icons and captions no live boundary names."""
+def read_ids(scan: Scan) -> set[int]:
+    """Return the ids of the live rows the compute read.
+
+    ``services.detection_entries`` is the one list the compute pairs
+    and measures, and blackletter's junk pass has run over it: a key
+    icon or a headnote on the blot along a page edge, an image box
+    that is a text box's twin and a key that is the show-through of
+    the leaf's other side are not in it. A finding about a box takes
+    its candidates from this set, never from a raw query over the live
+    rows, or a box the compute never saw is a card about an opinion it
+    was never part of. The rows themselves stay live: only the list
+    changes.
+
+    :param scan: The scan.
+    :returns: The ``Detection`` pks of the entries.
+    :rtype: set[int]
+    """
+    from scanning.services import detection_entries
+
+    return {
+        entry["id"]
+        for entry in detection_entries(scan.pk, page_numbers={})
+        if entry.get("id") is not None
+    }
+
+
+def _unmatched_findings(
+    scan: Scan, rows: list[OpinionBoundary], read: set[int] | None = None
+):
+    """Yield the key icons and captions no live boundary names.
+
+    The key icons are the ones the compute read (:func:`read_ids`): a
+    key the junk pass dropped closed no opinion and is no card either.
+    """
+    if read is None:
+        read = read_ids(scan)
     paired_captions = set()
     paired_keys = set()
     for row in rows:
@@ -407,7 +442,7 @@ def _unmatched_findings(scan: Scan, rows: list[OpinionBoundary]):
             paired_keys.add(row.end_detection_id)
     for det in (
         Detection.objects.live()
-        .filter(scan=scan, label="KEY_ICON")
+        .filter(scan=scan, label="KEY_ICON", pk__in=read)
         .exclude(pk__in=paired_keys)
         .order_by("page_index", "y0")
     ):
@@ -489,7 +524,7 @@ def _uncovered_pages_findings(
         }
 
 
-def _uncovered_headnote_findings(scan: Scan):
+def _uncovered_headnote_findings(scan: Scan, read: set[int] | None = None):
     """Yield one finding per confident headnote box no headnote box covers.
 
     The detections are in the render's pixels and the redactions in
@@ -509,10 +544,18 @@ def _uncovered_headnote_findings(scan: Scan):
         boxes.setdefault(row.page_index, []).append(
             (row.x0, row.y0, row.x1, row.y1)
         )
+    # The headnote boxes the compute read (:func:`read_ids`): a box on
+    # the blot along the page edge had no redaction because it was
+    # never in the document, and it is no card.
+    if read is None:
+        read = read_ids(scan)
     for det in (
         Detection.objects.live()
         .filter(
-            scan=scan, label="HEADNOTE", confidence__gte=HEADNOTE_CONFIDENCE
+            scan=scan,
+            label="HEADNOTE",
+            confidence__gte=HEADNOTE_CONFIDENCE,
+            pk__in=read,
         )
         .order_by("page_index", "y0")
     ):

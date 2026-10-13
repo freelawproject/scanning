@@ -506,6 +506,7 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     from scanning import review_states, yolo
+    from scanning.services import drop_junk_entries
 
     scan = get_object_or_404(Scan, pk=pk)
     if review_states.preview_only(scan):
@@ -544,9 +545,22 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # "approve" is a row written before #414; since then an
             # approval is a hand-drawn row (``manual``) over a dismiss.
             "decision": d.decision.kind if d.decision_id else None,
+            # Read by the junk rule below, and not sent.
+            "found_by": (
+                d.found_by
+                if d.found_by and d.model_name != Detection.ModelName.MANUAL
+                else None
+            ),
         }
         for d in dets
     ]
+    # The blot along the top or the bottom edge the model boxed as a key
+    # icon or a headnote is not drawn, and a box that runs down onto the
+    # bottom one is cut at the band top: the compute reads the boxes that way
+    # (``services.detection_entries``), so a page must show them that way.
+    drop_junk_entries(data)
+    for entry in data:
+        del entry["found_by"]
     return JsonResponse(data, safe=False)
 
 
