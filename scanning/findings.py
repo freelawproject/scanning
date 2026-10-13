@@ -467,13 +467,13 @@ def _unmatched_findings(
         .filter(scan=scan, label="KEY_ICON", pk__in=read)
         .order_by("page_index", "y0")
     )
-    keys = [
-        det
-        for det in boundaries.key_icon_rows(
-            candidates, _model_rows_are_bl_warm(scan)
-        )
-        if det.pk not in paired_keys
-    ]
+    read_keys = boundaries.key_icon_rows(
+        candidates, _model_rows_are_bl_warm(scan)
+    )
+    keys = [det for det in read_keys if det.pk not in paired_keys]
+    paired_rows = {
+        row.pk: row for row in Detection.objects.filter(pk__in=paired_keys)
+    }
     by_page: dict[int, list[Detection]] = {}
     if keys:
         pages = (
@@ -495,18 +495,40 @@ def _unmatched_findings(
             by_page.setdefault(det.page_index, []).append(det)
         # The keys the pairing read, paired or not: the next one down
         # a column ends the guess, because a caption never runs past
-        # the key that closes its own opinion.
-        for det in candidates:
+        # the key that closes its own opinion. Never a box the size
+        # filter rejected: a sliver between the key and a drawn
+        # caption would end the place before the caption.
+        for det in read_keys:
             by_page.setdefault(det.page_index, []).append(det)
     for det in keys:
         mid_pt, _ = boundaries.to_points(
             det.img_width / 2, 0, det.img_width, det.img_height
         )
         pos = _reading_position(det, mid_pt)
+        if _over_a_paired_key(det, paired_rows):
+            # A second box over one icon: the warning, as for a key
+            # past the last caption, never the error of a missed
+            # caption, which it is not.
+            yield _detection_finding(
+                CheckName.UNMATCHED_KEY_ICON,
+                Issue.Target.DETECTION,
+                det,
+                f"A key icon (confidence {det.confidence:.2f}) is not matched "
+                "to any opinion.",
+            )
+            continue
         starts = [
             (r.start_page_index, r.start_x >= mid_pt, r.start_y) for r in spans
         ]
-        ends = [(r.end_page_index, r.end_x >= mid_pt, r.end_y) for r in spans]
+        # A span ends at its key's own reading position, the key's
+        # top, not the bottom the boundary stores: a box over the end
+        # key compares as inside against the bottom.
+        ends = [
+            _reading_position(paired_rows[r.end_detection_id], mid_pt)
+            if r.end_detection_id in paired_rows
+            else (r.end_page_index, r.end_x >= mid_pt, r.end_y)
+            for r in spans
+        ]
         holder = next(
             (
                 span
@@ -530,8 +552,7 @@ def _unmatched_findings(
                 "to any opinion.",
             )
     paired_key_positions = sorted(
-        (d.page_index, d.x0, d.y0)
-        for d in Detection.objects.filter(pk__in=paired_keys)
+        (d.page_index, d.x0, d.y0) for d in paired_rows.values()
     )
     for det in (
         Detection.objects.live()
@@ -548,6 +569,21 @@ def _unmatched_findings(
             f"A case caption (confidence {det.confidence:.2f}) is not "
             "matched to any opinion, and it is not inside one.",
         )
+
+
+def _over_a_paired_key(det: Detection, paired_rows: dict) -> bool:
+    """Return whether a key box overlaps a key a boundary ends at.
+
+    Two boxes over one icon are one key, and the pairing skipped the
+    second; it is the unmatched-key warning here, never the error of a
+    caption nobody missed.
+    """
+    return any(
+        row.page_index == det.page_index
+        and min(det.x1, row.x1) > max(det.x0, row.x0)
+        and min(det.y1, row.y1) > max(det.y0, row.y0)
+        for row in paired_rows.values()
+    )
 
 
 def _model_rows_are_bl_warm(scan: Scan) -> bool:

@@ -231,6 +231,22 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(row.metadata["source_page"], 2)
         self.assertIn(f"page {inside.page_index + 1}", row.message)
 
+    def test_a_second_box_over_a_paired_key_is_an_unmatched_key(self):
+        """Two boxes over one icon: the pairing skipped the second, and
+        it is the warning, not a missed caption inside the opinion the
+        first one closes."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(
+            scan, "KEY_ICON", 3, x0=110.0, y0=95.0, x1=350.0, y1=185.0
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(checks_of(scan), [CheckName.UNMATCHED_KEY_ICON])
+
     def test_a_caption_drawn_in_the_place_answers_the_card(self):
         """A live caption box after the key, inside its column, is the
         box the next compute starts the opinion on, so the card goes at
@@ -247,6 +263,11 @@ class TestRebuild(ScanningTestCase):
         key = make_detection(scan, "KEY_ICON", 3)
         make_boundary(scan, caption, key)
         make_detection(scan, "KEY_ICON", 2, y0=300.0, y1=390.0)
+        # A sliver the size filter rejects, between the key and the
+        # caption: it is no key to the pairing, so it ends nothing.
+        make_detection(
+            scan, "KEY_ICON", 2, confidence=0.5, y0=420.0, y1=450.0, x1=250.0
+        )
         make_detection(
             scan,
             "TEXT_COLUMN",
