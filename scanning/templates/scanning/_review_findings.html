@@ -38,6 +38,8 @@
   <button type="button" class="ml-auto text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white font-normal"
           title="Read the detection, boundary and redaction rows again and write this list again. It changes no box. A box you drew needs Recompute redactions."
           onclick="rebuildFindings(this)">Recompute</button>
+  {% if scan %}<a href="{% url 'scan_card_review' scan.pk %}" class="text-[10px] px-2 py-0.5 rounded bg-blue-600 text-white font-normal"
+     title="Walk the missed brackets, the missed captions and the image boxes one after the next, each a crop of the page with its box.">Cards</a>{% endif %}
 </h2>
 {% if not finding_groups %}
 <div class="bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800 rounded px-2 py-2 text-xs text-green-700 dark:text-green-300 font-medium mb-2">
@@ -57,6 +59,7 @@
      data-bbox="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"
      data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
      {% if issue.metadata.detection_id %}data-detection-id="{{ issue.metadata.detection_id }}"{% endif %}
+     {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% endif %}
      onclick="highlightDetection(this)"
      {% elif issue.nav_pdf_index is not None %}
      data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)"
@@ -73,6 +76,10 @@
     {% elif issue.is_stale %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" title="Take back the decision this finding names. The model's answer stands; make the decision again on the page as it is now." onclick="event.stopPropagation(); withdrawStaleEdit(this, {{ issue.pk }})">Withdraw</button>
     {% else %}
+    {% if issue.check_name == 'missing_headnote_bracket' and issue.metadata.guess %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Draw a headnote bracket box where the reader saw the bracket, the box the card flashes. The card goes now, and the next compute redacts the box."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
+    {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
     {% if issue.metadata.conf < 1 %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="{% if issue.check_name == 'low_confidence_headnote_bracket' %}Approve the detection (confidence 1.0). The card goes now, and the next compute redacts the box.{% else %}Approve the detection (confidence 1.0). The card stays until the opinions are paired again.{% endif %}"

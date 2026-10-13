@@ -51,6 +51,7 @@ WRITE_VIEWS = (
     "move_redaction",
     "rebuild_findings",
     "restore_boundary",
+    "restore_detection",
     "restore_finding",
     "restore_redaction",
     "update_detection",

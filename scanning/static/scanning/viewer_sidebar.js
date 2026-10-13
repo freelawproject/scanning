@@ -340,14 +340,99 @@ function highlightDetection(el) {
     setTimeout(function () {
         container.style.outline = "";
     }, 2000);
-    _flashBoxes(container, [d.bbox], d.imgW, d.imgH);
+    _flashBoxes(container, [d.guess || d.bbox], d.imgW, d.imgH);
+}
+
+// The "add" of a missed-bracket card: a HEADNOTE_BRACKET box drawn
+// where the card's guess puts the bracket, through the same endpoint
+// as the drawer. The endpoint rebuilt the findings, so the card goes
+// when the section is fetched again: a live bracket box covers the
+// reading. The viewer draws the row at once.
+function addGuessedDetection(btn) {
+    var d = _getDetectionData(btn);
+    if (!d || !d.guess) return;
+    var cfg = window.SCAN_CONFIG;
+    btn.disabled = true;
+    btn.textContent = "...";
+    var det = {
+        page_index: d.pageIndex,
+        label: d.label,
+        label_id: d.labelId,
+        confidence: 1.0,
+        bbox: d.guess,
+        img_width: d.imgW,
+        img_height: d.imgH,
+    };
+    fetch("/scans/" + cfg.docId + "/add-single-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify(det),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = "+";
+                showToast((data && (data.message || data.error)) || "Could not add the box");
+                return;
+            }
+            if (data.added === false) {
+                if (window.adoptDetection) window.adoptDetection(data.replaced_id, data.detection_id);
+            } else if (window.addDetectionRow) {
+                det.id = data.detection_id;
+                window.addDetectionRow(det);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = "+";
+            showToast("Could not add the box");
+        });
 }
 
 // Pulse one or more boxes over a page for a few seconds: the box a
-// finding card names, or the guess a missing-caption row carries. The
-// boxes are in the detection's image pixels. The page is drawn lazily,
-// so the draw waits for its canvas, up to a few seconds: a page far
-// from the one in view is fetched and rendered after the scroll.
+// finding card names, or the image boxes an opinion card's chip names.
+// The boxes are in the detection's image pixels. The page is drawn
+// lazily, so the draw waits for its canvas, up to a few seconds: a page
+// far from the one in view is fetched and rendered after the scroll.
+// A link into the viewer with a page in its hash jumps there once the
+// page list exists: ``#pdf=<index>`` is the position in the drawn space
+// (data-pdf-index), and ``box=x0,y0,x1,y1&w=<width>&h=<height>``, in
+// image pixels, flashes that box on the page. The card review opens
+// step 2 at the card's page this way, into one named tab per volume, so
+// a hash change in that tab jumps again.
+function jumpToHashTarget(attempt) {
+    attempt = attempt || 0;
+    var params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+    var index = parseInt(params.get("pdf"), 10);
+    if (isNaN(index)) return;
+    var target = document.querySelector('.lazy-page[data-pdf-index="' + index + '"]');
+    if (!target) {
+        if (attempt < 75) {
+            setTimeout(function () { jumpToHashTarget(attempt + 1); }, 200);
+        }
+        return;
+    }
+    var el = document.createElement("span");
+    el.dataset.pdfIndex = String(index);
+    var box = (params.get("box") || "").split(",").map(parseFloat);
+    var imgW = parseInt(params.get("w"), 10);
+    var imgH = parseInt(params.get("h"), 10);
+    if (box.length === 4 && box.every(isFinite) && imgW > 0 && imgH > 0) {
+        el.dataset.boxes = box.join(",");
+        el.dataset.imgW = String(imgW);
+        el.dataset.imgH = String(imgH);
+    }
+    goToPage(el);
+}
+document.addEventListener("DOMContentLoaded", function () { jumpToHashTarget(0); });
+window.addEventListener("hashchange", function () { jumpToHashTarget(0); });
+
 function _flashBoxes(container, boxes, imgW, imgH, attempt) {
     attempt = attempt || 0;
     if (!attempt) {
@@ -897,5 +982,9 @@ function _getDetectionData(el) {
         label: row.dataset.unmatchedLabel,
         labelId: parseInt(row.dataset.labelId),
         detectionId: parseInt(row.dataset.detectionId),
+        // A missed-bracket card: the bracket's own place in the cell.
+        guess: row.dataset.guess
+            ? row.dataset.guess.split(",").map(function (s) { return parseFloat(s.trim()); })
+            : null,
     };
 }
