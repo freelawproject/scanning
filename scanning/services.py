@@ -2152,6 +2152,9 @@ def run_compute_redactions(
             ocr_document = text_fit.load_document(scan, run)
             cells = text_fit.page_cells(ocr_document)
             columns.separate_rows(scan, cells)
+            # A column box the model ran to the foot of the facing
+            # column ends at its own last line of print.
+            columns.trim_feet(scan, cells)
 
         # The brackets the reader saw, stored as rows so that the
         # findings can be rebuilt from the rows alone (#328). It reads
@@ -2173,6 +2176,7 @@ def run_compute_redactions(
             # gutter goes back in after it (#308).
             with _log_stage("Column gutter"):
                 columns.separate_rows(scan, cells)
+                columns.trim_feet(scan, cells)
 
         # One corrected document for the pairing and the geometry, and
         # one pairing (#240 PR C): the boundaries are rows written from

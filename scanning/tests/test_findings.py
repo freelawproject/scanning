@@ -12,6 +12,7 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.core.management import call_command
 from django.urls import reverse
 from django.utils import timezone
@@ -41,12 +42,19 @@ FINGERPRINT = "10:4"
 def make_detection(scan, label, page_index=0, **fields):
     """Create one live model detection.
 
+    A key icon is drawn with a key's shape (240 by 90 pixels, the icon
+    of a reporter page at 200 dpi), because ``blackletter.scanner.key_icons``
+    reads a box as a key only inside blackletter's ratio window and
+    near the volume's median size; a square is no key to the pairing
+    or to the cards. An override that moves a key keeps its shape.
+
     :param scan: The scan.
     :param label: The class label.
     :param page_index: The 0-based page.
     :param fields: Overrides.
     :returns: The row.
     """
+    key = label == "KEY_ICON"
     values = {
         "scan": scan,
         "page_index": page_index,
@@ -57,8 +65,8 @@ def make_detection(scan, label, page_index=0, **fields):
         "confidence": 0.9,
         "x0": 100.0,
         "y0": 100.0,
-        "x1": 200.0,
-        "y1": 200.0,
+        "x1": 340.0 if key else 200.0,
+        "y1": 190.0 if key else 200.0,
         "img_width": 1700,
         "img_height": 2200,
         "model_name": Detection.ModelName.BL_WARM,
@@ -166,7 +174,7 @@ class TestRebuild(ScanningTestCase):
         scan = make_scan()
         caption = make_detection(scan, "CASE_CAPTION", 0)
         key = make_detection(scan, "KEY_ICON", 1)
-        loose = make_detection(scan, "KEY_ICON", 2, x0=300.0, x1=400.0)
+        loose = make_detection(scan, "KEY_ICON", 2, x0=300.0, x1=540.0)
         make_boundary(scan, caption, key)
 
         findings.rebuild(scan)
@@ -177,9 +185,119 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(row.target, Issue.Target.DETECTION)
         self.assertEqual(row.page_number, 3)
         self.assertEqual(row.metadata["detection_id"], loose.pk)
-        self.assertEqual(row.metadata["bbox"], [300.0, 100.0, 400.0, 200.0])
+        self.assertEqual(row.metadata["bbox"], [300.0, 100.0, 540.0, 190.0])
         self.assertEqual(row.metadata["source_page"], 3)
         self.assertEqual(row.severity, Issue.Severity.WARNING)
+
+    def test_a_key_inside_an_opinion_with_no_caption_after_it_is_a_missing_caption(
+        self,
+    ):
+        """The pairing let the opinion before run on to the next key
+        (blackletter 0.4.4), so the key inside the span is the error
+        card, placed under the key in its column, naming the opinion
+        that runs on."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        span = make_boundary(scan, caption, key)
+        inside = make_detection(scan, "KEY_ICON", 1, y0=300.0, y1=390.0)
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            1,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=2000.0,
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(checks_of(scan), [CheckName.MISSING_CAPTION])
+        row = scan.issues.get(check_name=CheckName.MISSING_CAPTION)
+        self.assertEqual(row.severity, Issue.Severity.ERROR)
+        self.assertEqual(row.target, Issue.Target.BOUNDARY)
+        self.assertEqual(row.page_number, 2)
+        self.assertEqual(row.metadata["runs_on"], span.pk)
+        self.assertEqual(row.metadata["key_page_index"], 1)
+        self.assertEqual(
+            row.metadata["key_bbox"], [100.0, 300.0, 340.0, 390.0]
+        )
+        self.assertNotIn("detection_id", row.metadata)
+        # Under the key, half a key height down, the column's width,
+        # to the column's foot.
+        self.assertEqual(row.metadata["bbox"], [90.0, 435.0, 800.0, 2000.0])
+        self.assertEqual(row.metadata["source_page"], 2)
+        self.assertIn(f"page {inside.page_index + 1}", row.message)
+
+    def test_a_caption_drawn_in_the_place_answers_the_card(self):
+        """A live caption box after the key, inside its column, is the
+        box the next compute starts the opinion on, so the card goes at
+        the rebuild; one below the column is a footnote the model called
+        a caption and answers nothing. The drawn box sits between two
+        paired keys, as on a real page, so it is no unmatched caption."""
+        scan = make_scan()
+        first_caption = make_detection(scan, "CASE_CAPTION", 0)
+        first_key = make_detection(
+            scan, "KEY_ICON", 0, x0=1000.0, x1=1240.0, y0=1000.0, y1=1090.0
+        )
+        make_boundary(scan, first_caption, first_key)
+        caption = make_detection(scan, "CASE_CAPTION", 1)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(scan, "KEY_ICON", 2, y0=300.0, y1=390.0)
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            2,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=1500.0,
+        )
+        drawn = make_detection(
+            scan,
+            "CASE_CAPTION",
+            2,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+            confidence=1.0,
+            x0=120.0,
+            y0=1700.0,
+            x1=500.0,
+            y1=1800.0,
+        )
+
+        findings.rebuild(scan)
+        self.assertEqual(checks_of(scan), [CheckName.MISSING_CAPTION])
+
+        Detection.objects.filter(pk=drawn.pk).update(y0=500.0, y1=700.0)
+        findings.rebuild(scan)
+        self.assertEqual(checks_of(scan), [])
+
+    def test_the_first_key_of_a_volume_with_no_caption_before_it(self):
+        """Before the first computed opinion the card sits on the key
+        itself: the pages before it belong to no opinion."""
+        scan = make_scan()
+        first = make_detection(scan, "KEY_ICON", 0)
+        caption = make_detection(scan, "CASE_CAPTION", 1)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+
+        findings.rebuild(scan)
+
+        # The page before the opinion is an uncovered run as well.
+        self.assertIn(CheckName.MISSING_CAPTION, checks_of(scan))
+        self.assertNotIn(CheckName.UNMATCHED_KEY_ICON, checks_of(scan))
+        row = scan.issues.get(check_name=CheckName.MISSING_CAPTION)
+        self.assertEqual(row.severity, Issue.Severity.ERROR)
+        self.assertEqual(row.page_number, 1)
+        self.assertEqual(row.metadata["bbox"], [100.0, 100.0, 340.0, 190.0])
+        self.assertNotIn("detection_id", row.metadata)
+        self.assertNotIn("runs_on", row.metadata)
+        self.assertEqual(row.metadata["source_page"], first.source_page)
 
     def test_a_dismissed_boundary_frees_its_key(self):
         scan = make_scan()
@@ -642,7 +760,17 @@ class TestDismissals(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        self.loose = make_detection(self.scan, "KEY_ICON", 1)
+        # Past the span's end in reading order (the span ends in the
+        # right column of its last page): a key no opinion holds.
+        self.loose = make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
         self.finding = self.scan.issues.get(
             check_name=CheckName.UNMATCHED_KEY_ICON
@@ -652,9 +780,9 @@ class TestDismissals(ScanningTestCase):
         row = findings.dismiss(self.scan, self.finding, self.user)
 
         self.assertEqual(row.check_name, CheckName.UNMATCHED_KEY_ICON)
-        self.assertEqual(row.source_page, 2)
+        self.assertEqual(row.source_page, 4)
         self.assertEqual(row.label, "KEY_ICON")
-        self.assertEqual(row.target_bbox, [100.0, 100.0, 200.0, 200.0])
+        self.assertEqual(row.target_bbox, [1000.0, 1000.0, 1240.0, 1090.0])
         self.assertEqual(row.source_fingerprint, FINGERPRINT)
         self.assertEqual(row.author, self.user)
         self.finding.refresh_from_db()
@@ -682,7 +810,7 @@ class TestDismissals(ScanningTestCase):
 
     def test_a_box_that_moved_far_is_a_new_finding(self):
         findings.dismiss(self.scan, self.finding, self.user)
-        Detection.objects.filter(pk=self.loose.pk).update(x0=600.0, x1=700.0)
+        Detection.objects.filter(pk=self.loose.pk).update(x0=1300.0, x1=1540.0)
 
         findings.rebuild(self.scan)
 
@@ -816,7 +944,15 @@ class TestFindingEndpoints(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        make_detection(self.scan, "KEY_ICON", 1)
+        make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
         self.finding = self.scan.issues.get(
             check_name=CheckName.UNMATCHED_KEY_ICON
@@ -926,7 +1062,7 @@ class TestFindingEndpoints(ScanningTestCase):
         data = response.json()
         self.assertEqual(data["open"], 1)
         # The same position label as the page, for the viewer to relabel.
-        self.assertIn('data-finding-page="1">p.2<', data["html"])
+        self.assertIn('data-finding-page="3">p.4<', data["html"])
         self.assertEqual(data["stale"], 0)
         self.assertIn(f'data-issue-id="{self.finding.pk}"', data["html"])
         self.assertIn("dismissFinding(", data["html"])
@@ -990,7 +1126,17 @@ class TestTheRebuildButton(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        self.loose = make_detection(self.scan, "KEY_ICON", 1)
+        # Past the span's end in reading order (the span ends in the
+        # right column of its last page): a key no opinion holds.
+        self.loose = make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
 
     def _rebuild(self):

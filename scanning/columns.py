@@ -36,6 +36,20 @@ The vertical test is what removes the running head: one cell holds the
 whole head and it spans the gutter. It finds a band on 1290 of the 1291
 two-column pages of that volume, 10.1 pt wide at the median.
 
+**The foot** is the other edge the model gets wrong, and for the same
+reason: it measures one block and cuts it at the centre, so a column
+whose print ends halfway down (the column's last opinion closed at its
+key icon, and the next opinion starts at the top of the facing column,
+two pages in forty of one real volume) is boxed to the foot of the
+other column. :func:`trim_feet` moves a model column box's foot up to
+the lowest cell inside it, smaller only, by at least
+:data:`MIN_FOOT_TRIM_PX`, so a reader of the rows (the caption guess of
+``findings._caption_guess``, which may read no cell) can tell a blank
+half-column from one that holds the next caption. A page with no
+cells keeps its boxes, and a cell that runs out of the box (the blot
+along the bottom edge, where dots.mocr boxes it) holds the foot where
+it is, for ``blackletter.junk.cut_band_boxes`` to cut.
+
 Two callers share the rule, because they hold the boxes in different
 places: :func:`separate_rows` for the ``Detection`` rows, so the viewer
 overlay and ``detection_entries`` show what the geometry used, and
@@ -318,6 +332,100 @@ def separate_document(document, cells: dict[int, PageCells]) -> int:
             moved += 1
     _log(pages, moved, "the document")
     return moved
+
+
+#: The least a column foot moves up for, in pixels of the render the
+#: boxes are in. A line of print and its gap is about 45 px at 200 dpi,
+#: and the model boxes a column's last line a little long; under this
+#: the box is right, above it the column is boxed past its print.
+MIN_FOOT_TRIM_PX = 60.0
+
+
+def text_foot(
+    box: tuple[float, float, float, float],
+    cells: PageCells | None,
+    width: float,
+    height: float,
+) -> float | None:
+    """Return where the print inside a column box ends.
+
+    The foot of the lowest cell whose centre is inside the box's width
+    and that overlaps the box's height, held inside the box, in pixels
+    of the render the box is in.
+
+    :param box: The box's ``(x0, y0, x1, y1)``, in render pixels.
+    :param cells: The page's cells, or None.
+    :param width: The render width, in pixels.
+    :param height: The render height, in pixels.
+    :returns: The foot, or None when the page has no cells or the box
+        holds none.
+    :rtype: float | None
+    """
+    if (
+        cells is None
+        or not cells.boxes
+        or cells.width <= 0
+        or cells.height <= 0
+    ):
+        return None
+    x0, y0, x1, y1 = box
+    sx, sy = width / cells.width, height / cells.height
+    foot = None
+    for cx0, cy0, cx1, cy1 in cells.boxes:
+        centre = (cx0 + cx1) / 2 * sx
+        if not x0 <= centre <= x1:
+            continue
+        top, bottom = cy0 * sy, cy1 * sy
+        if bottom <= y0 or top >= y1:
+            continue
+        bottom = min(bottom, y1)
+        if foot is None or bottom > foot:
+            foot = bottom
+    return foot
+
+
+def trim_feet(scan, cells: dict[int, PageCells]) -> int:
+    """Trim the ``TEXT_COLUMN`` rows of a scan to their print, in place.
+
+    Model rows only, smaller only, and a page with no cells keeps its
+    boxes. The rows are what ``services.detection_entries`` hands every
+    reader of the geometry and what the viewer draws, like the gutter.
+
+    :param scan: The scan.
+    :param cells: The cells of each page, ``text_fit.page_cells``.
+    :returns: How many rows were written.
+    :rtype: int
+    """
+    from scanning.models import Detection
+
+    changed, read = [], 0
+    for row in (
+        Detection.objects.live()
+        .filter(scan=scan, label="TEXT_COLUMN")
+        .exclude(model_name=Detection.ModelName.MANUAL)
+    ):
+        page = cells.get(row.page_index)
+        if page is None:
+            continue
+        width, height = float(row.img_width), float(row.img_height)
+        if width <= 0 or height <= 0:
+            continue
+        read += 1
+        foot = text_foot((row.x0, row.y0, row.x1, row.y1), page, width, height)
+        if foot is None or row.y1 - foot < MIN_FOOT_TRIM_PX:
+            continue
+        row.y1 = round(foot, 1)
+        changed.append(row)
+    if changed:
+        Detection.objects.bulk_update(changed, ["y1"], batch_size=500)
+    if read:
+        logger.info(
+            "column foot: %d column box(es) read against the cells, %d "
+            "trimmed to the print",
+            read,
+            len(changed),
+        )
+    return len(changed)
 
 
 def _edges_for(
