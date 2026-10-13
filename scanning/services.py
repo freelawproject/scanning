@@ -693,6 +693,28 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
+def _label_of(entry: dict):
+    """Return the blackletter ``Label`` of a detection dict, or None.
+
+    The id first, the name when there is no id; None for either value
+    blackletter's enum does not carry, which a row written under an
+    older taxonomy can hold. A caller leaves such an entry out of what
+    it hands blackletter rather than raise on a page a person is
+    looking at.
+
+    :param entry: A detection dict with ``label_id`` and/or ``label``.
+    :returns: The label, or None.
+    """
+    from blackletter.models import Label
+
+    try:
+        if entry.get("label_id") is not None:
+            return Label(entry["label_id"])
+        return Label[entry["label"]]
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
 def drop_junk_entries(entries: list) -> tuple[set[int], int]:
     """Take the junk boxes out of a list of detection dicts, in place.
 
@@ -718,7 +740,7 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
     :rtype: tuple[set[int], int]
     """
     from blackletter.junk import drop_junk
-    from blackletter.models import BBox, Document, Label, Page
+    from blackletter.models import BBox, Document, Page
     from blackletter.models import Detection as BLDetection
 
     by_page: dict[int, list[dict]] = {}
@@ -726,6 +748,7 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
         by_page.setdefault(entry["page_index"], []).append(entry)
     pages = []
     lifted: dict[int, dict] = {}
+    unknown = 0
     for index in sorted(by_page):
         group = by_page[index]
         page = Page(
@@ -739,11 +762,13 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
             bbox = entry.get("bbox")
             if not isinstance(bbox, list | tuple) or len(bbox) != 4:
                 continue
-            label = (
-                Label(entry["label_id"])
-                if entry.get("label_id") is not None
-                else Label[entry["label"]]
-            )
+            label = _label_of(entry)
+            if label is None:
+                # A label blackletter does not know is not lifted: the
+                # entry is never judged and never dropped, and the
+                # page it is on is served and computed as before.
+                unknown += 1
+                continue
             det = BLDetection(
                 bbox=BBox(*(float(v) for v in bbox)),
                 label=label,
@@ -757,6 +782,12 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
             page.detections.append(det)
             lifted[id(det)] = entry
         pages.append(page)
+    if unknown:
+        logger.warning(
+            "%d detection(s) carry a label blackletter does not know and "
+            "were left out of the junk pass",
+            unknown,
+        )
     report = drop_junk(Document(pdf_path="", pages=pages))
     dropped = {lifted[id(d)].get("id") for d in report.dropped}
     for before, after in report.cut:
@@ -899,9 +930,19 @@ def _build_document_with_ids(
             )
             for d in pd["detections"]:
                 b = d.get("bbox", [0, 0, 1, 1])
+                label = _label_of(d)
+                if label is None:
+                    logger.warning(
+                        "Scan %s: a detection on page %s carries a label "
+                        "blackletter does not know and is left out of the "
+                        "document",
+                        scan.pk if isinstance(scan, Scan) else scan,
+                        pi + 1,
+                    )
+                    continue
                 detection = BLDetection(
                     bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                    label=Label(d["label_id"]),
+                    label=label,
                     confidence=d["confidence"],
                     page_index=pi,
                 )
