@@ -116,6 +116,59 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(page["counts"]["figures"], 1)
         self.assertEqual(page["counts"]["figure_single"], 0)
 
+    def test_one_box_over_two_pictures_leaves_two_pictures(self):
+        """One engine draws one box over two photographs side by side
+        where the two others draw one each: the box would join them
+        into one cut of both, so it is left out."""
+        left, right = [40.0, 70.0, 160.0, 200.0], [170.0, 70.0, 280.0, 200.0]
+        both = [40.0, 70.0, 280.0, 200.0]
+        page = page_of(
+            {
+                "dots_mocr": [picture("dots_mocr", 0, both)],
+                "mistral_ocr": [
+                    picture("mistral_ocr", 0, left, label="image"),
+                    picture("mistral_ocr", 1, right, label="image"),
+                ],
+                "surya": [
+                    picture("surya", 0, left),
+                    picture("surya", 1, right),
+                ],
+            }
+        )
+
+        found = figures(page)
+        self.assertEqual([g["box_pt"] for g in found], [left, right])
+        for group in found:
+            self.assertEqual(
+                sorted(group["engines"]), ["mistral_ocr", "surya"]
+            )
+        self.assertEqual(page["counts"]["figures"], 2)
+        self.assertEqual(page["counts"]["figure_single"], 0)
+
+    def test_two_boxes_over_two_pictures_keep_one_picture(self):
+        """Two engines draw one box over both photographs: the third
+        engine's two boxes are outvoted, and the cut is one picture."""
+        left, right = [40.0, 70.0, 160.0, 200.0], [170.0, 70.0, 280.0, 200.0]
+        both = [40.0, 70.0, 280.0, 200.0]
+        page = page_of(
+            {
+                "dots_mocr": [picture("dots_mocr", 0, both)],
+                "mistral_ocr": [
+                    picture("mistral_ocr", 0, left, label="image"),
+                    picture("mistral_ocr", 1, right, label="image"),
+                ],
+                "surya": [picture("surya", 0, both)],
+            }
+        )
+
+        found = figures(page)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["box_pt"], both)
+        self.assertEqual(
+            sorted(found[0]["engines"]),
+            ["dots_mocr", "mistral_ocr", "surya"],
+        )
+
     def test_a_picture_box_over_the_text_takes_none_of_it(self):
         """The guard of the alignment: a box that reads nothing never
         chains the text of a page into one group."""

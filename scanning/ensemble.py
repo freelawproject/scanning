@@ -1563,7 +1563,9 @@ def _figure_groups(
     :data:`OVERLAP` of the smaller box, and never with a text unit: a
     picture reads nothing, and a box that reads nothing must not chain
     the text of a page. The group is flagged ``figure``; its box is the
-    union of the engines' boxes, the rule of every group.
+    union of the engines' boxes, the rule of every group. A box that
+    would join two pictures the other engines drew apart is left out
+    (:func:`_picture_bridges`), or the union cuts them as one.
 
     :param pictures: The units of the ``figure`` kind.
     :param line_band: The height of one line band, in points.
@@ -1573,13 +1575,9 @@ def _figure_groups(
     :returns: The groups.
     :rtype: list[dict]
     """
-    union = _Union(len(pictures))
-    for left, right in combinations(range(len(pictures)), 2):
-        if pictures[left]["engine"] == pictures[right]["engine"]:
-            continue
-        share = contained(pictures[left]["box_pt"], pictures[right]["box_pt"])
-        if share >= OVERLAP:
-            union.join(left, right)
+    bridges = {id(unit) for unit in _picture_bridges(pictures)}
+    pictures = [unit for unit in pictures if id(unit) not in bridges]
+    union = _link_pictures(pictures)
     buckets: dict[int, list[int]] = {}
     for index in range(len(pictures)):
         buckets.setdefault(union.find(index), []).append(index)
@@ -1594,6 +1592,60 @@ def _figure_groups(
         group["figure"] = True
         groups.append(group)
     return groups
+
+
+def _link_pictures(pictures: list[dict]) -> _Union:
+    """Return the links of the picture units of a page (#463).
+
+    Two boxes of different engines link when the intersection covers
+    :data:`OVERLAP` of the smaller box, the rule of the text.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The union-find over ``pictures``, by index.
+    :rtype: _Union
+    """
+    union = _Union(len(pictures))
+    for left, right in combinations(range(len(pictures)), 2):
+        if pictures[left]["engine"] == pictures[right]["engine"]:
+            continue
+        share = contained(pictures[left]["box_pt"], pictures[right]["box_pt"])
+        if share >= OVERLAP:
+            union.join(left, right)
+    return union
+
+
+def _picture_bridges(pictures: list[dict]) -> list[dict]:
+    """Return the picture boxes that join pictures drawn apart (#463).
+
+    One engine draws one box over two photographs side by side where
+    the others draw one box each: linked, the four boxes are one
+    group, and the union of their boxes is one cut of both. Each box
+    is judged with the others in place: it is a bridge when the boxes
+    of the other engines it links fall into two groups or more without
+    it. So a box is left out only where another engine still draws
+    the pictures apart, and two engines that drew one box over both
+    keep one picture.
+
+    A bridge reads nothing, so leaving it out loses no text: the
+    picture group of each part names the engines that drew it.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The bridges, in the order of ``pictures``.
+    :rtype: list[dict]
+    """
+    bridges = []
+    for unit in pictures:
+        rest = [other for other in pictures if other is not unit]
+        union = _link_pictures(rest)
+        joined = {
+            union.find(index)
+            for index, other in enumerate(rest)
+            if other["engine"] != unit["engine"]
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+        }
+        if len(joined) >= 2:
+            bridges.append(unit)
+    return bridges
 
 
 def _link(speaking: list[dict], zones: list[list[float]] = ()) -> _Union:
