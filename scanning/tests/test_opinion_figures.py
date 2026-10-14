@@ -666,6 +666,54 @@ class TestTheApprovedText(SimpleTestCase):
             {"width_pt": 240.0, "height_pt": 140.0, "box_pt": PICTURE_PT},
         )
 
+    def test_a_footnote_holds_its_picture(self):
+        """Footnote 14 of the issue (#486): the label at the foot of one
+        column, the picture and its caption in the other. The picture
+        and the caption have no label, so both go on with note 14, the
+        picture a paragraph of its own."""
+
+        def note_group(id_, column, text, **extra):
+            return {
+                "id": id_,
+                "kind": extra.pop("kind", "paragraph"),
+                "section": paragraphs.FOOTNOTE_SECTION,
+                "band": paragraphs.FOOTNOTE_SECTION,
+                "column": column,
+                "text": text,
+                **extra,
+            }
+
+        groups = [
+            note_group(0, "left", "13. Id."),
+            note_group(1, "left", "14."),
+            note_group(
+                2,
+                "right",
+                "",
+                kind=markup.FIGURE,
+                box_pt=PICTURE_PT,
+                figure={"width_pt": 240.0, "height_pt": 140.0},
+            ),
+            note_group(3, "right", "Id. This is a conceptual rendering."),
+            note_group(4, "right", "15. See the statement."),
+        ]
+        document = {"pages": [{"page_in_opinion": 0, "groups": groups}]}
+
+        notes = paragraphs.footnotes(document)
+
+        self.assertEqual([n["label"] for n in notes], ["13", "14", "15"])
+        self.assertEqual(
+            [p["kind"] for p in notes[1]["paragraphs"]],
+            ["paragraph", "figure", "paragraph"],
+        )
+        self.assertEqual(
+            notes[1]["paragraphs"][1]["figure"]["box_pt"], PICTURE_PT
+        )
+        self.assertEqual(
+            notes[1]["paragraphs"][2]["text"],
+            "Id. This is a conceptual rendering.",
+        )
+
     def test_the_tagger_never_reads_the_picture(self):
         projection = markup.project(body_with_picture())
 
@@ -714,6 +762,39 @@ class TestTheXml(SimpleTestCase):
             xml,
         )
         self.assertEqual(xml.count("*257"), 1)
+
+    def test_a_picture_of_a_footnote_is_in_the_footnote(self):
+        """``casebody`` writes a note's paragraphs as it writes the
+        body's, so a picture of a note is a ``figure`` inside it
+        (#486), and the display draws it there."""
+        picture, caption = body_with_picture()[1:]
+        approved = {
+            "opinion": {},
+            "pages": [],
+            "body": [body_with_picture()[0]],
+            "footnotes": [
+                {
+                    "label": "14",
+                    "pages": [0],
+                    "paragraphs": [picture, caption],
+                }
+            ],
+        }
+
+        xml = casebody.build(approved, {"spans": []})
+
+        note = xml[
+            xml.index('<footnote label="14">') : xml.index("</footnote>")
+        ]
+        self.assertIn(
+            '<figure><img src="data:image/jpeg;base64,QUJD" alt="" '
+            'width="320" height="187"/></figure>',
+            note,
+        )
+        self.assertLess(note.index("<figure>"), note.index("So ordered."))
+        html = casebody.display_html(xml)
+        note_html = html[html.index('<div class="cb-fns">') :]
+        self.assertIn('<figure class="cb-figure"><img ', note_html)
 
     def test_a_picture_with_no_image_writes_no_img(self):
         for data in (None, 'x" onerror="alert(1)'):
