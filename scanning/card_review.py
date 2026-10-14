@@ -47,18 +47,22 @@ from scanning.models import CheckName, Detection, Issue, Scan
 #: gate (#410), approved, resized or taken out; an ``image`` card a
 #: live model ``IMAGE`` box, kept, resized or taken out; a ``link``
 #: card one with no box to act on here (the first key icon of a volume
-#: with no caption before it), which points at the viewer.
+#: with no caption before it), which points at the viewer; a ``text``
+#: card a block of print no box covers (``undetected``), answered by
+#: adding the column box the card holds over it.
 CAPTION = "caption"
 BRACKET = "bracket"
 FAINT = "faint"
+TEXT = "text"
 IMAGE = "image"
 LINK = "link"
 
 #: The sections of the page, in order (``group``). The captions first,
 #: because each one splits an opinion and the volume's pairing waits
 #: on them; then the brackets, the bulk, one key press each; then the
-#: images.
-GROUPS = (CAPTION, BRACKET, IMAGE)
+#: blocks of text in no box, which the opinion text would drop; then
+#: the images.
+GROUPS = (CAPTION, BRACKET, TEXT, IMAGE)
 
 #: The checks whose open cards this review walks, and the kind of card
 #: each one makes.
@@ -66,6 +70,7 @@ CHECKS = {
     CheckName.MISSING_CAPTION: CAPTION,
     CheckName.MISSING_HEADNOTE_BRACKET: BRACKET,
     CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET: FAINT,
+    CheckName.UNDETECTED_TEXT: TEXT,
 }
 
 #: The crop around a box, in render pixels: a fifth of an inch at
@@ -318,6 +323,40 @@ def caption_card(issue: Issue) -> dict | None:
     return _card(kind=CAPTION, crop=crop, box=box, anchor=anchor, **common)
 
 
+def text_card(issue: Issue) -> dict | None:
+    """Return the card of an ``undetected_text`` finding.
+
+    The box is the block of print no detection covers
+    (``undetected.uncovered``), the label the one the finding names (a
+    ``TEXT_COLUMN``), the crop the block and its pad, widened to its
+    column like every crop.
+
+    :param issue: The finding.
+    :returns: The card, or None when the finding names no page.
+    :rtype: dict | None
+    """
+    metadata = issue.metadata or {}
+    page = _page_of(metadata)
+    box = _box(metadata.get("bbox"))
+    label = metadata.get("label")
+    if page is None or box is None or label not in Label.__members__:
+        return None
+    page_index, width, height = page
+    return _card(
+        kind=TEXT,
+        group=TEXT,
+        key=_finding_key(issue, page_index, box),
+        page_index=page_index,
+        width=width,
+        height=height,
+        crop=_pad(box, CROP_PAD_PX, width, height),
+        box=box,
+        label=label,
+        message=issue.message,
+        issue_id=issue.pk,
+    )
+
+
 def image_card(row: Detection) -> dict | None:
     """Return the card of a live model ``IMAGE`` row.
 
@@ -455,6 +494,7 @@ def cards(scan: Scan) -> list[dict]:
         CAPTION: caption_card,
         BRACKET: bracket_card,
         FAINT: faint_bracket_card,
+        TEXT: text_card,
     }
     issues = Issue.objects.filter(
         scan=scan, check_name__in=list(CHECKS), dismissal__isnull=True

@@ -114,6 +114,69 @@ class TestTheBuilders(ScanningTestCase):
         card = card_review.caption_card(issue)
         self.assertEqual(card["kind"], card_review.LINK)
 
+    def test_a_text_card_is_the_block_in_no_box(self):
+        issue = finding(
+            self.scan,
+            CheckName.UNDETECTED_TEXT,
+            {
+                "bbox": [1000.0, 200.0, 1600.0, 600.0],
+                "guess": [1000.0, 200.0, 1600.0, 600.0],
+                "label": "TEXT_COLUMN",
+                "label_id": int(Label.TEXT_COLUMN),
+            },
+        )
+        card = card_review.text_card(issue)
+        self.assertEqual(card["kind"], card_review.TEXT)
+        self.assertEqual(card["group"], card_review.TEXT)
+        self.assertEqual(card["box"], [1000.0, 200.0, 1600.0, 600.0])
+        self.assertEqual(card["label"], "TEXT_COLUMN")
+        self.assertEqual(card["label_id"], int(Label.TEXT_COLUMN))
+        self.assertEqual(card["issue_id"], issue.pk)
+        # The block and its pad.
+        self.assertEqual(card["crop"], [960.0, 160.0, 1640.0, 640.0])
+        self.assertTrue(card["key"].startswith("f:undetected_text:0:"))
+
+    def test_a_text_finding_with_no_label_makes_no_card(self):
+        issue = finding(
+            self.scan,
+            CheckName.UNDETECTED_TEXT,
+            {"bbox": [1000.0, 200.0, 1600.0, 600.0]},
+        )
+        self.assertIsNone(card_review.text_card(issue))
+
+    def test_the_text_cards_come_between_the_brackets_and_the_images(self):
+        make_detection(
+            self.scan,
+            "IMAGE",
+            0,
+            label_id=int(Label.IMAGE),
+            x0=300.0,
+            y0=400.0,
+            x1=800.0,
+            y1=900.0,
+        )
+        finding(
+            self.scan,
+            CheckName.UNDETECTED_TEXT,
+            {
+                "bbox": [1000.0, 200.0, 1600.0, 600.0],
+                "label": "TEXT_COLUMN",
+                "label_id": int(Label.TEXT_COLUMN),
+            },
+        )
+        finding(
+            self.scan,
+            CheckName.MISSING_HEADNOTE_BRACKET,
+            {
+                "bbox": [200.0, 1000.0, 800.0, 1400.0],
+                "guess": [236.0, 1000.0, 290.0, 1033.0],
+            },
+        )
+        self.assertEqual(
+            [c["group"] for c in card_review.cards(self.scan)],
+            ["bracket", "text", "image"],
+        )
+
     def test_an_image_card_is_the_live_model_row(self):
         row = make_detection(
             self.scan,

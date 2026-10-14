@@ -1105,6 +1105,10 @@ class CheckName(models.TextChoices):
         "low_confidence_headnote_bracket",
         "Headnote bracket under the redaction gate",
     )
+    UNDETECTED_TEXT = (
+        "undetected_text",
+        "Text in no box",
+    )
     UNCOVERED_EDITORS_NOTE = (
         "uncovered_editors_note",
         "Editor's note not covered by a redaction",
@@ -1181,6 +1185,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.MISSING_HEADNOTE_BRACKET,
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
         CheckName.UNCOVERED_EDITORS_NOTE,
+        CheckName.UNDETECTED_TEXT,
     }
 )
 
@@ -2519,6 +2524,96 @@ class EditorialReading(AbstractDateTimeModel):
 #
 # Issue #335. The models alone. Nothing writes them yet: the creation of
 # the rows is #336 and the review interface is #334.
+
+
+class TextReading(AbstractDateTimeModel):
+    """The text cells of one page, as the OCR read them (``undetected``).
+
+    The opinion text drops a unit the detections of its page do not
+    cover (``opinion_ocr.UNDETECTED``), and nothing told a curator in
+    review 2 that a block of print lay outside every box. This row is
+    the reader's measure of the page, stored so that ``findings.rebuild``
+    can compare it with the ``Detection`` rows without an S3 read
+    (``undetected.uncovered``).
+
+    **One row per page, not per cell.** A volume holds twenty thousand
+    cells and every rebuild reads them all, so ``cells`` is the list:
+    one ``{"box", "kind", "text"}`` per cell with a box and some text,
+    the box in the pixels of the reader's own render (``img_width`` by
+    ``img_height``), ``kind`` the dots.mocr category and ``text`` its
+    first characters, for the card.
+
+    A disposable row, the rule of ``BracketReading``: every compute
+    replaces the scan's set (``undetected.write_rows``), and a curator
+    never writes one. The address is the source page, the rule of
+    ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="text_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="text_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="text_readings",
+        help_text=(
+            "The page edit whose one-page shard this page is. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    cells = models.JSONField(
+        default=list,
+        help_text=(
+            "The text cells of the page: ``[{box, kind, text}, ...]``, "
+            "the box in the pixels of the reader's render."
+        ),
+    )
+
+    class Meta:
+        ordering = ["page_index"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_textread_scan_run_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{len(self.cells or [])} cell(s) p.{self.page_index + 1}"
 
 
 class OpinionReviewStatus(models.TextChoices):

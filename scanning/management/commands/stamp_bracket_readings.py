@@ -6,7 +6,9 @@ The volumes already in review 2 have no readings, so the new finding
 would never be raised for them. This command reads the glued OCR volume
 of each one and writes the rows. The editor's notes (``EditorialReading``,
 ``editorial.write_rows``, #450) are read from the same document and
-written beside them.
+written beside them, and so are the text cells of every page
+(``TextReading``, ``undetected.write_rows``), for the card of a block
+no box covers.
 
 It reads the database and one JSON object per volume. It renders
 nothing, it pulls no PDF and it spends no GPU time. It writes no scan
@@ -26,7 +28,14 @@ Examples:
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from scanning import brackets, detections, editorial, findings, text_fit
+from scanning import (
+    brackets,
+    detections,
+    editorial,
+    findings,
+    text_fit,
+    undetected,
+)
 from scanning.models import CheckName, Issue, Scan, Status
 
 #: The statuses whose volumes are read by default: the two the
@@ -139,6 +148,7 @@ class Command(BaseCommand):
         with transaction.atomic():
             written = brackets.write_rows(scan, document, run)
             notes = editorial.write_rows(scan, document, run)
+            undetected.write_rows(scan, document, run)
             findings.rebuild(scan, run=run)
             missed = Issue.objects.filter(
                 scan=scan,
@@ -148,10 +158,14 @@ class Command(BaseCommand):
                 scan=scan,
                 check_name=CheckName.UNCOVERED_EDITORS_NOTE,
             ).count()
+            in_no_box = Issue.objects.filter(
+                scan=scan, check_name=CheckName.UNDETECTED_TEXT
+            ).count()
             if dry_run:
                 transaction.set_rollback(True)
         self.stdout.write(
             f"scan {scan.pk}: {written} reading(s), {missed} missed "
-            f"bracket(s), {notes} editor's note(s), {uncovered} uncovered"
+            f"bracket(s), {notes} editor's note(s), {uncovered} uncovered, "
+            f"{in_no_box} block(s) of text in no box"
         )
         return written, missed, notes, uncovered

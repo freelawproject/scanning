@@ -36,6 +36,7 @@ from scanning.models import (
     ReviewDismissal,
     Scan,
     Status,
+    TextReading,
     Volume,
     WithdrawnOpinion,
 )
@@ -389,6 +390,7 @@ class ScanAdmin(admin.ModelAdmin):
             (OpinionBoundary, "scan_id"),
             (BracketReading, "scan_id"),
             (EditorialReading, "scan_id"),
+            (TextReading, "scan_id"),
             (Opinion, "scan_id"),
             (WithdrawnOpinion, "scan_id"),
             (OpinionText, "opinion__scan_id"),
@@ -940,6 +942,36 @@ class EditorialReadingAdmin(admin.ModelAdmin):
     ]
     raw_id_fields = ["scan", "source_edit", "apply_run"]
     readonly_fields = [f.name for f in EditorialReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(TextReading)
+class TextReadingAdmin(admin.ModelAdmin):
+    """The text cells of one page, as the OCR read them.
+
+    Read-only, the rule of ``BracketReadingAdmin``: the compute writes
+    every row and replaces the set at each compute.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "cell_count",
+        "apply_run",
+        "date_created",
+    ]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in TextReading._meta.fields]
+
+    @admin.display(description="cells")
+    def cell_count(self, obj):
+        return len(obj.cells or [])
 
     def has_add_permission(self, request):
         return False

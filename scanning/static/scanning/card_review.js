@@ -46,13 +46,14 @@
     var DPR = Math.min(2, window.devicePixelRatio || 1);
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
-    var GROUPS = ['caption', 'bracket', 'image'];
+    var GROUPS = ['caption', 'bracket', 'text', 'image'];
     var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
         bracket: 'bracket the model missed',
         faint: 'bracket box under the gate',
+        text: 'text in no box',
         image: 'image box'
     };
     /** What a card is, in words: a link card reads by its group, since
@@ -68,6 +69,12 @@
     function addVerbs(card) {
         if (card.group === 'bracket') {
             return { add: 'Add bracket', none: 'No bracket', added: 'bracket added' };
+        }
+        if (card.kind === 'text') {
+            // No add: the answer is the page's column box pulled over
+            // the block (click its label on the crop), and the card
+            // goes by itself at the next read.
+            return { add: null, none: 'Not text', added: null };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
     }
@@ -448,10 +455,13 @@
         }
         if (card.edit) { layer.classList.add('cr-editing'); }
         if (card.box) {
-            var box = el('div', 'cr-box cr-' + card.kind + (frozen || card.edit ? ' cr-frozen' : ''));
+            // A text card's own box is the block, a highlight and no
+            // write: it takes no handles.
+            var still = card.kind === 'text';
+            var box = el('div', 'cr-box cr-' + card.kind + (frozen || card.edit || still ? ' cr-frozen' : ''));
             layer.appendChild(box);
             placeBox(card, box);
-            if (!frozen && !card.edit) {
+            if (!frozen && !card.edit && !still) {
                 bindDrag(card, card, box, wrap, node, function () { markMoved(card, node); });
             }
         }
@@ -583,7 +593,7 @@
             }));
         } else {
             var verbsToAdd = addVerbs(card);
-            if (card.kind !== 'link') {
+            if (card.kind !== 'link' && verbsToAdd.add) {
                 foot.appendChild(button(verbsToAdd.add, 'enter', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
                     add(card, node);
