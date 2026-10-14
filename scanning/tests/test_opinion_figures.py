@@ -42,6 +42,7 @@ from scanning import (
 from scanning.models import (
     Opinion,
     OpinionCheck,
+    OpinionEdit,
     OpinionFinding,
     OpinionReviewStatus,
 )
@@ -220,28 +221,86 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(figures(page), [])
         self.assertEqual(page["dropped"][0]["reason"], "redaction")
 
-    def test_a_picture_is_never_a_footnote_or_a_quote(self):
+    def test_a_picture_in_the_footnote_zone_is_a_footnote(self):
+        """A footnote can hold a picture (#486): the zone decides its
+        section as it decides a block's, and it is never a quote."""
         zone = [30.0, 400.0, 290.0, 580.0]
         pages = {
-            name: engine_page([picture(name, 0)], zones=[zone], quotes=[zone])
+            name: engine_page(
+                [
+                    unit(name, 0, ABOVE_PT, "The court held."),
+                    unit(name, 1, [40.0, 405.0, 280.0, 415.0], "14."),
+                    picture(name, 2),
+                ],
+                zones=[zone],
+                quotes=[zone],
+            )
             for name in ("dots_mocr", "mistral_ocr")
         }
 
         page = ensemble.build_page(pages, 0)
 
         group = figures(page)[0]
-        self.assertEqual(group["section"], ensemble.BODY)
+        self.assertEqual(group["section"], ensemble.FOOTNOTES)
+        self.assertEqual(group["band"], ensemble.FOOTNOTES)
         self.assertFalse(group["blockquote"])
         self.assertEqual(page["blockquotes"], [])
+        # In the footnotes after the label, and the text takes no
+        # paragraph for it.
+        self.assertEqual(page["footnotes"], "14.")
+        self.assertEqual(page["text"], "The court held.")
+        self.assertEqual((group["start"], group["end"]), (5, 5))
+        # The label and the picture: the summary counts both.
+        self.assertEqual(page["counts"]["footnote_groups"], 2)
 
-    def test_a_picture_is_in_no_block_below(self):
-        """A push to the footnotes takes the blocks below it, never a
-        picture: its edit would land on nothing."""
+    def test_a_picture_outside_every_zone_stays_in_the_body(self):
+        zone = [30.0, 600.0, 290.0, 700.0]
+        pages = {
+            name: engine_page([picture(name, 0)], zones=[zone])
+            for name in ("dots_mocr", "mistral_ocr")
+        }
+
+        page = ensemble.build_page(pages, 0)
+
+        self.assertEqual(figures(page)[0]["section"], ensemble.BODY)
+
+    def test_a_section_edit_moves_a_picture(self):
+        """A curator puts a picture the zone missed in the footnotes,
+        and one the zone took back in the body (#486)."""
+        zone = [30.0, 400.0, 290.0, 580.0]
+        for zones, section in (
+            ([], ensemble.FOOTNOTES),
+            ([zone], ensemble.BODY),
+        ):
+            pages = {
+                name: engine_page([picture(name, 0)], zones=zones)
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+            edit = {
+                "id": 7,
+                "kind": OpinionEdit.Kind.SECTION,
+                "box_pt": PICTURE_PT,
+                "section": section,
+                "by": "curator",
+                "at": "",
+            }
+
+            page = ensemble.build_page(pages, 0, [edit])
+
+            group = figures(page)[0]
+            self.assertEqual(group["section"], section)
+            self.assertEqual(group["section_edit"], 7)
+            self.assertEqual(page["unresolved_edits"], [])
+
+    def test_a_picture_goes_with_the_blocks_below(self):
+        """A push to the footnotes takes the blocks below it, a picture
+        too (#486), and a picture pushed takes the blocks below it."""
         page = self.three_engines()
 
-        above = page["groups"][0]
-        self.assertNotIn(figures(page)[0]["id"], above["below"])
-        self.assertNotIn("below", figures(page)[0])
+        above, below = page["groups"][0], page["groups"][2]
+        picture_id = figures(page)[0]["id"]
+        self.assertEqual(above["below"], [picture_id, below["id"]])
+        self.assertEqual(figures(page)[0]["below"], [below["id"]])
 
     def test_a_picture_at_the_head_of_the_page_is_body_text(self):
         """The approved text reads the body band alone, so a picture in
@@ -536,6 +595,54 @@ class TestTheApprovedText(SimpleTestCase):
             {"width_pt": 240.0, "height_pt": 140.0, "box_pt": PICTURE_PT},
         )
 
+    def test_a_footnote_holds_its_picture(self):
+        """Footnote 14 of the issue (#486): the label at the foot of one
+        column, the picture and its caption in the other. The picture
+        and the caption have no label, so both go on with note 14, the
+        picture a paragraph of its own."""
+
+        def note_group(id_, column, text, **extra):
+            return {
+                "id": id_,
+                "kind": extra.pop("kind", "paragraph"),
+                "section": paragraphs.FOOTNOTE_SECTION,
+                "band": paragraphs.FOOTNOTE_SECTION,
+                "column": column,
+                "text": text,
+                **extra,
+            }
+
+        groups = [
+            note_group(0, "left", "13. Id."),
+            note_group(1, "left", "14."),
+            note_group(
+                2,
+                "right",
+                "",
+                kind=markup.FIGURE,
+                box_pt=PICTURE_PT,
+                figure={"width_pt": 240.0, "height_pt": 140.0},
+            ),
+            note_group(3, "right", "Id. This is a conceptual rendering."),
+            note_group(4, "right", "15. See the statement."),
+        ]
+        document = {"pages": [{"page_in_opinion": 0, "groups": groups}]}
+
+        notes = paragraphs.footnotes(document)
+
+        self.assertEqual([n["label"] for n in notes], ["13", "14", "15"])
+        self.assertEqual(
+            [p["kind"] for p in notes[1]["paragraphs"]],
+            ["paragraph", "figure", "paragraph"],
+        )
+        self.assertEqual(
+            notes[1]["paragraphs"][1]["figure"]["box_pt"], PICTURE_PT
+        )
+        self.assertEqual(
+            notes[1]["paragraphs"][2]["text"],
+            "Id. This is a conceptual rendering.",
+        )
+
     def test_the_tagger_never_reads_the_picture(self):
         projection = markup.project(body_with_picture())
 
@@ -584,6 +691,39 @@ class TestTheXml(SimpleTestCase):
             xml,
         )
         self.assertEqual(xml.count("*257"), 1)
+
+    def test_a_picture_of_a_footnote_is_in_the_footnote(self):
+        """``casebody`` writes a note's paragraphs as it writes the
+        body's, so a picture of a note is a ``figure`` inside it
+        (#486), and the display draws it there."""
+        picture, caption = body_with_picture()[1:]
+        approved = {
+            "opinion": {},
+            "pages": [],
+            "body": [body_with_picture()[0]],
+            "footnotes": [
+                {
+                    "label": "14",
+                    "pages": [0],
+                    "paragraphs": [picture, caption],
+                }
+            ],
+        }
+
+        xml = casebody.build(approved, {"spans": []})
+
+        note = xml[
+            xml.index('<footnote label="14">') : xml.index("</footnote>")
+        ]
+        self.assertIn(
+            '<figure><img src="data:image/jpeg;base64,QUJD" alt="" '
+            'width="320" height="187"/></figure>',
+            note,
+        )
+        self.assertLess(note.index("<figure>"), note.index("So ordered."))
+        html = casebody.display_html(xml)
+        note_html = html[html.index('<div class="cb-fns">') :]
+        self.assertIn('<figure class="cb-figure"><img ', note_html)
 
     def test_a_picture_with_no_image_writes_no_img(self):
         for data in (None, 'x" onerror="alert(1)'):
@@ -1086,6 +1226,32 @@ class TestTheApproval(FigureTestCase):
             },
         )
 
+    def test_the_approval_embeds_the_cut_of_a_footnote(self):
+        """A picture a note holds is embedded like one of the body
+        (#486), and its box leaves the object."""
+        self.run_ensemble()
+        document = self.stored()
+        text = paragraphs.approved_document(document, {}, "curator", "now")
+        picture = next(p for p in text["body"] if p["kind"] == markup.FIGURE)
+        text["body"] = [p for p in text["body"] if p is not picture]
+        text["footnotes"] = [
+            {"label": "1", "pages": picture["pages"], "paragraphs": [picture]}
+        ]
+        figure = ensemble.figures_of(document)[0]
+        key = opinion_figures.key(self.opinion, "a1", figure)
+
+        with patch(
+            "scanning.s3_sync.download_bytes_object",
+            side_effect=lambda asked: {key: b"jpeg"}[asked],
+        ):
+            opinion_review._embed_figures(self.opinion, document, text)
+
+        embedded = text["footnotes"][0]["paragraphs"][0]["figure"]
+        self.assertNotIn("box_pt", embedded)
+        self.assertEqual(
+            embedded["data"], base64.b64encode(b"jpeg").decode("ascii")
+        )
+
     def test_a_missing_cut_refuses_the_approval(self):
         self.run_ensemble()
         document = self.stored()
@@ -1123,16 +1289,18 @@ class TestTheEndpoints(FigureTestCase):
         page = self.stored()["pages"][1]
         return next(g for g in page["groups"] if g["kind"] == markup.FIGURE)
 
-    def test_only_a_move_edits_a_picture(self):
-        group = self.figure_group()
+    def revisions(self) -> dict:
         document = self.stored()
-        revisions = {
+        return {
             "glue_revision": document["opinion"]["glue_revision"],
             "edit_revision": document.get("edit_revision", 0),
         }
+
+    def test_a_move_and_a_section_alone_edit_a_picture(self):
+        group = self.figure_group()
+        revisions = self.revisions()
         for name, body in (
             ("edit_opinion_text", {"text": "words"}),
-            ("edit_opinion_section", {"section": ensemble.FOOTNOTES}),
             ("edit_opinion_blockquote", {"quoted": True}),
             ("edit_opinion_drop", {}),
         ):
@@ -1151,6 +1319,32 @@ class TestTheEndpoints(FigureTestCase):
             self.assertEqual(
                 response.json()["message"], views_api.EDIT_FIGURE_MESSAGE
             )
+
+    def test_a_picture_goes_to_the_footnotes(self):
+        """The curator's answer to a footnote zone the detections drew
+        short (#486): one ``SECTION`` edit over the picture's box, and
+        the build puts the picture in the footnotes."""
+        group = self.figure_group()
+
+        response = self.client.post(
+            self.url("edit_opinion_section"),
+            {
+                "page_in_opinion": 1,
+                "group_id": group["id"],
+                "section": ensemble.FOOTNOTES,
+                **self.revisions(),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        edit = OpinionEdit.objects.get(opinion=self.opinion)
+        self.assertEqual(edit.kind, OpinionEdit.Kind.SECTION)
+        self.assertEqual(edit.box_pt, group["box_pt"])
+        self.opinion.refresh_from_db()
+        moved = self.figure_group()
+        self.assertEqual(moved["section"], ensemble.FOOTNOTES)
+        self.assertEqual(moved["section_edit"], edit.pk)
 
     def test_the_url_of_a_picture(self):
         group = self.figure_group()
@@ -1194,16 +1388,20 @@ VIEWER = (
 
 
 class TestTheViewer(TestCase):
-    def test_a_picture_takes_a_move_alone(self):
-        """The toolbar of a picture stops after the two moves and the
-        Undo of the order: the four other edits refuse it."""
+    def test_a_picture_takes_a_move_and_a_section_alone(self):
+        """The toolbar of a picture stops after the two moves, the two
+        sections (#486) and their Undos: the three other edits refuse
+        it."""
         source = VIEWER.read_text()
         bar = source[source.index("function fillBar(") :]
         bar = bar[: bar.index("\n    }\n")]
         stop = bar.index("if (figure) { return; }")
         self.assertLess(bar.index("'Move down'"), stop)
         self.assertLess(bar.index("'Undo the order'"), stop)
-        self.assertGreater(bar.index("'Put in the footnotes'"), stop)
+        self.assertLess(bar.index("'Put in the footnotes'"), stop)
+        self.assertLess(bar.index("'Undo the section'"), stop)
+        self.assertGreater(bar.index("quoteButtons(bar"), stop)
+        self.assertGreater(bar.index("'Not text'"), stop)
         self.assertIn("!figure", bar[: bar.index("'Edit text'") + 200])
 
     def test_the_picture_is_read_from_its_endpoint(self):

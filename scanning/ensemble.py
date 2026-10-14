@@ -202,7 +202,9 @@ logger = logging.getLogger(__name__)
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
 #: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
-SCHEMA_VERSION = 12
+#: 13 puts a picture in the footnotes by the zone or a section edit,
+#: like a block of text (#486).
+SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -3123,31 +3125,25 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
-    # A picture takes no edit of its text, its section or its quote
+    # A picture takes no edit of its text, its quote or its drop
     # (#463): the views refuse them, and a box copy must not land one.
+    # It takes a section (#486): a picture can be part of a footnote.
     texts = [group for group in groups if not group.get("figure")]
-    for kind, key in (
-        (OpinionEdit.Kind.SECTION, "_section_edit"),
-        (OpinionEdit.Kind.TEXT, "_text_edit"),
-        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
-        (OpinionEdit.Kind.DROP, "_drop_edit"),
+    for kind, key, targets in (
+        (OpinionEdit.Kind.SECTION, "_section_edit", groups),
+        (OpinionEdit.Kind.TEXT, "_text_edit", texts),
+        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit", texts),
+        (OpinionEdit.Kind.DROP, "_drop_edit", texts),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
+        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
         for here, edit in enumerate(wanted):
             if here in landed:
-                texts[landed[here]][key] = edit
+                targets[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
-        if group.get("figure"):
-            # A picture is body text in its place (#463): no zone moves
-            # it to the footnotes and none makes it a quote.
-            group["section"], group["footnote_doubt"] = BODY, False
-            group["blockquote"] = group["_zone_blockquote"] = False
-            by_section[BODY].append(group)
-            continue
         group["section"], group["footnote_doubt"] = section(group, zones)
         placed = group.get("_section_edit")
         if placed and placed["section"] in by_section:
@@ -3155,6 +3151,13 @@ def build_page(
             # not decide and the engines' label raises no doubt.
             group["section"] = placed["section"]
             group["footnote_doubt"] = False
+        if group.get("figure"):
+            # A picture takes its section like a block of text (#486),
+            # because a footnote can hold one, and is never a quote
+            # (#463). It reads nothing, so no label raises a doubt.
+            group["blockquote"] = group["_zone_blockquote"] = False
+            by_section[group["section"]].append(group)
+            continue
         group["blockquote"] = quoted(group, quotes)
         # The flag of the zone, for the place of a dropped group in the
         # runs: an edit whose block a redaction takes is not applied,
@@ -3190,10 +3193,14 @@ def build_page(
     for group in ordered:
         if group.get("figure") and not group["excluded"]:
             entry["groups"].append(
-                _figure_entry(group, len(entry["groups"]), offsets[BODY])
+                _figure_entry(
+                    group, len(entry["groups"]), offsets[group["section"]]
+                )
             )
             sequence.append(entry["groups"][-1])
             entry["counts"]["figures"] += 1
+            if group["section"] == FOOTNOTES:
+                entry["counts"]["footnote_groups"] += 1
             if len(group["engines"]) == 1 and len(pages) > 1:
                 entry["counts"]["figure_single"] += 1
             continue
@@ -3377,12 +3384,11 @@ def build_page(
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
-    # A picture never goes to the footnotes (#463), so it is in no
-    # block's ``below`` and has none of its own.
-    texts = [g for g in entry["groups"] if g["kind"] != markup.FIGURE]
-    for group in texts:
+    # A picture goes to the footnotes like a block (#486), so it is in
+    # the ``below`` of a block above it and has one of its own.
+    for group in entry["groups"]:
         if group["section"] == BODY:
-            group["below"] = blocks_below(texts, group)
+            group["below"] = blocks_below(entry["groups"], group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
@@ -3425,28 +3431,32 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
     """Return the document entry of one picture group (#463).
 
     The shape of a text group, so every reader of the groups reads it,
-    with no text: ``start`` and ``end`` are the place in the body text
-    the picture sits at, and the body text takes no paragraph for it.
+    with no text: ``start`` and ``end`` are the place in the text of
+    its section the picture sits at, and that text takes no paragraph
+    for it. A picture in the footnotes is part of the note it follows
+    (#486), the rule of a group with no label.
     ``figure`` holds the box and the size the picture has on the page,
     which the cut and the approved text read. It has no ``level``: the
     engines vote on no text here.
 
     :param group: The picture group of :func:`align_page`.
     :param group_id: Its id in the page.
-    :param offset: The body offset it sits at.
+    :param offset: The offset it sits at, in the text of its section.
     :returns: The entry.
     :rtype: dict
     """
     box = group["box_pt"]
     engines = _ranked(group["engines"])
+    name = group["section"]
     return {
         "id": group_id,
-        # Body text whatever band it sits in: the approved text reads
-        # the body band alone, and a picture at the head or the foot of
-        # a page is still a picture of the opinion, cut and paid for.
-        "band": "body",
+        # In the body, the body band whatever band it sits in: the
+        # approved text reads the body band alone, and a picture at the
+        # head or the foot of a page is still a picture of the opinion,
+        # cut and paid for. The footnotes have one band of their own.
+        "band": "body" if name == BODY else group["band"],
         "column": group["column"],
-        "section": BODY,
+        "section": name,
         "footnote_doubt": False,
         "footnote_by": [],
         "blockquote": False,
@@ -3466,7 +3476,7 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
         "n_low_confidence": 0,
         "level": None,
         "human": None,
-        "section_edit": None,
+        "section_edit": (group.get("_section_edit") or {}).get("id"),
         "tokens": [],
         "text": "",
         "kind": markup.FIGURE,
