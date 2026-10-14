@@ -41,6 +41,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionScan,
     Redaction,
+    ReviewDismissal,
     Scan,
     Stage,
     Status,
@@ -81,8 +82,40 @@ REVIEW_NOT_OPEN_MESSAGE = (
 )
 
 
-def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
-    """Refuse a write of review 2 while the volume is still in review 1.
+#: A write of review 2 after its approval (#240). The passes that
+#: build the opinions read the redaction rows when they run, so a row
+#: written now reaches the opinions not built yet and misses the others.
+REVIEW_APPROVED_MESSAGE = (
+    "The redaction review of this volume is approved, so nothing here "
+    "can be changed. Ask a staff member to reopen the redaction review "
+    "first."
+)
+
+
+#: A write of review 2 while its approval is in flight (#240).
+REVIEW_APPROVING_MESSAGE = (
+    "The redactions of this volume are being approved: the server is "
+    "creating the opinions now, so nothing here can be changed. Wait for "
+    "the page to reload."
+)
+
+
+def _refuse_closed_review(
+    scan: Scan, approved_ok: bool = False
+) -> JsonResponse | None:
+    """Refuse a write of review 2 while the review is not open.
+
+    Two closed states. The volume is still in review 1, below; or its
+    review 2 is approved (``REDACTION_REVIEW_DONE``, #240). The opinion
+    passes read the redaction rows when they run and build each opinion
+    once per revision, so a write after the approval reaches the
+    opinions not built yet and misses the others, and a detection
+    written then reaches none: only the compute turns it into a
+    redaction, and the compute refuses that status. The way back is the
+    staff reopen (``views_process.reopen_redaction_review``). A third
+    state is closed for the same reason: an approval in flight
+    (``opinions.APPROVAL_ACTIONS`` under a busy status), whose rows were
+    read already.
 
     The first thing every write of the redaction review does, the twin
     of ``views_process._refuse_locked_edits``, and the gate the preview
@@ -101,8 +134,8 @@ def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
     open. ``add_redaction`` accepted such a box until this.
 
     Out of it, deliberately: the legacy ``PENDING_REVIEW`` step 2,
-    whose rows the old pipeline wrote, and the two #263 statuses, which
-    are review 2 itself. Their own rules (the compare-and-swap of
+    whose rows the old pipeline wrote, and ``READY_FOR_REDACTION_REVIEW``,
+    which is review 2 itself. Its own rules (the compare-and-swap of
     ``approve_redaction_review``, ``REDACTION_COMPUTE_STATUSES``) stand
     where they already did. So is every read: ``export_pdf`` builds the
     corrected volume from the page edits and hands it over, which is
@@ -113,12 +146,28 @@ def _refuse_closed_review(scan: Scan) -> JsonResponse | None:
     view refuses a direct POST.
 
     :param scan: The scan the write is about.
+    :param approved_ok: Whether the write may run after the approval.
+        True for :func:`rebuild_findings` alone, which writes the cards
+        again from the rows and reaches no opinion (#305).
     :returns: A 409 answer naming the reason, or None when the write
         may proceed.
     :rtype: JsonResponse | None
     """
-    from scanning import review_states
+    from scanning import opinions, review_states
 
+    if (
+        scan.status in (Status.QUEUED, Status.PROCESSING)
+        and scan.queued_action in opinions.APPROVAL_ACTIONS
+    ):
+        return JsonResponse(
+            {"status": "error", "message": REVIEW_APPROVING_MESSAGE},
+            status=409,
+        )
+    if scan.status == Status.REDACTION_REVIEW_DONE and not approved_ok:
+        return JsonResponse(
+            {"status": "error", "message": REVIEW_APPROVED_MESSAGE},
+            status=409,
+        )
     if scan.status not in review_states.PREVIEW_STATUSES:
         return None
     return JsonResponse(
@@ -178,6 +227,23 @@ DISMISSED_DETECTION_MESSAGE = (
 )
 WITHDRAWN_DETECTION_MESSAGE = (
     "The detection was withdrawn. Nothing was deleted."
+)
+#: The Undo of a dismissal of a model box (``restore_detection``).
+RESTORED_DETECTION_MESSAGE = "The box is back. Nothing was deleted."
+#: ``restore_detection`` on a box no dismissal stands on.
+DETECTION_NOT_DISMISSED_MESSAGE = (
+    "This box was not dismissed, so there is nothing to take back."
+)
+#: ``restore_detection`` on a hand-drawn row (409).
+RESTORE_MODEL_ONLY_MESSAGE = (
+    "Only a dismissed model box comes back this way. A box you drew is "
+    "withdrawn and drawn again."
+)
+#: ``restore_detection`` on a model box a move or an approval replaced
+#: (409): the box the curator sees holds it now.
+RESTORE_REPLACED_MESSAGE = (
+    "This box was moved or approved, so the box you see holds it now. "
+    "Withdraw that box and the model's comes back."
 )
 ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
 MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
@@ -277,6 +343,10 @@ EDIT_QUOTE_SAVED_MESSAGE = {
     "none": "The block is not a blockquote now.",
     "span": "The selected text is a blockquote now.",
 }
+EDIT_DROP_SAVED_MESSAGE = (
+    "The block was taken out of the text. Its Undo is in the list of "
+    "the blocks taken out, under the page's label."
+)
 EDIT_MOVE_SAVED_MESSAGE = {
     "up": "The block was moved up.",
     "down": "The block was moved down.",
@@ -375,6 +445,11 @@ APPROVE_REFUSED_MESSAGES = {
         "approved text was not written."
     ),
     "bucket": ENSEMBLE_BUCKET_MESSAGE,
+    "review2_open": (
+        "The redaction review of this volume is open again, so no text "
+        "takes an approval until it is approved. Its approval builds "
+        "this opinion again with the new redactions."
+    ),
     "moved": (
         "The text or the findings of this opinion changed during the "
         "approval. The page was loaded again: look and approve again."
@@ -449,6 +524,7 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     from scanning import review_states, yolo
+    from scanning.services import drop_junk_entries
 
     scan = get_object_or_404(Scan, pk=pk)
     if review_states.preview_only(scan):
@@ -487,9 +563,22 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # "approve" is a row written before #414; since then an
             # approval is a hand-drawn row (``manual``) over a dismiss.
             "decision": d.decision.kind if d.decision_id else None,
+            # Read by the junk rule below, and not sent.
+            "found_by": (
+                d.found_by
+                if d.found_by and d.model_name != Detection.ModelName.MANUAL
+                else None
+            ),
         }
         for d in dets
     ]
+    # The blot along the top or the bottom edge the model boxed as a key
+    # icon or a headnote is not drawn, and a box that runs down onto the
+    # bottom one is cut at the band top: the compute reads the boxes that way
+    # (``services.detection_entries``), so a page must show them that way.
+    drop_junk_entries(data)
+    for entry in data:
+        del entry["found_by"]
     return JsonResponse(data, safe=False)
 
 
@@ -1435,7 +1524,12 @@ def _edit_target(
     return page, group, address
 
 
-def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
+def _build_after_edit(
+    request: HttpRequest,
+    opinion: Opinion,
+    saved: str,
+    extra: dict | None = None,
+):
     """Write the text again after an edit, and answer the curator.
 
     The build runs here, the rule of the "Read the OCR documents again"
@@ -1447,6 +1541,8 @@ def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
     :param request: The HTTP request.
     :param opinion: The opinion.
     :param saved: The line of the success.
+    :param extra: More keys for the answer: the id of the edit written,
+        so a page can take it back (``withdraw_opinion_edit``).
     :returns: The answer.
     """
     from scanning import ensemble
@@ -1484,10 +1580,12 @@ def _build_after_edit(request: HttpRequest, opinion: Opinion, saved: str):
             break
         else:
             messages.success(request, saved)
-            return JsonResponse({"status": "ok", "message": saved})
+            return JsonResponse(
+                {"status": "ok", "message": saved, **(extra or {})}
+            )
     warning = EDIT_NOT_BUILT_MESSAGE.format(reason=reason)
     messages.warning(request, warning)
-    return JsonResponse({"status": "ok", "message": warning})
+    return JsonResponse({"status": "ok", "message": warning, **(extra or {})})
 
 
 @login_required
@@ -1539,7 +1637,7 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
-    opinion_edits.supersede(
+    edit = opinion_edits.supersede(
         opinion,
         request.user,
         kind=OpinionEdit.Kind.TEXT,
@@ -1560,7 +1658,9 @@ def edit_opinion_text(
         group["id"],
         page["page_in_opinion"],
     )
-    return _build_after_edit(request, opinion, EDIT_TEXT_SAVED_MESSAGE)
+    return _build_after_edit(
+        request, opinion, EDIT_TEXT_SAVED_MESSAGE, {"edit_id": edit.pk}
+    )
 
 
 @login_required
@@ -1725,6 +1825,67 @@ def edit_opinion_blockquote(
         span or "",
     )
     return _build_after_edit(request, opinion, EDIT_QUOTE_SAVED_MESSAGE[said])
+
+
+@login_required
+@require_POST
+def edit_opinion_drop(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Say that one block of an opinion is not text.
+
+    The bleed-through of the page behind, a stray mark, the label of a
+    picture: the engines read words there, no redaction covers them,
+    and the vote cannot settle what no page prints. A person takes the
+    block out. The build drops it with a reason of its own
+    (``ensemble.DROP_HUMAN``) and the edit on the drop, the approved
+    text leaves it out, and the Undo is the one of every edit
+    (``withdraw_opinion_edit``), offered on the page's list of the
+    blocks taken out, because a dropped block has no node to lock. One
+    standing edit per block.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    row = opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.DROP,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=group.get("section") or ensemble.BODY,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s took block %s of page %s out of the text as "
+        "not text: %r",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        (group.get("text") or "")[:80],
+    )
+    # The id, for the Undo of the blocking review, the rule of the
+    # text edit.
+    return _build_after_edit(
+        request, opinion, EDIT_DROP_SAVED_MESSAGE, {"edit_id": row.pk}
+    )
 
 
 @login_required
@@ -2455,7 +2616,14 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
 def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """Take back the dismissal of a finding: the card comes back.
 
-    :param request: The HTTP request (JSON body with ``issue_id``).
+    By ``issue_id``, the card as the page holds it, or by
+    ``dismissal_id``, the row ``dismiss_finding`` answered: a finding's
+    pk dies at the next rebuild, which every later write runs, while a
+    dismissal is never deleted, so a page that keeps an Undo across
+    other writes (the card review) sends the dismissal.
+
+    :param request: The HTTP request (JSON body with ``issue_id`` or
+        ``dismissal_id``).
     :param pk: Scan primary key.
     :return: ``{status, restored, message}``.
     """
@@ -2467,10 +2635,21 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    row = _finding_or_404(scan, data)
-    if isinstance(row, JsonResponse):
-        return row
-    restored = findings.restore(scan, row, request.user)
+    if data.get("dismissal_id") is not None:
+        rows = ReviewDismissal.objects.filter(
+            pk=data["dismissal_id"], scan=scan
+        )
+        if not rows.exists():
+            return JsonResponse(
+                {"status": "error", "message": "Dismissal not found"},
+                status=404,
+            )
+        restored = bool(findings.withdraw(rows, request.user))
+    else:
+        row = _finding_or_404(scan, data)
+        if isinstance(row, JsonResponse):
+            return row
+        restored = findings.restore(scan, row, request.user)
     return JsonResponse(
         {
             "status": "ok",
@@ -2546,7 +2725,9 @@ def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
     """
     from scanning import findings
 
-    context = findings.viewer_groups(scan)
+    # The scan rides along for the link to the card review
+    # (``card_review``), which the page's own context carries already.
+    context = {**findings.viewer_groups(scan), "scan": scan}
     return {
         "html": render_to_string(
             "scanning/_review_findings.html", context, request=request
@@ -2587,9 +2768,10 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     needs :func:`compute_redactions_api` instead.
 
     Every logged-in user may press it: review 2 is a curator's step,
-    not a staff one (#151). No review gate either: the rebuild is
-    derived from the rows and is idempotent, so a volume whose rows
-    cannot change gets the findings it already had.
+    not a staff one (#151). No gate after the approval either (#240
+    closes the other writes there): the rebuild is derived from the
+    rows and is idempotent, so a volume whose rows cannot change gets
+    the findings it already had.
 
     **A busy volume is refused.** The compute writes the findings
     itself, against the run it measured in, and stamps that run on the
@@ -2606,7 +2788,7 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import findings
 
     scan = get_object_or_404(Scan, pk=pk)
-    if (refusal := _refuse_closed_review(scan)) is not None:
+    if (refusal := _refuse_closed_review(scan, approved_ok=True)) is not None:
         return refusal
     if scan.status in BUSY_STATUSES:
         return JsonResponse(
@@ -2674,6 +2856,79 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 WITHDRAWN_DETECTION_MESSAGE
                 if manual
                 else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a model box: the box is live again.
+
+    The Undo of :func:`delete_detection` on a model row, which the card
+    review offers on a box it took out (``card_review``). The standing
+    ``deactivate`` decision is withdrawn (``detections.withdraw``), the
+    row gets its own value back, and the findings are written again. A
+    hand-drawn row has no dismissal to take back: it is withdrawn and
+    drawn again, so the request is refused.
+
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
+    :param pk: Scan primary key.
+    :return: ``{status, restored, message}``; 404 when the row is gone,
+        409 for a hand-drawn row.
+    """
+    from scanning import detections
+
+    scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = Detection.objects.filter(
+        pk=data.get("detection_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    if row.model_name == Detection.ModelName.MANUAL:
+        return JsonResponse(
+            {"status": "error", "message": RESTORE_MODEL_ONLY_MESSAGE},
+            status=409,
+        )
+    restored = 0
+    with transaction.atomic():
+        # The lock first, the decision after it, in its own query
+        # (``detections.standing_decision``).
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        decision = detections.standing_decision(row)
+        if (
+            decision is not None
+            and decision.kind == DetectionDecision.Kind.DEACTIVATE
+        ):
+            # A move or an approval is a dismiss plus a hand-drawn row
+            # that names it (#414): withdrawing the dismiss alone would
+            # put the model's box back beside that row.
+            if Detection.objects.live().filter(replaces=decision).exists():
+                return JsonResponse(
+                    {"status": "error", "message": RESTORE_REPLACED_MESSAGE},
+                    status=409,
+                )
+            restored = detections.withdraw(
+                DetectionDecision.objects.filter(pk=decision.pk), request.user
+            )
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_DETECTION_MESSAGE
+                if restored
+                else DETECTION_NOT_DISMISSED_MESSAGE
             ),
         }
     )

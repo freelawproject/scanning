@@ -18,6 +18,9 @@
 # Document files
 *.pdf binary
 
+# Model files
+*.joblib binary
+
 # Vendored minified files - exclude from language stats
 *.min.js linguist-vendored
 *.min.css linguist-vendored

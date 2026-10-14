@@ -192,6 +192,49 @@ class TestOpinionList(ScanningTestCase):
         row = response.context["page_obj"][0]
         self.assertEqual((row.open_findings, row.stale_findings), (0, 0))
 
+    def tag(self, status=OpinionReviewStatus.TEXT_REVIEW_DONE):
+        """Give the opinion an approved text and its spans."""
+        key = "processing/1/jobs/opinions/412.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=status,
+            approved_text_key=key,
+            tagged_text_key=key,
+            tag_key="processing/1/jobs/opinions/412.0/tag/spans.json",
+        )
+
+    def xml_url(self):
+        return reverse(
+            "opinion_final_xml",
+            kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+        )
+
+    def test_a_tagged_opinion_links_its_final_xml(self):
+        self.tag()
+
+        response = self.client.get(
+            reverse("opinion_list"),
+            {"status": OpinionReviewStatus.TEXT_REVIEW_DONE},
+        )
+
+        self.assertContains(response, self.xml_url())
+
+    def test_an_opinion_with_no_spans_links_no_final_xml(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
+    def test_a_reopened_opinion_links_no_final_xml(self):
+        """The rule of the review page's link: the text review is done."""
+        self.tag(status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
     def test_the_badge_costs_no_query_per_row(self):
         """The count is one grouped query, whatever the row count."""
         for index in range(4):
@@ -716,12 +759,14 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "approved.json",
                 "tags.json",
                 "final.xml",
+                "exported.xml",
             ],
         )
         # The approved text and the tagger's spans over it are outside
         # the glue prefix (#272, #431), and blank before they exist; the
-        # final XML (#432) is built at each request and has no key.
-        for entry in body["files"][:-3]:
+        # final XML (#432) is built at each request and has no key, and
+        # its export (#408) is at a key of the two ids.
+        for entry in body["files"][:-4]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"

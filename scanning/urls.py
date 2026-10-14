@@ -13,6 +13,7 @@ from scanning.views import (
     legacy_opinion_upload,
     login_view,
     logout_view,
+    opinion_blocking_review,
     opinion_list,
     opinion_review,
     password_change,
@@ -43,6 +44,7 @@ from scanning.views_api import (
     dismiss_opinion_finding,
     dismiss_redaction,
     edit_opinion_blockquote,
+    edit_opinion_drop,
     edit_opinion_section,
     edit_opinion_text,
     export_pdf,
@@ -53,6 +55,7 @@ from scanning.views_api import (
     reopen_opinion_text,
     rerun_opinion_ensemble,
     restore_boundary,
+    restore_detection,
     restore_finding,
     restore_opinion_finding,
     restore_redaction,
@@ -79,6 +82,7 @@ from scanning.views_process import (
     dismiss_page_repair,
     glued_output_index,
     move_page,
+    opinion_blocking_cards,
     opinion_ensemble_url,
     opinion_file_index,
     opinion_final_xml,
@@ -89,19 +93,23 @@ from scanning.views_process import (
     recalculate,
     remove_page_insert,
     reopen_page_review,
+    reopen_redaction_review,
     replace_page,
     reprocess,
     request_page_repair,
     rotate_page,
+    scan_card_review,
     scan_ocr_text_url,
     scan_original_url,
     scan_process_view,
+    scan_review_cards,
     serve_apply_output,
     serve_apply_shard,
     serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
     serve_opinion_approved_text,
+    serve_opinion_exported_xml,
     serve_opinion_final_xml,
     serve_opinion_ocr,
     serve_opinion_pdf,
@@ -126,6 +134,17 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
+    path(
+        "opinions/blocking/",
+        opinion_blocking_review,
+        name="opinion_blocking_review",
+    ),
+    path(
+        "opinions/warnings/",
+        opinion_blocking_review,
+        {"level": "warning"},
+        name="opinion_warning_review",
+    ),
     path(
         "opinions/<int:pk>/review/",
         opinion_review,
@@ -281,6 +300,11 @@ urlpatterns = [
         name="edit_opinion_blockquote",
     ),
     path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/drop/",
+        edit_opinion_drop,
+        name="edit_opinion_drop",
+    ),
+    path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/edits/move/",
         move_opinion_block,
         name="move_opinion_block",
@@ -324,6 +348,11 @@ urlpatterns = [
         name="opinion_pdf_url",
     ),
     path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/blocking-cards/",
+        opinion_blocking_cards,
+        name="opinion_blocking_cards",
+    ),
+    path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
         opinion_ensemble_url,
         name="opinion_ensemble_url",
@@ -356,6 +385,12 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/final.xml",
         serve_opinion_final_xml,
         name="serve_opinion_final_xml",
+    ),
+    # The same document as stored for CourtListener (#408).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/exported/",
+        serve_opinion_exported_xml,
+        name="serve_opinion_exported_xml",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
@@ -408,6 +443,11 @@ urlpatterns = [
         "scans/<int:pk>/reopen-pages/",
         reopen_page_review,
         name="reopen_page_review",
+    ),
+    path(
+        "scans/<int:pk>/reopen-redactions/",
+        reopen_redaction_review,
+        name="reopen_redaction_review",
     ),
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
@@ -556,6 +596,24 @@ urlpatterns = [
         "scans/<int:pk>/ocr-results/",
         serve_ocr_results,
         name="serve_ocr_results",
+    ),
+    # The card review of review 2 (``card_review``): the page, its
+    # cards, and the Undo of a dismissed model box. Every other answer
+    # of the page goes to the step-2 writes below.
+    path(
+        "scans/<int:pk>/cards/",
+        scan_card_review,
+        name="scan_card_review",
+    ),
+    path(
+        "scans/<int:pk>/cards/list/",
+        scan_review_cards,
+        name="scan_review_cards",
+    ),
+    path(
+        "scans/<int:pk>/restore-detection/",
+        restore_detection,
+        name="restore_detection",
     ),
     path(
         "scans/<int:pk>/add-single-detection/",

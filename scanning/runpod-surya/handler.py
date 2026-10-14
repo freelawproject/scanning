@@ -1,6 +1,6 @@
 """RunPod Serverless handler for Surya OCR 2 full-page reads.
 
-Runs ``datalab-to/surya-ocr-2`` behind a local vLLM server (spawned as
+Runs ``freelawproject/surya-ocr-2`` behind a local vLLM server (spawned as
 a subprocess at worker boot) and dispatches on ``job["input"]["action"]``:
 
 - ``ocr``: fetch a PDF via presigned GET URL, render each page, read
@@ -89,7 +89,7 @@ MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
 # served name must equal this id: surya's client asks the server for
 # its model list and refuses a name other than its own checkpoint
 # setting (``surya.inference.backends.spawn.attach_or_spawn``).
-SURYA_MODEL = os.environ.get("SURYA_MODEL", "datalab-to/surya-ocr-2")
+SURYA_MODEL = os.environ.get("SURYA_MODEL", "freelawproject/surya-ocr-2")
 VLLM_HOST = "127.0.0.1"
 # HANDLER_-prefixed on purpose: ``VLLM_PORT`` itself is a *reserved*
 # vLLM env var (the base port for internal distributed services), and

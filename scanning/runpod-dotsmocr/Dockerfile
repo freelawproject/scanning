@@ -2,7 +2,7 @@
 #
 # GPU worker image for RunPod Serverless: dots.mocr document parsing.
 #
-# Runs rednote-hilab/dots.mocr (3B Qwen-VL-based multimodal OCR) behind
+# Runs freelawproject/dots.mocr (our fork of rednote-hilab/dots.mocr, 3B Qwen-VL-based multimodal OCR) behind
 # a local vLLM server, driven by handler.py. No Django, no AWS
 # credentials, no DB client. Model weights are baked in so cold start
 # skips the network.
@@ -62,17 +62,31 @@ WORKDIR /app
 # Deliberately ordered BEFORE the handler venv: the weights only need
 # the base image, so a dependency bump in pyproject/uv.lock rebuilds
 # the (small) venv layer without re-downloading ~6 GB of weights.
-ARG DOTSMOCR_MODEL=rednote-hilab/dots.mocr
+#
+# The snapshot comes from our fork, pinned to a commit, so a deleted or
+# rewritten upstream repo cannot break a build (#438). A download by
+# commit writes no ``refs/main``, and the offline runtime resolves the
+# bare repo id through it, so the build writes that ref by hand: every
+# reader of the cache (vLLM, the tokenizer, the remote code) lands on
+# the pinned snapshot. A new model is a new DOTSMOCR_REVISION.
+# The retry loop exits 0 whatever its last try did, so the check after
+# it resolves the bare id offline, as the worker does, and fails the
+# build unless it lands on the pinned commit.
+ARG DOTSMOCR_MODEL=freelawproject/dots.mocr
+ARG DOTSMOCR_REVISION=a4cead5fa6d72a81e468c341267757687e0b0bd4
 ENV DOTSMOCR_MODEL=${DOTSMOCR_MODEL}
 RUN set -e; \
     for i in 1 2 3; do \
-      python3 -c "from huggingface_hub import snapshot_download; snapshot_download('${DOTSMOCR_MODEL}')" \
+      python3 -c "import pathlib; from huggingface_hub import snapshot_download; snap = pathlib.Path(snapshot_download('${DOTSMOCR_MODEL}', revision='${DOTSMOCR_REVISION}')); ref = snap.parent.parent / 'refs' / 'main'; ref.parent.mkdir(exist_ok=True); ref.write_text('${DOTSMOCR_REVISION}')" \
         && break; \
       echo "snapshot_download attempt $i failed; sleeping 10s"; \
       sleep 10; \
     done \
  && python3 -c "\
 import pathlib; \
+from huggingface_hub import snapshot_download; \
+snap = pathlib.Path(snapshot_download('${DOTSMOCR_MODEL}', local_files_only=True)); \
+assert snap.name == '${DOTSMOCR_REVISION}', f'bare repo id resolves to {snap.name}, not the pinned revision'; \
 files = list(pathlib.Path('/opt/hf').rglob('*.safetensors')); \
 total = sum(f.stat().st_size for f in files); \
 assert total > 4_000_000_000, f'weights missing or truncated: {total} bytes in {len(files)} files'; \
@@ -86,7 +100,7 @@ ENV HF_HUB_OFFLINE=1
 
 # ── Handler venv ─────────────────────────────────────────────────────
 # pyproject.toml declares the handler deps; uv.lock pins them
-# (including dots_mocr at an exact upstream commit). ``uv sync
+# (including dots_mocr at an exact commit of our fork). ``uv sync
 # --frozen`` installs exactly the locked versions into /opt/venv and
 # errors out if the lock is stale vs. pyproject.toml.
 # --mount=type=cache keeps uv's wheel cache outside the image layer

@@ -30,6 +30,7 @@ caller that is not the view cannot skip it.
 import logging
 from datetime import UTC, datetime
 
+from botocore.exceptions import BotoCoreError, ClientError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
@@ -42,6 +43,7 @@ from scanning.models import (
     OpinionFinding,
     OpinionReviewStatus,
 )
+from scanning.opinion_pdf import OPINION_PDF_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +63,7 @@ OLD_DOCUMENT = "old_document"
 NO_PAGE_NUMBERS = "no_page_numbers"
 BUCKET = "bucket"
 MOVED = "moved"
+REVIEW2_OPEN = "review2_open"
 
 
 class ApprovalRefused(Exception):
@@ -99,6 +102,33 @@ def blocking_filter() -> Q:
     return Q(dismissal__isnull=True) & (
         Q(severity=Issue.Severity.ERROR)
         | Q(check_name__in=UNDISMISSABLE_OPINION_CHECKS)
+    )
+
+
+def warning_filter() -> Q:
+    """Return the filter of an open warning card.
+
+    The twin of :func:`blocking_filter` for the warnings review, which
+    walks these cards one after the next and gates nothing: an open
+    card of WARNING severity that a dismissal can close.
+
+    :returns: A ``Q`` over ``OpinionFinding``.
+    """
+    return (
+        Q(dismissal__isnull=True)
+        & Q(severity=Issue.Severity.WARNING)
+        & ~Q(check_name__in=UNDISMISSABLE_OPINION_CHECKS)
+    )
+
+
+def warning_findings(opinion: Opinion):
+    """Return the open warning cards of one opinion (:func:`warning_filter`).
+
+    :param opinion: The opinion.
+    :returns: A queryset of ``OpinionFinding`` rows.
+    """
+    return OpinionFinding.objects.filter(opinion=opinion).filter(
+        warning_filter()
     )
 
 
@@ -150,8 +180,7 @@ def approved_key(
     stamp = approved_at.astimezone(UTC).strftime("%Y%m%dT%H%M%S%fZ")
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
     return (
-        f"{prefix}jobs/opinions/{opinion.first_printed_page}."
-        f"{opinion.index_in_page}/approved/r{opinion.glue_revision}."
+        f"{prefix}{opinion.object_prefix}approved/r{opinion.glue_revision}."
         f"e{edit_revision}.j{join_rule}.t{stamp}.json"
     )
 
@@ -241,6 +270,13 @@ def check_gate(
     """
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
         raise ApprovalRefused(CLOSED)
+    if opinion.scan.status not in OPINION_PDF_STATUSES:
+        # The redaction review is open again (#240). Its next approval
+        # builds every opinion whose text is not approved, and never one
+        # whose text is: an approval now would keep the old redactions.
+        # The table of the opinion passes, never a literal: #334 extends
+        # it, and the approval must follow.
+        raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
     if opinion.edit_revision != opinion.ensemble_edit_revision:
@@ -295,6 +331,7 @@ def approve_text(
             moved = Opinion.objects.filter(
                 pk=opinion.pk,
                 status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                scan__status__in=OPINION_PDF_STATUSES,
                 glue_revision=opinion.glue_revision,
                 edit_revision=opinion.edit_revision,
                 ensemble_edit_revision=opinion.ensemble_edit_revision,
@@ -359,7 +396,8 @@ def rewrite_text(opinion: Opinion) -> str | None:
     joins them otherwise. That document stays in the bucket, because an
     approved row is never built again. The new object keeps who
     approved and when, and the row moves to it by a compare-and-swap
-    over the key it held.
+    over the key it held. When the spans carry, the stored final XML is
+    marked for the export to write again (``final_xml_schema`` None).
 
     :param opinion: An approved row, with ``scan`` and ``apply_run``.
     :returns: The new key, or None when the row holds it already.
@@ -385,21 +423,69 @@ def rewrite_text(opinion: Opinion) -> str | None:
         opinion.approved_at.isoformat() if opinion.approved_at else "",
     )
     wrote = _put(key, text)
+    carry = _spans_still_fit(opinion, text)
+    match = {}
+    fields = {"approved_text_key": key}
+    if carry:
+        match["tagged_text_key"] = opinion.tagged_text_key
+        fields["tagged_text_key"] = key
+        # The spans stay, so the stored final XML still reads as current
+        # (``final_xml.is_written`` compares the spans key). Its text is
+        # the old object: mark the content unknown, and the export writes
+        # the new footnotes (#408). The new text is a new input, so a
+        # row the pass stopped trying is tried again.
+        fields["final_xml_schema"] = None
+        fields["final_xml_attempts"] = 0
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,
         approved_text_key=opinion.approved_text_key,
-    ).update(approved_text_key=key)
+        **match,
+    ).update(**fields)
     if not moved:
         if wrote:
             _drop_unnamed(opinion, key)
         raise ApprovalRefused(MOVED)
     logger.info(
         "%s of scan %s: the approved text was written again at %s "
-        "(join rule %s)",
+        "(join rule %s)%s",
         opinion,
         opinion.scan_id,
         key,
         paragraphs.JOIN_RULE,
+        "; the spans stay placed" if carry else "",
     )
     return key
+
+
+def _spans_still_fit(opinion: Opinion, text: dict) -> bool:
+    """Return whether the spans of the old text are spans of the new one.
+
+    The tagger reads the body alone and a span addresses a body
+    paragraph (#272), so a new text whose body is the old body holds
+    every span where it was: a rule that changes only the footnotes
+    (#442) keeps the final XML of every tagged opinion. A read fault is
+    no proof, and the spans then wait for the next press.
+
+    :param opinion: The row, before the swap.
+    :param text: The new approved object.
+    :rtype: bool
+    """
+    if not (
+        opinion.tag_key
+        and opinion.approved_text_key
+        and opinion.tagged_text_key == opinion.approved_text_key
+    ):
+        return False
+    try:
+        old = s3_sync.download_json_object(opinion.approved_text_key)
+    except (BotoCoreError, ClientError, ValueError) as exc:
+        logger.warning(
+            "%s of scan %s: the old approved text did not load (%s); "
+            "the spans wait for the next press",
+            opinion,
+            opinion.scan_id,
+            exc,
+        )
+        return False
+    return isinstance(old, dict) and old.get("body") == text.get("body")

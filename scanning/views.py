@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count
+from django.db.models import Count, Exists, OuterRef, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -22,6 +22,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     ensemble,
+    final_xml,
     opinion_ocr,
     opinion_pdf,
     opinions,
@@ -36,6 +37,7 @@ from scanning.forms import (
 )
 from scanning.models import (
     Opinion,
+    OpinionFinding,
     OpinionReviewStatus,
     OpinionScan,
     OpinionStatus,
@@ -50,7 +52,11 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
-from scanning.opinion_review import MIN_DOCUMENT_SCHEMA
+from scanning.opinion_review import (
+    MIN_DOCUMENT_SCHEMA,
+    blocking_filter,
+    warning_filter,
+)
 from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
@@ -205,23 +211,16 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
-@login_required
-def opinion_list(request: HttpRequest) -> HttpResponse:
-    """List the opinions of the third review (#334).
+def _filtered_opinions(request: HttpRequest):
+    """Return the opinions of the list's filters, and the filters.
 
-    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
-    writes after the review-2 approval. The four filters are the shape
-    of the scan list, and the step-3 tab of a volume sends ``scan``.
-
-    The warning count is stamped after the pagination, so one grouped
-    query answers the 50 rows of this page and the size of the corpus
-    never reaches it. This is the badge rule of the scan list (#266).
-
-    The opinions of the legacy pipeline are on their own page
-    (:func:`legacy_opinion_list`), linked from this one.
+    The four filters of ``/opinions/`` (scan, reporter, status, volume)
+    and the ``blocking`` switch, in the list's order, for the list and
+    for the blocking review, which reads the same query string.
 
     :param request: The current HTTP request.
-    :return: The rendered opinion list page.
+    :returns: ``(queryset, {"scan", "reporter", "status", "volume",
+        "blocking"})``, the current values as the form shows them.
     """
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
@@ -261,7 +260,79 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
+    blocking_only = request.GET.get("blocking") == "1"
+    if blocking_only:
+        opinions_qs = _with_open_blocking_card(opinions_qs)
+    return opinions_qs, {
+        "scan": scan_filter,
+        "reporter": reporter_filter,
+        "status": status_filter or "",
+        "volume": volume_filter or "",
+        "blocking": blocking_only,
+    }
 
+
+def _with_open_card(opinions_qs, open_card: Q):
+    """Keep the opinions that hold an open card of ``open_card``."""
+    return opinions_qs.filter(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                open_card
+            )
+        )
+    )
+
+
+def _with_open_blocking_card(opinions_qs):
+    """Keep the opinions whose approval waits on an open card.
+
+    ``opinion_review.blocking_filter`` is the rule, the one the badge
+    counts by (#375).
+    """
+    return _with_open_card(opinions_qs, blocking_filter())
+
+
+#: The blocking review takes one volume at a time.
+BLOCKING_REVIEW_SCOPE_MESSAGE = (
+    "Filter the list to one scan or one volume first: the blocking review "
+    "takes one volume at a time."
+)
+
+
+def _review_url(current: dict, route: str) -> str | None:
+    """Return the blocking or the warnings review of the list's current
+    filters, or None when the filters name no volume (the page would
+    walk the corpus)."""
+    if not (current["scan"] or current["volume"]):
+        return None
+    query = {
+        key: value
+        for key, value in current.items()
+        if key in ("scan", "reporter", "volume") and value
+    }
+    address = reverse(route)
+    return f"{address}?{urlencode(query)}" if query else address
+
+
+@login_required
+def opinion_list(request: HttpRequest) -> HttpResponse:
+    """List the opinions of the third review (#334).
+
+    One flat row per :class:`Opinion`, the rows ``opinions.create_rows``
+    writes after the review-2 approval. The four filters are the shape
+    of the scan list, and the step-3 tab of a volume sends ``scan``.
+
+    The warning count is stamped after the pagination, so one grouped
+    query answers the 50 rows of this page and the size of the corpus
+    never reaches it. This is the badge rule of the scan list (#266).
+
+    The opinions of the legacy pipeline are on their own page
+    (:func:`legacy_opinion_list`), linked from this one.
+
+    :param request: The current HTTP request.
+    :return: The rendered opinion list page.
+    """
+    opinions_qs, current = _filtered_opinions(request)
     paginator = Paginator(opinions_qs, 50)
     page_obj = paginator.get_page(request.GET.get("page"))
 
@@ -272,6 +343,8 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             row.stale_findings,
             row.blocking_findings,
         ) = counts.get(row.pk, (0, 0, 0))
+        # The rule of the review page's XML link, read off the row.
+        row.final_xml_ready = final_xml.exportable(row)
 
     return render(
         request,
@@ -283,10 +356,109 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
-            "current_scan": scan_filter,
-            "current_reporter": reporter_filter,
-            "current_status": status_filter or "",
-            "current_volume": volume_filter or "",
+            "current_scan": current["scan"],
+            "current_reporter": current["reporter"],
+            "current_status": current["status"],
+            "current_volume": current["volume"],
+            "current_blocking": current["blocking"],
+            "blocking_review_url": _review_url(
+                current, "opinion_blocking_review"
+            ),
+            "warning_review_url": _review_url(
+                current, "opinion_warning_review"
+            ),
+        },
+    )
+
+
+@login_required
+def opinion_blocking_review(
+    request: HttpRequest, level: str = "blocking"
+) -> HttpResponse:
+    """Review every open blocking card of a filter, one after the next.
+
+    With ``level`` ``"warning"`` (``/opinions/warnings/``), every open
+    warning card instead, in the same format: the words a majority
+    settled over one engine, to bless or to correct, and the cards
+    that point at the page, to dismiss. A warning gates nothing, so
+    the page lists no opinion as ready, and the approval it offers
+    stays behind the gate (``blocking_open`` in the cards' answer).
+
+    The opinions of the list's filters (scan, reporter, volume) that
+    are in the text review and hold an open blocking card, in the
+    list's order, fifty to a page. **The page writes nothing of its
+    own**: the browser asks ``opinion_blocking_cards`` for each
+    opinion's cards and answers them through the review page's own
+    endpoints, the text edit, the dismissal and the approval, so the
+    two pages hold one set of rules (``blocking_review``).
+
+    :param request: The current HTTP request.
+    :return: The rendered page.
+    """
+    opinions_qs, current = _filtered_opinions(request)
+    if not (current["scan"] or current["volume"]):
+        # One volume at a time: the page is for finishing a volume,
+        # not for walking the corpus.
+        messages.error(request, BLOCKING_REVIEW_SCOPE_MESSAGE)
+        return redirect("opinion_list")
+    in_review = opinions_qs.filter(
+        status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+    )
+    warnings = level == "warning"
+    open_card = warning_filter() if warnings else blocking_filter()
+    paginator = Paginator(_with_open_card(in_review, open_card), 50)
+    page_obj = paginator.get_page(request.GET.get("page"))
+    # The opinions of the filter with nothing open: every card answered
+    # here or on the review page, waiting on the approval alone. A
+    # volume holds a few dozen, so the list is whole and not paged.
+    # The warnings review lists none: a warning holds no approval.
+    ready = (
+        []
+        if warnings
+        else list(
+            in_review.exclude(
+                pk__in=_with_open_blocking_card(in_review).values("pk")
+            )[:200]
+        )
+    )
+    counts = opinions.finding_counts(
+        [row.pk for row in page_obj] + [row.pk for row in ready]
+    )
+    for row in list(page_obj) + ready:
+        row.open_findings, _stale, row.blocking_findings = counts.get(
+            row.pk, (0, 0, 0)
+        )
+        kwargs = {"pk": row.scan_id, "opinion_pk": row.pk}
+        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs) + (
+            "?level=warning" if warnings else ""
+        )
+        row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
+        row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
+        row.edit_drop_url = reverse("edit_opinion_drop", kwargs=kwargs)
+        row.approve_url = reverse("approve_opinion_text", kwargs=kwargs)
+        row.withdraw_url = reverse("withdraw_opinion_edit", kwargs=kwargs)
+        row.review_url = reverse("opinion_review", kwargs={"pk": row.pk})
+    list_query = {
+        key: value
+        for key, value in current.items()
+        if key in ("scan", "reporter", "volume") and value
+    }
+    query = urlencode(list_query)
+    return render(
+        request,
+        "scanning/opinion_blocking_review.html",
+        {
+            "page_obj": page_obj,
+            "ready": ready,
+            "level": level,
+            "review_name": "Warnings review"
+            if warnings
+            else "Blocking review",
+            "card_word": "warning" if warnings else "blocking",
+            "current_scan": current["scan"],
+            "list_url": reverse("opinion_list")
+            + (f"?{query}" if query else ""),
+            "query": query,
         },
     )
 
@@ -416,6 +588,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         )
     open_findings = sum(1 for row in findings if row.dismissal_id is None)
     ocr_written = opinion_ocr.is_written(opinion)
+    review2_open = opinion.scan.status not in opinion_pdf.OPINION_PDF_STATUSES
     # The dismissal answers a card while the opinion is ready for the
     # text review alone, the gate of the endpoint (#419). A stale card
     # is a fact about the row and takes none.
@@ -495,6 +668,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "edit_text_url": address("edit_opinion_text"),
             "edit_section_url": address("edit_opinion_section"),
             "edit_blockquote_url": address("edit_opinion_blockquote"),
+            "edit_drop_url": address("edit_opinion_drop"),
             "edit_move_url": address("move_opinion_block"),
             "edit_withdraw_url": address("withdraw_opinion_edit"),
             # The approval (#375): offered where the endpoint takes it,
@@ -503,7 +677,11 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "can_approve": (
                 opinion.status == OpinionReviewStatus.READY_FOR_TEXT_REVIEW
                 and ensemble.is_written(opinion)
+                and not review2_open
             ),
+            # The redaction review of the volume is open again (#240):
+            # the approval refuses, so the page says why it offers none.
+            "review2_open": review2_open,
             "blocking_count": sum(
                 1
                 for row, block in zip(findings, blocking)

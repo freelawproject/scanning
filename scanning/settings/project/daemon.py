@@ -43,6 +43,15 @@ DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
 # 5 seconds is 25 minutes, in the background.
 DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
 
+# How often (in seconds) the daemon scores one volume with the bad-page
+# model (#436), and with how many worker processes. The tick blocks the
+# serial scheduler for the whole score, about 0.2 CPU-seconds a page,
+# so a 1300-page volume is a minute or two at two workers; the interval
+# and the pool size, not the count per tick, are the knobs. Two workers
+# leave the daemon's cores to the job waves; the web pods never run it.
+DAEMON_BADPAGE_INTERVAL = env.int("DAEMON_BADPAGE_INTERVAL", default=30)
+BADPAGE_JOBS = env.int("BADPAGE_JOBS", default=2)
+
 # How long (in seconds) a failed opinion PDF row waits before the pass
 # takes it again (#336). A counted fault will fail again, so retrying it
 # every tick would spend its three attempts in fifteen seconds; a
