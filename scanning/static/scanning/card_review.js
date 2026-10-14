@@ -71,7 +71,10 @@
             return { add: 'Add bracket', none: 'No bracket', added: 'bracket added' };
         }
         if (card.kind === 'text') {
-            return { add: 'Add column', none: 'Not text', added: 'column added' };
+            // No add: the answer is the page's column box pulled over
+            // the block (click its label on the crop), and the card
+            // goes by itself at the next read.
+            return { add: null, none: 'Not text', added: null };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
     }
@@ -452,10 +455,13 @@
         }
         if (card.edit) { layer.classList.add('cr-editing'); }
         if (card.box) {
-            var box = el('div', 'cr-box cr-' + card.kind + (frozen || card.edit ? ' cr-frozen' : ''));
+            // A text card's own box is the block, a highlight and no
+            // write: it takes no handles.
+            var still = card.kind === 'text';
+            var box = el('div', 'cr-box cr-' + card.kind + (frozen || card.edit || still ? ' cr-frozen' : ''));
             layer.appendChild(box);
             placeBox(card, box);
-            if (!frozen && !card.edit) {
+            if (!frozen && !card.edit && !still) {
                 bindDrag(card, card, box, wrap, node, function () { markMoved(card, node); });
             }
         }
@@ -587,7 +593,7 @@
             }));
         } else {
             var verbsToAdd = addVerbs(card);
-            if (card.kind !== 'link') {
+            if (card.kind !== 'link' && verbsToAdd.add) {
                 foot.appendChild(button(verbsToAdd.add, 'enter', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
                     add(card, node);

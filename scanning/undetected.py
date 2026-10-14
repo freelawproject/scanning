@@ -36,9 +36,20 @@ because a dropped footnote is three cells and one answer.
 
 A footnote cell makes no card (the curator's word, 2026-10-13: a
 footnote the ``FOOTNOTES`` box stopped short of is a loss worth no
-card), so a block is body text and the card offers a ``TEXT_COLUMN``
-box over it, or a dismissal for a block that is not text (the print
-of the leaf behind, a stray mark).
+card), so a block is body text. The verdict's order is kept: it reads
+the redactions before the frame, so a unit a visible redaction covers
+is excluded as a redaction and never dropped as undetected, and a
+block a curator blacked out by hand makes no card either
+(``redactions.visible_by_page``, the glue's own list).
+
+The card writes nothing of its own (the curator's word, 2026-10-14): a
+block the boxes miss is nearly always the foot of a column the model
+stopped short, so the answer is the page's column box pulled over it
+(the card page's edit of another box, the viewer's own handles), and
+the card goes at the next rebuild when the box covers the block. A
+dismissal says the block is not text (the print of the leaf behind, a
+stray mark). A third column box on a page is what the answer must not
+add: the gutter passes read a page's column boxes as its two columns.
 """
 
 from __future__ import annotations
@@ -50,7 +61,7 @@ from collections.abc import Iterator
 from blackletter.models import Label
 from django.db import transaction
 
-from scanning import boundaries, detections, opinion_ocr
+from scanning import boundaries, detections, opinion_ocr, redactions
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -207,7 +218,10 @@ def _inside(box: Box, rect: dict) -> bool:
 
 
 def missed_cells(
-    reading: TextReading, frame: list[dict], size: tuple[float, float]
+    reading: TextReading,
+    frame: list[dict],
+    size: tuple[float, float],
+    rects: list[dict] = (),
 ) -> list[dict]:
     """Return the text cells of a page the frame does not cover.
 
@@ -216,6 +230,8 @@ def missed_cells(
     :param size: The page size in points, the space the frame is in,
         so a reading rendered at another size than the detections
         lands on the same page.
+    :param rects: The page's visible redactions, in points
+        (``redactions.visible_by_page``): the verdict's first test.
     :returns: The cells, as the reading holds them.
     :rtype: list[dict]
     """
@@ -231,6 +247,14 @@ def missed_cells(
             box[2], box[3], reading.img_width, reading.img_height, *size
         )
         box_pt = [x0, y0, x1, y1]
+        # The verdict's first test: a unit a redaction covers is
+        # excluded as a redaction, never dropped as undetected.
+        if (
+            rects
+            and opinion_ocr.covered_share(box_pt, rects)[0]
+            >= opinion_ocr.EXCLUDE_SHARE
+        ):
+            continue
         # The common case first: a cell inside one box is covered
         # whole, and the measure need not be run on it.
         if any(_inside(box_pt, rect) for rect in frame):
@@ -295,27 +319,37 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
     )
     if not readings:
         return
-    # The run's space alone, the glue's own selection
-    # (``opinion_ocr.load_inputs``): a human row ``relocate_rows`` could
-    # not place keeps its old index and its old run, and is a stale
-    # card, never cover on the page its old index names.
+    # The run's space alone, every live row of it whatever its render
+    # size, the glue's own selection (``opinion_ocr.load_inputs``): a
+    # human row ``relocate_rows`` could not place keeps its old index
+    # and its old run, and is a stale card, never cover on the page
+    # its old index names.
     by_page: dict[int, list[Detection]] = {}
-    for row in Detection.objects.live().filter(
-        scan=scan, apply_run=run, img_width__gt=0, img_height__gt=0
-    ):
+    for row in Detection.objects.live().filter(scan=scan, apply_run=run):
         by_page.setdefault(row.page_index, []).append(row)
+    rects_by_page = {
+        entry["page_index"]: entry["rects"]
+        for entry in redactions.visible_by_page(scan)
+    }
     for reading in readings:
         rows = by_page.get(reading.page_index)
         if not rows or not reading.img_width or not reading.img_height:
             continue
-        width, height = rows[0].img_width, rows[0].img_height
+        # The page's render, off the first row that has one, as the
+        # glue's ``inputs.renders`` reads it.
+        sized = next((r for r in rows if r.img_width and r.img_height), None)
+        if sized is None:
+            continue
+        width, height = sized.img_width, sized.img_height
         # The page size in points, as the rows' render gives it: the
         # space ``opinion_ocr.verdict`` measures in.
         size = boundaries.to_points(width, height, width, height)
         frame = opinion_ocr.page_frame(rows, size)
         if frame is None:
             continue
-        missed = missed_cells(reading, frame, size)
+        missed = missed_cells(
+            reading, frame, size, rects_by_page.get(reading.page_index, [])
+        )
         for block in clusters(missed):
             yield _finding(reading, block, width, height)
 
@@ -326,9 +360,9 @@ def _finding(
     """Build the finding dict of one block of text in no box.
 
     The box is in the pixels of the detections' render, the space every
-    finding's box is in; ``guess`` repeats it, so the sidebar's add and
-    the card review draw the box where the block is. The metadata is
-    what ``findings.address_of`` keys a dismissal by.
+    finding's box is in; ``guess`` repeats it, so the sidebar card and
+    the card review flash the block. The metadata is what
+    ``findings.address_of`` keys a dismissal by.
     """
     cells = block["cells"]
     label = Label.TEXT_COLUMN
@@ -353,7 +387,7 @@ def _finding(
         "page_number": reading.page_index + 1,
         "message": (
             f"{count} in no box (“{text}”). The opinion "
-            "text leaves out a block the boxes miss. Draw a text column "
+            "text leaves out a block the boxes miss. Pull the column box "
             "over it, or dismiss the card if it is not text."
         ),
         "metadata": {

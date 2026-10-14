@@ -21,6 +21,7 @@ from scanning.models import (
 from scanning.tests.test_findings import (
     make_boundary,
     make_detection,
+    make_redaction,
     make_scan,
 )
 from scanning.tests.test_views import ScanningTestCase
@@ -291,6 +292,51 @@ class TestTheRule(ScanningTestCase):
             y1=OUTSIDE[3],
         )
         self.write(cell("Under a headnote box"))
+        self.assertEqual(self.found(), [])
+
+    def test_a_visible_redaction_is_cover(self):
+        # The verdict reads the redactions first: a unit a redaction
+        # covers is excluded as a redaction, never dropped as
+        # undetected, so a block a curator blacked out makes no card.
+        column(self.scan)
+        make_redaction(
+            self.scan,
+            page_index=0,
+            origin="human",
+            kind="add",
+            rect_type="manual",
+            x0=350.0,
+            y0=60.0,
+            x1=590.0,
+            y1=230.0,
+        )
+        self.write(cell("Blacked out by hand"))
+        self.assertEqual(self.found(), [])
+
+    def test_a_redaction_on_another_page_is_no_cover(self):
+        column(self.scan)
+        make_redaction(
+            self.scan, page_index=1, x0=350.0, y0=60.0, x1=590.0, y1=230.0
+        )
+        self.write(cell("Left outside"))
+        self.assertEqual(len(self.found()), 1)
+
+    def test_a_row_with_no_render_size_still_covers(self):
+        # The glue's frame is every live row of the run, a row with no
+        # render size mapped at the render density.
+        column(self.scan)
+        make_detection(
+            self.scan,
+            "HEADNOTE",
+            page_index=0,
+            x0=OUTSIDE[0],
+            y0=OUTSIDE[1],
+            x1=OUTSIDE[2],
+            y1=OUTSIDE[3],
+            img_width=0,
+            img_height=0,
+        )
+        self.write(cell("Under a box with no render"))
         self.assertEqual(self.found(), [])
 
     def test_a_deactivated_box_does_not_cover(self):
