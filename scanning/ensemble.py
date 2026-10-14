@@ -3199,6 +3199,8 @@ def build_page(
             )
             sequence.append(entry["groups"][-1])
             entry["counts"]["figures"] += 1
+            if group["section"] == FOOTNOTES:
+                entry["counts"]["footnote_groups"] += 1
             if len(group["engines"]) == 1 and len(pages) > 1:
                 entry["counts"]["figure_single"] += 1
             continue
