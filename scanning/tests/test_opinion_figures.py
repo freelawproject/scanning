@@ -1366,6 +1366,32 @@ class TestTheApproval(FigureTestCase):
         self.assertEqual(refused.exception.code, opinion_review.FIGURES)
         download.assert_not_called()
 
+    def test_the_approval_embeds_the_cut_of_a_footnote(self):
+        """A picture a note holds is embedded like one of the body
+        (#486), and its box leaves the object."""
+        self.run_ensemble()
+        document = self.stored()
+        text = paragraphs.approved_document(document, {}, "curator", "now")
+        picture = next(p for p in text["body"] if p["kind"] == markup.FIGURE)
+        text["body"] = [p for p in text["body"] if p is not picture]
+        text["footnotes"] = [
+            {"label": "1", "pages": picture["pages"], "paragraphs": [picture]}
+        ]
+        figure = ensemble.figures_of(document)[0]
+        key = opinion_figures.key(self.opinion, "a1", figure)
+
+        with patch(
+            "scanning.s3_sync.download_bytes_object",
+            side_effect=lambda asked: {key: b"jpeg"}[asked],
+        ):
+            opinion_review._embed_figures(self.opinion, document, text)
+
+        embedded = text["footnotes"][0]["paragraphs"][0]["figure"]
+        self.assertNotIn("box_pt", embedded)
+        self.assertEqual(
+            embedded["data"], base64.b64encode(b"jpeg").decode("ascii")
+        )
+
     def test_a_missing_cut_refuses_the_approval(self):
         self.run_ensemble()
         document = self.stored()
