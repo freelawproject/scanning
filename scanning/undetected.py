@@ -295,10 +295,13 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
     )
     if not readings:
         return
-    pages = {r.page_index for r in readings}
+    # The run's space alone, the glue's own selection
+    # (``opinion_ocr.load_inputs``): a human row ``relocate_rows`` could
+    # not place keeps its old index and its old run, and is a stale
+    # card, never cover on the page its old index names.
     by_page: dict[int, list[Detection]] = {}
     for row in Detection.objects.live().filter(
-        scan=scan, page_index__in=pages
+        scan=scan, apply_run=run, img_width__gt=0, img_height__gt=0
     ):
         by_page.setdefault(row.page_index, []).append(row)
     for reading in readings:
@@ -306,8 +309,6 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
         if not rows or not reading.img_width or not reading.img_height:
             continue
         width, height = rows[0].img_width, rows[0].img_height
-        if not width or not height:
-            continue
         # The page size in points, as the rows' render gives it: the
         # space ``opinion_ocr.verdict`` measures in.
         size = boundaries.to_points(width, height, width, height)

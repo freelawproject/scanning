@@ -342,6 +342,22 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(found[0]["metadata"]["bbox"], OUTSIDE)
         self.assertEqual(found[0]["metadata"]["img_width"], WIDTH)
 
+    def test_a_row_of_another_run_does_not_cover(self):
+        # The glue reads the run's space alone: a human row the
+        # relocation could not place keeps its old index and its old
+        # run, and is a stale card, not cover.
+        column(self.scan)
+        run = ApplyRun.objects.create(scan=self.scan, number=1, page_map={})
+        column(
+            self.scan,
+            bbox=OUTSIDE,
+            model_name=Detection.ModelName.MANUAL,
+            confidence=1.0,
+            apply_run=run,
+        )
+        self.write(cell("Left outside"))
+        self.assertEqual(len(self.found()), 1)
+
     def test_a_reading_of_another_run_is_not_read(self):
         column(self.scan)
         self.write(cell("Left outside"))

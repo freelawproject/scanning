@@ -81,7 +81,7 @@
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
     {% endif %}
     {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
-    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Draw a {{ issue.metadata.label }} box over the block of text, the box the card flashes. The card goes now, and the next compute reads the text."
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Draw a text column box over the block of text, the box the card flashes. The card goes now, and the next compute reads the text."
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
     {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
