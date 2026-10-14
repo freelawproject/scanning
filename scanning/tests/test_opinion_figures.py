@@ -1427,16 +1427,18 @@ class TestTheEndpoints(FigureTestCase):
         self.assertEqual(len(ensemble.figures_of(self.stored())), 1)
         self.assertFalse(OpinionEdit.objects.exists())
 
-    def test_only_a_move_edits_a_picture(self):
-        group = self.figure_group()
+    def revisions(self) -> dict:
         document = self.stored()
-        revisions = {
+        return {
             "glue_revision": document["opinion"]["glue_revision"],
             "edit_revision": document.get("edit_revision", 0),
         }
+
+    def test_a_move_and_a_section_alone_edit_a_picture(self):
+        group = self.figure_group()
+        revisions = self.revisions()
         for name, body in (
             ("edit_opinion_text", {"text": "words"}),
-            ("edit_opinion_section", {"section": ensemble.FOOTNOTES}),
             ("edit_opinion_blockquote", {"quoted": True}),
             ("edit_opinion_drop", {}),
         ):
@@ -1455,6 +1457,32 @@ class TestTheEndpoints(FigureTestCase):
             self.assertEqual(
                 response.json()["message"], views_api.EDIT_FIGURE_MESSAGE
             )
+
+    def test_a_picture_goes_to_the_footnotes(self):
+        """The curator's answer to a footnote zone the detections drew
+        short (#486): one ``SECTION`` edit over the picture's box, and
+        the build puts the picture in the footnotes."""
+        group = self.figure_group()
+
+        response = self.client.post(
+            self.url("edit_opinion_section"),
+            {
+                "page_in_opinion": 1,
+                "group_id": group["id"],
+                "section": ensemble.FOOTNOTES,
+                **self.revisions(),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        edit = OpinionEdit.objects.get(opinion=self.opinion)
+        self.assertEqual(edit.kind, OpinionEdit.Kind.SECTION)
+        self.assertEqual(edit.box_pt, group["box_pt"])
+        self.opinion.refresh_from_db()
+        moved = self.figure_group()
+        self.assertEqual(moved["section"], ensemble.FOOTNOTES)
+        self.assertEqual(moved["section_edit"], edit.pk)
 
     def test_the_url_of_a_picture(self):
         group = self.figure_group()
