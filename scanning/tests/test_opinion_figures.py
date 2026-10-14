@@ -232,28 +232,84 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(figures(page), [])
         self.assertEqual(page["dropped"][0]["reason"], "redaction")
 
-    def test_a_picture_is_never_a_footnote_or_a_quote(self):
+    def test_a_picture_in_the_footnote_zone_is_a_footnote(self):
+        """A footnote can hold a picture (#486): the zone decides its
+        section as it decides a block's, and it is never a quote."""
         zone = [30.0, 400.0, 290.0, 580.0]
         pages = {
-            name: engine_page([picture(name, 0)], zones=[zone], quotes=[zone])
+            name: engine_page(
+                [
+                    unit(name, 0, ABOVE_PT, "The court held."),
+                    unit(name, 1, [40.0, 405.0, 280.0, 415.0], "14."),
+                    picture(name, 2),
+                ],
+                zones=[zone],
+                quotes=[zone],
+            )
             for name in ("dots_mocr", "mistral_ocr")
         }
 
         page = ensemble.build_page(pages, 0)
 
         group = figures(page)[0]
-        self.assertEqual(group["section"], ensemble.BODY)
+        self.assertEqual(group["section"], ensemble.FOOTNOTES)
+        self.assertEqual(group["band"], ensemble.FOOTNOTES)
         self.assertFalse(group["blockquote"])
         self.assertEqual(page["blockquotes"], [])
+        # In the footnotes after the label, and the text takes no
+        # paragraph for it.
+        self.assertEqual(page["footnotes"], "14.")
+        self.assertEqual(page["text"], "The court held.")
+        self.assertEqual((group["start"], group["end"]), (5, 5))
 
-    def test_a_picture_is_in_no_block_below(self):
-        """A push to the footnotes takes the blocks below it, never a
-        picture: its edit would land on nothing."""
+    def test_a_picture_outside_every_zone_stays_in_the_body(self):
+        zone = [30.0, 600.0, 290.0, 700.0]
+        pages = {
+            name: engine_page([picture(name, 0)], zones=[zone])
+            for name in ("dots_mocr", "mistral_ocr")
+        }
+
+        page = ensemble.build_page(pages, 0)
+
+        self.assertEqual(figures(page)[0]["section"], ensemble.BODY)
+
+    def test_a_section_edit_moves_a_picture(self):
+        """A curator puts a picture the zone missed in the footnotes,
+        and one the zone took back in the body (#486)."""
+        zone = [30.0, 400.0, 290.0, 580.0]
+        for zones, section in (
+            ([], ensemble.FOOTNOTES),
+            ([zone], ensemble.BODY),
+        ):
+            pages = {
+                name: engine_page([picture(name, 0)], zones=zones)
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+            edit = {
+                "id": 7,
+                "kind": OpinionEdit.Kind.SECTION,
+                "box_pt": PICTURE_PT,
+                "section": section,
+                "by": "curator",
+                "at": "",
+            }
+
+            page = ensemble.build_page(pages, 0, [edit])
+
+            group = figures(page)[0]
+            self.assertEqual(group["section"], section)
+            self.assertEqual(group["section_edit"], 7)
+            self.assertEqual(page["unresolved_edits"], [])
+
+    def test_a_picture_goes_with_the_blocks_below(self):
+        """A push to the footnotes takes the blocks below it, a picture
+        too (#486), and a picture pushed takes the blocks below it."""
         page = self.three_engines()
 
-        above = page["groups"][0]
-        self.assertNotIn(figures(page)[0]["id"], above["below"])
-        self.assertNotIn("below", figures(page)[0])
+        above, below = page["groups"][0], page["groups"][2]
+        picture_id = figures(page)[0]["id"]
+        self.assertEqual(above["below"], [picture_id, below["id"]])
+        self.assertEqual(figures(page)[0]["below"], [below["id"]])
 
     def test_a_picture_at_the_head_of_the_page_is_body_text(self):
         """The approved text reads the body band alone, so a picture in
