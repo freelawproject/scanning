@@ -210,6 +210,43 @@ def inner_edges(
     return edge - nudge, edge + nudge
 
 
+#: A box is in a column when the column holds more than this of its
+#: width. The model's two boxes of a page overlap by a sliver at the
+#: gutter before the import separates them, and that sliver is the
+#: gutter, never one column.
+COLUMN_SHARE = 0.5
+
+
+def column_groups(spans: list[tuple[float, float]]) -> list[list[int]]:
+    """Group the boxes of a page into its columns, left to right.
+
+    A page's columns are groups of boxes, not boxes: a picture cuts
+    each column into a box above it and a box below it, and a curator
+    draws a box over a block at a column's foot. A box joins the column
+    to its left when that column holds more than :data:`COLUMN_SHARE`
+    of its width, so a sliver of overlap at the gutter opens the next
+    column. The gutter is read between the two groups, never between a
+    box and another box of its own column, and two boxes in one column
+    are no pair.
+
+    :param spans: ``(x0, x1)`` per box, in one space.
+    :returns: The positions of each group's boxes, left to right.
+    :rtype: list[list[int]]
+    """
+    groups: list[list[int]] = []
+    reach = None
+    for at in sorted(range(len(spans)), key=lambda i: spans[i][0]):
+        x0, x1 = spans[at]
+        inside = min(x1, reach) - x0 if reach is not None else 0.0
+        if groups and inside > (x1 - x0) * COLUMN_SHARE:
+            groups[-1].append(at)
+            reach = max(reach, x1)
+        else:
+            groups.append([at])
+            reach = x1
+    return groups
+
+
 def separate_rows(scan, cells: dict[int, PageCells]) -> int:
     """Separate the ``TEXT_COLUMN`` rows of a scan, in place.
 
@@ -240,33 +277,41 @@ def separate_rows(scan, cells: dict[int, PageCells]) -> int:
 
     changed, pairs = [], 0
     for page_index, rows in sorted(pages.items()):
-        if len(rows) != 2 or any(
+        groups = column_groups([(row.x0, row.x1) for row in rows])
+        if len(groups) != 2 or any(
             row.model_name == Detection.ModelName.MANUAL for row in rows
         ):
             continue
         pairs += 1
-        left, right = rows
-        width, height = float(left.img_width), float(left.img_height)
+        lefts = [rows[at] for at in groups[0]]
+        rights = [rows[at] for at in groups[1]]
+        width, height = float(lefts[0].img_width), float(lefts[0].img_height)
         if width <= 0 or height <= 0:
             continue
         edges = _edges_for(
-            (left.x0, left.x1),
-            (right.x0, right.x1),
+            (min(r.x0 for r in lefts), max(r.x1 for r in lefts)),
+            (min(r.x0 for r in rights), max(r.x1 for r in rights)),
             cells.get(page_index),
             width,
             height,
-            min(left.y0, right.y0),
-            max(left.y1, right.y1),
+            min(r.y0 for r in rows),
+            max(r.y1 for r in rows),
         )
         if edges is None:
             continue
         new_left, new_right = edges
-        if abs(new_left - left.x1) >= MIN_MOVE_PX:
-            left.x1 = round(new_left, 1)
-            changed.append(left)
-        if abs(new_right - right.x0) >= MIN_MOVE_PX:
-            right.x0 = round(new_right, 1)
-            changed.append(right)
+        # Inwards only, box by box: a box short of its column's edge
+        # keeps its own.
+        for left in lefts:
+            target = min(left.x1, new_left)
+            if abs(target - left.x1) >= MIN_MOVE_PX:
+                left.x1 = round(target, 1)
+                changed.append(left)
+        for right in rights:
+            target = max(right.x0, new_right)
+            if abs(target - right.x0) >= MIN_MOVE_PX:
+                right.x0 = round(target, 1)
+                changed.append(right)
     if changed:
         Detection.objects.bulk_update(changed, ["x0", "x1"], batch_size=500)
     _log(pairs, len(changed), "the rows")
@@ -293,43 +338,54 @@ def separate_document(document, cells: dict[int, PageCells]) -> int:
     moved = 0
     pages = 0
     for page in getattr(document, "pages", []):
-        indexed = sorted(
-            (
-                (position, det)
-                for position, det in enumerate(page.detections)
-                if det.label == Label.TEXT_COLUMN
-            ),
-            key=lambda pair: pair[1].bbox.x1,
-        )
-        if len(indexed) != 2:
+        indexed = [
+            (position, det)
+            for position, det in enumerate(page.detections)
+            if det.label == Label.TEXT_COLUMN
+        ]
+        groups = column_groups([(d.bbox.x1, d.bbox.x2) for _, d in indexed])
+        if len(groups) != 2:
             continue
         pages += 1
-        (left_at, left), (right_at, right) = indexed
+        lefts = [indexed[at] for at in groups[0]]
+        rights = [indexed[at] for at in groups[1]]
         width, height = float(page.img_width), float(page.img_height)
         if width <= 0 or height <= 0:
             continue
+        boxes = [d.bbox for _, d in indexed]
         edges = _edges_for(
-            (left.bbox.x1, left.bbox.x2),
-            (right.bbox.x1, right.bbox.x2),
+            (
+                min(d.bbox.x1 for _, d in lefts),
+                max(d.bbox.x2 for _, d in lefts),
+            ),
+            (
+                min(d.bbox.x1 for _, d in rights),
+                max(d.bbox.x2 for _, d in rights),
+            ),
             cells.get(page.index),
             width,
             height,
-            min(left.bbox.y1, right.bbox.y1),
-            max(left.bbox.y2, right.bbox.y2),
+            min(b.y1 for b in boxes),
+            max(b.y2 for b in boxes),
         )
         if edges is None:
             continue
         new_left, new_right = edges
-        if abs(new_left - left.bbox.x2) >= MIN_MOVE_PX:
-            page.detections[left_at] = replace(
-                left, bbox=replace(left.bbox, x2=round(new_left, 1))
-            )
-            moved += 1
-        if abs(new_right - right.bbox.x1) >= MIN_MOVE_PX:
-            page.detections[right_at] = replace(
-                right, bbox=replace(right.bbox, x1=round(new_right, 1))
-            )
-            moved += 1
+        # Inwards only, box by box, the rule of ``separate_rows``.
+        for left_at, left in lefts:
+            target = min(left.bbox.x2, new_left)
+            if abs(target - left.bbox.x2) >= MIN_MOVE_PX:
+                page.detections[left_at] = replace(
+                    left, bbox=replace(left.bbox, x2=round(target, 1))
+                )
+                moved += 1
+        for right_at, right in rights:
+            target = max(right.bbox.x1, new_right)
+            if abs(target - right.bbox.x1) >= MIN_MOVE_PX:
+                page.detections[right_at] = replace(
+                    right, bbox=replace(right.bbox, x1=round(target, 1))
+                )
+                moved += 1
     _log(pages, moved, "the document")
     return moved
 
