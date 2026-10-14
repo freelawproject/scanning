@@ -1279,16 +1279,20 @@ VIEWER = (
 
 
 class TestTheViewer(TestCase):
-    def test_a_picture_takes_a_move_alone(self):
-        """The toolbar of a picture stops after the two moves and the
-        Undo of the order: the four other edits refuse it."""
+    def test_a_picture_takes_a_move_and_a_section_alone(self):
+        """The toolbar of a picture stops after the two moves, the two
+        sections (#486) and their Undos: the three other edits refuse
+        it."""
         source = VIEWER.read_text()
         bar = source[source.index("function fillBar(") :]
         bar = bar[: bar.index("\n    }\n")]
         stop = bar.index("if (figure) { return; }")
         self.assertLess(bar.index("'Move down'"), stop)
         self.assertLess(bar.index("'Undo the order'"), stop)
-        self.assertGreater(bar.index("'Put in the footnotes'"), stop)
+        self.assertLess(bar.index("'Put in the footnotes'"), stop)
+        self.assertLess(bar.index("'Undo the section'"), stop)
+        self.assertGreater(bar.index("quoteButtons(bar"), stop)
+        self.assertGreater(bar.index("'Not text'"), stop)
         self.assertIn("!figure", bar[: bar.index("'Edit text'") + 200])
 
     def test_the_picture_is_read_from_its_endpoint(self):
