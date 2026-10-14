@@ -261,6 +261,8 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(page["footnotes"], "14.")
         self.assertEqual(page["text"], "The court held.")
         self.assertEqual((group["start"], group["end"]), (5, 5))
+        # The label and the picture: the summary counts both.
+        self.assertEqual(page["counts"]["footnote_groups"], 2)
 
     def test_a_picture_outside_every_zone_stays_in_the_body(self):
         zone = [30.0, 600.0, 290.0, 700.0]

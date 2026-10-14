@@ -3695,6 +3695,8 @@ def build_page(
             )
             sequence.append(entry["groups"][-1])
             entry["counts"]["figures"] += 1
+            if group["section"] == FOOTNOTES:
+                entry["counts"]["footnote_groups"] += 1
             continue
         read_back = resolve(group)
         # A person said the block is not text: the bleed-through of
