@@ -7,7 +7,7 @@ from django.db import migrations, models
 
 class Migration(migrations.Migration):
     dependencies = [
-        ("scanning", "0056_not_text"),
+        ("scanning", "0058_text_reading"),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
