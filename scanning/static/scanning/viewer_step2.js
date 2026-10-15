@@ -452,6 +452,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 })(div, entry.pdf_index);
             }
         } else if (!viewOnly) {
+            // A double click on the page itself drops a caption box
+            // there (``dropCaptionAt``). A box stops its own double
+            // click, so the one that reaches the wrapper is on the page;
+            // the ghost and its popup are left to their own clicks.
+            if (!opinionEditMode) (function (pageDiv, pIdx) {
+                pageDiv.querySelector('.canvas-wrapper').addEventListener('dblclick', function (e) {
+                    if (e.target.closest && e.target.closest('.det-draw-preview, .det-draw-popup')) return;
+                    e.stopPropagation();
+                    dropCaptionAt(pageDiv, pIdx, e);
+                });
+            })(div, entry.pdf_index);
             // Editable page number
             var editBtn = div.querySelector('.editable-page');
             if (editBtn) {
@@ -1212,6 +1223,109 @@ document.addEventListener('DOMContentLoaded', function () {
         activeDrawPageDiv.querySelector('.draw-det-btn').classList.remove('active');
         activeDrawPageDiv = null;
         _cancelDetDraw();
+    }
+
+    // A double click on an empty place of the page drops a caption box
+    // there, for the curator to resize and confirm with the handles and
+    // the Add popup of the Draw mode. The caption is the one box the
+    // model misses whole on a page it reads otherwise
+    // (``missing_caption``), and its place has one rule: it fills its
+    // column from the click down to the next box of the head matter or
+    // the next case under it, or to the height a caption has in this
+    // volume, whichever comes first. The click is the top: the curator
+    // points at where the title starts, and the box reads from there.
+
+    // The labels that end a caption: the head matter under it, or the
+    // next case on the page.
+    var CAPTION_FLOOR = {
+        KEY_ICON: 1, BACKGROUND: 1, SYLLABUS: 1, CASE_METADATA: 1, HEADNOTE: 1,
+        HEADNOTE_BRACKET: 1, DIVIDER: 1, CASE_SEQUENCE: 1, CASE_CAPTION: 1,
+        JUDGES: 1, EDITORIAL: 1, FOOTNOTES: 1, STATE_ABBREVIATION: 1,
+    };
+    // The space a caption keeps from the box under it, in image pixels.
+    var CAPTION_FLOOR_GAP = 8;
+    // The share of the volume's caption height the box keeps when the
+    // floor is right under the click, so there is a box to take hold of.
+    var CAPTION_MIN_SHARE = 0.25;
+    // The size of a caption when the volume has none to measure, as a
+    // share of the page.
+    var CAPTION_DEFAULT_WIDTH = 0.3, CAPTION_DEFAULT_HEIGHT = 0.16;
+    var _captionSize = null;
+
+    // The median width and height of the volume's captions, from the
+    // boxes the viewer holds (the model's at 0.5 and up, and every
+    // hand-drawn one, which reads 1.0), measured once.
+    function _volumeCaptionSize(imgW, imgH) {
+        if (_captionSize) return _captionSize;
+        var ws = [], hs = [];
+        (allDetections || []).forEach(function (d) {
+            if (d.label !== 'CASE_CAPTION' || !d.bbox || (d.confidence || 0) < 0.5) return;
+            ws.push(d.bbox[2] - d.bbox[0]);
+            hs.push(d.bbox[3] - d.bbox[1]);
+        });
+        var median = function (a) {
+            if (!a.length) return 0;
+            a.sort(function (p, q) { return p - q; });
+            return a[Math.floor(a.length / 2)];
+        };
+        var size = {
+            width: median(ws) || imgW * CAPTION_DEFAULT_WIDTH,
+            height: median(hs) || imgH * CAPTION_DEFAULT_HEIGHT,
+        };
+        if (ws.length) _captionSize = size;
+        return size;
+    }
+
+    // The caption box for a click at (ix, iy), in image pixels.
+    function _captionBoxAt(pdfIndex, ix, iy, imgW, imgH) {
+        var page = (allDetections || []).filter(function (d) {
+            return d.page_index === pdfIndex && d.bbox;
+        });
+        var mid = imgW / 2;
+        var left = ix < mid;
+        var columns = page.filter(function (d) {
+            return d.label === 'TEXT_COLUMN' && ((d.bbox[0] + d.bbox[2]) / 2 < mid) === left;
+        });
+        var size = _volumeCaptionSize(imgW, imgH);
+        var x0, x1;
+        if (columns.length) {
+            // The column under the click, else the nearest on that side.
+            var under = columns.filter(function (d) { return d.bbox[0] <= ix && ix <= d.bbox[2]; });
+            var col = under[0] || columns[0];
+            x0 = col.bbox[0]; x1 = col.bbox[2];
+        } else {
+            x0 = Math.max(0, ix - size.width / 2);
+            x1 = Math.min(imgW, x0 + size.width);
+        }
+        var y1 = Math.min(imgH, iy + size.height);
+        page.forEach(function (d) {
+            if (!CAPTION_FLOOR[d.label]) return;
+            if (d.bbox[2] <= x0 || d.bbox[0] >= x1) return;
+            if (d.bbox[1] <= iy + CAPTION_FLOOR_GAP) return;
+            y1 = Math.min(y1, d.bbox[1] - CAPTION_FLOOR_GAP);
+        });
+        if (columns.length) {
+            var foot = Math.max.apply(null, columns.map(function (d) { return d.bbox[3]; }));
+            y1 = Math.min(y1, foot);
+        }
+        y1 = Math.max(y1, Math.min(imgH, iy + size.height * CAPTION_MIN_SHARE));
+        return [x0, iy, x1, y1];
+    }
+
+    function dropCaptionAt(pageDiv, pdfIndex, e) {
+        var canvas = pageDiv.querySelector('.pdf-canvas');
+        if (!canvas || !canvas.width || !canvas.height) return;
+        var pt = eventToCanvasPixels(e, canvas);
+        // The image space of the page, as ``_confirmDetDraw`` reads it.
+        var imgW = cachedImgW || 1700, imgH = cachedImgH || 2200;
+        var pd = (allDetections || []).find(function (d) { return d.page_index === pdfIndex; });
+        if (pd) { imgW = pd.img_width || imgW; imgH = pd.img_height || imgH; }
+        var sx = imgW / canvas.width, sy = imgH / canvas.height;
+        var box = _captionBoxAt(pdfIndex, pt.x * sx, pt.y * sy, imgW, imgH);
+        _showDetDrawPreview(
+            pageDiv, pdfIndex,
+            box[0] / sx, box[1] / sy, (box[2] - box[0]) / sx, (box[3] - box[1]) / sy
+        );
     }
 
     function _showDetDrawPreview(pageDiv, pdfIndex, x, y, w, h) {
