@@ -545,22 +545,48 @@ _NEVER_JOINED = frozenset({"party", "separator"})
 _WORD = re.compile(r"\w+")
 
 
-def _snap_to_words(text: str, rows: list[dict]) -> list[dict]:
+def _words(paragraph: dict) -> list[tuple[int, int]]:
+    """Return the ``(start, end)`` of each word in the paragraph's text.
+
+    A word is found in the characters :func:`_paragraph` writes
+    (``markup.projected_characters``), so a word cut at a line end
+    ("Color-\\nado") is one word, as the tagger read it and the XML
+    writes it. The offsets are the source text's.
+
+    :param paragraph: A body paragraph.
+    :rtype: list[tuple[int, int]]
+    """
+    source = paragraph.get("text") or ""
+    items = frozenset(
+        mark["start"]
+        for mark in paragraph.get("marks") or []
+        if mark.get("kind") == markup.ITEM and mark.get("start", 0) > 0
+    )
+    kept = markup.projected_characters(source, items)
+    text = "".join(char for _, char in kept)
+    return [
+        (kept[word.start()][0], kept[word.end() - 1][0] + 1)
+        for word in _WORD.finditer(text)
+    ]
+
+
+def _snap_to_words(paragraph: dict, rows: list[dict]) -> list[dict]:
     """Give every word a span edge cuts to the longest span that touches it.
 
     The tagger labels tokens, and a token is often part of a word, so a
     label can change inside it (``Color|ado``, ``TR|UST`` with the
     ``TR`` left out). The longest span is the one the model was surest
     of: the line it labels whole. The other spans lose their share of
-    the word, and a span left with no text is dropped.
+    the word, and a span left with no text is dropped. The words are
+    :func:`_words`.
 
-    :param text: The paragraph's text.
+    :param paragraph: A body paragraph.
     :param rows: Its spans, copies the caller owns.
     :returns: The spans in text order.
     :rtype: list[dict]
     """
-    for word in _WORD.finditer(text):
-        start, end = word.span()
+    text = paragraph.get("text") or ""
+    for start, end in _words(paragraph):
         touching = [r for r in rows if r["start"] < end and r["end"] > start]
         if not touching or (
             len(touching) == 1
@@ -601,7 +627,7 @@ def _snap_to_words(text: str, rows: list[dict]) -> list[dict]:
     return merged
 
 
-def _one_caption_label(rows: list[dict]) -> None:
+def _one_caption_label(rows: list[dict]) -> set[int]:
     """Give a caption line's other spans its one caption label.
 
     On a line in capitals the model changes the label word by word
@@ -613,44 +639,63 @@ def _one_caption_label(rows: list[dict]) -> None:
     labels is two elements (:func:`_cut_caption_paragraph`).
 
     :param rows: The spans of one head-matter paragraph, changed in place.
+    :returns: The ``id`` of every span it relabeled: a piece of the
+        element beside it, which :func:`_join_touching` joins to it
+        whatever the label.
+    :rtype: set[int]
     """
     caption = {
         row["label"] for row in rows if row["label"] in HEAD_MATTER_LABELS
     }
     if len(caption) != 1:
-        return
+        return set()
     (label,) = caption
     own = sum(r["end"] - r["start"] for r in rows if r["label"] == label)
     other = sum(r["end"] - r["start"] for r in rows if r["label"] != label)
     if own <= other:
-        return
+        return set()
+    relabeled = {id(row) for row in rows if row["label"] != label}
     for row in rows:
         row["label"] = label
+    return relabeled
 
 
-def _join_touching(text: str, rows: list[dict]) -> list[dict]:
+def _join_touching(
+    text: str, rows: list[dict], relabeled: set[int] = frozenset()
+) -> list[dict]:
     """Join the spans of one label that only :data:`_EDGE` separates.
 
     The model cuts one element at a bracket or a full stop
-    (``[`` and ``June 5, 2024]``, ``Bradley S`` and ``Davis``). Never
-    ``party`` or ``separator`` (:data:`_NEVER_JOINED`).
+    (``[`` and ``June 5, 2024]``, ``Bradley S`` and ``Davis``). Two
+    ``party`` or ``separator`` spans (:data:`_NEVER_JOINED`) are two
+    elements, unless one of the pair is a span
+    :func:`_one_caption_label` relabeled: a flicker inside one party
+    ("Michael R. BARBER" and a ``heading`` on "Appellant") is that
+    party, never a second one.
 
     :param text: The paragraph's text.
     :param rows: Its spans in text order.
+    :param relabeled: The ``id`` of each span step 2 relabeled.
     :returns: The spans in text order.
     :rtype: list[dict]
     """
     joined: list[dict] = []
+    # Whether the last piece of joined[-1] is a relabeled span.
+    last_relabeled = False
     for row in rows:
+        flicker = id(row) in relabeled
         if (
             joined
             and joined[-1]["label"] == row["label"]
-            and row["label"] not in _NEVER_JOINED
+            and (
+                row["label"] not in _NEVER_JOINED or flicker or last_relabeled
+            )
             and not text[joined[-1]["end"] : row["start"]].strip(_EDGE)
         ):
             joined[-1]["end"] = max(joined[-1]["end"], row["end"])
         else:
             joined.append(row)
+        last_relabeled = flicker
     return joined
 
 
@@ -778,17 +823,16 @@ def repair_spans(
     :raises CasebodyError: When a span does not address the body.
     """
     by = {
-        index: _snap_to_words(
-            body[index].get("text") or "", [dict(row) for row in rows]
-        )
+        index: _snap_to_words(body[index], [dict(row) for row in rows])
         for index, rows in _spans_by_paragraph(body, spans).items()
     }
     by = {index: rows for index, rows in by.items() if rows}
     split = head_matter_end(body, by)
     for index, rows in by.items():
-        if index < split:
-            _one_caption_label(rows)
-        by[index] = _join_touching(body[index].get("text") or "", rows)
+        relabeled = _one_caption_label(rows) if index < split else set()
+        by[index] = _join_touching(
+            body[index].get("text") or "", rows, relabeled
+        )
     split = head_matter_end(body, by)
     new_body: list[dict] = []
     new_spans: list[dict] = []

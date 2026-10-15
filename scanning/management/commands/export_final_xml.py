@@ -117,12 +117,23 @@ class Command(BaseCommand):
                 else:
                     final_xml.mark_for_rewrite(rows)
                     owed = list(final_xml.owed_rows(rows))
+            stranded = (
+                list(final_xml.stranded_rows(rows))
+                if options["rewrite"]
+                else []
+            )
             withdrawn = list(final_xml.withdrawn_rows(rows))
             orphans = [
                 key
                 for prefix in prefixes
                 for key in final_xml.orphan_keys(prefix)
             ]
+            for opinion in stranded:
+                self.stdout.write(
+                    f"keep {final_xml.key(opinion)} ({opinion} of scan "
+                    f"{opinion.scan_id}): its spans are of an older "
+                    "approved text, so a rewrite needs a tagger run first"
+                )
             if dry_run:
                 self._report(owed, withdrawn, orphans)
                 return

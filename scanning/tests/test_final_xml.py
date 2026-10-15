@@ -566,6 +566,33 @@ class TestTheCommand(_ExportCase):
         self.assertIn("Would write 1 and delete 0", out)
         self.assertEqual(self.refresh().final_xml_schema, casebody.SCHEMA)
 
+    def test_rewrite_names_a_row_whose_spans_were_left_behind(self):
+        # A rewrite of the approved text that moved the body: the stored
+        # object stays until a tagger run of the new text.
+        self.tagged()
+        final_xml.export_due()
+        key = final_xml.key(self.opinion)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=f"{self.opinion.approved_text_key}.new"
+        )
+        stored = self.xml[key]
+
+        for args in (("--rewrite", "--dry-run"), ("--rewrite",)):
+            out = self.run_command("--all", *args)
+
+            self.assertIn(f"keep {key}", out)
+            self.assertIn("needs a tagger run first", out)
+        self.assertEqual(self.xml[key], stored)
+
+    def test_without_rewrite_no_row_is_named(self):
+        self.tagged()
+        final_xml.export_due()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=f"{self.opinion.approved_text_key}.new"
+        )
+
+        self.assertNotIn("keep ", self.run_command("--all", "--dry-run"))
+
     def test_it_deletes_the_objects_no_stamp_names(self):
         self.tagged()
         final_xml.export_due()

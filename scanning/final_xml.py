@@ -545,6 +545,27 @@ def written_rows(opinions: QuerySet | None = None) -> QuerySet:
     ).order_by("-approved_at", "-pk")
 
 
+def stranded_rows(opinions: QuerySet | None = None) -> QuerySet:
+    """Return the stored rows a rewrite cannot build again (#474).
+
+    The text review is done and an object is stored, but the spans are
+    over an older approved text: a rewrite of the text moved the body
+    and left the spans behind (``opinion_review.rewrite_text``). The
+    object stays as it was until a tagger run of the new text, the
+    rule of the module docstring, so the command names each one.
+
+    :param opinions: The rows to look in; every opinion by default.
+    :rtype: QuerySet
+    """
+    opinions = Opinion.objects.all() if opinions is None else opinions
+    return (
+        opinions.exclude(final_xml_tag_key="")
+        .filter(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .exclude(_exportable_q())
+        .order_by("pk")
+    )
+
+
 def mark_for_rewrite(opinions: QuerySet | None = None) -> int:
     """Make the current stored objects owed again (#474).
 

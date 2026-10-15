@@ -1598,6 +1598,18 @@ class TestTheWordEdges(TestCase):
 
         self.assertEqual(root.find("attorneys").text, text)
 
+    def test_a_word_cut_at_a_line_end_is_one_word(self):
+        # The XML writes "Colorado": the hyphen and the line end go.
+        approved_doc, spans = with_opinion(
+            para("Color-\nado Court of Appeals"),
+            spans=[span(0, 0, 5, "docketnumber"), span(0, 7, 27, "court")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(root.find("court").text, "Colorado Court of Appeals")
+        self.assertIsNone(root.find(".//docketnumber"))
+
     def test_a_span_at_word_edges_is_kept(self):
         body, spans = casebody.repair_spans(
             [para("No. 1 Court.")],
@@ -1633,6 +1645,47 @@ class TestOneCaptionLabel(TestCase):
         history = root.find("history")
         self.assertEqual(history.text, text)
         self.assertEqual(len(history), 0)
+
+    def test_a_flicker_inside_one_party_is_that_party(self):
+        approved_doc, spans = with_opinion(
+            para("Michael R. BARBER, Appellant,"),
+            para("v."),
+            para("STATE."),
+            spans=[
+                span(0, 0, 17, "party"),
+                span(0, 19, 28, "heading"),
+                span(1, 0, 2, "separator"),
+                span(2, 0, 6, "party"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [c.tag for c in root.find("parties")],
+            ["party", "separator", "party"],
+        )
+        self.assertEqual(
+            root.find("parties/party").text, "Michael R. BARBER, Appellant,"
+        )
+
+    def test_a_flicker_joins_only_the_party_it_touches(self):
+        approved_doc, spans = with_opinion(
+            para("Jane ROE; John DOE SMITH, Appellants,"),
+            spans=[
+                span(0, 0, 8, "party"),
+                span(0, 10, 18, "party"),
+                span(0, 19, 24, "heading"),
+                span(0, 26, 36, "party"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [p.text for p in root.findall("parties/party")],
+            ["Jane ROE;", "John DOE SMITH, Appellants,"],
+        )
 
     def test_a_line_with_two_caption_labels_keeps_both(self):
         approved_doc, spans = with_opinion(
