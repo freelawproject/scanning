@@ -452,6 +452,17 @@ document.addEventListener('DOMContentLoaded', function () {
                 })(div, entry.pdf_index);
             }
         } else if (!viewOnly) {
+            // A double click on the page itself drops a caption box
+            // there (``dropCaptionAt``). A box stops its own double
+            // click, so the one that reaches the wrapper is on the page;
+            // the ghost and its popup are left to their own clicks.
+            if (!opinionEditMode) (function (pageDiv, pIdx) {
+                pageDiv.querySelector('.canvas-wrapper').addEventListener('dblclick', function (e) {
+                    if (e.target.closest && e.target.closest('.det-draw-preview, .det-draw-popup')) return;
+                    e.stopPropagation();
+                    dropCaptionAt(pageDiv, pIdx, e);
+                });
+            })(div, entry.pdf_index);
             // Editable page number
             var editBtn = div.querySelector('.editable-page');
             if (editBtn) {
@@ -1014,11 +1025,11 @@ document.addEventListener('DOMContentLoaded', function () {
         wrapper.querySelectorAll('.detection-box').forEach(function (el) { el.remove(); });
 
         // The labels that affect the pipeline (pairing, redaction,
-        // headnotes, layout), plus HEADING and BLOCKQUOTE. Those two
-        // affect no redaction: they are opinion-body structure and they
-        // feed the opinion model (#335). They are drawn so a curator can
-        // see what the model read before drawing the box it missed, so
-        // do not take them out as "unused" (#343).
+        // headnotes, layout). HEADING and BLOCKQUOTE affect no
+        // redaction: they are opinion-body structure for the opinion
+        // model (#335), and the model's boxes of them crowd the page, so
+        // they are not drawn. A curator's own box of either still draws
+        // (``d.manual``), and the drawer still offers both.
         var USED_LABELS = {
             CASE_CAPTION: true, KEY_ICON: true,
             STATE_ABBREVIATION: true, PAGE_HEADER: true, PAGE_NUMBER: true,
@@ -1026,7 +1037,6 @@ document.addEventListener('DOMContentLoaded', function () {
             CASE_SEQUENCE: true, HEADNOTE: true, CASE_METADATA: true,
             FOOTNOTES: true, IMAGE: true, TEXT_COLUMN: true,
             BACKGROUND: true, SYLLABUS: true, JUDGES: true,
-            HEADING: true, BLOCKQUOTE: true,
         };
         // A column box is the full height of its column, so it would cover the
         // detections inside it and take their clicks. Draw those first, and the
@@ -1215,6 +1225,109 @@ document.addEventListener('DOMContentLoaded', function () {
         _cancelDetDraw();
     }
 
+    // A double click on an empty place of the page drops a caption box
+    // there, for the curator to resize and confirm with the handles and
+    // the Add popup of the Draw mode. The caption is the one box the
+    // model misses whole on a page it reads otherwise
+    // (``missing_caption``), and its place has one rule: it fills its
+    // column from the click down to the next box of the head matter or
+    // the next case under it, or to the height a caption has in this
+    // volume, whichever comes first. The click is the top: the curator
+    // points at where the title starts, and the box reads from there.
+
+    // The labels that end a caption: the head matter under it, or the
+    // next case on the page.
+    var CAPTION_FLOOR = {
+        KEY_ICON: 1, BACKGROUND: 1, SYLLABUS: 1, CASE_METADATA: 1, HEADNOTE: 1,
+        HEADNOTE_BRACKET: 1, DIVIDER: 1, CASE_SEQUENCE: 1, CASE_CAPTION: 1,
+        JUDGES: 1, EDITORIAL: 1, FOOTNOTES: 1, STATE_ABBREVIATION: 1,
+    };
+    // The space a caption keeps from the box under it, in image pixels.
+    var CAPTION_FLOOR_GAP = 8;
+    // The share of the volume's caption height the box keeps when the
+    // floor is right under the click, so there is a box to take hold of.
+    var CAPTION_MIN_SHARE = 0.25;
+    // The size of a caption when the volume has none to measure, as a
+    // share of the page.
+    var CAPTION_DEFAULT_WIDTH = 0.3, CAPTION_DEFAULT_HEIGHT = 0.16;
+    var _captionSize = null;
+
+    // The median width and height of the volume's captions, from the
+    // boxes the viewer holds (the model's at 0.5 and up, and every
+    // hand-drawn one, which reads 1.0), measured once.
+    function _volumeCaptionSize(imgW, imgH) {
+        if (_captionSize) return _captionSize;
+        var ws = [], hs = [];
+        (allDetections || []).forEach(function (d) {
+            if (d.label !== 'CASE_CAPTION' || !d.bbox || (d.confidence || 0) < 0.5) return;
+            ws.push(d.bbox[2] - d.bbox[0]);
+            hs.push(d.bbox[3] - d.bbox[1]);
+        });
+        var median = function (a) {
+            if (!a.length) return 0;
+            a.sort(function (p, q) { return p - q; });
+            return a[Math.floor(a.length / 2)];
+        };
+        var size = {
+            width: median(ws) || imgW * CAPTION_DEFAULT_WIDTH,
+            height: median(hs) || imgH * CAPTION_DEFAULT_HEIGHT,
+        };
+        if (ws.length) _captionSize = size;
+        return size;
+    }
+
+    // The caption box for a click at (ix, iy), in image pixels.
+    function _captionBoxAt(pdfIndex, ix, iy, imgW, imgH) {
+        var page = (allDetections || []).filter(function (d) {
+            return d.page_index === pdfIndex && d.bbox;
+        });
+        var mid = imgW / 2;
+        var left = ix < mid;
+        var columns = page.filter(function (d) {
+            return d.label === 'TEXT_COLUMN' && ((d.bbox[0] + d.bbox[2]) / 2 < mid) === left;
+        });
+        var size = _volumeCaptionSize(imgW, imgH);
+        var x0, x1;
+        if (columns.length) {
+            // The column under the click, else the nearest on that side.
+            var under = columns.filter(function (d) { return d.bbox[0] <= ix && ix <= d.bbox[2]; });
+            var col = under[0] || columns[0];
+            x0 = col.bbox[0]; x1 = col.bbox[2];
+        } else {
+            x0 = Math.max(0, ix - size.width / 2);
+            x1 = Math.min(imgW, x0 + size.width);
+        }
+        var y1 = Math.min(imgH, iy + size.height);
+        page.forEach(function (d) {
+            if (!CAPTION_FLOOR[d.label]) return;
+            if (d.bbox[2] <= x0 || d.bbox[0] >= x1) return;
+            if (d.bbox[1] <= iy + CAPTION_FLOOR_GAP) return;
+            y1 = Math.min(y1, d.bbox[1] - CAPTION_FLOOR_GAP);
+        });
+        if (columns.length) {
+            var foot = Math.max.apply(null, columns.map(function (d) { return d.bbox[3]; }));
+            y1 = Math.min(y1, foot);
+        }
+        y1 = Math.max(y1, Math.min(imgH, iy + size.height * CAPTION_MIN_SHARE));
+        return [x0, iy, x1, y1];
+    }
+
+    function dropCaptionAt(pageDiv, pdfIndex, e) {
+        var canvas = pageDiv.querySelector('.pdf-canvas');
+        if (!canvas || !canvas.width || !canvas.height) return;
+        var pt = eventToCanvasPixels(e, canvas);
+        // The image space of the page, as ``_confirmDetDraw`` reads it.
+        var imgW = cachedImgW || 1700, imgH = cachedImgH || 2200;
+        var pd = (allDetections || []).find(function (d) { return d.page_index === pdfIndex; });
+        if (pd) { imgW = pd.img_width || imgW; imgH = pd.img_height || imgH; }
+        var sx = imgW / canvas.width, sy = imgH / canvas.height;
+        var box = _captionBoxAt(pdfIndex, pt.x * sx, pt.y * sy, imgW, imgH);
+        _showDetDrawPreview(
+            pageDiv, pdfIndex,
+            box[0] / sx, box[1] / sy, (box[2] - box[0]) / sx, (box[3] - box[1]) / sy
+        );
+    }
+
     function _showDetDrawPreview(pageDiv, pdfIndex, x, y, w, h) {
         _cancelDetDraw();
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
@@ -1222,8 +1335,10 @@ document.addEventListener('DOMContentLoaded', function () {
 
         var preview = document.createElement('div');
         preview.className = 'det-draw-preview';
-        _updatePreviewPos();
+        // The positioner reads the variable, so it is set first: set
+        // after, the ghost had no place or size until it was dragged.
         detDrawPreview = preview;
+        _updatePreviewPos();
 
         // 8 resize handles
         ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'].forEach(function (hName) {
@@ -1621,8 +1736,9 @@ document.addEventListener('DOMContentLoaded', function () {
             clearOverlaysByClass('margin-overlay-box');
             clearOverlaysByClass('opinion-bounds-overlay');
         }
-        // The masks of the selected opinion live in the bounds mode
-        // alone, so every other step of the cycle removes them (#311).
+        // The masks of the selected opinion follow the mode (dim in the
+        // bounds mode, white on a shared page in the solid mode, none
+        // otherwise), so every step of the cycle draws them again (#311).
         drawOpinionDim();
         _showOverlayMode();
     };
@@ -2089,6 +2205,22 @@ document.addEventListener('DOMContentLoaded', function () {
         if (adoptDetection(replacedId, newId)) refreshOverlays();
     };
 
+
+    // A row the sidebar drew (the "add" of a missed-bracket card): one
+    // entry, drawn on its page the way the drawer's own add is.
+    window.addDetectionRow = function (det) {
+        if (!allDetections) allDetections = [];
+        det.page_number = _pageNumForIndex(det.page_index);
+        det.manual = true;
+        allDetections.push(det);
+        var pageDiv = _pageDivForIndex(det.page_index);
+        if (pageDiv) {
+            detectionsVisible[det.page_index] = true;
+            var btn = pageDiv.querySelector('.detect-btn');
+            if (btn) btn.classList.add('active');
+            drawDetectionOverlay(pageDiv, det.page_index);
+        }
+    };
     function _selectDetectionBox(div, det) {
         _deselectDetectionBox();
         _selectedDetBox = div;
@@ -2326,12 +2458,15 @@ document.addEventListener('DOMContentLoaded', function () {
     /**
      * Draw the masks of the selected opinion on one page.
      *
-     * A page outside the opinion is covered whole; a page the opinion
-     * shares with a neighbour gets one mask per outside rect. Both are
-     * dim, and both draw in the bounds mode alone: that mode is the one
-     * the opinion boundaries are the subject of. The redaction modes
-     * show the page as the output has it, so an opinion mask has no
-     * place there, and an opaque white page even less (#311).
+     * In the bounds mode, the mode the opinion boundaries are the
+     * subject of, a page outside the opinion is covered whole and a
+     * page the opinion shares with a neighbour gets one dim mask per
+     * outside rect. In the solid mode the shared page shows what the
+     * opinion's own PDF has: the neighbour's share painted white, the
+     * mask ``opinion_pdf`` cuts. The pages outside the opinion stay as
+     * they are there, because an opaque white page over every other
+     * page read as a whiteout of the volume (#311). The two other modes
+     * draw no mask.
      *
      * @param {HTMLElement} pageDiv - The .page-container element.
      */
@@ -2339,10 +2474,13 @@ document.addEventListener('DOMContentLoaded', function () {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
         if (!wrapper) return;
         wrapper.querySelectorAll('.opinion-dim-overlay').forEach(function(el) { el.remove(); });
-        if (!_dimSpan || overlayMode !== 'bounds') return;
+        if (!_dimSpan) return;
+        var solid = overlayMode === 'solid';
+        if (!solid && overlayMode !== 'bounds') return;
 
         var num = parseInt(pageDiv.dataset.pdfIndex);
         if (num < _dimSpan.start || num > _dimSpan.end) {
+            if (solid) return;
             var cover = document.createElement('div');
             cover.className = 'opinion-dim-overlay';
             cover.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.3);z-index:15;pointer-events:none;';
@@ -2369,9 +2507,13 @@ document.addEventListener('DOMContentLoaded', function () {
             dim.style.top = (r.y0 * dsy) + 'px';
             dim.style.width = ((r.x1 - r.x0) * dsx) + 'px';
             dim.style.height = ((r.y1 - r.y0) * dsy) + 'px';
-            dim.style.background = 'rgba(0,0,0,0.25)';
+            dim.style.background = solid ? 'rgba(255,255,255,1)' : 'rgba(0,0,0,0.25)';
             dim.style.zIndex = '15';
-            dim.style.pointerEvents = 'none';
+            // The white mask is opaque and sits above the boxes, so it
+            // takes the pointer too: a box nobody can see must not take
+            // a click or a drag. The dim mask is see-through, and the
+            // boxes under it stay in reach.
+            dim.style.pointerEvents = solid ? 'auto' : 'none';
             wrapper.appendChild(dim);
         });
     }

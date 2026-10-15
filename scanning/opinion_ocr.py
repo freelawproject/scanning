@@ -1215,15 +1215,31 @@ def verdict(
     elif is_page_number(box_pt, text, printed, height_pt, label):
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
-    elif (
-        frame is not None
-        and covered_share(box_pt, frame)[0] < UNDETECTED_SHARE
-    ):
+    elif undetected(box_pt, frame):
         exclusion = {"reason": UNDETECTED}
         share = 1.0
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def undetected(box_pt: list[float], frame: list[dict] | None) -> bool:
+    """Say whether the detections of a page missed a unit.
+
+    **The one rule**, read by :func:`verdict` for the drop and by
+    ``undetected.uncovered`` for the review-2 card, so the card and
+    the drop agree: the frame (:func:`page_frame`) covers less than
+    :data:`UNDETECTED_SHARE` of the unit. A page with no frame is not
+    judged.
+
+    :param box_pt: The unit's box in points.
+    :param frame: The page's frame, or None.
+    :returns: Whether the unit is undetected.
+    :rtype: bool
+    """
+    if frame is None:
+        return False
+    return covered_share(box_pt, frame)[0] < UNDETECTED_SHARE
 
 
 def is_page_number(

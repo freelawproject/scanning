@@ -10,6 +10,18 @@
 var _currentOpinionIdx = -1;
 var _opinions = [];
 
+// A click on a finding card moves the PDF pane, the scroll tracking
+// selects the opinion under it, and the selected card would scroll
+// into view, carrying the findings off the top of the aside out from
+// under the reader's hand. The click holds the aside still for the
+// moment the pane takes to settle, and no longer: an arrow step or the
+// reader's own scroll brings the selected card into view as before.
+var _asideHeldUntil = 0;
+var ASIDE_HOLD_MS = 1500;
+function holdAside() {
+    _asideHeldUntil = Date.now() + ASIDE_HOLD_MS;
+}
+
 (function () {
     var cfg = window.SCAN_CONFIG;
     if (!cfg || cfg.step < 2) return;
@@ -27,7 +39,9 @@ var _opinions = [];
         cards.forEach(function (c, i) {
             if (i === idx) {
                 c.classList.add("selected");
-                c.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                if (Date.now() >= _asideHeldUntil) {
+                    c.scrollIntoView({ behavior: "smooth", block: "nearest" });
+                }
             } else {
                 c.classList.remove("selected");
             }
@@ -265,6 +279,9 @@ var _opinions = [];
 // --- Global functions (called from template onclick handlers) ---
 
 function goToPage(elOrNum) {
+    if (typeof elOrNum === "object" && elOrNum.classList && elOrNum.classList.contains("finding-card")) {
+        holdAside();
+    }
     // Opinion image/headnote badges carry data-pdf-index: resolve to that
     // exact page. Logical page numbers can repeat (e.g. unnumbered front
     // matter borrowing the real pages' numbers), so pdf_index is unambiguous.
@@ -278,6 +295,19 @@ function goToPage(elOrNum) {
             setTimeout(function () {
                 pel.style.outline = "";
             }, 2000);
+            // A row that carries boxes (the missing-caption row's guess
+            // of where the caption is) flashes them on the page.
+            if (elOrNum.dataset.boxes) {
+                var boxes = elOrNum.dataset.boxes.split(";").map(function (s) {
+                    return s.split(",").map(parseFloat);
+                });
+                _flashBoxes(
+                    pel,
+                    boxes,
+                    parseInt(elOrNum.dataset.imgW, 10),
+                    parseInt(elOrNum.dataset.imgH, 10)
+                );
+            }
         }
         return;
     }
@@ -297,11 +327,7 @@ function goToPage(elOrNum) {
 function highlightDetection(el) {
     var d = _getDetectionData(el);
     if (!d) return;
-
-    document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
-        e.remove();
-    });
-
+    holdAside();
     // Resolve by pdf index: logical page numbers can repeat (e.g.
     // unnumbered front matter colliding with the real pages), so
     // 'pv-page-<logical>' ids are ambiguous.
@@ -314,33 +340,137 @@ function highlightDetection(el) {
     setTimeout(function () {
         container.style.outline = "";
     }, 2000);
+    _flashBoxes(container, [d.guess || d.bbox], d.imgW, d.imgH);
+}
 
+// The "add" of a missed-bracket card: a HEADNOTE_BRACKET box drawn
+// where the card's guess puts the bracket, through the same endpoint
+// as the drawer. The endpoint rebuilt the findings, so the card goes
+// when the section is fetched again: a live bracket box covers the
+// reading. The viewer draws the row at once.
+function addGuessedDetection(btn) {
+    var d = _getDetectionData(btn);
+    if (!d || !d.guess) return;
+    var cfg = window.SCAN_CONFIG;
+    btn.disabled = true;
+    btn.textContent = "...";
+    var det = {
+        page_index: d.pageIndex,
+        label: d.label,
+        label_id: d.labelId,
+        confidence: 1.0,
+        bbox: d.guess,
+        img_width: d.imgW,
+        img_height: d.imgH,
+    };
+    fetch("/scans/" + cfg.docId + "/add-single-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify(det),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = "+";
+                showToast((data && (data.message || data.error)) || "Could not add the box");
+                return;
+            }
+            if (data.added === false) {
+                if (window.adoptDetection) window.adoptDetection(data.replaced_id, data.detection_id);
+            } else if (window.addDetectionRow) {
+                det.id = data.detection_id;
+                window.addDetectionRow(det);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = "+";
+            showToast("Could not add the box");
+        });
+}
+
+// Pulse one or more boxes over a page for a few seconds: the box a
+// finding card names, or the image boxes an opinion card's chip names.
+// The boxes are in the detection's image pixels. The page is drawn
+// lazily, so the draw waits for its canvas, up to a few seconds: a page
+// far from the one in view is fetched and rendered after the scroll.
+// A link into the viewer with a page in its hash jumps there once the
+// page list exists: ``#pdf=<index>`` is the position in the drawn space
+// (data-pdf-index), and ``box=x0,y0,x1,y1&w=<width>&h=<height>``, in
+// image pixels, flashes that box on the page. The card review opens
+// step 2 at the card's page this way, into one named tab per volume, so
+// a hash change in that tab jumps again.
+function jumpToHashTarget(attempt) {
+    attempt = attempt || 0;
+    var params = new URLSearchParams((location.hash || "").replace(/^#/, ""));
+    var index = parseInt(params.get("pdf"), 10);
+    if (isNaN(index)) return;
+    var target = document.querySelector('.lazy-page[data-pdf-index="' + index + '"]');
+    if (!target) {
+        if (attempt < 75) {
+            setTimeout(function () { jumpToHashTarget(attempt + 1); }, 200);
+        }
+        return;
+    }
+    var el = document.createElement("span");
+    el.dataset.pdfIndex = String(index);
+    var box = (params.get("box") || "").split(",").map(parseFloat);
+    var imgW = parseInt(params.get("w"), 10);
+    var imgH = parseInt(params.get("h"), 10);
+    if (box.length === 4 && box.every(isFinite) && imgW > 0 && imgH > 0) {
+        el.dataset.boxes = box.join(",");
+        el.dataset.imgW = String(imgW);
+        el.dataset.imgH = String(imgH);
+    }
+    goToPage(el);
+}
+document.addEventListener("DOMContentLoaded", function () { jumpToHashTarget(0); });
+window.addEventListener("hashchange", function () { jumpToHashTarget(0); });
+
+function _flashBoxes(container, boxes, imgW, imgH, attempt) {
+    attempt = attempt || 0;
+    if (!attempt) {
+        document.querySelectorAll(".unmatched-highlight").forEach(function (e) {
+            e.remove();
+        });
+    }
     setTimeout(function () {
         var wrapper = container.querySelector(".canvas-wrapper");
         var canvas = container.querySelector(".pdf-canvas");
-        if (!wrapper || !canvas) return;
+        if (!wrapper || !canvas || !canvas.offsetWidth) {
+            if (attempt < 15) _flashBoxes(container, boxes, imgW, imgH, attempt + 1);
+            return;
+        }
 
-        var sx = canvas.offsetWidth / (d.imgW || 1);
-        var sy = canvas.offsetHeight / (d.imgH || 1);
+        var sx = canvas.offsetWidth / (imgW || 1);
+        var sy = canvas.offsetHeight / (imgH || 1);
 
-        var div = document.createElement("div");
-        div.className = "unmatched-highlight";
-        div.style.position = "absolute";
-        div.style.left = d.bbox[0] * sx + "px";
-        div.style.top = d.bbox[1] * sy + "px";
-        div.style.width = (d.bbox[2] - d.bbox[0]) * sx + "px";
-        div.style.height = (d.bbox[3] - d.bbox[1]) * sy + "px";
-        div.style.border = "3px solid #f59e0b";
-        div.style.background = "rgba(245, 158, 11, 0.15)";
-        div.style.zIndex = "20";
-        div.style.pointerEvents = "none";
-        div.style.borderRadius = "2px";
-        div.style.animation = "unmatched-pulse 1s ease-in-out 3";
-        wrapper.appendChild(div);
+        boxes.forEach(function (bbox) {
+            var div = document.createElement("div");
+            div.className = "unmatched-highlight";
+            div.style.position = "absolute";
+            div.style.left = bbox[0] * sx + "px";
+            div.style.top = bbox[1] * sy + "px";
+            div.style.width = (bbox[2] - bbox[0]) * sx + "px";
+            div.style.height = (bbox[3] - bbox[1]) * sy + "px";
+            div.style.border = "3px solid #f59e0b";
+            div.style.background = "rgba(245, 158, 11, 0.15)";
+            div.style.zIndex = "20";
+            div.style.pointerEvents = "none";
+            div.style.borderRadius = "2px";
+            div.style.animation = "unmatched-pulse 1s ease-in-out 3";
+            wrapper.appendChild(div);
 
-        setTimeout(function () {
-            div.remove();
-        }, 5000);
+            setTimeout(function () {
+                div.remove();
+            }, 5000);
+        });
     }, 400);
 }
 
@@ -852,5 +982,9 @@ function _getDetectionData(el) {
         label: row.dataset.unmatchedLabel,
         labelId: parseInt(row.dataset.labelId),
         detectionId: parseInt(row.dataset.detectionId),
+        // A missed-bracket card: the bracket's own place in the cell.
+        guess: row.dataset.guess
+            ? row.dataset.guess.split(",").map(function (s) { return parseFloat(s.trim()); })
+            : null,
     };
 }

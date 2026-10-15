@@ -105,6 +105,33 @@ def blocking_filter() -> Q:
     )
 
 
+def warning_filter() -> Q:
+    """Return the filter of an open warning card.
+
+    The twin of :func:`blocking_filter` for the warnings review, which
+    walks these cards one after the next and gates nothing: an open
+    card of WARNING severity that a dismissal can close.
+
+    :returns: A ``Q`` over ``OpinionFinding``.
+    """
+    return (
+        Q(dismissal__isnull=True)
+        & Q(severity=Issue.Severity.WARNING)
+        & ~Q(check_name__in=UNDISMISSABLE_OPINION_CHECKS)
+    )
+
+
+def warning_findings(opinion: Opinion):
+    """Return the open warning cards of one opinion (:func:`warning_filter`).
+
+    :param opinion: The opinion.
+    :returns: A queryset of ``OpinionFinding`` rows.
+    """
+    return OpinionFinding.objects.filter(opinion=opinion).filter(
+        warning_filter()
+    )
+
+
 def blocking_findings(opinion: Opinion):
     """Return the open cards the approval of one opinion waits on.
 

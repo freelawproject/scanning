@@ -27,6 +27,9 @@
     var SCALE = 2;
 
     var root = null;
+    /** The level the page walks: 'blocking', or 'warning' for the
+     *  warnings review, which gates nothing (``data-level``). */
+    var level = 'blocking';
     var sections = [];
 
     function el(tag, className, text) {
@@ -125,6 +128,9 @@
             }
             self.opinion = answer.data.opinion;
             self.cards = answer.data.cards;
+            // The open blocking cards, whatever this page walks: the
+            // approval stays behind the gate.
+            self.blockingOpen = answer.data.blocking_open || 0;
             self.render();
         }).catch(function (error) {
             self.cardsNode.replaceChildren(note('The cards did not load: ' + error.message, 'error'));
@@ -160,7 +166,8 @@
         this.cardsNode.replaceChildren.apply(this.cardsNode, nodes);
         this.metaNode.textContent = (this.opinion ? this.opinion.page_count + ' pages · ' : '')
             + this.open().length + ' card(s) open';
-        this.approveButton.disabled = this.approved || this.cards.length > 0;
+        this.approveButton.disabled = this.approved || this.cards.length > 0
+            || (level === 'warning' && this.blockingOpen > 0);
         this.cards.concat(this.answers.map(function (a) { return a.card; })).forEach(function (card) {
             if (card.kind !== 'link' && card.crop) { drawCrop(self, card); }
         });
@@ -322,7 +329,8 @@
     /** Whether the opinion can be approved from here: loaded, not
      *  approved yet, and no card left, link cards included. */
     Section.prototype.ready = function () {
-        return !!this.opinion && !this.approved && this.cards.length === 0;
+        return !!this.opinion && !this.approved && this.cards.length === 0
+            && (level !== 'warning' || this.blockingOpen === 0);
     };
 
     Section.prototype.approve = function () {
@@ -502,7 +510,32 @@
             release.title = 'Open this card again';
             release.addEventListener('click', function () { section.release(card); });
             footer.appendChild(release);
+        } else if (card.kind === 'link' && card.dismiss_url) {
+            // A card that only points at the page: once the page was
+            // looked at, the dismissal closes it, with the Undo of
+            // every dismissal.
+            var fine = el('button', 'btn-outline text-xs', 'Looks good');
+            fine.type = 'button';
+            fine.title = 'Dismiss this card: the page was looked at and'
+                + ' reads right';
+            fine.addEventListener('click', function () {
+                fine.disabled = true;
+                section.dismiss(card, node);
+            });
+            footer.appendChild(fine);
         } else if (card.kind !== 'link') {
+            // The plain way to bless a card: the text stays as shown,
+            // and the page's card closes once every open word of the
+            // page is kept, the rule of ``keep``.
+            var right = el('button', 'btn-outline text-xs', 'Looks good');
+            right.type = 'button';
+            right.title = 'Keep the text as shown; the page\'s card closes'
+                + ' once every open word of the page is answered';
+            right.addEventListener('click', function () {
+                right.disabled = true;
+                section.keep(card, node);
+            });
+            footer.appendChild(right);
             var junk = el('button', 'btn-outline text-xs', 'Not text');
             junk.type = 'button';
             junk.title = 'Take the whole block out of the text: it is not'
@@ -531,6 +564,17 @@
     }
 
     function describe(card) {
+        if (card.level === 'warning') {
+            if (card.kind === 'word') {
+                return 'a majority settled this word over one engine: bless it or pick the other reading';
+            }
+            if (card.kind === 'block') {
+                return (card.silent && card.silent.length
+                    ? card.silent.join(', ') + ' read nothing here'
+                    : 'the engines did not all read this block alike')
+                    + ': keep it as shown or pick a reading';
+            }
+        }
         if (card.kind === 'word') { return 'no two engines agree on a word'; }
         if (card.kind === 'block') {
             return (card.table ? 'a table' : 'a block') + ' with ' + card.open
@@ -592,12 +636,23 @@
         button.type = 'button';
         button.appendChild(el('span', 'bk-who', engine));
         var val = el('span', 'bk-val');
+        // The reading that is in the text now, marked: the majority's
+        // word in the warnings review, the shown block or word in the
+        // blocking one. Choosing it keeps the text as shown.
+        var shown = value !== '' && (card.kind === 'word'
+            ? fold(value) === fold(card.token)
+            : fold(value) === fold(card.text));
         if (value === '') {
             val.appendChild(el('span', 'bk-nothing', 'read nothing here'));
         } else {
             if (before) { val.appendChild(el('span', 'bk-ctx', lastWords(before, 1) + ' ')); }
             val.appendChild(document.createTextNode(value));
             if (after) { val.appendChild(el('span', 'bk-ctx', ' ' + firstWords(after, 1))); }
+        }
+        if (shown) {
+            button.classList.add('bk-shown');
+            button.title = 'This reading is in the text now; choosing it keeps the text as shown';
+            val.appendChild(el('span', 'bk-shown-tag', '\u2713'));
         }
         button.appendChild(val);
         button.addEventListener('click', function () {
@@ -766,6 +821,7 @@
 
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('blocking-review');
+        level = (root && root.dataset.level) || 'blocking';
         if (!root) { return; }
         if (window.pdfjsLib) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =

@@ -41,6 +41,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionScan,
     Redaction,
+    ReviewDismissal,
     Scan,
     Stage,
     Status,
@@ -226,6 +227,23 @@ DISMISSED_DETECTION_MESSAGE = (
 )
 WITHDRAWN_DETECTION_MESSAGE = (
     "The detection was withdrawn. Nothing was deleted."
+)
+#: The Undo of a dismissal of a model box (``restore_detection``).
+RESTORED_DETECTION_MESSAGE = "The box is back. Nothing was deleted."
+#: ``restore_detection`` on a box no dismissal stands on.
+DETECTION_NOT_DISMISSED_MESSAGE = (
+    "This box was not dismissed, so there is nothing to take back."
+)
+#: ``restore_detection`` on a hand-drawn row (409).
+RESTORE_MODEL_ONLY_MESSAGE = (
+    "Only a dismissed model box comes back this way. A box you drew is "
+    "withdrawn and drawn again."
+)
+#: ``restore_detection`` on a model box a move or an approval replaced
+#: (409): the box the curator sees holds it now.
+RESTORE_REPLACED_MESSAGE = (
+    "This box was moved or approved, so the box you see holds it now. "
+    "Withdraw that box and the model's comes back."
 )
 ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
 MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
@@ -530,6 +548,7 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     from scanning import review_states, yolo
+    from scanning.services import drop_junk_entries
 
     scan = get_object_or_404(Scan, pk=pk)
     if review_states.preview_only(scan):
@@ -568,9 +587,22 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # "approve" is a row written before #414; since then an
             # approval is a hand-drawn row (``manual``) over a dismiss.
             "decision": d.decision.kind if d.decision_id else None,
+            # Read by the junk rule below, and not sent.
+            "found_by": (
+                d.found_by
+                if d.found_by and d.model_name != Detection.ModelName.MANUAL
+                else None
+            ),
         }
         for d in dets
     ]
+    # The blot along the top or the bottom edge the model boxed as a key
+    # icon or a headnote is not drawn, and a box that runs down onto the
+    # bottom one is cut at the band top: the compute reads the boxes that way
+    # (``services.detection_entries``), so a page must show them that way.
+    drop_junk_entries(data)
+    for entry in data:
+        del entry["found_by"]
     return JsonResponse(data, safe=False)
 
 
@@ -2735,7 +2767,14 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
 def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """Take back the dismissal of a finding: the card comes back.
 
-    :param request: The HTTP request (JSON body with ``issue_id``).
+    By ``issue_id``, the card as the page holds it, or by
+    ``dismissal_id``, the row ``dismiss_finding`` answered: a finding's
+    pk dies at the next rebuild, which every later write runs, while a
+    dismissal is never deleted, so a page that keeps an Undo across
+    other writes (the card review) sends the dismissal.
+
+    :param request: The HTTP request (JSON body with ``issue_id`` or
+        ``dismissal_id``).
     :param pk: Scan primary key.
     :return: ``{status, restored, message}``.
     """
@@ -2747,10 +2786,21 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    row = _finding_or_404(scan, data)
-    if isinstance(row, JsonResponse):
-        return row
-    restored = findings.restore(scan, row, request.user)
+    if data.get("dismissal_id") is not None:
+        rows = ReviewDismissal.objects.filter(
+            pk=data["dismissal_id"], scan=scan
+        )
+        if not rows.exists():
+            return JsonResponse(
+                {"status": "error", "message": "Dismissal not found"},
+                status=404,
+            )
+        restored = bool(findings.withdraw(rows, request.user))
+    else:
+        row = _finding_or_404(scan, data)
+        if isinstance(row, JsonResponse):
+            return row
+        restored = findings.restore(scan, row, request.user)
     return JsonResponse(
         {
             "status": "ok",
@@ -2826,7 +2876,9 @@ def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
     """
     from scanning import findings
 
-    context = findings.viewer_groups(scan)
+    # The scan rides along for the link to the card review
+    # (``card_review``), which the page's own context carries already.
+    context = {**findings.viewer_groups(scan), "scan": scan}
     return {
         "html": render_to_string(
             "scanning/_review_findings.html", context, request=request
@@ -2955,6 +3007,79 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 WITHDRAWN_DETECTION_MESSAGE
                 if manual
                 else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a model box: the box is live again.
+
+    The Undo of :func:`delete_detection` on a model row, which the card
+    review offers on a box it took out (``card_review``). The standing
+    ``deactivate`` decision is withdrawn (``detections.withdraw``), the
+    row gets its own value back, and the findings are written again. A
+    hand-drawn row has no dismissal to take back: it is withdrawn and
+    drawn again, so the request is refused.
+
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
+    :param pk: Scan primary key.
+    :return: ``{status, restored, message}``; 404 when the row is gone,
+        409 for a hand-drawn row.
+    """
+    from scanning import detections
+
+    scan = get_object_or_404(Scan, pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = Detection.objects.filter(
+        pk=data.get("detection_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    if row.model_name == Detection.ModelName.MANUAL:
+        return JsonResponse(
+            {"status": "error", "message": RESTORE_MODEL_ONLY_MESSAGE},
+            status=409,
+        )
+    restored = 0
+    with transaction.atomic():
+        # The lock first, the decision after it, in its own query
+        # (``detections.standing_decision``).
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        decision = detections.standing_decision(row)
+        if (
+            decision is not None
+            and decision.kind == DetectionDecision.Kind.DEACTIVATE
+        ):
+            # A move or an approval is a dismiss plus a hand-drawn row
+            # that names it (#414): withdrawing the dismiss alone would
+            # put the model's box back beside that row.
+            if Detection.objects.live().filter(replaces=decision).exists():
+                return JsonResponse(
+                    {"status": "error", "message": RESTORE_REPLACED_MESSAGE},
+                    status=409,
+                )
+            restored = detections.withdraw(
+                DetectionDecision.objects.filter(pk=decision.pk), request.user
+            )
+    _rebuild_findings(scan)
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_DETECTION_MESSAGE
+                if restored
+                else DETECTION_NOT_DISMISSED_MESSAGE
             ),
         }
     )

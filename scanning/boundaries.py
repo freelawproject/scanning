@@ -174,6 +174,38 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
+def key_icon_rows(rows: list[Detection], bl_warm: bool) -> list[Detection]:
+    """Return the rows of ``rows`` that are key icons.
+
+    blackletter's rule for "this box is a key icon"
+    (``blackletter.scanner.key_icons``: the gate for the family and the
+    size filter over the whole volume) over ``Detection`` rows, for a
+    reader that has no document: each row is lifted into a blackletter
+    detection in its own pixels, and the gate and the size filter are
+    scale-free, so the answer is the pairing's.
+
+    :param rows: ``KEY_ICON`` rows of one scan, every one of them, so
+        the median is the volume's.
+    :param bl_warm: Whether bl-warm alone drew them.
+    :returns: The rows that are key icons, in the order given.
+    """
+    from blackletter.models import BBox, Label
+    from blackletter.models import Detection as BLDetection
+    from blackletter.scanner import key_icons
+
+    lifted = {}
+    for row in rows:
+        det = BLDetection(
+            bbox=BBox(x1=row.x0, y1=row.y0, x2=row.x1, y2=row.y1),
+            label=Label.KEY_ICON,
+            confidence=row.confidence,
+            page_index=row.page_index,
+        )
+        lifted[id(det)] = (det, row)
+    kept = key_icons([det for det, _ in lifted.values()], bl_warm)
+    return [lifted[id(det)][1] for det in kept]
+
+
 def write_computed(
     scan: Scan,
     document,
@@ -205,12 +237,21 @@ def write_computed(
     :param run: The apply run whose space the document is in; None for
         the original's space.
     :param detect_run: The ``ExternalJob.run`` the rows came from.
-    :returns: The ``(caption, key)`` pairs, as ``_pair_opinions`` gives
-        them.
+    :returns: The ``(caption, key)`` pairs, as blackletter's
+        ``_pair_opinions`` gives them, in reading order: the gate
+        pairing, then the keys it left unmatched paired on the key
+        before them (``_pair_on_keys_before``).
     """
+    from blackletter.models import CaptionMarker
     from blackletter.scanner import _pair_opinions
 
     pairs = _pair_opinions(document) if document.pages else []
+    # An opinion paired on the key before starts at a marker under that
+    # key, one pixel tall, that names the caption box it was paired on:
+    # the boundary's start FK names the box's row.
+    for caption, _ in pairs:
+        if isinstance(caption, CaptionMarker) and id(caption.box) in row_ids:
+            row_ids[id(caption)] = row_ids[id(caption.box)]
     pages_by_index = {p.index: p for p in document.pages}
     scan.refresh_from_db(fields=["source_fingerprint"])
     rows = []
