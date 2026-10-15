@@ -245,22 +245,36 @@ def missed_cells(
     """
     missed = []
     for cell in reading.cells or []:
-        # The box held inside the page (``opinion_ocr.clamp_box``), the
-        # glue's own reading of it: a box the reader ran past the edge
-        # is judged, and carded, as the page holds it.
-        box = opinion_ocr.clamp_box(
-            _box(cell.get("box")), reading.img_width, reading.img_height
-        )
+        box = _box(cell.get("box"))
         if box is None or not is_text(cell):
             continue
-        cell = {**cell, "box": box}
         x0, y0 = boundaries.to_points(
             box[0], box[1], reading.img_width, reading.img_height, *size
         )
         x1, y1 = boundaries.to_points(
             box[2], box[3], reading.img_width, reading.img_height, *size
         )
-        box_pt = [x0, y0, x1, y1]
+        # A box the reader ran past the page is cut at the detection
+        # box that holds it (``opinion_ocr.fit_overrun``), the glue's
+        # own reading of it, so the card judges, and names, the box
+        # the text has.
+        box_pt = opinion_ocr.fit_overrun(
+            [x0, y0, x1, y1], size[0], size[1], frame
+        )
+        if box_pt is None:
+            continue
+        if box_pt != [x0, y0, x1, y1]:
+            sx = reading.img_width / size[0]
+            sy = reading.img_height / size[1]
+            cell = {
+                **cell,
+                "box": [
+                    round(box_pt[0] * sx, 1),
+                    round(box_pt[1] * sy, 1),
+                    round(box_pt[2] * sx, 1),
+                    round(box_pt[3] * sy, 1),
+                ],
+            }
         # The verdict's first test: a unit a redaction covers is
         # excluded as a redaction, never dropped as undetected.
         if (

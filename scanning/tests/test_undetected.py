@@ -484,6 +484,27 @@ class TestTheRule(ScanningTestCase):
             found[0]["metadata"]["bbox"], [1000.0, 200.0, 1700.0, 600.0]
         )
 
+    def test_a_box_wholly_past_the_page_is_no_cell(self):
+        # No cell is ever past the page: with nothing of it on the
+        # page there is no box to judge, so no card, and the glue
+        # leaves the unit unjudged.
+        column(self.scan)
+        self.write(cell("Off the page", [2000.0, 200.0, 2600.0, 600.0]))
+        self.assertEqual(self.found(), [])
+        self.assertIsNone(
+            opinion_ocr.clamp_box(
+                [2000.0, 200.0, 2600.0, 600.0], WIDTH, HEIGHT
+            )
+        )
+
+    def test_a_box_past_the_page_is_cut_at_the_box_that_holds_it(self):
+        # A cell that starts at the right of its column and runs off
+        # the page: cut at the column's edge it is wholly inside, so
+        # no card; cut at the page edge it would be a card.
+        column(self.scan, bbox=[900.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Near the edge", [1400.0, 200.0, 11387.0, 600.0]))
+        self.assertEqual(self.found(), [])
+
     def test_a_stray_mark_is_no_card(self):
         column(self.scan)
         self.write(cell("— ."), cell("a b"), cell("12"))
