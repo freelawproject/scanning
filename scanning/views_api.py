@@ -404,10 +404,11 @@ EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
 )
 EDIT_QUOTE_TABLE_MESSAGE = "A table holds no blockquote."
-#: A picture of the text (#463) takes a move alone: it has no text, it
-#: is no footnote and no quote.
+#: A picture of the text (#463) takes a move and a drop alone: it has
+#: no text, it is no footnote and no quote.
 EDIT_FIGURE_MESSAGE = (
-    "A picture takes no edit but a move: Move up or Move down."
+    "A picture takes no edit but a move (Move up or Move down) or "
+    "Not a picture."
 )
 EDIT_QUOTE_NO_WORD_MESSAGE = (
     "Select at least one word of the block, then save."
@@ -1864,7 +1865,7 @@ def edit_opinion_drop(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: ``{status, message}``; 404, 400 or 409 on a refusal.
     """
-    from scanning import ensemble, markup, opinion_edits
+    from scanning import ensemble, opinion_edits
     from scanning.models import OpinionEdit
 
     context = _edit_context(request, pk, opinion_pk)
@@ -1875,8 +1876,8 @@ def edit_opinion_drop(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
-    if group.get("kind") == markup.FIGURE:
-        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
+    # A picture takes the drop too (#463): a stamp or a blot one
+    # engine drew as a picture is no picture of the opinion.
     row = opinion_edits.supersede(
         opinion,
         request.user,

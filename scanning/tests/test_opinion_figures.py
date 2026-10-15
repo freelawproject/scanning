@@ -307,6 +307,25 @@ class TestTheColumnBoundary(SimpleTestCase):
         self.assertEqual(crossed, plain)
         self.assertGreater(crossed, 300.0)
 
+    def test_a_narrow_box_in_the_margin_keeps_the_gutter(self):
+        """A stamp or a blot near the page edge is no part of the text
+        block: read into its extent, it moved the middle past the
+        gutter, the right column straddled it, and the page had no
+        boundary."""
+        plain = ensemble.column_boundary(self.boxes(), self.WIDTH, self.HEIGHT)
+        for stray in (
+            [560.0, 400.0, 606.0, 420.0],
+            [540.0, 300.0, 590.0, 330.0],
+            [4.0, 400.0, 40.0, 420.0],
+        ):
+            with self.subTest(stray=stray):
+                self.assertEqual(
+                    ensemble.column_boundary(
+                        self.boxes(stray), self.WIDTH, self.HEIGHT
+                    ),
+                    plain,
+                )
+
     def test_a_two_column_page_keeps_its_gutter(self):
         """No box crosses the middle: the right column's first edge less
         the pad, the boundary the rule gave before #463."""
@@ -791,6 +810,57 @@ class TestTheLedger(FigureTestCase):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.figures_cut_digest, "")
 
+    def test_a_box_that_moved_under_the_same_text_is_cut_next_tick(self):
+        """A redaction over a picture written after the ensemble's
+        stamp, with no new text (``refit_text_redactions``, an orphan
+        whose boundary a recompute deleted). The cut stamps the new
+        ledger, so the next tick cuts; left at the old digest, the row
+        was due on every tick and held the pass."""
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        written = self.opinion.figure_digest
+        box = to_pt(self.PICTURE)
+        self.redact(2, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+
+        with self.fake_source():
+            self.assertEqual(opinion_figures.run_tick(), 0)
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.figure_digest, written)
+        self.assertEqual(
+            self.opinion.figure_digest,
+            opinion_figures.ledger_digest(self.opinion, self.stored()),
+        )
+        self.assertEqual(self.cuts, {})
+
+        with self.fake_source(answer=white_jpeg(40, 30)):
+            self.assertEqual(opinion_figures.run_tick(), 1)
+        self.opinion.refresh_from_db()
+        self.assertTrue(opinion_figures.is_written(self.opinion))
+        self.assertFalse(
+            opinion_figures.due().filter(pk=self.opinion.pk).exists()
+        )
+
+    def test_a_new_text_wins_over_the_stamp_of_the_cut(self):
+        """The ensemble wrote again since the tick read the row: the
+        swap over the stamps read fails, and the new text's digest
+        stays."""
+        self.run_ensemble()
+        read = Opinion.objects.select_related("scan", "apply_run").get(
+            pk=self.opinion.pk
+        )
+        box = to_pt(self.PICTURE)
+        self.redact(2, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            figure_digest="new text",
+            ensemble_edit_revision=F("ensemble_edit_revision") + 1,
+        )
+
+        with self.fake_source():
+            self.assertEqual(opinion_figures.cut_one(read), 0)
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.figure_digest, "new text")
+
     @override_settings(OPINION_PDF_RETRY_AFTER_SECONDS=0)
     def test_a_picture_that_does_not_render_spends_attempts_then_ends(self):
         self.run_ensemble()
@@ -1086,6 +1156,23 @@ class TestTheApproval(FigureTestCase):
             },
         )
 
+    def test_the_approval_waits_for_the_cut(self):
+        """The key of a cut holds no ledger: an old cut at the key of a
+        picture a new redaction covers must never be embedded."""
+        self.ready()
+        self.assertFalse(opinion_figures.is_written(self.opinion))
+
+        with (
+            patch("scanning.s3_sync.download_bytes_object") as download,
+            self.assertRaises(opinion_review.ApprovalRefused) as refused,
+        ):
+            opinion_review.approve_text(
+                self.opinion, get_user_model().objects.create(username="c")
+            )
+
+        self.assertEqual(refused.exception.code, opinion_review.FIGURES)
+        download.assert_not_called()
+
     def test_a_missing_cut_refuses_the_approval(self):
         self.run_ensemble()
         document = self.stored()
@@ -1123,6 +1210,36 @@ class TestTheEndpoints(FigureTestCase):
         page = self.stored()["pages"][1]
         return next(g for g in page["groups"] if g["kind"] == markup.FIGURE)
 
+    def test_not_a_picture_takes_the_picture_out(self):
+        """A stamp or a blot one engine drew as a picture: the drop
+        takes it out of the text, and nothing is left to cut."""
+        group = self.figure_group()
+        document = self.stored()
+
+        response = self.client.post(
+            self.url("edit_opinion_drop"),
+            {
+                "page_in_opinion": 1,
+                "group_id": group["id"],
+                "glue_revision": document["opinion"]["glue_revision"],
+                "edit_revision": document.get("edit_revision", 0),
+            },
+            content_type="application/json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.content)
+        self.opinion.refresh_from_db()
+        built = self.stored()
+        self.assertEqual(ensemble.figures_of(built), [])
+        drop = next(
+            d
+            for d in built["pages"][1]["dropped"]
+            if d["reason"] == ensemble.DROP_HUMAN
+        )
+        self.assertEqual(drop["box_pt"], group["box_pt"])
+        self.assertEqual(self.opinion.figure_digest, "")
+        self.assertTrue(opinion_figures.is_written(self.opinion))
+
     def test_only_a_move_edits_a_picture(self):
         group = self.figure_group()
         document = self.stored()
@@ -1134,7 +1251,6 @@ class TestTheEndpoints(FigureTestCase):
             ("edit_opinion_text", {"text": "words"}),
             ("edit_opinion_section", {"section": ensemble.FOOTNOTES}),
             ("edit_opinion_blockquote", {"quoted": True}),
-            ("edit_opinion_drop", {}),
         ):
             response = self.client.post(
                 self.url(name),
@@ -1194,17 +1310,23 @@ VIEWER = (
 
 
 class TestTheViewer(TestCase):
-    def test_a_picture_takes_a_move_alone(self):
-        """The toolbar of a picture stops after the two moves and the
-        Undo of the order: the four other edits refuse it."""
+    def test_a_picture_takes_a_move_and_a_drop_alone(self):
+        """The toolbar of a picture stops after the two moves, the Undo
+        of the order and the drop: the three other edits refuse it."""
         source = VIEWER.read_text()
         bar = source[source.index("function fillBar(") :]
-        bar = bar[: bar.index("\n    }\n")]
-        stop = bar.index("if (figure) { return; }")
+        bar = bar[: bar.index("\n    }\n\n")]
+        stop = bar.index("if (figure) {")
+        figure = bar[stop : bar.index("return;", stop)]
         self.assertLess(bar.index("'Move down'"), stop)
         self.assertLess(bar.index("'Undo the order'"), stop)
+        self.assertIn("dropButton(page, group, true)", figure)
         self.assertGreater(bar.index("'Put in the footnotes'"), stop)
         self.assertIn("!figure", bar[: bar.index("'Edit text'") + 200])
+        drop = source[source.index("function dropButton(") :]
+        drop = drop[: drop.index("\n    }\n")]
+        self.assertIn("'Not a picture'", drop)
+        self.assertIn("endpoint('editDropUrl')", drop)
 
     def test_the_picture_is_read_from_its_endpoint(self):
         source = VIEWER.read_text()

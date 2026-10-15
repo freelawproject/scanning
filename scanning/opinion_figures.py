@@ -300,8 +300,9 @@ def cut_one(opinion: Opinion) -> int:
     """Cut every picture of one opinion's text, store it and stamp the row.
 
     The document is the stamped one, the text a reviewer sees. Its
-    digest must be the row's: an ensemble that wrote again during the
-    tick wins, and the row is due again at the new digest. Every
+    ledger must be the row's. When it is not, the cut stamps the ledger
+    it computed and cuts nothing, so the next tick cuts at it; this is
+    the one writer of ``figure_digest`` beside the ensemble. Every
     picture is stored before the stamp, so a stamped row has them all.
 
     :param opinion: The row, with ``scan`` and ``apply_run``.
@@ -322,13 +323,29 @@ def cut_one(opinion: Opinion) -> int:
         raise FigureError(str(exc)) from exc
     digest = ledger_digest(opinion, document)
     if digest != opinion.figure_digest:
-        # The ensemble wrote another text since the row was read, or a
-        # redaction over a picture moved without a new text.
+        # A redaction or a mask over a picture moved with no new text
+        # (``refit_text_redactions``, an orphan whose boundary a
+        # recompute deleted), or the ensemble wrote again. The ledger of
+        # the document read is stamped, over the stamps read, so the
+        # row is cut at it on the next tick; left at the old digest, the
+        # row stays due, first in the order, and holds the pass for
+        # every volume. A lost swap is a new text with its own digest.
+        restamped = Opinion.objects.filter(
+            pk=opinion.pk,
+            figure_digest=opinion.figure_digest,
+            ensemble_revision=opinion.ensemble_revision,
+            ensemble_edit_revision=opinion.ensemble_edit_revision,
+        ).update(
+            figure_digest=digest,
+            figure_attempts=0,
+            figures_attempted_at=None,
+        )
         logger.info(
-            "%s of scan %s: the pictures moved during the cut; it is due "
-            "again",
+            "%s of scan %s: the pictures or the boxes over them moved "
+            "since the text was written; %s",
             opinion,
             opinion.scan_id,
+            "the new ledger is stamped" if restamped else "it is due again",
         )
         return 0
     figures = ensemble.figures_of(document)
@@ -478,8 +495,8 @@ def run_tick() -> int:
     done = 0
     for opinion in due()[:FIGURES_PER_TICK]:
         try:
-            cut_one(opinion)
-            done += 1
+            if cut_one(opinion):
+                done += 1
         except TransientFault as exc:
             _fail(opinion, str(exc), counted=False)
         except FigureError as exc:

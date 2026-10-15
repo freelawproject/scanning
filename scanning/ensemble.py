@@ -256,6 +256,12 @@ MAX_BOUNDARY = 0.85
 #: A page with fewer body boxes reads as one column.
 MIN_BODY_BOXES = 4
 
+#: The least width, as a fraction of the page width, of a body box that
+#: marks the extent of the text block, whose middle no column box
+#: crosses (#463). A column of a two-column page is about two fifths of
+#: the page; a box in the margin is far narrower.
+EXTENT_WIDTH = 0.15
+
 #: What joins two groups in a page's text.
 PARAGRAPH_GAP = "\n\n"
 
@@ -1870,17 +1876,29 @@ def column_boundary(
     # picture or a centered line sits on both sides, and its left edge
     # would split the left column from its own text. The middle of the
     # text and not of the page: a scan of a bound book sets the text
-    # off the page's middle, and a column must not cross it there.
-    middle = (
-        (min(b["box_pt"][0] for b in body) + max(b["box_pt"][2] for b in body))
-        / 2
-        if body
-        else width / 2
-    )
+    # off the page's middle, and a column must not cross it there. The
+    # text block is the extent of the wide boxes alone: a narrow box in
+    # the margin (a stamp, a blot, a library label) would move the
+    # middle past the gutter, and the right column would straddle it.
+    # A box wholly outside that extent is no column's either: its left
+    # edge would open the widest gap of the page.
+    wide = [
+        b
+        for b in body
+        if b["box_pt"][2] - b["box_pt"][0] >= EXTENT_WIDTH * width
+    ] or body
+    if wide:
+        left = min(b["box_pt"][0] for b in wide)
+        right = max(b["box_pt"][2] for b in wide)
+    else:
+        left, right = 0.0, width
+    middle = (left + right) / 2
     edges = sorted(
         box["box_pt"][0]
         for box in body
         if not _straddles(box["box_pt"], middle, width)
+        and box["box_pt"][0] < right
+        and box["box_pt"][2] > left
     )
     if len(edges) < MIN_BODY_BOXES:
         return None
@@ -3125,6 +3143,8 @@ def build_page(
     unresolved: list[dict] = []
     # A picture takes no edit of its text, its section or its quote
     # (#463): the views refuse them, and a box copy must not land one.
+    # It takes a drop: a stamp, a seal or a blot one engine drew as a
+    # picture is no picture of the opinion, and a person says so.
     texts = [group for group in groups if not group.get("figure")]
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
@@ -3133,10 +3153,11 @@ def build_page(
         (OpinionEdit.Kind.DROP, "_drop_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
+        targets = groups if kind == OpinionEdit.Kind.DROP else texts
+        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
         for here, edit in enumerate(wanted):
             if here in landed:
-                texts[landed[here]][key] = edit
+                targets[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
@@ -3188,7 +3209,12 @@ def build_page(
     # still parts two quotes.
     sequence: list[dict] = []
     for group in ordered:
-        if group.get("figure") and not group["excluded"]:
+        # A picture a person dropped goes like a block: below.
+        if (
+            group.get("figure")
+            and not group["excluded"]
+            and not group.get("_drop_edit")
+        ):
             entry["groups"].append(
                 _figure_entry(group, len(entry["groups"]), offsets[BODY])
             )

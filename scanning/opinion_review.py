@@ -36,7 +36,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from scanning import apply, ensemble, paragraphs, s3_sync
+from scanning import apply, ensemble, opinion_figures, paragraphs, s3_sync
 from scanning.models import (
     UNDISMISSABLE_OPINION_CHECKS,
     Issue,
@@ -240,8 +240,6 @@ def _embed_figures(opinion: Opinion, document: dict, text: dict) -> None:
     :raises ApprovalRefused: When a cut is missing, or the bucket did
         not answer.
     """
-    from scanning import opinion_figures
-
     index_of = {
         page.get("page_in_opinion"): page.get("page_index")
         for page in document.get("pages") or []
@@ -327,6 +325,12 @@ def check_gate(
         raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
+    if not opinion_figures.is_written(opinion):
+        # The key of a cut holds the place of the picture and not its
+        # ledger (#463): a redaction added over a picture leaves the
+        # old cut at that key until the daemon cuts it again, and the
+        # approval would embed what the redaction hides.
+        raise ApprovalRefused(FIGURES)
     if opinion.edit_revision != opinion.ensemble_edit_revision:
         # An edit the text does not hold yet: its build failed, so the
         # text is not what the curator decided.
