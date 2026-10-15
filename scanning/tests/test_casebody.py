@@ -1720,6 +1720,23 @@ class TestOneCaptionLabel(TestCase):
 
         self.assertEqual(root.find(".//judges").text, "Before A and B, JJ.")
 
+    def test_a_judge_between_two_attorneys_spans_keeps_judges(self):
+        text = (
+            "Jane Roe for the appellant; Before A, J.; John Doe for appellee."
+        )
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[
+                span(0, 0, 27, "attorneys"),
+                span(0, 28, 40, "judges"),
+                span(0, 42, 64, "attorneys"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(root.find(".//judges").text, "Before A, J.")
+
     def test_a_line_with_two_caption_labels_keeps_both(self):
         approved_doc, spans = with_opinion(
             para("Appeal from X. Jane Roe for appellant."),

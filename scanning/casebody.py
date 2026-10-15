@@ -94,6 +94,8 @@ PARTY_ELEMENTS = frozenset({ELEMENTS["party"], ELEMENTS["separator"]})
 #: The label whose first paragraph starts the opinion (:func:`head_matter_end`).
 AUTHOR = "author"
 HEADING = "heading"
+HISTORY = "history"
+JUDGES = "judges"
 #: The labels of the caption alone. ``judges``, ``disposition`` and
 #: ``heading`` are not here: the end of a main opinion and its body
 #: hold them too.
@@ -653,11 +655,12 @@ def _one_caption_label(rows: list[dict]) -> set[int]:
     U.S. District Judge]"). On a head-matter line with one label of
     :data:`HEAD_MATTER_LABELS` that covers more characters than the
     other spans together, a ``heading`` span takes that label, and so
-    does any other span with that label on both sides: the judge of a
-    history line. A ``judges`` span at an edge of the line is the panel
-    the engines read into the same block, and keeps its label. A line
-    with two caption labels is two elements
-    (:func:`_cut_caption_paragraph`).
+    does any other span with that label on both sides. A ``judges``
+    span takes it on a ``history`` line alone, where CAP writes the
+    judge below ("[Hon. ..., U.S. District Judge]"): the judges and the
+    attorneys are never mixed, and a panel the engines read into an
+    attorneys block keeps its label. A line with two caption labels is
+    two elements (:func:`_cut_caption_paragraph`).
 
     :param rows: The spans of one head-matter paragraph, changed in place.
     :returns: The ``id`` of every span it relabeled: a piece of the
@@ -683,6 +686,8 @@ def _one_caption_label(rows: list[dict]) -> set[int]:
         inside = 0 < at < len(rows) - 1 and (
             labels[at - 1] == label == labels[at + 1]
         )
+        if row["label"] == JUDGES and label != HISTORY:
+            continue
         if row["label"] == HEADING or inside:
             relabeled.add(id(row))
     for row in rows:
