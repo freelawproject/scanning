@@ -1153,6 +1153,26 @@ document.addEventListener('DOMContentLoaded', function () {
         detDrawDragState = null;
     }
 
+    // While the Add popup is open, Enter is its Add button and Esc its
+    // Cancel: a box dropped by a double click or drawn by hand is
+    // confirmed without reaching for the mouse. A field being typed in
+    // keeps both keys; the popup's own select does not, so Enter on it
+    // adds the label it shows.
+    document.addEventListener('keydown', function (e) {
+        if (!detDrawPopup) return;
+        if (e.key !== 'Enter' && e.key !== 'Escape') return;
+        var tag = e.target && e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'Escape') {
+            _cancelDetDraw();
+            return;
+        }
+        var confirm = detDrawPopup.querySelector('.det-draw-confirm');
+        if (confirm && !confirm.disabled) confirm.click();
+    });
+
     function activateDrawMode(pageDiv, pdfIndex) {
         if (activeDrawPageDiv === pageDiv) {
             _deactivateDrawMode();

@@ -499,6 +499,9 @@ def _unmatched_findings(
             label__in=[
                 Label.TEXT_COLUMN.name,
                 Label.CASE_CAPTION.name,
+                # The case number above a caption: the guess starts
+                # under it.
+                Label.CASE_SEQUENCE.name,
                 *HEAD_MATTER_NAMES,
             ],
         ):
@@ -710,6 +713,12 @@ _CAPTION_MIN_KEY_HEIGHTS = 2.0
 #: How far a guess with no column box to end it runs, in key heights.
 _CAPTION_FALLBACK_KEY_HEIGHTS = 4.0
 
+#: The space a caption guess keeps under the case number above it and
+#: above the key icon or the synopsis that ends it, as a share of the
+#: key's height: a box drawn edge to edge takes the number and the key
+#: for part of the caption, and the curator trims both.
+_CAPTION_EDGE_GAP = 0.3
+
 
 def _caption_guess(
     key: Detection, by_page: dict[int, list[Detection]]
@@ -722,10 +731,12 @@ def _caption_guess(
     key heights below the key, else the facing column, else a column of
     the next page. The first synopsis (``BACKGROUND``) box or the next
     key icon of that column under the start ends it (the orders of a
-    S.Ct. volume are a column of captions, each closed by a key), else
-    the column's foot. A caption
-    that runs on into the next column is boxed in its first column
-    alone. A key's page with no column box of its own (the washed-out
+    S.Ct. volume are a column of captions, each closed by a key), a
+    little above it (``_CAPTION_EDGE_GAP``), else the column's foot;
+    a case number (``CASE_SEQUENCE``) at the start moves the start a
+    little under it, so the box holds the title and not the number. A
+    caption that runs on into the next column is boxed in its first
+    column alone. A key's page with no column box of its own (the washed-out
     page 792 of scan 3579, whose keys were real and whose print the
     model could not read) borrows the column boxes of the page before
     or after it, because the pages of a volume share their geometry,
@@ -735,9 +746,9 @@ def _caption_guess(
     With no column box anywhere, a few key heights under the key.
 
     :param key: The key icon the caption follows.
-    :param by_page: The live ``TEXT_COLUMN`` and ``BACKGROUND`` rows and
-        the read ``KEY_ICON`` rows of the key's page, the one before and
-        the next, by page index.
+    :param by_page: The live ``TEXT_COLUMN``, ``BACKGROUND`` and
+        ``CASE_SEQUENCE`` rows and the read ``KEY_ICON`` rows of the
+        key's page, the one before and the next, by page index.
     :returns: The page index, the box in that page's pixels, and the
         row whose page address the dismissal is keyed by.
     """
@@ -773,7 +784,21 @@ def _caption_guess(
             if d.label in (Label.BACKGROUND.name, Label.KEY_ICON.name)
             and d.y0 >= start
         ]
-        bottom = max(min(ends) if ends else foot, start + key_height)
+        edge = _CAPTION_EDGE_GAP * key_height
+        bottom = min(ends) - edge if ends else foot
+        # The case number of this caption: at the start or just under
+        # it, above the box's end. The next case's number is below the
+        # key that ends the box, so it never moves the start.
+        numbers = [
+            d.y1
+            for d in dets
+            if d.label == Label.CASE_SEQUENCE.name
+            and d.y1 > start
+            and d.y0 < bottom
+        ]
+        if numbers:
+            start = min(numbers) + edge
+        bottom = max(bottom, start + key_height)
         box = [
             min(d.x0 for d in boxes),
             start,
@@ -828,8 +853,9 @@ def _missing_caption_finding(
             "No caption box was found after the key icon that closes the "
             f"opinion before (page {key.page_index + 1}), so no opinion "
             "starts there and that opinion runs on to the next key. The "
-            "box is where the caption is likely to be. Draw the caption "
-            "box; the next compute splits the opinion on it."
+            "box is where the caption is likely to be. Press + to add the "
+            "caption box there, or draw it; the next compute splits the "
+            "opinion on it."
         ),
         "metadata": {
             "page_index": page_index,

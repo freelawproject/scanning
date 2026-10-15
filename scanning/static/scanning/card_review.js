@@ -71,10 +71,12 @@
             return { add: 'Add bracket', none: 'No bracket', added: 'bracket added' };
         }
         if (card.kind === 'text') {
-            // No add: the answer is the page's column box pulled over
-            // the block (click its label on the crop), and the card
-            // goes by itself at the next read.
-            return { add: null, none: 'Not text', added: null };
+            // The block's box is added as a column box, resized first
+            // if need be; a box in a column that has one already joins
+            // that column (``columns.column_groups``). Pulling the
+            // page's own column box over the block (click its label on
+            // the crop) answers the card too.
+            return { add: 'Add column', none: 'Not text', added: 'column added' };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
     }
@@ -455,9 +457,9 @@
         }
         if (card.edit) { layer.classList.add('cr-editing'); }
         if (card.box) {
-            // A text card's own box is the block, a highlight and no
-            // write: it takes no handles.
-            var still = card.kind === 'text';
+            // A text card's own box is the block, and the column box
+            // the add writes: it takes the handles like a guess.
+            var still = false;
             var box = el('div', 'cr-box cr-' + card.kind + (frozen || card.edit || still ? ' cr-frozen' : ''));
             layer.appendChild(box);
             placeBox(card, box);
