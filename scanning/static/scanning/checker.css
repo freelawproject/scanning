@@ -1365,6 +1365,22 @@ h3.ensemble-group {
     font-size: 14px;
     font-weight: 600;
 }
+/* A picture of the text (#463): drawn at its printed width, never
+   wider than the column. */
+figure.ensemble-group[data-kind="figure"] {
+    margin: 0.5rem 0;
+}
+img.ensemble-figure {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+}
+.ensemble-figure-missing {
+    font-size: 0.75rem;
+    font-style: italic;
+    opacity: 0.7;
+}
 div.ensemble-group[data-kind="list_item"] {
     margin-left: 1.2em;
 }

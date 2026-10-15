@@ -43,6 +43,14 @@ DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
 # 5 seconds is 25 minutes, in the background.
 DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
 
+# How often (in seconds) the daemon cuts the pictures of one opinion's
+# text from the original scan (#463). Few opinions print a picture, so
+# most ticks read one query and stop; the first cut of a volume pulls a
+# shard, inside the serial loop, the hazard of the PDF pass.
+DAEMON_OPINION_FIGURE_INTERVAL = env.int(
+    "DAEMON_OPINION_FIGURE_INTERVAL", default=10
+)
+
 # How often (in seconds) the daemon scores one volume with the bad-page
 # model (#436), and with how many worker processes. The tick blocks the
 # serial scheduler for the whole score, about 0.2 CPU-seconds a page,

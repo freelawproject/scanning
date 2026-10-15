@@ -777,8 +777,67 @@
         heading: 'h3',
         list_item: 'div',
         table: 'div',
+        figure: 'figure',
         paragraph: 'p'
     };
+
+    /**
+     * CSS pixels per point: a picture of the text is drawn at the size
+     * it has on the page (#463), the rule of ``casebody.PIXELS_PER_POINT``.
+     */
+    var PIXELS_PER_POINT = 96 / 72;
+
+    /**
+     * Draw one picture of the text in its node (#463).
+     *
+     * The daemon cut it from the original, and ``opinion_figure_url``
+     * answers a presigned URL for it, named by the volume page and the
+     * box the document gives: the server builds the key, so the script
+     * spells no path. The picture holds the width it has on the page,
+     * and no more than the column. A picture the daemon has not cut
+     * says so, in text.
+     *
+     * @param {HTMLElement} node - The group node, a ``figure``.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function drawFigure(node, page, group) {
+        var size = group.figure || {};
+        var image = document.createElement('img');
+        image.className = 'ensemble-figure';
+        image.alt = 'A picture of the text, cut from the original';
+        if (size.width_pt) {
+            image.style.width = Math.round(size.width_pt * PIXELS_PER_POINT)
+                + 'px';
+        }
+        node.appendChild(image);
+        var address = endpoint('figureUrlEndpoint');
+        if (!address) { return; }
+        var query = '?page=' + encodeURIComponent(page.page_index)
+            + '&box=' + encodeURIComponent((group.box_pt || []).join(','));
+        fetch(address + query, { credentials: 'same-origin' })
+            .then(function (response) {
+                // A server fault can answer a page and no JSON: the line
+                // is then ours, never the parser's.
+                return response.json().catch(function () {
+                    return {};
+                }).then(function (data) {
+                    if (!response.ok || !data.url) {
+                        throw new Error(
+                            data.error || 'The picture could not be loaded.'
+                        );
+                    }
+                    image.src = data.url;
+                });
+            })
+            .catch(function (error) {
+                node.removeChild(image);
+                var line = document.createElement('p');
+                line.className = 'ensemble-figure-missing';
+                line.textContent = error.message;
+                node.appendChild(line);
+            });
+    }
 
     /**
      * Put one element per item of a list item group in its node (#428).
@@ -954,6 +1013,11 @@
         if (group.human) { node.classList.add('ensemble-human'); }
         if (hasLevels() && group.level) { node.dataset.level = group.level; }
 
+        if (kind === 'figure') {
+            // A picture holds no text and no reading to compare (#463).
+            drawFigure(node, page, group);
+            return node;
+        }
         if (kind === 'table' && (group.table || []).length) {
             node.appendChild(tableNode(group));
         } else if (span) {
@@ -1752,7 +1816,9 @@
         select(page, group, from);
         var node = nodeFor(page, group);
         var entry = groupOf(pageOf(page), group);
-        var opened = !!(node && entry && !readingsOf(node));
+        // A picture has no readings to open (#463).
+        var opened = !!(node && entry && entry.kind !== 'figure'
+            && !readingsOf(node));
         if (opened) { openReadings(pageOf(page), entry, node); }
         locked = {
             page: page, group: group, opened: opened, bar: null, editor: null
@@ -2197,6 +2263,10 @@
         var same = sectionGroups(page, section);
         var place = same.indexOf(group);
         var orderEdit = (page.order_edits || {})[section];
+        // A picture takes a move and a drop alone (#463): it has no
+        // text, it is no footnote and no quote, the refusals of the
+        // three other edit views.
+        var figure = group.kind === 'figure';
 
         if (group.human) {
             bar.appendChild(barButton(
@@ -2209,7 +2279,7 @@
                     withdrawEdit(group.human.edit_id, button);
                 }
             ));
-        } else if (group.level && group.kind !== 'table') {
+        } else if (group.level && group.kind !== 'table' && !figure) {
             bar.appendChild(barButton(
                 'Edit text',
                 'Write the text of this block. The engines did not read'
@@ -2240,6 +2310,10 @@
                     withdrawEdit(orderEdit, button);
                 }
             ));
+        }
+        if (figure) {
+            bar.appendChild(dropButton(page, group, true));
+            return;
         }
         var other = section === FOOTNOTES ? BODY : FOOTNOTES;
         // The body blocks below this one go to the footnotes with it
@@ -2283,22 +2357,39 @@
             ));
         }
         quoteButtons(bar, page, group);
-        bar.appendChild(barButton(
-            'Not text',
-            'Take this block out of the text: it is not text of the'
-                + ' opinion (the bleed-through of the page behind, a'
-                + ' stray mark)',
+        bar.appendChild(dropButton(page, group, false));
+    }
+
+    /**
+     * Return the button that takes a block out of the text, a ``DROP``
+     * edit. A picture (#463) takes it too: a stamp, a seal or a blot one
+     * engine drew as a picture is no picture of the opinion.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {boolean} figure - Whether the group is a picture.
+     * @returns {HTMLElement} The button.
+     */
+    function dropButton(page, group, figure) {
+        return barButton(
+            figure ? 'Not a picture' : 'Not text',
+            figure
+                ? 'Take this picture out of the text: it is not a picture'
+                    + ' of the opinion (a stamp, a seal, a blot)'
+                : 'Take this block out of the text: it is not text of the'
+                    + ' opinion (the bleed-through of the page behind, a'
+                    + ' stray mark)',
             function (button) {
-                if (!window.confirm('Take this block out of the text? It'
-                        + ' is left out of the opinion until the edit is'
-                        + ' undone from the list under the page\'s'
-                        + ' label.')) { return; }
+                if (!window.confirm('Take this ' + (figure ? 'picture' : 'block')
+                        + ' out of the text? It is left out of the opinion'
+                        + ' until the edit is undone from the list under'
+                        + ' the page\'s label.')) { return; }
                 postEdit(endpoint('editDropUrl'), {
                     page_in_opinion: page.page_in_opinion,
                     group_id: group.id
                 }, button);
             }
-        ));
+        );
     }
 
     /**

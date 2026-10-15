@@ -598,15 +598,21 @@ def text_review_ready(opinion: Opinion) -> bool:
     the text of that revision (``ensemble.is_written``, which holds the
     OCR glue's own stamp inside it). The review page draws those two
     objects and nothing else, so a row that has them is a row a person
-    can work on.
+    can work on. The pictures of the text are cut too
+    (``opinion_figures.is_written``, #463): the page shows them in the
+    text, and the approval embeds them.
 
     :param opinion: The row.
     :returns: Whether the review can start.
     :rtype: bool
     """
-    from scanning import ensemble, opinion_pdf
+    from scanning import ensemble, opinion_figures, opinion_pdf
 
-    return opinion_pdf.is_written(opinion) and ensemble.is_written(opinion)
+    return (
+        opinion_pdf.is_written(opinion)
+        and ensemble.is_written(opinion)
+        and opinion_figures.is_written(opinion)
+    )
 
 
 #: How many rows one tick moves in each direction. The twin of
@@ -632,7 +638,7 @@ def _live_stamps() -> Q:
         redacted_pdf_revision=F("glue_revision"),
         ocr_glue_revision=F("glue_revision"),
         ensemble_revision=F("glue_revision"),
-    )
+    ) & (Q(figure_digest="") | Q(figures_cut_digest=F("figure_digest")))
 
 
 def promote_ready(opinion: Opinion) -> bool:

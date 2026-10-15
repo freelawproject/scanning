@@ -152,6 +152,8 @@ button of the review page waive the gate for it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import time
@@ -163,7 +165,7 @@ from itertools import combinations
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
 from scanning import detections, markup, opinion_ocr, s3_sync
@@ -198,8 +200,9 @@ logger = logging.getLogger(__name__)
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
-#: and the page its list runs (``lists``, #428).
-SCHEMA_VERSION = 11
+#: and the page its list runs (``lists``, #428). 12 writes a picture
+#: as a ``figure`` group with no text, its size under ``figure`` (#463).
+SCHEMA_VERSION = 12
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -252,6 +255,12 @@ MAX_BOUNDARY = 0.85
 
 #: A page with fewer body boxes reads as one column.
 MIN_BODY_BOXES = 4
+
+#: The least width, as a fraction of the page width, of a body box that
+#: marks the extent of the text block, whose middle no column box
+#: crosses (#463). A column of a two-column page is about two fifths of
+#: the page; a box in the margin is far narrower.
+EXTENT_WIDTH = 0.15
 
 #: What joins two groups in a page's text.
 PARAGRAPH_GAP = "\n\n"
@@ -335,6 +344,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.UNRESOLVED_EDIT,
+        OpinionCheck.FIGURE_ONE_ENGINE,
     }
 )
 
@@ -1510,8 +1520,13 @@ def align_page(
     # group can span the gutter, and the members inside it read by
     # column like everything else (:func:`reading_order`).
     boundary = column_boundary(units, width, height)
-    speaking, quiet = [], []
+    speaking, quiet, pictures = [], [], []
     for unit in units:
+        if unit.get("kind") == markup.FIGURE:
+            # A picture links with the pictures alone (#463), so it
+            # never takes the text around it into its group.
+            pictures.append(unit)
+            continue
         # :func:`plain` and never ``compare_text``: a lone heading
         # mark is text to a comparison and no reading. A box that
         # reads nothing must not link, whatever it wrote in place of
@@ -1536,7 +1551,107 @@ def align_page(
             )
         groups.append(_group(by_engine, line_band, page_area, boundary, width))
     _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
+    return groups + _figure_groups(
+        pictures, line_band, page_area, boundary, width
+    )
+
+
+def _figure_groups(
+    pictures: list[dict],
+    line_band: float,
+    page_area: float,
+    boundary: float | None,
+    width: float,
+) -> list[dict]:
+    """Return the picture groups of one page (#463).
+
+    The engines' picture boxes link by the rule of the text,
+    :data:`OVERLAP` of the smaller box, and never with a text unit: a
+    picture reads nothing, and a box that reads nothing must not chain
+    the text of a page. The group is flagged ``figure``; its box is the
+    union of the engines' boxes, the rule of every group. A box that
+    would join two pictures the other engines drew apart is left out
+    (:func:`_picture_bridges`), or the union cuts them as one.
+
+    :param pictures: The units of the ``figure`` kind.
+    :param line_band: The height of one line band, in points.
+    :param page_area: The area of the page, in square points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
+    :returns: The groups.
+    :rtype: list[dict]
+    """
+    bridges = {id(unit) for unit in _picture_bridges(pictures)}
+    pictures = [unit for unit in pictures if id(unit) not in bridges]
+    union = _link_pictures(pictures)
+    buckets: dict[int, list[int]] = {}
+    for index in range(len(pictures)):
+        buckets.setdefault(union.find(index), []).append(index)
+    groups = []
+    for indices in buckets.values():
+        by_engine: dict[str, list[dict]] = {}
+        for index in indices:
+            by_engine.setdefault(pictures[index]["engine"], []).append(
+                pictures[index]
+            )
+        group = _group(by_engine, line_band, page_area, boundary, width)
+        group["figure"] = True
+        groups.append(group)
     return groups
+
+
+def _link_pictures(pictures: list[dict]) -> _Union:
+    """Return the links of the picture units of a page (#463).
+
+    Two boxes of different engines link when the intersection covers
+    :data:`OVERLAP` of the smaller box, the rule of the text.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The union-find over ``pictures``, by index.
+    :rtype: _Union
+    """
+    union = _Union(len(pictures))
+    for left, right in combinations(range(len(pictures)), 2):
+        if pictures[left]["engine"] == pictures[right]["engine"]:
+            continue
+        share = contained(pictures[left]["box_pt"], pictures[right]["box_pt"])
+        if share >= OVERLAP:
+            union.join(left, right)
+    return union
+
+
+def _picture_bridges(pictures: list[dict]) -> list[dict]:
+    """Return the picture boxes that join pictures drawn apart (#463).
+
+    One engine draws one box over two photographs side by side where
+    the others draw one box each: linked, the four boxes are one
+    group, and the union of their boxes is one cut of both. Each box
+    is judged with the others in place: it is a bridge when the boxes
+    of the other engines it links fall into two groups or more without
+    it. So a box is left out only where another engine still draws
+    the pictures apart, and two engines that drew one box over both
+    keep one picture.
+
+    A bridge reads nothing, so leaving it out loses no text: the
+    picture group of each part names the engines that drew it.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The bridges, in the order of ``pictures``.
+    :rtype: list[dict]
+    """
+    bridges = []
+    for unit in pictures:
+        rest = [other for other in pictures if other is not unit]
+        union = _link_pictures(rest)
+        joined = {
+            union.find(index)
+            for index, other in enumerate(rest)
+            if other["engine"] != unit["engine"]
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+        }
+        if len(joined) >= 2:
+            bridges.append(unit)
+    return bridges
 
 
 def _link(speaking: list[dict], zones: list[list[float]] = ()) -> _Union:
@@ -1740,7 +1855,9 @@ def column_boundary(
     """Return the x that separates the two columns, or None.
 
     Only the body boxes vote: a running head and a footer straddle the
-    gutter and would hide it. The boundary is the right cluster's first
+    gutter and would hide it. A body box across the middle of the text
+    block does not vote either (#463): a picture or a centered line is
+    on both sides. The boundary is the right cluster's first
     edge less a pad, not the middle of the gap, because the left
     column's text runs up to the gutter.
 
@@ -1755,7 +1872,34 @@ def column_boundary(
     :rtype: float | None
     """
     _, body, _ = _split_bands(boxes, height)
-    edges = sorted(box["box_pt"][0] for box in body)
+    # A box across the middle of the text is no column's (#463): a
+    # picture or a centered line sits on both sides, and its left edge
+    # would split the left column from its own text. The middle of the
+    # text and not of the page: a scan of a bound book sets the text
+    # off the page's middle, and a column must not cross it there. The
+    # text block is the extent of the wide boxes alone: a narrow box in
+    # the margin (a stamp, a blot, a library label) would move the
+    # middle past the gutter, and the right column would straddle it.
+    # A box wholly outside that extent is no column's either: its left
+    # edge would open the widest gap of the page.
+    wide = [
+        b
+        for b in body
+        if b["box_pt"][2] - b["box_pt"][0] >= EXTENT_WIDTH * width
+    ] or body
+    if wide:
+        left = min(b["box_pt"][0] for b in wide)
+        right = max(b["box_pt"][2] for b in wide)
+    else:
+        left, right = 0.0, width
+    middle = (left + right) / 2
+    edges = sorted(
+        box["box_pt"][0]
+        for box in body
+        if not _straddles(box["box_pt"], middle, width)
+        and box["box_pt"][0] < right
+        and box["box_pt"][2] > left
+    )
     if len(edges) < MIN_BODY_BOXES:
         return None
     gap, right_edge = 0.0, None
@@ -2565,6 +2709,7 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
     :rtype: tuple[list[dict], list[dict]]
     """
     placed, unplaced = [], []
+    spec = opinion_ocr.ENGINES.get(engine)
     for unit in page.get("units") or []:
         if not isinstance(unit, dict):
             continue
@@ -2587,13 +2732,32 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
             # A document of the glue before #404 has none of these,
             # and reads as plain paragraphs.
             "marks": unit.get("marks") or [],
-            "kind": unit.get("kind") or markup.PARAGRAPH,
+            "kind": _unit_kind(unit, spec),
             "table": unit.get("table"),
             # The glue deleted a bracket token of this unit (#373).
             "bracket": bool(unit.get("removed")),
         }
         (placed if box else unplaced).append(entry)
     return placed, unplaced
+
+
+def _unit_kind(unit: dict, spec) -> str:
+    """Return the kind of one unit, a picture by its label too (#463).
+
+    The glue gives a picture unit the ``figure`` kind from the engine's
+    label (``EngineSpec.kind_types``). A document glued before that
+    reads the label here, so a picture needs a run of the ensemble and
+    no new glue.
+
+    :param unit: One unit of an opinion document.
+    :param spec: The engine's ``opinion_ocr.EngineSpec``, or None.
+    :returns: A ``markup.BLOCK_KINDS`` value.
+    :rtype: str
+    """
+    label = unit.get("type") or ""
+    if spec is not None and spec.kind_types.get(label) == markup.FIGURE:
+        return markup.FIGURE
+    return unit.get("kind") or markup.PARAGRAPH
 
 
 def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
@@ -2659,6 +2823,10 @@ def _counts() -> dict:
         "blockquote_lists": 0,
         "lists": 0,
         "unresolved_edits": 0,
+        # The pictures of the page (#463), and those one engine alone
+        # drew in a document of more engines.
+        "figures": 0,
+        "figure_single": 0,
     }
 
 
@@ -2973,6 +3141,11 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
+    # A picture takes no edit of its text, its section or its quote
+    # (#463): the views refuse them, and a box copy must not land one.
+    # It takes a drop: a stamp, a seal or a blot one engine drew as a
+    # picture is no picture of the opinion, and a person says so.
+    texts = [group for group in groups if not group.get("figure")]
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
         (OpinionEdit.Kind.TEXT, "_text_edit"),
@@ -2980,14 +3153,22 @@ def build_page(
         (OpinionEdit.Kind.DROP, "_drop_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], groups)
+        targets = groups if kind == OpinionEdit.Kind.DROP else texts
+        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
         for here, edit in enumerate(wanted):
             if here in landed:
-                groups[landed[here]][key] = edit
+                targets[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
+        if group.get("figure"):
+            # A picture is body text in its place (#463): no zone moves
+            # it to the footnotes and none makes it a quote.
+            group["section"], group["footnote_doubt"] = BODY, False
+            group["blockquote"] = group["_zone_blockquote"] = False
+            by_section[BODY].append(group)
+            continue
         group["section"], group["footnote_doubt"] = section(group, zones)
         placed = group.get("_section_edit")
         if placed and placed["section"] in by_section:
@@ -3028,6 +3209,20 @@ def build_page(
     # still parts two quotes.
     sequence: list[dict] = []
     for group in ordered:
+        # A picture a person dropped goes like a block: below.
+        if (
+            group.get("figure")
+            and not group["excluded"]
+            and not group.get("_drop_edit")
+        ):
+            entry["groups"].append(
+                _figure_entry(group, len(entry["groups"]), offsets[BODY])
+            )
+            sequence.append(entry["groups"][-1])
+            entry["counts"]["figures"] += 1
+            if len(group["engines"]) == 1 and len(pages) > 1:
+                entry["counts"]["figure_single"] += 1
+            continue
         read_back = resolve(group)
         # A person said the block is not text: the bleed-through of
         # the page behind, a stray mark. It goes like a block a box
@@ -3208,9 +3403,12 @@ def build_page(
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
-    for group in entry["groups"]:
+    # A picture never goes to the footnotes (#463), so it is in no
+    # block's ``below`` and has none of its own.
+    texts = [g for g in entry["groups"] if g["kind"] != markup.FIGURE]
+    for group in texts:
         if group["section"] == BODY:
-            group["below"] = blocks_below(entry["groups"], group)
+            group["below"] = blocks_below(texts, group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
@@ -3247,6 +3445,72 @@ def build_page(
     entry["unresolved_edits"] = unresolved
     entry["counts"]["unresolved_edits"] = len(unresolved)
     return entry
+
+
+def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
+    """Return the document entry of one picture group (#463).
+
+    The shape of a text group, so every reader of the groups reads it,
+    with no text: ``start`` and ``end`` are the place in the body text
+    the picture sits at, and the body text takes no paragraph for it.
+    ``figure`` holds the box and the size the picture has on the page,
+    which the cut and the approved text read. It has no ``level``: the
+    engines vote on no text here.
+
+    :param group: The picture group of :func:`align_page`.
+    :param group_id: Its id in the page.
+    :param offset: The body offset it sits at.
+    :returns: The entry.
+    :rtype: dict
+    """
+    box = group["box_pt"]
+    engines = _ranked(group["engines"])
+    return {
+        "id": group_id,
+        # Body text whatever band it sits in: the approved text reads
+        # the body band alone, and a picture at the head or the foot of
+        # a page is still a picture of the opinion, cut and paid for.
+        "band": "body",
+        "column": group["column"],
+        "section": BODY,
+        "footnote_doubt": False,
+        "footnote_by": [],
+        "blockquote": False,
+        "quote_span": None,
+        "quote_edit": None,
+        "list_by": [],
+        "box_pt": box,
+        "start": offset,
+        "end": offset,
+        "agreement": UNANIMOUS if len(engines) > 1 else SINGLE,
+        "source": engines[0],
+        "agreeing": engines,
+        "alignment_iou": group["alignment_iou"],
+        "weak": group["weak"],
+        "page_scale": group["page_scale"],
+        "silent": [],
+        "n_low_confidence": 0,
+        "level": None,
+        "human": None,
+        "section_edit": None,
+        "tokens": [],
+        "text": "",
+        "kind": markup.FIGURE,
+        "list": None,
+        "marks": [],
+        "figure": {
+            "width_pt": round(box[2] - box[0], 2),
+            "height_pt": round(box[3] - box[1], 2),
+        },
+        "engines": {
+            name: {
+                "ids": unit["ids"],
+                "box_pt": unit["box_pt"],
+                "text": "",
+            }
+            for name, unit in group["engines"].items()
+        },
+    }
 
 
 def _no_group(entry: dict, edits: list[dict]) -> None:
@@ -3866,6 +4130,17 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("figure_single"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.FIGURE_ONE_ENGINE,
+                    Issue.Severity.WARNING,
+                    _figure_message(page),
+                    standing,
+                )
+            )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
 
@@ -3880,6 +4155,26 @@ _REASON_WORDS = {
     opinion_ocr.UNDETECTED: "no detection",
     DROP_HUMAN: "a person",
 }
+
+
+def _figure_message(page: dict) -> str:
+    """Return the line of one ``FIGURE_ONE_ENGINE`` card (#463).
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    lonely = [
+        group
+        for group in page["groups"]
+        if group.get("kind") == markup.FIGURE
+        and len(group.get("engines") or {}) == 1
+    ]
+    named = ", ".join(_ranked({g["source"] for g in lonely})) or "One engine"
+    return (
+        f"{named} alone drew {len(lonely)} picture(s) on this page. Check "
+        "the picture against the PDF: the final text embeds it."
+    )
 
 
 def _undetected_message(page: dict) -> str:
@@ -4218,6 +4513,55 @@ def _read(key: str, code: str = UNREADABLE) -> dict:
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
 
+def figures_of(document: dict) -> list[dict]:
+    """Return the pictures of an ensemble document, in reading order (#463).
+
+    **The one reader** of the pictures of a text: the cut, the approval
+    and the review page walk the same list.
+
+    :param document: The ensemble document.
+    :returns: ``{"page_in_opinion", "page_index", "group", "box_pt",
+        "width_pt", "height_pt"}`` per picture.
+    :rtype: list[dict]
+    """
+    figures = []
+    for page in document.get("pages") or []:
+        for group in page.get("groups") or []:
+            if group.get("kind") != markup.FIGURE:
+                continue
+            figures.append(
+                {
+                    "page_in_opinion": page.get("page_in_opinion"),
+                    "page_index": page.get("page_index"),
+                    "group": group.get("id"),
+                    "box_pt": list(group["box_pt"]),
+                    **(group.get("figure") or {}),
+                }
+            )
+    return figures
+
+
+def figure_digest(document: dict) -> str:
+    """Return the digest of the pictures of a document, or blank (#463).
+
+    Over the run and the place of each picture, and nothing else: a
+    rebuild that moves a block, or a glue that reads the same pictures,
+    keeps the digest, so the cut is not paid again.
+
+    :param document: The ensemble document.
+    :returns: A hex digest, or "" when the text holds no picture.
+    :rtype: str
+    """
+    places = sorted(
+        (figure["page_index"], [round(v, 1) for v in figure["box_pt"]])
+        for figure in figures_of(document)
+    )
+    if not places:
+        return ""
+    raw = json.dumps([document.get("apply_run") or "", places])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def read_document(opinion: Opinion) -> dict:
     """Read the stamped ensemble document of one opinion off S3.
 
@@ -4287,6 +4631,9 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :raises RevisionMoved: When the OCR glue wrote again during this
         write, which keeps nothing.
     """
+    # A function-level import: ``opinion_figures`` reads this module.
+    from scanning import opinion_figures
+
     # The revision first and the edits second (#376): an edit written
     # between the two reads is in the build and raises the revision, so
     # the swap below fails and the next build holds both.
@@ -4318,6 +4665,7 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
+            digest = opinion_figures.ledger_digest(opinion, document)
             stamped = Opinion.objects.filter(
                 pk=opinion.pk,
                 ocr_glue_revision=opinion.ocr_glue_revision,
@@ -4326,6 +4674,23 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
                 ensemble_revision=opinion.ocr_glue_revision,
                 ensemble_edit_revision=edit_revision,
                 ensemble_attempts=0,
+                # The pictures the text holds (#463): the ledger the
+                # cut of ``opinion_figures`` answers. A new digest is a
+                # new cut, with a clean count of its faults and no
+                # cooldown of the old one; the same digest keeps both,
+                # so a rebuild does not reset a cut that fails.
+                figure_digest=digest,
+                figure_attempts=Case(
+                    When(figure_digest=digest, then=F("figure_attempts")),
+                    default=Value(0),
+                ),
+                figures_attempted_at=Case(
+                    When(
+                        figure_digest=digest,
+                        then=F("figures_attempted_at"),
+                    ),
+                    default=Value(None, output_field=DateTimeField()),
+                ),
             )
             if not stamped:
                 # The glue wrote the documents again while this ran, or

@@ -105,13 +105,25 @@ CITATION = "citation"
 FOOTNOTE_MARK = "footnotemark"
 PAGE_NUMBER = "page-number"
 
+#: The element of a picture of the text (#463), and the image inside
+#: it: CourtListener draws the stored XML as HTML, so the picture is an
+#: ``img`` whose ``src`` is the JPEG as a data URI, sized to the place it
+#: has on the page.
+FIGURE = "figure"
+IMAGE = "img"
+#: CSS pixels per point: an ``img`` takes its size in CSS pixels, 96 to
+#: the inch, and a point is 1/72 of one, so the printed size holds.
+PIXELS_PER_POINT = 96 / 72
+#: The only ``src`` the XML writes and the display draws.
+_DATA_URI = re.compile(r"^data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+$")
+
 #: The elements that give the text its shape. Every other element is a
 #: role: a tag of the tagger (or ``parties``), drawn with the tint of its
 #: role, the review sheet of centralia.
 STRUCTURE = frozenset({
     "casebody", "opinion", "p", "blockquote", "heading", "footnote",
     "ul", "ol", "li", "table", "tr", "td", "em", "strong", "sup",
-    FOOTNOTE_MARK, PAGE_NUMBER,
+    FOOTNOTE_MARK, PAGE_NUMBER, FIGURE, IMAGE,
 })  # fmt: skip
 
 #: The ``type`` of a CAP ``opinion`` (#442). Every value is a key of
@@ -361,6 +373,8 @@ def _paragraph(
     :returns: The element, and its inner XML.
     :rtype: tuple[str, str]
     """
+    if paragraph.get("kind") == markup.FIGURE:
+        return FIGURE, _figure(paragraph, breaks)
     if paragraph.get("kind") == markup.TABLE:
         # A page that starts at a table is numbered in its first cell:
         # the star number is a citation anchor, and no page may lose it.
@@ -457,6 +471,37 @@ def _paragraph(
             inner = f"<{name}>{inner}</{name}>"
             name = "blockquote"
     return name, inner
+
+
+def _figure(paragraph: dict, breaks: dict[int, str]) -> str:
+    """Write the inner XML of one picture of the text (#463).
+
+    The page numbers of a page that starts at the picture, then one
+    ``img``: the JPEG the approval embedded, as a data URI, at the size
+    the picture has on the page. A picture with no image (a cut that is
+    not a JPEG or a PNG in base64) writes no ``img``, never a broken
+    one.
+
+    :param paragraph: A ``figure`` paragraph of the approved body.
+    :param breaks: ``{offset: printed number}`` of the pages that start
+        at it; a picture has one offset, 0.
+    :returns: The inner XML.
+    :rtype: str
+    """
+    numbers = "".join(_page_number(breaks[at]) for at in sorted(breaks))
+    figure = paragraph.get("figure") or {}
+    src = (
+        f"data:{figure.get('content_type') or ''};base64,"
+        f"{figure.get('data') or ''}"
+    )
+    if not _DATA_URI.match(src):
+        return numbers
+    attrs = {"src": src, "alt": ""}
+    for name, key in (("width", "width_pt"), ("height", "height_pt")):
+        size = figure.get(key)
+        if isinstance(size, int | float) and size > 0:
+            attrs[name] = str(round(size * PIXELS_PER_POINT))
+    return f"{numbers}<{IMAGE}{_attrs(attrs)}/>"
 
 
 def _spans_by_paragraph(body: list[dict], spans: list[dict]) -> dict:
@@ -1193,6 +1238,24 @@ def display_html(xml: str) -> str:
             f'title="{_role(tag)}">{inner}</span>'
         )
 
+    def draw_figure(node: ET.Element) -> str:
+        """A picture of the text (#463), its ``src`` a data URI alone."""
+        numbers = "".join(
+            draw_inline(child) for child in node if child.tag == PAGE_NUMBER
+        )
+        image = node.find(IMAGE)
+        if image is None or not _DATA_URI.match(image.get("src") or ""):
+            return f'<figure class="cb-figure">{numbers}</figure>'
+        size = "".join(
+            f' {name}="{_escape(image.get(name))}"'
+            for name in ("width", "height")
+            if (image.get(name) or "").isdigit()
+        )
+        return (
+            f'<figure class="cb-figure">{numbers}<img src="'
+            f'{_escape(image.get("src"))}" alt=""{size}></figure>'
+        )
+
     def rows(children: list[ET.Element]) -> str:
         """Blocks in order; a run of one role is named once, in the margin."""
         out = []
@@ -1204,6 +1267,9 @@ def display_html(xml: str) -> str:
                 last = None
             elif tag == "heading":
                 out.append(f'<h3 class="cb-heading">{inline(child)}</h3>')
+                last = None
+            elif tag == FIGURE:
+                out.append(draw_figure(child))
                 last = None
             elif tag in ("blockquote", "ul", "ol"):
                 out.append(draw_inline(child))
