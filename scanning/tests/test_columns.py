@@ -293,6 +293,74 @@ class TestSeparateRows(TestCase):
         only.refresh_from_db()
         self.assertEqual(only.x1, LEFT_BOX[2])
 
+    def test_a_picture_that_cuts_the_columns_into_four_keeps_the_gutter(self):
+        """Each column is two boxes, above and below the picture: the
+        gutter is read between the two columns and every box takes it."""
+        boxes = [
+            self.column((LEFT_BOX[0], 176.6, LEFT_BOX[2], 900.0)),
+            self.column((LEFT_BOX[0], 1000.0, LEFT_BOX[2], 1983.5)),
+            self.column((RIGHT_BOX[0], 176.6, RIGHT_BOX[2], 900.0)),
+            self.column((RIGHT_BOX[0], 1000.0, RIGHT_BOX[2], 1983.5)),
+        ]
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 4
+        )
+
+        for row in boxes:
+            row.refresh_from_db()
+        self.assertAlmostEqual(boxes[0].x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[2].x0, RIGHT_TEXT_START, places=1)
+        self.assertAlmostEqual(boxes[3].x0, RIGHT_TEXT_START, places=1)
+
+    def test_a_third_box_at_a_columns_foot_keeps_the_pair(self):
+        """A box over a block at the left column's foot is the left
+        column's, not a column of its own, and short of the gutter it
+        keeps its own edge."""
+        left = self.column(LEFT_BOX)
+        right = self.column(RIGHT_BOX)
+        foot = self.column((240.0, 1900.0, 700.0, 2000.0))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 2
+        )
+
+        left.refresh_from_db()
+        right.refresh_from_db()
+        foot.refresh_from_db()
+        self.assertAlmostEqual(left.x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(right.x0, RIGHT_TEXT_START, places=1)
+        self.assertEqual(foot.x1, 700.0)
+
+    def test_a_pair_that_overlaps_at_the_gutter_is_still_a_pair(self):
+        """The model's two boxes meet or overlap by a sliver before the
+        import separates them: that sliver is the gutter, not a column."""
+        left = self.column((LEFT_BOX[0], LEFT_BOX[1], 840.0, LEFT_BOX[3]))
+        right = self.column((810.0, RIGHT_BOX[1], RIGHT_BOX[2], RIGHT_BOX[3]))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 2
+        )
+
+        left.refresh_from_db()
+        right.refresh_from_db()
+        self.assertAlmostEqual(left.x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(right.x0, RIGHT_TEXT_START, places=1)
+
+    def test_two_boxes_in_one_column_are_no_pair(self):
+        upper = self.column(LEFT_BOX)
+        lower = self.column((240.0, 1990.0, 820.0, 2100.0))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 0
+        )
+
+        upper.refresh_from_db()
+        lower.refresh_from_db()
+        self.assertEqual(upper.x1, LEFT_BOX[2])
+        self.assertEqual(lower.x0, 240.0)
+
     def test_a_hand_drawn_pair_is_not_written(self):
         """A box reaches the database exactly as the reviewer drew it.
         ``separate_document`` corrects the geometry's copy instead."""
@@ -356,6 +424,48 @@ class TestSeparateDocument(TestCase):
         self.assertEqual(moved, 2)
         self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
         self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
+
+    def test_a_picture_that_cuts_the_columns_into_four_keeps_the_gutter(self):
+        document = self.document(
+            (LEFT_BOX[0], 176.6, LEFT_BOX[2], 900.0),
+            (RIGHT_BOX[0], 176.6, RIGHT_BOX[2], 900.0),
+            (LEFT_BOX[0], 1000.0, LEFT_BOX[2], 1983.5),
+            (RIGHT_BOX[0], 1000.0, RIGHT_BOX[2], 1983.5),
+        )
+
+        moved = columns.separate_document(
+            document, {0: cells_of(*body_cells())}
+        )
+
+        boxes = [d.bbox for d in document.pages[0].detections]
+        self.assertEqual(moved, 4)
+        self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[2].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
+        self.assertAlmostEqual(boxes[3].x1, RIGHT_TEXT_START, places=1)
+
+    def test_a_third_box_at_a_columns_foot_keeps_the_pair(self):
+        document = self.document(
+            LEFT_BOX, RIGHT_BOX, (240.0, 1900.0, 700.0, 2000.0)
+        )
+
+        moved = columns.separate_document(
+            document, {0: cells_of(*body_cells())}
+        )
+
+        boxes = [d.bbox for d in document.pages[0].detections]
+        self.assertEqual(moved, 2)
+        self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
+        self.assertEqual(boxes[2].x2, 700.0)
+
+    def test_two_boxes_in_one_column_are_no_pair(self):
+        document = self.document(LEFT_BOX, (240.0, 1990.0, 820.0, 2100.0))
+
+        self.assertEqual(
+            columns.separate_document(document, {0: cells_of(*body_cells())}),
+            0,
+        )
 
     def test_the_order_of_the_detections_is_kept(self):
         document = self.document(RIGHT_BOX, LEFT_BOX)

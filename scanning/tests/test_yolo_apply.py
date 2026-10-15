@@ -26,6 +26,7 @@ from scanning import (
     redactions,
     services,
     text_fit,
+    undetected,
     yolo,
 )
 from scanning.factories import ScanFactory
@@ -41,6 +42,7 @@ from scanning.models import (
     Redaction,
     Scan,
     Status,
+    TextReading,
 )
 from scanning.tests.test_jobs import make_manifest
 
@@ -735,6 +737,16 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertEqual(row.text, note)
         self.assertEqual(row.bbox, [150.0, 210.0, 450.0, 390.0])
         self.assertEqual(row.page_index, 0)
+        # The text readings are written from the same document, in the
+        # same pass: one row per page, both cells on it.
+        reading = TextReading.objects.get(scan=scan)
+        self.assertEqual(reading.page_index, 0)
+        self.assertEqual((reading.img_width, reading.img_height), (1000, 1000))
+        # The reading keeps the first characters of a cell's text.
+        self.assertEqual(
+            [c["text"] for c in reading.cells],
+            [note[: undetected.MAX_TEXT_CHARS], "Body text"],
+        )
 
     def test_a_recompute_rewrites_the_computed_rows_and_keeps_the_human_ones(
         self,

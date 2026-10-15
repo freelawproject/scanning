@@ -1,7 +1,7 @@
 """The findings of review 2: one rebuild from the rows, and the dismissals.
 
 A finding of review 2 is an ``Issue`` row whose ``check_name`` is in
-``models.REVIEW2_CHECKS`` (issue #240, PR D). Eleven checks, in three
+``models.REVIEW2_CHECKS`` (issue #240, PR D). Twelve checks, in three
 groups:
 
 - **about detections and opinions**: a key icon or a caption no opinion
@@ -10,7 +10,9 @@ groups:
   (``missing_headnote_bracket``, ``brackets.missing``, #328), and a key
   icon with no caption box after it, so the opinion it closes runs on
   (``missing_caption``, the one error card: an opinion starts at a
-  caption box, and a miss is shown, never covered);
+  caption box, and a miss is shown, never covered), and a block of
+  text the reader saw that no box covers, which the opinion text would
+  drop (``undetected_text``, ``undetected.uncovered``);
 - **about redactions and pages**: a confident headnote box no black
   redaction covers (``uncovered_headnote``), a headnote bracket box
   under blackletter's redaction gate (``low_confidence_headnote_bracket``,
@@ -63,7 +65,14 @@ from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 
-from scanning import boundaries, brackets, detections, editorial, redactions
+from scanning import (
+    boundaries,
+    brackets,
+    detections,
+    editorial,
+    redactions,
+    undetected,
+)
 from scanning.models import (
     REVIEW2_CHECKS,
     STALE_REVIEW2_CHECKS,
@@ -165,6 +174,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
         found.extend(editorial.uncovered(scan, run))
+        found.extend(undetected.uncovered(scan, run))
     resolve(scan, found)
     with transaction.atomic():
         # One row lock on the scan serializes the rebuilds. Under READ
