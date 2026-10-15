@@ -1610,6 +1610,28 @@ class TestTheWordEdges(TestCase):
         self.assertEqual(root.find("court").text, "Colorado Court of Appeals")
         self.assertIsNone(root.find(".//docketnumber"))
 
+    def test_a_vote_line_cut_in_a_name_opens_no_writing(self):
+        # The longer author span would take "Ciklin" and start its
+        # paragraph: opinion_starts reads that as a concurrence.
+        approved_doc, spans = with_opinion(
+            para("No. 1"), spans=[span(0, 0, 5, "docketnumber")]
+        )
+        approved_doc["body"].append(para("Ciklin, J., concurs in part."))
+        spans += [span(3, 0, 3, "judges"), span(3, 3, 10, "author")]
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(len(root.findall("opinion")), 1)
+
+    def test_a_possessive_is_one_word(self):
+        text = "the court's order is REVERSED."
+        _body, spans = casebody.repair_spans(
+            [para("No. 1"), para(text)],
+            [span(0, 0, 5, "docketnumber"), span(1, 9, 30, "disposition")],
+        )
+
+        self.assertEqual(spans[-1]["start"], text.index("court"))
+
     def test_a_span_at_word_edges_is_kept(self):
         body, spans = casebody.repair_spans(
             [para("No. 1 Court.")],
@@ -1686,6 +1708,17 @@ class TestOneCaptionLabel(TestCase):
             [p.text for p in root.findall("parties/party")],
             ["Jane ROE;", "John DOE SMITH, Appellants,"],
         )
+
+    def test_a_panel_at_the_end_of_a_line_keeps_its_label(self):
+        text = "Jane Roe and John Doe for the appellant. Before A and B, JJ."
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[span(0, 0, 40, "attorneys"), span(0, 41, 60, "judges")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(root.find(".//judges").text, "Before A and B, JJ.")
 
     def test_a_line_with_two_caption_labels_keeps_both(self):
         approved_doc, spans = with_opinion(

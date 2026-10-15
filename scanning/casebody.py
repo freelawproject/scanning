@@ -93,6 +93,7 @@ PARTY_ELEMENTS = frozenset({ELEMENTS["party"], ELEMENTS["separator"]})
 
 #: The label whose first paragraph starts the opinion (:func:`head_matter_end`).
 AUTHOR = "author"
+HEADING = "heading"
 #: The labels of the caption alone. ``judges``, ``disposition`` and
 #: ``heading`` are not here: the end of a main opinion and its body
 #: hold them too.
@@ -542,7 +543,8 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
 #: The labels that two spans of one line keep apart: two parties of one
 #: line are two elements of ``parties``.
 _NEVER_JOINED = frozenset({"party", "separator"})
-_WORD = re.compile(r"\w+")
+#: A word, with the letters after an apostrophe: "court's" is one word.
+_WORD = re.compile(r"\w+(?:['\u2019]\w+)*")
 
 
 def _words(paragraph: dict) -> list[tuple[int, int]]:
@@ -580,6 +582,12 @@ def _snap_to_words(paragraph: dict, rows: list[dict]) -> list[dict]:
     the word, and a span left with no text is dropped. The words are
     :func:`_words`.
 
+    The first word of a paragraph never goes to an ``author`` span that
+    did not start it: an author span that starts its paragraph opens a
+    writing (:func:`opinion_starts`), and the tagger cuts the judge's
+    name of a vote line ("Ciklin, J., concurs in part.") into a
+    ``judges`` and an ``author`` span.
+
     :param paragraph: A body paragraph.
     :param rows: Its spans, copies the caller owns.
     :returns: The spans in text order.
@@ -594,7 +602,16 @@ def _snap_to_words(paragraph: dict, rows: list[dict]) -> list[dict]:
             and touching[0]["end"] >= end
         ):
             continue
-        owner = max(touching, key=lambda r: r["end"] - r["start"])
+        owners = touching
+        if not text[:start].strip(_EDGE):
+            owners = [
+                r
+                for r in touching
+                if r["label"] != AUTHOR or r["start"] <= start
+            ]
+            if not owners:
+                continue
+        owner = max(owners, key=lambda r: r["end"] - r["start"])
         for row in touching:
             if row is owner:
                 row["start"] = min(row["start"], start)
@@ -628,15 +645,19 @@ def _snap_to_words(paragraph: dict, rows: list[dict]) -> list[dict]:
 
 
 def _one_caption_label(rows: list[dict]) -> set[int]:
-    """Give a caption line's other spans its one caption label.
+    """Give a caption line's flickers its one caption label.
 
     On a line in capitals the model changes the label word by word
     (``history``, ``heading``, ``history``, ``judges``: "APPEAL FROM
     THE UNITED STATES DISTRICT COURT ... [Hon. John J. McConnell, Jr.,
-    U.S. District Judge]"). A head-matter line with one label of
+    U.S. District Judge]"). On a head-matter line with one label of
     :data:`HEAD_MATTER_LABELS` that covers more characters than the
-    other spans together is that element whole. A line with two caption
-    labels is two elements (:func:`_cut_caption_paragraph`).
+    other spans together, a ``heading`` span takes that label, and so
+    does any other span with that label on both sides: the judge of a
+    history line. A ``judges`` span at an edge of the line is the panel
+    the engines read into the same block, and keeps its label. A line
+    with two caption labels is two elements
+    (:func:`_cut_caption_paragraph`).
 
     :param rows: The spans of one head-matter paragraph, changed in place.
     :returns: The ``id`` of every span it relabeled: a piece of the
@@ -654,9 +675,19 @@ def _one_caption_label(rows: list[dict]) -> set[int]:
     other = sum(r["end"] - r["start"] for r in rows if r["label"] != label)
     if own <= other:
         return set()
-    relabeled = {id(row) for row in rows if row["label"] != label}
+    labels = [row["label"] for row in rows]
+    relabeled = set()
+    for at, row in enumerate(rows):
+        if row["label"] == label:
+            continue
+        inside = 0 < at < len(rows) - 1 and (
+            labels[at - 1] == label == labels[at + 1]
+        )
+        if row["label"] == HEADING or inside:
+            relabeled.add(id(row))
     for row in rows:
-        row["label"] = label
+        if id(row) in relabeled:
+            row["label"] = label
     return relabeled
 
 
