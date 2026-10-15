@@ -31,7 +31,7 @@
   {% if opinion.index_in_page %}<span class="text-base font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
 </h1>
 <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
-  The approved text with {{ span_count }} span{{ span_count|pluralize }} of tagger run {{ run }}{% if model %} ({{ model }}){% endif %}, in the CAP casebody shape. Built now, stored nowhere.
+  The approved text with {{ span_count }} span{{ span_count|pluralize }} of tagger run {{ run }}{% if model %} ({{ model }}){% endif %}, in the CAP casebody shape. The counts below are the tagger's; the build repairs the spans first, so the document can hold fewer. Built now, stored nowhere.
 </p>
 
 <ul class="cb-chips" aria-label="The labels of the spans">
