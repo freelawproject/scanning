@@ -88,10 +88,12 @@ def kept(opinion: Opinion) -> bool:
 def kept_on_shared_page(opinion: Opinion) -> bool:
     """Return whether a kept row lifts a mask the opinion would have.
 
-    :func:`kept`, on an opinion whose first page the opinion before
-    still ends on (``boundaries.shared_first_pages``). The card of a
-    kept page reads it: a row on a page nobody shares lifts nothing,
-    and a card would say what is not so.
+    :func:`kept`, on an opinion whose first page has a footnote mask
+    with no kept row (``boundaries.outside_rects``): the opinion before
+    still ends on that page, and a ``FOOTNOTES`` box of the page is
+    below its end. The card of a kept page reads it: a row on a page
+    with no such mask lifts nothing, and a card would say what is not
+    so.
 
     :param opinion: The opinion.
     :returns: Whether the kept row lifts a mask.
@@ -100,12 +102,12 @@ def kept_on_shared_page(opinion: Opinion) -> bool:
     from scanning import boundaries
 
     boundary = opinion.boundary
-    return (
-        boundary is not None
-        and kept(opinion)
-        and boundary.pk
-        in boundaries.shared_first_pages(opinion.scan, [boundary])
+    if boundary is None or not kept(opinion):
+        return False
+    rects = boundaries.outside_rects(opinion.scan, [boundary]).get(
+        boundary.pk, []
     )
+    return any(rect.get("kind") == boundaries.FOOTNOTES_MASK for rect in rects)
 
 
 def kept_boundaries(scan: Scan) -> set[int]:

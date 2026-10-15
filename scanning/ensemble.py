@@ -3102,6 +3102,15 @@ def build_page(
                     # drop where the detections drew nothing, the sign
                     # of a column they missed rather than bleed-through.
                     "agreed": _dropped_alike(group),
+                    # The labels of the notes the footnote mask took
+                    # (#457), for the ``SHARED_FOOTNOTES`` card. A
+                    # label and never the words.
+                    "labels": (
+                        _note_labels(group)
+                        if group["excluded"]
+                        and group["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
+                        else []
+                    ),
                     # The edit that took the block out, for its Undo.
                     "edit": (
                         {
@@ -3919,13 +3928,14 @@ def _shared_footnotes_card(
     the notes of that page as the earlier opinion's. Each such page is
     one card: a warning, because the earlier opinion's notes are the
     daily shape of it, or an ERROR the approval waits on when the
-    opinion's own body text on the page carries a footnote mark, a
-    sign that one of the notes is its own, or when the opinion starts
-    and ends on that page, whose notes are then likely its own. A
-    person answers it with a
-    dismissal (the notes are the earlier opinion's) or with "Keep the
-    footnotes" (``shared_footnotes.keep``). A kept page is a warning
-    that says so, and carries the way back.
+    opinion's own body text on the page carries a footnote mark that a
+    taken note has as its label (or a taken block whose label no engine
+    read may have), a sign that one of the notes is its own, or when
+    the opinion starts and ends on that page, whose notes are then
+    likely its own. A person answers it with a dismissal (the notes are
+    the earlier opinion's) or with "Keep the footnotes"
+    (``shared_footnotes.keep``). A kept page is a warning that says so,
+    and carries the way back.
 
     :param opinion: The row.
     :param page: One page of the document.
@@ -3963,11 +3973,17 @@ def _shared_footnotes_card(
         "footnote block(s) were taken out of the text and whited out of "
         "the redacted PDF."
     )
-    if marks or opinion.page_count == 1:
+    # A mark of the body names a note the mask took when a taken note
+    # has its label, or when a taken block has no label the engines
+    # read, which may be that note.
+    labels = {label for drop in taken for label in drop.get("labels") or []}
+    unlabelled = any(not drop.get("labels") for drop in taken)
+    own = [mark for mark in marks if unlabelled or mark in labels]
+    if own or opinion.page_count == 1:
         why = (
             f"The text of this opinion on the page carries the footnote "
-            f"mark(s) {', '.join(marks)}, so a note may be its own."
-            if marks
+            f"mark(s) {', '.join(own)}, so a note may be its own."
+            if own
             else "This opinion starts and ends on this page, so a note "
             "may be its own."
         )
@@ -3985,7 +4001,13 @@ def _shared_footnotes_card(
         page["page_in_opinion"],
         OpinionCheck.SHARED_FOOTNOTES,
         Issue.Severity.WARNING,
-        f"{message} Keep the footnotes if they are this opinion's.",
+        f"{message} Keep the footnotes if they are this opinion's."
+        + (
+            f" The footnote mark(s) {', '.join(marks)} of this opinion's "
+            "text name no note that was taken."
+            if marks
+            else ""
+        ),
         standing,
     )
 
@@ -4020,6 +4042,24 @@ def _undetected_message(page: dict) -> str:
         "behind, as the engines read it. Check that no column of print "
         "is among them."
     )
+
+
+def _note_labels(group: dict) -> list[str]:
+    """Return the footnote labels the engines read at the start of a group.
+
+    Each engine's words the verdict took (``hidden_key``), read by
+    ``paragraphs.leading_label``. The engines can disagree on a label,
+    so every label any engine read is one of the group's.
+
+    :param group: One dropped group.
+    :returns: The labels, sorted.
+    :rtype: list[str]
+    """
+    labels = {
+        paragraphs.leading_label(unit.get("hidden_key") or "")
+        for unit in group["engines"].values()
+    }
+    return sorted(label for label in labels if label)
 
 
 def _dropped_alike(group: dict) -> bool:

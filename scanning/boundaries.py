@@ -929,8 +929,8 @@ def outside_rects(
 
     blackletter's masks stop above the footnotes, so on a first page
     the opinion before ends on (:func:`shared_first_pages`), each live
-    ``FOOTNOTES`` box of the page below the end of the opinion before is
-    a mask too, with ``kind`` :data:`FOOTNOTES_MASK` (#457): those notes
+    ``FOOTNOTES`` box of the page that reaches below the end of the
+    opinion before is a mask too, with ``kind`` :data:`FOOTNOTES_MASK` (#457): those notes
     belong to the text the first mask covers. A person who said the
     notes are the opinion's own (``shared_footnotes.keep``) lifts it,
     through ``kept_footnotes``. The last page keeps its footnotes.
@@ -1043,10 +1043,13 @@ def outside_rects(
                     if det.label != Label.FOOTNOTES:
                         continue
                     box = det.bbox.to_pdf(page.scale_x, page.scale_y)
-                    if box.y1 < shared[row.pk]:
-                        # A box that starts above the end of the opinion
+                    if box.y2 <= shared[row.pk]:
+                        # A box wholly above the end of the opinion
                         # before is not the foot of the page: a stray
-                        # box over the text would white it out.
+                        # box over the text would white it out. The
+                        # band crosses both columns, so its top can be
+                        # above an end low in one column; the bottom
+                        # is the test.
                         continue
                     rect = fitz.Rect(box.x1, box.y1, box.x2, box.y2)
                     if fitz_page is not None:

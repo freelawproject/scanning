@@ -181,6 +181,25 @@ class TestTheMask(ScanningTestCase):
         self.assertEqual(len(notes), 1)
         self.assertGreater(notes[0]["y0"], 400.0)
 
+    def test_a_band_that_starts_above_the_end_in_one_column_is_masked(self):
+        """The band crosses both columns, and its top is no test (#457).
+
+        The opinion before ends low in the left column, and the notes of
+        the right column start higher, so the band's top is above the
+        end. Its bottom is below the end, so it is the foot of the page.
+        """
+        scan = ScanFactory(page_count=3)
+        detection(scan, 1, Label.TEXT_COLUMN, 100, 100, 800, 1700)
+        detection(scan, 1, Label.TEXT_COLUMN, 900, 100, 1600, 1700)
+        detection(scan, 1, Label.FOOTNOTES, 100, 1000, 1600, 2050)
+        _, after = two_opinions(scan)
+
+        masks = boundaries.outside_rects(scan, [after])
+
+        notes = footnote_masks(masks[after.pk])
+        self.assertEqual(len(notes), 1)
+        self.assertAlmostEqual(notes[0]["y0"], 1000 * 72 / 200, places=0)
+
 
 class TestTheVerdict(ScanningTestCase):
     """The OCR glue names a unit under the footnote mask."""
@@ -270,6 +289,50 @@ class TestTheCard(ScanningTestCase):
 
         self.assertEqual(card.severity, Issue.Severity.WARNING)
 
+    def test_a_mark_no_taken_note_has_is_a_warning(self):
+        """The body's note 1 is printed on a later page (#457)."""
+        group = {
+            "section": ensemble.BODY,
+            "text": "The court held 1 that",
+            "marks": [{"kind": "sup", "start": 15, "end": 16}],
+        }
+        drops = [
+            {**NOTE_DROP, "labels": ["3"]},
+            {**NOTE_DROP, "labels": ["4"]},
+        ]
+
+        card = self.card(page_of(drops, [group]))
+
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn(
+            "mark(s) 1 of this opinion's text name no note", card.message
+        )
+
+    def test_a_mark_a_taken_note_has_is_an_error(self):
+        group = {
+            "section": ensemble.BODY,
+            "text": "The court held 1 that",
+            "marks": [{"kind": "sup", "start": 15, "end": 16}],
+        }
+        drops = [{**NOTE_DROP, "labels": ["1"]}]
+
+        card = self.card(page_of(drops, [group]))
+
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+        self.assertIn("mark(s) 1", card.message)
+
+    def test_a_taken_block_with_no_label_may_be_the_marked_note(self):
+        group = {
+            "section": ensemble.BODY,
+            "text": "The court held 1 that",
+            "marks": [{"kind": "sup", "start": 15, "end": 16}],
+        }
+        drops = [{**NOTE_DROP, "labels": ["3"]}, {**NOTE_DROP, "labels": []}]
+
+        card = self.card(page_of(drops, [group]))
+
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+
     def test_an_opinion_of_one_page_makes_it_an_error(self):
         self.opinion.page_count = 1
 
@@ -298,6 +361,37 @@ class TestBodyMarks(ScanningTestCase):
         }
 
         self.assertEqual(paragraphs.body_marks(group), ["*", "12"])
+
+
+class TestNoteLabels(ScanningTestCase):
+    """The labels of the notes a drop took, for the card (#457)."""
+
+    def test_the_label_each_engine_read(self):
+        group = {
+            "engines": {
+                "dots_mocr": {"hidden_key": "3 See Smith v. Jones"},
+                "mistral": {"hidden_key": "3. See Smith"},
+                "surya": {"hidden_key": "See Smith"},
+            }
+        }
+
+        self.assertEqual(ensemble._note_labels(group), ["3"])
+
+    def test_engines_that_read_two_labels_give_both(self):
+        group = {
+            "engines": {
+                "dots_mocr": {"hidden_key": "3 See"},
+                "mistral": {"hidden_key": "8 See"},
+            }
+        }
+
+        self.assertEqual(ensemble._note_labels(group), ["3", "8"])
+
+    def test_the_leading_label(self):
+        self.assertEqual(paragraphs.leading_label("12. The court"), "12")
+        self.assertEqual(paragraphs.leading_label("* The court"), "*")
+        self.assertIsNone(paragraphs.leading_label("The court"))
+        self.assertIsNone(paragraphs.leading_label(""))
 
 
 class TestKeep(ScanningTestCase):
@@ -595,6 +689,60 @@ class TestThePdfMasks(ScanningTestCase):
         notes = footnote_masks(opinion_pdf._masks(self.opinion, self.volume))
 
         self.assertEqual(notes, [])
+
+    def test_the_footnote_mask_starts_at_the_top_of_its_box(self):
+        """``generate`` moves an outside rect's top down by 3 pt (#457)."""
+        rects = boundaries.outside_rects(
+            self.scan, [self.opinion.boundary], document=self.volume
+        )[self.opinion.boundary.pk]
+        (expected,) = footnote_masks(rects)
+
+        (note,) = footnote_masks(opinion_pdf._masks(self.opinion, self.volume))
+
+        self.assertAlmostEqual(
+            note["y0"] + opinion_pdf.GENERATE_OUTSIDE_INSET_PT, expected["y0"]
+        )
+        others = [r for r in rects if r not in footnote_masks(rects)]
+        masks = opinion_pdf._masks(self.opinion, self.volume)
+        self.assertEqual(
+            [r["y0"] for r in others],
+            [m["y0"] for m in masks if m not in footnote_masks(masks)],
+        )
+
+
+class TestKeptOnSharedPage(ScanningTestCase):
+    """``shared_footnotes.kept_on_shared_page``, the rule of the kept card."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.scan = ScanFactory(page_count=3)
+        _, after = two_opinions(self.scan)
+        self.opinion = OpinionFactory(
+            scan=self.scan,
+            boundary=after,
+            start_page_index=1,
+            start_source_page=2,
+            end_page_index=2,
+            end_source_page=3,
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+        )
+
+    def test_a_kept_row_over_a_footnote_band_lifts_a_mask(self):
+        shared_page(self.scan)
+        shared_footnotes.keep(self.opinion, self.user)
+
+        self.assertTrue(shared_footnotes.kept_on_shared_page(self.opinion))
+
+    def test_a_kept_row_on_a_page_with_no_footnote_box_lifts_nothing(self):
+        detection(self.scan, 1, Label.TEXT_COLUMN, 100, 100, 800, 1700)
+        shared_footnotes.keep(self.opinion, self.user)
+
+        self.assertFalse(shared_footnotes.kept_on_shared_page(self.opinion))
+
+    def test_no_kept_row_lifts_nothing(self):
+        shared_page(self.scan)
+
+        self.assertFalse(shared_footnotes.kept_on_shared_page(self.opinion))
 
 
 class TestTheEnsembleZones(ScanningTestCase):

@@ -615,6 +615,12 @@ def _image_rects(
     return images
 
 
+#: How far ``blackletter.api.generate`` moves the top of every outside
+#: rect down before it cuts it (``orect["y0"] + 3``). :func:`_masks`
+#: moves the top of a footnote mask up by as much (#457).
+GENERATE_OUTSIDE_INSET_PT = 3.0
+
+
 def _masks(opinion: Opinion, volume: fitz.Document) -> list[dict]:
     """Return the masks over the neighbour opinions, remapped.
 
@@ -622,8 +628,8 @@ def _masks(opinion: Opinion, volume: fitz.Document) -> list[dict]:
     over the ink that continues past its side edges, which the viewer's
     unwidened masks do not. The footnote mask of a shared first page
     whites out the earlier opinion's notes, unless a person kept them
-    (#457). The page indexes come back in the volume's
-    space and go out in the small source's.
+    (#457), from the top of its box. The page indexes come back in the
+    volume's space and go out in the small source's.
 
     :param opinion: The opinion.
     :param volume: The run's bitonal copy, open.
@@ -644,12 +650,17 @@ def _masks(opinion: Opinion, volume: fitz.Document) -> list[dict]:
     ).get(boundary.pk, [])
     masks = []
     for rect in rects:
-        masks.append(
-            {
-                **rect,
-                "page_index": rect["page_index"] - opinion.start_page_index,
-            }
-        )
+        mask = {
+            **rect,
+            "page_index": rect["page_index"] - opinion.start_page_index,
+        }
+        if rect.get("kind") == boundaries.FOOTNOTES_MASK:
+            # ``generate`` cuts every outside rect from ``y0`` plus
+            # :data:`GENERATE_OUTSIDE_INSET_PT`. The top of a footnote
+            # mask is the top of the box, so the cut would leave the top
+            # of the first note line in the PDF.
+            mask["y0"] = max(rect["y0"] - GENERATE_OUTSIDE_INSET_PT, 0.0)
+        masks.append(mask)
     return masks
 
 
