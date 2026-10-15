@@ -536,6 +536,36 @@ class TestTheCommand(_ExportCase):
 
         self.assertTrue(final_xml.is_written(self.refresh()))
 
+    def test_rewrite_writes_a_current_object_again(self):
+        # A casebody change that keeps the schema (#474): the stamp says
+        # current, the object is old.
+        self.tagged()
+        final_xml.export_due()
+        self.assertTrue(final_xml.is_written(self.refresh()))
+        key = final_xml.key(self.opinion)
+        self.xml[key] = b"<casebody/>"
+
+        self.assertIn("Wrote or deleted 0", self.run_command("--all"))
+        self.assertEqual(self.xml[key], b"<casebody/>")
+
+        out = self.run_command("--all", "--rewrite")
+
+        self.assertIn("Wrote or deleted 1", out)
+        self.assertNotEqual(self.xml[key], b"<casebody/>")
+        self.assertTrue(final_xml.is_written(self.refresh()))
+
+    def test_rewrite_dry_run_lists_the_current_objects_and_changes_nothing(
+        self,
+    ):
+        self.tagged()
+        final_xml.export_due()
+
+        out = self.run_command("--all", "--rewrite", "--dry-run")
+
+        self.assertIn(f"write {final_xml.key(self.opinion)}", out)
+        self.assertIn("Would write 1 and delete 0", out)
+        self.assertEqual(self.refresh().final_xml_schema, casebody.SCHEMA)
+
     def test_it_deletes_the_objects_no_stamp_names(self):
         self.tagged()
         final_xml.export_due()

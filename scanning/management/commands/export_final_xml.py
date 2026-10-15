@@ -14,6 +14,10 @@ Last, it deletes the objects under ``export/`` that no stamp names
 (``final_xml.orphan_keys``): the files of a deleted scan whose admin
 sweep failed. The tick does not list the prefix; this command does.
 
+With ``--rewrite`` it writes the current objects again too: after a
+change of ``casebody`` that keeps ``casebody.SCHEMA`` (#474), every
+stored document is old, but no stamp says so.
+
 It holds the exporter's lock, the one the tick takes, and refuses when
 the tick holds it: run it again a moment later.
 
@@ -22,6 +26,10 @@ Examples:
     # Say what would be written and deleted, and change nothing.
     docker exec scanning-daemon python manage.py \\
         export_final_xml --all --dry-run
+
+    # Write every stored document again after a casebody change.
+    docker exec scanning-daemon python manage.py \\
+        export_final_xml --all --rewrite
 
     # Store the final XML of two volumes.
     docker exec scanning-daemon python manage.py export_final_xml 3593 2845
@@ -56,6 +64,12 @@ class Command(BaseCommand):
             "--all",
             action="store_true",
             help="Export the opinions of every volume.",
+        )
+        parser.add_argument(
+            "--rewrite",
+            action="store_true",
+            help="Write the current stored documents again too, after a "
+            "casebody change that keeps the schema.",
         )
         parser.add_argument(
             "--dry-run",
@@ -97,6 +111,12 @@ class Command(BaseCommand):
                     "a moment"
                 )
             owed = list(final_xml.owed_rows(rows))
+            if options["rewrite"]:
+                if dry_run:
+                    owed.extend(final_xml.written_rows(rows))
+                else:
+                    final_xml.mark_for_rewrite(rows)
+                    owed = list(final_xml.owed_rows(rows))
             withdrawn = list(final_xml.withdrawn_rows(rows))
             orphans = [
                 key

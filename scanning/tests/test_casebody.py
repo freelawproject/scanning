@@ -1533,3 +1533,382 @@ class TestTheFinalXmlRoutes(_S3Case):
         self.assertTrue(entry["written"])
         self.assertTrue(entry["computed"])
         self.assertEqual(entry["url"], self.url("serve_opinion_final_xml"))
+
+
+def with_opinion(*head, spans=()):
+    """The head-matter paragraphs, then an author line and a sentence.
+
+    :returns: The approved document and its spans, the author's included.
+    """
+    body = [*head, para("SMITH, J."), para("We affirm.")]
+    return doc(*body), [*spans, span(len(head), 0, 9, "author")]
+
+
+def head_of(root):
+    return [child for child in root if child.tag != "opinion"]
+
+
+class TestTheWordEdges(TestCase):
+    """A word a span edge cuts goes to the longest span (#474)."""
+
+    def test_a_span_that_starts_inside_a_word_takes_the_word(self):
+        # 3136/598: the tagger left the "TR" of "TRUST" out.
+        approved_doc, spans = with_opinion(
+            para("TRUST UNDER the TRUST, Appellants"),
+            para("v."),
+            para("COMMISSIONER"),
+            spans=[
+                span(0, 2, 33, "party"),
+                span(1, 0, 2, "separator"),
+                span(2, 0, 12, "party"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(head_of(root)[0].tag, "parties")
+        self.assertEqual(
+            root.find("parties/party").text,
+            "TRUST UNDER the TRUST, Appellants",
+        )
+
+    def test_the_longer_span_takes_a_word_two_spans_cut(self):
+        # 3578/2808: "Color" was a docketnumber, "ado Court ..." a court.
+        approved_doc, spans = with_opinion(
+            para("Colorado Court of Appeals, Div. I."),
+            spans=[span(0, 0, 5, "docketnumber"), span(0, 5, 34, "court")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            root.find("court").text, "Colorado Court of Appeals, Div. I."
+        )
+        self.assertIsNone(root.find(".//docketnumber"))
+
+    def test_a_word_cut_three_times_is_one_span(self):
+        # 3136/584: "S|olic|itor", the middle left out.
+        text = "Assistant Solicitor General"
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[span(0, 0, 11, "attorneys"), span(0, 15, 27, "attorneys")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(root.find("attorneys").text, text)
+
+    def test_a_span_at_word_edges_is_kept(self):
+        body, spans = casebody.repair_spans(
+            [para("No. 1 Court.")],
+            [span(0, 0, 5, "docketnumber"), span(0, 6, 12, "court")],
+        )
+
+        self.assertEqual(
+            [(s["start"], s["end"]) for s in spans], [(0, 5), (0, 6)]
+        )
+        self.assertEqual([p["text"] for p in body], ["No. 1", "Court."])
+
+
+class TestOneCaptionLabel(TestCase):
+    """A head line with one caption label is that element (#474)."""
+
+    def test_a_flickering_line_is_one_history(self):
+        # 3136/583: history, heading, history, judges word by word.
+        text = "APPEAL FROM THE DISTRICT COURT [Hon. John Doe, Judge]"
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[
+                span(0, 0, 11, "history"),
+                span(0, 12, 15, "heading"),
+                span(0, 16, 30, "history"),
+                span(0, 31, 36, "history"),
+                span(0, 37, 45, "judges"),
+                span(0, 45, 53, "history"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        history = root.find("history")
+        self.assertEqual(history.text, text)
+        self.assertEqual(len(history), 0)
+
+    def test_a_line_with_two_caption_labels_keeps_both(self):
+        approved_doc, spans = with_opinion(
+            para("Appeal from X. Jane Roe for appellant."),
+            spans=[span(0, 0, 14, "history"), span(0, 15, 38, "attorneys")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [c.tag for c in head_of(root)], ["history", "attorneys"]
+        )
+
+    def test_a_short_caption_span_does_not_relabel_a_heading(self):
+        approved_doc, spans = with_opinion(
+            para("OPINION ON REHEARING", kind="heading"),
+            spans=[
+                span(0, 0, 7, "heading"),
+                span(0, 8, 10, "history"),
+                span(0, 11, 20, "heading"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(head_of(root)[0].tag, "heading")
+        self.assertEqual(root.find("heading/history").text, "ON")
+
+    def test_a_line_of_the_opinion_keeps_its_labels(self):
+        approved_doc, spans = with_opinion(
+            para("No. 1"),
+            spans=[span(0, 0, 5, "docketnumber")],
+        )
+        approved_doc["body"].append(para("HISTORY OF THE CASE and more"))
+        spans += [span(3, 0, 7, "history"), span(3, 8, 19, "heading")]
+
+        _xml, root = build(approved_doc, *spans)
+
+        paragraph = root.find("opinion")[-1]
+        self.assertEqual([c.tag for c in paragraph], ["history", "heading"])
+
+
+class TestTheJoins(TestCase):
+    """Spans of one label that only punctuation separates are one (#474)."""
+
+    def test_a_date_cut_at_its_bracket_is_one_element(self):
+        # 3593/2603: "[" and "June 5, 2024]".
+        approved_doc, spans = with_opinion(
+            para("[June 5, 2024]"),
+            spans=[span(0, 0, 1, "datefiled"), span(0, 1, 14, "datefiled")],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(root.find("decisiondate").text, "[June 5, 2024]")
+        self.assertEqual(head_of(root)[0].tag, "decisiondate")
+
+    def test_two_parties_of_one_line_stay_two(self):
+        approved_doc, spans = with_opinion(
+            para("Jane ROE; John DOE, Appellants,"),
+            para("v."),
+            para("STATE."),
+            spans=[
+                span(0, 0, 8, "party"),
+                span(0, 10, 31, "party"),
+                span(1, 0, 2, "separator"),
+                span(2, 0, 6, "party"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [c.tag for c in root.find("parties")],
+            ["party", "party", "separator", "party"],
+        )
+
+    def test_a_word_between_two_spans_keeps_them_apart(self):
+        body, spans = casebody.repair_spans(
+            [para("Jane Roe and Texas John Doe")],
+            [span(0, 0, 12, "attorneys"), span(0, 19, 27, "attorneys")],
+        )
+
+        self.assertEqual(len(spans), 2)
+        self.assertEqual(len(body), 1)
+
+
+class TestTheCaptionCut(TestCase):
+    """Caption spans that cover a paragraph cut it (#474)."""
+
+    def test_a_caption_in_one_block_is_the_parties_and_the_docket(self):
+        # 3593/2275: the whole caption is one paragraph.
+        text = "Michael BARBER, Appellant, v. MANATEE, Appellee. No. 2D22-3459"
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[
+                span(0, 0, 26, "party"),
+                span(0, 27, 29, "separator"),
+                span(0, 30, 48, "party"),
+                span(0, 49, 62, "docketnumber"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [c.tag for c in head_of(root)], ["parties", "docketnumber"]
+        )
+        self.assertEqual(
+            [c.tag for c in root.find("parties")],
+            ["party", "separator", "party"],
+        )
+        self.assertEqual(
+            root.find("parties/party").text, "Michael BARBER, Appellant,"
+        )
+        self.assertEqual(root.find("docketnumber").text, "No. 2D22-3459")
+
+    def test_a_caption_over_two_paragraphs_is_one_parties(self):
+        # 3136/579: "UNITED STATES, Appellee v." then the other party.
+        approved_doc, spans = with_opinion(
+            para("UNITED STATES, Appellee v."),
+            para("Jonathan JOHNSON, Appellant"),
+            spans=[
+                span(0, 0, 23, "party"),
+                span(0, 24, 26, "separator"),
+                span(1, 0, 27, "party"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(len(root.findall("parties")), 1)
+        self.assertEqual(
+            [c.tag for c in root.find("parties")],
+            ["party", "separator", "party"],
+        )
+
+    def test_a_label_of_no_caption_is_not_cut(self):
+        # 3593/2188: a disposition span on "ON" of a heading.
+        approved_doc, spans = with_opinion(
+            para("No. 1"),
+            para("ON MOTION FOR REHEARING", kind="heading"),
+            spans=[
+                span(0, 0, 5, "docketnumber"),
+                span(1, 0, 2, "disposition"),
+                span(1, 3, 23, "heading"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [c.tag for c in head_of(root)], ["docketnumber", "heading"]
+        )
+
+    def test_a_date_in_a_sentence_stays_a_paragraph(self):
+        approved_doc, spans = with_opinion(
+            para("No. 1"),
+            para("The court ruled on June 5, 2024 for the state."),
+            spans=[
+                span(0, 0, 5, "docketnumber"),
+                span(1, 19, 31, "datefiled"),
+                span(1, 36, 45, "court"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        line = head_of(root)[1]
+        self.assertEqual(line.tag, "p")
+        self.assertEqual(line.find("decisiondate").text, "June 5, 2024")
+
+    def test_a_page_break_goes_with_its_piece_once(self):
+        approved_doc, spans = with_opinion(
+            para("ROE, Appellant, v. STATE.", pages=(0, 1), breaks=[(19, 1)]),
+            spans=[
+                span(0, 0, 15, "party"),
+                span(0, 16, 18, "separator"),
+                span(0, 19, 25, "party"),
+            ],
+        )
+        approved_doc["body"][1]["pages"] = [1]
+        approved_doc["body"][2]["pages"] = [1]
+
+        xml, root = build(approved_doc, *spans)
+
+        self.assertEqual(
+            [n.get("label") for n in root.iter("page-number")], ["503"]
+        )
+        self.assertIn(
+            '<party><page-number label="503">*503</page-number>STATE.</party>',
+            xml,
+        )
+
+    def test_a_mark_across_two_pieces_is_cut(self):
+        approved_doc, spans = with_opinion(
+            para("No. 1 Court.", marks=[mark(0, 12, "em")]),
+            spans=[span(0, 0, 5, "docketnumber"), span(0, 6, 12, "court")],
+        )
+
+        xml, root = build(approved_doc, *spans)
+
+        self.assertIn("<docketnumber><em>No. 1</em></docketnumber>", xml)
+        self.assertIn("<court><em>Court.</em></court>", xml)
+
+    def test_the_text_of_the_cut_is_every_character(self):
+        text = "ROE, Appellant, v. STATE. No. 9 [June 5, 2024]"
+        approved_doc, spans = with_opinion(
+            para(text),
+            spans=[
+                span(0, 0, 15, "party"),
+                span(0, 16, 18, "separator"),
+                span(0, 19, 25, "party"),
+                span(0, 26, 31, "docketnumber"),
+                span(0, 32, 33, "datefiled"),
+                span(0, 33, 46, "datefiled"),
+            ],
+        )
+
+        _xml, root = build(approved_doc, *spans)
+
+        written = "".join("".join(c.itertext()) for c in head_of(root))
+        self.assertEqual(written.replace(" ", ""), text.replace(" ", ""))
+
+
+class TestTheHeadMatterHasNoBold(TestCase):
+    """The engines read a caption in bold; a CAP head matter has none (#474)."""
+
+    def test_a_bold_party_has_no_strong(self):
+        approved_doc, spans = with_opinion(
+            para("Jane ROE,", marks=[mark(0, 9, "strong")]),
+            para("v."),
+            para("STATE.", marks=[mark(0, 6, "strong")]),
+            spans=[
+                span(0, 0, 9, "party"),
+                span(1, 0, 2, "separator"),
+                span(2, 0, 6, "party"),
+            ],
+        )
+
+        xml, root = build(approved_doc, *spans)
+
+        self.assertNotIn("<strong>", xml)
+        self.assertEqual(root.find("parties/party").text, "Jane ROE,")
+
+    def test_an_italic_of_the_head_matter_is_kept(self):
+        approved_doc, spans = with_opinion(
+            para("In re Smith", marks=[mark(6, 11, "em")]),
+            spans=[span(0, 0, 11, "party")],
+        )
+
+        xml, _root = build(approved_doc, *spans)
+
+        self.assertIn("<em>Smith</em>", xml)
+
+    def test_the_opinion_keeps_its_bold(self):
+        approved_doc, spans = with_opinion(
+            para("No. 1", marks=[mark(0, 5, "strong")]),
+            spans=[span(0, 0, 5, "docketnumber")],
+        )
+        approved_doc["body"][2]["marks"] = [mark(3, 9, "strong")]
+
+        xml, _root = build(approved_doc, *spans)
+
+        self.assertIn("<docketnumber>No. 1</docketnumber>", xml)
+        self.assertIn("We <strong>affirm</strong>.", xml)
+
+    def test_the_approved_object_does_not_change(self):
+        approved_doc, spans = with_opinion(
+            para("ROE, v.", marks=[mark(0, 7, "strong")]),
+            spans=[span(0, 0, 4, "party"), span(0, 5, 7, "separator")],
+        )
+        before = json.dumps(approved_doc, sort_keys=True)
+        spans_before = json.dumps(spans, sort_keys=True)
+
+        build(approved_doc, *spans)
+
+        self.assertEqual(json.dumps(approved_doc, sort_keys=True), before)
+        self.assertEqual(json.dumps(spans, sort_keys=True), spans_before)

@@ -528,6 +528,38 @@ def due_rows(opinions: QuerySet | None = None) -> QuerySet:
     return owed_rows(opinions).filter(final_xml_attempts__lt=MAX_ATTEMPTS)
 
 
+def written_rows(opinions: QuerySet | None = None) -> QuerySet:
+    """Return the rows whose stored object is current (:func:`is_written`).
+
+    The rows a rewrite makes owed again (#474): a change of ``casebody``
+    that keeps ``SCHEMA`` leaves every one of them written.
+
+    :param opinions: The rows to look in; every opinion by default.
+    :rtype: QuerySet
+    """
+    opinions = Opinion.objects.all() if opinions is None else opinions
+    return opinions.filter(
+        _exportable_q(),
+        final_xml_tag_key=F("tag_key"),
+        final_xml_schema=casebody.SCHEMA,
+    ).order_by("-approved_at", "-pk")
+
+
+def mark_for_rewrite(opinions: QuerySet | None = None) -> int:
+    """Make the current stored objects owed again (#474).
+
+    The schema goes to None, the "content unknown" state of a lost
+    stamp swap (:func:`_mark_unknown`): :func:`is_written` is false and
+    :func:`is_stored` holds, so the next export writes the same key
+    again. The caller holds :func:`exporter_lock`.
+
+    :param opinions: The rows to look in; every opinion by default.
+    :returns: The number of rows marked.
+    :rtype: int
+    """
+    return written_rows(opinions).update(final_xml_schema=None)
+
+
 @contextmanager
 def exporter_lock() -> Iterator[bool]:
     """Hold the one exporter's advisory lock, if no one else holds it.

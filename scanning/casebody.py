@@ -32,7 +32,10 @@ covers a whole paragraph is that paragraph's element (``<court>``); a
 span that covers a part is an inline element inside it. The tagger was
 trained on its own label names, and :data:`ELEMENTS` is the one table
 from a label to the CAP element. ``heading`` and ``separator`` have no
-CAP element and keep their own name.
+CAP element and keep their own name. The spans are read through
+:func:`repair_spans` first (#474): the tagger labels tokens and the
+engines read a caption as one block, and the stored spans stay as the
+tagger wrote them. The head matter has no bold (#474).
 
 **The text is the text the tagger read.** The approved text keeps a
 ``\\n`` where a line or a column ended, and a word cut there. The XML
@@ -535,6 +538,299 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     return max(run, caption[-1] + 1) if caption else run
 
 
+# ── The repair of the spans (#474) ──────────────────────────────────
+#: The labels that two spans of one line keep apart: two parties of one
+#: line are two elements of ``parties``.
+_NEVER_JOINED = frozenset({"party", "separator"})
+_WORD = re.compile(r"\w+")
+
+
+def _snap_to_words(text: str, rows: list[dict]) -> list[dict]:
+    """Give every word a span edge cuts to the longest span that touches it.
+
+    The tagger labels tokens, and a token is often part of a word, so a
+    label can change inside it (``Color|ado``, ``TR|UST`` with the
+    ``TR`` left out). The longest span is the one the model was surest
+    of: the line it labels whole. The other spans lose their share of
+    the word, and a span left with no text is dropped.
+
+    :param text: The paragraph's text.
+    :param rows: Its spans, copies the caller owns.
+    :returns: The spans in text order.
+    :rtype: list[dict]
+    """
+    for word in _WORD.finditer(text):
+        start, end = word.span()
+        touching = [r for r in rows if r["start"] < end and r["end"] > start]
+        if not touching or (
+            len(touching) == 1
+            and touching[0]["start"] <= start
+            and touching[0]["end"] >= end
+        ):
+            continue
+        owner = max(touching, key=lambda r: r["end"] - r["start"])
+        for row in touching:
+            if row is owner:
+                row["start"] = min(row["start"], start)
+                row["end"] = max(row["end"], end)
+                continue
+            if row["start"] >= start:
+                row["start"] = max(row["start"], end)
+            if row["end"] <= end:
+                row["end"] = min(row["end"], start)
+    kept = sorted(
+        (
+            row
+            for row in rows
+            if row["start"] < row["end"]
+            and text[row["start"] : row["end"]].strip()
+        ),
+        key=lambda r: r["start"],
+    )
+    merged: list[dict] = []
+    for row in kept:
+        # Two pieces of one label that now share a word are one span.
+        if (
+            merged
+            and merged[-1]["label"] == row["label"]
+            and row["start"] <= merged[-1]["end"]
+        ):
+            merged[-1]["end"] = max(merged[-1]["end"], row["end"])
+        else:
+            merged.append(row)
+    return merged
+
+
+def _one_caption_label(rows: list[dict]) -> None:
+    """Give a caption line's other spans its one caption label.
+
+    On a line in capitals the model changes the label word by word
+    (``history``, ``heading``, ``history``, ``judges``: "APPEAL FROM
+    THE UNITED STATES DISTRICT COURT ... [Hon. John J. McConnell, Jr.,
+    U.S. District Judge]"). A head-matter line with one label of
+    :data:`HEAD_MATTER_LABELS` that covers more characters than the
+    other spans together is that element whole. A line with two caption
+    labels is two elements (:func:`_cut_caption_paragraph`).
+
+    :param rows: The spans of one head-matter paragraph, changed in place.
+    """
+    caption = {
+        row["label"] for row in rows if row["label"] in HEAD_MATTER_LABELS
+    }
+    if len(caption) != 1:
+        return
+    (label,) = caption
+    own = sum(r["end"] - r["start"] for r in rows if r["label"] == label)
+    other = sum(r["end"] - r["start"] for r in rows if r["label"] != label)
+    if own <= other:
+        return
+    for row in rows:
+        row["label"] = label
+
+
+def _join_touching(text: str, rows: list[dict]) -> list[dict]:
+    """Join the spans of one label that only :data:`_EDGE` separates.
+
+    The model cuts one element at a bracket or a full stop
+    (``[`` and ``June 5, 2024]``, ``Bradley S`` and ``Davis``). Never
+    ``party`` or ``separator`` (:data:`_NEVER_JOINED`).
+
+    :param text: The paragraph's text.
+    :param rows: Its spans in text order.
+    :returns: The spans in text order.
+    :rtype: list[dict]
+    """
+    joined: list[dict] = []
+    for row in rows:
+        if (
+            joined
+            and joined[-1]["label"] == row["label"]
+            and row["label"] not in _NEVER_JOINED
+            and not text[joined[-1]["end"] : row["start"]].strip(_EDGE)
+        ):
+            joined[-1]["end"] = max(joined[-1]["end"], row["end"])
+        else:
+            joined.append(row)
+    return joined
+
+
+def _is_caption_block(paragraph: dict, rows: list[dict]) -> bool:
+    """Return whether caption spans cover a paragraph between them.
+
+    Two spans or more, every one of :data:`HEAD_MATTER_LABELS`, and
+    only :data:`_EDGE` outside them: the engines read the caption lines
+    as one block. A line where the spans leave words is a sentence, and
+    a ``heading`` beside a ``disposition`` is no caption.
+
+    :param paragraph: A head-matter paragraph.
+    :param rows: Its spans in text order.
+    :rtype: bool
+    """
+    if len(rows) < 2 or paragraph.get("blockquote"):
+        return False
+    if paragraph.get("kind") in (markup.TABLE, markup.LIST_ITEM):
+        return False
+    if any(row["label"] not in HEAD_MATTER_LABELS for row in rows):
+        return False
+    text = paragraph.get("text") or ""
+    at = 0
+    for row in rows:
+        if text[at : row["start"]].strip(_EDGE):
+            return False
+        at = row["end"]
+    return not text[at:].strip(_EDGE)
+
+
+def _cut_caption_paragraph(
+    paragraph: dict, rows: list[dict]
+) -> list[tuple[dict, dict]]:
+    """Cut a caption block into one paragraph per span.
+
+    A piece runs from its span's start to the next span's start, so the
+    punctuation after a span stays with it, less the space at its end.
+    The marks are clipped to the piece. A page break and a join go to
+    the piece that holds their offset, and a piece's ``pages`` start at
+    the page in effect at its first character, so ``breaks_of`` in
+    :func:`build` writes every star number once.
+
+    :param paragraph: A paragraph :func:`_is_caption_block` accepts.
+    :param rows: Its spans in text order.
+    :returns: ``(piece, span)`` pairs, the span in the piece's offsets.
+    :rtype: list[tuple[dict, dict]]
+    """
+    text = paragraph.get("text") or ""
+    pages = paragraph.get("pages") or []
+    breaks = sorted(
+        paragraph.get("page_breaks") or [], key=lambda e: e["offset"]
+    )
+    bounds = [0, *(row["start"] for row in rows[1:]), len(text)]
+    out = []
+    for row, start, end in zip(rows, bounds, bounds[1:], strict=False):
+        piece = dict(paragraph)
+        piece["text"] = text[start:end].rstrip()
+        length = len(piece["text"])
+        piece["marks"] = [
+            dict(
+                mark,
+                start=max(mark["start"], start) - start,
+                end=min(mark["end"] - start, length),
+            )
+            for mark in paragraph.get("marks") or []
+            if mark["start"] < start + length and mark["end"] > start
+        ]
+        before = [e for e in breaks if e["offset"] <= start]
+        inside = [e for e in breaks if start < e["offset"] < end]
+        first = before[-1]["page_in_opinion"] if before else None
+        if first is None and pages:
+            first = pages[0]
+        piece["pages"] = ([] if first is None else [first]) + [
+            e["page_in_opinion"] for e in inside
+        ]
+        piece["page_breaks"] = [
+            dict(e, offset=e["offset"] - start) for e in inside
+        ]
+        piece["joins"] = [
+            dict(j, offset=j["offset"] - start)
+            for j in paragraph.get("joins") or []
+            if start <= j["offset"] < end
+        ]
+        out.append(
+            (
+                piece,
+                dict(row, start=row["start"] - start, end=row["end"] - start),
+            )
+        )
+    return out
+
+
+def repair_spans(
+    body: list[dict], spans: list[dict]
+) -> tuple[list[dict], list[dict]]:
+    """Return the body and the spans :func:`build` writes (#474).
+
+    The tagger labels tokens and the engines read a caption as one
+    block, so the spans as stored cut words, change label inside a
+    line, cut one element in two, and share one paragraph among the
+    caption elements. Four steps, in this order:
+
+    1. A word a span edge cuts goes whole to the longest span that
+       touches it (:func:`_snap_to_words`), in every paragraph.
+    2. A head-matter line with one caption label gives it to its other
+       spans (:func:`_one_caption_label`).
+    3. The spans of one label that only :data:`_EDGE` separates are
+       one (:func:`_join_touching`), in every paragraph.
+    4. A head-matter paragraph that caption spans cover is one
+       paragraph per span (:func:`_cut_caption_paragraph`), so each is
+       an element of ``casebody`` and the ``party`` run is one
+       ``parties``.
+
+    Step 1 comes first, or step 4 writes the two halves of a cut word
+    as two elements. The head matter is read again before step 4,
+    because a join can make a line a caption line. Pure: the stored
+    spans never change, so a better rule is a new export and never a
+    tagger run.
+
+    :param body: The body paragraphs of the approved text.
+    :param spans: The spans of the tagger.
+    :returns: The body and the spans, the spans in the new body's
+        paragraph offsets.
+    :rtype: tuple[list[dict], list[dict]]
+    :raises CasebodyError: When a span does not address the body.
+    """
+    by = {
+        index: _snap_to_words(
+            body[index].get("text") or "", [dict(row) for row in rows]
+        )
+        for index, rows in _spans_by_paragraph(body, spans).items()
+    }
+    by = {index: rows for index, rows in by.items() if rows}
+    split = head_matter_end(body, by)
+    for index, rows in by.items():
+        if index < split:
+            _one_caption_label(rows)
+        by[index] = _join_touching(body[index].get("text") or "", rows)
+    split = head_matter_end(body, by)
+    new_body: list[dict] = []
+    new_spans: list[dict] = []
+    for index, paragraph in enumerate(body):
+        rows = by.get(index, [])
+        if index < split and _is_caption_block(paragraph, rows):
+            for piece, row in _cut_caption_paragraph(paragraph, rows):
+                new_spans.append(dict(row, paragraph=len(new_body)))
+                new_body.append(piece)
+            continue
+        new_spans.extend(dict(row, paragraph=len(new_body)) for row in rows)
+        new_body.append(paragraph)
+    return new_body, new_spans
+
+
+def _plain_head_matter(body: list[dict], split: int) -> list[dict]:
+    """Return the body with no ``strong`` mark before ``split`` (#474).
+
+    The engines read a caption in bold, and a CAP head matter has no
+    bold. An italic case name and a footnote mark keep their marks, and
+    the opinion keeps its bold.
+
+    :param body: The body paragraphs.
+    :param split: :func:`head_matter_end`.
+    :returns: A new list; the paragraphs it changes are copies.
+    :rtype: list[dict]
+    """
+    return [
+        dict(
+            paragraph,
+            marks=[
+                mark
+                for mark in paragraph.get("marks") or []
+                if mark.get("kind") != markup.STRONG
+            ],
+        )
+        if index < split
+        else paragraph
+        for index, paragraph in enumerate(body)
+    ]
+
+
 def main_citation(volume, cite_name: str, first_page) -> str:
     """Return the citation of an opinion in its own reporter (#435).
 
@@ -928,8 +1224,12 @@ def build(
     :raises OpinionTypeError: When a writing names no type the table
         reads (:func:`opinion_type`).
     """
-    body = approved.get("body") or []
-    by = _spans_by_paragraph(body, tags.get("spans") or [])
+    body, spans = repair_spans(
+        approved.get("body") or [], tags.get("spans") or []
+    )
+    by = _spans_by_paragraph(body, spans)
+    split = head_matter_end(body, by)
+    body = _plain_head_matter(body, split)
     notes = approved.get("footnotes") or []
     labels = frozenset(
         str(note["label"]) for note in notes if note.get("label") is not None
@@ -979,7 +1279,6 @@ def build(
             at += 1
         return out
 
-    split = head_matter_end(body, by)
     cited = citation_paragraphs(body, by, split)
     cites = [_escape(citation)] if citation else []
     # The printed characters alone: a citation is a string the importer
