@@ -913,6 +913,94 @@ def as_box(value) -> list[float] | None:
     return [x0, y0, x1, y1]
 
 
+def clamp_box(
+    box: list[float] | None, width: float, height: float
+) -> list[float] | None:
+    """Hold a box inside its page, or return None when nothing is left.
+
+    No cell is ever past the page. A reader writes the odd box past
+    the edge (a footnote cell of 452 P.3d ten pages wide, x to 11,387
+    on a 1,700-pixel render), and a box judged as drawn is covered by
+    a sliver of itself, so the unit is dropped and the card flashes a
+    box wider than the page. A box with nothing on the page is no
+    box: its unit is unjudged, left out of the text and counted in
+    the manifest. :func:`fit_overrun` is the rule the readers call,
+    which cuts an overrun at the detection box that holds the cell
+    first and comes here for the rest.
+
+    :param box: ``[x0, y0, x1, y1]`` with area, or None.
+    :param width: The page's width in the box's space.
+    :param height: The page's height in the box's space.
+    :returns: The box held inside ``[0, width]`` and ``[0, height]``,
+        or None when the box is None or lies wholly outside the page.
+    :rtype: list[float] | None
+    """
+    if box is None:
+        return None
+    x0 = min(max(box[0], 0.0), width)
+    y0 = min(max(box[1], 0.0), height)
+    x1 = min(max(box[2], 0.0), width)
+    y1 = min(max(box[3], 0.0), height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def fit_overrun(
+    box: list[float] | None,
+    width: float,
+    height: float,
+    rects: list[dict] | None,
+) -> list[float] | None:
+    """Cut the part of a box that runs past the page at the box that holds it.
+
+    A reader's box that starts inside a detection box and runs off the
+    page almost always ends where that box ends: the footnote cell of
+    452 P.3d written ten pages wide starts inside the footnote box and
+    is the rest of its line. So each side that runs past the page is
+    cut at the far edge of the detection boxes that overlap the part of
+    the cell on the page; a side no box reaches is held at the page
+    edge (:func:`clamp_box`), and a box wholly off the page is pinned
+    to the margin it ran over. One rule for the glue's verdict and the
+    review-2 card, over the same frame.
+
+    :param box: ``[x0, y0, x1, y1]`` with area, or None.
+    :param width: The page's width in the box's space.
+    :param height: The page's height in the box's space.
+    :param rects: The page's frame, ``{"x0", "y0", "x1", "y1"}`` dicts
+        in the box's space, or None.
+    :returns: The fitted box, or None for None.
+    :rtype: list[float] | None
+    """
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    over = (x0 < 0, y0 < 0, x1 > width, y1 > height)
+    if not any(over):
+        return list(box)
+    inside = clamp_box(box, width, height)
+    if inside is None or not rects:
+        return inside
+    holders = [
+        r
+        for r in rects
+        if min(inside[2], r["x1"]) > max(inside[0], r["x0"])
+        and min(inside[3], r["y1"]) > max(inside[1], r["y0"])
+    ]
+    if not holders:
+        return inside
+    if over[0]:
+        x0 = min(r["x0"] for r in holders)
+    if over[1]:
+        y0 = min(r["y0"] for r in holders)
+    if over[2]:
+        x1 = max(r["x1"] for r in holders)
+    if over[3]:
+        y1 = max(r["y1"] for r in holders)
+    fitted = clamp_box([x0, y0, x1, y1], width, height)
+    return fitted if fitted is not None else inside
+
+
 def _number(value) -> bool:
     """Return whether ``value`` is a real number."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1391,6 +1479,10 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
+                # A box the reader ran past the page is cut at the
+                # detection box that holds it (``fit_overrun``), the
+                # rule the review-2 card reads too.
+                box_pt = fit_overrun(box_pt, size[0], size[1], frame_rects)
             # The engine's markup becomes marks over a plain text
             # (#404), and the bracket strip runs on that text: Surya's
             # markup is in its ``html``, where the token sits behind a

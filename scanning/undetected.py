@@ -73,10 +73,13 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: The dots.mocr categories whose cells make no card: the running head
-#: and foot, which the text never holds; a picture, which has no text;
-#: and a footnote, a loss the curator accepts.
-SKIP_KINDS = frozenset({"Picture", "Page-header", "Page-footer", "Footnote"})
+#: No cell is skipped for the reader's category. The model's boxes say
+#: what a block is: a footnote inside the footnote box is covered, and
+#: a footnote line outside it is a drop (page 221 of 452 P.3d, a
+#: footnote the reader labelled a page foot, under a column box with no
+#: footnote box on the page). A running head, a page number and a
+#: picture caption sit inside their own boxes, or hold no word.
+SKIP_KINDS = frozenset()
 
 #: A cell with no run of three letters or digits is a stray mark.
 WORD = re.compile(r"[A-Za-z0-9]{3,}")
@@ -206,7 +209,7 @@ def write_rows(scan: Scan, document: dict | None, run: ApplyRun | None) -> int:
 
 
 def is_text(cell: dict) -> bool:
-    """Return whether a cell is text the opinion would keep."""
+    """Return whether a cell is text: it holds a word, whatever its kind."""
     if cell.get("kind") in SKIP_KINDS:
         return False
     return bool(WORD.search(cell.get("text") or ""))
@@ -251,7 +254,27 @@ def missed_cells(
         x1, y1 = boundaries.to_points(
             box[2], box[3], reading.img_width, reading.img_height, *size
         )
-        box_pt = [x0, y0, x1, y1]
+        # A box the reader ran past the page is cut at the detection
+        # box that holds it (``opinion_ocr.fit_overrun``), the glue's
+        # own reading of it, so the card judges, and names, the box
+        # the text has.
+        box_pt = opinion_ocr.fit_overrun(
+            [x0, y0, x1, y1], size[0], size[1], frame
+        )
+        if box_pt is None:
+            continue
+        if box_pt != [x0, y0, x1, y1]:
+            sx = reading.img_width / size[0]
+            sy = reading.img_height / size[1]
+            cell = {
+                **cell,
+                "box": [
+                    round(box_pt[0] * sx, 1),
+                    round(box_pt[1] * sy, 1),
+                    round(box_pt[2] * sx, 1),
+                    round(box_pt[3] * sy, 1),
+                ],
+            }
         # The verdict's first test: a unit a redaction covers is
         # excluded as a redaction, never dropped as undetected.
         if (
