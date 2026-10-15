@@ -461,6 +461,45 @@ def _starts_again(label: str, last: int | None) -> bool:
     )
 
 
+def leading_label(text: str) -> str | None:
+    """Return the footnote label a text starts with, or None.
+
+    The label rule of :func:`split_label` over plain text: a number or
+    a symbol followed by a period, a parenthesis or a space. The
+    ``SHARED_FOOTNOTES`` card reads it over the notes the mask took
+    (#457).
+
+    :param text: The text of one note.
+    :returns: The label, or None.
+    :rtype: str | None
+    """
+    found = _LABEL.match(text or "")
+    return found.group(1) if found else None
+
+
+def body_marks(group: dict) -> list[str]:
+    """Return the footnote marks of one group, in the order of its text.
+
+    A mark is a ``sup`` mark whose text is a label alone: a number or a
+    footnote symbol. The ``SHARED_FOOTNOTES`` card reads it over the
+    body of a first page (#457).
+
+    :param group: One group of the ensemble document.
+    :returns: The labels.
+    :rtype: list[str]
+    """
+    text = group.get("text") or ""
+    labels = []
+    for mark in sorted(
+        (m for m in group.get("marks") or [] if m.get("kind") == "sup"),
+        key=lambda m: m["start"],
+    ):
+        found = _LABEL_ALONE.match(text[mark["start"] : mark["end"]])
+        if found:
+            labels.append(found.group(1))
+    return labels
+
+
 def mark_restarts(document: dict) -> list[tuple[str, int]]:
     """Return where the footnote marks of the body start again.
 
