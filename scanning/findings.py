@@ -713,11 +713,18 @@ _CAPTION_MIN_KEY_HEIGHTS = 2.0
 #: How far a guess with no column box to end it runs, in key heights.
 _CAPTION_FALLBACK_KEY_HEIGHTS = 4.0
 
-#: The space a caption guess keeps under the case number above it and
-#: above the key icon or the synopsis that ends it, as a share of the
-#: key's height: a box drawn edge to edge takes the number and the key
-#: for part of the caption, and the curator trims both.
+#: The space a caption guess keeps above the key icon or the synopsis
+#: that ends it, as a share of the key's height: a box drawn edge to
+#: edge takes the key for part of the caption, and the curator trims it.
 _CAPTION_EDGE_GAP = 0.3
+
+#: The space it keeps under the case number above it, as a share of the
+#: key's height: a few pixels. The title's first line can start right
+#: under the number (the model's own caption boxes begin a pixel or
+#: three below it), and a box that starts inside that line masks the
+#: line out of the opinion, where a box that starts a little high only
+#: takes the number along.
+_CAPTION_NUMBER_GAP = 0.05
 
 
 def _caption_guess(
@@ -734,7 +741,8 @@ def _caption_guess(
     S.Ct. volume are a column of captions, each closed by a key), a
     little above it (``_CAPTION_EDGE_GAP``), else the column's foot;
     a case number (``CASE_SEQUENCE``) at the start moves the start a
-    little under it, so the box holds the title and not the number. A
+    few pixels under it (``_CAPTION_NUMBER_GAP``), so the box holds
+    the title and not the number, and never starts inside the title. A
     caption that runs on into the next column is boxed in its first
     column alone. A key's page with no column box of its own (the washed-out
     page 792 of scan 3579, whose keys were real and whose print the
@@ -797,7 +805,7 @@ def _caption_guess(
             and d.y0 < bottom
         ]
         if numbers:
-            start = min(numbers) + edge
+            start = min(numbers) + _CAPTION_NUMBER_GAP * key_height
         bottom = max(bottom, start + key_height)
         box = [
             min(d.x0 for d in boxes),

@@ -273,9 +273,10 @@ class TestRebuild(ScanningTestCase):
         card = next(r for r in rows if r.metadata["key_bbox"][1] == inside.y0)
         self.assertEqual(card.metadata["runs_on"], span.pk)
         # Half a key height under the key is 435; the number ends at
-        # 470, and the box starts 0.3 key heights (27) under it; the
-        # next key starts at 1200, and the box ends 27 above it.
-        self.assertEqual(card.metadata["bbox"], [90.0, 497.0, 800.0, 1173.0])
+        # 470, and the box starts 0.05 key heights (4.5) under it; the
+        # next key starts at 1200, and the box ends 0.3 key heights
+        # (27) above it.
+        self.assertEqual(card.metadata["bbox"], [90.0, 474.5, 800.0, 1173.0])
 
     def test_a_second_box_over_a_paired_key_is_an_unmatched_key(self):
         """Two boxes over one icon: the pairing skipped the second, and
