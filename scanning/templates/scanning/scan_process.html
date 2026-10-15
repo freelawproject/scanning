@@ -434,11 +434,14 @@ body.boundary-pick .opinion-nav.picking {
       {% for m in op.missing %}
       <div class="ml-4 mb-1 rounded border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-2 py-1 text-xs cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40 missing-opinion"
            data-pdf-index="{{ m.idx }}" data-boxes="{{ m.boxes }}" data-img-w="{{ m.img_w }}" data-img-h="{{ m.img_h }}" data-issue-pk="{{ m.issue_pk }}"
+           data-label="{{ m.label }}" data-label-id="{{ m.label_id }}"
            onclick="event.stopPropagation(); goToPage(this)"
-           title="The key icon on page {{ m.key_num }} closes the opinion above, and no caption box follows it, so this opinion has no start. Click to show where the caption is likely to be, then draw the caption box there; the next compute starts the opinion on it.">
+           title="The key icon on page {{ m.key_num }} closes the opinion above, and no caption box follows it, so this opinion has no start. Click to show where the caption is likely to be, then draw the caption box there, or press + to add it where the card guesses; the next compute starts the opinion on it.">
         <span class="font-bold text-red-700 dark:text-red-300">?</span>
         <span class="text-[10px] px-1 rounded bg-red-600 text-white">missing</span>
         <span class="text-gray-700 dark:text-gray-300">Pages {{ m.num }}&ndash;{{ m.end_num }}: no caption box after the key on page {{ m.key_num }}</span>
+        <button class="ml-1 px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700 missing-add" title="Add a caption box where the card guesses the caption is, the box the row flashes. Resize it on the page if it is off; the next compute starts the opinion on it."
+                onclick="event.stopPropagation(); addMissingCaption(this)">+</button>
       </div>
       {% endfor %}
       {% if op.image_pages %}

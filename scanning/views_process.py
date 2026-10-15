@@ -944,6 +944,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # every opinion of a page that holds several.
     missing_count = 0
     if opinions and not preview:
+        from blackletter.models import Label
+
         open_missing = [
             row
             for row in Issue.objects.filter(
@@ -987,6 +989,13 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                         "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
                         "img_w": md["img_width"],
                         "img_h": md["img_height"],
+                        # The row's + adds the guess as a caption box
+                        # (``addMissingCaption``), with the label the
+                        # finding names and never one the script spells.
+                        "label": md.get("label", Label.CASE_CAPTION.name),
+                        "label_id": md.get(
+                            "label_id", Label.CASE_CAPTION.value
+                        ),
                     }
                 )
             missing_count += len(op["missing"])

@@ -259,16 +259,91 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(meta["source_page"], 1)
         self.assertEqual(meta["cells"], 1)
 
-    def test_a_page_with_no_column_box_is_not_judged(self):
-        # The glue keeps every unit of such a page, so no card asks for
-        # a box the text does not need.
+    def test_a_page_with_no_column_box_is_judged_against_its_boxes(self):
+        # The glue keeps every unit of such a page, so the card is no
+        # drop there: it says the page has no column box, which the
+        # curator who shrank an image box off the text needs to hear.
         make_detection(self.scan, "HEADNOTE", page_index=0)
         self.write(cell("Left outside"))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertIn("the page has no column box", found[0]["message"])
+        self.assertIn("keeps the block", found[0]["message"])
+        self.assertTrue(found[0]["metadata"]["no_column"])
+
+    def test_on_a_page_with_no_column_the_guess_is_the_blocks_column(self):
+        # The + adds the column the block sits in: the footnote under
+        # it is inside, the running head above it is not, and a cell in
+        # the other column is not. The address stays the block.
+        self.write(
+            cell(
+                "Running head",
+                [1000.0, 50.0, 1600.0, 90.0],
+                kind="Page-header",
+            ),
+            cell("Left outside"),
+            cell(
+                "A footnote under it",
+                [1050.0, 1800.0, 1550.0, 1900.0],
+                kind="Footnote",
+            ),
+            cell("Other column", [100.0, 200.0, 900.0, 600.0]),
+        )
+        found = self.found()
+        cards = {tuple(f["metadata"]["bbox"]): f for f in found}
+        card = cards[tuple(OUTSIDE)]
+        self.assertTrue(card["metadata"]["no_column"])
+        self.assertEqual(
+            card["metadata"]["guess"], [1000.0, 200.0, 1600.0, 1900.0]
+        )
+        # The other column's card keeps its own column.
+        other = cards[(100.0, 200.0, 900.0, 600.0)]
+        self.assertEqual(
+            other["metadata"]["guess"], [100.0, 200.0, 900.0, 600.0]
+        )
+
+    def test_on_a_page_with_a_column_the_guess_is_the_block(self):
+        column(self.scan)
+        self.write(
+            cell("Left outside"),
+            cell(
+                "Under it", [1050.0, 1800.0, 1550.0, 1900.0], kind="Footnote"
+            ),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["metadata"]["guess"], OUTSIDE)
+
+    def test_a_box_of_another_label_covers_on_a_page_with_no_column(self):
+        make_detection(
+            self.scan,
+            "IMAGE",
+            page_index=0,
+            x0=OUTSIDE[0],
+            y0=OUTSIDE[1],
+            x1=OUTSIDE[2],
+            y1=OUTSIDE[3],
+        )
+        self.write(cell("Under the picture"))
         self.assertEqual(self.found(), [])
 
-    def test_a_page_with_no_box_at_all_is_not_judged(self):
+    def test_a_page_with_no_box_at_all_is_judged(self):
         self.write(cell("Left outside"))
-        self.assertEqual(self.found(), [])
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["metadata"]["no_column"])
+        meta = found[0]["metadata"]
+        self.assertEqual(
+            (meta["img_width"], meta["img_height"]), (WIDTH, HEIGHT)
+        )
+
+    def test_a_page_with_a_column_box_says_the_text_is_lost(self):
+        column(self.scan)
+        self.write(cell("Left outside"))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertIn("leaves out", found[0]["message"])
+        self.assertFalse(found[0]["metadata"]["no_column"])
 
     def test_a_cell_the_box_covers_mostly_is_no_finding(self):
         column(self.scan)

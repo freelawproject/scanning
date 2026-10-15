@@ -329,7 +329,8 @@ def text_card(issue: Issue) -> dict | None:
     The box is the block of print no detection covers
     (``undetected.uncovered``), the label the one the finding names (a
     ``TEXT_COLUMN``), the crop the block and its pad, widened to its
-    column like every crop.
+    column like every crop. ``no_column`` says the page has no column
+    box: that card offers an add, the block's box as the column.
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -337,15 +338,20 @@ def text_card(issue: Issue) -> dict | None:
     """
     metadata = issue.metadata or {}
     page = _page_of(metadata)
-    box = _box(metadata.get("bbox"))
+    block = _box(metadata.get("bbox"))
     label = metadata.get("label")
-    if page is None or box is None or label not in Label.__members__:
+    if page is None or block is None or label not in Label.__members__:
         return None
     page_index, width, height = page
-    return _card(
+    # The box the add writes is the finding's guess (the column the
+    # block sits in, on a page with no column box; the block itself on
+    # one that has); the key stays the block, the address a dismissal
+    # is keyed by.
+    box = _box(metadata.get("guess")) or block
+    card = _card(
         kind=TEXT,
         group=TEXT,
-        key=_finding_key(issue, page_index, box),
+        key=_finding_key(issue, page_index, block),
         page_index=page_index,
         width=width,
         height=height,
@@ -355,6 +361,11 @@ def text_card(issue: Issue) -> dict | None:
         message=issue.message,
         issue_id=issue.pk,
     )
+    # A page with no column box has none to pull over the block, so
+    # that card offers the add the others withhold: the block's box as
+    # the page's column box, through the same write as a bracket.
+    card["no_column"] = bool(metadata.get("no_column"))
+    return card
 
 
 def image_card(row: Detection) -> dict | None:

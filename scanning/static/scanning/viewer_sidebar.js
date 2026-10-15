@@ -395,6 +395,71 @@ function addGuessedDetection(btn) {
         });
 }
 
+// The "+" of a missing-caption row under an opinion card: a caption
+// box drawn where the card guesses the caption is (the row's boxes,
+// the ones a click flashes), through the same endpoint as the drawer.
+// The guess is usually the right shape and nearly the right place, so
+// the curator places it with one press and resizes it on the page when
+// it is off. The endpoint rebuilt the findings, and a live caption box
+// in the pairing's place answers the card; the row says so, because
+// the opinion cards are drawn with the page and are not fetched again.
+function addMissingCaption(btn) {
+    var row = btn.closest(".missing-opinion");
+    if (!row || !row.dataset.boxes) return;
+    var cfg = window.SCAN_CONFIG;
+    var box = row.dataset.boxes.split(",").map(function (s) { return parseFloat(s.trim()); });
+    if (box.length !== 4 || box.some(isNaN)) return;
+    btn.disabled = true;
+    btn.textContent = "...";
+    var det = {
+        page_index: parseInt(row.dataset.pdfIndex),
+        label: row.dataset.label,
+        label_id: parseInt(row.dataset.labelId),
+        confidence: 1.0,
+        bbox: box,
+        img_width: parseInt(row.dataset.imgW),
+        img_height: parseInt(row.dataset.imgH),
+    };
+    fetch("/scans/" + cfg.docId + "/add-single-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify(det),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = "+";
+                showToast((data && (data.message || data.error)) || "Could not add the box");
+                return;
+            }
+            if (data.added === false) {
+                if (window.adoptDetection) window.adoptDetection(data.replaced_id, data.detection_id);
+            } else if (window.addDetectionRow) {
+                det.id = data.detection_id;
+                window.addDetectionRow(det);
+            }
+            btn.remove();
+            row.classList.add("opacity-60");
+            var tag = row.querySelector(".bg-red-600");
+            if (tag) {
+                tag.textContent = "caption added";
+                tag.classList.remove("bg-red-600");
+                tag.classList.add("bg-green-600");
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = "+";
+            showToast("Could not add the box");
+        });
+}
+
 // Pulse one or more boxes over a page for a few seconds: the box a
 // finding card names, or the image boxes an opinion card's chip names.
 // The boxes are in the detection's image pixels. The page is drawn

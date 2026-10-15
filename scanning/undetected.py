@@ -81,6 +81,11 @@ SKIP_KINDS = frozenset({"Picture", "Page-header", "Page-footer", "Footnote"})
 #: A cell with no run of three letters or digits is a stray mark.
 WORD = re.compile(r"[A-Za-z0-9]{3,}")
 
+#: The cells that are no part of a column box: the running head and
+#: foot, and a picture. A footnote is, so the column the + adds on a
+#: page with no column box covers it.
+_NOT_COLUMN_KINDS = frozenset({"Picture", "Page-header", "Page-footer"})
+
 #: How much of a cell's text a reading keeps, for the card.
 MAX_TEXT_CHARS = 48
 
@@ -332,74 +337,137 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
         for entry in redactions.visible_by_page(scan)
     }
     for reading in readings:
-        rows = by_page.get(reading.page_index)
-        if not rows or not reading.img_width or not reading.img_height:
+        rows = by_page.get(reading.page_index, [])
+        if not reading.img_width or not reading.img_height:
             continue
         # The page's render, off the first row that has one, as the
-        # glue's ``inputs.renders`` reads it.
+        # glue's ``inputs.renders`` reads it; the reading's own on a
+        # page with no row at all, the one space there is.
         sized = next((r for r in rows if r.img_width and r.img_height), None)
-        if sized is None:
+        if sized is not None:
+            width, height = sized.img_width, sized.img_height
+        elif rows:
             continue
-        width, height = sized.img_width, sized.img_height
+        else:
+            width, height = reading.img_width, reading.img_height
         # The page size in points, as the rows' render gives it: the
         # space ``opinion_ocr.verdict`` measures in.
         size = boundaries.to_points(width, height, width, height)
         frame = opinion_ocr.page_frame(rows, size)
-        if frame is None:
-            continue
+        # The glue's frame is None on a page with no ``TEXT_COLUMN``
+        # box, and its verdict keeps every unit there, so on such a
+        # page this card is no drop in review 3. The page is judged
+        # against its other boxes all the same: the model took the
+        # page for a picture, the curator shrank the image box off the
+        # text, and the text now sits in no box and in no column, which
+        # nothing else would say. The card asks for the column box the
+        # page lacks, and its message says the text is kept.
+        no_column = frame is None
+        if no_column:
+            frame = [
+                {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
+                for box in opinion_ocr.zones_pt(rows, size)
+            ]
         missed = missed_cells(
             reading, frame, size, rects_by_page.get(reading.page_index, [])
         )
         for block in clusters(missed):
-            yield _finding(reading, block, width, height)
+            yield _finding(reading, block, width, height, no_column=no_column)
 
 
 def _finding(
-    reading: TextReading, block: dict, width: int, height: int
+    reading: TextReading,
+    block: dict,
+    width: int,
+    height: int,
+    no_column: bool = False,
 ) -> dict:
     """Build the finding dict of one block of text in no box.
 
     The box is in the pixels of the detections' render, the space every
     finding's box is in; ``guess`` repeats it, so the sidebar card and
     the card review flash the block. The metadata is what
-    ``findings.address_of`` keys a dismissal by.
+    ``findings.address_of`` keys a dismissal by. ``no_column`` says the
+    page has no column box to pull: the message asks for one to be
+    drawn and says the text is kept, and the metadata carries the flag.
     """
     cells = block["cells"]
     label = Label.TEXT_COLUMN
     sx = width / reading.img_width
     sy = height / reading.img_height
     box = block["box"]
-    bbox = [
-        round(box[0] * sx, 1),
-        round(box[1] * sy, 1),
-        round(box[2] * sx, 1),
-        round(box[3] * sy, 1),
-    ]
+
+    def scaled(b):
+        return [
+            round(b[0] * sx, 1),
+            round(b[1] * sy, 1),
+            round(b[2] * sx, 1),
+            round(b[3] * sy, 1),
+        ]
+
+    bbox = scaled(box)
+    # The box the + adds. On a page with a column box it is the block,
+    # and the curator pulls the column over it or adds the block. On a
+    # page with none, the first column box turns the glue's judgement
+    # on for the whole page, and a block-sized box would leave the
+    # rest of its column, the footnotes under it included, outside
+    # every box with no card to say so (a footnote makes none). So
+    # there the guess is the column the block sits in: every cell of
+    # the page beside the running head, the foot and the pictures that
+    # overlaps the block sideways, the way a double click fills a
+    # caption's column.
+    guess = bbox
+    if no_column:
+        column = list(box)
+        for cell in reading.cells or []:
+            other = _box(cell.get("box"))
+            if other is None or cell.get("kind") in _NOT_COLUMN_KINDS:
+                continue
+            if other[2] <= box[0] or other[0] >= box[2]:
+                continue
+            column = [
+                min(column[0], other[0]),
+                min(column[1], other[1]),
+                max(column[2], other[2]),
+                max(column[3], other[3]),
+            ]
+        guess = scaled(column)
     text = (cells[0].get("text") or "").strip()
     count = (
         "A block of text here is"
         if len(cells) == 1
         else f"{len(cells)} blocks of text here are"
     )
+    if no_column:
+        message = (
+            f"{count} in no box, and the page has no column box "
+            f"(“{text}”). The opinion text keeps the block but has no "
+            "column to place it in. Draw the column box over the text, "
+            "or dismiss the card if it is not text."
+        )
+    else:
+        message = (
+            f"{count} in no box (“{text}”). The opinion "
+            "text leaves out a block the boxes miss. Add a column box "
+            "over it or pull the page's over it, or dismiss the card if "
+            "it is not text."
+        )
     return {
         "check_name": CheckName.UNDETECTED_TEXT,
         "target": Issue.Target.DETECTION,
         "page_number": reading.page_index + 1,
-        "message": (
-            f"{count} in no box (“{text}”). The opinion "
-            "text leaves out a block the boxes miss. Pull the column box "
-            "over it, or dismiss the card if it is not text."
-        ),
+        "message": message,
         "metadata": {
             "page_index": reading.page_index,
             "label": label.name,
             "label_id": label.value,
             "bbox": bbox,
-            "guess": bbox,
+            "guess": guess,
             "img_width": width,
             "img_height": height,
             "source_edit": reading.source_edit_id,
             "source_page": reading.source_page,
             "cells": len(cells),
+            "no_column": no_column,
         },
     }
