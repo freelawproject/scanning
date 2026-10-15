@@ -338,15 +338,20 @@ def text_card(issue: Issue) -> dict | None:
     """
     metadata = issue.metadata or {}
     page = _page_of(metadata)
-    box = _box(metadata.get("bbox"))
+    block = _box(metadata.get("bbox"))
     label = metadata.get("label")
-    if page is None or box is None or label not in Label.__members__:
+    if page is None or block is None or label not in Label.__members__:
         return None
     page_index, width, height = page
+    # The box the add writes is the finding's guess (the column the
+    # block sits in, on a page with no column box; the block itself on
+    # one that has); the key stays the block, the address a dismissal
+    # is keyed by.
+    box = _box(metadata.get("guess")) or block
     card = _card(
         kind=TEXT,
         group=TEXT,
-        key=_finding_key(issue, page_index, box),
+        key=_finding_key(issue, page_index, block),
         page_index=page_index,
         width=width,
         height=height,

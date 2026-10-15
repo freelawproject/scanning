@@ -271,6 +271,49 @@ class TestTheRule(ScanningTestCase):
         self.assertIn("keeps the block", found[0]["message"])
         self.assertTrue(found[0]["metadata"]["no_column"])
 
+    def test_on_a_page_with_no_column_the_guess_is_the_blocks_column(self):
+        # The + adds the column the block sits in: the footnote under
+        # it is inside, the running head above it is not, and a cell in
+        # the other column is not. The address stays the block.
+        self.write(
+            cell(
+                "Running head",
+                [1000.0, 50.0, 1600.0, 90.0],
+                kind="Page-header",
+            ),
+            cell("Left outside"),
+            cell(
+                "A footnote under it",
+                [1050.0, 1800.0, 1550.0, 1900.0],
+                kind="Footnote",
+            ),
+            cell("Other column", [100.0, 200.0, 900.0, 600.0]),
+        )
+        found = self.found()
+        cards = {tuple(f["metadata"]["bbox"]): f for f in found}
+        card = cards[tuple(OUTSIDE)]
+        self.assertTrue(card["metadata"]["no_column"])
+        self.assertEqual(
+            card["metadata"]["guess"], [1000.0, 200.0, 1600.0, 1900.0]
+        )
+        # The other column's card keeps its own column.
+        other = cards[(100.0, 200.0, 900.0, 600.0)]
+        self.assertEqual(
+            other["metadata"]["guess"], [100.0, 200.0, 900.0, 600.0]
+        )
+
+    def test_on_a_page_with_a_column_the_guess_is_the_block(self):
+        column(self.scan)
+        self.write(
+            cell("Left outside"),
+            cell(
+                "Under it", [1050.0, 1800.0, 1550.0, 1900.0], kind="Footnote"
+            ),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["metadata"]["guess"], OUTSIDE)
+
     def test_a_box_of_another_label_covers_on_a_page_with_no_column(self):
         make_detection(
             self.scan,

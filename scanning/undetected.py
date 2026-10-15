@@ -81,6 +81,11 @@ SKIP_KINDS = frozenset({"Picture", "Page-header", "Page-footer", "Footnote"})
 #: A cell with no run of three letters or digits is a stray mark.
 WORD = re.compile(r"[A-Za-z0-9]{3,}")
 
+#: The cells that are no part of a column box: the running head and
+#: foot, and a picture. A footnote is, so the column the + adds on a
+#: page with no column box covers it.
+_NOT_COLUMN_KINDS = frozenset({"Picture", "Page-header", "Page-footer"})
+
 #: How much of a cell's text a reading keeps, for the card.
 MAX_TEXT_CHARS = 48
 
@@ -391,12 +396,42 @@ def _finding(
     sx = width / reading.img_width
     sy = height / reading.img_height
     box = block["box"]
-    bbox = [
-        round(box[0] * sx, 1),
-        round(box[1] * sy, 1),
-        round(box[2] * sx, 1),
-        round(box[3] * sy, 1),
-    ]
+
+    def scaled(b):
+        return [
+            round(b[0] * sx, 1),
+            round(b[1] * sy, 1),
+            round(b[2] * sx, 1),
+            round(b[3] * sy, 1),
+        ]
+
+    bbox = scaled(box)
+    # The box the + adds. On a page with a column box it is the block,
+    # and the curator pulls the column over it or adds the block. On a
+    # page with none, the first column box turns the glue's judgement
+    # on for the whole page, and a block-sized box would leave the
+    # rest of its column, the footnotes under it included, outside
+    # every box with no card to say so (a footnote makes none). So
+    # there the guess is the column the block sits in: every cell of
+    # the page beside the running head, the foot and the pictures that
+    # overlaps the block sideways, the way a double click fills a
+    # caption's column.
+    guess = bbox
+    if no_column:
+        column = list(box)
+        for cell in reading.cells or []:
+            other = _box(cell.get("box"))
+            if other is None or cell.get("kind") in _NOT_COLUMN_KINDS:
+                continue
+            if other[2] <= box[0] or other[0] >= box[2]:
+                continue
+            column = [
+                min(column[0], other[0]),
+                min(column[1], other[1]),
+                max(column[2], other[2]),
+                max(column[3], other[3]),
+            ]
+        guess = scaled(column)
     text = (cells[0].get("text") or "").strip()
     count = (
         "A block of text here is"
@@ -427,7 +462,7 @@ def _finding(
             "label": label.name,
             "label_id": label.value,
             "bbox": bbox,
-            "guess": bbox,
+            "guess": guess,
             "img_width": width,
             "img_height": height,
             "source_edit": reading.source_edit_id,

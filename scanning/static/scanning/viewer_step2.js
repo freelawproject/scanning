@@ -1415,6 +1415,12 @@ document.addEventListener('DOMContentLoaded', function () {
 
         popup.querySelector('.det-draw-cancel-btn').addEventListener('click', _cancelDetDraw);
         popup.querySelector('.det-draw-confirm').addEventListener('click', function () {
+            // One add per popup: the button is off while the request
+            // is out, so a held Enter or a second click posts nothing.
+            // A refusal closes the popup; a transport fault turns the
+            // button back on.
+            if (this.disabled) return;
+            this.disabled = true;
             var labelName = popup.querySelector('.det-draw-label-select').value;
             _confirmDetDraw(pageDiv, pdfIndex, labelName);
         });
@@ -1497,6 +1503,13 @@ document.addEventListener('DOMContentLoaded', function () {
             // started here: an auto re-pair on every added box would
             // interrupt the reviewer in the middle of their edits. The
             // view names the button that does start it (#305/#322).
+        })
+        .catch(function () {
+            // A transport fault: the popup is still open, so the button
+            // comes back on for another try.
+            var confirm = detDrawPopup && detDrawPopup.querySelector('.det-draw-confirm');
+            if (confirm) confirm.disabled = false;
+            showToast('Failed to add detection');
         });
     }
 
