@@ -274,10 +274,13 @@ class TestTheRule(ScanningTestCase):
     def test_on_a_page_with_no_column_the_guess_is_the_blocks_column(self):
         # The + adds the column the block sits in: the footnote under
         # it is inside, the running head above it is not, and a cell in
-        # the other column is not. The address stays the block.
+        # the other column is not. The address stays the block. The
+        # running head holds no word, so it is no card of its own; the
+        # footnote is a card of its own, far enough down to be its own
+        # block.
         self.write(
             cell(
-                "Running head",
+                "P.3d",
                 [1000.0, 50.0, 1600.0, 90.0],
                 kind="Page-header",
             ),
@@ -303,11 +306,15 @@ class TestTheRule(ScanningTestCase):
         )
 
     def test_on_a_page_with_a_column_the_guess_is_the_block(self):
+        # A page with a column box: the guess is the block alone, and a
+        # cell inside the column is covered.
         column(self.scan)
         self.write(
             cell("Left outside"),
             cell(
-                "Under it", [1050.0, 1800.0, 1550.0, 1900.0], kind="Footnote"
+                "In the column",
+                [150.0, 1800.0, 850.0, 1900.0],
+                kind="Footnote",
             ),
         )
         found = self.found()
@@ -420,7 +427,11 @@ class TestTheRule(ScanningTestCase):
         self.write(cell("Left outside"))
         self.assertEqual(len(self.found()), 1)
 
-    def test_the_kinds_that_make_no_card(self):
+    def test_no_kind_is_skipped_the_boxes_decide(self):
+        # The reader's category never hides a cell: a footnote line the
+        # model's footnote box stopped short of is a drop, whatever the
+        # reader called it (page 221 of 452 P.3d, a footnote labelled a
+        # page foot). The four cells share one place, so one card.
         column(self.scan)
         self.write(
             cell("452 P.3d", kind="Page-header"),
@@ -428,7 +439,50 @@ class TestTheRule(ScanningTestCase):
             cell("a picture", kind="Picture"),
             cell("1. A footnote the box stopped short of", kind="Footnote"),
         )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["metadata"]["cells"], 4)
+
+    def test_a_footnote_inside_the_footnote_box_is_covered(self):
+        column(self.scan)
+        make_detection(
+            self.scan,
+            "FOOTNOTES",
+            page_index=0,
+            x0=OUTSIDE[0],
+            y0=OUTSIDE[1],
+            x1=OUTSIDE[2],
+            y1=OUTSIDE[3],
+        )
+        self.write(cell("1. A footnote in its box", kind="Footnote"))
         self.assertEqual(self.found(), [])
+
+    def test_a_box_past_the_page_edge_is_judged_as_the_page_holds_it(self):
+        # Page 100 of 452 P.3d: a footnote cell ten pages wide, inside
+        # the footnote box once held to the page, so no card.
+        column(self.scan)
+        make_detection(
+            self.scan,
+            "FOOTNOTES",
+            page_index=0,
+            x0=300.0,
+            y0=1900.0,
+            x1=1500.0,
+            y1=2000.0,
+        )
+        self.write(
+            cell("839 (Colo. App. 2007).", [900.0, 1920.0, 11387.0, 1990.0])
+        )
+        self.assertEqual(self.found(), [])
+
+    def test_a_card_never_names_a_box_past_the_page(self):
+        column(self.scan)
+        self.write(cell("Past the edge", [1000.0, 200.0, 11387.0, 600.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0]["metadata"]["bbox"], [1000.0, 200.0, 1700.0, 600.0]
+        )
 
     def test_a_stray_mark_is_no_card(self):
         column(self.scan)

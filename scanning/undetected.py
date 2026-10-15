@@ -73,10 +73,13 @@ from scanning.models import (
 
 logger = logging.getLogger(__name__)
 
-#: The dots.mocr categories whose cells make no card: the running head
-#: and foot, which the text never holds; a picture, which has no text;
-#: and a footnote, a loss the curator accepts.
-SKIP_KINDS = frozenset({"Picture", "Page-header", "Page-footer", "Footnote"})
+#: No cell is skipped for the reader's category. The model's boxes say
+#: what a block is: a footnote inside the footnote box is covered, and
+#: a footnote line outside it is a drop (page 221 of 452 P.3d, a
+#: footnote the reader labelled a page foot, under a column box with no
+#: footnote box on the page). A running head, a page number and a
+#: picture caption sit inside their own boxes, or hold no word.
+SKIP_KINDS = frozenset()
 
 #: A cell with no run of three letters or digits is a stray mark.
 WORD = re.compile(r"[A-Za-z0-9]{3,}")
@@ -206,7 +209,7 @@ def write_rows(scan: Scan, document: dict | None, run: ApplyRun | None) -> int:
 
 
 def is_text(cell: dict) -> bool:
-    """Return whether a cell is text the opinion would keep."""
+    """Return whether a cell is text: it holds a word, whatever its kind."""
     if cell.get("kind") in SKIP_KINDS:
         return False
     return bool(WORD.search(cell.get("text") or ""))
@@ -242,9 +245,15 @@ def missed_cells(
     """
     missed = []
     for cell in reading.cells or []:
-        box = _box(cell.get("box"))
+        # The box held inside the page (``opinion_ocr.clamp_box``), the
+        # glue's own reading of it: a box the reader ran past the edge
+        # is judged, and carded, as the page holds it.
+        box = opinion_ocr.clamp_box(
+            _box(cell.get("box")), reading.img_width, reading.img_height
+        )
         if box is None or not is_text(cell):
             continue
+        cell = {**cell, "box": box}
         x0, y0 = boundaries.to_points(
             box[0], box[1], reading.img_width, reading.img_height, *size
         )

@@ -913,6 +913,35 @@ def as_box(value) -> list[float] | None:
     return [x0, y0, x1, y1]
 
 
+def clamp_box(
+    box: list[float] | None, width: float, height: float
+) -> list[float] | None:
+    """Hold a box inside its page, or return None when nothing is left.
+
+    A reader writes the odd box past the page edge (a footnote cell of
+    452 P.3d ten pages wide, x to 11,387 on a 1,700-pixel render), and
+    a box judged as drawn is covered by a sliver of itself, so the
+    unit is dropped and the card flashes a box wider than the page.
+    One rule for every reader of a unit's box, beside :func:`as_box`.
+
+    :param box: ``[x0, y0, x1, y1]`` or None.
+    :param width: The page's width in the box's space.
+    :param height: The page's height in the box's space.
+    :returns: The box held inside ``[0, width]`` and ``[0, height]``,
+        or None when the box is None or lies outside the page.
+    :rtype: list[float] | None
+    """
+    if box is None:
+        return None
+    x0 = min(max(box[0], 0.0), width)
+    y0 = min(max(box[1], 0.0), height)
+    x1 = min(max(box[2], 0.0), width)
+    y1 = min(max(box[3], 0.0), height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+
 def _number(value) -> bool:
     """Return whether ``value`` is a real number."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1382,6 +1411,8 @@ def build_document(
             if not isinstance(unit, dict):
                 continue
             box = as_box(unit.get("bbox"))
+            if box and frame:
+                box = clamp_box(box, frame[0], frame[1])
             box_pt = None
             if box and size and frame:
                 sx, sy = size[0] / frame[0], size[1] / frame[1]
