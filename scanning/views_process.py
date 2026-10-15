@@ -993,7 +993,9 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                         # (``addMissingCaption``), with the label the
                         # finding names and never one the script spells.
                         "label": md.get("label", Label.CASE_CAPTION.name),
-                        "label_id": md.get("label_id", Label.CASE_CAPTION.value),
+                        "label_id": md.get(
+                            "label_id", Label.CASE_CAPTION.value
+                        ),
                     }
                 )
             missing_count += len(op["missing"])

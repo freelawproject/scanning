@@ -270,9 +270,7 @@ class TestRebuild(ScanningTestCase):
         findings.rebuild(scan)
 
         rows = scan.issues.filter(check_name=CheckName.MISSING_CAPTION)
-        card = next(
-            r for r in rows if r.metadata["key_bbox"][1] == inside.y0
-        )
+        card = next(r for r in rows if r.metadata["key_bbox"][1] == inside.y0)
         self.assertEqual(card.metadata["runs_on"], span.pk)
         # Half a key height under the key is 435; the number ends at
         # 470, and the box starts 0.3 key heights (27) under it; the

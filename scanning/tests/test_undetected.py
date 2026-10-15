@@ -290,7 +290,9 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(len(found), 1)
         self.assertTrue(found[0]["metadata"]["no_column"])
         meta = found[0]["metadata"]
-        self.assertEqual((meta["img_width"], meta["img_height"]), (WIDTH, HEIGHT))
+        self.assertEqual(
+            (meta["img_width"], meta["img_height"]), (WIDTH, HEIGHT)
+        )
 
     def test_a_page_with_a_column_box_says_the_text_is_lost(self):
         column(self.scan)
