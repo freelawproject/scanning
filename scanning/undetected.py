@@ -56,7 +56,6 @@ add: the gutter passes read a page's column boxes as its two columns.
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Iterator
 
 from blackletter.models import Label
@@ -73,17 +72,6 @@ from scanning.models import (
 )
 
 logger = logging.getLogger(__name__)
-
-#: No cell is skipped for the reader's category. The model's boxes say
-#: what a block is: a footnote inside the footnote box is covered, and
-#: a footnote line outside it is a drop (page 221 of 452 P.3d, a
-#: footnote the reader labelled a page foot, under a column box with no
-#: footnote box on the page). A running head, a page number and a
-#: picture caption sit inside their own boxes, or hold no word.
-SKIP_KINDS = frozenset()
-
-#: A cell with no run of three letters or digits is a stray mark.
-WORD = re.compile(r"[A-Za-z0-9]{3,}")
 
 #: The cells that are no part of a column box: the running head and
 #: foot, and a picture. A footnote is, so the column the + adds on a
@@ -209,13 +197,6 @@ def write_rows(scan: Scan, document: dict | None, run: ApplyRun | None) -> int:
     return len(rows)
 
 
-def is_text(cell: dict) -> bool:
-    """Return whether a cell is text: it holds a word, whatever its kind."""
-    if cell.get("kind") in SKIP_KINDS:
-        return False
-    return bool(WORD.search(cell.get("text") or ""))
-
-
 def _inside(box: Box, rect: dict) -> bool:
     """Return whether ``box`` lies inside one frame rect: covered whole."""
     return (
@@ -246,8 +227,10 @@ def missed_cells(
     """
     missed = []
     for cell in reading.cells or []:
+        # Every cell with a box is text, whatever the reader called it
+        # and however short: the cover tests below are the whole rule.
         box = _box(cell.get("box"))
-        if box is None or not is_text(cell):
+        if box is None:
             continue
         x0, y0 = boundaries.to_points(
             box[0], box[1], reading.img_width, reading.img_height, *size
