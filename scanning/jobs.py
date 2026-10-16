@@ -2199,6 +2199,12 @@ def enqueue_missing_runs(
             continue
         refused.pop(scan.pk, None)
         rows = create(scan, manifest)
+        if not rows:
+            # A committed set with no shard. ``sharding.ensure_shards``
+            # refuses a zero-page original, so this is not reached
+            # today; the guard keeps ``rows[0]`` below from raising if
+            # that ever changes.
+            continue
         blank = [row.pk for row in rows if not row.source_fingerprint]
         if blank:
             # A run from before the column, handed back because it
