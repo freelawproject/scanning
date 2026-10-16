@@ -128,7 +128,7 @@ State is `Scan.status`. The stages, and where each runs:
 - A legacy row (before #173) holds `PENDING_REVIEW` for both reviews, never enters the #154/#263 states, gets no apply and keeps the old buttons. `legacy_review` reads the status; `has_legacy_ocr` asks who read the page numbers. They are different questions
 - `RUNPOD_ENABLED` gates only whether GPU jobs dispatch. Upload paths must work without it
 - Work that takes seconds over a JSON file runs on the collect tick (the page-number apply, the glues); work that pulls a PDF or renders pages is queued (the apply, the redaction compute)
-- `process_next_scan` claims by action before age (`CLAIM_PRIORITY`: full pipeline, redaction compute, apply), and an apply waiting `CLAIM_LIFT_SECONDS` is claimed next. The external job wave ranks an apply row before the volume rows, and a volume row of a scan with an `ApplyRun` before one of a scan with none (`jobs._pending_slice`, #291, #500). Rank the rows, not the status
+- `process_next_scan` claims by action before age (`CLAIM_PRIORITY`: full pipeline, redaction compute, apply), and an apply waiting `CLAIM_LIFT_SECONDS` is claimed next. The external job wave ranks an apply row before the volume rows, a PENDING row that carries a deadline (one an endpoint declined) next, and then a volume row of a scan with an `ApplyRun` before one of a scan with none (`jobs._pending_slice`, #291, #500). Rank the rows, not the status
 
 ## Status writes
 

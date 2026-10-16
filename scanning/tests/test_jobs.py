@@ -650,6 +650,28 @@ class TestApplyRowsGoFirst(ScanningTestCase):
         self.assertTrue(self._sent(newer[0]))
         self.assertFalse(self._sent(older[0]))
 
+    def test_a_deferred_row_is_claimed_before_the_reviewed_class(self):
+        """A row an endpoint declined keeps the ceiling of its first
+        claim, so it must not wait behind every volume approved during
+        the pause, or the sweep fails it in our own queue (#500)."""
+        unopened = ScanFactory()
+        declined = jobs.ensure_convert_jobs(
+            unopened, make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=declined.pk).update(
+            deadline=timezone.now() + timedelta(hours=1)
+        )
+        reviewed = ScanFactory()
+        ApplyRun.objects.create(scan=reviewed, number=1)
+        newer = jobs.ensure_convert_jobs(
+            reviewed, make_manifest(shard_count=1)
+        )[0]
+
+        self._tick()
+
+        self.assertTrue(self._sent(declined))
+        self.assertFalse(self._sent(newer))
+
     def test_the_cap_still_bounds_the_wave(self):
         """The rank picks who takes a free place; it preempts nothing."""
         scan = ScanFactory()

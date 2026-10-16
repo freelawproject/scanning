@@ -2728,6 +2728,19 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     rows go first, the reviewed set is bounded by the review itself, a
     row that waits carries no deadline, and nothing is preempted.
 
+    **A deferred row goes before the reviewed class.** The third
+    property above has one exception: a row an endpoint declined
+    (:func:`_defer`) is back in PENDING with the ceiling its first
+    claim stamped, and :func:`sweep_jobs` fails it ``QUEUE_TIMEOUT``
+    at that ceiling. Behind the small apply set alone it was always
+    the next row sent once the endpoint answered again; behind every
+    volume approved during the wait it could run out its clock in our
+    own queue, and a dead run is re-run by no tick. So a PENDING row
+    that carries a deadline is ranked right after the apply rows,
+    whatever its volume. A retry clears the deadline
+    (:func:`_retry_or_fail`), so the key names a deferred row and
+    nothing else.
+
     The id stays the last key: inside one class the creation order is
     what keeps the drain fair. The rank reads the rows and not
     ``Scan.status``, which moves under a row that is already waiting
@@ -2737,9 +2750,9 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
 
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: The apply rows first, then the rows of a volume with an
-        apply run, each class in creation order, at most ``room`` of
-        them.
+    :returns: The apply rows first, then the deferred rows, then the
+        rows of a volume with an apply run, each class in creation
+        order, at most ``room`` of them.
     :rtype: list[ExternalJob]
     """
     from django.db.models import Exists, OuterRef
@@ -2752,9 +2765,10 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
         .select_related("scan", "scan__reporter", "apply_run")
         .annotate(
             is_apply=Q(apply_run__isnull=False),
+            deferred=Q(deadline__isnull=False),
             reviewed=Exists(ApplyRun.objects.filter(scan=OuterRef("scan"))),
         )
-        .order_by("-is_apply", "-reviewed", "id")[:room]
+        .order_by("-is_apply", "-deferred", "-reviewed", "id")[:room]
     )
 
 
