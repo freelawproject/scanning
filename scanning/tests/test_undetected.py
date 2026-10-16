@@ -275,12 +275,21 @@ class TestTheRule(ScanningTestCase):
         # The + adds the column the block sits in: the footnote under
         # it is inside, the running head above it is not, and a cell in
         # the other column is not. The address stays the block. The
-        # running head holds no word, so it is no card of its own; the
-        # footnote is a card of its own, far enough down to be its own
-        # block.
+        # running head sits in its header box, so it is covered and no
+        # card of its own; the footnote is a card of its own, far
+        # enough down to be its own block.
+        make_detection(
+            self.scan,
+            "PAGE_HEADER",
+            page_index=0,
+            x0=1000.0,
+            y0=50.0,
+            x1=1600.0,
+            y1=90.0,
+        )
         self.write(
             cell(
-                "P.3d",
+                "452",
                 [1000.0, 50.0, 1600.0, 90.0],
                 kind="Page-header",
             ),
@@ -505,10 +514,28 @@ class TestTheRule(ScanningTestCase):
         self.write(cell("Near the edge", [1400.0, 200.0, 11387.0, 600.0]))
         self.assertEqual(self.found(), [])
 
-    def test_a_stray_mark_is_no_card(self):
+    def test_every_cell_outside_the_boxes_is_a_card(self):
+        # No word test and no kind test: a short mark, a bare number and
+        # a footnote of pairs are cells like any other, and the cover
+        # tests alone decide. The one in the column box is covered.
         column(self.scan)
-        self.write(cell("— ."), cell("a b"), cell("12"))
-        self.assertEqual(self.found(), [])
+        self.write(
+            cell("— ."),
+            cell("12", [1000.0, 800.0, 1600.0, 900.0]),
+            cell("17", [150.0, 300.0, 250.0, 340.0]),
+        )
+        self.assertEqual(
+            sorted(f["metadata"]["bbox"][1] for f in self.found()),
+            [200.0, 800.0],
+        )
+
+    def test_a_short_footnote_is_text(self):
+        # "53. Id. at 16-18." (page 961 of 433 F. Supp. 3d) has no run
+        # of three letters or digits, and is a footnote the footnote
+        # box stopped short of.
+        column(self.scan)
+        self.write(cell("53. *Id.* at 16-18."))
+        self.assertEqual(len(self.found()), 1)
 
     def test_the_cells_of_a_block_make_one_card(self):
         column(self.scan)
