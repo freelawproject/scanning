@@ -2651,6 +2651,8 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
                 "marks": list(u.get("marks") or []),
                 "kind": u.get("kind") or "paragraph",
                 "table": u.get("table"),
+                # The curated box a ``figure`` unit stands for (#463).
+                **({"figure": u["figure"]} if u.get("figure") else {}),
             }
             for u in units_of_engine
         ],

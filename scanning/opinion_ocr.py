@@ -1608,6 +1608,16 @@ def build_document(
             # lost does not take the unit (#419); every other box does.
             tokens = token_boxes(token_rects, box_pt, before, removed)
             unit_rects = [r for r in rects if not any(r is t for t in tokens)]
+            exclusion, share = verdict(
+                box_pt,
+                unit_rects,
+                page_masks,
+                text,
+                printed,
+                size[1] if size else None,
+                label,
+                frame_rects,
+            )
             picture_share, picture = (
                 covered_share(box_pt, picture_rects)
                 if box_pt is not None and picture_rects
@@ -1616,24 +1626,19 @@ def build_document(
             if picture is not None and picture_share >= FIGURE_SHARE:
                 # Under a curated picture: the picture goes into the
                 # text in its place, and the words the engine read
-                # inside it stay out (:data:`PICTURE`).
+                # inside it stay out (:data:`PICTURE`). The unit's own
+                # verdict rides beside it, for the day a person says the
+                # box is no picture: the ensemble judges the words by it
+                # again. The share stays the measured one, so a block
+                # half in the box is a partial cover with its card.
                 exclusion = {
                     "reason": PICTURE,
                     "detection_id": picture.get("id"),
+                    "verdict": exclusion,
+                    "verdict_share": share,
                 }
-                share = 1.0
+                share = picture_share
                 counts["under_picture"] += 1
-            else:
-                exclusion, share = verdict(
-                    box_pt,
-                    unit_rects,
-                    page_masks,
-                    text,
-                    printed,
-                    size[1] if size else None,
-                    label,
-                    frame_rects,
-                )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1

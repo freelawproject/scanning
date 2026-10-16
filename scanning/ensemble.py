@@ -1091,8 +1091,31 @@ def _covered_things(
                 dict.fromkeys(plain(unit["text"]) for unit in thing)
             ),
             "box_pt": _union_box([unit["box_pt"] for unit in thing]),
+            "reasons": {unit["exclusion"].get("reason") for unit in thing},
         }
         for thing in things
+    ]
+
+
+def _things_under(things: list[dict], member: dict) -> list[dict]:
+    """Return the things under the kind of box that covers ``member``.
+
+    A curated picture's words uncover a reading a picture covers in
+    part, and never one a redaction or a mask covers (#463): the words
+    under a picture are known and harmless, the words under a redaction
+    are neither, and a block that spans both must not ride out on the
+    picture's words with the redaction's still in it.
+
+    :param things: :func:`_covered_things`.
+    :param member: The covered reading, with its ``exclusion``.
+    :returns: The things that may uncover it.
+    :rtype: list[dict]
+    """
+    picture = (member["exclusion"] or {}).get("reason") == opinion_ocr.PICTURE
+    return [
+        thing
+        for thing in things
+        if (opinion_ocr.PICTURE in thing.get("reasons", ())) == picture
     ]
 
 
@@ -1230,11 +1253,12 @@ def _merge(
             kept.append(member)
             continue
         found = None
-        if things and member["share"] < opinion_ocr.FULL_SHARE:
+        under = _things_under(things, member) if things else []
+        if under and member["share"] < opinion_ocr.FULL_SHARE:
             found = _uncover(
                 member["text"],
                 member.get("marks") or [],
-                things,
+                under,
                 member["box_pt"],
             )
         if found is None:
@@ -2731,6 +2755,8 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
             "type": unit.get("type") or "",
             "exclusion": unit.get("exclusion"),
             "share": unit.get("share") or 0.0,
+            # The curated box a ``figure`` unit stands for (#463).
+            "figure": unit.get("figure"),
             # A document of the glue before #404 has none of these,
             # and reads as plain paragraphs.
             "marks": unit.get("marks") or [],
@@ -2914,6 +2940,114 @@ def land_edits(
         landed[here] = there
         taken.add(there)
     return landed
+
+
+def _aligned_with_edits(
+    units: list[dict],
+    width: float,
+    height: float,
+    zones: list[list[float]],
+    edits: list[dict],
+    twins: list[list[float]] = (),
+) -> tuple[list[dict], list[dict]]:
+    """Align one page and land its human edits on the groups.
+
+    The edits land on the aligned groups, before any of them is dropped
+    (#376), so an edit whose block a redaction now takes says so and
+    never lands on a neighbour. A picture takes no edit of its text,
+    its section or its quote (#463): the views refuse them, and a box
+    copy must not land one. It takes a drop: a stamp, a seal or a blot
+    drawn as a picture is no picture of the opinion, and a person says
+    so.
+
+    :param units: The placed units of the page.
+    :param width: The page width, in points.
+    :param height: The page height, in points.
+    :param zones: The footnote zones, in points.
+    :param edits: The edit entries of the page.
+    :param twins: The boxes of the pictures a person dropped, whose
+        words are text again (:func:`_released_pictures`): a text group
+        at one of them is the figure's twin still, and second to it
+        where an edit's box fits both alike.
+    :returns: The groups, each with its edits on it, and the edits that
+        landed on no group.
+    :rtype: tuple[list[dict], list[dict]]
+    """
+    groups = align_page(units, width, height, zones)
+    for group in groups:
+        group["_under_picture"] = under_picture(group) or (
+            not group.get("figure")
+            and any(iou(group["box_pt"], box) >= OVERLAP for box in twins)
+        )
+    unresolved: list[dict] = []
+    texts = [group for group in groups if not group.get("figure")]
+    for kind, key in (
+        (OpinionEdit.Kind.SECTION, "_section_edit"),
+        (OpinionEdit.Kind.TEXT, "_text_edit"),
+        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
+        (OpinionEdit.Kind.DROP, "_drop_edit"),
+    ):
+        wanted = [edit for edit in edits if edit["kind"] == kind]
+        targets = groups if kind == OpinionEdit.Kind.DROP else texts
+        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
+        for here, edit in enumerate(wanted):
+            if here in landed:
+                targets[landed[here]][key] = edit
+            else:
+                unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
+    return groups, unresolved
+
+
+def _released_pictures(units: list[dict], groups: list[dict]) -> set:
+    """Return the curated boxes whose picture a person dropped (#463).
+
+    A ``figure`` group with a drop edit on it, named by the detection
+    its figure units carry: the words the glue excluded under that box
+    are text again (:func:`_own_verdict`).
+
+    :param units: The placed units of the page.
+    :param groups: The aligned groups, with their edits landed.
+    :returns: The detection ids.
+    :rtype: set
+    """
+    released = set()
+    for group in groups:
+        if not group.get("figure") or not group.get("_drop_edit"):
+            continue
+        for unit in units:
+            figure = unit.get("figure")
+            if figure and iou(unit["box_pt"], group["box_pt"]) >= OVERLAP:
+                released.add(figure.get("detection_id"))
+    released.discard(None)
+    return released
+
+
+def _under_released(unit: dict, released: set) -> bool:
+    """Say whether a curated picture a person dropped took ``unit``."""
+    exclusion = unit.get("exclusion") or {}
+    return (
+        exclusion.get("reason") == opinion_ocr.PICTURE
+        and exclusion.get("detection_id") in released
+    )
+
+
+def _own_verdict(unit: dict) -> dict:
+    """Return ``unit`` judged by its own verdict, the picture's set aside.
+
+    The glue keeps the unit's own verdict and share beside the picture
+    reason (``exclusion.verdict``, ``exclusion.verdict_share``); a
+    document glued before carries none, and the unit reads as clean.
+
+    :param unit: A unit a curated picture excluded.
+    :returns: The unit with that verdict.
+    :rtype: dict
+    """
+    exclusion = unit["exclusion"]
+    return {
+        **unit,
+        "exclusion": exclusion.get("verdict"),
+        "share": exclusion.get("verdict_share") or 0.0,
+    }
 
 
 def under_picture(group: dict) -> bool:
@@ -3157,37 +3291,33 @@ def build_page(
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
     entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
-    groups = align_page(units, width, height, zones)
-    for group in groups:
-        group["_under_picture"] = under_picture(group)
+    groups, unresolved = _aligned_with_edits(
+        units, width, height, zones, edits
+    )
+    released = _released_pictures(units, groups)
+    if released:
+        # "Not a picture" (#463): the words under the box a person
+        # dropped are text again, judged by the verdict the glue kept
+        # beside the picture's, and the page aligns once more with them.
+        # Their group is still the figure's twin at its box, so the drop
+        # lands on the figure again and not on the words it set free.
+        twins = [
+            group["box_pt"]
+            for group in groups
+            if group.get("figure") and group.get("_drop_edit")
+        ]
+        units = [
+            _own_verdict(unit) if _under_released(unit, released) else unit
+            for unit in units
+        ]
+        groups, unresolved = _aligned_with_edits(
+            units, width, height, zones, edits, twins
+        )
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
     # too, and a page with two footnotes has too few boxes of its own
     # to find its gutter.
     boundary = column_boundary(groups, width, height)
-    # The human edits land on the aligned groups, before any of them is
-    # dropped (#376), so an edit whose block a redaction now takes says
-    # so and never lands on a neighbour.
-    unresolved: list[dict] = []
-    # A picture takes no edit of its text, its section or its quote
-    # (#463): the views refuse them, and a box copy must not land one.
-    # It takes a drop: a stamp, a seal or a blot one engine drew as a
-    # picture is no picture of the opinion, and a person says so.
-    texts = [group for group in groups if not group.get("figure")]
-    for kind, key in (
-        (OpinionEdit.Kind.SECTION, "_section_edit"),
-        (OpinionEdit.Kind.TEXT, "_text_edit"),
-        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
-        (OpinionEdit.Kind.DROP, "_drop_edit"),
-    ):
-        wanted = [edit for edit in edits if edit["kind"] == kind]
-        targets = groups if kind == OpinionEdit.Kind.DROP else texts
-        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
-        for here, edit in enumerate(wanted):
-            if here in landed:
-                targets[landed[here]][key] = edit
-            else:
-                unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
         if group.get("figure"):

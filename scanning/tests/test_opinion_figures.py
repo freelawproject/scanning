@@ -310,6 +310,88 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(figures(on_figure), [])
         self.assertEqual(figures(tied), [])
 
+    def test_not_a_picture_brings_the_words_under_it_back(self):
+        """A person drops the picture of a wrong IMAGE box: the words the
+        glue excluded under it are text again, by the verdict the glue
+        kept beside the picture's, so nothing is lost in silence. Words
+        a redaction took stay out."""
+        kept = {
+            "reason": "picture",
+            "detection_id": 9,
+            "verdict": None,
+            "verdict_share": 0.0,
+        }
+        redacted = {
+            "reason": "picture",
+            "detection_id": 9,
+            "verdict": {"reason": "redaction"},
+            "verdict_share": 1.0,
+        }
+
+        def pages(taken):
+            return {
+                name: engine_page(
+                    [
+                        {
+                            **unit(name, 0, PICTURE_PT, "Words in the table."),
+                            "exclusion": taken,
+                            "share": 1.0,
+                        },
+                        {**picture(name, 1), "figure": {"detection_id": 9}},
+                    ]
+                )
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+
+        drop = [entry(OpinionEdit.Kind.DROP, PICTURE_PT)]
+        before = ensemble.build_page(pages(kept), 0, [])
+        released = ensemble.build_page(pages(kept), 0, drop)
+        still_out = ensemble.build_page(pages(redacted), 0, drop)
+
+        self.assertEqual([g["text"] for g in before["groups"]], [""])
+        self.assertEqual(figures(released), [])
+        self.assertEqual(
+            [g["text"] for g in released["groups"]], ["Words in the table."]
+        )
+        self.assertEqual(figures(still_out), [])
+        self.assertEqual([g["text"] for g in still_out["groups"]], [])
+
+    def test_the_words_under_a_picture_never_uncover_a_redaction(self):
+        """One engine's block spans a redaction and a curated picture.
+        The other read the picture's words as a unit of their own, so
+        they are a known thing, but they do not stand in for what the
+        redaction hid: the block stays silent, and the redacted words
+        reach no text."""
+        block = [36.0, 100.0, 288.0, 560.0]
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                block,
+                "secret words\ntable words",
+                {"reason": "redaction"},
+                0.5,
+            ),
+            unit(
+                "mistral_ocr",
+                0,
+                PICTURE_PT,
+                "table words",
+                {"reason": "picture", "detection_id": 9},
+                1.0,
+            ),
+        ]
+
+        groups = ensemble.align_page(units, 612.0, 792.0)
+
+        texts = [
+            read["text"]
+            for group in groups
+            for read in group["engines"].values()
+            if not read["excluded"]
+        ]
+        self.assertNotIn("secret words", " ".join(texts))
+
     def test_an_engines_picture_label_alone_is_no_picture(self):
         """The kind is the glue's: a unit the engine labelled a picture
         with no ``figure`` kind is a paragraph, because the pictures are

@@ -3077,7 +3077,13 @@ class TestThePicture(OpinionOcrTestCase):
                 taken = self.unit(document, 0, "body A")
                 self.assertEqual(
                     taken["exclusion"],
-                    {"reason": opinion_ocr.PICTURE, "detection_id": row.pk},
+                    {
+                        "reason": opinion_ocr.PICTURE,
+                        "detection_id": row.pk,
+                        # The unit's own verdict, for "Not a picture".
+                        "verdict": None,
+                        "verdict_share": 0.0,
+                    },
                 )
                 self.assertEqual(taken["share"], 1.0)
                 self.assertIsNone(
@@ -3100,6 +3106,23 @@ class TestThePicture(OpinionOcrTestCase):
                 self.assertIsNone(figure["exclusion"])
                 for page in document["pages"][1:]:
                     self.assertEqual(self.figure_units(page), [])
+
+    def test_a_unit_part_inside_a_picture_keeps_the_measured_share(self):
+        """A box over three fifths of a block takes it with the share
+        it measured, so the drop is a partial one with its card, and the
+        block's own verdict rides beside the picture's."""
+        self.redact(1, to_pt(BODY_B))
+        self.picture(box=(BODY_A[0], BODY_A[1], BODY_A[2], 660))
+
+        document = self.documents()["dots_mocr"]
+
+        taken = self.unit(document, 0, "body A")
+        self.assertEqual(taken["exclusion"]["reason"], opinion_ocr.PICTURE)
+        self.assertIsNone(taken["exclusion"]["verdict"])
+        self.assertGreaterEqual(taken["share"], opinion_ocr.FIGURE_SHARE)
+        self.assertLess(taken["share"], opinion_ocr.FULL_SHARE)
+        under_redaction = self.unit(document, 0, "body B")
+        self.assertEqual(under_redaction["exclusion"]["reason"], "redaction")
 
     def test_a_unit_less_than_half_inside_a_picture_is_text(self):
         """A box over the foot of a block takes a third of it: the
