@@ -3113,9 +3113,17 @@ class TestThePicture(OpinionOcrTestCase):
 
     def test_an_engines_own_picture_label_is_a_paragraph(self):
         """No curated box: the engine's picture label makes no figure,
-        and its unit goes on as a paragraph that reads nothing."""
+        and its unit goes on as a paragraph that reads nothing, whatever
+        words the engine wrote into the block."""
         self.objects[self.apply_run.ocr_key]["pages"][1]["cells"].append(
-            cell(100, 1500, 800, 2000, text="", category="Picture")
+            cell(
+                100,
+                1500,
+                800,
+                2000,
+                text="words the engine put in the picture",
+                category="Picture",
+            )
         )
 
         document = self.documents()["dots_mocr"]
@@ -3125,6 +3133,31 @@ class TestThePicture(OpinionOcrTestCase):
             u for u in document["pages"][0]["units"] if u["type"] == "Picture"
         )
         self.assertEqual(labelled["kind"], markup.PARAGRAPH)
+        self.assertEqual(labelled["text"], "")
+        self.assertEqual(labelled["marks"], [])
+
+    def test_a_picture_under_a_redaction_is_judged_like_a_block(self):
+        """A curated box a redaction covers goes with its verdict, so the
+        ensemble drops the picture as it dropped the engines' before."""
+        self.picture()
+        self.redact(1, to_pt(BODY_A))
+
+        document = self.documents()["dots_mocr"]
+
+        [figure] = self.figure_units(document["pages"][0])
+        self.assertEqual(figure["exclusion"]["reason"], "redaction")
+        self.assertGreaterEqual(figure["share"], opinion_ocr.FULL_SHARE)
+
+    def test_the_junk_rule_reads_loaded_fields(self):
+        """The fields the junk rule reads are in the detection query, so
+        the pass costs no query per row."""
+        self.picture()
+        inputs = self.inputs()
+
+        with self.assertNumQueries(0):
+            pictures = opinion_ocr.curated_pictures(inputs)
+
+        self.assertEqual(sorted(pictures), [1])
 
     def test_a_dismissed_box_is_no_picture(self):
         row = self.picture()
@@ -3201,6 +3234,18 @@ class TestWithPictures(OpinionOcrTestCase):
 
     def test_a_text_that_holds_a_picture_is_taken_too(self):
         other = self.second_opinion(figure_digest="abc")
+
+        rows = opinion_ocr.picture_rows(self.scan)
+
+        self.assertEqual([r.pk for r in rows], [other.pk])
+
+    def test_a_glue_the_ensemble_has_not_read_is_taken_too(self):
+        """A glue written before the rule carries the engines' picture
+        labels as figures, and the ensemble trusts them: it is glued
+        again, box or no box."""
+        other = self.second_opinion(
+            glue_revision=1, ocr_glue_revision=1, ensemble_revision=0
+        )
 
         rows = opinion_ocr.picture_rows(self.scan)
 

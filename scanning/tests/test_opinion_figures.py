@@ -45,6 +45,7 @@ from scanning import (
 from scanning.models import (
     Opinion,
     OpinionCheck,
+    OpinionEdit,
     OpinionFinding,
     OpinionReviewStatus,
 )
@@ -54,6 +55,7 @@ from scanning.tests.test_ensemble import (
     engine_page,
     unit,
 )
+from scanning.tests.test_opinion_edits import entry
 from scanning.tests.test_opinion_ocr import (
     IMG_H,
     IMG_W,
@@ -270,6 +272,43 @@ class TestThePictureGroup(SimpleTestCase):
         self.assertEqual(
             [p["kind"] for p in body], [markup.FIGURE, markup.PARAGRAPH]
         )
+
+    def test_a_drop_of_the_words_under_a_picture_leaves_the_picture(self):
+        """The group the words under a curated picture form is the
+        figure's twin: a drop whose box is the words' lands on the words
+        and the picture stays, a drop at the figure's box takes the
+        picture, and a box that fits both alike goes to the figure."""
+        words = [41.0, 421.0, 279.0, 559.0]
+        taken = {"reason": "picture", "detection_id": 9}
+
+        def pages(box):
+            return {
+                name: engine_page(
+                    [
+                        {
+                            **unit(name, 0, box, "Words in the table."),
+                            "exclusion": taken,
+                            "share": 1.0,
+                        },
+                        picture(name, 1),
+                    ]
+                )
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+
+        on_words = ensemble.build_page(
+            pages(words), 0, [entry(OpinionEdit.Kind.DROP, words)]
+        )
+        on_figure = ensemble.build_page(
+            pages(words), 0, [entry(OpinionEdit.Kind.DROP, PICTURE_PT)]
+        )
+        tied = ensemble.build_page(
+            pages(PICTURE_PT), 0, [entry(OpinionEdit.Kind.DROP, PICTURE_PT)]
+        )
+
+        self.assertEqual(len(figures(on_words)), 1)
+        self.assertEqual(figures(on_figure), [])
+        self.assertEqual(figures(tied), [])
 
     def test_an_engines_picture_label_alone_is_no_picture(self):
         """The kind is the glue's: a unit the engine labelled a picture
@@ -695,17 +734,18 @@ class FigureTestCase(EnsembleTestCase):
 
     #: The picture in render pixels: below the two body cells.
     PICTURE = (100, 1500, 800, 2000)
+    #: The engines' own box of it, a little inside the curated one, as
+    #: a model's box sits inside a curator's.
+    DRAWN = (110, 1510, 790, 1990)
 
     def setUp(self):
         super().setUp()
         self.picture_row = self.image_row(2)
         self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].append(
-            cell(*self.PICTURE, text="", category="Picture")
+            cell(*self.DRAWN, text="", category="Picture")
         )
         self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].append(
-            block(
-                *self.PICTURE, text="![img-0.jpeg](img-0.jpeg)", kind="image"
-            )
+            block(*self.DRAWN, text="![img-0.jpeg](img-0.jpeg)", kind="image")
         )
         # The run's bitonal copy, under the processing prefix, for the
         # masks the cut widens over its ink.

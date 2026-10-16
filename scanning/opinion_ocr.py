@@ -791,6 +791,12 @@ def load_inputs(scan: Scan) -> ScanInputs:
             "y1",
             "img_width",
             "img_height",
+            # The junk rule of :func:`curated_pictures` reads these
+            # three: loaded here, or Django loads each with a query
+            # per row.
+            "model_name",
+            "found_by",
+            "label_id",
         )
         .order_by("page_index", "y0", "x0")
     ):
@@ -1584,10 +1590,19 @@ def build_document(
                 counts["tables"] += 1
             elif parsed.kind == markup.FIGURE:
                 # The engine's own picture label is no picture: the
-                # pictures are the curated boxes, written below. A unit
-                # it read as a picture holds no words, and goes on as a
-                # paragraph the ensemble drops for want of one.
-                parsed = replace(parsed, kind=markup.PARAGRAPH)
+                # pictures are the curated boxes, written below. The
+                # unit goes on as a paragraph that reads nothing, which
+                # the ensemble drops: Surya writes words into a block it
+                # labelled a figure, and they are no text of the opinion
+                # where no curated box covers them.
+                parsed = replace(
+                    parsed,
+                    kind=markup.PARAGRAPH,
+                    text="",
+                    marks=[],
+                    table=None,
+                )
+                text, marks, before = "", [], ""
             label = unit.get(spec.type_key) or ""
             # The ``manual`` box that is the bracket token this unit
             # lost does not take the unit (#419); every other box does.
@@ -1658,6 +1673,19 @@ def build_document(
                 picture["y1"],
             ]
             sx, sy = render[0] / size[0], render[1] / size[1]
+            # Under a redaction or the neighbour's mask the picture goes
+            # like a block the box took, and the ensemble drops it: the
+            # rules of :func:`verdict`, over the box with no text.
+            exclusion, share = verdict(
+                box_pt,
+                rects,
+                page_masks,
+                "",
+                printed,
+                size[1],
+                "image",
+                frame_rects,
+            )
             entry["units"].append(
                 {
                     "id": len(entry["units"]),
@@ -1672,8 +1700,8 @@ def build_document(
                         round(box_pt[3] * sy),
                     ],
                     "box_pt": box_pt,
-                    "exclusion": None,
-                    "share": 0.0,
+                    "exclusion": exclusion,
+                    "share": share,
                     "figure": {"detection_id": picture.get("id")},
                 }
             )
@@ -1966,8 +1994,11 @@ def picture_rows(scan: Scan) -> list[Opinion]:
     Of :func:`reglue_rows`: an opinion whose page span holds a live
     ``IMAGE`` detection of its run, or whose text holds a picture
     already (``figure_digest``), because the rule reads the first and
-    wrote the second. Every other opinion glues the same, so
-    ``reglue_opinion_ocr --with-pictures`` leaves it alone.
+    wrote the second; and one whose glue is written but whose ensemble
+    has not read it yet, because that glue carries the engines' own
+    picture labels as ``figure`` units, which the ensemble now trusts.
+    Every other opinion glues the same, so ``reglue_opinion_ocr
+    --with-pictures`` leaves it alone.
 
     :param scan: The scan.
     :returns: The rows, in the order of :func:`reglue_rows`.
@@ -1983,9 +2014,17 @@ def picture_rows(scan: Scan) -> list[Opinion]:
     rows = []
     for row in reglue_rows(scan):
         pages = by_run.get(row.apply_run_id, set())
-        if row.figure_digest or any(
-            row.start_page_index <= page <= row.end_page_index
-            for page in pages
+        unread_glue = (
+            row.ocr_glue_revision == row.glue_revision
+            and row.ensemble_revision != row.ocr_glue_revision
+        )
+        if (
+            row.figure_digest
+            or unread_glue
+            or any(
+                row.start_page_index <= page <= row.end_page_index
+                for page in pages
+            )
         ):
             rows.append(row)
     return rows

@@ -2895,20 +2895,20 @@ def land_edits(
         if not box:
             continue
         for there, group in enumerate(groups):
-            if group.get("_under_picture"):
-                # The words under a curated picture are the picture
-                # (#463): the glue wrote the figure in their place, so
-                # their group shares its box and takes no edit, or a
-                # drop of the picture lands on the words first and the
-                # picture stays.
-                continue
             score = iou(box, group["box_pt"])
             if score >= OVERLAP:
-                pairs.append((-score, here, there))
+                # The words under a curated picture are the picture
+                # (#463): their group shares the figure's box, so a tie
+                # goes to the figure, which is the group a person sees.
+                # A box that fits the words better than the figure
+                # still lands on the words, so an old drop of them does
+                # not take the picture.
+                twin = int(bool(group.get("_under_picture")))
+                pairs.append((-score, here, twin, there))
     pairs.sort()
     landed: dict[int, int] = {}
     taken: set[int] = set()
-    for _score, here, there in pairs:
+    for _score, here, _twin, there in pairs:
         if here in landed or there in taken:
             continue
         landed[here] = there
@@ -2922,7 +2922,8 @@ def under_picture(group: dict) -> bool:
     The glue excludes the words under a live ``IMAGE`` box with reason
     ``opinion_ocr.PICTURE`` and writes a ``figure`` unit at the box
     (#463), so such a group is the figure's twin: dropped for the box,
-    and no target of an edit (:func:`land_edits`).
+    and second to the figure where an edit's box fits both alike
+    (:func:`land_edits`).
 
     :param group: An aligned group.
     :returns: Whether the group is excluded by a curated picture.
