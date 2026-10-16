@@ -1143,11 +1143,9 @@ a.doc-name:hover { text-decoration: underline; }
    window was of no use (the toolbar is sticky, so it is the containing
    block of the panel). */
 .viewer-help-panel {
-    /* Beside the column, not under it: the stack is the positioned
-       ancestor, so the panel opens to its right at the top. */
     position: absolute;
-    top: 0;
-    left: calc(100% + 6px);
+    top: calc(100% + 6px);
+    left: 0;
     width: max-content;
     max-width: 460px;
     max-height: calc(100vh - 260px);
@@ -1160,6 +1158,15 @@ a.doc-name:hover { text-decoration: underline; }
     font-size: 12px;
     line-height: 1.5;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+}
+/* Under the step-2 toolbar column the panel opens beside the stack,
+   not under it: the stack is its positioned ancestor. Scoped here,
+   because the text review's guide shares the rule and must keep
+   hanging under its own "?" (the panel over its toggle could not be
+   closed). */
+.zoom-toolbar .viewer-help-panel {
+    top: 0;
+    left: calc(100% + 6px);
 }
 .viewer-help-panel h3 {
     margin: 8px 0 4px;
