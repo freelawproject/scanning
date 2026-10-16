@@ -135,6 +135,8 @@ class TestTheBuilders(ScanningTestCase):
         # The block and its pad.
         self.assertEqual(card["crop"], [960.0, 160.0, 1640.0, 640.0])
         self.assertTrue(card["key"].startswith("f:undetected_text:0:"))
+        # The footnote answer takes the block itself.
+        self.assertEqual(card["block"], card["box"])
 
     def test_a_text_finding_with_no_label_makes_no_card(self):
         issue = finding(

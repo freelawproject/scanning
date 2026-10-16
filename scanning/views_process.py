@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from blackletter.models import Label
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -944,8 +945,6 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     # every opinion of a page that holds several.
     missing_count = 0
     if opinions and not preview:
-        from blackletter.models import Label
-
         open_missing = [
             row
             for row in Issue.objects.filter(
@@ -1080,6 +1079,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 engine["available"] for engine in ocr_engines
             ),
             "opinions": opinions,
+            # The text card's footnote answer writes this label (the
+            # server's table, never a script's copy of it).
+            "footnote_label": Label.FOOTNOTES.name,
+            "footnote_label_id": Label.FOOTNOTES.value,
             "opinion_count": opinion_count,
             "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
@@ -5336,7 +5339,6 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: The rendered page.
     """
-    from blackletter.models import Label
 
     scan = get_object_or_404(Scan, pk=pk)
     flags = _review_flags(scan)

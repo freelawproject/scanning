@@ -180,7 +180,11 @@ function holdAside() {
             e.preventDefault();
             _currentOpinionIdx = Math.max(_currentOpinionIdx - 1, 0);
             cards[_currentOpinionIdx].click();
-        } else if (e.key === "ArrowDown") {
+        } else if (e.key === "ArrowDown" || e.key === "PageDown") {
+            // One page at a time, to its top: the next page whose top
+            // is below the viewer's. Page Down is the same move, so a
+            // screenful never lands mid-page. The jump settles after
+            // the lazy render, the rule of scrollPageIntoView.
             e.preventDefault();
             _clearDim();
             var pages = document.querySelectorAll(".lazy-page");
@@ -188,14 +192,13 @@ function holdAside() {
             if (viewer && pages.length) {
                 var vTop = viewer.getBoundingClientRect().top;
                 for (var i = 0; i < pages.length; i++) {
-                    var diff = pages[i].getBoundingClientRect().top - vTop;
-                    if (diff > 5) {
-                        viewer.scrollBy({ top: diff, behavior: "smooth" });
+                    if (pages[i].getBoundingClientRect().top - vTop > 5) {
+                        window.scrollPageIntoView(pages[i]);
                         break;
                     }
                 }
             }
-        } else if (e.key === "ArrowUp") {
+        } else if (e.key === "ArrowUp" || e.key === "PageUp") {
             e.preventDefault();
             _clearDim();
             var pages = document.querySelectorAll(".lazy-page");
@@ -203,9 +206,8 @@ function holdAside() {
             if (viewer && pages.length) {
                 var vTop = viewer.getBoundingClientRect().top;
                 for (var i = pages.length - 1; i >= 0; i--) {
-                    var diff = pages[i].getBoundingClientRect().top - vTop;
-                    if (diff < -5) {
-                        viewer.scrollBy({ top: diff, behavior: "smooth" });
+                    if (pages[i].getBoundingClientRect().top - vTop < -5) {
+                        window.scrollPageIntoView(pages[i]);
                         break;
                     }
                 }
@@ -348,18 +350,30 @@ function highlightDetection(el) {
 // as the drawer. The endpoint rebuilt the findings, so the card goes
 // when the section is fetched again: a live bracket box covers the
 // reading. The viewer draws the row at once.
-function addGuessedDetection(btn) {
+function addGuessedDetection(btn, variant) {
     var d = _getDetectionData(btn);
     if (!d || !d.guess) return;
     var cfg = window.SCAN_CONFIG;
+    // The text card's second answer: a footnote box over the block
+    // itself, with the label the card carries from the server. The
+    // column add takes the card's guess, the column the block sits in
+    // on a page with no column box.
+    var footnote = variant === "footnote";
+    if (footnote && !(cfg.footnoteLabel && cfg.footnoteLabelId)) {
+        // Never fall back to a column box: the page did not say which
+        // label a footnote is, so the press does nothing.
+        showToast("The page carries no footnote label; reload it.", "error");
+        return;
+    }
+    var label = btn.textContent;
     btn.disabled = true;
     btn.textContent = "...";
     var det = {
         page_index: d.pageIndex,
-        label: d.label,
-        label_id: d.labelId,
+        label: footnote ? cfg.footnoteLabel : d.label,
+        label_id: footnote ? cfg.footnoteLabelId : d.labelId,
         confidence: 1.0,
-        bbox: d.guess,
+        bbox: footnote ? d.bbox : d.guess,
         img_width: d.imgW,
         img_height: d.imgH,
     };
@@ -375,7 +389,7 @@ function addGuessedDetection(btn) {
         .then(function (data) {
             if (!data || data.status === "error" || data.error) {
                 btn.disabled = false;
-                btn.textContent = "+";
+                btn.textContent = label;
                 showToast((data && (data.message || data.error)) || "Could not add the box");
                 return;
             }
@@ -390,7 +404,7 @@ function addGuessedDetection(btn) {
         })
         .catch(function () {
             btn.disabled = false;
-            btn.textContent = "+";
+            btn.textContent = label;
             showToast("Could not add the box");
         });
 }

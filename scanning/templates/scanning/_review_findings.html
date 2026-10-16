@@ -86,7 +86,9 @@
     {% endif %}
     {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a text column box over this block, the box the card flashes, and resize it on the page if it is short. A box in a column that has one already joins that column. The card goes now."
-            onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+ column</button>
+    <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Add a footnote box over this block: the footnote line the page's footnote box stopped short of. The opinion text takes it as a footnote. The card goes now."
+            onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
     {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
     {% if issue.metadata.conf < 1 %}

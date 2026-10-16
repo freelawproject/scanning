@@ -47,7 +47,7 @@
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
     var GROUPS = ['caption', 'bracket', 'text', 'image'];
-    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd' };
+    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
@@ -134,6 +134,15 @@
     function moved(card) {
         if (!card.box || !card.original) { return false; }
         return card.box.some(function (v, i) { return Math.abs(v - card.original[i]) >= 0.5; });
+    }
+
+    /** One label of the server's table, by name. */
+    function labelNamed(name) {
+        return (cfg.labels || []).filter(function (l) { return l.name === name; })[0] || null;
+    }
+
+    function sameBox(a, b) {
+        return !!a && !!b && a.every(function (v, i) { return Math.abs(v - b[i]) < 0.5; });
     }
 
     // ── the crop ─────────────────────────────────────────────────────
@@ -466,6 +475,14 @@
             if (!frozen && !card.edit && !still) {
                 bindDrag(card, card, box, wrap, node, function () { markMoved(card, node); });
             }
+            if (card.kind === 'text' && card.block && !sameBox(card.block, card.original || card.box)) {
+                // A page with no column box: the box is the column the
+                // block sits in, and the block itself is what the
+                // footnote answer takes, so it is drawn too.
+                var block = el('div', 'cr-block');
+                layer.appendChild(block);
+                placeBox(card, block, card.block);
+            }
         }
         if (card.edit) {
             var editBox = el('div', 'cr-box cr-edit');
@@ -601,6 +618,23 @@
                     add(card, node);
                 }));
             }
+            var footnoteLabel = labelNamed('FOOTNOTES');
+            if (card.kind === 'text' && footnoteLabel) {
+                // The text card's second answer: a footnote box, for the
+                // footnote line the page's footnote box stopped short
+                // of. It takes the box as the curator shaped it, else
+                // the block itself (the dotted outline inside a wider
+                // guess), never a column-sized box.
+                foot.appendChild(button('Add footnote', 'n', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    add(card, node, {
+                        label: footnoteLabel.name,
+                        labelId: footnoteLabel.id,
+                        box: moved(card) ? card.box : (card.block || card.box),
+                        added: 'footnote added'
+                    });
+                }));
+            }
             foot.appendChild(button(verbsToAdd.none, 'x', 'btn-outline text-xs', function (btn) {
                 btn.disabled = true;
                 dismiss(card, node);
@@ -705,16 +739,17 @@
         });
     }
 
-    function add(card, node) {
+    function add(card, node, as) {
+        as = as || {};
         write(card, node, cfg.urls.add_single_detection, {
             page_index: card.page_index,
-            label: card.label,
-            label_id: card.label_id,
+            label: as.label || card.label,
+            label_id: as.labelId || card.label_id,
             confidence: 1.0,
-            bbox: card.box,
+            bbox: as.box || card.box,
             img_width: card.img_width,
             img_height: card.img_height
-        }, addVerbs(card).added, function (data) {
+        }, as.added || addVerbs(card).added, function (data) {
             // The hand-drawn row that holds the box (an add, or the
             // approval of a model box it landed on): withdrawn, it
             // gives back whatever it replaced.
