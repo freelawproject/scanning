@@ -28,19 +28,20 @@ detections of their pages. The measure is the glue's own, so the card
 and the drop agree: the frame of a page is ``opinion_ocr.page_frame``
 (every live detection, and no frame on a page with no ``TEXT_COLUMN``
 box, which the glue does not judge either), and the test is
-``opinion_ocr.undetected``. A page header, a page footer and a picture
-cell are no text to keep; a cell with no word of three letters is a
-stray mark the glue drops and nobody misses. The missed cells of a
-page are clustered into blocks (:func:`clusters`), one card each,
-because a dropped footnote is three cells and one answer.
+``opinion_ocr.undetected``. No cell is skipped for the reader's own
+category (the curator's word, 2026-10-15): the model's boxes say what
+a block is, so a footnote line the ``FOOTNOTES`` box stopped short of
+is a card, where the reader's "footnote" or "page footer" label once
+hid it. A cell with no word of three letters is a stray mark the glue
+drops and nobody misses. The missed cells of a page are clustered
+into blocks (:func:`clusters`), one card each, because a dropped
+footnote is three cells and one answer.
 
-A footnote cell makes no card (the curator's word, 2026-10-13: a
-footnote the ``FOOTNOTES`` box stopped short of is a loss worth no
-card), so a block is body text. The verdict's order is kept: it reads
-the redactions before the frame, so a unit a visible redaction covers
-is excluded as a redaction and never dropped as undetected, and a
-block a curator blacked out by hand makes no card either
-(``redactions.visible_by_page``, the glue's own list).
+The verdict's order is kept: it reads the redactions before the frame,
+so a unit a visible redaction covers is excluded as a redaction and
+never dropped as undetected, and a block a curator blacked out by hand
+makes no card either (``redactions.visible_by_page``, the glue's own
+list).
 
 The card writes nothing of its own (the curator's word, 2026-10-14): a
 block the boxes miss is nearly always the foot of a column the model
@@ -434,7 +435,7 @@ def _finding(
     # page with none, the first column box turns the glue's judgement
     # on for the whole page, and a block-sized box would leave the
     # rest of its column, the footnotes under it included, outside
-    # every box with no card to say so (a footnote makes none). So
+    # every box. So
     # there the guess is the column the block sits in: every cell of
     # the page beside the running head, the foot and the pictures that
     # overlaps the block sideways, the way a double click fills a

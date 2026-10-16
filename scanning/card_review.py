@@ -326,11 +326,13 @@ def caption_card(issue: Issue) -> dict | None:
 def text_card(issue: Issue) -> dict | None:
     """Return the card of an ``undetected_text`` finding.
 
-    The box is the block of print no detection covers
-    (``undetected.uncovered``), the label the one the finding names (a
-    ``TEXT_COLUMN``), the crop the block and its pad, widened to its
-    column like every crop. ``no_column`` says the page has no column
-    box: that card offers an add, the block's box as the column.
+    The box is the finding's guess (``undetected.uncovered``: the block
+    of print no detection covers, or the column it sits in on a page
+    with no column box), the label the one the finding names (a
+    ``TEXT_COLUMN``), the crop the box and its pad, widened to its
+    column like every crop. The card answers two ways: Add column
+    writes that box, Add footnote writes a ``FOOTNOTES`` box over the
+    block (``block``), with the label from the page's own table.
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -365,6 +367,10 @@ def text_card(issue: Issue) -> dict | None:
     # that card offers the add the others withhold: the block's box as
     # the page's column box, through the same write as a bracket.
     card["no_column"] = bool(metadata.get("no_column"))
+    # The second answer, a footnote box, takes the block itself unless
+    # the curator reshaped the box; the page shows the block inside a
+    # wider guess so the curator sees what that answer takes.
+    card["block"] = block
     return card
 
 
