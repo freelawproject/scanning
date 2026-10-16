@@ -2709,24 +2709,46 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     - The rank decides who takes a free place and **preempts nothing**;
       :func:`_room_for` counts the in-flight rows against the cap.
 
-    The id stays the second key: inside one class the creation order is
-    what keeps the drain fair. The rank reads the row and not
-    ``Scan.status``, which moves under a row that is already waiting.
-    (It would cost no join: the slice already reaches ``scan`` through
+    **A volume shard of a reviewed volume goes next** (issue #500).
+    The Surya sweep creates a volume run at the upload, so after the
+    deploy every volume of the corpus queues its shards at once, oldest
+    id first, and the endpoint takes ``SURYA_MAX_CONCURRENCY`` at a
+    time. A volume whose review 1 is approved is further along than one
+    nobody opened: its opinion OCR glue waits on the Surya read
+    (``opinion_ocr.engines_owed``), and the other's waits on nothing.
+    The mark of that approval is an ``ApplyRun`` row (``apply.py``
+    creates one for every approved volume, the identity run included),
+    so the rank asks for one. The same four properties hold: the apply
+    rows go first, the reviewed set is bounded by the review itself, a
+    row that waits carries no deadline, and nothing is preempted.
+
+    The id stays the last key: inside one class the creation order is
+    what keeps the drain fair. The rank reads the rows and not
+    ``Scan.status``, which moves under a row that is already waiting
+    and names more states than the rank cares about. (It costs one
+    ``EXISTS`` per row: the slice already reaches ``scan`` through
     ``select_related``.)
 
     :param queryset: This provider and stage's rows.
     :param room: How many rows the cap allows.
-    :returns: The apply rows first, each class in creation order, at
-        most ``room`` of them.
+    :returns: The apply rows first, then the rows of a volume with an
+        apply run, each class in creation order, at most ``room`` of
+        them.
     :rtype: list[ExternalJob]
     """
+    from django.db.models import Exists, OuterRef
+
+    from scanning.models import ApplyRun
+
     return list(
         queryset.filter(status=JobStatus.PENDING)
         # ``s3_job_attempt_key`` reads the apply run's number (#224).
         .select_related("scan", "scan__reporter", "apply_run")
-        .annotate(is_apply=Q(apply_run__isnull=False))
-        .order_by("-is_apply", "id")[:room]
+        .annotate(
+            is_apply=Q(apply_run__isnull=False),
+            reviewed=Exists(ApplyRun.objects.filter(scan=OuterRef("scan"))),
+        )
+        .order_by("-is_apply", "-reviewed", "id")[:room]
     )
 
 
