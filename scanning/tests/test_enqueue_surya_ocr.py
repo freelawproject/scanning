@@ -122,6 +122,70 @@ class TestEnqueueSuryaOcr(TestCase):
         self._call(str(scan.pk))
         self.assertEqual(len(surya.live_extract_jobs(scan)), 2)
 
+    def test_a_named_volume_read_over_another_shard_set_gets_a_fresh_run(self):
+        # The button's other case: an approved volume whose set was
+        # re-cut after its run finished. The sweep never reads its
+        # status, so the named path must reach the creator.
+        scan = self._scan_with_run(
+            dead=False, status=Status.REDACTION_REVIEW_DONE
+        )
+        ExternalJob.objects.filter(scan=scan).update(
+            status=JobStatus.CONSUMED, source_fingerprint="1024:20"
+        )
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        self.committed.return_value = (
+            make_manifest(shard_count=4, pages_per_shard=5),
+            "",
+        )
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            out, _ = self._call(str(scan.pk))
+        rows = surya.live_extract_jobs(scan)
+        self.assertEqual(rows[0].run, 2)
+        self.assertEqual(len(rows), 4)
+        self.assertIn("4 of 4 shard(s) to read again", out)
+
+    def test_a_dry_run_names_the_other_shard_set(self):
+        scan = self._scan_with_run(
+            dead=False, status=Status.REDACTION_REVIEW_DONE
+        )
+        ExternalJob.objects.filter(scan=scan).update(
+            source_fingerprint="1024:20"
+        )
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        out, _ = self._call(str(scan.pk), "--dry-run")
+        self.assertIn("run 1 read another shard set", out)
+        self.assertEqual(surya.live_extract_jobs(scan)[0].run, 1)
+
+    def test_dead_runs_leaves_a_finished_run_over_another_set_alone(self):
+        # The sweep's case wherever the sweep reads: one run per set,
+        # started by the tick, never by this flag.
+        scan = self._scan_with_run(dead=False)
+        ExternalJob.objects.filter(scan=scan).update(
+            source_fingerprint="1024:20"
+        )
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        out, _ = self._call("--dead-runs")
+        self.assertEqual(surya.live_extract_jobs(scan)[0].run, 1)
+        self.assertIn("0 run(s) started, 1 skipped", out)
+
+    def test_a_named_run_the_creator_hands_back_is_not_counted(self):
+        # The fingerprint moved but the shards did not: the creator
+        # reuses the run, and the command says so instead of
+        # announcing a start.
+        scan = self._scan_with_run(dead=False)
+        ExternalJob.objects.filter(scan=scan).update(
+            status=JobStatus.CONSUMED, source_fingerprint="1024:20"
+        )
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        out, err = self._call(str(scan.pk))
+        self.assertEqual(surya.live_extract_jobs(scan)[0].run, 1)
+        self.assertIn("still covers today's shard set", err)
+        self.assertIn("0 run(s) started, 1 skipped", out)
+
     def test_a_volume_out_of_the_sweep_is_out_of_dead_runs(self):
         # An approved volume and a legacy status alike.
         for status in (

@@ -36,6 +36,14 @@ Examples:
     # Two named volumes, whatever their status and their run's.
     docker exec scanning-daemon python manage.py enqueue_surya_ocr \\
         2561 2599
+
+A named volume whose finished run was read over another shard set (a
+re-upload or a ``MANIFEST_VERSION`` bump re-cut it, and its status is
+one the sweep does not read) gets a fresh run too: the creator replaces
+a run that no longer describes today's set and carries every unchanged
+shard, so that is what the button did for it. ``--dead-runs`` leaves
+such a run alone, because the sweep handles it wherever the sweep
+reads.
 """
 
 from django.core.management.base import BaseCommand, CommandError
@@ -121,13 +129,14 @@ class Command(BaseCommand):
                 break
             rows = surya.live_extract_jobs(scan)
             dead = any(row.status in DEAD_JOB_STATUSES for row in rows)
+            stale = bool(wanted) and _another_set(scan, rows)
             if not wanted and not dead:
                 skipped += 1
                 continue
-            if rows and not dead:
-                # A named scan with a live or finished run: the sweep
-                # rule holds, and this command does not force a run
-                # over paid output.
+            if rows and not dead and not stale:
+                # A named scan with a live or finished run over today's
+                # shard set: the sweep rule holds, and this command does
+                # not force a run over paid output.
                 skipped += 1
                 self.stderr.write(
                     f"scan {scan.pk}: run {rows[0].run} is not dead "
@@ -137,9 +146,13 @@ class Command(BaseCommand):
                 continue
             if dry_run:
                 started += 1
+                why = ""
+                if dead:
+                    why = f" (run {rows[0].run} died)"
+                elif stale:
+                    why = f" (run {rows[0].run} read another shard set)"
                 self.stdout.write(
-                    f"scan {scan.pk}: would start a fresh run"
-                    + (f" (run {rows[0].run} died)" if rows else "")
+                    f"scan {scan.pk}: would start a fresh run{why}"
                 )
                 continue
 
@@ -149,6 +162,16 @@ class Command(BaseCommand):
                 self.stderr.write(f"scan {scan.pk}: {reason}")
                 continue
             new_rows = surya.ensure_extract_jobs(scan, manifest)
+            if rows and new_rows[0].run == rows[0].run:
+                # The creator judged the live run to describe today's
+                # set after all (the fingerprint moved, the shards did
+                # not), and handed it back. Nothing was paid.
+                skipped += 1
+                self.stderr.write(
+                    f"scan {scan.pk}: run {rows[0].run} still covers today's "
+                    "shard set; nothing to do"
+                )
+                continue
             pending = sum(1 for r in new_rows if r.status == JobStatus.PENDING)
             started += 1
             self.stdout.write(
@@ -165,3 +188,23 @@ class Command(BaseCommand):
                 f"{' (dry run)' if dry_run else ''}"
             )
         )
+
+
+def _another_set(scan, rows) -> bool:
+    """Return whether a run was read over a shard set that is not the
+    scan's today.
+
+    Every row stamps the ``source_fingerprint`` of the set it read
+    (#250); a blank one, from before the column, matches anything, as
+    does a scan with no fingerprint yet.
+
+    :param scan: The scan.
+    :param rows: The live run's rows.
+    :returns: Whether a stamped row names another set.
+    :rtype: bool
+    """
+    return bool(scan.source_fingerprint) and any(
+        row.source_fingerprint
+        and row.source_fingerprint != scan.source_fingerprint
+        for row in rows
+    )
