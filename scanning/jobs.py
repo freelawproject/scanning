@@ -1479,8 +1479,8 @@ def ready_apply_runs(
 
     **A volume nobody read with this engine is never a candidate**,
     which is what keeps a pass over it from starting paid work of its
-    own: the candidate is a glued volume run, and only a person starts
-    one.
+    own: the candidate is a glued volume run, which the sweep starts
+    for Surya (#500) and a person starts for Mistral (#191).
 
     :param target: The engine and its two ``ApplyRun`` fields.
     :param live_rows: The engine's own live-run reader, called per
