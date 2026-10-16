@@ -1,7 +1,8 @@
 """Tests for the pictures of an opinion's text (issue #463).
 
-The engines draw a box over a picture and read no text in it. The
-ensemble writes it as a ``figure`` group, the daemon cuts it from the
+A curator keeps an IMAGE box over a picture in review 2. The OCR glue
+drops the engines' words under it and writes a ``figure`` unit in its
+place, the ensemble writes the ``figure`` group, the daemon cuts it from the
 original (``opinion_figures``), the review page draws it and moves it,
 and the approval embeds it in the approved text, which the final XML
 writes as a ``figure`` holding a data-URI ``img``.
@@ -20,6 +21,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import fitz
+from blackletter.models import Label
 from botocore.exceptions import ClientError
 from django.contrib.auth import get_user_model
 from django.db.models import F
@@ -33,6 +35,7 @@ from scanning import (
     ensemble,
     markup,
     opinion_figures,
+    opinion_ocr,
     opinion_pdf,
     opinion_review,
     opinions,
@@ -45,12 +48,20 @@ from scanning.models import (
     OpinionFinding,
     OpinionReviewStatus,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_ensemble import (
     EnsembleTestCase,
     engine_page,
     unit,
 )
-from scanning.tests.test_opinion_ocr import PAGES, block, cell, to_pt
+from scanning.tests.test_opinion_ocr import (
+    IMG_H,
+    IMG_W,
+    PAGES,
+    block,
+    cell,
+    to_pt,
+)
 
 #: A picture between the two body blocks of the fixture, in points.
 PICTURE_PT = [40.0, 420.0, 280.0, 560.0]
@@ -260,15 +271,16 @@ class TestThePictureGroup(SimpleTestCase):
             [p["kind"] for p in body], [markup.FIGURE, markup.PARAGRAPH]
         )
 
-    def test_a_document_glued_before_the_kind_reads_the_label(self):
-        """A document of the glue before #463 has no ``figure`` kind;
-        the label of the engine names the picture."""
+    def test_an_engines_picture_label_alone_is_no_picture(self):
+        """The kind is the glue's: a unit the engine labelled a picture
+        with no ``figure`` kind is a paragraph, because the pictures are
+        the curated boxes and the glue writes those itself."""
         old = unit("dots_mocr", 0, PICTURE_PT, "", label="Picture")
         page = {"units": [{**old, "kind": None}]}
 
         placed, _ = ensemble._units_of(page, "dots_mocr")
 
-        self.assertEqual(placed[0]["kind"], markup.FIGURE)
+        self.assertEqual(placed[0]["kind"], markup.PARAGRAPH)
 
 
 class TestTheColumnBoundary(SimpleTestCase):
@@ -677,13 +689,16 @@ class TestThePaint(SimpleTestCase):
 # ── the ledger and the cut ───────────────────────────────────────────
 class FigureTestCase(EnsembleTestCase):
     """The fixture of the OCR glue, with a picture on page 2 of the
-    volume (the second page of the opinion) that both engines draw."""
+    volume (the second page of the opinion): a live IMAGE box of the
+    run, the curated picture, which both engines also draw and read
+    no text in."""
 
     #: The picture in render pixels: below the two body cells.
     PICTURE = (100, 1500, 800, 2000)
 
     def setUp(self):
         super().setUp()
+        self.picture_row = self.image_row(2)
         self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].append(
             cell(*self.PICTURE, text="", category="Picture")
         )
@@ -713,6 +728,24 @@ class FigureTestCase(EnsembleTestCase):
         self.cuts[key] = data
         self.objects[key] = data
         return True
+
+    def image_row(self, page_index, box=None):
+        """One live model IMAGE box of the run over ``page_index``."""
+        box = box or self.PICTURE
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            page_index=page_index,
+            source_page=page_index + 1,
+            x0=box[0],
+            y0=box[1],
+            x1=box[2],
+            y1=box[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
 
     @contextmanager
     def fake_source(self, answer=b"jpeg bytes"):
@@ -762,6 +795,7 @@ class TestTheLedger(FigureTestCase):
         self.assertFalse(opinions.text_review_ready(self.opinion))
 
     def test_a_text_with_no_picture_owes_no_cut(self):
+        self.picture_row.delete()
         self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].pop()
         self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].pop()
 
@@ -1066,9 +1100,16 @@ class TestTheLedger(FigureTestCase):
 
 class TestTheCard(FigureTestCase):
     def test_a_picture_one_engine_drew_is_a_warning(self):
-        self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].pop()
+        """A document glued before the curated boxes, where one engine's
+        label alone made the picture: the card still names it."""
+        self.glue()
+        key = opinion_ocr.engine_key(self.opinion, "mistral_ocr")
+        page = self.objects[key]["pages"][1]
+        page["units"] = [
+            u for u in page["units"] if u.get("kind") != markup.FIGURE
+        ]
 
-        self.run_ensemble()
+        ensemble.rerun(self.opinion)
 
         card = OpinionFinding.objects.get(
             opinion=self.opinion, check_name=OpinionCheck.FIGURE_ONE_ENGINE

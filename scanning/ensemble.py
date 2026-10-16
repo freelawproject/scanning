@@ -1038,7 +1038,9 @@ class _Union:
 
 
 #: The reasons of ``opinion_ocr.verdict`` that are a box over the unit.
-_BOX_REASONS = frozenset({"redaction", "outside", opinion_ocr.PAGE_NUMBER})
+_BOX_REASONS = frozenset(
+    {"redaction", "outside", opinion_ocr.PAGE_NUMBER, opinion_ocr.PICTURE}
+)
 
 
 def _covered_things(
@@ -2742,21 +2744,20 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
 
 
 def _unit_kind(unit: dict, spec) -> str:
-    """Return the kind of one unit, a picture by its label too (#463).
+    """Return the kind of one unit, the glue's and never the label's.
 
-    The glue gives a picture unit the ``figure`` kind from the engine's
-    label (``EngineSpec.kind_types``). A document glued before that
-    reads the label here, so a picture needs a run of the ensemble and
-    no new glue.
+    The pictures of a text are the curated ``IMAGE`` boxes of the run,
+    which the OCR glue writes as ``figure`` units of its own
+    (``opinion_ocr.PICTURE``); an engine's own picture label is a
+    paragraph there, so it is one here too. A document glued before
+    that rule keeps the kinds its glue wrote until it is glued again
+    (``reglue_opinion_ocr``), the rule of every transform.
 
     :param unit: One unit of an opinion document.
     :param spec: The engine's ``opinion_ocr.EngineSpec``, or None.
     :returns: A ``markup.BLOCK_KINDS`` value.
     :rtype: str
     """
-    label = unit.get("type") or ""
-    if spec is not None and spec.kind_types.get(label) == markup.FIGURE:
-        return markup.FIGURE
     return unit.get("kind") or markup.PARAGRAPH
 
 
@@ -2894,6 +2895,13 @@ def land_edits(
         if not box:
             continue
         for there, group in enumerate(groups):
+            if group.get("_under_picture"):
+                # The words under a curated picture are the picture
+                # (#463): the glue wrote the figure in their place, so
+                # their group shares its box and takes no edit, or a
+                # drop of the picture lands on the words first and the
+                # picture stays.
+                continue
             score = iou(box, group["box_pt"])
             if score >= OVERLAP:
                 pairs.append((-score, here, there))
@@ -2906,6 +2914,23 @@ def land_edits(
         landed[here] = there
         taken.add(there)
     return landed
+
+
+def under_picture(group: dict) -> bool:
+    """Say whether a curated picture took every reading of a group.
+
+    The glue excludes the words under a live ``IMAGE`` box with reason
+    ``opinion_ocr.PICTURE`` and writes a ``figure`` unit at the box
+    (#463), so such a group is the figure's twin: dropped for the box,
+    and no target of an edit (:func:`land_edits`).
+
+    :param group: An aligned group.
+    :returns: Whether the group is excluded by a curated picture.
+    :rtype: bool
+    """
+    return bool(group.get("excluded")) and (
+        group.get("reason") == opinion_ocr.PICTURE
+    )
 
 
 def _apply_order(ordered: list[dict], edit: dict) -> int:
@@ -3132,6 +3157,8 @@ def build_page(
     quotes = _zones_of(read, BLOCKQUOTES)
     entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
     groups = align_page(units, width, height, zones)
+    for group in groups:
+        group["_under_picture"] = under_picture(group)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
     # too, and a page with two footnotes has too few boxes of its own
