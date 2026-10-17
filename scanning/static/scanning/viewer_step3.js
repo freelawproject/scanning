@@ -2263,9 +2263,10 @@
         var same = sectionGroups(page, section);
         var place = same.indexOf(group);
         var orderEdit = (page.order_edits || {})[section];
-        // A picture takes a move and a drop alone (#463): it has no
-        // text, it is no footnote and no quote, the refusals of the
-        // three other edit views.
+        // A picture takes a move alone (#463): it is an IMAGE box of the
+        // redaction review, so it has no text, it is no footnote and no
+        // quote, and it is not for this review to take out; the edit
+        // views refuse all four.
         var figure = group.kind === 'figure';
 
         if (group.human) {
@@ -2312,7 +2313,6 @@
             ));
         }
         if (figure) {
-            bar.appendChild(dropButton(page, group, true));
             return;
         }
         var other = section === FOOTNOTES ? BODY : FOOTNOTES;
@@ -2357,33 +2357,30 @@
             ));
         }
         quoteButtons(bar, page, group);
-        bar.appendChild(dropButton(page, group, false));
+        bar.appendChild(dropButton(page, group));
     }
 
     /**
      * Return the button that takes a block out of the text, a ``DROP``
-     * edit. A picture (#463) takes it too: a stamp, a seal or a blot one
-     * engine drew as a picture is no picture of the opinion.
+     * edit. A picture takes none (#463): it is a box of the redaction
+     * review, and the drop view refuses it.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
-     * @param {boolean} figure - Whether the group is a picture.
      * @returns {HTMLElement} The button.
      */
-    function dropButton(page, group, figure) {
+    function dropButton(page, group) {
         return barButton(
-            figure ? 'Not a picture' : 'Not text',
-            figure
-                ? 'Take this picture out of the text: it is not a picture'
-                    + ' of the opinion (a stamp, a seal, a blot)'
-                : 'Take this block out of the text: it is not text of the'
-                    + ' opinion (the bleed-through of the page behind, a'
-                    + ' stray mark)',
+            'Not text',
+            'Take this block out of the text: it is not text of the'
+                + ' opinion (the bleed-through of the page behind, a'
+                + ' stray mark)',
             function (button) {
-                if (!window.confirm('Take this ' + (figure ? 'picture' : 'block')
-                        + ' out of the text? It is left out of the opinion'
-                        + ' until the edit is undone from the list under'
-                        + ' the page\'s label.')) { return; }
+                if (!window.confirm('Take this block out of the text? It is'
+                        + ' left out of the opinion until the edit is undone'
+                        + ' from the list under the page\'s label.')) {
+                    return;
+                }
                 postEdit(endpoint('editDropUrl'), {
                     page_in_opinion: page.page_in_opinion,
                     group_id: group.id

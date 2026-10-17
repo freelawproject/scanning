@@ -344,7 +344,10 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.UNRESOLVED_EDIT,
+        # No writer since the pictures are review 2's boxes: here so
+        # the rebuild deletes the rows written before.
         OpinionCheck.FIGURE_ONE_ENGINE,
+        OpinionCheck.FIGURE_TO_CHECK,
     }
 )
 
@@ -1038,7 +1041,9 @@ class _Union:
 
 
 #: The reasons of ``opinion_ocr.verdict`` that are a box over the unit.
-_BOX_REASONS = frozenset({"redaction", "outside", opinion_ocr.PAGE_NUMBER})
+_BOX_REASONS = frozenset(
+    {"redaction", "outside", opinion_ocr.PAGE_NUMBER, opinion_ocr.PICTURE}
+)
 
 
 def _covered_things(
@@ -1089,8 +1094,31 @@ def _covered_things(
                 dict.fromkeys(plain(unit["text"]) for unit in thing)
             ),
             "box_pt": _union_box([unit["box_pt"] for unit in thing]),
+            "reasons": {unit["exclusion"].get("reason") for unit in thing},
         }
         for thing in things
+    ]
+
+
+def _things_under(things: list[dict], member: dict) -> list[dict]:
+    """Return the things under the kind of box that covers ``member``.
+
+    A curated picture's words uncover a reading a picture covers in
+    part, and never one a redaction or a mask covers (#463): the words
+    under a picture are known and harmless, the words under a redaction
+    are neither, and a block that spans both must not ride out on the
+    picture's words with the redaction's still in it.
+
+    :param things: :func:`_covered_things`.
+    :param member: The covered reading, with its ``exclusion``.
+    :returns: The things that may uncover it.
+    :rtype: list[dict]
+    """
+    picture = (member["exclusion"] or {}).get("reason") == opinion_ocr.PICTURE
+    return [
+        thing
+        for thing in things
+        if (opinion_ocr.PICTURE in thing.get("reasons", ())) == picture
     ]
 
 
@@ -1228,11 +1256,12 @@ def _merge(
             kept.append(member)
             continue
         found = None
-        if things and member["share"] < opinion_ocr.FULL_SHARE:
+        under = _things_under(things, member) if things else []
+        if under and member["share"] < opinion_ocr.FULL_SHARE:
             found = _uncover(
                 member["text"],
                 member.get("marks") or [],
-                things,
+                under,
                 member["box_pt"],
             )
         if found is None:
@@ -1276,6 +1305,13 @@ def _merge(
     ]
     # Whether this engine read a word here that no exclusion covers.
     clean = any(plain(m["text"]) for m in kept)
+    # A member a curated picture took although the box covers only
+    # part of it: the words outside the box may be text (#463).
+    picture_partial = any(
+        (m["exclusion"] or {}).get("reason") == opinion_ocr.PICTURE
+        and m["share"] < opinion_ocr.FULL_SHARE
+        for m in excluded
+    )
     return {
         "ids": [m["id"] for m in ordered],
         "types": [m["type"] for m in judged],
@@ -1300,6 +1336,7 @@ def _merge(
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        "picture_partial": picture_partial,
         # Whether the OCR glue deleted a bracket token of a member
         # (``removed``, #373). A drop of such a group writes no
         # ``PARTIAL_REDACTION`` card (#419).
@@ -1368,6 +1405,11 @@ def _group(
         # A dropped group a box covered in part is text the reader
         # loses, and the ``PARTIAL_REDACTION`` card says so (#365).
         "partial": any(unit["partial"] for unit in merged.values()),
+        # A dropped group a picture covered in part: the
+        # ``FIGURE_TO_CHECK`` card names it (#463).
+        "picture_partial": any(
+            unit.get("picture_partial") for unit in merged.values()
+        ),
     }
 
 
@@ -2742,21 +2784,20 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
 
 
 def _unit_kind(unit: dict, spec) -> str:
-    """Return the kind of one unit, a picture by its label too (#463).
+    """Return the kind of one unit, the glue's and never the label's.
 
-    The glue gives a picture unit the ``figure`` kind from the engine's
-    label (``EngineSpec.kind_types``). A document glued before that
-    reads the label here, so a picture needs a run of the ensemble and
-    no new glue.
+    The pictures of a text are the curated ``IMAGE`` boxes of the run,
+    which the OCR glue writes as ``figure`` units of its own
+    (``opinion_ocr.PICTURE``); an engine's own picture label is a
+    paragraph there, so it is one here too. A document glued before
+    that rule keeps the kinds its glue wrote until it is glued again
+    (``reglue_opinion_ocr``), the rule of every transform.
 
     :param unit: One unit of an opinion document.
     :param spec: The engine's ``opinion_ocr.EngineSpec``, or None.
     :returns: A ``markup.BLOCK_KINDS`` value.
     :rtype: str
     """
-    label = unit.get("type") or ""
-    if spec is not None and spec.kind_types.get(label) == markup.FIGURE:
-        return markup.FIGURE
     return unit.get("kind") or markup.PARAGRAPH
 
 
@@ -2823,10 +2864,10 @@ def _counts() -> dict:
         "blockquote_lists": 0,
         "lists": 0,
         "unresolved_edits": 0,
-        # The pictures of the page (#463), and those one engine alone
-        # drew in a document of more engines.
+        # The pictures of the page (#463), and the blocks a picture
+        # took although it covers only part of them.
         "figures": 0,
-        "figure_single": 0,
+        "figure_partial": 0,
     }
 
 
@@ -3141,10 +3182,11 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
-    # A picture takes no edit of its text, its section or its quote
-    # (#463): the views refuse them, and a box copy must not land one.
-    # It takes a drop: a stamp, a seal or a blot one engine drew as a
-    # picture is no picture of the opinion, and a person says so.
+    # A picture takes no edit (#463): it is a box of review 2, the views
+    # refuse every edit of it, and a box copy must not land one. So a
+    # drop lands on the text groups alone, and an old drop of the words
+    # under a picture lands on the words, which the box took already,
+    # and never on the picture.
     texts = [group for group in groups if not group.get("figure")]
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
@@ -3153,11 +3195,10 @@ def build_page(
         (OpinionEdit.Kind.DROP, "_drop_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        targets = groups if kind == OpinionEdit.Kind.DROP else texts
-        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
+        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
         for here, edit in enumerate(wanted):
             if here in landed:
-                targets[landed[here]][key] = edit
+                texts[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
@@ -3209,19 +3250,12 @@ def build_page(
     # still parts two quotes.
     sequence: list[dict] = []
     for group in ordered:
-        # A picture a person dropped goes like a block: below.
-        if (
-            group.get("figure")
-            and not group["excluded"]
-            and not group.get("_drop_edit")
-        ):
+        if group.get("figure") and not group["excluded"]:
             entry["groups"].append(
                 _figure_entry(group, len(entry["groups"]), offsets[BODY])
             )
             sequence.append(entry["groups"][-1])
             entry["counts"]["figures"] += 1
-            if len(group["engines"]) == 1 and len(pages) > 1:
-                entry["counts"]["figure_single"] += 1
             continue
         read_back = resolve(group)
         # A person said the block is not text: the bleed-through of
@@ -3269,6 +3303,9 @@ def build_page(
                         else (DROP_HUMAN if by_hand else DROP_EMPTY)
                     ),
                     "partial": group["partial"] and not by_hand,
+                    "picture_partial": (
+                        group.get("picture_partial", False) and not by_hand
+                    ),
                     "bracket": any(
                         unit.get("bracket")
                         for unit in group["engines"].values()
@@ -3431,6 +3468,9 @@ def build_page(
     )
     entry["counts"]["partial_bracket"] = sum(
         1 for drop in entry["dropped"] if drop["partial"] and drop["bracket"]
+    )
+    entry["counts"]["figure_partial"] = sum(
+        1 for drop in entry["dropped"] if drop.get("picture_partial")
     )
     entry["counts"]["undetected"] = sum(
         1
@@ -4130,12 +4170,12 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
-        if counts.get("figure_single"):
+        if counts.get("figures") or counts.get("figure_partial"):
             cards.append(
                 _card(
                     opinion,
                     page_number,
-                    OpinionCheck.FIGURE_ONE_ENGINE,
+                    OpinionCheck.FIGURE_TO_CHECK,
                     Issue.Severity.WARNING,
                     _figure_message(page),
                     standing,
@@ -4158,23 +4198,31 @@ _REASON_WORDS = {
 
 
 def _figure_message(page: dict) -> str:
-    """Return the line of one ``FIGURE_ONE_ENGINE`` card (#463).
+    """Return the line of one ``FIGURE_TO_CHECK`` card (#463).
+
+    Every page with a picture gets one, because a picture's place is a
+    box and the engines' text is a block: a block a picture covers in
+    part goes whole, and only the PDF shows whether a caption or a line
+    of text went with it.
 
     :param page: One page of the document.
     :returns: The message.
     :rtype: str
     """
-    lonely = [
-        group
-        for group in page["groups"]
-        if group.get("kind") == markup.FIGURE
-        and len(group.get("engines") or {}) == 1
-    ]
-    named = ", ".join(_ranked({g["source"] for g in lonely})) or "One engine"
-    return (
-        f"{named} alone drew {len(lonely)} picture(s) on this page. Check "
-        "the picture against the PDF: the final text embeds it."
+    counts = page["counts"]
+    figures = counts.get("figures", 0)
+    line = (
+        f"{figures} picture(s) on this page. Check each against the PDF: "
+        "the final text embeds the cut, and the text around it must all "
+        "be in the text."
     )
+    partial = counts.get("figure_partial", 0)
+    if partial:
+        line += (
+            f" {partial} block(s) the picture covers only in part went "
+            "with it: the words outside the picture box are not in the text."
+        )
+    return line
 
 
 def _undetected_message(page: dict) -> str:

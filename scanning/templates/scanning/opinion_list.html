@@ -9,7 +9,8 @@
   which the view stamps after the pagination from
   opinions.finding_counts: one grouped query for the 50 rows of this
   page, the badge rule of the scan list. The blocking count is the gate
-  of the approval of the text (#375).
+  of the approval of the text (#375). pictures is the count of review
+  2's IMAGE boxes in the opinion's pages (opinions.picture_counts).
 {% endcomment %}
 
 {% block title %}Opinions - FLP Scanning Portal{% endblock %}
@@ -87,6 +88,7 @@
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Printed pages</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Warnings</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider" title="The IMAGE boxes of the redaction review in this opinion's pages">Pictures</th>
         <th class="px-4 py-3"></th>
       </tr>
     </thead>
@@ -123,6 +125,9 @@
           {% else %}
           <span class="text-gray-400">&mdash;</span>
           {% endif %}
+        </td>
+        <td class="px-4 py-3 text-sm whitespace-nowrap">
+          {% if opinion.pictures %}<span class="font-medium" title="IMAGE boxes of the redaction review"><i class="fa-regular fa-image mr-1"></i>{{ opinion.pictures }}</span>{% else %}<span class="text-gray-400">&mdash;</span>{% endif %}
         </td>
         <td class="px-4 py-3 text-sm text-right">
           {% if opinion.final_xml_ready %}

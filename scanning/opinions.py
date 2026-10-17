@@ -541,6 +541,38 @@ def run(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
+def picture_counts(rows) -> dict[int, int]:
+    """Return how many pictures each opinion's text holds.
+
+    A picture is a curated box of review 2 on a page of the opinion's
+    span, read by ``opinion_ocr.picture_pages``, the glue's own rule:
+    a live ``IMAGE`` detection of the opinion's run less the junk the
+    viewer drops (#463). A page two opinions share counts for both.
+    The caller passes the rows of one page of the list, so two queries
+    answer it whatever its length, one when no page holds a box.
+
+    :param rows: The ``Opinion`` rows, usually one page of the list.
+    :returns: ``{opinion id: count}``; an opinion with none is absent.
+    :rtype: dict[int, int]
+    """
+    from scanning import opinion_ocr
+
+    rows = [row for row in rows if row.apply_run_id]
+    if not rows:
+        return {}
+    pages = opinion_ocr.picture_pages({row.apply_run_id for row in rows})
+    counts = {}
+    for row in rows:
+        count = sum(
+            1
+            for page in pages.get(row.apply_run_id, ())
+            if row.start_page_index <= page <= row.end_page_index
+        )
+        if count:
+            counts[row.pk] = count
+    return counts
+
+
 def finding_counts(opinion_ids) -> dict[int, tuple[int, int, int]]:
     """Return the open findings, the stale ones and the blocking ones (#334).
 

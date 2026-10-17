@@ -216,11 +216,14 @@ def _filtered_opinions(request: HttpRequest):
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
     and the ``blocking`` switch, in the list's order, for the list and
-    for the blocking review, which reads the same query string.
+    for the blocking review, which reads the same query string. The
+    ``opinion`` filter is the review page's: its two buttons open the
+    blocking and the warnings review of that opinion alone.
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "blocking"})``, the current values as the form shows them.
+        "opinion", "blocking"})``, the current values as the form shows
+        them.
     """
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
@@ -260,6 +263,11 @@ def _filtered_opinions(request: HttpRequest):
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
+    opinion_filter = request.GET.get("opinion")
+    if _whole_number(opinion_filter) is not None:
+        opinions_qs = opinions_qs.filter(pk=opinion_filter)
+    else:
+        opinion_filter = ""
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
@@ -268,6 +276,7 @@ def _filtered_opinions(request: HttpRequest):
         "reporter": reporter_filter,
         "status": status_filter or "",
         "volume": volume_filter or "",
+        "opinion": opinion_filter,
         "blocking": blocking_only,
     }
 
@@ -337,12 +346,14 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     page_obj = paginator.get_page(request.GET.get("page"))
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
+    pictures = opinions.picture_counts(page_obj)
     for row in page_obj:
         (
             row.open_findings,
             row.stale_findings,
             row.blocking_findings,
         ) = counts.get(row.pk, (0, 0, 0))
+        row.pictures = pictures.get(row.pk, 0)
         # The rule of the review page's XML link, read off the row.
         row.final_xml_ready = final_xml.exportable(row)
 
@@ -396,9 +407,9 @@ def opinion_blocking_review(
     :return: The rendered page.
     """
     opinions_qs, current = _filtered_opinions(request)
-    if not (current["scan"] or current["volume"]):
-        # One volume at a time: the page is for finishing a volume,
-        # not for walking the corpus.
+    if not (current["scan"] or current["volume"] or current["opinion"]):
+        # One volume at a time, or one opinion: the page is for
+        # finishing a volume, not for walking the corpus.
         messages.error(request, BLOCKING_REVIEW_SCOPE_MESSAGE)
         return redirect("opinion_list")
     in_review = opinions_qs.filter(
@@ -443,7 +454,14 @@ def opinion_blocking_review(
         for key, value in current.items()
         if key in ("scan", "reporter", "volume") and value
     }
-    query = urlencode(list_query)
+    # The walk's own pages keep the opinion of the review page's
+    # button; the list the walk goes back to is the volume's whole.
+    query = urlencode(
+        {
+            **list_query,
+            **({"opinion": current["opinion"]} if current["opinion"] else {}),
+        }
+    )
     return render(
         request,
         "scanning/opinion_blocking_review.html",
@@ -457,7 +475,7 @@ def opinion_blocking_review(
             "card_word": "warning" if warnings else "blocking",
             "current_scan": current["scan"],
             "list_url": reverse("opinion_list")
-            + (f"?{query}" if query else ""),
+            + (f"?{urlencode(list_query)}" if list_query else ""),
             "query": query,
         },
     )
@@ -621,6 +639,14 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         else None
     )
 
+    def walk_url(route: str) -> str | None:
+        """Return a card walk of this opinion alone, or None when the
+        opinion is not in the text review."""
+        if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+            return None
+        query = urlencode({"scan": opinion.scan_id, "opinion": opinion.pk})
+        return f"{reverse(route)}?{query}"
+
     def address(name: str) -> str:
         """Return one route of this opinion, for a ``data-`` attribute."""
         return reverse(
@@ -642,6 +668,10 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "open_warnings": sum(
                 1 for r in warnings if r.dismissal_id is None
             ),
+            # The blocking and the warnings review of this opinion
+            # alone; they walk the opinions of the text review only.
+            "blocking_walk_url": walk_url("opinion_blocking_review"),
+            "warning_walk_url": walk_url("opinion_warning_review"),
             # The three addresses the script reads (#365). They are
             # routes and not presigned URLs: each one is minted per
             # request, and a URL signed at render time would die in an

@@ -748,6 +748,92 @@ class TestTheBlockingPage(ScanningTestCase):
             reverse("opinion_blocking_review") + f"?scan={self.scan.pk}",
         )
 
+    def walk(self, route, opinion):
+        return reverse(route) + f"?scan={self.scan.pk}&opinion={opinion.pk}"
+
+    def test_an_opinion_filter_walks_that_opinion_alone(self):
+        other = OpinionFactory(
+            scan=self.scan,
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+            first_printed_page=70,
+        )
+        OpinionFindingFactory(
+            opinion=other,
+            check_name=OpinionCheck.NO_MAJORITY,
+            severity=Issue.Severity.ERROR,
+        )
+
+        answer = self.client.get(
+            self.walk("opinion_blocking_review", self.waiting)
+        )
+
+        self.assertContains(answer, f'id="opinion-{self.waiting.pk}"')
+        self.assertNotContains(answer, f'id="opinion-{other.pk}"')
+        # Nor the opinion of the volume that waits on its approval.
+        self.assertNotContains(answer, f'id="ready-{self.clean.pk}"')
+
+    def test_the_walk_of_one_opinion_goes_back_to_the_whole_list(self):
+        """Its own pages keep the opinion; the list it goes back to is
+        the volume's."""
+        answer = self.client.get(
+            self.walk("opinion_blocking_review", self.waiting)
+        )
+
+        self.assertEqual(
+            answer.context["list_url"],
+            reverse("opinion_list") + f"?scan={self.scan.pk}",
+        )
+        self.assertIn(f"opinion={self.waiting.pk}", answer.context["query"])
+
+    def test_an_opinion_alone_is_a_scope(self):
+        answer = self.client.get(
+            reverse("opinion_blocking_review") + f"?opinion={self.waiting.pk}"
+        )
+
+        self.assertEqual(answer.status_code, 200)
+        self.assertContains(answer, f'id="opinion-{self.waiting.pk}"')
+
+    def test_the_review_page_offers_the_walks_of_its_opinion(self):
+        OpinionFindingFactory(opinion=self.waiting)
+
+        answer = self.client.get(
+            reverse("opinion_review", kwargs={"pk": self.waiting.pk})
+        )
+
+        self.assertContains(
+            answer,
+            self.walk("opinion_blocking_review", self.waiting).replace(
+                "&", "&amp;"
+            ),
+        )
+        self.assertContains(
+            answer,
+            self.walk("opinion_warning_review", self.waiting).replace(
+                "&", "&amp;"
+            ),
+        )
+
+    def test_the_review_page_offers_no_walk_with_nothing_open(self):
+        """The clean opinion has a warning and no blocking card, so it
+        offers the warnings walk alone."""
+        answer = self.client.get(
+            reverse("opinion_review", kwargs={"pk": self.clean.pk})
+        )
+
+        self.assertNotContains(answer, reverse("opinion_blocking_review"))
+        self.assertContains(answer, reverse("opinion_warning_review"))
+
+    def test_an_approved_opinion_offers_no_walk(self):
+        self.waiting.status = OpinionReviewStatus.TEXT_REVIEW_DONE
+        self.waiting.save(update_fields=["status"])
+
+        answer = self.client.get(
+            reverse("opinion_review", kwargs={"pk": self.waiting.pk})
+        )
+
+        self.assertNotContains(answer, reverse("opinion_blocking_review"))
+        self.assertNotContains(answer, reverse("opinion_warning_review"))
+
     def test_the_button_waits_for_a_volume(self):
         answer = self.client.get(reverse("opinion_list"))
 

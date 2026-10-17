@@ -1,7 +1,8 @@
 """Tests for the pictures of an opinion's text (issue #463).
 
-The engines draw a box over a picture and read no text in it. The
-ensemble writes it as a ``figure`` group, the daemon cuts it from the
+A curator keeps an IMAGE box over a picture in review 2. The OCR glue
+drops the engines' words under it and writes a ``figure`` unit in its
+place, the ensemble writes the ``figure`` group, the daemon cuts it from the
 original (``opinion_figures``), the review page draws it and moves it,
 and the approval embeds it in the approved text, which the final XML
 writes as a ``figure`` holding a data-URI ``img``.
@@ -20,6 +21,7 @@ from contextlib import contextmanager
 from unittest.mock import patch
 
 import fitz
+from blackletter.models import Label
 from botocore.exceptions import ClientError
 from django.contrib.auth import get_user_model
 from django.db.models import F
@@ -40,17 +42,29 @@ from scanning import (
     views_api,
 )
 from scanning.models import (
+    Issue,
     Opinion,
     OpinionCheck,
+    OpinionEdit,
     OpinionFinding,
+    OpinionFindingDismissal,
     OpinionReviewStatus,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_ensemble import (
     EnsembleTestCase,
     engine_page,
     unit,
 )
-from scanning.tests.test_opinion_ocr import PAGES, block, cell, to_pt
+from scanning.tests.test_opinion_edits import entry
+from scanning.tests.test_opinion_ocr import (
+    IMG_H,
+    IMG_W,
+    PAGES,
+    block,
+    cell,
+    to_pt,
+)
 
 #: A picture between the two body blocks of the fixture, in points.
 PICTURE_PT = [40.0, 420.0, 280.0, 560.0]
@@ -114,7 +128,6 @@ class TestThePictureGroup(SimpleTestCase):
         # The body text takes no paragraph for the picture.
         self.assertEqual(page["text"], "The court held.\n\nSo ordered.")
         self.assertEqual(page["counts"]["figures"], 1)
-        self.assertEqual(page["counts"]["figure_single"], 0)
 
     def test_one_box_over_two_pictures_leaves_two_pictures(self):
         """One engine draws one box over two photographs side by side
@@ -143,7 +156,6 @@ class TestThePictureGroup(SimpleTestCase):
                 sorted(group["engines"]), ["mistral_ocr", "surya"]
             )
         self.assertEqual(page["counts"]["figures"], 2)
-        self.assertEqual(page["counts"]["figure_single"], 0)
 
     def test_two_boxes_over_two_pictures_keep_one_picture(self):
         """Two engines draw one box over both photographs: the third
@@ -193,7 +205,7 @@ class TestThePictureGroup(SimpleTestCase):
         )
         self.assertEqual(len(figures(page)), 1)
 
-    def test_one_engine_alone_counts_for_the_card(self):
+    def test_one_engine_alone_draws_a_single_picture(self):
         page = page_of(
             {
                 "dots_mocr": [picture("dots_mocr", 0)],
@@ -203,7 +215,7 @@ class TestThePictureGroup(SimpleTestCase):
             }
         )
 
-        self.assertEqual(page["counts"]["figure_single"], 1)
+        self.assertEqual(page["counts"]["figures"], 1)
         self.assertEqual(figures(page)[0]["agreement"], ensemble.SINGLE)
 
     def test_a_picture_under_a_redaction_is_dropped(self):
@@ -260,15 +272,58 @@ class TestThePictureGroup(SimpleTestCase):
             [p["kind"] for p in body], [markup.FIGURE, markup.PARAGRAPH]
         )
 
-    def test_a_document_glued_before_the_kind_reads_the_label(self):
-        """A document of the glue before #463 has no ``figure`` kind;
-        the label of the engine names the picture."""
+    def test_a_drop_never_lands_on_a_picture(self):
+        """A drop lands on the text groups alone: an old "Not text" drop
+        of the words under a curated picture lands on the words, which
+        the box took already, and the picture stays, whether the drop's
+        box is the words', the figure's, or fits both alike."""
+        words = [41.0, 421.0, 279.0, 559.0]
+        taken = {"reason": "picture", "detection_id": 9}
+
+        def pages(box):
+            return {
+                name: engine_page(
+                    [
+                        {
+                            **unit(name, 0, box, "Words in the table."),
+                            "exclusion": taken,
+                            "share": 1.0,
+                        },
+                        picture(name, 1),
+                    ]
+                )
+                for name in ("dots_mocr", "mistral_ocr")
+            }
+
+        for units, box in (
+            (words, words),
+            (words, PICTURE_PT),
+            (PICTURE_PT, PICTURE_PT),
+        ):
+            with self.subTest(units=units, drop=box):
+                page = ensemble.build_page(
+                    pages(units), 0, [entry(OpinionEdit.Kind.DROP, box)]
+                )
+                self.assertEqual(len(figures(page)), 1)
+                self.assertEqual(
+                    [
+                        g["text"]
+                        for g in page["groups"]
+                        if g["kind"] != "figure"
+                    ],
+                    [],
+                )
+
+    def test_an_engines_picture_label_alone_is_no_picture(self):
+        """The kind is the glue's: a unit the engine labelled a picture
+        with no ``figure`` kind is a paragraph, because the pictures are
+        the curated boxes and the glue writes those itself."""
         old = unit("dots_mocr", 0, PICTURE_PT, "", label="Picture")
         page = {"units": [{**old, "kind": None}]}
 
         placed, _ = ensemble._units_of(page, "dots_mocr")
 
-        self.assertEqual(placed[0]["kind"], markup.FIGURE)
+        self.assertEqual(placed[0]["kind"], markup.PARAGRAPH)
 
 
 class TestTheColumnBoundary(SimpleTestCase):
@@ -677,20 +732,24 @@ class TestThePaint(SimpleTestCase):
 # ── the ledger and the cut ───────────────────────────────────────────
 class FigureTestCase(EnsembleTestCase):
     """The fixture of the OCR glue, with a picture on page 2 of the
-    volume (the second page of the opinion) that both engines draw."""
+    volume (the second page of the opinion): a live IMAGE box of the
+    run, the curated picture, which both engines also draw and read
+    no text in."""
 
     #: The picture in render pixels: below the two body cells.
     PICTURE = (100, 1500, 800, 2000)
+    #: The engines' own box of it, a little inside the curated one, as
+    #: a model's box sits inside a curator's.
+    DRAWN = (110, 1510, 790, 1990)
 
     def setUp(self):
         super().setUp()
+        self.picture_row = self.image_row(2)
         self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].append(
-            cell(*self.PICTURE, text="", category="Picture")
+            cell(*self.DRAWN, text="", category="Picture")
         )
         self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].append(
-            block(
-                *self.PICTURE, text="![img-0.jpeg](img-0.jpeg)", kind="image"
-            )
+            block(*self.DRAWN, text="![img-0.jpeg](img-0.jpeg)", kind="image")
         )
         # The run's bitonal copy, under the processing prefix, for the
         # masks the cut widens over its ink.
@@ -713,6 +772,24 @@ class FigureTestCase(EnsembleTestCase):
         self.cuts[key] = data
         self.objects[key] = data
         return True
+
+    def image_row(self, page_index, box=None):
+        """One live model IMAGE box of the run over ``page_index``."""
+        box = box or self.PICTURE
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            page_index=page_index,
+            source_page=page_index + 1,
+            x0=box[0],
+            y0=box[1],
+            x1=box[2],
+            y1=box[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
 
     @contextmanager
     def fake_source(self, answer=b"jpeg bytes"):
@@ -762,6 +839,7 @@ class TestTheLedger(FigureTestCase):
         self.assertFalse(opinions.text_review_ready(self.opinion))
 
     def test_a_text_with_no_picture_owes_no_cut(self):
+        self.picture_row.delete()
         self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].pop()
         self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].pop()
 
@@ -1065,18 +1143,77 @@ class TestTheLedger(FigureTestCase):
 
 
 class TestTheCard(FigureTestCase):
-    def test_a_picture_one_engine_drew_is_a_warning(self):
-        self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].pop()
+    def test_every_page_with_a_picture_gets_a_card_to_check(self):
+        self.run_ensemble()
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
+        )
+        self.assertEqual(card.page_in_opinion, 1)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("1 picture(s) on this page", card.message)
+        self.assertNotIn("covers only in part", card.message)
+
+    def test_a_page_with_no_picture_gets_no_card(self):
+        self.picture_row.active = False
+        self.picture_row.save(update_fields=["active"])
+
+        self.run_ensemble()
+
+        self.assertFalse(
+            OpinionFinding.objects.filter(
+                check_name=OpinionCheck.FIGURE_TO_CHECK
+            ).exists()
+        )
+
+    def test_a_block_the_picture_covers_in_part_is_named(self):
+        """Both engines read a caption into one block with the picture,
+        which covers most of it: the block goes with the picture, and
+        the card says text beside the picture may have gone too."""
+        # Starts 150 pixels above the picture: three quarters inside.
+        merged = (100, 1350, 800, 1950)
+        self.objects[self.apply_run.ocr_key]["pages"][2]["cells"].append(
+            cell(*merged, text="Figure 1. The caption", category="Text")
+        )
+        self.objects[self.apply_run.extract_key]["pages"][2]["blocks"].append(
+            block(*merged, text="Figure 1. The caption")
+        )
 
         self.run_ensemble()
 
         card = OpinionFinding.objects.get(
-            opinion=self.opinion, check_name=OpinionCheck.FIGURE_ONE_ENGINE
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
         )
-        self.assertEqual(card.page_in_opinion, 1)
-        self.assertIn("dots_mocr alone drew 1 picture(s)", card.message)
+        self.assertIn(
+            "1 block(s) the picture covers only in part", card.message
+        )
+        self.assertNotIn("The caption", self.stored()["pages"][1]["text"])
 
-    def test_a_picture_every_engine_drew_writes_no_card(self):
+    def test_a_dismissal_of_the_old_card_does_not_mute_the_new_one(self):
+        """The old card named one engine's picture; a curator who
+        dismissed it said nothing about the picture to check."""
+        OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.FIGURE_ONE_ENGINE,
+        )
+
+        self.run_ensemble()
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
+        )
+        self.assertIsNone(card.dismissal)
+
+    def test_the_rebuild_deletes_the_old_card(self):
+        OpinionFinding.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.FIGURE_ONE_ENGINE,
+            severity=Issue.Severity.WARNING,
+            message="old",
+        )
+
         self.run_ensemble()
 
         self.assertFalse(
@@ -1210,9 +1347,9 @@ class TestTheEndpoints(FigureTestCase):
         page = self.stored()["pages"][1]
         return next(g for g in page["groups"] if g["kind"] == markup.FIGURE)
 
-    def test_not_a_picture_takes_the_picture_out(self):
-        """A stamp or a blot one engine drew as a picture: the drop
-        takes it out of the text, and nothing is left to cut."""
+    def test_a_picture_takes_no_drop(self):
+        """A picture is an IMAGE box of review 2: the drop view refuses
+        it, and the text keeps the picture and no word under it."""
         group = self.figure_group()
         document = self.stored()
 
@@ -1227,18 +1364,12 @@ class TestTheEndpoints(FigureTestCase):
             content_type="application/json",
         )
 
-        self.assertEqual(response.status_code, 200, response.content)
-        self.opinion.refresh_from_db()
-        built = self.stored()
-        self.assertEqual(ensemble.figures_of(built), [])
-        drop = next(
-            d
-            for d in built["pages"][1]["dropped"]
-            if d["reason"] == ensemble.DROP_HUMAN
+        self.assertEqual(response.status_code, 409, response.content)
+        self.assertEqual(
+            response.json()["message"], views_api.EDIT_FIGURE_MESSAGE
         )
-        self.assertEqual(drop["box_pt"], group["box_pt"])
-        self.assertEqual(self.opinion.figure_digest, "")
-        self.assertTrue(opinion_figures.is_written(self.opinion))
+        self.assertEqual(len(ensemble.figures_of(self.stored())), 1)
+        self.assertFalse(OpinionEdit.objects.exists())
 
     def test_only_a_move_edits_a_picture(self):
         group = self.figure_group()
@@ -1251,6 +1382,7 @@ class TestTheEndpoints(FigureTestCase):
             ("edit_opinion_text", {"text": "words"}),
             ("edit_opinion_section", {"section": ensemble.FOOTNOTES}),
             ("edit_opinion_blockquote", {"quoted": True}),
+            ("edit_opinion_drop", {}),
         ):
             response = self.client.post(
                 self.url(name),
@@ -1310,9 +1442,10 @@ VIEWER = (
 
 
 class TestTheViewer(TestCase):
-    def test_a_picture_takes_a_move_and_a_drop_alone(self):
-        """The toolbar of a picture stops after the two moves, the Undo
-        of the order and the drop: the three other edits refuse it."""
+    def test_a_picture_takes_a_move_alone(self):
+        """The toolbar of a picture stops after the two moves and the
+        Undo of the order: the four other edits refuse it, the drop
+        among them, because the box is review 2's."""
         source = VIEWER.read_text()
         bar = source[source.index("function fillBar(") :]
         bar = bar[: bar.index("\n    }\n\n")]
@@ -1320,12 +1453,13 @@ class TestTheViewer(TestCase):
         figure = bar[stop : bar.index("return;", stop)]
         self.assertLess(bar.index("'Move down'"), stop)
         self.assertLess(bar.index("'Undo the order'"), stop)
-        self.assertIn("dropButton(page, group, true)", figure)
+        self.assertNotIn("dropButton", figure)
         self.assertGreater(bar.index("'Put in the footnotes'"), stop)
+        self.assertGreater(bar.index("dropButton(page, group)"), stop)
         self.assertIn("!figure", bar[: bar.index("'Edit text'") + 200])
         drop = source[source.index("function dropButton(") :]
         drop = drop[: drop.index("\n    }\n")]
-        self.assertIn("'Not a picture'", drop)
+        self.assertNotIn("Not a picture", drop)
         self.assertIn("endpoint('editDropUrl')", drop)
 
     def test_the_picture_is_read_from_its_endpoint(self):

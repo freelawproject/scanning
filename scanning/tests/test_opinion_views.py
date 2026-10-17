@@ -7,6 +7,7 @@ pages keep their tests in ``test_views.py``, under their new names.
 
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.urls import reverse
 
 from scanning import stats
@@ -27,6 +28,7 @@ from scanning.models import (
     OpinionReviewStatus,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -253,6 +255,95 @@ class TestOpinionList(ScanningTestCase):
                 index_in_page=0,
             )
         with self.assertNumQueries(7):
+            self.client.get(reverse("opinion_list"))
+
+    def pictured(self):
+        """A run, and the opinion over its pages 3 to 5 (indexes 2-4)."""
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            apply_run=run, start_page_index=2, end_page_index=4
+        )
+        return run
+
+    def test_the_pictures_column_counts_review_2s_image_boxes(self):
+        run = self.pictured()
+        for page in (2, 4):
+            model_row(
+                self.scan,
+                apply_run=run,
+                page_index=page,
+                label="IMAGE",
+                label_id=int(Label.IMAGE),
+            )
+        # Outside the span, another label, and a box the curator
+        # dismissed: none of them is a picture of this opinion.
+        model_row(
+            self.scan, apply_run=run, page_index=5, label="IMAGE", label_id=8
+        )
+        model_row(self.scan, apply_run=run, page_index=3)
+        model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            active=False,
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        row = response.context["page_obj"][0]
+        self.assertEqual(row.pictures, 2)
+        self.assertContains(response, ">Pictures</th>")
+
+    def test_a_junk_box_is_no_picture(self):
+        """The column counts the glue's pictures: a box the junk rule
+        drops from every screen is not one."""
+        run = self.pictured()
+        row = model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+        )
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_an_opinion_with_no_picture_shows_a_dash(self):
+        self.pictured()
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_the_pictures_cost_one_query_per_page(self):
+        run = self.pictured()
+        for index in range(4):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=500 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
+            self.client.get(reverse("opinion_list"))
+
+        for index in range(20):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=600 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
 
