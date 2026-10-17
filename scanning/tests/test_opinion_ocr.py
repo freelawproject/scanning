@@ -3030,3 +3030,264 @@ class TestTheReglueLog(OpinionOcrTestCase):
             f"scan {self.scan.pk}: 0 opinion(s) due again, 0 PDF(s) carried",
             logs.output[0],
         )
+
+
+# ── the curated pictures ─────────────────────────────────────────────
+class TestThePicture(OpinionOcrTestCase):
+    """A live IMAGE box of the run is the picture of the text: the words
+    the engines read under it stay out, and a ``figure`` unit stands in
+    its place on every engine's page."""
+
+    def picture(self, box=BODY_A, page_index=1, **fields):
+        """One live model IMAGE box of the run, over ``BODY_A`` of the
+        opinion's first page unless told otherwise."""
+        values = {
+            "apply_run": self.apply_run,
+            "label": "IMAGE",
+            "label_id": int(Label.IMAGE),
+            "page_index": page_index,
+            "source_page": page_index + 1,
+            "x0": box[0],
+            "y0": box[1],
+            "x1": box[2],
+            "y1": box[3],
+            "img_width": IMG_W,
+            "img_height": IMG_H,
+        }
+        values.update(fields)
+        return model_row(self.scan, **values)
+
+    def documents(self) -> dict[str, dict]:
+        """Write the opinion, and return every engine's document."""
+        self.write()
+        return {
+            name: self.uploads[opinion_ocr.engine_key(self.opinion, name)]
+            for name in ("dots_mocr", "mistral_ocr")
+        }
+
+    @staticmethod
+    def figure_units(page: dict) -> list[dict]:
+        return [u for u in page["units"] if u.get("kind") == markup.FIGURE]
+
+    def test_the_words_under_a_curated_picture_stay_out(self):
+        row = self.picture()
+
+        for name, document in self.documents().items():
+            with self.subTest(engine=name):
+                taken = self.unit(document, 0, "body A")
+                self.assertEqual(
+                    taken["exclusion"],
+                    {"reason": opinion_ocr.PICTURE, "detection_id": row.pk},
+                )
+                self.assertEqual(taken["share"], 1.0)
+                self.assertIsNone(
+                    self.unit(document, 0, "body B")["exclusion"]
+                )
+                self.assertIsNone(
+                    self.unit(document, 1, "body A")["exclusion"]
+                )
+
+    def test_one_figure_unit_per_box_on_every_engine_page(self):
+        row = self.picture()
+
+        for name, document in self.documents().items():
+            with self.subTest(engine=name):
+                [figure] = self.figure_units(document["pages"][0])
+                self.assertEqual(figure["figure"], {"detection_id": row.pk})
+                self.assertEqual(figure["box_pt"], to_pt(BODY_A))
+                self.assertEqual(figure["bbox"], list(BODY_A))
+                self.assertEqual(figure["text"], "")
+                self.assertIsNone(figure["exclusion"])
+                for page in document["pages"][1:]:
+                    self.assertEqual(self.figure_units(page), [])
+
+    def test_a_unit_part_inside_a_picture_keeps_the_measured_share(self):
+        """A box over three fifths of a block takes it with the share
+        it measured, so the drop is a partial one with its card."""
+        self.redact(1, to_pt(BODY_B))
+        self.picture(box=(BODY_A[0], BODY_A[1], BODY_A[2], 660))
+
+        document = self.documents()["dots_mocr"]
+
+        taken = self.unit(document, 0, "body A")
+        self.assertEqual(taken["exclusion"]["reason"], opinion_ocr.PICTURE)
+        self.assertGreaterEqual(taken["share"], opinion_ocr.FIGURE_SHARE)
+        self.assertLess(taken["share"], opinion_ocr.FULL_SHARE)
+        under_redaction = self.unit(document, 0, "body B")
+        self.assertEqual(under_redaction["exclusion"]["reason"], "redaction")
+
+    def test_a_unit_less_than_half_inside_a_picture_is_text(self):
+        """A box over the foot of a block takes a third of it: the
+        block stays text, and the box is a picture beside it."""
+        self.picture(box=(BODY_A[0], 700, BODY_A[2], BODY_A[3]))
+
+        document = self.documents()["dots_mocr"]
+
+        self.assertIsNone(self.unit(document, 0, "body A")["exclusion"])
+        self.assertEqual(len(self.figure_units(document["pages"][0])), 1)
+
+    def test_an_engines_own_picture_label_is_a_paragraph(self):
+        """No curated box: the engine's picture label makes no figure,
+        and its unit goes on as a paragraph with the words the engine
+        read, text like any other."""
+        self.objects[self.apply_run.ocr_key]["pages"][1]["cells"].append(
+            cell(
+                100,
+                1500,
+                800,
+                2000,
+                text="words the engine put in the picture",
+                category="Picture",
+            )
+        )
+
+        document = self.documents()["dots_mocr"]
+
+        self.assertEqual(self.figure_units(document["pages"][0]), [])
+        labelled = next(
+            u for u in document["pages"][0]["units"] if u["type"] == "Picture"
+        )
+        self.assertEqual(labelled["kind"], markup.PARAGRAPH)
+        self.assertEqual(
+            labelled["text"], "words the engine put in the picture"
+        )
+
+    def test_a_picture_under_a_redaction_is_judged_like_a_block(self):
+        """A curated box a redaction covers goes with its verdict, so the
+        ensemble drops the picture as it dropped the engines' before."""
+        self.picture()
+        self.redact(1, to_pt(BODY_A))
+
+        document = self.documents()["dots_mocr"]
+
+        [figure] = self.figure_units(document["pages"][0])
+        self.assertEqual(figure["exclusion"]["reason"], "redaction")
+        self.assertGreaterEqual(figure["share"], opinion_ocr.FULL_SHARE)
+
+    def test_the_junk_rule_reads_loaded_fields(self):
+        """The fields the junk rule reads are in the detection query, so
+        the pass costs no query per row."""
+        self.picture()
+        inputs = self.inputs()
+
+        with self.assertNumQueries(0):
+            pictures = opinion_ocr.curated_pictures(inputs)
+
+        self.assertEqual(sorted(pictures), [1])
+
+    def test_a_dismissed_box_is_no_picture(self):
+        row = self.picture()
+        Detection.objects.filter(pk=row.pk).update(active=False)
+
+        document = self.documents()["dots_mocr"]
+
+        self.assertIsNone(self.unit(document, 0, "body A")["exclusion"])
+        self.assertEqual(self.figure_units(document["pages"][0]), [])
+
+    def test_a_junk_box_is_no_picture(self):
+        """The glue sees the boxes the curator saw: a box blackletter's
+        junk rule drops from every screen is no picture here either."""
+        row = self.picture()
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            document = self.documents()["dots_mocr"]
+
+        self.assertIsNone(self.unit(document, 0, "body A")["exclusion"])
+        self.assertEqual(self.figure_units(document["pages"][0]), [])
+
+
+class TestWithPictures(OpinionOcrTestCase):
+    """``reglue_opinion_ocr --with-pictures`` takes the opinions a live
+    IMAGE box or an existing picture touches, and no other."""
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("reglue_opinion_ocr", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def second_opinion(self, **fields):
+        return self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 4, 5),
+            505,
+            **fields,
+        )
+
+    def box(self, page_index):
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            page_index=page_index,
+            source_page=page_index + 1,
+            x0=100,
+            y0=1500,
+            x1=800,
+            y1=2000,
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+
+    def test_a_live_box_inside_the_span_takes_the_opinion(self):
+        other = self.second_opinion()
+        self.box(2)
+
+        rows = opinion_ocr.picture_rows(self.scan)
+        output = self.run_command("--with-pictures", str(self.scan.pk))
+
+        self.assertEqual([r.pk for r in rows], [self.opinion.pk])
+        self.assertIn("glued 1 opinion(s) with pictures again", output)
+        self.opinion.refresh_from_db()
+        other.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 1)
+        self.assertEqual(other.glue_revision, 0)
+
+    def test_a_text_that_holds_a_picture_is_taken_too(self):
+        other = self.second_opinion(figure_digest="abc")
+
+        rows = opinion_ocr.picture_rows(self.scan)
+
+        self.assertEqual([r.pk for r in rows], [other.pk])
+
+    def test_a_glue_the_ensemble_has_not_read_is_taken_too(self):
+        """A glue written before the rule carries the engines' picture
+        labels as figures, and the ensemble trusts them: it is glued
+        again, box or no box."""
+        other = self.second_opinion(
+            glue_revision=1, ocr_glue_revision=1, ensemble_revision=0
+        )
+
+        rows = opinion_ocr.picture_rows(self.scan)
+
+        self.assertEqual([r.pk for r in rows], [other.pk])
+
+    def test_a_dismissed_box_takes_nothing(self):
+        row = self.box(2)
+        Detection.objects.filter(pk=row.pk).update(active=False)
+
+        self.assertEqual(opinion_ocr.picture_rows(self.scan), [])
+        output = self.run_command("--with-pictures", str(self.scan.pk))
+        self.assertIn("glued 0 opinion(s) with pictures again", output)
+
+    def test_a_dry_run_counts_and_moves_nothing(self):
+        self.box(2)
+
+        output = self.run_command(
+            "--with-pictures", str(self.scan.pk), "--dry-run"
+        )
+
+        self.assertIn("would glue 1 opinion(s) with pictures again", output)
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.glue_revision, 0)
+
+    def test_the_flag_does_not_go_with_named_opinions(self):
+        with self.assertRaises(CommandError):
+            self.run_command(
+                "--with-pictures", "--opinion", str(self.opinion.pk)
+            )

@@ -53,6 +53,7 @@ from django.db.models import Case, Count, F, Q, Value, When
 from scanning import apply, boundaries, review_states, s3_sync
 from scanning.models import (
     STALE_OPINION_CHECKS,
+    Detection,
     Issue,
     Opinion,
     OpinionBoundary,
@@ -539,6 +540,46 @@ def run(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 # The list page
 # ---------------------------------------------------------------------------
+
+
+def picture_counts(rows) -> dict[int, int]:
+    """Return how many pictures review 2 drew in each opinion's pages.
+
+    A picture is a live ``IMAGE`` detection of the opinion's run on a
+    page of its span, the box the OCR glue makes the picture of the
+    text (#463). A page two opinions share counts for both. The caller
+    passes the rows of one page of the list, so one query answers it.
+
+    :param rows: The ``Opinion`` rows, usually one page of the list.
+    :returns: ``{opinion id: count}``; an opinion with none is absent.
+    :rtype: dict[int, int]
+    """
+    from blackletter.models import Label
+
+    rows = [row for row in rows if row.apply_run_id]
+    if not rows:
+        return {}
+    pages: dict[int, list[int]] = {}
+    for run_id, page_index in (
+        Detection.objects.live()
+        .filter(
+            apply_run_id__in={row.apply_run_id for row in rows},
+            label=Label.IMAGE.name,
+        )
+        .order_by()
+        .values_list("apply_run_id", "page_index")
+    ):
+        pages.setdefault(run_id, []).append(page_index)
+    counts = {}
+    for row in rows:
+        count = sum(
+            1
+            for page in pages.get(row.apply_run_id, ())
+            if row.start_page_index <= page <= row.end_page_index
+        )
+        if count:
+            counts[row.pk] = count
+    return counts
 
 
 def finding_counts(opinion_ids) -> dict[int, tuple[int, int, int]]:

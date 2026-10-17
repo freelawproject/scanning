@@ -636,12 +636,15 @@
         button.type = 'button';
         button.appendChild(el('span', 'bk-who', engine));
         var val = el('span', 'bk-val');
-        // The reading that is in the text now, marked: the majority's
-        // word in the warnings review, the shown block or word in the
-        // blocking one. Choosing it keeps the text as shown.
-        var shown = value !== '' && (card.kind === 'word'
+        // The reading that is in the text now, marked with a tick in
+        // the warnings review alone: there a majority chose it. On a
+        // blocking card nothing chose it, it stands by the engines'
+        // rank, so no row carries a tick and the choice is the
+        // person's. Choosing the shown reading keeps the text as shown.
+        var inText = value !== '' && (card.kind === 'word'
             ? fold(value) === fold(card.token)
             : fold(value) === fold(card.text));
+        var shown = inText && level !== 'blocking';
         if (value === '') {
             val.appendChild(el('span', 'bk-nothing', 'read nothing here'));
         } else {
