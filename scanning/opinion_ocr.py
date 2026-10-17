@@ -135,7 +135,7 @@ import json
 import logging
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 
 from blackletter.models import Label
 from django.conf import settings
@@ -400,9 +400,10 @@ class EngineSpec:
         kind (a ``Section-header`` is a heading whether or not the
         engine wrote ``##``), each mapped to a ``markup.BLOCK_KINDS``
         value. Mistral's ``title`` names the caption's party names
-        too; the ensemble's majority answers that, not this table. A
-        picture's label is ``markup.FIGURE`` (#463): the ensemble aligns
-        the pictures apart from the text.
+        too; the ensemble's majority answers that, not this table. No
+        picture label is here (#463): the pictures of the text are
+        review 2's boxes, and a unit an engine labels a picture is
+        parsed as the paragraph it reads, bullets and all.
     """
 
     name: str
@@ -535,7 +536,6 @@ ENGINES: dict[str, EngineSpec] = {
             "Section-header": markup.HEADING,
             "List-item": markup.LIST_ITEM,
             "Table": markup.TABLE,
-            "Picture": markup.FIGURE,
         },
     ),
     "mistral_ocr": EngineSpec(
@@ -560,7 +560,6 @@ ENGINES: dict[str, EngineSpec] = {
             "title": markup.HEADING,
             "list": markup.LIST_ITEM,
             "table": markup.TABLE,
-            "image": markup.FIGURE,
         },
     ),
     "surya": EngineSpec(
@@ -586,8 +585,6 @@ ENGINES: dict[str, EngineSpec] = {
             "SectionHeader": markup.HEADING,
             "ListGroup": markup.LIST_ITEM,
             "Table": markup.TABLE,
-            "Picture": markup.FIGURE,
-            "Figure": markup.FIGURE,
         },
     ),
 }
@@ -713,9 +710,10 @@ class ScanInputs:
     detected: dict[int, list] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
     zones: dict[str, dict[int, list]] = field(default_factory=dict)
-    #: ``{page_index: [rect]}`` in points, the curated pictures: the
-    #: live ``IMAGE`` detections of the run after the junk rule, each
-    #: with the row's ``id`` (:data:`PICTURE`).
+    #: ``{page_index: [picture]}``, the curated pictures in render
+    #: pixels (:func:`curated_pictures`), each with its own render size;
+    #: :func:`pictures_pt` puts them in points once the page size is
+    #: known, the rule of the zones.
     pictures: dict[int, list[dict]] = field(default_factory=dict)
 
 
@@ -808,25 +806,49 @@ def load_inputs(scan: Scan) -> ScanInputs:
     return inputs
 
 
-def curated_pictures(inputs: ScanInputs) -> dict[int, list[dict]]:
-    """Return the pictures of every page, in points, by page index.
+#: The fields of a detection row the junk rule of :func:`kept_pictures`
+#: reads, loaded with the row so the rule costs no query per row.
+PICTURE_FIELDS = (
+    "id",
+    "page_index",
+    "label",
+    "label_id",
+    "confidence",
+    "x0",
+    "y0",
+    "x1",
+    "y1",
+    "img_width",
+    "img_height",
+    "model_name",
+    "found_by",
+)
 
-    The live ``IMAGE`` detections of the run, the boxes review 2 kept
-    (the model's, a curator's own, none a curator dismissed), less the
-    junk the viewer and the compute drop too (``services.drop_junk_entries``):
-    the glue sees the boxes the curator saw and decided on, and a twin
-    the model drew over a caption, which no screen shows, is no picture.
-    Each is the rect :func:`covered_share` measures, with the row's
-    ``id``. A page with no render size has none.
 
-    :param inputs: The inputs, with ``detected`` and ``renders`` read.
-    :returns: ``{page_index: [{"x0", "y0", "x1", "y1", "id"}]}``.
+def kept_pictures(rows_by_page: dict[int, list]) -> dict[int, list[dict]]:
+    """Return the curated pictures of some pages, in render pixels.
+
+    **The one rule of a picture of the text (#463).** The live ``IMAGE``
+    detections of the run, the boxes review 2 kept (the model's, a
+    curator's own, none a curator dismissed), less the junk the viewer
+    and the compute drop too (``services.drop_junk_entries``): the glue
+    sees the boxes the curator saw and decided on, and a twin the model
+    drew over a caption, which no screen shows, is no picture. The glue
+    (:func:`curated_pictures`), the re-glue's filter
+    (:func:`picture_rows`) and the opinions list
+    (``opinions.picture_counts``) all read it.
+
+    :param rows_by_page: ``{page_index: [Detection]}``, every live row
+        of each page, whatever its label: the junk rule judges an image
+        box against the text boxes beside it. The rows of one run.
+    :returns: ``{page_index: [{"id", "bbox", "img_width",
+        "img_height"}]}``, the box as the junk rule left it.
     :rtype: dict[int, list[dict]]
     """
     from scanning.services import drop_junk_entries
 
     entries = []
-    for page_index, rows in inputs.detected.items():
+    for page_index, rows in rows_by_page.items():
         for row in rows:
             manual = (
                 getattr(row, "model_name", "") == Detection.ModelName.MANUAL
@@ -844,32 +866,114 @@ def curated_pictures(inputs: ScanInputs) -> dict[int, list[dict]]:
                     "found_by": "" if manual else getattr(row, "found_by", ""),
                 }
             )
-    if entries:
-        drop_junk_entries(entries)
+    if not any(e["label"] == Label.IMAGE.name for e in entries):
+        return {}
+    drop_junk_entries(entries)
     pictures: dict[int, list[dict]] = {}
     for entry in entries:
         if entry["label"] != Label.IMAGE.name:
             continue
-        render = inputs.renders.get(entry["page_index"])
-        if not render:
-            continue
-        size = boundaries.to_points(render[0], render[1], render[0], render[1])
-        bbox = entry["bbox"]
-        x0, y0 = boundaries.to_points(bbox[0], bbox[1], *render, *size)
-        x1, y1 = boundaries.to_points(bbox[2], bbox[3], *render, *size)
-        box = as_box([x0, y0, x1, y1])
-        if box is None:
-            continue
         pictures.setdefault(entry["page_index"], []).append(
             {
-                "x0": box[0],
-                "y0": box[1],
-                "x1": box[2],
-                "y1": box[3],
                 "id": entry["id"],
+                "bbox": entry["bbox"],
+                "img_width": entry["img_width"],
+                "img_height": entry["img_height"],
             }
         )
     return pictures
+
+
+def curated_pictures(inputs: ScanInputs) -> dict[int, list[dict]]:
+    """Return the pictures of every page of the inputs, in render pixels.
+
+    :func:`kept_pictures` over every live detection of the run.
+
+    :param inputs: The inputs, with ``detected`` read.
+    :returns: ``{page_index: [picture]}``.
+    :rtype: dict[int, list[dict]]
+    """
+    return kept_pictures(inputs.detected)
+
+
+def pictures_pt(pictures: list[dict], size: tuple[float, float]) -> list[dict]:
+    """Return one page's pictures in points, as :func:`covered_share`
+    measures them.
+
+    One box per picture, off the row's own render size against the page
+    size, the rule of :func:`zones_pt` and of the frame, so the glue,
+    the frame and the cut read one box: a zero render size falls back
+    to the render density.
+
+    :param pictures: The page's entries of :func:`kept_pictures`.
+    :param size: The page size in points.
+    :returns: ``[{"x0", "y0", "x1", "y1", "id"}]``.
+    :rtype: list[dict]
+    """
+    rects = []
+    for picture in pictures:
+        bbox = picture["bbox"]
+        width, height = picture["img_width"], picture["img_height"]
+        x0, y0 = boundaries.to_points(bbox[0], bbox[1], width, height, *size)
+        x1, y1 = boundaries.to_points(bbox[2], bbox[3], width, height, *size)
+        box = as_box([x0, y0, x1, y1])
+        if box is None:
+            continue
+        rects.append(
+            {
+                "x0": round(box[0], 2),
+                "y0": round(box[1], 2),
+                "x1": round(box[2], 2),
+                "y1": round(box[3], 2),
+                "id": picture["id"],
+            }
+        )
+    return rects
+
+
+def picture_pages(run_ids) -> dict[int, list[int]]:
+    """Return the page of every curated picture of some runs.
+
+    :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
+    two queries, the image boxes and then every live row of their pages,
+    which the junk rule judges them against.
+
+    :param run_ids: The ``ApplyRun`` ids.
+    :returns: ``{run id: [page_index, ...]}``, one entry per picture;
+        a run with none is absent.
+    :rtype: dict[int, list[int]]
+    """
+    pairs = set(
+        Detection.objects.live()
+        .filter(apply_run_id__in=set(run_ids), label=Label.IMAGE.name)
+        .order_by()
+        .values_list("apply_run_id", "page_index")
+    )
+    if not pairs:
+        return {}
+    by_run: dict[int, dict[int, list]] = {}
+    for run_id, pages in _pages_by_run(pairs).items():
+        for row in (
+            Detection.objects.live()
+            .filter(apply_run_id=run_id, page_index__in=pages)
+            .only(*PICTURE_FIELDS)
+        ):
+            by_run.setdefault(run_id, {}).setdefault(
+                row.page_index, []
+            ).append(row)
+    out: dict[int, list[int]] = {}
+    for run_id, rows_by_page in by_run.items():
+        for page_index, pictures in kept_pictures(rows_by_page).items():
+            out.setdefault(run_id, []).extend([page_index] * len(pictures))
+    return out
+
+
+def _pages_by_run(pairs) -> dict[int, list[int]]:
+    """Group ``(run id, page_index)`` pairs by run."""
+    pages: dict[int, list[int]] = {}
+    for run_id, page_index in sorted(pairs):
+        pages.setdefault(run_id, []).append(page_index)
+    return pages
 
 
 def _printed_numbers(scan: Scan, run) -> dict[int, str]:
@@ -1551,7 +1655,11 @@ def build_document(
             if size
             else None
         )
-        picture_rects = inputs.pictures.get(page_index, []) if size else []
+        picture_rects = (
+            pictures_pt(inputs.pictures.get(page_index, []), size)
+            if size
+            else []
+        )
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -1588,30 +1696,36 @@ def build_document(
                 counts["list_items"] += 1
             elif parsed.kind == markup.TABLE:
                 counts["tables"] += 1
-            elif parsed.kind == markup.FIGURE:
-                # The engine's own picture label means nothing: the
-                # pictures are the curated boxes, written below, and the
-                # engines are about text. The unit goes on as a paragraph
-                # with the words the engine read; under a curated box
-                # they are excluded with the picture, anywhere else they
-                # are text, judged like any other.
-                parsed = replace(parsed, kind=markup.PARAGRAPH)
             label = unit.get(spec.type_key) or ""
             # The ``manual`` box that is the bracket token this unit
             # lost does not take the unit (#419); every other box does.
             tokens = token_boxes(token_rects, box_pt, before, removed)
             unit_rects = [r for r in rects if not any(r is t for t in tokens)]
+            exclusion, share = verdict(
+                box_pt,
+                unit_rects,
+                page_masks,
+                text,
+                printed,
+                size[1] if size else None,
+                label,
+                frame_rects,
+            )
             picture_share, picture = (
                 covered_share(box_pt, picture_rects)
-                if box_pt is not None and picture_rects
+                if exclusion is None and box_pt is not None and picture_rects
                 else (0.0, None)
             )
             if picture is not None and picture_share >= FIGURE_SHARE:
                 # Under a curated picture: the picture goes into the
                 # text in its place, and the words the engine read
-                # inside it stay out (:data:`PICTURE`). The share stays
-                # the measured one, so a block half in the box is a
-                # partial cover with its card. The box is review 2's
+                # inside it stay out (:data:`PICTURE`). Only a unit the
+                # verdict kept: a redaction or the neighbour's mask
+                # over the unit names itself first and keeps its own
+                # rules, partial card included, because a picture's
+                # words may uncover a reading (``ensemble._things_under``)
+                # and a redacted one must never ride out with them. The
+                # share stays the measured one. The box is review 2's
                 # decision, and nothing in review 3 frees the words.
                 exclusion = {
                     "reason": PICTURE,
@@ -1619,17 +1733,6 @@ def build_document(
                 }
                 share = picture_share
                 counts["under_picture"] += 1
-            else:
-                exclusion, share = verdict(
-                    box_pt,
-                    unit_rects,
-                    page_masks,
-                    text,
-                    printed,
-                    size[1] if size else None,
-                    label,
-                    frame_rects,
-                )
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1
@@ -1660,15 +1763,13 @@ def build_document(
         # The pictures of the page: one ``figure`` unit per curated box,
         # on every engine's page alike, so the ensemble's picture groups
         # are the boxes a person kept and nothing else.
-        render = inputs.renders.get(page_index)
-        for picture in picture_rects if render else []:
+        for picture in picture_rects:
             box_pt = [
                 picture["x0"],
                 picture["y0"],
                 picture["x1"],
                 picture["y1"],
             ]
-            sx, sy = render[0] / size[0], render[1] / size[1]
             # Under a redaction or the neighbour's mask the picture goes
             # like a block the box took, and the ensemble drops it: the
             # rules of :func:`verdict`, over the box with no text.
@@ -1689,12 +1790,17 @@ def build_document(
                     "text": "",
                     "marks": [],
                     "kind": markup.FIGURE,
-                    "bbox": [
-                        round(box_pt[0] * sx),
-                        round(box_pt[1] * sy),
-                        round(box_pt[2] * sx),
-                        round(box_pt[3] * sy),
-                    ],
+                    # In the engine's frame like every other unit's box.
+                    "bbox": (
+                        [
+                            round(box_pt[0] * frame[0] / size[0]),
+                            round(box_pt[1] * frame[1] / size[1]),
+                            round(box_pt[2] * frame[0] / size[0]),
+                            round(box_pt[3] * frame[1] / size[1]),
+                        ]
+                        if frame
+                        else None
+                    ),
                     "box_pt": box_pt,
                     "exclusion": exclusion,
                     "share": share,
@@ -1987,29 +2093,36 @@ def reglue_rows(scan: Scan | None = None) -> QuerySet:
 def picture_rows(scan: Scan) -> list[Opinion]:
     """Return the rows of ``scan`` a change of the picture rule moves.
 
-    Of :func:`reglue_rows`: an opinion whose page span holds a live
-    ``IMAGE`` detection of its run, or whose text holds a picture
-    already (``figure_digest``), because the rule reads the first and
-    wrote the second; and one whose glue is written but whose ensemble
-    has not read it yet, because that glue carries the engines' own
-    picture labels as ``figure`` units, which the ensemble now trusts.
-    Every other opinion glues the same, so ``reglue_opinion_ocr
+    Of :func:`reglue_rows`: an opinion whose page span holds a curated
+    picture (:func:`picture_pages`, the glue's own rule), or whose text
+    holds a picture already (``figure_digest``), because the rule reads
+    the first and wrote the second; one whose glue is written but whose
+    ensemble has not read it yet, because that glue carries the
+    engines' own picture labels as ``figure`` units, which the ensemble
+    trusts as the glue wrote them; and one with a standing ``DROP``
+    edit, because under the engines' labels a person took a stamp or a
+    blot out with "Not a picture", and that drop lands again only once
+    the glue has written the unit as the text it is (a picture takes no
+    drop). Every other opinion glues the same, so ``reglue_opinion_ocr
     --with-pictures`` leaves it alone.
 
     :param scan: The scan.
     :returns: The rows, in the order of :func:`reglue_rows`.
     :rtype: list[Opinion]
     """
-    by_run: dict[int | None, set[int]] = {}
-    for run_id, page_index in (
-        Detection.objects.live()
-        .filter(scan=scan, label=Label.IMAGE.name)
-        .values_list("apply_run_id", "page_index")
-    ):
-        by_run.setdefault(run_id, set()).add(page_index)
-    rows = []
-    for row in reglue_rows(scan):
-        pages = by_run.get(row.apply_run_id, set())
+    from scanning.models import OpinionEdit
+
+    rows = list(reglue_rows(scan))
+    pages = picture_pages({row.apply_run_id for row in rows})
+    dropped = set(
+        OpinionEdit.objects.filter(
+            opinion__in=rows,
+            kind=OpinionEdit.Kind.DROP,
+            withdrawn_at__isnull=True,
+        ).values_list("opinion_id", flat=True)
+    )
+    picked = []
+    for row in rows:
         unread_glue = (
             row.ocr_glue_revision == row.glue_revision
             and row.ensemble_revision != row.ocr_glue_revision
@@ -2017,13 +2130,14 @@ def picture_rows(scan: Scan) -> list[Opinion]:
         if (
             row.figure_digest
             or unread_glue
+            or row.pk in dropped
             or any(
                 row.start_page_index <= page <= row.end_page_index
-                for page in pages
+                for page in pages.get(row.apply_run_id, ())
             )
         ):
-            rows.append(row)
-    return rows
+            picked.append(row)
+    return picked
 
 
 def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:

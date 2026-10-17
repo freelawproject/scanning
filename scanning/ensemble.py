@@ -344,7 +344,10 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.UNRESOLVED_EDIT,
+        # No writer since the pictures are review 2's boxes: here so
+        # the rebuild deletes the rows written before.
         OpinionCheck.FIGURE_ONE_ENGINE,
+        OpinionCheck.FIGURE_TO_CHECK,
     }
 )
 
@@ -1403,7 +1406,7 @@ def _group(
         # loses, and the ``PARTIAL_REDACTION`` card says so (#365).
         "partial": any(unit["partial"] for unit in merged.values()),
         # A dropped group a picture covered in part: the
-        # ``FIGURE_ONE_ENGINE`` card names it (#463).
+        # ``FIGURE_TO_CHECK`` card names it (#463).
         "picture_partial": any(
             unit.get("picture_partial") for unit in merged.values()
         ),
@@ -4172,7 +4175,7 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 _card(
                     opinion,
                     page_number,
-                    OpinionCheck.FIGURE_ONE_ENGINE,
+                    OpinionCheck.FIGURE_TO_CHECK,
                     Issue.Severity.WARNING,
                     _figure_message(page),
                     standing,
@@ -4195,7 +4198,7 @@ _REASON_WORDS = {
 
 
 def _figure_message(page: dict) -> str:
-    """Return the line of one ``FIGURE_ONE_ENGINE`` card (#463).
+    """Return the line of one ``FIGURE_TO_CHECK`` card (#463).
 
     Every page with a picture gets one, because a picture's place is a
     box and the engines' text is a block: a block a picture covers in

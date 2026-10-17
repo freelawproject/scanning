@@ -772,6 +772,19 @@ class TestTheBlockingPage(ScanningTestCase):
         # Nor the opinion of the volume that waits on its approval.
         self.assertNotContains(answer, f'id="ready-{self.clean.pk}"')
 
+    def test_the_walk_of_one_opinion_goes_back_to_the_whole_list(self):
+        """Its own pages keep the opinion; the list it goes back to is
+        the volume's."""
+        answer = self.client.get(
+            self.walk("opinion_blocking_review", self.waiting)
+        )
+
+        self.assertEqual(
+            answer.context["list_url"],
+            reverse("opinion_list") + f"?scan={self.scan.pk}",
+        )
+        self.assertIn(f"opinion={self.waiting.pk}", answer.context["query"])
+
     def test_an_opinion_alone_is_a_scope(self):
         answer = self.client.get(
             reverse("opinion_blocking_review") + f"?opinion={self.waiting.pk}"

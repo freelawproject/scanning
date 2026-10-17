@@ -296,6 +296,27 @@ class TestOpinionList(ScanningTestCase):
         self.assertEqual(row.pictures, 2)
         self.assertContains(response, ">Pictures</th>")
 
+    def test_a_junk_box_is_no_picture(self):
+        """The column counts the glue's pictures: a box the junk rule
+        drops from every screen is not one."""
+        run = self.pictured()
+        row = model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+        )
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
     def test_an_opinion_with_no_picture_shows_a_dash(self):
         self.pictured()
 

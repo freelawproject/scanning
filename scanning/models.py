@@ -2669,6 +2669,11 @@ class OpinionCheck(models.TextChoices):
         "figure_one_engine",
         "One engine alone drew a picture",
     )
+    # Every page that holds a picture of the text (#463): a person reads
+    # the picture and the text around it against the PDF.
+    # ``FIGURE_ONE_ENGINE`` has no writer since the pictures are review
+    # 2's boxes, and the ensemble's rebuild deletes its rows.
+    FIGURE_TO_CHECK = "figure_to_check", "A picture to check"
 
 
 #: The checks a curator may dismiss. The two stale checks are facts

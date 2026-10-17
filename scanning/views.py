@@ -452,9 +452,16 @@ def opinion_blocking_review(
     list_query = {
         key: value
         for key, value in current.items()
-        if key in ("scan", "reporter", "volume", "opinion") and value
+        if key in ("scan", "reporter", "volume") and value
     }
-    query = urlencode(list_query)
+    # The walk's own pages keep the opinion of the review page's
+    # button; the list the walk goes back to is the volume's whole.
+    query = urlencode(
+        {
+            **list_query,
+            **({"opinion": current["opinion"]} if current["opinion"] else {}),
+        }
+    )
     return render(
         request,
         "scanning/opinion_blocking_review.html",
@@ -468,7 +475,7 @@ def opinion_blocking_review(
             "card_word": "warning" if warnings else "blocking",
             "current_scan": current["scan"],
             "list_url": reverse("opinion_list")
-            + (f"?{query}" if query else ""),
+            + (f"?{urlencode(list_query)}" if list_query else ""),
             "query": query,
         },
     )

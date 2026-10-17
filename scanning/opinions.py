@@ -53,7 +53,6 @@ from django.db.models import Case, Count, F, Q, Value, When
 from scanning import apply, boundaries, review_states, s3_sync
 from scanning.models import (
     STALE_OPINION_CHECKS,
-    Detection,
     Issue,
     Opinion,
     OpinionBoundary,
@@ -543,33 +542,25 @@ def run(scan_pk: int) -> None:
 
 
 def picture_counts(rows) -> dict[int, int]:
-    """Return how many pictures review 2 drew in each opinion's pages.
+    """Return how many pictures each opinion's text holds.
 
-    A picture is a live ``IMAGE`` detection of the opinion's run on a
-    page of its span, the box the OCR glue makes the picture of the
-    text (#463). A page two opinions share counts for both. The caller
-    passes the rows of one page of the list, so one query answers it.
+    A picture is a curated box of review 2 on a page of the opinion's
+    span, read by ``opinion_ocr.picture_pages``, the glue's own rule:
+    a live ``IMAGE`` detection of the opinion's run less the junk the
+    viewer drops (#463). A page two opinions share counts for both.
+    The caller passes the rows of one page of the list, so two queries
+    answer it whatever its length, one when no page holds a box.
 
     :param rows: The ``Opinion`` rows, usually one page of the list.
     :returns: ``{opinion id: count}``; an opinion with none is absent.
     :rtype: dict[int, int]
     """
-    from blackletter.models import Label
+    from scanning import opinion_ocr
 
     rows = [row for row in rows if row.apply_run_id]
     if not rows:
         return {}
-    pages: dict[int, list[int]] = {}
-    for run_id, page_index in (
-        Detection.objects.live()
-        .filter(
-            apply_run_id__in={row.apply_run_id for row in rows},
-            label=Label.IMAGE.name,
-        )
-        .order_by()
-        .values_list("apply_run_id", "page_index")
-    ):
-        pages.setdefault(run_id, []).append(page_index)
+    pages = opinion_ocr.picture_pages({row.apply_run_id for row in rows})
     counts = {}
     for row in rows:
         count = sum(

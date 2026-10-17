@@ -44,6 +44,7 @@ from scanning.models import (
     JobStage,
     JobStatus,
     Opinion,
+    OpinionEdit,
     OpinionReviewStatus,
     Redaction,
     Scan,
@@ -3116,6 +3117,67 @@ class TestThePicture(OpinionOcrTestCase):
         under_redaction = self.unit(document, 0, "body B")
         self.assertEqual(under_redaction["exclusion"]["reason"], "redaction")
 
+    def test_a_redaction_over_part_of_a_picture_block_names_itself(self):
+        """A block inside a picture and a quarter under a redaction is
+        the redaction's: the verdict runs first, so the partial card
+        holds and no picture's words can uncover the redacted ones."""
+        self.picture()
+        self.redact(1, to_pt((BODY_A[0], BODY_A[1], BODY_A[2], 450)))
+
+        for name, document in self.documents().items():
+            with self.subTest(engine=name):
+                taken = self.unit(document, 0, "body A")
+                self.assertEqual(taken["exclusion"]["reason"], "redaction")
+                self.assertLess(taken["share"], opinion_ocr.FULL_SHARE)
+
+    def test_a_picture_of_another_render_size_lands_in_its_own_place(self):
+        """Each box is put in points off its own row's render size, the
+        rule of the zones and of the frame: a box drawn on a render
+        twice the size of the page's other rows covers the same block."""
+        model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label="TEXT_COLUMN",
+            label_id=int(Label.TEXT_COLUMN),
+            page_index=1,
+            source_page=2,
+            x0=BODY_B[0],
+            y0=BODY_B[1],
+            x1=BODY_B[2],
+            y1=BODY_B[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+        row = self.picture(
+            box=tuple(v * 2 for v in BODY_A),
+            img_width=IMG_W * 2,
+            img_height=IMG_H * 2,
+        )
+
+        document = self.documents()["dots_mocr"]
+
+        [figure] = self.figure_units(document["pages"][0])
+        self.assertEqual(figure["box_pt"], to_pt(BODY_A))
+        self.assertEqual(
+            self.unit(document, 0, "body A")["exclusion"],
+            {"reason": opinion_ocr.PICTURE, "detection_id": row.pk},
+        )
+
+    def test_an_engines_picture_label_keeps_its_bullets(self):
+        """The label never reaches the parse: the unit is parsed as the
+        paragraph it reads, list items and all."""
+        for name, spec in opinion_ocr.ENGINES.items():
+            with self.subTest(engine=name):
+                for label in ("Picture", "Figure", "image"):
+                    unit = {
+                        spec.type_key: label,
+                        spec.text_key: "- one\n- two",
+                        spec.markup_key: "- one\n- two",
+                    }
+                    plain = {**unit, spec.type_key: ""}
+                    self.assertNotEqual(spec.parse(unit).kind, markup.FIGURE)
+                    self.assertEqual(spec.parse(unit), spec.parse(plain))
+
     def test_a_unit_less_than_half_inside_a_picture_is_text(self):
         """A box over the foot of a block takes a third of it: the
         block stays text, and the box is a picture beside it."""
@@ -3266,6 +3328,49 @@ class TestWithPictures(OpinionOcrTestCase):
         rows = opinion_ocr.picture_rows(self.scan)
 
         self.assertEqual([r.pk for r in rows], [other.pk])
+
+    def test_a_standing_drop_takes_the_opinion_too(self):
+        """A person took a stamp an engine labelled a picture out with
+        "Not a picture": the glue writes it as text again, where the
+        drop lands, so the opinion is glued again, box or no box."""
+        other = self.second_opinion()
+        OpinionEdit.objects.create(
+            opinion=other,
+            kind=OpinionEdit.Kind.DROP,
+            source_page=5,
+            page_in_opinion=0,
+            box_pt=[10, 10, 20, 20],
+            glue_revision=0,
+        )
+
+        rows = opinion_ocr.picture_rows(self.scan)
+
+        self.assertEqual([r.pk for r in rows], [other.pk])
+
+    def test_a_withdrawn_drop_takes_nothing(self):
+        other = self.second_opinion()
+        OpinionEdit.objects.create(
+            opinion=other,
+            kind=OpinionEdit.Kind.DROP,
+            source_page=5,
+            page_in_opinion=0,
+            box_pt=[10, 10, 20, 20],
+            glue_revision=0,
+            withdrawn_at=timezone.now(),
+        )
+
+        self.assertEqual(opinion_ocr.picture_rows(self.scan), [])
+
+    def test_a_junk_box_takes_nothing(self):
+        """The filter reads the glue's own rule, junk rule included."""
+        row = self.box(2)
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            self.assertEqual(opinion_ocr.picture_rows(self.scan), [])
 
     def test_a_dismissed_box_takes_nothing(self):
         row = self.box(2)

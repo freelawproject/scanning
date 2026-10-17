@@ -47,6 +47,7 @@ from scanning.models import (
     OpinionCheck,
     OpinionEdit,
     OpinionFinding,
+    OpinionFindingDismissal,
     OpinionReviewStatus,
 )
 from scanning.tests.test_detections import model_row
@@ -1146,7 +1147,7 @@ class TestTheCard(FigureTestCase):
         self.run_ensemble()
 
         card = OpinionFinding.objects.get(
-            opinion=self.opinion, check_name=OpinionCheck.FIGURE_ONE_ENGINE
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
         )
         self.assertEqual(card.page_in_opinion, 1)
         self.assertEqual(card.severity, Issue.Severity.WARNING)
@@ -1161,7 +1162,7 @@ class TestTheCard(FigureTestCase):
 
         self.assertFalse(
             OpinionFinding.objects.filter(
-                check_name=OpinionCheck.FIGURE_ONE_ENGINE
+                check_name=OpinionCheck.FIGURE_TO_CHECK
             ).exists()
         )
 
@@ -1181,12 +1182,45 @@ class TestTheCard(FigureTestCase):
         self.run_ensemble()
 
         card = OpinionFinding.objects.get(
-            opinion=self.opinion, check_name=OpinionCheck.FIGURE_ONE_ENGINE
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
         )
         self.assertIn(
             "1 block(s) the picture covers only in part", card.message
         )
         self.assertNotIn("The caption", self.stored()["pages"][1]["text"])
+
+    def test_a_dismissal_of_the_old_card_does_not_mute_the_new_one(self):
+        """The old card named one engine's picture; a curator who
+        dismissed it said nothing about the picture to check."""
+        OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.FIGURE_ONE_ENGINE,
+        )
+
+        self.run_ensemble()
+
+        card = OpinionFinding.objects.get(
+            opinion=self.opinion, check_name=OpinionCheck.FIGURE_TO_CHECK
+        )
+        self.assertIsNone(card.dismissal)
+
+    def test_the_rebuild_deletes_the_old_card(self):
+        OpinionFinding.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.FIGURE_ONE_ENGINE,
+            severity=Issue.Severity.WARNING,
+            message="old",
+        )
+
+        self.run_ensemble()
+
+        self.assertFalse(
+            OpinionFinding.objects.filter(
+                check_name=OpinionCheck.FIGURE_ONE_ENGINE
+            ).exists()
+        )
 
 
 class TestTheApproval(FigureTestCase):
