@@ -582,6 +582,64 @@ class TestTheFrame(OpinionOcrTestCase):
 
 # ── the verdict ──────────────────────────────────────────────────────
 class TestTheVerdict(OpinionOcrTestCase):
+    def head_box(self, page_index, box, label="PAGE_HEADER"):
+        """One live detection of the running head's line."""
+        return model_row(
+            self.scan,
+            apply_run=self.apply_run,
+            label=label,
+            label_id=int(getattr(Label, label)),
+            page_index=page_index,
+            source_page=page_index + 1,
+            x0=box[0],
+            y0=box[1],
+            x1=box[2],
+            y1=box[3],
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+
+    def test_a_unit_on_the_running_heads_line_is_taken_whole(self):
+        """Nothing at the height of the running head is the opinion: the
+        unit goes whatever box covers it, and the body below stays."""
+        self.head_box(
+            2, (500, HEADER[1], 800, HEADER[3]), "STATE_ABBREVIATION"
+        )
+
+        document = self.write()
+
+        head = self.unit(document, 1, "878 N. C.")
+        self.assertEqual(
+            head["exclusion"], {"reason": opinion_ocr.RUNNING_HEAD}
+        )
+        self.assertEqual(head["share"], 1.0)
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+        # Another page with no head box keeps its head to the other rules.
+        self.assertNotEqual(
+            (self.unit(document, 2, "878 N. C.")["exclusion"] or {}).get(
+                "reason"
+            ),
+            opinion_ocr.RUNNING_HEAD,
+        )
+
+    def test_a_unit_mostly_below_the_head_line_is_judged_by_the_others(self):
+        """An engine that read the head with the paragraph under it holds
+        less than half of its height on the head's line: no rule drops
+        the whole block for it."""
+        self.head_box(2, (100, HEADER[1], 800, HEADER[3]))
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, HEADER[1] * 0.36, 300, 400],
+                [(HEADER[1] * 0.36, HEADER[3] * 0.36)],
+            )
+        )
+        self.assertTrue(
+            opinion_ocr.on_head_line(
+                [0, HEADER[1] * 0.36, 300, HEADER[3] * 0.36],
+                [(HEADER[1] * 0.36, HEADER[3] * 0.36)],
+            )
+        )
+
     def columns_end_at(self, page_index, y1):
         """Cut the text columns of one page short, in render pixels."""
         Detection.objects.filter(

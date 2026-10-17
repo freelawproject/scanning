@@ -254,6 +254,23 @@ ZONES: dict[str, Zone] = {
     ),
 }
 
+#: The verdict of a unit on the running head's line: the height of a
+#: ``PAGE_HEADER``, ``STATE_ABBREVIATION`` or ``PAGE_NUMBER`` detection
+#: of the page holds nothing of the opinion, so a unit at least
+#: :data:`HEAD_LINE_SHARE` of whose height lies inside one is taken
+#: whole, whatever box covers it and whoever read it. A unit that runs
+#: on from the head into the body is mostly below it, and the other
+#: rules judge it, so a block an engine merged is never dropped whole.
+RUNNING_HEAD = "running_head"
+HEAD_LINE_LABELS = frozenset(
+    {
+        Label.PAGE_HEADER.name,
+        Label.STATE_ABBREVIATION.name,
+        Label.PAGE_NUMBER.name,
+    }
+)
+HEAD_LINE_SHARE = 0.5
+
 #: The verdict of a unit where the detections drew nothing: the
 #: bleed-through of the page behind, which the engines read as words.
 #: A page's columns, its footnote band, its head and its pictures are
@@ -1449,6 +1466,7 @@ def verdict(
     height_pt: float | None = None,
     label: str = "",
     frame: list[dict] | None = None,
+    head_lines: list[tuple[float, float]] | None = None,
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
@@ -1481,11 +1499,15 @@ def verdict(
     :param label: The unit's label, as the engine wrote it.
     :param frame: The page's detections (:func:`page_frame`), or None
         for a page the rule does not judge.
+    :param head_lines: The heights of the running head's line
+        (:func:`head_lines`), ``(top, bottom)`` in points.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
     if box_pt is None:
         return {"reason": UNJUDGED}, 0.0
+    if on_head_line(box_pt, head_lines):
+        return {"reason": RUNNING_HEAD}, 1.0
     red_share, hit = covered_share(box_pt, rects)
     out_share, _ = covered_share(box_pt, masks)
     share = max(red_share, out_share)
@@ -1511,6 +1533,49 @@ def verdict(
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def head_lines(
+    rows: list, size: tuple[float, float]
+) -> list[tuple[float, float]]:
+    """Return the heights of the running head's line on one page.
+
+    One ``(top, bottom)`` per ``PAGE_HEADER``, ``STATE_ABBREVIATION``
+    and ``PAGE_NUMBER`` detection of the page (:data:`HEAD_LINE_LABELS`),
+    in points, off each row's own render size (:func:`zones_pt`). The
+    page number counts: it sits on the line of the head or the foot,
+    and a unit of its height is furniture too.
+
+    :param rows: The page's live detections.
+    :param size: The page size in points.
+    :returns: The spans, in no order.
+    :rtype: list[tuple[float, float]]
+    """
+    heads = [row for row in rows if row.label in HEAD_LINE_LABELS]
+    return [(box[1], box[3]) for box in zones_pt(heads, size)]
+
+
+def on_head_line(
+    box_pt: list[float], spans: list[tuple[float, float]] | None
+) -> bool:
+    """Return whether a unit lies on the running head's line.
+
+    :data:`HEAD_LINE_SHARE` of the unit's height or more inside one of
+    the spans of :func:`head_lines`.
+
+    :param box_pt: The unit's box in points.
+    :param spans: The page's head-line spans, or None.
+    :returns: Whether the unit is the running head's.
+    :rtype: bool
+    """
+    height = box_pt[3] - box_pt[1]
+    if not spans or height <= 0:
+        return False
+    return any(
+        min(box_pt[3], bottom) - max(box_pt[1], top)
+        >= HEAD_LINE_SHARE * height
+        for top, bottom in spans
+    )
 
 
 def undetected(box_pt: list[float], frame: list[dict] | None) -> bool:
@@ -1697,6 +1762,11 @@ def build_document(
             if size
             else []
         )
+        head_spans = (
+            head_lines(inputs.detected.get(page_index, []), size)
+            if size
+            else []
+        )
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -1747,6 +1817,7 @@ def build_document(
                 size[1] if size else None,
                 label,
                 frame_rects,
+                head_spans,
             )
             picture_share, picture = (
                 covered_share(box_pt, picture_rects)
