@@ -3615,7 +3615,7 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
 class ShardRead:
     """What one engine's start button says, asks and calls.
 
-    The three buttons (#190, #191, #364) are one view: each writes one
+    The two buttons (#190, #191) are one view: each writes one
     ``ExternalJob`` row per original shard, behind the same four gates,
     and each answers the same five messages. Only the words and the
     three functions differ, so they are an entry here rather than a
@@ -3649,7 +3649,10 @@ class ShardRead:
 
 
 def _shard_reads() -> dict[str, ShardRead]:
-    """Return the three reads over a volume's original shards.
+    """Return the reads a staff button starts over a volume's shards.
+
+    dots.mocr and Mistral. Surya left the table in #500: the daemon's
+    sweep (``surya.enqueue_missing_runs``) starts its read.
 
     Rebuilt on each call, and deliberately not cached, for the reason
     ``jobs._runpod_engines`` is: the entries read functions off the
@@ -3684,17 +3687,6 @@ def _shard_reads() -> dict[str, ShardRead]:
             run_summary=mistral_ocr.run_summary,
             create=mistral_ocr.ensure_extract_jobs,
         ),
-        JobEngine.SURYA: ShardRead(
-            name="start_surya_ocr",
-            label="Surya OCR",
-            off_label="Surya OCR",
-            cost="money",
-            switches="RUNPOD_SURYA_ENDPOINT_ID",
-            dispatch="sends them to RunPod",
-            is_enabled=surya.enabled,
-            run_summary=surya.run_summary,
-            create=surya.ensure_extract_jobs,
-        ),
     }
 
 
@@ -3703,7 +3695,7 @@ def _start_shard_read(
 ) -> HttpResponse:
     """Create one engine's rows over a scan's original shards.
 
-    The body of the three start buttons. Four gates, in this order:
+    The body of the two start buttons. Four gates, in this order:
 
     1. **Staff only.** Every press can start real paid work.
     2. **The stage must be switched on.** An environment that must not
@@ -3831,23 +3823,6 @@ def start_mistral_ocr(request: HttpRequest, pk: int) -> HttpResponse:
     return _start_shard_read(
         request, pk, _shard_reads()[JobEngine.MISTRAL_OCR]
     )
-
-
-@login_required
-@require_POST
-def start_surya_ocr(request: HttpRequest, pk: int) -> HttpResponse:
-    """Start the Surya OCR read over a scan's shards (#364).
-
-    The only way into this stage: no tick and no pipeline arm creates a
-    Surya row. The read is over the original shards, so the button
-    waits on no review state, and the pages are unredacted, which is
-    what a reader of the headnote brackets needs (#303).
-
-    :param request: The HTTP request.
-    :param pk: Scan primary key.
-    :return: See :func:`_start_shard_read`.
-    """
-    return _start_shard_read(request, pk, _shard_reads()[JobEngine.SURYA])
 
 
 @login_required

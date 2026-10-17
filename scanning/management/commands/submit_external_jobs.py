@@ -1,11 +1,12 @@
 """Submit one wave of pending external jobs per provider (a daemon tick).
 
-Before the waves, two passes create work: ``yolo.enqueue_missing_runs``
-(issue #250) and ``dots_mocr.enqueue_missing_runs`` (issue #327) each
-start a run for every fingerprinted shard set that has none of theirs
-yet, so a new upload, a backlog from before the sweep and a volume
-uploaded while the stage was off all get their run, and the rows go out
-in the wave of the same tick. The rule is one run per shard set, ever:
+Before the waves, three passes create work: ``yolo.enqueue_missing_runs``
+(issue #250), ``dots_mocr.enqueue_missing_runs`` (issue #327) and
+``surya.enqueue_missing_runs`` (issue #500) each start a run for every
+fingerprinted shard set that has none of theirs yet, so a new upload, a
+backlog from before the sweep and a volume uploaded while the stage was
+off all get their run, and the rows go out in the wave of the same
+tick. The rule is one run per shard set, ever:
 a dead run under the scan's own fingerprint is not re-run by a tick. A
 run from before the fingerprint column is adopted when it is whole, and
 replaced with a carry when a row of it is dead.
@@ -94,13 +95,14 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import dots_mocr, jobs, yolo
+        from scanning import dots_mocr, jobs, surya, yolo
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
                 started = yolo.enqueue_missing_runs()
                 ocr_started = dots_mocr.enqueue_missing_runs()
+                surya_started = surya.enqueue_missing_runs()
                 summary = jobs.submit_pending(limit=options["limit"])
                 break
             except OperationalError as exc:
@@ -122,6 +124,7 @@ class Command(BaseCommand):
             (
                 started,
                 ocr_started,
+                surya_started,
                 summary.submitted,
                 summary.failed,
                 summary.retried,
@@ -131,8 +134,8 @@ class Command(BaseCommand):
             )
         ):
             self.stdout.write(
-                f"Started {started} detection run(s) and {ocr_started} OCR "
-                f"run(s); "
+                f"Started {started} detection run(s), {ocr_started} OCR "
+                f"run(s) and {surya_started} Surya OCR run(s); "
                 f"submitted {summary.submitted}, retried {summary.retried}, "
                 f"deferred {summary.deferred}, failed {summary.failed}, "
                 f"unanswered {summary.unanswered}, skipped {summary.skipped}"

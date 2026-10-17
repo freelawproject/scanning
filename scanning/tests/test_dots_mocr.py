@@ -1999,7 +1999,9 @@ class TestKnownEnqueuePaths(ScanningTestCase):
     that remains as the staff re-run path (#190) and the backfill
     command for runs that left pages unread (#238). YOLO
     detection has one, the daemon's sweep (#250), which starts one run
-    per shard set and replaced the staff button of #195.
+    per shard set and replaced the staff button of #195. The Surya read
+    has the same kind of sweep since #500, which replaced the staff
+    button of #364.
 
     Row creation is what costs GPU money, so a new caller of the
     creators must be a deliberate decision that updates this set -- not
@@ -2075,19 +2077,24 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # corrected volume (#245). That pass creates a row
                 # only for a scan whose volume read a person already
                 # started and the daemon already glued, so it mints no
-                # work of its own.
+                # work of its own. The two buttons are one view over a
+                # table, so the view module names ``ensure_analyze_jobs``
+                # once and ``ensure_extract_jobs`` once.
                 ("scanning/views_process.py", "ensure_extract_jobs"),
                 ("scanning/mistral_ocr.py", "ensure_extract_jobs"),
-                # Surya: the staff button (#364), and the collect
-                # pass that reads the edited pages of a corrected
-                # volume (#368), which is the Mistral rule engine for
-                # engine -- a row only for a scan whose volume read a
-                # person already started and the daemon already glued.
-                # The three buttons are one view over a table, so the
-                # view module names ``ensure_analyze_jobs`` once and
-                # ``ensure_extract_jobs`` once for three engines; the
-                # wrappers below are what pin the two of this stage.
+                # Surya: the daemon's sweep (#500), which replaced the
+                # staff button of #364 and starts one run per shard
+                # set, and the collect pass that reads the edited pages
+                # of a corrected volume (#368), a row only for a scan
+                # whose volume read the daemon already glued. Both live
+                # in the stage module.
                 ("scanning/surya.py", "ensure_extract_jobs"),
+                # And the command that re-runs a dead Surya run (#500),
+                # staff-run like ``enqueue_yolo_detect``.
+                (
+                    "scanning/management/commands/enqueue_surya_ocr.py",
+                    "ensure_extract_jobs",
+                ),
                 #
                 # The generic creator's five wrappers.
                 ("scanning/dots_mocr.py", "ensure_shard_jobs"),
@@ -2110,7 +2117,7 @@ class TestKnownEnqueuePaths(ScanningTestCase):
         )
 
     def test_every_start_button_is_wired_to_its_own_entry(self):
-        # The three buttons are one view over ``_shard_reads`` (#364).
+        # The two buttons are one view over ``_shard_reads`` (#364).
         # A wrong entry would start another engine's read, and the
         # press would still look right, so the route, the name and the
         # label of each entry are pinned together.
