@@ -728,6 +728,31 @@ class TestTheAlignment(TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(groups[0]["engines"]["surya"]["uncovered"], 0)
 
+    def test_two_engines_reading_one_block_under_part_of_a_box_both_uncover(
+        self,
+    ):
+        """Two engines read the block as one, a box covering its first
+        line; the third read that line as a unit covered whole and the
+        rest as clean text. Each long reading is the other's twin, and
+        a twin holds the line the uncover takes out, so it is not a
+        leftover beside the box: both keep what the box did not hide."""
+        red = {"reason": "redaction", "rect_type": "HEADNOTE"}
+        block = (100, 100, 300, 130)
+        units = [
+            unit("mistral_ocr", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit("surya", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit("dots_mocr", 0, (100, 100, 300, 112), "HIDDEN LINE", red, 1.0),
+            unit("dots_mocr", 1, (100, 116, 300, 130), "kept words"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        group = next(g for g in groups if not g["excluded"])
+        self.assertEqual(
+            group["engines"]["mistral_ocr"]["text"], "kept words"
+        )
+        self.assertEqual(group["engines"]["surya"]["text"], "kept words")
+
     def test_without_a_partial_reading_the_rest_is_uncovered(self):
         """The control: no other engine read the rest under a box, so
         the long reading keeps what the box did not hide."""

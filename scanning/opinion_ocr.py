@@ -1544,7 +1544,9 @@ def head_lines(
     and ``PAGE_NUMBER`` detection of the page (:data:`HEAD_LINE_LABELS`),
     in points, off each row's own render size (:func:`zones_pt`). The
     page number counts: it sits on the line of the head or the foot,
-    and a unit of its height is furniture too.
+    and a unit of its height is furniture too. Only a box in the head or
+    the foot band (``page_numbers.edge_in_band``): a box of these labels
+    the model drew in the body would take every unit at its height.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
@@ -1552,7 +1554,11 @@ def head_lines(
     :rtype: list[tuple[float, float]]
     """
     heads = [row for row in rows if row.label in HEAD_LINE_LABELS]
-    return [(box[1], box[3]) for box in zones_pt(heads, size)]
+    return [
+        (box[1], box[3])
+        for box in zones_pt(heads, size)
+        if page_numbers.edge_in_band(box, size[1])
+    ]
 
 
 def on_head_line(

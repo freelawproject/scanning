@@ -2235,7 +2235,16 @@ def run_compute_redactions(
         # text width at its own height, so no letter of it is left on the
         # page; the page number stays.
         with _log_stage("Running head fit"):
-            text_fit.widen_running_heads(rects, document.pages)
+            text_fit.widen_running_heads(
+                rects,
+                document.pages,
+                redactions.dismissed_boxes(
+                    scan,
+                    text_fit.HEAD_RECT_TYPE,
+                    run,
+                    [entry["page_index"] for entry in rects],
+                ),
+            )
 
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _measure_margin_rects(pdf_path, document)

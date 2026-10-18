@@ -1281,7 +1281,10 @@ def _merge(
         group (:func:`_covered_things`), for :func:`_uncover`.
     :param partials: What the other engines read only under part of a
         box (:func:`_partly_covered`): a member that holds the place of
-        one is never uncovered.
+        one is never uncovered, unless that one holds a thing the
+        uncover takes out. Then it is another engine's reading of the
+        same merged block, which uncovers the same way, and not a
+        leftover beside the box like "Conn. 51".
     :returns: The merged unit.
     :rtype: dict
     """
@@ -1306,6 +1309,10 @@ def _merge(
             and member["share"] < opinion_ocr.FULL_SHARE
             and not any(
                 contained(unit["box_pt"], member["box_pt"]) >= OVERLAP
+                and not any(
+                    contained(thing["box_pt"], unit["box_pt"]) >= OVERLAP
+                    for thing in under
+                )
                 for unit in partials
                 if member.get("box_pt")
             )

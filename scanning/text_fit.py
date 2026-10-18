@@ -47,7 +47,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from scanning import dots_mocr
+from scanning import dots_mocr, page_numbers
 
 logger = logging.getLogger(__name__)
 
@@ -382,7 +382,11 @@ def fit_rects(rects: list[dict], cells: dict[int, PageCells], pages) -> int:
 HEAD_RECT_TYPE = "PAGE_HEADER"
 
 
-def widen_running_heads(rects: list[dict], pages) -> int:
+def widen_running_heads(
+    rects: list[dict],
+    pages,
+    dismissed: dict[int, list[list[float]]] | None = None,
+) -> int:
     """Grow each running head's whiteout across the width of the text.
 
     blackletter whites the running head out by the ``PAGE_HEADER`` box
@@ -398,16 +402,32 @@ def widen_running_heads(rects: list[dict], pages) -> int:
     Wider is the safe direction here and only here: a running head is
     never the opinion's text, and a short box is what shows.
 
+    Three whiteouts keep their width, because the line may not be the
+    running head's alone:
+
+    - one outside the head and the foot band
+      (``page_numbers.edge_in_band``), a box the model drew in the body;
+    - one whose bottom passes the top of the page's columns, whose
+      height a line of the opinion shares (1 of 1,291 on 218 A.3d);
+    - one a standing dismiss points at (``dismissed``), or the dismiss,
+      which lands on one row by IoU (``redactions.resolve``), would find
+      pieces of another size and the strip the curator lifted returns.
+
     :param rects: blackletter's rects of the compute, in render pixels,
         mutated in place (:func:`fit_rects`'s input).
     :param pages: The blackletter ``Page`` objects, for the columns and
         the page-number boxes.
+    :param dismissed: ``{page_index: [box in points]}``, the copied
+        boxes of the standing ``PAGE_HEADER`` dismissals of each page.
     :returns: How many whiteouts changed.
     :rtype: int
     """
     from blackletter.models import Label
 
+    from scanning.detections import IOU_THRESHOLD, iou
+
     by_index = {page.index: page for page in pages}
+    dismissed = dismissed or {}
     changed = 0
     for entry in rects:
         page = by_index.get(entry.get("page_index"))
@@ -422,14 +442,32 @@ def widen_running_heads(rects: list[dict], pages) -> int:
             continue
         left = min(c.x1 for c in columns)
         right = max(c.x2 for c in columns)
+        column_top = min(c.y1 for c in columns)
         numbers = [
             d.bbox
             for d in (getattr(page, "detections", None) or [])
             if d.label == Label.PAGE_NUMBER
         ]
+        lifted = dismissed.get(entry["page_index"], [])
+        # Pixels to points, the scale ``redactions.write_computed`` uses.
+        sx = page.pdf_width / page.img_width
+        sy = page.pdf_height / page.img_height
         out: list[dict] = []
         for rect in entry.get("rects") or []:
-            if rect.get("type") != HEAD_RECT_TYPE:
+            box = [rect["x0"], rect["y0"], rect["x1"], rect["y1"]]
+            if (
+                rect.get("type") != HEAD_RECT_TYPE
+                or not page_numbers.edge_in_band(box, page.img_height)
+                or rect["y1"] > column_top
+                or any(
+                    iou(
+                        [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy],
+                        copy,
+                    )
+                    >= IOU_THRESHOLD
+                    for copy in lifted
+                )
+            ):
                 out.append(rect)
                 continue
             x0, x1 = min(rect["x0"], left), max(rect["x1"], right)

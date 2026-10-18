@@ -622,6 +622,15 @@ class TestTheVerdict(OpinionOcrTestCase):
             opinion_ocr.RUNNING_HEAD,
         )
 
+    def test_a_head_box_in_the_body_takes_nothing(self):
+        """A ``PAGE_HEADER`` box the model drew in the body is no head
+        line: the units at its height are the opinion's."""
+        self.head_box(2, (100, BODY_A[1], 800, BODY_A[3]))
+
+        document = self.write()
+
+        self.assertIsNone(self.unit(document, 1, "body A")["exclusion"])
+
     def test_a_unit_mostly_below_the_head_line_is_judged_by_the_others(self):
         """An engine that read the head with the paragraph under it holds
         less than half of its height on the head's line: no rule drops

@@ -405,6 +405,46 @@ class TestWidenRunningHeads(TestCase):
             [(100, 800), (880, 1600)],
         )
 
+    def test_a_head_box_in_the_body_keeps_its_width(self):
+        """A ``PAGE_HEADER`` box the model drew in the body: its line is
+        the opinion's, so nothing grows across it."""
+        from blackletter.models import Label
+
+        entry = rect(300, 1000, 1300, 1030, rtype=text_fit.HEAD_RECT_TYPE)
+        pages = self.page((Label.TEXT_COLUMN, (100, 100, 1600, 2000)))
+
+        self.assertEqual(text_fit.widen_running_heads([entry], pages), 0)
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in entry["rects"]], [(300, 1300)]
+        )
+
+    def test_a_head_that_reaches_the_columns_keeps_its_width(self):
+        """The whiteout's bottom passes the top of the columns, so a line
+        of the opinion shares its height: it is left as drawn."""
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page((Label.TEXT_COLUMN, (100, 70, 1600, 2000)))
+
+        self.assertEqual(text_fit.widen_running_heads(rects, pages), 0)
+
+    def test_a_dismissed_head_keeps_its_width(self):
+        """A standing dismiss lands on one row by IoU, so the head it
+        names is not cut into pieces of another size."""
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page((Label.TEXT_COLUMN, (100, 100, 1600, 2000)))
+        sx, sy = POINTS_W / WIDTH, POINTS_H / HEIGHT
+        dismissed = {0: [[300 * sx, 50 * sy, 1300 * sx, 80 * sy]]}
+
+        self.assertEqual(
+            text_fit.widen_running_heads(rects, pages, dismissed), 0
+        )
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in rects[0]["rects"]], [(300, 1300)]
+        )
+
     def test_other_boxes_and_a_page_with_no_column_stay(self):
         from blackletter.models import Label
 
