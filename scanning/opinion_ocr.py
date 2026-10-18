@@ -305,6 +305,16 @@ FIGURE_SHARE = 0.5
 #: half of itself on that axis.
 EDGE_PT = 3.0
 
+#: A gap between two boxes no wider than this hides no line of print,
+#: so the share counts it as covered (:func:`bridge_seams`). Review 2
+#: draws one black box per headnote, and where one headnote ends and
+#: the next begins the two boxes leave a hairline of white paper, two
+#: points wide, that runs through the engine's cell for the heading
+#: below it; measured as uncovered, that hairline put every heading of
+#: a volume a point under :data:`FULL_SHARE` and raised a partial-cover
+#: card for a block the boxes cover whole.
+SEAM_PT = EDGE_PT
+
 #: How many rows one tick writes, all of one scan. One row is a cut of
 #: about four pages, a geometry over about 800 units and 30 boxes and
 #: two PUTs, about a third of a second; ten hold the serial scheduler
@@ -1297,7 +1307,34 @@ def covered_share(
             best, hit = share, rect
     if not clipped:
         return 0.0, None
-    return min(1.0, union_area(clipped) / area), hit
+    return min(1.0, union_area(bridge_seams(clipped)) / area), hit
+
+
+def bridge_seams(boxes: list[list[float]]) -> list[list[float]]:
+    """Return ``boxes`` with the seams between neighbours filled in.
+
+    Two boxes that overlap in one axis and stand apart in the other by
+    :data:`SEAM_PT` or less get a third box over the gap between them,
+    so the union reads them as one cover. A gap that narrow cannot hold
+    a line of print, and for the question the share answers, "could a
+    word be hiding where no box is?", it is no gap at all.
+
+    :param boxes: ``[x0, y0, x1, y1]`` lists, in points.
+    :returns: The boxes, plus one bridge per seam.
+    :rtype: list[list[float]]
+    """
+    bridges: list[list[float]] = []
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1 :]:
+            x0, x1 = max(a[0], b[0]), min(a[2], b[2])
+            y0, y1 = max(a[1], b[1]), min(a[3], b[3])
+            if x1 > x0 and y1 <= y0 and y0 - y1 <= SEAM_PT:
+                # One above the other: fill the strip between them.
+                bridges.append([x0, y1, x1, y0])
+            elif y1 > y0 and x1 <= x0 and x0 - x1 <= SEAM_PT:
+                # Side by side: fill the strip between them.
+                bridges.append([x1, y0, x0, y1])
+    return boxes + bridges
 
 
 def is_bracket_box(rect: dict, box: list[float]) -> bool:

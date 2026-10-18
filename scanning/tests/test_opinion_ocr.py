@@ -2719,6 +2719,31 @@ class TestTheCoveredShare(TestCase):
         self.assertGreaterEqual(share, opinion_ocr.FULL_SHARE)
         self.assertIs(hit, lower)
 
+    def test_a_hairline_seam_between_two_boxes_is_filled(self):
+        """The heading of the next headnote: a one-line cell of 25
+        points whose core reaches into the box above and the box below,
+        with the two-point seam review 2 leaves between them running
+        through it. Measured as uncovered, the seam put every heading
+        of a volume a point under the full share; the measure fills a
+        seam no wider than ``SEAM_PT``, which holds no line of print."""
+        upper = {"x0": 0, "y0": -100, "x1": 100, "y1": 12.3}
+        lower = {"x0": 0, "y0": 14.5, "x1": 100, "y1": 100}
+
+        share, hit = opinion_ocr.covered_share([0, 0, 100, 25], [upper, lower])
+
+        self.assertEqual(share, 1.0)
+        self.assertIn(hit, (upper, lower))
+
+    def test_a_gap_wider_than_a_seam_stays_uncovered(self):
+        """Five points between two boxes can hold a line of print: the
+        gap counts as uncovered, and the cell reads as partial."""
+        upper = {"x0": 0, "y0": -100, "x1": 100, "y1": 10}
+        lower = {"x0": 0, "y0": 15, "x1": 100, "y1": 100}
+
+        share, _ = opinion_ocr.covered_share([0, 0, 100, 25], [upper, lower])
+
+        self.assertLess(share, opinion_ocr.FULL_SHARE)
+
     def test_a_strip_that_grazes_the_edge_covers_nothing(self):
         """The bottom margin strip of a page overlaps the last cell of
         a footnote by two points: the footnote keeps its last word."""
