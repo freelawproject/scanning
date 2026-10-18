@@ -699,6 +699,82 @@ class TestTheAlignment(TestCase):
         self.assertTrue(groups[0]["excluded"])
         self.assertEqual(groups[0]["engines"]["dots_mocr"]["uncovered"], 0)
 
+    def test_words_another_engine_read_under_part_of_a_box_stay_out(self):
+        """One engine read the running head as one block, which the box
+        covers just short of whole; the others read the case name as a
+        block covered whole and "Conn. 51" as a block covered in part.
+        The case name is taken out of the long reading, and what is
+        left was read by the others only under a box, so it does not
+        ride out as clean text: the group is dropped."""
+        red = {"reason": "redaction", "rect_type": "PAGE_HEADER"}
+        units = [
+            unit(
+                "surya",
+                0,
+                (150, 40, 510, 54),
+                "MAYER v. BOARD Conn. 51",
+                red,
+                0.89,
+            ),
+            unit(
+                "dots_mocr", 0, (150, 41, 438, 52), "MAYER v. BOARD", red, 1.0
+            ),
+            unit("dots_mocr", 1, (457, 41, 508, 54), "Conn. 51", red, 0.57),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        kept = [g for g in groups if not g["excluded"]]
+        self.assertEqual(kept, [])
+        self.assertEqual(groups[0]["engines"]["surya"]["uncovered"], 0)
+
+    def test_two_engines_reading_one_block_under_part_of_a_box_both_uncover(
+        self,
+    ):
+        """Two engines read the block as one, a box covering its first
+        line; the third read that line as a unit covered whole and the
+        rest as clean text. Each long reading is the other's twin, and
+        a twin holds the line the uncover takes out, so it is not a
+        leftover beside the box: both keep what the box did not hide."""
+        red = {"reason": "redaction", "rect_type": "HEADNOTE"}
+        block = (100, 100, 300, 130)
+        units = [
+            unit("mistral_ocr", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit("surya", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit(
+                "dots_mocr", 0, (100, 100, 300, 112), "HIDDEN LINE", red, 1.0
+            ),
+            unit("dots_mocr", 1, (100, 116, 300, 130), "kept words"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        group = next(g for g in groups if not g["excluded"])
+        self.assertEqual(group["engines"]["mistral_ocr"]["text"], "kept words")
+        self.assertEqual(group["engines"]["surya"]["text"], "kept words")
+
+    def test_without_a_partial_reading_the_rest_is_uncovered(self):
+        """The control: no other engine read the rest under a box, so
+        the long reading keeps what the box did not hide."""
+        red = {"reason": "redaction", "rect_type": "PAGE_HEADER"}
+        units = [
+            unit(
+                "surya",
+                0,
+                (150, 40, 510, 54),
+                "MAYER v. BOARD Conn. 51",
+                red,
+                0.89,
+            ),
+            unit(
+                "dots_mocr", 0, (150, 41, 438, 52), "MAYER v. BOARD", red, 1.0
+            ),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(groups[0]["engines"]["surya"]["text"], "Conn. 51")
+
     def test_uncover_takes_the_run_with_its_whitespace_and_moves_the_marks(
         self,
     ):

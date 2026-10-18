@@ -1042,8 +1042,48 @@ class _Union:
 
 #: The reasons of ``opinion_ocr.verdict`` that are a box over the unit.
 _BOX_REASONS = frozenset(
-    {"redaction", "outside", opinion_ocr.PAGE_NUMBER, opinion_ocr.PICTURE}
+    {
+        "redaction",
+        "outside",
+        opinion_ocr.PAGE_NUMBER,
+        opinion_ocr.PICTURE,
+        opinion_ocr.RUNNING_HEAD,
+    }
 )
+
+
+def _partly_covered(
+    engine: str, by_engine: dict[str, list[dict]]
+) -> list[dict]:
+    """Return the units the other engines read only under part of a box.
+
+    A unit of another engine that a box covers in part (a box verdict
+    below :data:`opinion_ocr.FULL_SHARE`) with words in it. Its words
+    are not clean: the verdict took them for what the box hid. So a
+    reading that holds the place of one (:func:`_merge`) is never
+    uncovered by the things that box covered whole, or the words the
+    other engines dropped for the cover ride out in the one engine
+    that read them inside a larger block: a running head read with its
+    state abbreviation, a name beside a redacted headnote. A picture is
+    not among them: the words under it are not hidden text.
+
+    :param engine: The engine whose reading asks.
+    :param by_engine: ``{engine: its units of this group}``.
+    :returns: The units, each with its ``box_pt``.
+    :rtype: list[dict]
+    """
+    return [
+        unit
+        for other, members in by_engine.items()
+        if other != engine
+        for unit in members
+        if unit["exclusion"]
+        and unit["exclusion"].get("reason") in _BOX_REASONS
+        and unit["exclusion"].get("reason") != opinion_ocr.PICTURE
+        and unit["share"] < opinion_ocr.FULL_SHARE
+        and unit.get("box_pt")
+        and plain(unit["text"])
+    ]
 
 
 def _covered_things(
@@ -1222,6 +1262,7 @@ def _merge(
     boundary: float | None,
     width: float,
     things: list[dict] = (),
+    partials: list[dict] = (),
 ) -> dict:
     """Merge one engine's members of a group into one unit.
 
@@ -1238,6 +1279,12 @@ def _merge(
     :param width: The page width, in points.
     :param things: What the other engines read under the boxes of the
         group (:func:`_covered_things`), for :func:`_uncover`.
+    :param partials: What the other engines read only under part of a
+        box (:func:`_partly_covered`): a member that holds the place of
+        one is never uncovered, unless that one holds a thing the
+        uncover takes out. Then it is another engine's reading of the
+        same merged block, which uncovers the same way, and not a
+        leftover beside the box like "Conn. 51".
     :returns: The merged unit.
     :rtype: dict
     """
@@ -1257,7 +1304,19 @@ def _merge(
             continue
         found = None
         under = _things_under(things, member) if things else []
-        if under and member["share"] < opinion_ocr.FULL_SHARE:
+        if (
+            under
+            and member["share"] < opinion_ocr.FULL_SHARE
+            and not any(
+                contained(unit["box_pt"], member["box_pt"]) >= OVERLAP
+                and not any(
+                    contained(thing["box_pt"], unit["box_pt"]) >= OVERLAP
+                    for thing in under
+                )
+                for unit in partials
+                if member.get("box_pt")
+            )
+        ):
             found = _uncover(
                 member["text"],
                 member.get("marks") or [],
@@ -1377,6 +1436,7 @@ def _group(
             boundary,
             width,
             _covered_things(engine, by_engine),
+            _partly_covered(engine, by_engine),
         )
         for engine, members in by_engine.items()
     }
@@ -4192,6 +4252,7 @@ _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
     opinion_ocr.PAGE_NUMBER: "the page number",
+    opinion_ocr.RUNNING_HEAD: "the running head",
     opinion_ocr.UNDETECTED: "no detection",
     DROP_HUMAN: "a person",
 }
