@@ -741,16 +741,16 @@ class TestTheAlignment(TestCase):
         units = [
             unit("mistral_ocr", 0, block, "HIDDEN LINE kept words", red, 0.45),
             unit("surya", 0, block, "HIDDEN LINE kept words", red, 0.45),
-            unit("dots_mocr", 0, (100, 100, 300, 112), "HIDDEN LINE", red, 1.0),
+            unit(
+                "dots_mocr", 0, (100, 100, 300, 112), "HIDDEN LINE", red, 1.0
+            ),
             unit("dots_mocr", 1, (100, 116, 300, 130), "kept words"),
         ]
 
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
         group = next(g for g in groups if not g["excluded"])
-        self.assertEqual(
-            group["engines"]["mistral_ocr"]["text"], "kept words"
-        )
+        self.assertEqual(group["engines"]["mistral_ocr"]["text"], "kept words")
         self.assertEqual(group["engines"]["surya"]["text"], "kept words")
 
     def test_without_a_partial_reading_the_rest_is_uncovered(self):
