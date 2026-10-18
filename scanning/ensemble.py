@@ -1348,6 +1348,34 @@ def _merge(
     }
 
 
+def _partial_cover(merged: dict[str, dict]) -> bool:
+    """Return whether a box covers the group's place only in part.
+
+    An engine whose reading a redaction covers in part says some of
+    the place is outside the box; an engine whose reading a redaction
+    covers whole says none of it is. The engines draw their boxes
+    apart by a few points, so one box that sticks out past a redaction
+    the others read inside it is the engine's geometry and not text
+    the reader loses. The group is a partial cover when the engines
+    that say so are at least as many as the ones that read it covered
+    whole. Only the card follows the vote: the drop does not change.
+
+    :param merged: ``{engine: its merged reading of the group}``.
+    :returns: Whether the ``PARTIAL_REDACTION`` card counts the group.
+    :rtype: bool
+    """
+    partial = sum(1 for unit in merged.values() if unit["partial"])
+    whole = sum(
+        1
+        for unit in merged.values()
+        if unit["excluded"]
+        and not unit["partial"]
+        and unit["reason"] == "redaction"
+        and unit["hidden_key"]
+    )
+    return partial > 0 and partial >= whole
+
+
 def _round_box(box: list[float]) -> list[float]:
     """Return a box rounded the way the viewer draws it."""
     return [round(value, 2) for value in box]
@@ -1403,8 +1431,9 @@ def _group(
         "excluded": bool(excluded) and not clean,
         "reason": excluded[0]["reason"] if excluded else "",
         # A dropped group a box covered in part is text the reader
-        # loses, and the ``PARTIAL_REDACTION`` card says so (#365).
-        "partial": any(unit["partial"] for unit in merged.values()),
+        # loses, and the ``PARTIAL_REDACTION`` card says so (#365),
+        # unless more engines read the place covered whole.
+        "partial": _partial_cover(merged),
         # A dropped group a picture covered in part: the
         # ``FIGURE_TO_CHECK`` card names it (#463).
         "picture_partial": any(
