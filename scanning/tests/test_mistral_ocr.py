@@ -966,11 +966,25 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(summary.retried, 1)
         self.assertEqual(self.job.error_code, "DEADLINE_EXCEEDED")
 
-    def test_a_claim_with_no_batch_id_is_a_lost_claim(self):
-        # The scheduler is serial: a SUBMITTED row with no id at sweep
-        # time is a claim the daemon died holding.
+    def test_a_fresh_claim_with_no_batch_id_is_still_rendering(self):
+        # The sweep and the wave no longer share one serial scheduler
+        # (#503): a SUBMITTED row with no id inside LOST_CLAIM_AFTER is
+        # a shard another worker is rendering now.
         ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
         summary, mocks = self._sweep(mistral_client.BatchOutcome(status=None))
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        mocks["poll"].assert_not_called()
+
+    def test_an_old_claim_with_no_batch_id_is_a_lost_claim(self):
+        # Past the clock, a claim with no id is one a worker died holding.
+        ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
+        summary, mocks = self._sweep(
+            mistral_client.BatchOutcome(status=None),
+            now=timezone.now() + mistral_ocr.LOST_CLAIM_AFTER,
+        )
         self.assertEqual(summary.retried, 1)
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, JobStatus.PENDING)
