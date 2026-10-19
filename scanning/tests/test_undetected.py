@@ -756,6 +756,31 @@ class TestTheCutLine(ScanningTestCase):
 
         self.assertEqual(self.found(), [])
 
+    def test_a_cell_that_runs_off_the_page_is_cut_at_its_box_first(self):
+        """The glue cuts a reader's cell that runs past the page at the
+        box that holds it (``opinion_ocr.fit_overrun``). Measured raw,
+        the line read half covered and "Cover the line" stretched the
+        box past the page edge; fitted, the box covers it whole."""
+        column(self.scan, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=580.0, y1=385.0)
+        self.write(
+            cell("the words of the line", [300.0, 1000.0, 2400.0, 1050.0])
+        )
+
+        self.assertEqual(self.found(), [])
+
+    def test_the_cover_of_a_line_that_runs_off_the_page_stays_on_it(self):
+        column(self.scan, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=400.0, y1=385.0)
+        self.write(
+            cell("the words of the line", [300.0, 1000.0, 2400.0, 1050.0])
+        )
+
+        [finding] = self.found()
+
+        self.assertLessEqual(finding["metadata"]["cover"][2], 612.0)
+        self.assertLessEqual(finding["metadata"]["bbox"][2], 1700.0)
+
     def test_the_rebuild_writes_the_card_and_a_move_over_the_line_ends_it(
         self,
     ):

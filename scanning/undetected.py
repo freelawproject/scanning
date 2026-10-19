@@ -512,6 +512,7 @@ def cut_cells(
     size: tuple[float, float],
     rects: list[dict],
     head_spans: list[tuple[float, float]] = (),
+    frame: list[dict] | None = None,
 ) -> list[tuple[dict, list[float], float, dict]]:
     """Return the cells of a page a black redaction covers in part.
 
@@ -529,6 +530,9 @@ def cut_cells(
     :param size: The page size in points.
     :param rects: The page's visible redactions, in points.
     :param head_spans: The page's running-head lines, in points.
+    :param frame: ``opinion_ocr.page_frame`` of the page's detections:
+        a cell that runs off the page is cut at the box that holds it
+        (``opinion_ocr.fit_overrun``), the line the glue measures.
     :returns: ``(cell, box in points, share, the box that covers most)``.
     :rtype: list[tuple]
     """
@@ -543,7 +547,13 @@ def cut_cells(
         x1, y1 = boundaries.to_points(
             box[2], box[3], reading.img_width, reading.img_height, *size
         )
-        box_pt = [x0, y0, x1, y1]
+        # The glue's own reading of a cell that runs off the page, so
+        # the card measures, names and covers the line review 3 does.
+        box_pt = opinion_ocr.fit_overrun(
+            [x0, y0, x1, y1], size[0], size[1], frame
+        )
+        if box_pt is None:
+            continue
         if opinion_ocr.on_head_line(box_pt, list(head_spans)):
             continue
         black = [
@@ -604,7 +614,10 @@ def cut_lines(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
         )
         size = boundaries.to_points(width, height, width, height)
         heads = opinion_ocr.head_lines(rows, size)
-        for cell, box_pt, share, hit in cut_cells(reading, size, rects, heads):
+        frame = opinion_ocr.page_frame(rows, size)
+        for cell, box_pt, share, hit in cut_cells(
+            reading, size, rects, heads, frame
+        ):
             yield _cut_finding(
                 reading, cell, box_pt, share, hit, width, height, size
             )
