@@ -933,11 +933,9 @@ def write_apply_state(detect_jobs: list[ExternalJob], state: dict) -> None:
     :param state: The state to store.
     :return: None.
     """
-    head = detect_jobs[0]
-    meta = head.provider_meta or {}
-    meta["apply"] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    jobs.swap_provider_meta(
+        detect_jobs[0], lambda meta: meta.update(apply=state)
+    )
 
 
 def record_apply_start(detect_jobs: list[ExternalJob]) -> None:

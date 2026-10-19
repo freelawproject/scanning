@@ -1622,6 +1622,46 @@ def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
     return int(run_ledger(rows, key).get("attempts") or 0)
 
 
+#: How many times a ``provider_meta`` swap is tried before it gives up.
+META_SWAP_ATTEMPTS = 5
+
+
+def swap_provider_meta(row: ExternalJob, mutate) -> dict:
+    """Change a row's ``provider_meta`` by compare-and-swap (#503).
+
+    The ledgers of the passes (the glue counters, the apply state, the
+    tagger's glue count) are keys of one JSON field, and a plain save
+    of the field writes over whatever another pass wrote beside the
+    key since the read. With the passes on several workers that is
+    live, so the write goes as ``UPDATE ... WHERE provider_meta = <what
+    was read>``, read again and tried again on a lost swap, and the
+    last try writes anyway, because a lost counter is better than a
+    pass that never records its failure.
+
+    :param row: The row; its ``provider_meta`` is refreshed in place.
+    :param mutate: ``mutate(meta) -> None``, applied to a copy of the
+        current dict.
+    :returns: The dict written.
+    :rtype: dict
+    """
+    for attempt in range(META_SWAP_ATTEMPTS):
+        current = (
+            ExternalJob.objects.filter(pk=row.pk)
+            .values_list("provider_meta", flat=True)
+            .first()
+        )
+        new = dict(current or {})
+        mutate(new)
+        last = attempt == META_SWAP_ATTEMPTS - 1
+        query = ExternalJob.objects.filter(pk=row.pk)
+        if not last:
+            query = query.filter(provider_meta=current)
+        if query.update(provider_meta=new):
+            row.provider_meta = new
+            return new
+    raise AssertionError("unreachable: the last try is unguarded")
+
+
 def bump_run_ledger(
     rows: list[ExternalJob], key: str, exc: Exception
 ) -> tuple[int, ExternalJob]:
@@ -1644,20 +1684,22 @@ def bump_run_ledger(
     :rtype: tuple[int, ExternalJob]
     """
     head = rows[0]
-    meta = dict(head.provider_meta or {})
-    state = dict(meta.get(key) or {})
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta[key] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
-    return attempts, head
+    written: dict = {}
+
+    def bump(meta: dict) -> None:
+        state = dict(meta.get(key) or {})
+        state.update(
+            {
+                "attempts": int(state.get("attempts") or 0) + 1,
+                "last_error": str(exc)[:500],
+                "last_attempt_at": timezone.now().isoformat(),
+            }
+        )
+        meta[key] = state
+        written.update(state)
+
+    swap_provider_meta(head, bump)
+    return int(written["attempts"]), head
 
 
 @dataclass
