@@ -2163,6 +2163,25 @@ document.addEventListener('DOMContentLoaded', function () {
         }).catch(function() { showToast('Failed to save the box'); });
     }
 
+    // A box moved from outside the page's own handles (the sidebar's
+    // "Cover the line" of a redaction_cuts_text card): the row the
+    // server answered takes the new place, and the page is drawn again.
+    window.applyRedactionMove = function(pageIndex, oldId, newId, bbox) {
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            (entry.rects || []).forEach(function(rect) {
+                if (rect.id !== oldId) return;
+                rect.x0 = bbox.x0; rect.y0 = bbox.y0;
+                rect.x1 = bbox.x1; rect.y1 = bbox.y1;
+                if (newId !== undefined && newId !== oldId) {
+                    rect.id = newId;
+                    rect.origin = 'human';
+                }
+            });
+        });
+        drawRedactionOverlaysForPage(pageIndex);
+    };
+
     function drawRedactionOverlaysForPage(pdfIndex) {
         if (!redactionRects || !redactionsVisible) return;
         for (var i = 0; i < redactionRects.length; i++) {
