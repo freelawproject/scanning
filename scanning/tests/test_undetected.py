@@ -733,6 +733,24 @@ class TestTheCutLine(ScanningTestCase):
 
         self.assertEqual(self.found(), [])
 
+    def test_a_white_box_over_the_rest_of_the_line_makes_it_covered(self):
+        """Review 3 measures every visible box: a headnote box over the
+        start of the line and the margin strip over the rest cover it
+        whole, so the glue reads no partial cover and no card asks."""
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=330.0, y1=385.0)
+        make_redaction(
+            self.scan,
+            rect_type="margin",
+            fill="white",
+            x0=330.0,
+            y0=355.0,
+            x1=612.0,
+            y1=385.0,
+        )
+        self.write(cell("the words of the line", LINE))
+
+        self.assertEqual(self.found(), [])
+
     def test_a_speck_is_no_card(self):
         make_redaction(self.scan, x0=100.0, y0=355.0, x1=470.0, y1=385.0)
         self.write(cell("a.", LINE))

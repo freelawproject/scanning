@@ -61,7 +61,7 @@ from collections.abc import Iterator
 from blackletter.models import Label
 from django.db import transaction
 
-from scanning import boundaries, detections, opinion_ocr, redactions
+from scanning import boundaries, brackets, detections, opinion_ocr, redactions
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -517,12 +517,13 @@ def cut_cells(
     """Return the cells of a page a black redaction covers in part.
 
     The share is the glue's own (``opinion_ocr.covered_share``, the core
-    of the cell under the union of the boxes), and the band is the one
-    that makes review 3 drop the block as a partial cover: at least
-    ``EXCLUDE_SHARE`` and below ``FULL_SHARE``. Only the black boxes of
-    words count: a white one is a margin or the running head, and a
-    glyph's box (:data:`GLYPH_RECT_TYPES`, or a bracket a curator drew)
-    covers part of its line by design. A cell on the running head's line
+    of the cell under the union of the boxes) over the boxes review 3's
+    verdict measures (every visible box but a bracket's), and the band
+    is the one that makes review 3 drop the block as a partial cover:
+    at least ``EXCLUDE_SHARE`` and below ``FULL_SHARE``. A cell whose
+    box of most cover is white (a margin, the running head) or a
+    glyph's (:data:`GLYPH_RECT_TYPES`) is that box's job and no card.
+    A cell on the running head's line
     (``opinion_ocr.head_lines``) is no text either way: review 3 takes it
     whole, and the head's whiteout covers it on the page.
 
@@ -556,20 +557,33 @@ def cut_cells(
             continue
         if opinion_ocr.on_head_line(box_pt, list(head_spans)):
             continue
-        black = [
+        # The boxes review 3's verdict measures: every visible box but
+        # a bracket's (the glue deletes the token instead, #373), so a
+        # white or glyph box that covers the rest of the line counts,
+        # and a line the glue reads covered whole makes no card.
+        measured = [
             rect
             for rect in rects
-            if rect.get("fill") == "black"
-            and rect.get("rect_type") not in GLYPH_RECT_TYPES
-            and not opinion_ocr.is_bracket_box(rect, box_pt)
+            if rect.get("rect_type") != brackets.BRACKET_LABEL
+            and not (
+                rect.get("rect_type") in opinion_ocr.TOKEN_RECT_TYPES
+                and opinion_ocr.is_bracket_box(rect, box_pt)
+            )
         ]
-        if not black:
-            continue
-        share, hit = opinion_ocr.covered_share(box_pt, black)
+        share, hit = opinion_ocr.covered_share(box_pt, measured)
         if hit is None:
             continue
-        if opinion_ocr.EXCLUDE_SHARE <= share < opinion_ocr.FULL_SHARE:
-            out.append((cell, box_pt, share, hit))
+        if not opinion_ocr.EXCLUDE_SHARE <= share < opinion_ocr.FULL_SHARE:
+            continue
+        # The card is about a box of words: a line a white or a glyph's
+        # box covers most of is its job, a margin, the running head, a
+        # key beside its caption.
+        if (
+            hit.get("fill") != "black"
+            or hit.get("rect_type") in GLYPH_RECT_TYPES
+        ):
+            continue
+        out.append((cell, box_pt, share, hit))
     return out
 
 
@@ -577,7 +591,8 @@ def cut_lines(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
     """Yield one finding per line of text a redaction covers in part.
 
     The step-2 twin of review 3's ``PARTIAL_REDACTION`` card: a cell the
-    glue would measure under part of a box, read on the reader's cells
+    glue would measure under part of a box (the same boxes and the same
+    share), read on the reader's cells
     the compute stored, so the box is fixed before the approval. Two
     causes give one shape: a box the model drew short of its paragraph
     (the end of the line prints beside it), or a box that reaches into
