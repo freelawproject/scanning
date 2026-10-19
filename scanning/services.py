@@ -1706,6 +1706,25 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Apply the page numbers under the lock the bad-page score shares.
+
+    See :func:`_run_compute_issues`. The score (``badpage.scoring
+    .score_scan``) stamps and rebuilds under the same lock (#503), so
+    this apply never reads the scores before the stamp and opens the
+    review after the score's status check.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed.
+    :rtype: bool
+    """
+    from scanning import locks
+
+    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True):
+        return _run_compute_issues(scan, result_key)
+
+
+def _run_compute_issues(scan: "Scan", result_key: str) -> bool:
     """Read page numbers off a glued dots.mocr run and rebuild Issues.
 
     The apply step of issues #149/#204, called by

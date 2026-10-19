@@ -49,6 +49,7 @@ import numpy as np
 from django.conf import settings
 from django.utils import timezone
 
+from scanning import locks
 from scanning.badpage import features
 
 logger = logging.getLogger(__name__)
@@ -355,6 +356,10 @@ def record_failure(scan, reason: str) -> int:
     return attempts
 
 
+#: The lock the score and the page-number apply share (#503).
+ISSUES_LOCK = "issue_rebuild"
+
+
 def score_scan(scan, pdf, jobs: int | None = None) -> dict[int, float]:
     """Score a scan's bitonal copy, stamp it and rebuild its cards.
 
@@ -381,19 +386,25 @@ def score_scan(scan, pdf, jobs: int | None = None) -> dict[int, float]:
             f"{page_count}: the scores would address the wrong pages"
         )
     scores = score_pdf(pdf, jobs=jobs)
-    stamp(scan, scores)
-    scan.refresh_from_db()
-    if scan.ocr_results and scan.status in REVIEW_STATUSES:
-        # The stamp is the fact and it is written; a rebuild that
-        # fails must not read as a failed score, and the next recompute
-        # or page-number rebuild writes the cards anyway.
-        try:
-            services.recalculate_issues(scan)
-        except Exception:
-            logger.exception(
-                "bad-page score: scan %s scored, but the issue rebuild failed",
-                scan.pk,
-            )
+    # Under the lock the page-number apply holds for its own rebuild
+    # (``services.run_compute_issues``, #503): the two run on different
+    # workers now, and the apply must not read the scores before the
+    # stamp and open the review after the status check below.
+    with locks.held(ISSUES_LOCK, wait=True):
+        stamp(scan, scores)
+        scan.refresh_from_db()
+        if scan.ocr_results and scan.status in REVIEW_STATUSES:
+            # The stamp is the fact and it is written; a rebuild that
+            # fails must not read as a failed score, and the next
+            # recompute or page-number rebuild writes the cards anyway.
+            try:
+                services.recalculate_issues(scan)
+            except Exception:
+                logger.exception(
+                    "bad-page score: scan %s scored, but the issue "
+                    "rebuild failed",
+                    scan.pk,
+                )
     return scores
 
 
