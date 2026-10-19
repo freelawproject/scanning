@@ -728,6 +728,23 @@ class TestTheAlignment(TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(groups[0]["engines"]["surya"]["uncovered"], 0)
 
+    def test_a_speck_two_engines_read_does_not_outvote_a_partial_cover(self):
+        """dots.mocr reads a line a box covers in part; the other two
+        read only a speck there, under part of the same box. The specks
+        are no partial cover and no whole cover either, so the line
+        keeps its card."""
+        red = {"reason": "redaction", "rect_type": "EDITORIAL"}
+        box = (100, 100, 300, 112)
+        units = [
+            unit("dots_mocr", 0, box, "the end of the line", red, 0.6),
+            unit("mistral_ocr", 0, box, "a.", red, 0.6),
+            unit("surya", 0, box, "a.", red, 0.6),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(any(g["partial"] for g in groups))
+
     def test_two_engines_reading_one_block_under_part_of_a_box_both_uncover(
         self,
     ):
@@ -4702,10 +4719,24 @@ class TestThePartialCoverVote(TestCase):
     def reading(partial: bool, excluded: bool = True) -> dict:
         return {
             "partial": partial,
+            "whole": excluded and not partial,
             "excluded": excluded,
             "reason": "redaction" if excluded else "",
             "hidden_key": "words" if excluded else "",
         }
+
+    def test_an_engine_that_read_a_speck_votes_neither_way(self):
+        """A speck under part of the box is no partial cover, and no
+        whole cover either: it does not outvote the engines that read
+        the place covered in part."""
+        speck = {**self.reading(False), "whole": False}
+        merged = {
+            "dots_mocr": self.reading(True),
+            "mistral_ocr": speck,
+            "surya": {**speck},
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
 
     def test_one_engine_out_of_three_is_no_partial_cover(self):
         merged = {

@@ -1356,6 +1356,12 @@ def _merge(
     judged = kept or ordered
     kind = _kind_of(judged)
     excluded = out
+    redacted = [
+        m
+        for m in excluded
+        if (m["exclusion"] or {}).get("reason") == "redaction"
+        and plain(m["text"])
+    ]
     partial = [
         m
         for m in excluded
@@ -1399,6 +1405,11 @@ def _merge(
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        # Whether a box covers every reading of this engine here whole:
+        # the vote of ``_partial_cover`` on the other side. A speck the
+        # partial filter left out is neither, so it votes neither way.
+        "whole": bool(redacted)
+        and all(m["share"] >= opinion_ocr.FULL_SHARE for m in redacted),
         "picture_partial": picture_partial,
         # Whether the OCR glue deleted a bracket token of a member
         # (``removed``, #373). A drop of such a group writes no
@@ -1439,12 +1450,7 @@ def _partial_cover(merged: dict[str, dict]) -> bool:
     """
     partial = sum(1 for unit in merged.values() if unit["partial"])
     whole = sum(
-        1
-        for unit in merged.values()
-        if unit["excluded"]
-        and not unit["partial"]
-        and unit["reason"] == "redaction"
-        and unit["hidden_key"]
+        1 for unit in merged.values() if unit["excluded"] and unit.get("whole")
     )
     return partial > 0 and partial >= whole
 
