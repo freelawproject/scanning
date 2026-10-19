@@ -54,6 +54,16 @@ WORD = "word"
 BLOCK = "block"
 SINGLE = "single"
 LINK = "link"
+#: A ``cover`` card is a ``PARTIAL_REDACTION`` finding: the crop of the
+#: blocks a box covers in part, each outlined, over the redacted page,
+#: so a person sees whether any word shows past the box. "Looks right"
+#: dismisses it.
+COVER = "cover"
+
+#: The least crop of a ``cover`` card, in points: a column's width and
+#: five lines, so a block of one word shows the redaction beside it.
+COVER_MIN_WIDTH_PT = 220.0
+COVER_MIN_HEIGHT_PT = 5 * LINE_PT
 
 #: A voted block with more open words than this is one ``block`` card
 #: and not a card per word: 71 words of a table Mistral read as noise
@@ -393,6 +403,57 @@ def block_crop(box: list[float]) -> dict:
     }
 
 
+def _cover_card(page: dict, finding) -> dict | None:
+    """Return the ``cover`` card of a page's ``PARTIAL_REDACTION`` card.
+
+    The blocks are the page's partial drops the card counts (a drop of
+    a group that lost a bracket token is in ``partial_bracket`` and not
+    the card's, ``ensemble._partial_message``), each with the box the
+    alignment found. The crop is their union, :data:`CROP_PAD_PT` wider
+    and a line taller on each side, so the edge of the redaction shows.
+    None when the document records no box for them (a document written
+    before the drops carried one): the link card stands in.
+
+    :param page: The page of the stamped document.
+    :param finding: The page's open ``PARTIAL_REDACTION`` finding.
+    :returns: The card, or None.
+    :rtype: dict | None
+    """
+    boxes = [
+        drop["box_pt"]
+        for drop in page.get("dropped") or []
+        if drop.get("partial")
+        and not drop.get("bracket")
+        and drop.get("box_pt")
+    ]
+    if not boxes:
+        return None
+    x0 = min(b[0] for b in boxes) - CROP_PAD_PT
+    y0 = min(b[1] for b in boxes) - LINE_PT
+    x1 = max(b[2] for b in boxes) + CROP_PAD_PT
+    y1 = max(b[3] for b in boxes) + LINE_PT
+    # A block of a word or two is shown with the page around it, or the
+    # crop is a few letters blown up and nothing can be judged.
+    grow_x = max(0.0, COVER_MIN_WIDTH_PT - (x1 - x0)) / 2
+    grow_y = max(0.0, COVER_MIN_HEIGHT_PT - (y1 - y0)) / 2
+    return {
+        **_link_card(finding),
+        "kind": COVER,
+        "boxes": boxes,
+        "crop": {
+            "crop": [
+                round(max(0.0, x0 - grow_x), 2),
+                round(max(0.0, y0 - grow_y), 2),
+                round(x1 + grow_x, 2),
+                round(y1 + grow_y, 2),
+            ],
+            "highlight": None,
+            "line": None,
+            "lines": None,
+        },
+    }
+
+
 def _place(page: dict, group: dict) -> str:
     """Return where on the page a block sits, for the card's header."""
     section = (
@@ -537,6 +598,11 @@ def cards(
         for finding in page_findings:
             if finding.pk in answered:
                 continue
+            if finding.check_name == OpinionCheck.PARTIAL_REDACTION:
+                cover = _cover_card(page, finding)
+                if cover is not None:
+                    out.append(cover)
+                    continue
             # A card the groups did not answer, the ``NO_MAJORITY`` card
             # of a page whose blocks hold no open word included: a text
             # written under another rule. The card is still open and
@@ -626,7 +692,16 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
     for finding in page_findings:
         if finding.pk in answered:
             continue
-        out.append({**_link_card(finding), "level": ensemble.WARNING})
+        # A text built before the card blocked keeps it as a warning
+        # until its next build; it is the same card here.
+        cover = (
+            _cover_card(page, finding)
+            if finding.check_name == OpinionCheck.PARTIAL_REDACTION
+            else None
+        )
+        out.append(
+            {**(cover or _link_card(finding)), "level": ensemble.WARNING}
+        )
     return out
 
 

@@ -1853,6 +1853,9 @@ class TestTheFindings(EnsembleTestCase):
         cards = self.rebuild(partial=1)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.PARTIAL_REDACTION)
+        # A redaction drawn short leaves words on the page: the approval
+        # waits on a person.
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
 
     def test_blocks_where_the_detections_drew_nothing_are_a_card(self):
         cards = self.rebuild(undetected=2)

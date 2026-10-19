@@ -1361,6 +1361,10 @@ def _merge(
         for m in excluded
         if (m["exclusion"] or {}).get("reason") == "redaction"
         and m["share"] < opinion_ocr.FULL_SHARE
+        # A speck an engine read as a character or two under the edge
+        # of a box is no text a reader loses (218 A.3d: one mark in the
+        # margin under the strip), and no card asks about it.
+        and _letters(m["text"]) >= PARTIAL_MIN_LETTERS
     ]
     # Whether this engine read a word here that no exclusion covers.
     clean = any(plain(m["text"]) for m in kept)
@@ -1405,6 +1409,16 @@ def _merge(
         # Never their words: they are the text under a redaction.
         "uncovered": uncovered,
     }
+
+
+#: The least letters and digits of a reading a box covers in part for
+#: the ``PARTIAL_REDACTION`` card to count it: fewer is a speck.
+PARTIAL_MIN_LETTERS = 3
+
+
+def _letters(text: str) -> int:
+    """Return how many letters and digits ``text`` holds."""
+    return sum(1 for char in text or "" if char.isalnum())
 
 
 def _partial_cover(merged: dict[str, dict]) -> bool:
@@ -4210,12 +4224,16 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
         if counts["partial"]:
+            # A box that covers part of a block is either an engine's
+            # box running past it or a redaction drawn short, and the
+            # second leaves words on the page: the approval waits until
+            # a person has looked at the block and dismissed the card.
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.PARTIAL_REDACTION,
-                    Issue.Severity.WARNING,
+                    Issue.Severity.ERROR,
                     _partial_message(page),
                     standing,
                 )

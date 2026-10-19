@@ -459,6 +459,113 @@ class TestCards(TestCase):
         self.assertEqual([c["kind"] for c in cards], ["link"])
         self.assertEqual(cards[0]["finding_pk"], 11)
 
+    def test_a_partial_redaction_is_a_cover_card_of_its_blocks(self):
+        """The page's partial drops, each outlined: the crop holds them
+        all, with the page around a short one, and a bracket drop is
+        not the card's."""
+        document = {
+            "pages": [
+                {
+                    "page_in_opinion": 0,
+                    "groups": [],
+                    "dropped": [
+                        {"partial": True, "box_pt": [100, 200, 140, 210]},
+                        {"partial": True, "box_pt": [100, 400, 300, 430]},
+                        {
+                            "partial": True,
+                            "bracket": True,
+                            "box_pt": [50, 50, 60, 60],
+                        },
+                        {"partial": False, "box_pt": [0, 0, 10, 10]},
+                    ],
+                }
+            ]
+        }
+
+        cards = blocking_review.cards(
+            document, [finding(0, OpinionCheck.PARTIAL_REDACTION, 21)]
+        )
+
+        self.assertEqual([c["kind"] for c in cards], [blocking_review.COVER])
+        card = cards[0]
+        self.assertEqual(card["finding_pk"], 21)
+        self.assertEqual(
+            card["boxes"], [[100, 200, 140, 210], [100, 400, 300, 430]]
+        )
+        x0, y0, x1, y1 = card["crop"]["crop"]
+        self.assertLessEqual(
+            (x0, y0),
+            (100 - blocking_review.CROP_PAD_PT, 200 - blocking_review.LINE_PT),
+        )
+        self.assertGreaterEqual(
+            (x1, y1),
+            (300 + blocking_review.CROP_PAD_PT, 430 + blocking_review.LINE_PT),
+        )
+        self.assertGreaterEqual(x1 - x0, blocking_review.COVER_MIN_WIDTH_PT)
+
+    def test_a_short_block_is_shown_with_the_page_around_it(self):
+        document = {
+            "pages": [
+                {
+                    "page_in_opinion": 0,
+                    "groups": [],
+                    "dropped": [
+                        {"partial": True, "box_pt": [200, 300, 210, 308]}
+                    ],
+                }
+            ]
+        }
+
+        [card] = blocking_review.cards(
+            document, [finding(0, OpinionCheck.PARTIAL_REDACTION, 21)]
+        )
+
+        x0, y0, x1, y1 = card["crop"]["crop"]
+        self.assertAlmostEqual(x1 - x0, blocking_review.COVER_MIN_WIDTH_PT)
+        self.assertAlmostEqual(y1 - y0, blocking_review.COVER_MIN_HEIGHT_PT)
+        self.assertAlmostEqual((x0 + x1) / 2, 205)
+
+    def test_a_partial_redaction_with_no_box_is_a_link(self):
+        """A document written before the drops carried a box."""
+        document = {
+            "pages": [
+                {
+                    "page_in_opinion": 0,
+                    "groups": [],
+                    "dropped": [{"partial": True}],
+                }
+            ]
+        }
+
+        cards = blocking_review.cards(
+            document, [finding(0, OpinionCheck.PARTIAL_REDACTION, 21)]
+        )
+
+        self.assertEqual([c["kind"] for c in cards], [blocking_review.LINK])
+
+    def test_a_warning_partial_redaction_is_a_cover_card_too(self):
+        """A text built before the card blocked keeps it as a warning."""
+        document = {
+            "pages": [
+                {
+                    "page_in_opinion": 0,
+                    "groups": [],
+                    "dropped": [
+                        {"partial": True, "box_pt": [100, 200, 300, 230]}
+                    ],
+                }
+            ]
+        }
+
+        cards = blocking_review.cards(
+            document,
+            [finding(0, OpinionCheck.PARTIAL_REDACTION, 21)],
+            ensemble.WARNING,
+        )
+
+        self.assertEqual([c["kind"] for c in cards], [blocking_review.COVER])
+        self.assertEqual(cards[0]["level"], ensemble.WARNING)
+
     def test_a_warning_block_and_a_dismissed_page_make_no_card(self):
         settled = read("a b c", "a b c", "a x c")
         settled.update(
