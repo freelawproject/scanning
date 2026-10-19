@@ -1304,27 +1304,50 @@ def covered_share(
     area = (core[2] - core[0]) * (core[3] - core[1])
     if area <= 0:
         return 0.0, None
-    best, hit = 0.0, None
-    clipped: list[list[float]] = []
-    for rect in rects:
-        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
-        if other is None:
-            continue
-        clip = [
+
+    def clip(other: list[float]) -> list[float] | None:
+        piece = [
             max(core[0], other[0]),
             max(core[1], other[1]),
             min(core[2], other[2]),
             min(core[3], other[3]),
         ]
-        if clip[2] <= clip[0] or clip[3] <= clip[1]:
+        if piece[2] <= piece[0] or piece[3] <= piece[1]:
+            return None
+        return piece
+
+    best, hit = 0.0, None
+    boxes: list[list[float]] = []
+    for rect in rects:
+        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+        if other is None:
             continue
-        clipped.append(clip)
-        share = (clip[2] - clip[0]) * (clip[3] - clip[1]) / area
+        boxes.append(other)
+        piece = clip(other)
+        if piece is None:
+            continue
+        share = (piece[2] - piece[0]) * (piece[3] - piece[1]) / area
         if share > best:
             best, hit = share, rect
-    if not clipped:
+    if hit is None:
         return 0.0, None
-    return min(1.0, union_area(bridge_seams(clipped)) / area), hit
+    # The seams are bridged between the whole boxes and only then cut
+    # to the core: a seam just past the core's edge leaves the box
+    # beyond it outside the core, and a bridge between the cut pieces
+    # would find no neighbour to reach (218 A.3d, a headnote line read
+    # 85% covered across a 2.2 pt seam). Only the boxes within a seam
+    # of the core can bridge into it, so the pairwise pass runs over
+    # those few and not over every box of the page.
+    near = [
+        box
+        for box in boxes
+        if box[0] < core[2] + SEAM_PT
+        and box[2] > core[0] - SEAM_PT
+        and box[1] < core[3] + SEAM_PT
+        and box[3] > core[1] - SEAM_PT
+    ]
+    pieces = [piece for piece in map(clip, bridge_seams(near)) if piece]
+    return min(1.0, union_area(pieces) / area), hit
 
 
 def bridge_seams(boxes: list[list[float]]) -> list[list[float]]:

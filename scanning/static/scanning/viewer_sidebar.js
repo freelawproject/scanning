@@ -409,6 +409,48 @@ function addGuessedDetection(btn, variant) {
         });
 }
 
+// "Cover the line" of a card about a redaction that covers part of a
+// line of text: the box is moved to cover the whole line (the card's
+// ``cover``, the box grown over the reader's cell), through the same
+// endpoint as a drag of its handles. A computed box becomes a
+// hand-drawn one the next compute keeps, and the endpoint rebuilt the
+// findings, so the card goes.
+function coverCutLine(btn) {
+    var row = btn.closest("[data-redaction-id]");
+    if (!row) return;
+    var cfg = window.SCAN_CONFIG;
+    var id = parseInt(row.dataset.redactionId);
+    var cover = row.dataset.cover.split(",").map(function (v) { return parseFloat(v); });
+    var bbox = { x0: cover[0], y0: cover[1], x1: cover[2], y1: cover[3] };
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/move/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+        body: JSON.stringify(bbox),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not move the box");
+                return;
+            }
+            if (window.applyRedactionMove) {
+                window.applyRedactionMove(parseInt(row.dataset.pageIndex), id, data.id, bbox);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not move the box");
+        });
+}
+
 // The "+" of a missing-caption row under an opinion card: a caption
 // box drawn where the card guesses the caption is (the row's boxes,
 // the ones a click flashes), through the same endpoint as the drawer.

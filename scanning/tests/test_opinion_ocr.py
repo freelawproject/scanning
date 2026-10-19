@@ -2801,6 +2801,22 @@ class TestTheCoveredShare(TestCase):
         self.assertEqual(share, 1.0)
         self.assertIn(hit, (upper, lower))
 
+    def test_a_seam_just_past_the_cores_edge_is_filled(self):
+        """218 A.3d, printed page 878: the upper box ends a point above
+        the core of the line, so the core holds none of it, and a seam
+        bridged between the pieces cut to the core found no neighbour
+        and left 15 per cent of the line uncovered. The seams are
+        bridged between the whole boxes and only then cut."""
+        upper = {"x0": 98.1, "y0": 602.4, "x1": 297.7, "y1": 679.0}
+        lower = {"x0": 98.1, "y0": 681.2, "x1": 297.7, "y1": 722.9}
+
+        share, hit = opinion_ocr.covered_share(
+            [98.0, 677.0, 202.0, 691.0], [upper, lower]
+        )
+
+        self.assertEqual(share, 1.0)
+        self.assertIs(hit, lower)
+
     def test_a_gap_wider_than_a_seam_stays_uncovered(self):
         """Five points between two boxes can hold a line of print: the
         gap counts as uncovered, and the cell reads as partial."""

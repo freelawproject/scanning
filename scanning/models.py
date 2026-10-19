@@ -1113,6 +1113,10 @@ class CheckName(models.TextChoices):
         "uncovered_editors_note",
         "Editor's note not covered by a redaction",
     )
+    REDACTION_CUTS_TEXT = (
+        "redaction_cuts_text",
+        "Redaction covers part of a line of text",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1186,6 +1190,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
         CheckName.UNCOVERED_EDITORS_NOTE,
         CheckName.UNDETECTED_TEXT,
+        CheckName.REDACTION_CUTS_TEXT,
     }
 )
 

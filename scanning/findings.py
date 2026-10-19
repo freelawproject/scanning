@@ -175,6 +175,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(brackets.missing(scan, rows, run))
         found.extend(editorial.uncovered(scan, run))
         found.extend(undetected.uncovered(scan, run))
+        found.extend(undetected.cut_lines(scan, run))
     resolve(scan, found)
     with transaction.atomic():
         # One row lock on the scan serializes the rebuilds. Under READ

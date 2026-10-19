@@ -61,7 +61,7 @@ from collections.abc import Iterator
 from blackletter.models import Label
 from django.db import transaction
 
-from scanning import boundaries, detections, opinion_ocr, redactions
+from scanning import boundaries, brackets, detections, opinion_ocr, redactions
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -476,5 +476,222 @@ def _finding(
             "source_page": reading.source_page,
             "cells": len(cells),
             "no_column": no_column,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# A redaction that covers part of a line
+# ---------------------------------------------------------------------------
+
+#: The black boxes that cover a glyph and not words: a bracket, the key
+#: icon, the divider rule. One of them over part of a line is its job.
+GLYPH_RECT_TYPES = frozenset({"HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER"})
+
+#: A cell with fewer letters and digits than this is a speck the reader
+#: read as a character, and no card asks about it.
+MIN_CUT_LETTERS = 3
+
+
+#: How a card names the box that cuts the line.
+_BOX_WORDS = {
+    "headnote": "A headnote box",
+    "EDITORIAL": "An editor's note box",
+    "CASE_SEQUENCE": "A case sequence box",
+    "manual": "A hand-drawn box",
+}
+
+
+def _letters(text: str) -> int:
+    """Return how many letters and digits ``text`` holds."""
+    return sum(1 for char in text or "" if char.isalnum())
+
+
+def cut_cells(
+    reading: TextReading,
+    size: tuple[float, float],
+    rects: list[dict],
+    head_spans: list[tuple[float, float]] = (),
+    frame: list[dict] | None = None,
+) -> list[tuple[dict, list[float], float, dict]]:
+    """Return the cells of a page a black redaction covers in part.
+
+    The share is the glue's own (``opinion_ocr.covered_share``, the core
+    of the cell under the union of the boxes) over the boxes review 3's
+    verdict measures (every visible box but a bracket's), and the band
+    is the one that makes review 3 drop the block as a partial cover:
+    at least ``EXCLUDE_SHARE`` and below ``FULL_SHARE``. A cell whose
+    box of most cover is white (a margin, the running head) or a
+    glyph's (:data:`GLYPH_RECT_TYPES`) is that box's job and no card.
+    A cell on the running head's line
+    (``opinion_ocr.head_lines``) is no text either way: review 3 takes it
+    whole, and the head's whiteout covers it on the page.
+
+    :param reading: The page's reading.
+    :param size: The page size in points.
+    :param rects: The page's visible redactions, in points.
+    :param head_spans: The page's running-head lines, in points.
+    :param frame: ``opinion_ocr.page_frame`` of the page's detections:
+        a cell that runs off the page is cut at the box that holds it
+        (``opinion_ocr.fit_overrun``), the line the glue measures.
+    :returns: ``(cell, box in points, share, the box that covers most)``.
+    :rtype: list[tuple]
+    """
+    out = []
+    for cell in reading.cells or []:
+        box = _box(cell.get("box"))
+        if box is None or _letters(cell.get("text")) < MIN_CUT_LETTERS:
+            continue
+        x0, y0 = boundaries.to_points(
+            box[0], box[1], reading.img_width, reading.img_height, *size
+        )
+        x1, y1 = boundaries.to_points(
+            box[2], box[3], reading.img_width, reading.img_height, *size
+        )
+        # The glue's own reading of a cell that runs off the page, so
+        # the card measures, names and covers the line review 3 does.
+        box_pt = opinion_ocr.fit_overrun(
+            [x0, y0, x1, y1], size[0], size[1], frame
+        )
+        if box_pt is None:
+            continue
+        if opinion_ocr.on_head_line(box_pt, list(head_spans)):
+            continue
+        # The boxes review 3's verdict measures: every visible box but
+        # a bracket's (the glue deletes the token instead, #373), so a
+        # white or glyph box that covers the rest of the line counts,
+        # and a line the glue reads covered whole makes no card.
+        measured = [
+            rect
+            for rect in rects
+            if rect.get("rect_type") != brackets.BRACKET_LABEL
+            and not (
+                rect.get("rect_type") in opinion_ocr.TOKEN_RECT_TYPES
+                and opinion_ocr.is_bracket_box(rect, box_pt)
+            )
+        ]
+        share, hit = opinion_ocr.covered_share(box_pt, measured)
+        if hit is None:
+            continue
+        if not opinion_ocr.EXCLUDE_SHARE <= share < opinion_ocr.FULL_SHARE:
+            continue
+        # The card is about a box of words: a line a white or a glyph's
+        # box covers most of is its job, a margin, the running head, a
+        # key beside its caption.
+        if (
+            hit.get("fill") != "black"
+            or hit.get("rect_type") in GLYPH_RECT_TYPES
+        ):
+            continue
+        out.append((cell, box_pt, share, hit))
+    return out
+
+
+def cut_lines(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+    """Yield one finding per line of text a redaction covers in part.
+
+    The step-2 twin of review 3's ``PARTIAL_REDACTION`` card: a cell the
+    glue would measure under part of a box (the same boxes and the same
+    share), read on the reader's cells
+    the compute stored, so the box is fixed before the approval. Two
+    causes give one shape: a box the model drew short of its paragraph
+    (the end of the line prints beside it), or a box that reaches into
+    text that stays. Rows alone, the rule of ``findings.rebuild``.
+
+    :param scan: The scan.
+    :param run: The apply run the rows are measured against, or None.
+    :yields: The finding dicts ``findings.rebuild`` writes.
+    """
+    readings = list(
+        TextReading.objects.filter(scan=scan, apply_run=run).order_by(
+            "page_index"
+        )
+    )
+    if not readings:
+        return
+    rects_by_page = {
+        entry["page_index"]: entry["rects"]
+        for entry in redactions.visible_by_page(scan)
+    }
+    by_page: dict[int, list[Detection]] = {}
+    for row in Detection.objects.live().filter(scan=scan, apply_run=run):
+        by_page.setdefault(row.page_index, []).append(row)
+    for reading in readings:
+        rects = rects_by_page.get(reading.page_index)
+        if not rects or not reading.img_width or not reading.img_height:
+            continue
+        rows = by_page.get(reading.page_index, [])
+        sized = next((r for r in rows if r.img_width and r.img_height), None)
+        width, height = (
+            (sized.img_width, sized.img_height)
+            if sized is not None
+            else (reading.img_width, reading.img_height)
+        )
+        size = boundaries.to_points(width, height, width, height)
+        heads = opinion_ocr.head_lines(rows, size)
+        frame = opinion_ocr.page_frame(rows, size)
+        for cell, box_pt, share, hit in cut_cells(
+            reading, size, rects, heads, frame
+        ):
+            yield _cut_finding(
+                reading, cell, box_pt, share, hit, width, height, size
+            )
+
+
+def _cut_finding(
+    reading: TextReading,
+    cell: dict,
+    box_pt: list[float],
+    share: float,
+    hit: dict,
+    width: int,
+    height: int,
+    size: tuple[float, float],
+) -> dict:
+    """Build the finding dict of one line a redaction covers in part.
+
+    ``bbox`` is the cell in the pixels of the detections' render, the
+    space every finding's box is in and the address a dismissal keys
+    on, with the box's type as its label. ``cover`` is the redaction
+    grown over the cell, in points, the box "Cover the line" moves it
+    to; ``redaction_id`` names the box.
+    """
+    sx, sy = width / size[0], height / size[1]
+    bbox = [
+        round(box_pt[0] * sx, 1),
+        round(box_pt[1] * sy, 1),
+        round(box_pt[2] * sx, 1),
+        round(box_pt[3] * sy, 1),
+    ]
+    cover = [
+        round(min(hit["x0"], box_pt[0]), 1),
+        round(min(hit["y0"], box_pt[1]), 1),
+        round(max(hit["x1"], box_pt[2]), 1),
+        round(max(hit["y1"], box_pt[3]), 1),
+    ]
+    # The message quotes no word of the line: the line is partly under
+    # the box, so its words may be the redacted ones.
+    kind = _BOX_WORDS.get(hit.get("rect_type") or "", "A redaction box")
+    return {
+        "check_name": CheckName.REDACTION_CUTS_TEXT,
+        "target": Issue.Target.REDACTION,
+        "page_number": reading.page_index + 1,
+        "message": (
+            f"{kind} covers {round(share * 100)}% of a line of text. Either "
+            "the box stops short and the rest of the line prints beside it, "
+            "or it reaches into text that should stay. Cover the line, pull "
+            "the box's edge back, or dismiss the card."
+        ),
+        "metadata": {
+            "page_index": reading.page_index,
+            "label": hit.get("rect_type") or "",
+            "bbox": bbox,
+            "img_width": width,
+            "img_height": height,
+            "source_edit": reading.source_edit_id,
+            "source_page": reading.source_page,
+            "redaction_id": hit.get("id"),
+            "cover": cover,
+            "share": round(share, 3),
         },
     }
