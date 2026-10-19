@@ -2893,8 +2893,15 @@ def _submit_runpod_engine_wave(
         setattr(summary, result, getattr(summary, result) + 1)
 
 
-def submit_pending(limit: int | None = None) -> SubmitSummary:
+def submit_pending(
+    limit: int | None = None, providers: tuple[str, ...] | None = None
+) -> SubmitSummary:
     """Submit one wave per provider and record what happened.
+
+    ``providers`` names the waves to run, in the table's order; ``None``
+    runs them all, the daemon's serial tick. A Celery tick task names
+    one (#503), so the doctor wave holding its sockets and the Mistral
+    wave rendering a shard each block only their own queue.
 
     Each provider counts its own in-flight rows against its own cap, so
     one saturated endpoint cannot starve another. Doctor's ceiling is
@@ -2915,18 +2922,23 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
+    :param providers: The ``JobProvider`` values whose waves run, or
+        ``None`` for every one.
     :returns: Counts of what the tick did, summed over the waves.
     :rtype: SubmitSummary
     """
     summary = SubmitSummary()
-    providers = _providers()
+    table = _providers()
+    if providers is None:
+        providers = tuple(table)
+    specs = {name: table[name] for name in providers}
     if not s3_sync.s3_active():
         # Every provider reads its input from the bucket -- through a
         # presigned GET, or downloaded by the daemon -- so without S3
         # the shards were never uploaded: every request would 404 and
         # burn a job's whole retry budget under a misleading code. Say
         # so once instead.
-        if any(spec.is_enabled() for spec in providers.values()):
+        if any(spec.is_enabled() for spec in specs.values()):
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -2938,7 +2950,7 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     # The table's insertion order is the wave order (see
     # ``_providers``): what a person waits behind goes first, and the
     # wave nothing waits behind goes last.
-    for spec in providers.values():
+    for spec in specs.values():
         if spec.is_enabled():
             spec.submit_wave(summary, limit)
     return summary
