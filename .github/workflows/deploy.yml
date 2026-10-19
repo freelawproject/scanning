@@ -163,11 +163,42 @@ jobs:
       - name: Watch scanning-daemon rollout status
         run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/scanning-daemon
 
+  deploy-workers:
+    needs: [get-pr-labels, setup-deploy]
+    runs-on: ubuntu-latest
+    if: ${{ !contains(needs.get-pr-labels.outputs.labels, 'skip-daemon-deploy') }}
+    strategy:
+      matrix:
+        # The Celery workers (#503): one deployment per queue of
+        # scanning.tasks, each the daemon image with the `worker`
+        # entrypoint command and its CELERY_QUEUES. The daemon
+        # deployment above is the clock that sends their ticks.
+        deployment:
+          - scanning-celery-worker-fast
+          - scanning-celery-worker-io
+          - scanning-celery-worker-heavy
+          - scanning-celery-worker-opinions
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Create Kubeconfig with AWS CLI
+        run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
+
+      - name: Rollout ${{ matrix.deployment }}
+        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} ${{ matrix.deployment }}=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
+      - name: Watch ${{ matrix.deployment }} rollout status
+        run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }}
+
   complete-deploy:
     needs:
       [
         deploy-web,
         deploy-daemon,
+        deploy-workers,
       ]
     runs-on: ubuntu-latest
     concurrency: production
