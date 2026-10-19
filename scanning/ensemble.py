@@ -1356,11 +1356,21 @@ def _merge(
     judged = kept or ordered
     kind = _kind_of(judged)
     excluded = out
+    redacted = [
+        m
+        for m in excluded
+        if (m["exclusion"] or {}).get("reason") == "redaction"
+        and plain(m["text"])
+    ]
     partial = [
         m
         for m in excluded
         if (m["exclusion"] or {}).get("reason") == "redaction"
         and m["share"] < opinion_ocr.FULL_SHARE
+        # A speck an engine read as a character or two under the edge
+        # of a box is no text a reader loses (218 A.3d: one mark in the
+        # margin under the strip), and no card asks about it.
+        and _letters(m["text"]) >= PARTIAL_MIN_LETTERS
     ]
     # Whether this engine read a word here that no exclusion covers.
     clean = any(plain(m["text"]) for m in kept)
@@ -1395,6 +1405,11 @@ def _merge(
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        # Whether a box covers every reading of this engine here whole:
+        # the vote of ``_partial_cover`` on the other side. A speck the
+        # partial filter left out is neither, so it votes neither way.
+        "whole": bool(redacted)
+        and all(m["share"] >= opinion_ocr.FULL_SHARE for m in redacted),
         "picture_partial": picture_partial,
         # Whether the OCR glue deleted a bracket token of a member
         # (``removed``, #373). A drop of such a group writes no
@@ -1405,6 +1420,39 @@ def _merge(
         # Never their words: they are the text under a redaction.
         "uncovered": uncovered,
     }
+
+
+#: The least letters and digits of a reading a box covers in part for
+#: the ``PARTIAL_REDACTION`` card to count it: fewer is a speck.
+PARTIAL_MIN_LETTERS = 3
+
+
+def _letters(text: str) -> int:
+    """Return how many letters and digits ``text`` holds."""
+    return sum(1 for char in text or "" if char.isalnum())
+
+
+def _partial_cover(merged: dict[str, dict]) -> bool:
+    """Return whether a box covers the group's place only in part.
+
+    An engine whose reading a redaction covers in part says some of
+    the place is outside the box; an engine whose reading a redaction
+    covers whole says none of it is. The engines draw their boxes
+    apart by a few points, so one box that sticks out past a redaction
+    the others read inside it is the engine's geometry and not text
+    the reader loses. The group is a partial cover when the engines
+    that say so are at least as many as the ones that read it covered
+    whole. Only the card follows the vote: the drop does not change.
+
+    :param merged: ``{engine: its merged reading of the group}``.
+    :returns: Whether the ``PARTIAL_REDACTION`` card counts the group.
+    :rtype: bool
+    """
+    partial = sum(1 for unit in merged.values() if unit["partial"])
+    whole = sum(
+        1 for unit in merged.values() if unit["excluded"] and unit.get("whole")
+    )
+    return partial > 0 and partial >= whole
 
 
 def _round_box(box: list[float]) -> list[float]:
@@ -1463,8 +1511,9 @@ def _group(
         "excluded": bool(excluded) and not clean,
         "reason": excluded[0]["reason"] if excluded else "",
         # A dropped group a box covered in part is text the reader
-        # loses, and the ``PARTIAL_REDACTION`` card says so (#365).
-        "partial": any(unit["partial"] for unit in merged.values()),
+        # loses, and the ``PARTIAL_REDACTION`` card says so (#365),
+        # unless more engines read the place covered whole.
+        "partial": _partial_cover(merged),
         # A dropped group a picture covered in part: the
         # ``FIGURE_TO_CHECK`` card names it (#463).
         "picture_partial": any(
@@ -4181,12 +4230,16 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
         if counts["partial"]:
+            # A box that covers part of a block is either an engine's
+            # box running past it or a redaction drawn short, and the
+            # second leaves words on the page: the approval waits until
+            # a person has looked at the block and dismissed the card.
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.PARTIAL_REDACTION,
-                    Issue.Severity.WARNING,
+                    Issue.Severity.ERROR,
                     _partial_message(page),
                     standing,
                 )

@@ -728,6 +728,23 @@ class TestTheAlignment(TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(groups[0]["engines"]["surya"]["uncovered"], 0)
 
+    def test_a_speck_two_engines_read_does_not_outvote_a_partial_cover(self):
+        """dots.mocr reads a line a box covers in part; the other two
+        read only a speck there, under part of the same box. The specks
+        are no partial cover and no whole cover either, so the line
+        keeps its card."""
+        red = {"reason": "redaction", "rect_type": "EDITORIAL"}
+        box = (100, 100, 300, 112)
+        units = [
+            unit("dots_mocr", 0, box, "the end of the line", red, 0.6),
+            unit("mistral_ocr", 0, box, "a.", red, 0.6),
+            unit("surya", 0, box, "a.", red, 0.6),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(any(g["partial"] for g in groups))
+
     def test_two_engines_reading_one_block_under_part_of_a_box_both_uncover(
         self,
     ):
@@ -1853,6 +1870,9 @@ class TestTheFindings(EnsembleTestCase):
         cards = self.rebuild(partial=1)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.PARTIAL_REDACTION)
+        # A redaction drawn short leaves words on the page: the approval
+        # waits on a person.
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
 
     def test_blocks_where_the_detections_drew_nothing_are_a_card(self):
         cards = self.rebuild(undetected=2)
@@ -4689,3 +4709,74 @@ class TestTheListsTheReviewFound(TestCase):
         self.assertNotIn(
             markup.ITEM, [mark["kind"] for mark in ensemble._marks(entry)]
         )
+
+
+class TestThePartialCoverVote(TestCase):
+    """One engine's box sticking out past a redaction the others read
+    it inside is the engine's geometry, not text the reader loses."""
+
+    @staticmethod
+    def reading(partial: bool, excluded: bool = True) -> dict:
+        return {
+            "partial": partial,
+            "whole": excluded and not partial,
+            "excluded": excluded,
+            "reason": "redaction" if excluded else "",
+            "hidden_key": "words" if excluded else "",
+        }
+
+    def test_an_engine_that_read_a_speck_votes_neither_way(self):
+        """A speck under part of the box is no partial cover, and no
+        whole cover either: it does not outvote the engines that read
+        the place covered in part."""
+        speck = {**self.reading(False), "whole": False}
+        merged = {
+            "dots_mocr": self.reading(True),
+            "mistral_ocr": speck,
+            "surya": {**speck},
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_one_engine_out_of_three_is_no_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "mistral_ocr": self.reading(False),
+            "surya": self.reading(True),
+        }
+
+        self.assertFalse(ensemble._partial_cover(merged))
+
+    def test_two_engines_out_of_three_are_a_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(True),
+            "mistral_ocr": self.reading(False),
+            "surya": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_a_tie_is_a_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "mistral_ocr": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_an_engine_that_read_nothing_there_does_not_vote(self):
+        merged = {
+            "dots_mocr": self.reading(False, excluded=False),
+            "mistral_ocr": self.reading(False, excluded=False),
+            "surya": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_no_engine_partly_covered_is_no_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "surya": self.reading(False),
+        }
+
+        self.assertFalse(ensemble._partial_cover(merged))

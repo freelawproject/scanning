@@ -453,7 +453,16 @@
             var height = Math.max(1, y1 - y0);
             canvas.width = width;
             canvas.height = height;
-            canvas.getContext('2d').drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            var context = canvas.getContext('2d');
+            context.drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            // The blocks of a cover card, outlined where the engines
+            // read them: the box is a fact of the document, not a guess.
+            (card.boxes || []).forEach(function (b) {
+                context.strokeStyle = '#dc2626';
+                context.lineWidth = 2;
+                context.strokeRect(b[0] * SCALE - x0, b[1] * SCALE - y0,
+                    (b[2] - b[0]) * SCALE, (b[3] - b[1]) * SCALE);
+            });
         }).catch(function (error) {
             wrap.replaceChildren(note('The scan did not load: ' + error.message, 'error'));
         });
@@ -471,6 +480,14 @@
         header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
         node.appendChild(header);
         if (card.kind === 'link') {
+            node.appendChild(note(card.message));
+        } else if (card.kind === 'cover') {
+            // The redacted page around the blocks a box covers in part,
+            // each outlined: a word that shows past the box is a
+            // redaction drawn short.
+            var coverWrap = el('div', 'bk-cropwrap');
+            coverWrap.appendChild(el('canvas'));
+            node.appendChild(coverWrap);
             node.appendChild(note(card.message));
         } else {
             // The crop alone, no highlight: the line is a guess from the
@@ -510,6 +527,16 @@
             release.title = 'Open this card again';
             release.addEventListener('click', function () { section.release(card); });
             footer.appendChild(release);
+        } else if (card.kind === 'cover' && card.dismiss_url) {
+            var covered = el('button', 'btn-outline text-xs', 'Looks right');
+            covered.type = 'button';
+            covered.title = 'Dismiss this card: no word shows past the'
+                + ' redaction in the outlined block(s)';
+            covered.addEventListener('click', function () {
+                covered.disabled = true;
+                section.dismiss(card, node);
+            });
+            footer.appendChild(covered);
         } else if (card.kind === 'link' && card.dismiss_url) {
             // A card that only points at the page: once the page was
             // looked at, the dismissal closes it, with the Undo of
@@ -581,6 +608,9 @@
                 + ' word(s) no two engines agree on: pick a reading';
         }
         if (card.kind === 'single') { return 'one engine alone read this block (' + card.engine + ')'; }
+        if (card.kind === 'cover') {
+            return 'a box covers part of the outlined block(s): does any word show past it?';
+        }
         return card.check_label || card.check;
     }
 
