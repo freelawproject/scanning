@@ -1335,8 +1335,18 @@ def covered_share(
     # to the core: a seam just past the core's edge leaves the box
     # beyond it outside the core, and a bridge between the cut pieces
     # would find no neighbour to reach (218 A.3d, a headnote line read
-    # 85% covered across a 2.2 pt seam).
-    pieces = [piece for piece in map(clip, bridge_seams(boxes)) if piece]
+    # 85% covered across a 2.2 pt seam). Only the boxes within a seam
+    # of the core can bridge into it, so the pairwise pass runs over
+    # those few and not over every box of the page.
+    near = [
+        box
+        for box in boxes
+        if box[0] < core[2] + SEAM_PT
+        and box[2] > core[0] - SEAM_PT
+        and box[1] < core[3] + SEAM_PT
+        and box[3] > core[1] - SEAM_PT
+    ]
+    pieces = [piece for piece in map(clip, bridge_seams(near)) if piece]
     return min(1.0, union_area(pieces) / area), hit
 
 
