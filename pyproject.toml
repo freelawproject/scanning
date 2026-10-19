@@ -97,6 +97,7 @@ dependencies = [
   # citation, so the head-matter paragraph we write as one is read by the
   # same parser.
   "eyecite",
+  "celery[redis]>=5.4",
 ]
 
 [project.optional-dependencies]
