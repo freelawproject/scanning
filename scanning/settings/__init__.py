@@ -15,4 +15,5 @@ from .project.tagger import *
 from .project.testing import *
 from .project.yolo import *
 from .third_party.aws import *
+from .third_party.celery import *
 from .third_party.sentry import *
