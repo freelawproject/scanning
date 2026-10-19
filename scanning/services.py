@@ -308,7 +308,14 @@ def _update_progress(
     :param total: Total step count, if applicable.
     :param kwargs: Additional Scan fields to update.
     """
-    updates = {"progress_message": message[:255]}
+    # The heartbeat (#503): ``processed_at`` is the claim stamp the
+    # stale sweep reads (``process_next_scan.recover_stale``), and a
+    # progress write refreshes it, so a long action on one of several
+    # workers is never swept for being old while it reports progress.
+    updates = {
+        "progress_message": message[:255],
+        "processed_at": timezone.now(),
+    }
     if current is not None:
         updates["progress_current"] = current
     if total is not None:

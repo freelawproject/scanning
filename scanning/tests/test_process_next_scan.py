@@ -351,3 +351,61 @@ class TestClaimPriority(TestCase):
         claimed = [Command()._claim_next()[0].pk for _ in range(3)]
 
         self.assertEqual(claimed, [waiting.pk, upload.pk, fresh.pk])
+
+
+class TestHeartbeat(TestCase):
+    """A running action stamps its claim (#503)."""
+
+    def test_the_stamp_moves_processed_at_of_a_processing_scan_only(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from scanning.management.commands import process_next_scan
+
+        old = timezone.now() - timedelta(hours=2)
+        running = ScanFactory(status=Status.PROCESSING)
+        parked = ScanFactory(status=Status.AWAITING)
+        Scan.objects.filter(pk__in=[running.pk, parked.pk]).update(
+            processed_at=old
+        )
+        self.assertEqual(process_next_scan.stamp_heartbeat(running.pk), 1)
+        self.assertEqual(process_next_scan.stamp_heartbeat(parked.pk), 0)
+        running.refresh_from_db()
+        parked.refresh_from_db()
+        self.assertGreater(running.processed_at, old)
+        self.assertEqual(parked.processed_at, old)
+
+    def test_the_thread_beats_for_the_block_and_stops_after_it(self):
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        beats = []
+        with (
+            patch.object(
+                process_next_scan,
+                "stamp_heartbeat",
+                side_effect=lambda pk: beats.append(pk) or 1,
+            ),
+            patch("django.db.connection.close"),
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.1)
+            count = len(beats)
+            time.sleep(0.05)
+        self.assertGreater(count, 2)
+        self.assertEqual(set(beats), {7})
+        self.assertEqual(len(beats), count)
+
+    def test_the_dispatch_runs_the_action_under_a_heartbeat(self):
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(status=Status.PROCESSING)
+        with (
+            patch.object(process_next_scan, "heartbeat") as beat,
+            patch("scanning.services.run_create_opinions") as run,
+        ):
+            process_next_scan.dispatch(scan, QueuedAction.CREATE_OPINIONS)
+        beat.assert_called_once_with(scan.pk)
+        run.assert_called_once_with(scan.pk)
