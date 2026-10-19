@@ -217,3 +217,54 @@ class TestHandleSignal(TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.QUEUED)
         self.assertEqual(scan.interruption_count, 3)
+
+
+class TestCeleryMode(TestCase):
+    """With the switch on, the daemon is the clock and runs no pass."""
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_the_schedule_is_the_tick_table(self):
+        from scanning import tasks
+
+        cmd = Command()
+        schedule = cmd._build_celery_schedule()
+        self.assertEqual(
+            [t.name for t in schedule], [t.name for t in tasks.TICKS]
+        )
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_due_entry_sends_its_tick_and_calls_no_command(self):
+        cmd = Command()
+        sent = []
+
+        def fake_send(self):
+            sent.append(self.name)
+            cmd.shutdown = True
+            return True
+
+        with (
+            patch("scanning.tasks.Tick.send", fake_send),
+            patch(
+                "scanning.management.commands.run_daemon.call_command"
+            ) as call,
+            patch("scanning.management.commands.run_daemon.signal.signal"),
+            patch("scanning.management.commands.run_daemon.time.sleep"),
+            patch("scanning.opinion_pdf.release_mirrors") as release,
+        ):
+            cmd.handle()
+        self.assertTrue(sent)
+        call.assert_not_called()
+        # The opinions worker frees the mirrors, not the clock.
+        release.assert_not_called()
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_the_signal_requeues_nothing(self):
+        """The workers hold the scans."""
+        scan = ScanFactory(status=Status.PROCESSING)
+        cmd = Command()
+        cmd.celery = True
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+        self.assertTrue(cmd.shutdown)
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PROCESSING)
