@@ -48,6 +48,7 @@ from scanning import (
     stats,
     surya,
     tagger,
+    tasks,
     yolo,
 )
 from scanning.badpage import scoring as badpage_scoring
@@ -63,6 +64,7 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     Opinion,
@@ -3659,6 +3661,8 @@ class ShardRead:
     :ivar create: The row creator. **This is what costs money**, which
         is why the AST test of ``TestKnownEnqueuePaths`` pins the
         modules that name one.
+    :ivar provider: The ``JobProvider`` whose wave sends the rows, so
+        the button can send that wave now (``tasks.submit_soon``, #503).
     """
 
     name: str
@@ -3670,6 +3674,7 @@ class ShardRead:
     is_enabled: Callable[[], bool]
     run_summary: Callable[[Scan], dict | None]
     create: Callable[[Scan, dict], list[ExternalJob]]
+    provider: str
 
 
 def _shard_reads() -> dict[str, ShardRead]:
@@ -3694,6 +3699,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
+            provider=JobProvider.RUNPOD,
         ),
         JobEngine.MISTRAL_OCR: ShardRead(
             name="start_mistral_ocr",
@@ -3707,6 +3713,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=mistral_ocr.enabled,
             run_summary=mistral_ocr.run_summary,
             create=mistral_ocr.ensure_extract_jobs,
+            provider=JobProvider.MISTRAL,
         ),
         JobEngine.SURYA: ShardRead(
             name="start_surya_ocr",
@@ -3718,6 +3725,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=surya.enabled,
             run_summary=surya.run_summary,
             create=surya.ensure_extract_jobs,
+            provider=JobProvider.RUNPOD,
         ),
     }
 
@@ -3802,6 +3810,7 @@ def _start_shard_read(
         queued,
     )
     if queued:
+        tasks.submit_soon(spec.provider)
         messages.success(
             request,
             f"Queued {spec.label} for {queued} part(s) of this volume. "

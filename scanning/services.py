@@ -43,7 +43,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
-from scanning import boundaries, undetected
+from scanning import boundaries, tasks, undetected
 from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
@@ -253,6 +253,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     scan.save()
     flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
+    tasks.dispatch_scan(scan.pk)
 
 
 def recover_pending_upload(pending) -> bool:
@@ -2431,6 +2432,7 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         progress_total=0,
     )
     if queued:
+        tasks.dispatch_scan(scan.pk)
         return True, (
             "Queued. The redactions are computed on the server, and this "
             "page reloads when they are ready."
@@ -2488,7 +2490,7 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
             f"The redactions are computed, with {open_findings} open "
             "finding(s). The opinions are queued for creation."
         )
-    Scan.objects.filter(
+    moved = Scan.objects.filter(
         pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
     ).update(
         status=Status.QUEUED,
@@ -2497,6 +2499,8 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
         progress_current=0,
         progress_total=0,
     )
+    if moved:
+        tasks.dispatch_scan(scan_pk)
 
 
 def _park_after_redactions(

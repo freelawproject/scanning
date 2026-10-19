@@ -2225,6 +2225,11 @@ def start_caselaw_tagger(
         )
         return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
     message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status == JobStatus.PENDING:
+        from scanning import tasks
+        from scanning.models import JobProvider
+
+        tasks.submit_soon(JobProvider.RUNPOD)
     if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
         # A result that is paid for already: carried from an earlier
         # run of the same text, a glue the tick gave up on, or a second

@@ -51,7 +51,7 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from scanning import jobs, runpod_client, s3_sync
+from scanning import jobs, runpod_client, s3_sync, tasks
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -1132,6 +1132,7 @@ def queue_ready_runs() -> int:
             # Somebody moved the scan between the read and the write.
             # No mark: the next tick sees it again.
             continue
+        tasks.dispatch_scan(scan.pk)
         state["queued_at"] = timezone.now().isoformat()
         write_apply_state(rows, state)
         logger.info(
