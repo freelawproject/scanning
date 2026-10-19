@@ -130,6 +130,16 @@ State is `Scan.status`. The stages, and where each runs:
 - Work that takes seconds over a JSON file runs on the collect tick (the page-number apply, the glues); work that pulls a PDF or renders pages is queued (the apply, the redaction compute)
 - `process_next_scan` claims by action before age (`CLAIM_PRIORITY`: full pipeline, redaction compute, apply), and an apply waiting `CLAIM_LIFT_SECONDS` is claimed next. The external job wave ranks an apply row before the volume rows (`jobs._pending_slice`, #291). Rank the row, not the status
 
+## Celery (#503)
+
+- `CELERY_ENABLED` is the one switch, off in tests. The database stays the queue of record: every task in `scanning/tasks.py` is a tick (a poll over the rows, the pass groups of `scanning/ticks.py`) or a claim by compare-and-swap (`run_scan`), so a lost message waits for the next tick and a duplicate loses its swap. Celery retries nothing and stores no result; the rows keep the attempt counters
+- There is no beat. `run_daemon` is the clock: with the switch on it sends the ticks of `tasks.TICKS` on their intervals instead of running the passes, and its shutdown re-queues nothing, because the workers hold the scans. A finished step sends the next tick at once (`tasks.nudge`), so a hand-off never waits an interval; the interval is the safety net
+- Every writer of QUEUED calls `tasks.dispatch_scan` after its swap and never before: `apply_upload_action`, `queue_redaction_compute`, `_queue_opinions_after_compute`, `opinions.queue_create_opinions`, `yolo.queue_ready_runs`, `apply.queue_ready_scans`, the admin re-queue. The read buttons and the tagger button call `tasks.submit_soon` with their provider. Both helpers swallow a broker fault
+- A tick that reads a count and then writes runs under a named advisory lock (`locks.held`, `tasks.locked`), so two copies never overlap; a second copy skips its tick. The three opinion passes share the `opinion_mirror` lock, because they share the local mirror and one releases it. `claim_scans`, `run_scan` and `submit_mistral` take no lock: their claims are swaps. `jobs.submit_pending(providers=...)` runs one provider's wave, so each wave is its own task on its own queue
+- `processed_at` is the claim stamp and the heartbeat: `process_next_scan.heartbeat` stamps it every `HEARTBEAT_SECONDS` from a thread while an action runs, `services._update_progress` refreshes it too, and `recover_stale` sweeps only a scan that reported nothing for `DAEMON_PROCESSING_TIMEOUT`. `mistral_ocr.LOST_CLAIM_AFTER` is the clock of the lost-claim rule, because the sweep and the wave no longer share one serial scheduler
+- Every ledger in `provider_meta` is written through `jobs.swap_provider_meta`, a compare-and-swap over the whole JSON, never a `save()` of the field: another pass writes beside the key. The bad-page score and the page-number apply share the `issue_rebuild` lock, blocking, because the score's stamp and the apply's rebuild read each other
+- `opinion_pdf.release_mirrors` runs when a worker that serves `opinions` starts (`tasks._release_mirrors_at_start`), where the daemon ran it, and the daemon skips it with the switch on
+
 ## Status writes
 
 - Every status write is a compare-and-swap over the current status, never a full `save()`. A second writer is always live: the collect tick, a second tab, the daemon shutdown handler

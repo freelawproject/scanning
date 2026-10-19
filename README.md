@@ -525,6 +525,28 @@ automatically.
 Custom component classes: `.btn-primary`, `.btn-outline`, `.btn-danger`,
 `.btn-ghost`, `.card`, `.input-text`, `.alert-*`, `.badge-*` (status badges).
 
+### Running the passes on Celery (#503)
+
+By default the daemon (`run_daemon`) runs every pass in one serial
+loop. With `CELERY_ENABLED=True` the daemon becomes the clock: on each
+pass's interval it sends a task instead of running the pass, the
+workers run the tasks on four queues (`fast`, `io`, `heavy`,
+`opinions`), and a button press sends its own task instead of waiting
+for a poll. The database stays the queue of record, so the broker
+never holds work that cannot be found again in the rows.
+
+Locally the broker and one worker for every queue come up under the
+`celery` compose profile, beside the daemon:
+
+```bash
+CELERY_ENABLED=True docker compose -f docker/scanning/docker-compose.yml --profile celery up scanning-redis scanning-celery-worker scanning-daemon
+```
+
+In production each queue is its own deployment of the daemon image
+(`command: worker` with `CELERY_QUEUES=<queue>`), and the one daemon
+deployment stays as the clock. The `heavy` queue is the one that
+scales by replica count.
+
 ### Testing RunPod Locally
 
 The daemon can offload the two GPU-heavy blackletter steps (`detect` and
