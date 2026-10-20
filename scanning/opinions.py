@@ -287,8 +287,8 @@ class ScanRows:
         y1)]}``, the boxes a reader paints, rounded to a tenth of a
         point.
     :param detections: ``{page_index: [(label, x0, y0, x1, y1,
-        confidence, img_width, img_height)]}``, the live detections of
-        the run.
+        confidence, img_width, img_height)]}``, every live detection of
+        the page, whatever its run.
     """
 
     redactions: dict[int, list[tuple]] = field(default_factory=dict)
@@ -300,9 +300,16 @@ def read_rows(scan: Scan, run) -> ScanRows:
 
     The same selections the glue and the PDF make: the visible
     redactions of the scan (``redactions.visible_by_page``,
-    ``opinion_pdf._redaction_pages``) and the live detections of the
-    run (``opinion_ocr.load_inputs``). A digest over anything else, or
-    anything less, would miss a move the glue sees.
+    ``opinion_pdf._redaction_pages``) and every live detection of the
+    scan, whatever its run: the glue reads the run's
+    (``opinion_ocr.load_inputs``), but the masks and the picture rects
+    of the PDF read them all (``boundaries.outside_rects``,
+    ``opinion_pdf._image_rects``), so the union is what a digest must
+    cover. A digest over anything else, or anything less, would miss a
+    move a reader sees. The run's engine documents go in by key alone
+    (:func:`input_digest`): a document a re-glue rewrites in place
+    under its key reaches the opinions through ``reglue_opinion_ocr``,
+    the rule of every transform change, and never through an approval.
 
     :param scan: The scan.
     :param run: The final apply run the rows are measured in.
@@ -326,7 +333,7 @@ def read_rows(scan: Scan, run) -> ScanRows:
     detections: dict[int, list[tuple]] = defaultdict(list)
     for page, label, x0, y0, x1, y1, confidence, width, height in (
         Detection.objects.live()
-        .filter(scan=scan, apply_run=run)
+        .filter(scan=scan)
         .values_list(
             "page_index",
             "label",
@@ -368,7 +375,8 @@ def input_digest(
     builds the neighbour masks from the opinion's own anchors and the
     page's detections, never from a neighbour's); the printed numbers
     of its pages; and the run, whose engine documents, bitonal copy and
-    page map are fixed for its lifetime. Human text edits have their
+    page map are fixed for its lifetime (a document rewritten in place
+    is ``reglue_opinion_ocr``'s to apply). Human text edits have their
     own ``edit_revision`` and the pictures their own ``figure_digest``.
 
     The rows are sorted, so the order a query returns them in is no
@@ -560,11 +568,17 @@ def create_rows(
             # glue (#350, #336): a redaction a curator moved after a
             # send-back changes the ink of the PDF and no field of this
             # row, so the revision is what says the set is new. An
-            # approved opinion keeps its revision and its glues.
+            # approved opinion keeps its revision and its glues, and
+            # its digest with them: the digest names the inputs its
+            # glues were built from, so the first creation after a
+            # text reopen sees the move and rebuilds it then.
             approved = Q(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
             Opinion.objects.filter(pk=opinion.pk).update(
                 **fields,
-                input_digest=digest,
+                input_digest=Case(
+                    When(approved, then=F("input_digest")),
+                    default=Value(digest),
+                ),
                 status=Case(
                     When(
                         status=OpinionReviewStatus.ERROR,

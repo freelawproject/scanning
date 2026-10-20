@@ -8,9 +8,14 @@ command writes the digest of every opinion at the rows as they stand,
 and that approval then rebuilds only what moved.
 
 It reads the rows and one JSON object per volume (the printed-page map)
-and writes one column. No revision, no status, no glue, no PDF. A row
+and writes one column. No revision, no status, no glue, no PDF. Only a
+volume in step 3 (``REDACTION_REVIEW_DONE``), named or not: there every
+row is what the last creation built, because the writes of review 2
+refuse while the review is closed. A volume sent back to step 2 may
+already hold edits no build has seen, so a digest of its rows as they
+stand would call those edits built; its next approval stamps it. A row
 whose boundary is gone or that sits in another run's space is left for
-the next creation, which rewrites both.
+that creation too.
 
 Examples:
 
@@ -25,9 +30,10 @@ from django.core.management.base import BaseCommand
 from scanning import apply, opinions, review_states
 from scanning.models import Opinion, Scan, Status
 
-#: The statuses whose volumes hold opinions: the closed redaction review,
-#: and the review opened again, whose rows wait for the next approval.
-STATUSES = (Status.REDACTION_REVIEW_DONE, Status.READY_FOR_REDACTION_REVIEW)
+#: The one status a volume is stamped in: its rows are what the last
+#: creation built. A volume opened again in step 2 is refused, named or
+#: not, because its rows may hold edits no build has seen.
+STATUSES = (Status.REDACTION_REVIEW_DONE,)
 
 
 class Command(BaseCommand):
@@ -65,7 +71,14 @@ class Command(BaseCommand):
         dry_run = options["dry_run"]
         scans = Scan.objects.filter(status__in=STATUSES)
         if options["scan_pks"]:
-            scans = Scan.objects.filter(pk__in=options["scan_pks"])
+            named = Scan.objects.filter(pk__in=options["scan_pks"])
+            for scan in named.exclude(status__in=STATUSES):
+                self.stderr.write(
+                    f"scan {scan.pk}: {scan.status}, not in step 3; its "
+                    "rows may hold edits no build has seen, so its next "
+                    "approval stamps it"
+                )
+            scans = named.filter(status__in=STATUSES)
         scans = scans.order_by("pk")
 
         total_stamped = total_current = total_skipped = 0

@@ -18,6 +18,7 @@ from unittest.mock import patch
 from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
 from scanning import apply, opinions, review_states, s3_sync
 from scanning.factories import (
@@ -714,10 +715,14 @@ class TestTheInputDigest(TestCase):
         self.a.refresh_from_db()
         self.assertEqual(self.a.status, OpinionReviewStatus.PROCESSING)
 
-    def test_an_approved_row_keeps_its_revision_and_takes_the_digest(self):
+    def test_an_approved_row_keeps_its_digest_until_a_text_reopen(self):
+        """Boxes move under an approved opinion: it keeps its glues and
+        the digest they were built from, so the first creation after
+        the text reopen sees the move and rebuilds it then."""
         a_before, b_before = self.revisions()
+        built_from = self.b.input_digest
         Opinion.objects.filter(pk=self.b.pk).update(
-            status=OpinionReviewStatus.TEXT_REVIEW_DONE, input_digest=""
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
         )
         make_redaction(self.scan, page_index=4)
 
@@ -726,7 +731,75 @@ class TestTheInputDigest(TestCase):
         self.assertEqual(summary.rebuilt, 0)
         self.assertEqual(self.revisions(), (a_before, b_before))
         self.b.refresh_from_db()
-        self.assertTrue(self.b.input_digest)
+        self.assertEqual(self.b.input_digest, built_from)
+
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before, b_before + 1))
+
+    def test_a_live_detection_of_another_run_counts(self):
+        """The PDF's masks and picture rects read every live detection
+        of the page, whatever its run: one withdrawn moves the PDF."""
+        row = make_detection(self.scan, "IMAGE", page_index=1)
+        self._create()
+        a_before, b_before = self.revisions()
+        # The withdrawal's own write: ``active`` is what ``live`` reads.
+        row.active = False
+        row.withdrawn_at = timezone.now()
+        row.save(update_fields=["active", "withdrawn_at"])
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+
+    def test_the_backfill_stamps_step_three_alone(self):
+        """``stamp_opinion_digests``: a blank digest is written on a
+        step-3 volume and no revision moves; a volume sent back to step
+        2 is refused, named or not."""
+        Opinion.objects.filter(scan=self.scan).update(input_digest="")
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        before = self.revisions()
+        out, err = StringIO(), StringIO()
+
+        with (
+            patch.object(
+                apply, "load_printed_pages", return_value=self.printed
+            ),
+            patch.object(
+                review_states, "final_run", return_value=self.apply_run
+            ),
+        ):
+            call_command("stamp_opinion_digests", "--dry-run", stdout=out)
+            self.a.refresh_from_db()
+            self.assertEqual(self.a.input_digest, "")
+            self.assertIn("would stamp 2", out.getvalue())
+
+            call_command("stamp_opinion_digests", stdout=out)
+            self.a.refresh_from_db()
+            self.assertTrue(self.a.input_digest)
+            self.assertEqual(self.revisions(), before)
+            self.assertEqual(self._create().rebuilt, 0)
+
+            Opinion.objects.filter(scan=self.scan).update(input_digest="")
+            self.scan.status = Status.READY_FOR_REDACTION_REVIEW
+            self.scan.save(update_fields=["status"])
+            call_command("stamp_opinion_digests", stdout=out, stderr=err)
+            call_command(
+                "stamp_opinion_digests",
+                str(self.scan.pk),
+                stdout=out,
+                stderr=err,
+            )
+            self.a.refresh_from_db()
+            self.assertEqual(self.a.input_digest, "")
+            self.assertIn("not in step 3", err.getvalue())
 
     def test_the_digest_does_not_read_the_order_of_the_rows(self):
         boundary = OpinionBoundary.objects.get(
