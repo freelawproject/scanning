@@ -188,10 +188,17 @@ jobs:
       - name: Create Kubeconfig with AWS CLI
         run: aws eks update-kubeconfig --region ${{ env.AWS_REGION }} --name ${{ env.EKS_CLUSTER_NAME }}
 
+      # The deployment exists only once infra creates it: until then
+      # the leg is skipped, so a deploy never fails on the switch
+      # being off.
       - name: Rollout ${{ matrix.deployment }}
-        run: kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} ${{ matrix.deployment }}=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
-      - name: Watch ${{ matrix.deployment }} rollout status
-        run: kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }}
+        run: |
+          if kubectl get -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} >/dev/null 2>&1; then
+            kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} ${{ matrix.deployment }}=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
+            kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }}
+          else
+            echo "deployment/${{ matrix.deployment }} does not exist yet; skipped"
+          fi
 
   complete-deploy:
     needs:

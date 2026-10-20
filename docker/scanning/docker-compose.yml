@@ -55,6 +55,9 @@ services:
     env_file:
       - ../../.env.dev
     environment:
+      # CELERY_ENABLED=True in the shell switches the clock and the views
+      # (#503), beside the `celery` profile.
+      - CELERY_ENABLED=${CELERY_ENABLED:-False}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
@@ -125,6 +128,9 @@ services:
     env_file:
       - ../../.env.dev
     environment:
+      # CELERY_ENABLED=True in the shell switches the clock and the views
+      # (#503), beside the `celery` profile.
+      - CELERY_ENABLED=${CELERY_ENABLED:-False}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
