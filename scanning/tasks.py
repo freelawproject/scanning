@@ -510,6 +510,12 @@ TICKS: tuple[Tick, ...] = (
         "DAEMON_OPINION_PDF_INTERVAL",
         QUEUE_OPINIONS,
     ),
+    Tick(
+        "recover_uploads",
+        recover_uploads,
+        "PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS",
+        QUEUE_FAST,
+    ),
     # Every pod has its own /tmp, so every queue sweeps its own.
     *(
         Tick(
