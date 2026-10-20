@@ -40,12 +40,20 @@ CELERY_TASK_REJECT_ON_WORKER_LOST = True
 CELERY_WORKER_PREFETCH_MULTIPLIER = 1
 #: Redis redelivers a task not acknowledged within this window. It
 #: must exceed the longest task (an apply build of a large volume), or
-#: a second worker starts the same scan and loses the claim.
+#: a second worker starts the same scan and loses the claim. The
+#: socket timeouts bound what a view pays when Redis is down: a send
+#: fails in seconds, and ``tasks.has_room`` then holds every send back
+#: for ``BROKER_BACKOFF_SECONDS``.
 CELERY_BROKER_TRANSPORT_OPTIONS = {
     "visibility_timeout": env.int(
         "CELERY_VISIBILITY_TIMEOUT", default=4 * 60 * 60
     ),
+    "socket_connect_timeout": 2,
+    "socket_timeout": 5,
 }
+CELERY_BROKER_CONNECTION_TIMEOUT = 2
+#: A send never retries in the request: the tick claims the row.
+CELERY_TASK_PUBLISH_RETRY = False
 #: The throttle (#503), CourtListener's ``CeleryThrottle`` for senders
 #: that cannot sleep: a tick or a dispatch is not sent while its queue
 #: already holds this many messages, because the rows are the queue of

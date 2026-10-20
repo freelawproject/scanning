@@ -30,21 +30,26 @@ TICK_TASKS = (
     tasks.cut_figures,
     tasks.build_opinion_pdfs,
     tasks.cleanup_tmp,
+    tasks.recover_uploads,
 )
 
 
 def _no_connection_reset(test):
     """Keep the test transaction: the tasks open a fresh connection
-    per run, as the tick commands do, and their tests patch it too."""
+    per run, as the tick commands do, and their tests patch it too.
+    Forgets a broker fault another test noted, too."""
     patcher = patch("scanning.tasks.connections.close_all")
     patcher.start()
     test.addCleanup(patcher.stop)
+    tasks.reset_broker_backoff()
+    test.addCleanup(tasks.reset_broker_backoff)
 
 
 class TestTicks(TestCase):
     """``TICKS`` is the daemon's schedule."""
 
     def setUp(self):
+        _no_connection_reset(self)
         patcher = patch("scanning.tasks.queue_depth", return_value=0)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -134,6 +139,51 @@ class TestThrottle(TestCase):
         ):
             self.assertTrue(tick.send())
         send_tick.assert_called_once()
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_broker_fault_holds_every_send_back_for_the_backoff(self):
+        """An admin loop over many scans pays one timeout, not one per
+        scan: the rows hold the work and the clock finds it."""
+        with (
+            patch("scanning.tasks.queue_depth", return_value=0),
+            patch.object(
+                tasks.run_scan, "apply_async", side_effect=OSError("down")
+            ) as send,
+            self.assertLogs("scanning.tasks", level="INFO"),
+        ):
+            self.assertFalse(
+                tasks.dispatch_scan(1, QueuedAction.FULL_PIPELINE)
+            )
+            self.assertFalse(
+                tasks.dispatch_scan(2, QueuedAction.FULL_PIPELINE)
+            )
+            tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
+            self.assertFalse(tick.send())
+        send.assert_called_once()
+        tasks.reset_broker_backoff()
+        with (
+            patch("scanning.tasks.queue_depth", return_value=0),
+            patch.object(tasks.run_scan, "apply_async") as send,
+        ):
+            self.assertTrue(tasks.dispatch_scan(3, QueuedAction.FULL_PIPELINE))
+        send.assert_called_once()
+
+    def test_the_sweeps_split_the_uploads_from_the_tmp(self):
+        """The upload sweep is a database sweep, so it runs once under
+        a lock; the /tmp sweep runs on every pod."""
+        with patch("scanning.tasks.call_command") as command:
+            tasks.cleanup_tmp()
+            tasks.recover_uploads()
+        self.assertEqual(
+            [
+                c.args + tuple(sorted(c.kwargs.items()))
+                for c in command.call_args_list
+            ],
+            [
+                ("cleanup_processing_tmp", ("no_uploads", True)),
+                ("cleanup_processing_tmp", ("uploads_only", True)),
+            ],
+        )
 
     def test_a_broker_fault_reads_as_unknown_depth(self):
         with (

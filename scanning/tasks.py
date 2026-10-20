@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import time
 from dataclasses import dataclass
 
 from celery.signals import worker_ready
@@ -62,6 +63,40 @@ QUEUES = (QUEUE_FAST, QUEUE_IO, QUEUE_HEAVY, QUEUE_OPINIONS)
 #: local mirror (``apply.local_copy`` under ``Scan.output_dir``).
 OPINION_MIRROR_LOCK = "opinion_mirror"
 
+#: How long every send is held back after a broker fault, so a view or
+#: an admin loop over many scans pays one short timeout and not one
+#: per scan. The rows hold the work; the clock finds it when the
+#: broker is back.
+BROKER_BACKOFF_SECONDS = 30
+_broker_down_until = 0.0
+
+
+def _broker_failed() -> None:
+    """Note a broker fault: no send for :data:`BROKER_BACKOFF_SECONDS`.
+
+    :return: None.
+    """
+    global _broker_down_until
+    _broker_down_until = time.monotonic() + BROKER_BACKOFF_SECONDS
+
+
+def _broker_ok() -> bool:
+    """Return whether the broker may be asked right now.
+
+    :returns: ``False`` inside the backoff after a fault.
+    :rtype: bool
+    """
+    return time.monotonic() >= _broker_down_until
+
+
+def reset_broker_backoff() -> None:
+    """Forget a broker fault (tests).
+
+    :return: None.
+    """
+    global _broker_down_until
+    _broker_down_until = 0.0
+
 
 def queue_depth(queue: str) -> int | None:
     """Return how many messages wait on a queue, or ``None`` when the
@@ -80,6 +115,7 @@ def queue_depth(queue: str) -> int | None:
         with app.connection_for_read() as connection:
             return int(connection.default_channel.client.llen(queue))
     except Exception:
+        _broker_failed()
         logger.warning("could not read the depth of %s", queue, exc_info=True)
         return None
 
@@ -97,6 +133,11 @@ def has_room(queue: str) -> bool:
     :returns: Whether to send.
     :rtype: bool
     """
+    if not _broker_ok():
+        logger.info(
+            "broker fault %ss ago at most; not sending", BROKER_BACKOFF_SECONDS
+        )
+        return False
     depth = queue_depth(queue)
     if depth is None or depth < int(settings.CELERY_QUEUE_MAX_DEPTH):
         return True
@@ -424,6 +465,7 @@ class Tick:
         try:
             self.task.apply_async(queue=self.queue, expires=self.interval())
         except Exception:
+            _broker_failed()
             logger.warning(
                 "could not send the %s tick", self.name, exc_info=True
             )
@@ -578,6 +620,7 @@ def dispatch_scan(scan_pk: int, action: str) -> bool:
             expires=float(settings.DAEMON_PROCESSING_TIMEOUT),
         )
     except Exception:
+        _broker_failed()
         logger.warning(
             "could not send the task of scan %s; the tick will claim it",
             scan_pk,
