@@ -698,7 +698,7 @@ def queue_create_opinions(scan: Scan) -> str:
     if moved:
         from scanning import tasks
 
-        tasks.dispatch_scan(scan.pk)
+        tasks.dispatch_scan(scan.pk, action)
     return action if moved else ""
 
 

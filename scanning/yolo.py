@@ -1132,7 +1132,7 @@ def queue_ready_runs() -> int:
             # Somebody moved the scan between the read and the write.
             # No mark: the next tick sees it again.
             continue
-        tasks.dispatch_scan(scan.pk)
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         state["queued_at"] = timezone.now().isoformat()
         write_apply_state(rows, state)
         logger.info(

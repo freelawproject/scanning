@@ -1773,7 +1773,7 @@ def queue_ready_scans() -> int:
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
             queued += claimed
-            tasks.dispatch_scan(scan.pk)
+            tasks.dispatch_scan(scan.pk, QueuedAction.APPLY_PAGE_EDITS)
     return queued
 
 

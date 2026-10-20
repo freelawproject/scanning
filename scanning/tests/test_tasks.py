@@ -213,7 +213,9 @@ class TestNudges(TestCase):
             patch.object(tasks.build_opinion_pdfs, "apply_async") as pdfs,
             patch.object(tasks.cut_figures, "apply_async") as figures,
         ):
-            self.assertTrue(tasks.run_scan(scan.pk))
+            self.assertTrue(
+                tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
+            )
         for send in (prepare, pdfs, figures):
             send.assert_called_once()
 
@@ -223,15 +225,23 @@ class TestDispatch(TestCase):
 
     def test_nothing_is_sent_while_celery_is_off(self):
         with patch.object(tasks.run_scan, "apply_async") as send:
-            self.assertFalse(tasks.dispatch_scan(1))
+            self.assertFalse(
+                tasks.dispatch_scan(1, QueuedAction.FULL_PIPELINE)
+            )
             self.assertFalse(tasks.submit_soon(JobProvider.DOCTOR))
         send.assert_not_called()
 
     @override_settings(CELERY_ENABLED=True)
     def test_the_scan_task_is_sent_to_the_heavy_queue(self):
         with patch.object(tasks.run_scan, "apply_async") as send:
-            self.assertTrue(tasks.dispatch_scan(7))
-        send.assert_called_once_with((7,), queue=tasks.QUEUE_HEAVY)
+            self.assertTrue(
+                tasks.dispatch_scan(7, QueuedAction.COMPUTE_REDACTIONS)
+            )
+        send.assert_called_once_with(
+            (7, QueuedAction.COMPUTE_REDACTIONS),
+            queue=tasks.QUEUE_HEAVY,
+            expires=3600.0,
+        )
 
     @override_settings(CELERY_ENABLED=True)
     def test_a_broker_fault_is_a_warning_and_not_an_error(self):
@@ -242,7 +252,9 @@ class TestDispatch(TestCase):
             ),
             self.assertLogs("scanning.tasks", level="WARNING"),
         ):
-            self.assertFalse(tasks.dispatch_scan(7))
+            self.assertFalse(
+                tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE)
+            )
 
     @override_settings(CELERY_ENABLED=True)
     def test_a_provider_wave_is_sent_to_its_own_queue(self):
@@ -268,7 +280,9 @@ class TestRunScan(TestCase):
         with patch(
             "scanning.management.commands.process_next_scan.dispatch"
         ) as dispatch:
-            self.assertTrue(tasks.run_scan(scan.pk))
+            self.assertTrue(
+                tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
+            )
         dispatch.assert_called_once()
         claimed, action = dispatch.call_args.args
         self.assertEqual(claimed.pk, scan.pk)
@@ -282,8 +296,36 @@ class TestRunScan(TestCase):
         with patch(
             "scanning.management.commands.process_next_scan.dispatch"
         ) as dispatch:
-            self.assertFalse(tasks.run_scan(scan.pk))
+            self.assertFalse(
+                tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
+            )
         dispatch.assert_not_called()
+
+    def test_a_scan_queued_again_for_another_action_is_left_alone(self):
+        """A message from before an admin re-queue never runs the old
+        action."""
+        scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
+        )
+        with patch(
+            "scanning.management.commands.process_next_scan.dispatch"
+        ) as dispatch:
+            self.assertFalse(
+                tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
+            )
+        dispatch.assert_not_called()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.QUEUED)
+
+    def test_a_blank_action_is_the_full_pipeline(self):
+        scan = ScanFactory(status=Status.QUEUED, queued_action="")
+        with patch(
+            "scanning.management.commands.process_next_scan.dispatch"
+        ) as dispatch:
+            self.assertTrue(
+                tasks.run_scan(scan.pk, QueuedAction.FULL_PIPELINE)
+            )
+        dispatch.assert_called_once()
 
     def test_the_tick_task_claims_the_next_by_rank(self):
         ScanFactory(
@@ -335,7 +377,9 @@ class TestQueuedWritersDispatch(TestCase):
         with patch("scanning.tasks.dispatch_scan") as dispatch:
             queued, _ = services.queue_redaction_compute(scan)
         self.assertTrue(queued)
-        dispatch.assert_called_once_with(scan.pk)
+        dispatch.assert_called_once_with(
+            scan.pk, QueuedAction.COMPUTE_REDACTIONS
+        )
 
     @override_settings(CELERY_ENABLED=True)
     def test_a_lost_swap_dispatches_nothing(self):
@@ -361,5 +405,5 @@ class TestQueuedWritersDispatch(TestCase):
                 opinions.queue_create_opinions(scan),
                 QueuedAction.CREATE_OPINIONS,
             )
-        dispatch.assert_called_once_with(scan.pk)
+        dispatch.assert_called_once_with(scan.pk, QueuedAction.CREATE_OPINIONS)
         self.assertEqual(Scan.objects.get(pk=scan.pk).status, Status.QUEUED)

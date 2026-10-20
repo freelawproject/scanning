@@ -561,7 +561,7 @@ class ScanAdmin(admin.ModelAdmin):
             **counter_resets,
         )
         for pk in pks:
-            tasks.dispatch_scan(pk)
+            tasks.dispatch_scan(pk, QueuedAction.FULL_PIPELINE)
         if not updated:
             self.message_user(
                 request, no_match_message, level=messages.WARNING

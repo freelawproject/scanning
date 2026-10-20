@@ -253,7 +253,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     scan.save()
     flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
-    tasks.dispatch_scan(scan.pk)
+    tasks.dispatch_scan(scan.pk, QueuedAction.FULL_PIPELINE)
 
 
 def recover_pending_upload(pending) -> bool:
@@ -2432,7 +2432,7 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         progress_total=0,
     )
     if queued:
-        tasks.dispatch_scan(scan.pk)
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         return True, (
             "Queued. The redactions are computed on the server, and this "
             "page reloads when they are ready."
@@ -2500,7 +2500,7 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
         progress_total=0,
     )
     if moved:
-        tasks.dispatch_scan(scan_pk)
+        tasks.dispatch_scan(scan_pk, QueuedAction.CREATE_OPINIONS)
 
 
 def _park_after_redactions(

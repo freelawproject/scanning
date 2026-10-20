@@ -467,20 +467,25 @@ def _nudge_after(action: str) -> None:
 
 
 @app.task(name="scanning.tasks.run_scan", queue=QUEUE_HEAVY)
-def run_scan(scan_pk: int) -> bool:
-    """Claim the scan a view queued, if it is still queued, and run it.
+def run_scan(scan_pk: int, action: str) -> bool:
+    """Claim the scan a view queued, if it is still queued for the
+    action the view wrote, and run it.
 
     :param scan_pk: The scan the view moved to QUEUED.
+    :param action: The ``QueuedAction`` it wrote.
     :returns: Whether this task ran it. ``False`` when a tick, or a
-        second delivery of this message, took it first.
+        second delivery of this message, took it first, or when the
+        scan was queued again for another action since.
     :rtype: bool
     """
     from scanning.management.commands import process_next_scan
 
     _fresh_connection()
-    claimed = process_next_scan.claim_next(scan_pk)
+    claimed = process_next_scan.claim_next(scan_pk, action)
     if claimed is None:
-        logger.info("scan %s was not QUEUED when its task ran", scan_pk)
+        logger.info(
+            "scan %s was not QUEUED for %s when its task ran", scan_pk, action
+        )
         return False
     scan, action = claimed
     process_next_scan.dispatch(scan, action)
@@ -488,23 +493,30 @@ def run_scan(scan_pk: int) -> bool:
     return True
 
 
-def dispatch_scan(scan_pk: int) -> bool:
+def dispatch_scan(scan_pk: int, action: str) -> bool:
     """Send the task that runs a scan a view just queued.
 
     Called after the view's compare-and-swap to QUEUED, never before:
     the task claims by the same swap, and a scan that is not QUEUED
-    when it runs is left alone. A no-op when Celery is off, and a
-    logged warning when the broker is unreachable, because the tick
-    finds the row either way.
+    for ``action`` when it runs is left alone. The message expires
+    after ``DAEMON_PROCESSING_TIMEOUT``, so one from before an outage
+    never claims a scan queued much later: the tick claims that one.
+    A no-op when Celery is off, and a logged warning when the broker
+    is unreachable, because the tick finds the row either way.
 
     :param scan_pk: The scan that is now QUEUED.
+    :param action: The ``QueuedAction`` the caller wrote.
     :returns: Whether a task was sent.
     :rtype: bool
     """
     if not settings.CELERY_ENABLED:
         return False
     try:
-        run_scan.apply_async((scan_pk,), queue=QUEUE_HEAVY)
+        run_scan.apply_async(
+            (scan_pk, action),
+            queue=QUEUE_HEAVY,
+            expires=float(settings.DAEMON_PROCESSING_TIMEOUT),
+        )
     except Exception:
         logger.warning(
             "could not send the task of scan %s; the tick will claim it",
