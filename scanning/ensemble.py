@@ -3129,7 +3129,17 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         if len(present) >= 2:
             base = _pairs(engines[present[0]]["text"])
             others = [_pairs(engines[name]["text"]) for name in present[1:]]
-            voted = [t for t in vote_words(base, others)[0] if t.get("text")]
+            # The vote is from the first engine's side, so a word the
+            # majority read and the first engine missed comes back
+            # ``low_confidence``; the majority settled it, and only
+            # the ``majority`` flag is a card of such a block
+            # (``blocking_review.open_words``). A block two engines
+            # read alike can stay a warning and never become blocking.
+            voted = [
+                {k: v for k, v in t.items() if k != "low_confidence"}
+                for t in vote_words(base, others)[0]
+                if t.get("text")
+            ]
     if not voted:
         return []
     run_index: int | None = None

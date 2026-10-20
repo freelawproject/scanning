@@ -138,6 +138,45 @@ class TestOpenWords(TestCase):
             [blocking_review.READ_NOTHING, "and", "and"],
         )
 
+    def test_a_block_a_majority_read_alike_never_becomes_blocking(self):
+        """The re-vote for the carry is from the first engine's side, so
+        a word the majority read and the first engine missed (``x``)
+        comes back as a word no majority settled; the majority settled
+        it, so the carry drops that flag and the block stays a
+        warning for the majority word left (``h``)."""
+        voted = read("a b c d g", "a b x c e h", "a b x c e h")
+        self.assertEqual(voted["agreement"], ensemble.MAJORITY)
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+        self.assertEqual([c["token"] for c in cards], ["e", "h"])
+        first = cards[0]
+
+        kept = ensemble._human_read(
+            voted,
+            {
+                "text": "a b x c f h",
+                "span": [first["start"], first["start"] + first["length"]],
+            },
+            voted["engines"],
+        )
+
+        self.assertEqual(kept["n_low_confidence"], 0)
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+        self.assertEqual(
+            blocking_review.open_words(kept, blocking_review.LOW_CONFIDENCE),
+            [],
+        )
+        self.assertEqual(
+            [
+                c["token"]
+                for c in blocking_review.open_words(
+                    kept, blocking_review.MAJORITY
+                )
+            ],
+            ["h"],
+        )
+
     def test_a_block_a_majority_read_alike_keeps_its_majority_words(self):
         """The warnings review: a block two engines read alike has no
         tokens of its own, so its majority words are voted for the
