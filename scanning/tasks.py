@@ -26,8 +26,8 @@ interval is the safety net, as CourtListener chains its steps.
 a second copy, from a second worker process or a tick sent while the
 last one runs, skips its turn. The three opinion passes share one
 lock, because they share the local mirror and one of them releases
-it. ``claim_scans``, ``run_scan`` and ``submit_mistral`` take none:
-their claims are swaps, and N copies are N scans or N shards.
+it. ``claim_scans`` and ``run_scan`` take none: their claims are
+swaps, and N copies are N scans.
 
 The dispatch tasks are sent by the views and the triggers through
 :func:`dispatch_scan` and :func:`submit_soon`, after their status
@@ -186,12 +186,14 @@ def submit_doctor() -> int:
 
 
 @app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
+@locked("submit_mistral")
 def submit_mistral() -> int:
     """Render and submit one shard to Mistral: minutes, on the heavy queue.
 
-    No lock: N heavy workers render N shards, each claimed by swap.
-    The batch cap (``mistral_ocr.MAX_CONCURRENCY``) is counted before
-    the claim, so N copies may overshoot it by N at most.
+    Locked like the other waves: one render at a time keeps the batch
+    cap (``mistral_ocr.MAX_CONCURRENCY``, counted before the claim)
+    exact, and two workers never pay for two renders when one was
+    wanted. Lifting it is a measured decision, not a default.
 
     :returns: The submitted count.
     :rtype: int
