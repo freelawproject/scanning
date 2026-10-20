@@ -306,10 +306,8 @@ def read_rows(scan: Scan, run) -> ScanRows:
     of the PDF read them all (``boundaries.outside_rects``,
     ``opinion_pdf._image_rects``), so the union is what a digest must
     cover. A digest over anything else, or anything less, would miss a
-    move a reader sees. The run's engine documents go in by key alone
-    (:func:`input_digest`): a document a re-glue rewrites in place
-    under its key reaches the opinions through ``reglue_opinion_ocr``,
-    the rule of every transform change, and never through an approval.
+    move a reader sees. The run's engine documents are no input
+    (:func:`input_digest`): they are the re-glue's to apply.
 
     :param scan: The scan.
     :param run: The final apply run the rows are measured in.
@@ -374,10 +372,18 @@ def input_digest(
     page indexes and the two anchor points (``boundaries.outside_rects``
     builds the neighbour masks from the opinion's own anchors and the
     page's detections, never from a neighbour's); the printed numbers
-    of its pages; and the run, whose engine documents, bitonal copy and
-    page map are fixed for its lifetime (a document rewritten in place
-    is ``reglue_opinion_ocr``'s to apply). Human text edits have their
-    own ``edit_revision`` and the pictures their own ``figure_digest``.
+    of its pages; and the run, whose bitonal copy and page map are
+    fixed for its lifetime. Human text edits have their own
+    ``edit_revision`` and the pictures their own ``figure_digest``.
+
+    The run's engine documents are **no input**, by choice. They move
+    the text and never the PDF, and the approval never carries a PDF,
+    so a digest that read them would cut every PDF of the volume again
+    for a late engine or a document a re-glue rewrote in place.
+    ``reglue_opinion_ocr`` is the one way an engine reaches the
+    opinions: it writes the text again and carries the PDF (#452). So
+    a late engine moves no digest, and the first approval after one
+    rebuilds only what the boxes moved.
 
     The rows are sorted, so the order a query returns them in is no
     input. :data:`DIGEST_RULES` is, so a change of what the glue reads
@@ -394,12 +400,7 @@ def input_digest(
     raw = json.dumps(
         {
             "rules": DIGEST_RULES,
-            "run": [
-                run.pk,
-                run.ocr_key or "",
-                run.extract_key or "",
-                run.surya_key or "",
-            ],
+            "run": run.pk,
             "anchors": [
                 row.start_page_index,
                 row.end_page_index,

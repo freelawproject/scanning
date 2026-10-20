@@ -839,6 +839,26 @@ class TestTheInputDigest(TestCase):
             opinions.input_digest(boundary, self.apply_run, elsewhere, lookup),
         )
 
+    def test_a_late_engine_moves_no_digest(self):
+        """A run that gains a Mistral and a Surya key gives the same
+        digest: an engine moves the text and never the PDF, which the
+        creation never carries, so it reaches the opinions through
+        ``reglue_opinion_ocr`` alone."""
+        boundary = OpinionBoundary.objects.get(
+            scan=self.scan, start_page_index=0
+        )
+        rows = opinions.read_rows(self.scan, self.apply_run)
+        lookup = opinions.printed_lookup(self.printed)
+        before = opinions.input_digest(boundary, self.apply_run, rows, lookup)
+
+        self.apply_run.extract_key = "jobs/apply/a1/extract-volume.json"
+        self.apply_run.surya_key = "jobs/apply/a1/surya-volume.json"
+
+        self.assertEqual(
+            opinions.input_digest(boundary, self.apply_run, rows, lookup),
+            before,
+        )
+
 
 class TestTheWorker(TestCase):
     """Where ``opinions.run`` parks the scan.
