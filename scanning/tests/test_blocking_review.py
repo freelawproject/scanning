@@ -55,15 +55,19 @@ class TestOpenWords(TestCase):
         )
 
     def test_a_block_a_person_wrote_keeps_the_open_words_they_left(self):
-        """One card answered, the other stays: the open word the person
-        left as it was is placed in the person's text, with the same
-        readings, and a word they changed is no card."""
+        """One card answered (the edit's ``span``), the other stays:
+        the open word the person left as it was is placed in the
+        person's text, with the same readings; a word they changed is
+        no card, and a whole-block answer leaves none."""
         voted = read(
             "the court held that",
             "the court heId that",
             "the court hold that",
         )
-        kept = ensemble._human_read(voted, {"text": "a court held that day"})
+        engines = voted["engines"]
+        kept = ensemble._human_read(
+            voted, {"text": "a court held that day", "span": [0, 3]}, engines
+        )
         words = blocking_review.open_words(kept)
 
         self.assertEqual(len(words), 1)
@@ -79,9 +83,84 @@ class TestOpenWords(TestCase):
         )
 
         answered = ensemble._human_read(
-            voted, {"text": "the court ruled that"}
+            voted, {"text": "the court ruled that", "span": [10, 14]}, engines
         )
         self.assertEqual(blocking_review.open_words(answered), [])
+
+        whole = ensemble._human_read(
+            voted, {"text": "a court held that", "span": None}, engines
+        )
+        self.assertEqual(whole["tokens"], [])
+        self.assertEqual(blocking_review.open_words(whole), [])
+
+    def test_a_run_the_base_did_not_read_keeps_its_place_after_an_answer(
+        self,
+    ):
+        """Two engines read ``plainly and`` where the base read nothing
+        (and differ at the end, so no reading holds a majority): two
+        cards. The person answers the first; the card of the second
+        still shows the engines' second word of the run, not their
+        first, because the place in the run is carried on the token."""
+        voted = read(
+            "the court held today",
+            "the court plainly and held today",
+            "the court plainly and held todey",
+        )
+        self.assertEqual(voted["agreement"], ensemble.VOTED)
+        cards = blocking_review.open_words(voted)
+        self.assertEqual([c["token"] for c in cards], ["plainly", "and"])
+        self.assertEqual(
+            [r["word"] for r in cards[1]["readings"]],
+            [blocking_review.READ_NOTHING, "and", "and"],
+        )
+        first = cards[0]
+        text = voted["text"]
+        answered = (
+            text[: first["start"]]
+            + "clearly"
+            + text[first["start"] + first["length"] :]
+        )
+
+        kept = ensemble._human_read(
+            voted,
+            {
+                "text": answered,
+                "span": [first["start"], first["start"] + first["length"]],
+            },
+            voted["engines"],
+        )
+        cards = blocking_review.open_words(kept)
+
+        self.assertEqual(kept["text"], "the court clearly and held today")
+        self.assertEqual([c["token"] for c in cards], ["and"])
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]],
+            [blocking_review.READ_NOTHING, "and", "and"],
+        )
+
+    def test_a_block_a_majority_read_alike_keeps_its_majority_words(self):
+        """The warnings review: a block two engines read alike has no
+        tokens of its own, so its majority words are voted for the
+        carry, and the block is a warning until each is answered."""
+        voted = read("a b c", "a b c", "a x c")
+        self.assertEqual(voted["agreement"], ensemble.MAJORITY)
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+        self.assertEqual([c["token"] for c in cards], ["b"])
+
+        kept = ensemble._human_read(
+            voted, {"text": "a b d", "span": [4, 5]}, voted["engines"]
+        )
+
+        self.assertTrue(ensemble._differs(kept, 3))
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+        self.assertEqual([(c["token"], c["start"]) for c in cards], [("b", 2)])
+        self.assertEqual(
+            blocking_review.open_words(kept, blocking_review.LOW_CONFIDENCE),
+            [],
+        )
 
     def test_a_block_a_majority_settled_has_no_open_word(self):
         self.assertEqual(

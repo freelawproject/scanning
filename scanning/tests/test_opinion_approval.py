@@ -175,10 +175,7 @@ class TestTheGate(ApprovalTestCase):
         )
 
     def test_an_edited_block_leaves_no_card(self):
-        """A text edit is the other answer to a blocking card (#376),
-        for the open words it changes: one that leaves an open word
-        as it was keeps the card, one that answers every open word
-        leaves none."""
+        """A text edit is the other answer to a blocking card (#376)."""
         from scanning.models import OpinionEdit
 
         group = self.split_group()
@@ -186,7 +183,26 @@ class TestTheGate(ApprovalTestCase):
             kind=OpinionEdit.Kind.TEXT,
             box_pt=group["box_pt"],
             base_text=group["text"],
-            text="body A 1.",
+            text="body A 1",
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(self.blocking(), [])
+        self.approve()
+
+    def test_a_word_answer_keeps_the_card_for_the_open_word_it_left(self):
+        """A word card's answer (the edit's ``span``) vouches for its
+        word alone: the block's other open word still blocks."""
+        from scanning.models import OpinionEdit
+
+        group = self.split_group()
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A 1",
+            span=[0, 4],
         )
         self.opinion.refresh_from_db()
         ensemble.rerun(self.opinion)
@@ -200,7 +216,8 @@ class TestTheGate(ApprovalTestCase):
             kind=OpinionEdit.Kind.TEXT,
             box_pt=group["box_pt"],
             base_text=group["text"],
-            text="bodies A one.",
+            text="bodies A one",
+            span=[9, 10],
         )
         self.opinion.refresh_from_db()
         ensemble.rerun(self.opinion)

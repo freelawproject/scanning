@@ -242,7 +242,12 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     for token in tokens:
         if not token["text"]:
             continue
-        if token.get("inserted"):
+        if "run_index" in token:
+            # A block a person wrote: the place of an inserted word in
+            # its run is carried on the token (``ensemble._kept_open``),
+            # because the person may have changed its neighbour.
+            run_index = token["run_index"]
+        elif token.get("inserted"):
             run_index = 0 if run_index is None else run_index + 1
         else:
             run_index = None

@@ -1140,7 +1140,14 @@
                 span.title = 'A majority chose this word, and not'
                     + ' every engine read it so.';
             }
-            if (!first) { target.appendChild(document.createTextNode(' ')); }
+            if (!first) {
+                // The separator the text holds there: a line break a
+                // person kept (``opinion_edits.fold``) stays one.
+                var between = (group.text || '').charAt(start - 1);
+                target.appendChild(document.createTextNode(
+                    between === '\n' ? '\n' : ' '
+                ));
+            }
             first = false;
             target.appendChild(span);
         });
