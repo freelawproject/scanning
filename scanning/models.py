@@ -3048,6 +3048,17 @@ class Opinion(AbstractDateTimeModel):
             "opinion_pdf.retry_after() has passed."
         ),
     )
+    input_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "A digest of everything the row's OCR documents and redacted "
+            "PDF are built from (opinions.input_digest), stamped by the "
+            "creation. A later creation that computes the same digest "
+            "keeps the revision; blank on a row from before the rule."
+        ),
+    )
     notes = models.TextField(blank=True, default="")
 
     class Meta:
