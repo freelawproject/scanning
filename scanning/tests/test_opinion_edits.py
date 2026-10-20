@@ -156,7 +156,7 @@ class TestTheTextEdit(TestCase):
                     BODY_A_PT,
                     base_text=group["text"],
                     text="The tribunal held that",
-                    span=[4, 9],
+                    span=[4, 12],
                     section=ensemble.BODY,
                 )
             ],
@@ -204,7 +204,7 @@ class TestTheTextEdit(TestCase):
                     BODY_A_PT,
                     base_text=group["text"],
                     text="The courts held this",
-                    span=[4, 9],
+                    span=[4, 10],
                     section=ensemble.BODY,
                 )
             ],

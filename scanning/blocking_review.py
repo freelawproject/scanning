@@ -256,9 +256,17 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     # not rank first of all that read.
     source = group.get("source")
     if group.get("agreement") == ensemble.HUMAN:
-        # A person's text was written over the shown engine's; the
-        # engines' own resolve names that engine again.
-        source = ensemble.resolve(group).get("source")
+        # A person's text: its tokens count their positions against
+        # the engine they name (``ensemble._kept_open``); a document
+        # from before that stamp counted against the first that read.
+        source = next(
+            (
+                t.get("base")
+                for t in group.get("tokens") or []
+                if t.get("base")
+            ),
+            present[0],
+        )
     base = source if source in present else present[0]
     base_pairs = ensemble._pairs(engines[base]["text"])
     others = [
@@ -280,34 +288,6 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     }
     ends = {name: _span_ends(at) for name, (at, _) in candidates.items()}
     shown = [token["text"] for token in tokens if token["text"]]
-    # The places one engine alone read words the base did not: the
-    # vote dropped them with no mark (``ensemble.vote_words``), and the
-    # warnings review opens each on the base's word there, so a
-    # star-page number read off the margin is one small card and not
-    # the whole block. A place the vote marked is a card already.
-    marked = {
-        token.get("position")
-        for token in tokens
-        if token.get("low_confidence") or token.get("inserted")
-    }
-    lone = (
-        {
-            position
-            for _, (_, inserted) in candidates.items()
-            for position in inserted
-            if position not in marked
-        }
-        if flag == MAJORITY
-        else set()
-    )
-    if lone and len(base_pairs) in lone:
-        # A run after the last word: its card is the last word's.
-        lone.discard(len(base_pairs))
-        lone.add(len(base_pairs) - 1)
-        after_last = True
-    else:
-        after_last = False
-
     # Every token with its offset in the group's text, its index among
     # the shown words and its place in an inserted run.
     text = group.get("text") or " ".join(shown)
@@ -352,10 +332,16 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     spans: list[list[int]] = []
     for entry in placed:
         token = entry["token"]
+        # A lone run (``lone``, ``lone_after``) is a card of the
+        # warnings review alone, read off the token: the vote wrote it,
+        # and a person's answer takes it off (``ensemble._kept_open``).
+        lone = flag == MAJORITY and (
+            token.get("lone") or token.get("lone_after")
+        )
         if (
             entry["run_index"] is not None
             or token.get("position") is None
-            or not (token.get(flag) or token["position"] in lone)
+            or not (token.get(flag) or lone)
         ):
             continue
         first = last = token["position"]
@@ -394,9 +380,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
         # its reading of the place: the card shows ``1490 included``
         # against ``included``, and the answer goes into the word's
         # place.
-        tail = covered[-1]["token"].get("disputed_after") or (
-            after_last and last == len(base_pairs) - 1
-        )
+        tail = covered[-1]["token"].get("disputed_after") or covered[-1][
+            "token"
+        ].get("lone_after")
         for name, (at, inserted) in candidates.items():
             run_before = _run_words(inserted, first)
             run_after = _run_words(inserted, last + 1) if tail else ""

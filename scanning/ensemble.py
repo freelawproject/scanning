@@ -2626,6 +2626,9 @@ def vote_words(
       word), beside ``low_confidence``: no two engines read this spot
       alike, counting the words each read before it that the base did
       not. None of those runs goes in; the card shows them.
+    - ``"lone": True`` (``"lone_after"`` on the last word): one engine
+      alone read words before this one, the others alike. Dropped,
+      and a warning card of its own.
 
     :param base: The base engine's ``(key, word)`` pairs.
     :param others: The other engines' pairs.
@@ -2720,12 +2723,23 @@ def vote_words(
             and len(set(spot_keys)) == len(spot_keys)
             and any(inserted.get(position) for inserted in inserts)
         )
+        # A run one engine alone read here, the others alike: dropped,
+        # and the base's word carries ``lone`` so the warnings review
+        # opens it on its own and a person's answer closes it
+        # (``blocking_review.open_words``, ``_kept_open``).
+        lone_here = (
+            not put_in
+            and not disputed_before
+            and any(inserted.get(position) for inserted in inserts)
+        )
         if position == len(base):
-            if disputed_before and tokens:
+            if tokens and disputed_before:
                 if not tokens[-1].get("low_confidence"):
                     disputed += 1
                 tokens[-1]["low_confidence"] = True
                 tokens[-1]["disputed_after"] = True
+            elif tokens and lone_here:
+                tokens[-1]["lone_after"] = True
             break
         readings = [base[position]]
         for vote in votes:
@@ -2755,6 +2769,8 @@ def vote_words(
                     token["low_confidence"] = True
                     token["disputed_before"] = True
                     disputed += 1
+                if lone_here:
+                    token["lone"] = True
                 tokens.append(token)
         else:
             chosen[position] = base[position][0]
@@ -2766,6 +2782,8 @@ def vote_words(
             }
             if disputed_before:
                 token["disputed_before"] = True
+            if lone_here:
+                token["lone"] = True
             tokens.append(token)
     return tokens, disputed
 
@@ -3142,7 +3160,12 @@ def _apply_order(ordered: list[dict], edit: dict) -> int:
     return len(boxes) - len(landed)
 
 
-def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
+def _kept_open(
+    read_back: dict,
+    text: str,
+    engines: dict,
+    judged: tuple[int, int] | None = None,
+) -> list[dict]:
     """Return the tokens of a person's text, the vote's flags kept on
     the words the person left as they were.
 
@@ -3166,26 +3189,42 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     majority words with it. A whole-block judgement never comes here
     (:func:`_human_read`).
 
+    The span the person judged (``judged``, offsets into ``text``) is
+    answered whatever it holds: a token inside it carries no open flag,
+    so an answer that keeps the base's word (``I contract or`` over
+    ``or``) closes its own card. Every token carries ``base``, the
+    engine whose words its ``position`` counts, so the cards index
+    the same words whichever engine ranks first.
+
     :param read_back: :func:`resolve` of the group, the engines' own.
     :param text: The text the person wrote, folded.
     :param engines: The group's ``engines``, for a block the vote left
         no tokens on.
+    :param judged: The span of ``text`` the person answered, or None.
     :returns: One token per word of ``text``.
     :rtype: list[dict]
     """
     voted = [t for t in read_back.get("tokens") or [] if t.get("text")]
-    if not voted and read_back.get("agreement") == MAJORITY and engines:
-        present = [
+    present = (
+        [
             name
             for name in _ranked(engines)
             if compare_text(engines[name]["text"])
         ]
+        if engines
+        else []
+    )
+    # The engine the positions count against: the one whose text is
+    # shown, the rule of ``blocking_review.open_words``; on a block a
+    # person wrote already, the one its tokens name.
+    first = read_back.get("source")
+    if first not in present:
+        first = next(
+            (t.get("base") for t in voted if t.get("base")),
+            present[0] if present else None,
+        )
+    if not voted and read_back.get("agreement") == MAJORITY and engines:
         if len(present) >= 2:
-            # The base is the engine whose text is shown, the rule of
-            # ``blocking_review.open_words``, so the tokens are the
-            # words of that text.
-            source = read_back.get("source")
-            first = source if source in present else present[0]
             base = _pairs(engines[first]["text"])
             others = [
                 _pairs(engines[name]["text"])
@@ -3212,7 +3251,8 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             token["run_index"] = run_index
         else:
             run_index = None
-    words = text.split()
+    placed = [(m.start(), m.end(), m.group()) for m in _WORD.finditer(text)]
+    words = [word for _, _, word in placed]
     matcher = SequenceMatcher(
         None,
         [compare_word(t["text"]) for t in voted],
@@ -3226,24 +3266,34 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         for offset in range(i2 - i1):
             carried[j1 + offset] = voted[i1 + offset]
     tokens: list[dict] = []
-    for index, word in enumerate(words):
+    for index, (start, end, word) in enumerate(placed):
         token: dict = {"text": word}
         old = carried.get(index)
+        answered = judged is not None and start < judged[1] and end > judged[0]
         if old:
-            for flag in (
-                "low_confidence",
-                "majority",
-                "inserted",
-                "disputed_before",
-                "disputed_after",
-            ):
-                if old.get(flag):
-                    token[flag] = True
+            if not answered:
+                for flag in (
+                    "low_confidence",
+                    "majority",
+                    "inserted",
+                    "disputed_before",
+                    "disputed_after",
+                    "lone",
+                    "lone_after",
+                ):
+                    if old.get(flag):
+                        token[flag] = True
             for key in ("position", "run_index"):
                 if key in old:
                     token[key] = old[key]
+            if first:
+                token["base"] = first
         tokens.append(token)
     return tokens
+
+
+#: A word of a person's text, the split :func:`_kept_open` places by.
+_WORD = re.compile(r"\S+")
 
 
 def _human_read(
@@ -3276,9 +3326,12 @@ def _human_read(
         # The items carry like the marks: a word the curator kept
         # still starts its item (#428).
         marks, kind_of_list = _with_items(text, marks, readings, 1)
+    span = edit.get("span")
     tokens = (
-        _kept_open(read_back, text, engines or {})
-        if edit.get("span") is not None
+        _kept_open(
+            read_back, text, engines or {}, (int(span[0]), int(span[1]))
+        )
+        if span is not None
         else []
     )
     return {
@@ -3865,7 +3918,10 @@ def _differs(group: dict, engines: int) -> bool:
         # open, or settled over one engine, that they left as it was
         # is still that (``_kept_open``).
         return bool(group.get("n_low_confidence")) or any(
-            token.get("majority") for token in group.get("tokens") or []
+            token.get("majority")
+            or token.get("lone")
+            or token.get("lone_after")
+            for token in group.get("tokens") or []
         )
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True

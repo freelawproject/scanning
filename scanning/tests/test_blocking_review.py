@@ -292,6 +292,84 @@ class TestOpenWords(TestCase):
             [("mistral_ocr", "x"), ("dots_mocr", "b"), ("surya", "x")],
         )
 
+    def test_an_answer_that_keeps_the_base_word_closes_its_own_card(self):
+        """The red spot card ``or`` / ``[c]ontract or`` / ``I contract
+        or``, answered with Surya's reading: the word ``or`` stands as
+        it stood, but the span the person judged holds it, so it
+        carries no open flag and the block is settled."""
+        voted = read(
+            "two or more statutes",
+            "two [c]ontract or more statutes",
+            "two I contract or more statutes",
+        )
+        card = blocking_review.open_words(voted)[0]
+        answered = (
+            voted["text"][: card["start"]]
+            + "I contract or"
+            + voted["text"][card["start"] + card["length"] :]
+        )
+
+        kept = ensemble._human_read(
+            voted,
+            {"text": answered, "span": [card["start"], card["start"] + 13]},
+            voted["engines"],
+        )
+
+        self.assertEqual(kept["text"], "two I contract or more statutes")
+        self.assertEqual(kept["n_low_confidence"], 0)
+        self.assertIsNone(ensemble.disagreement_level(kept, 3))
+        self.assertEqual(blocking_review.open_words(kept), [])
+
+    def test_a_lone_card_outlives_the_other_answers_and_closes_when_judged(
+        self,
+    ):
+        """Two cards on one block: a majority word (``e`` over ``d``)
+        and a lone run (``1490`` before ``c``). Answering the majority
+        word keeps the lone card; answering the lone card closes it."""
+        voted = read("a b c d", "a b c e", "a b 1490 c e")
+        self.assertEqual(voted["agreement"], ensemble.VOTED)
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+        self.assertEqual([c["token"] for c in cards], ["c", "e"])
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]], ["c", "c", "1490 c"]
+        )
+
+        kept = ensemble._human_read(
+            voted, {"text": "a b c f", "span": [6, 7]}, voted["engines"]
+        )
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+        self.assertEqual([c["token"] for c in cards], ["c"])
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]], ["c", "c", "1490 c"]
+        )
+
+        done = ensemble._human_read(
+            kept, {"text": "a b c f", "span": [4, 5]}, voted["engines"]
+        )
+        self.assertIsNone(ensemble.disagreement_level(done, 3))
+        self.assertEqual(
+            blocking_review.open_words(done, blocking_review.MAJORITY), []
+        )
+
+    def test_the_carried_tokens_name_the_engine_they_count_against(self):
+        """Two engines outvote the first-ranked one: the shown text is
+        theirs, and the carried tokens say so, so the cards are placed
+        in that text."""
+        voted = read("a b c", "a x c", "a x c")
+        kept = ensemble._human_read(
+            voted, {"text": "a x d", "span": [4, 5]}, voted["engines"]
+        )
+
+        self.assertEqual(
+            {t.get("base") for t in kept["tokens"] if t.get("base")},
+            {"mistral_ocr"},
+        )
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+        self.assertEqual([(c["token"], c["start"]) for c in cards], [("x", 2)])
+
     def test_a_block_a_majority_settled_has_no_open_word(self):
         self.assertEqual(
             blocking_review.open_words(read("a b c", "a b c", "a x c")), []

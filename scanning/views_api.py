@@ -1652,9 +1652,10 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
-    # The span the person judged, in the text they saw: the word card
-    # of the blocking review sends its word's, and the build then
-    # keeps the block's other open words open (``ensemble._kept_open``);
+    # The span the person judged, sent in the text they saw and stored
+    # in the text they wrote: the word card of the blocking review
+    # sends its word's, and the build then keeps the block's other
+    # open words open and closes this one (``ensemble._kept_open``);
     # the block card and the edit box send none, a whole-block
     # judgement.
     span = body.get("span")
@@ -1667,6 +1668,11 @@ def edit_opinion_text(
         or not 0 <= span[0] < span[1] <= len(group["text"])
     ):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    if span is not None:
+        # Stored as offsets into the new text: what follows the span
+        # is the same in both, so the end moves by the length change.
+        tail = len(group["text"]) - span[1]
+        span = [span[0], max(span[0], min(len(text), len(text) - tail))]
     edit = opinion_edits.supersede(
         opinion,
         request.user,
