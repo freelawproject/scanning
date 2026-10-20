@@ -1132,9 +1132,11 @@ def queue_ready_runs() -> int:
             # Somebody moved the scan between the read and the write.
             # No mark: the next tick sees it again.
             continue
-        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         state["queued_at"] = timezone.now().isoformat()
         write_apply_state(rows, state)
+        # After the ledger write, never before: the worker's own
+        # ledger writes start as soon as it claims (#503).
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         logger.info(
             "Queued the redaction computation for scan %s (detection run %s)",
             scan.pk,
