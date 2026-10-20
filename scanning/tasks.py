@@ -495,7 +495,7 @@ TICKS: tuple[Tick, ...] = (
         "prepare_opinions",
         prepare_opinions,
         "DAEMON_COLLECT_INTERVAL",
-        QUEUE_FAST,
+        QUEUE_OPINIONS,
     ),
     Tick("score_pages", score_pages, "DAEMON_BADPAGE_INTERVAL", QUEUE_HEAVY),
     Tick(

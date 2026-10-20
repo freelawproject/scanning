@@ -366,6 +366,7 @@ class TestDispatch(TestCase):
     """``dispatch_scan`` and ``submit_soon``."""
 
     def setUp(self):
+        _no_connection_reset(self)
         patcher = patch("scanning.tasks.queue_depth", return_value=0)
         patcher.start()
         self.addCleanup(patcher.stop)

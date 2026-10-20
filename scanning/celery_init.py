@@ -19,8 +19,9 @@ The queues (``scanning.tasks``):
 - ``heavy``: the scan actions (shard, apply, compute, create opinions),
   the Mistral render and the bad-page score. Minutes, and the only
   queue that scales by replica count.
-- ``opinions``: the opinion PDFs and the figure cuts, which share the
-  local mirror of a volume and so run on one pod.
+- ``opinions``: the opinion OCR glue, the ensemble, the PDFs and the
+  figure cuts, which share the local mirror of a volume and so run on
+  one pod.
 """
 
 import os
