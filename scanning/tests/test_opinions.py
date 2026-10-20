@@ -617,7 +617,7 @@ class TestTheInputDigest(TestCase):
         revision, and the ones whose stamps were behind are still owed,
         because what is owed is read off the stamps, never off the
         creation."""
-        from scanning import ensemble, opinion_ocr, opinion_pdf
+        from scanning import opinion_ocr, opinion_pdf
 
         Opinion.objects.filter(pk=self.b.pk).update(
             status=OpinionReviewStatus.PROCESSING,
