@@ -1632,7 +1632,8 @@ def edit_opinion_text(
     page, group, address = target
     if group.get("kind") == markup.FIGURE:
         return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
-    if group.get("human"):
+    human = group.get("human") or {}
+    if human and group.get("level") is None:
         return _edit_refusal(request, EDIT_HUMAN_ALREADY_MESSAGE)
     if group.get("level") is None:
         return _edit_refusal(request, EDIT_UNANIMOUS_MESSAGE)
@@ -1651,6 +1652,21 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
+    # The span the person judged, in the text they saw: the word card
+    # of the blocking review sends its word's, and the build then
+    # keeps the block's other open words open (``ensemble._kept_open``);
+    # the block card and the edit box send none, a whole-block
+    # judgement.
+    span = body.get("span")
+    if span is not None and (
+        not isinstance(span, list)
+        or len(span) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) for v in span
+        )
+        or not 0 <= span[0] < span[1] <= len(group["text"])
+    ):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     edit = opinion_edits.supersede(
         opinion,
         request.user,
@@ -1660,8 +1676,13 @@ def edit_opinion_text(
         page_in_opinion=page["page_in_opinion"],
         box_pt=group["box_pt"],
         section=group.get("section") or ensemble.BODY,
-        base_text=group["text"],
+        # A second edit on a block a person wrote, for an open word
+        # the first left as it was, judges the engines' text the first
+        # judged, and supersedes it: the build compares ``base_text``
+        # with the engines' reading, never with the person's.
+        base_text=human.get("base_text") or group["text"],
         text=text,
+        span=span,
         glue_revision=opinion.glue_revision,
     )
     logger.info(

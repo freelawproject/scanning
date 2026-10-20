@@ -187,6 +187,11 @@
             page_in_opinion: card.page_in_opinion,
             group_id: card.group_id,
             text: text,
+            // The span judged: a word card answers its word, and the
+            // block's other open words stay open; a block card
+            // answers the block.
+            span: card.kind === 'word'
+                ? [card.start, card.start + card.length] : null,
             glue_revision: this.opinion.glue_revision,
             edit_revision: this.opinion.edit_revision
         }).then(function (answer) {

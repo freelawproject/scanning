@@ -180,7 +180,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     each carries the base position it answers for. Each other engine's
     word at that position comes from the same alignment the vote used
     (``ensemble._candidates``), so the rows of the card are the votes
-    that were cast.
+    that were cast. A block a person wrote keeps the open words they
+    left as they were, as the document's own tokens, placed in the
+    person's text: an answer to one card closes that card alone.
 
     **A card covers the span the engines joined.** dots.mocr writes
     ``Ill. Adm. Code`` as three words and the others as one, so the
@@ -201,9 +203,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     :rtype: list[dict]
     """
     agreements = (
-        (ensemble.VOTED, ensemble.MAJORITY)
+        (ensemble.VOTED, ensemble.MAJORITY, ensemble.HUMAN)
         if flag == MAJORITY
-        else (ensemble.VOTED,)
+        else (ensemble.VOTED, ensemble.HUMAN)
     )
     if group.get("agreement") not in agreements:
         return []
@@ -216,35 +218,52 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     others = [
         (name, ensemble._pairs(engines[name]["text"])) for name in present[1:]
     ]
-    tokens, _ = ensemble.vote_words(base_pairs, [pairs for _, pairs in others])
+    if group.get("agreement") == ensemble.HUMAN:
+        # A person wrote the text; the open words they left as they
+        # were are the document's own tokens, each at its base
+        # position (``ensemble._kept_open``), placed in that text.
+        tokens = group.get("tokens") or []
+    else:
+        tokens, _ = ensemble.vote_words(
+            base_pairs, [pairs for _, pairs in others]
+        )
     candidates = {
         name: ensemble._candidates(base_pairs, pairs) for name, pairs in others
     }
     ends = {name: _span_ends(at) for name, (at, _) in candidates.items()}
     shown = [token["text"] for token in tokens if token["text"]]
 
-    # Every token with its offset, its index among the shown words and
-    # its place in an inserted run.
+    # Every token with its offset in the group's text, its index among
+    # the shown words and its place in an inserted run.
+    text = group.get("text") or " ".join(shown)
     placed: list[dict] = []
     offset = 0
     run_index: int | None = None
     for token in tokens:
         if not token["text"]:
             continue
-        if token.get("inserted"):
+        if "run_index" in token:
+            # A block a person wrote: the place of an inserted word in
+            # its run is carried on the token (``ensemble._kept_open``),
+            # because the person may have changed its neighbour.
+            run_index = token["run_index"]
+        elif token.get("inserted"):
             run_index = 0 if run_index is None else run_index + 1
         else:
             run_index = None
+        start = text.find(token["text"], offset)
+        if start < 0:
+            start = offset
         placed.append(
             {
                 "token": token,
-                "start": offset,
-                "end": offset + len(token["text"]),
+                "start": start,
+                "end": start + len(token["text"]),
                 "index": len(placed),
                 "run_index": run_index,
             }
         )
-        offset += len(token["text"]) + 1
+        offset = start + len(token["text"])
 
     def context(first_index: int, last_index: int) -> tuple[str, str]:
         return (
@@ -258,7 +277,11 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     spans: list[list[int]] = []
     for entry in placed:
         token = entry["token"]
-        if not token.get(flag) or entry["run_index"] is not None:
+        if (
+            not token.get(flag)
+            or entry["run_index"] is not None
+            or token.get("position") is None
+        ):
             continue
         first = last = token["position"]
         for name, (at, _) in candidates.items():
@@ -275,6 +298,7 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
             e
             for e in placed
             if e["run_index"] is None
+            and e["token"].get("position") is not None
             and first <= e["token"]["position"] <= last
         ]
         if not covered:
@@ -307,7 +331,11 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     # The words of a run the base did not read, one card each.
     for entry in placed:
         token = entry["token"]
-        if not token.get(flag) or entry["run_index"] is None:
+        if (
+            not token.get(flag)
+            or entry["run_index"] is None
+            or token.get("position") is None
+        ):
             continue
         position = token["position"]
         before, after = context(entry["index"], entry["index"])
