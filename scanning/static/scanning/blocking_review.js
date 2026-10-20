@@ -486,6 +486,10 @@
         node.appendChild(header);
         if (card.kind === 'link') {
             node.appendChild(note(card.message));
+        } else if (card.kind === 'block' && card.alike) {
+            // The engines that read the block read it alike; one read
+            // nothing here. One line to say so, and the footer.
+            node.appendChild(note(alikeNote(card)));
         } else if (card.kind === 'cover') {
             // The redacted page around the blocks a box covers in part,
             // each outlined: a word that shows past the box is a
@@ -600,6 +604,9 @@
             if (card.kind === 'word') {
                 return 'a majority settled this word over one engine: bless it or pick the other reading';
             }
+            if (card.kind === 'block' && card.alike) {
+                return 'the engines that read this block read it alike: keep it as shown';
+            }
             if (card.kind === 'block') {
                 return (card.silent && card.silent.length
                     ? card.silent.join(', ') + ' read nothing here'
@@ -617,6 +624,26 @@
             return 'a box covers part of the outlined block(s): does any word show past it?';
         }
         return card.check_label || card.check;
+    }
+
+    /** The one line of an ``alike`` block card: who read it, who did
+     *  not, and the first words of the block to find it by. */
+    function alikeNote(card) {
+        var hyphens = card.hyphen_only || [];
+        var read = (card.read || (card.readings || []).map(function (r) { return r.engine; }))
+            .filter(function (name) { return hyphens.indexOf(name) < 0; });
+        var missing = (card.missing || []).concat(card.silent || []);
+        var words = fold(card.text || '').split(' ').slice(0, 8).join(' ');
+        return (missing.length
+            ? missing.join(', ') + ' read no block here; '
+            : '')
+            + (hyphens.length
+                ? hyphens.join(', ') + ' differs only by line-end hyphens; '
+                : '')
+            + (read.length > 1
+                ? read.join(' and ') + ' read it alike'
+                : (read[0] || 'one engine') + ' alone read it')
+            + ': "' + words + (card.text && card.text.length > words.length ? '…' : '') + '"';
     }
 
     function snippet(card) {

@@ -2622,6 +2622,11 @@ def vote_words(
     tie. A word only a minority read is dropped, which is the reading
     of the majority.
 
+    - ``"disputed_before": True`` (``"disputed_after"`` on the last
+      word), beside ``low_confidence``: no two engines read this spot
+      alike, counting the words each read before it that the base did
+      not. None of those runs goes in; the card shows them.
+
     :param base: The base engine's ``(key, word)`` pairs.
     :param others: The other engines' pairs.
     :returns: ``(tokens, how many positions had no majority)``.
@@ -2653,6 +2658,7 @@ def vote_words(
             for run in inserted.get(position, [])
         ]
         counted = Counter(keys for keys, _ in runs)
+        put_in = False
         for keys, count in counted.items():
             # A run the base does not have: ``count`` engines read it
             # and ``total - count`` did not. A majority of them puts it
@@ -2662,6 +2668,7 @@ def vote_words(
             # dropped, the reading of the majority.
             if count < quorum and count * 2 != total:
                 continue
+            put_in = True
             words = next(words for other, words in runs if other == keys)
             tokens += [
                 {
@@ -2676,7 +2683,49 @@ def vote_words(
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
             disputed += len(words)
+        # **A spot no two engines read alike is in doubt**, whatever
+        # the word vote makes of it. An engine's reading of the spot is
+        # the words it read here that the base did not, then its word
+        # for the base's: ``As`` against ``1659As`` against ``Isaa As``
+        # is three readings of one glyph, and the majority on the word
+        # ``As`` says nothing about the glyph. So the base's word is
+        # marked (its card shows each engine's reading of the spot,
+        # ``blocking_review.open_words``) and the text keeps the
+        # base's. Two readings alike is a majority on the spot: a word
+        # one engine alone read before it is dropped with no mark (the
+        # warnings review opens it on its own), and a run a majority
+        # read alike went in above.
+        # The base's reading of the spot: its word, or nothing after
+        # its last word, which is a reading too.
+        spot_keys = [base[position][0]] if position < len(base) else [""]
+        for at, inserted in zip(votes, inserts, strict=True):
+            run = " ".join(
+                key for run in inserted.get(position, []) for key, _ in run
+            )
+            word = ""
+            if position < len(base):
+                entries = at.get(position) or []
+                if entries:
+                    entry = entries[0]
+                    word = (
+                        entry.key if isinstance(entry, Carried) else entry[0]
+                    )
+            spot_keys.append(f"{run} {word}".strip())
+        # Only where some engine read words the base did not: three
+        # readings of one word with nothing before it are the plain
+        # word vote's own no-majority, marked below.
+        disputed_before = (
+            not put_in
+            and len(spot_keys) >= 3
+            and len(set(spot_keys)) == len(spot_keys)
+            and any(inserted.get(position) for inserted in inserts)
+        )
         if position == len(base):
+            if disputed_before and tokens:
+                if not tokens[-1].get("low_confidence"):
+                    disputed += 1
+                tokens[-1]["low_confidence"] = True
+                tokens[-1]["disputed_after"] = True
             break
         readings = [base[position]]
         for vote in votes:
@@ -2702,17 +2751,22 @@ def vote_words(
                     # reading elsewhere (#391) confirmed nothing, so
                     # its silence must not read as one more voice.
                     token["majority"] = True
+                if disputed_before:
+                    token["low_confidence"] = True
+                    token["disputed_before"] = True
+                    disputed += 1
                 tokens.append(token)
         else:
             chosen[position] = base[position][0]
             disputed += 1
-            tokens.append(
-                {
-                    "text": base[position][1],
-                    "low_confidence": True,
-                    "position": position,
-                }
-            )
+            token = {
+                "text": base[position][1],
+                "low_confidence": True,
+                "position": position,
+            }
+            if disputed_before:
+                token["disputed_before"] = True
+            tokens.append(token)
     return tokens, disputed
 
 
@@ -3127,8 +3181,17 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             if compare_text(engines[name]["text"])
         ]
         if len(present) >= 2:
-            base = _pairs(engines[present[0]]["text"])
-            others = [_pairs(engines[name]["text"]) for name in present[1:]]
+            # The base is the engine whose text is shown, the rule of
+            # ``blocking_review.open_words``, so the tokens are the
+            # words of that text.
+            source = read_back.get("source")
+            first = source if source in present else present[0]
+            base = _pairs(engines[first]["text"])
+            others = [
+                _pairs(engines[name]["text"])
+                for name in present
+                if name != first
+            ]
             # The vote is from the first engine's side, so a word the
             # majority read and the first engine missed comes back
             # ``low_confidence``; the majority settled it, and only
@@ -3167,7 +3230,13 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         token: dict = {"text": word}
         old = carried.get(index)
         if old:
-            for flag in ("low_confidence", "majority", "inserted"):
+            for flag in (
+                "low_confidence",
+                "majority",
+                "inserted",
+                "disputed_before",
+                "disputed_after",
+            ):
                 if old.get(flag):
                     token[flag] = True
             for key in ("position", "run_index"):

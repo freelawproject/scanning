@@ -20,6 +20,8 @@ the guess, and the card says so.
 
 from __future__ import annotations
 
+import re
+
 from scanning import ensemble, markup
 
 #: The height of one printed line, in points: the estimate every crop
@@ -122,6 +124,34 @@ def _reading(
     return entry[1]
 
 
+#: A hyphen an engine kept at a line end, with the break as a space or
+#: a newline: ``Depart- ment``. Mistral writes the page's line breaks
+#: so; the others join the word. Not a difference worth a card.
+_HYPHEN_BREAK = re.compile(r"(?<=\w)-\s(?=\w)")
+
+
+def dehyphenated(text: str) -> str:
+    """Return ``text`` with every line-end hyphen joined."""
+    return _HYPHEN_BREAK.sub("", text)
+
+
+def _hyphens_alone(base_words: str, readings: list[dict]) -> bool:
+    """Return whether every other reading of a span is the base's
+    words but for line-end hyphens."""
+    want = ensemble.compare_text(dehyphenated(base_words))
+    return all(
+        ensemble.compare_text(dehyphenated(r["word"])) == want
+        for r in readings[1:]
+    )
+
+
+def _run_words(inserted: dict, position: int) -> str:
+    """Return the words one engine read at a base position that the
+    base did not, as the engine wrote them, or "" for none."""
+    runs = inserted.get(position) or []
+    return " ".join(word for run in runs for _, word in run)
+
+
 def _span_ends(at: dict) -> dict[int, int]:
     """Return ``{head: last position}`` of every span one engine joined.
 
@@ -195,6 +225,13 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     engine's words over the whole span: the answer replaces the span.
     A word of a run the base did not read is a card of its own.
 
+    **A place other engines read words at that the base did not** is a
+    card on the base's word there, and each engine's row carries its
+    run before that word (``1490 included`` against ``included``): a
+    red card where a majority read something and no two alike
+    (``disputed_before``), a warning card, in the ``MAJORITY`` mode,
+    where one engine alone did. Never the whole block.
+
     :param group: One group of a stamped ensemble document.
     :param flag: The flag of the tokens to open.
     :returns: One entry per open place: ``{start, length, token,
@@ -213,10 +250,21 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     if len(present) < 2:
         return []
     engines = group["engines"]
-    base = present[0]
+    # The base is the engine whose text is shown, so every offset of a
+    # card is an offset into that text: for a block a majority read
+    # alike the shown text is the first agreeing engine's, which need
+    # not rank first of all that read.
+    source = group.get("source")
+    if group.get("agreement") == ensemble.HUMAN:
+        # A person's text was written over the shown engine's; the
+        # engines' own resolve names that engine again.
+        source = ensemble.resolve(group).get("source")
+    base = source if source in present else present[0]
     base_pairs = ensemble._pairs(engines[base]["text"])
     others = [
-        (name, ensemble._pairs(engines[name]["text"])) for name in present[1:]
+        (name, ensemble._pairs(engines[name]["text"]))
+        for name in present
+        if name != base
     ]
     if group.get("agreement") == ensemble.HUMAN:
         # A person wrote the text; the open words they left as they
@@ -232,6 +280,33 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     }
     ends = {name: _span_ends(at) for name, (at, _) in candidates.items()}
     shown = [token["text"] for token in tokens if token["text"]]
+    # The places one engine alone read words the base did not: the
+    # vote dropped them with no mark (``ensemble.vote_words``), and the
+    # warnings review opens each on the base's word there, so a
+    # star-page number read off the margin is one small card and not
+    # the whole block. A place the vote marked is a card already.
+    marked = {
+        token.get("position")
+        for token in tokens
+        if token.get("low_confidence") or token.get("inserted")
+    }
+    lone = (
+        {
+            position
+            for _, (_, inserted) in candidates.items()
+            for position in inserted
+            if position not in marked
+        }
+        if flag == MAJORITY
+        else set()
+    )
+    if lone and len(base_pairs) in lone:
+        # A run after the last word: its card is the last word's.
+        lone.discard(len(base_pairs))
+        lone.add(len(base_pairs) - 1)
+        after_last = True
+    else:
+        after_last = False
 
     # Every token with its offset in the group's text, its index among
     # the shown words and its place in an inserted run.
@@ -278,9 +353,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     for entry in placed:
         token = entry["token"]
         if (
-            not token.get(flag)
-            or entry["run_index"] is not None
+            entry["run_index"] is not None
             or token.get("position") is None
+            or not (token.get(flag) or token["position"] in lone)
         ):
             continue
         first = last = token["position"]
@@ -314,10 +389,31 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 ),
             }
         ]
-        for name, (at, _) in candidates.items():
-            readings.append(
-                {"engine": name, "word": _span_reading(at, first, last)}
+        # The words an engine read before (or, at the end of the
+        # block, after) this place that the base did not are part of
+        # its reading of the place: the card shows ``1490 included``
+        # against ``included``, and the answer goes into the word's
+        # place.
+        tail = covered[-1]["token"].get("disputed_after") or (
+            after_last and last == len(base_pairs) - 1
+        )
+        for name, (at, inserted) in candidates.items():
+            run_before = _run_words(inserted, first)
+            run_after = _run_words(inserted, last + 1) if tail else ""
+            word = " ".join(
+                part
+                for part in (
+                    run_before,
+                    _span_reading(at, first, last),
+                    run_after,
+                )
+                if part
             )
+            readings.append({"engine": name, "word": word})
+        if flag == MAJORITY and _hyphens_alone(readings[0]["word"], readings):
+            # ``Depart- ment`` against ``Department``: the engine kept
+            # the page's line-end hyphen. Nothing to decide.
+            continue
         words.append(
             {
                 "start": covered[0]["start"],
@@ -648,11 +744,15 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
 
     One ``word`` card per place a majority settled over one engine in
     a WARNING group, while the page's ``ENGINES_DISAGREE`` card is
-    open; a ``block`` card for a WARNING group with no such place (a
-    silent engine, a box one engine did not draw), whose rows all read
-    alike, so choosing one is "looks right"; and a ``link`` card for
-    every other open warning of the page, with its dismissal. A
-    BLOCKING group is no card here: the blocking review holds it.
+    open, the places one engine alone read words at among them
+    (:func:`open_words`); a ``block`` card for a WARNING group with no
+    such place, marked ``alike`` (a silent engine, a box one engine
+    did not draw: the engines that read it read it alike, so the card
+    is one line and "Looks good", with no crop and one reading), or
+    a table, or more than :data:`MANY_OPEN_WORDS` open; and a ``link``
+    card for every other open warning of the page, with its
+    dismissal. A BLOCKING group is no card here: the blocking review
+    holds it.
 
     :param page: The page of the document.
     :param number: Its ``page_in_opinion``.
@@ -684,10 +784,10 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
             "level": ensemble.WARNING,
             "finding_pk": disagree.pk,
         }
-        answered.add(disagree.pk)
         table = group.get("kind") == markup.TABLE
         words = [] if table else open_words(group, MAJORITY)
         if words and len(words) <= MANY_OPEN_WORDS:
+            answered.add(disagree.pk)
             for word in words:
                 out.append(
                     {
@@ -703,18 +803,54 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
                     }
                 )
             continue
+        present = _present(group)
+        # No word to choose between: the engines that read the block
+        # read it alike (or but for line-end hyphens), and the warning
+        # is that one read nothing here (no box, or an empty one). One
+        # line and "Looks good", never the block twice over.
+        alike = not table and not words
+        shown = group["engines"][present[0]]["text"] if present else ""
+        shown_key = ensemble.compare_text(dehyphenated(shown))
+        hyphen_only = [
+            name
+            for name in present[1:]
+            if ensemble.compare_text(group["engines"][name]["text"])
+            != ensemble.compare_text(shown)
+            and ensemble.compare_text(
+                dehyphenated(group["engines"][name]["text"])
+            )
+            == shown_key
+        ]
+        missing = [
+            name
+            for name in page.get("engines") or []
+            if name not in group["engines"]
+        ]
+        if alike:
+            # The engines that read the block read it alike (but for a
+            # line-end hyphen, a spaced ellipsis, a space before a
+            # quote), and the warning is that one read nothing here or
+            # drew no box. A card is a decision, and there is none to
+            # make; the page's finding keeps its own card if no block
+            # of the page has one.
+            continue
+        answered.add(disagree.pk)
         out.append(
             {
                 **common,
                 "kind": BLOCK,
                 "table": table,
+                "alike": alike,
                 "open": len(words),
                 "silent": list(group.get("silent") or []),
+                "read": present,
+                "hyphen_only": hyphen_only,
+                "missing": missing,
                 "readings": [
                     {"engine": name, "text": group["engines"][name]["text"]}
-                    for name in _present(group)
+                    for name in (present[:1] if alike else present)
                 ],
-                "crop": block_crop(group["box_pt"]),
+                "crop": None if alike else block_crop(group["box_pt"]),
             }
         )
     for finding in page_findings:

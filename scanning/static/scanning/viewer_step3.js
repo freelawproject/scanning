@@ -1130,6 +1130,13 @@
                 span.title = 'The first engine that read here did'
                     + ' not read this word. The engines that read'
                     + ' it put it in.';
+            } else if (token.disputed_before || token.disputed_after) {
+                span.className = 'ensemble-low';
+                span.title = 'Other engines read words '
+                    + (token.disputed_after ? 'after' : 'before')
+                    + ' this one that the first engine did not, and'
+                    + ' no two of them read the same. None of them'
+                    + ' is in the text; the readings show them.';
             } else if (token.low_confidence) {
                 span.className = 'ensemble-low';
                 span.title = 'No majority settled this word. It is'

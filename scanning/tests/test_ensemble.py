@@ -1009,6 +1009,89 @@ class TestTheVote(TestCase):
             if token.get("inserted"):
                 self.assertTrue(token.get("low_confidence"), token)
 
+    def test_a_place_a_majority_read_at_and_disagree_marks_the_next_word(
+        self,
+    ):
+        """The base read nothing between ``two`` and ``or``; two engines
+        read something there, not alike. Neither run goes in, and the
+        base's next word is marked, with the mark that says why."""
+        answer = ensemble.resolve(
+            self.read(
+                "two or more",
+                "two [c]ontract or more",
+                "two I contract or more",
+            )
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        self.assertEqual(answer["text"], "two or more")
+        self.assertEqual(answer["n_low_confidence"], 1)
+        marked = [t for t in answer["tokens"] if t.get("low_confidence")]
+        self.assertEqual(
+            [(t["text"], t.get("disputed_before")) for t in marked],
+            [("or", True)],
+        )
+
+    def test_a_spot_no_two_engines_read_alike_is_marked_over_the_word_vote(
+        self,
+    ):
+        """``As`` has a majority as a word, but the three readings of
+        the spot (the glyph before it read three ways) are all
+        different, so the word is marked and the text keeps the
+        base's."""
+        answer = ensemble.resolve(
+            self.read(
+                "As previously noted",
+                "1659As previously noted",
+                "Isaa As previously noted",
+            )
+        )
+
+        self.assertEqual(answer["text"], "As previously noted")
+        marked = [t for t in answer["tokens"] if t.get("low_confidence")]
+        self.assertEqual(
+            [(t["text"], t.get("disputed_before")) for t in marked],
+            [("As", True)],
+        )
+
+    def test_two_readings_alike_settle_the_spot(self):
+        """One engine read a number before ``included``; the other two
+        read the spot alike, a majority on it. No mark on the word."""
+        answer = ensemble.resolve(
+            self.read("a included b", "a included c", "a 1490 included b")
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        included = next(t for t in answer["tokens"] if t["text"] == "included")
+        self.assertFalse(included.get("low_confidence"))
+        self.assertFalse(included.get("disputed_before"))
+
+    def test_a_run_one_engine_alone_read_marks_nothing(self):
+        answer = ensemble.resolve(
+            self.read("two or more", "two or more", "two 1490 or more")
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["text"], "two or more")
+        self.assertEqual(answer["tokens"], [])
+
+    def test_a_disagreement_after_the_last_word_marks_that_word(self):
+        answer = ensemble.resolve(
+            self.read("the end", "the end [1]", "the end 1650")
+        )
+
+        self.assertEqual(answer["text"], "the end")
+        self.assertEqual(answer["n_low_confidence"], 1)
+        last = answer["tokens"][-1]
+        self.assertEqual(
+            (
+                last["text"],
+                last.get("low_confidence"),
+                last.get("disputed_after"),
+            ),
+            ("end", True, True),
+        )
+
     def test_a_word_no_majority_settles_is_not_an_inserted_word(self):
         answer = ensemble.resolve(
             self.read(

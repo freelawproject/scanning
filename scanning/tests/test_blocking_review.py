@@ -147,8 +147,10 @@ class TestOpenWords(TestCase):
         voted = read("a b c d g", "a b x c e h", "a b x c e h")
         self.assertEqual(voted["agreement"], ensemble.MAJORITY)
         cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
-        self.assertEqual([c["token"] for c in cards], ["e", "h"])
-        first = cards[0]
+        # ``x`` too: two engines read it where the first read nothing,
+        # a word a majority settled over one engine.
+        self.assertEqual([c["token"] for c in cards], ["x", "e", "h"])
+        first = cards[1]
 
         kept = ensemble._human_read(
             voted,
@@ -174,7 +176,7 @@ class TestOpenWords(TestCase):
                     kept, blocking_review.MAJORITY
                 )
             ],
-            ["h"],
+            ["x", "h"],
         )
 
     def test_a_block_a_majority_read_alike_keeps_its_majority_words(self):
@@ -199,6 +201,95 @@ class TestOpenWords(TestCase):
         self.assertEqual(
             blocking_review.open_words(kept, blocking_review.LOW_CONFIDENCE),
             [],
+        )
+
+    def test_a_place_a_majority_read_words_at_and_disagree_is_a_card(self):
+        """The first engine read nothing between ``two`` and ``or``;
+        the other two read something there and not alike. The text
+        keeps the first engine's reading, and the card sits on ``or``
+        with each engine's run before it, so a person decides."""
+        voted = read(
+            "two or more statutes",
+            "two [c]ontract or more statutes",
+            "two I contract or more statutes",
+        )
+        self.assertEqual(voted["agreement"], ensemble.VOTED)
+        self.assertEqual(voted["text"], "two or more statutes")
+        self.assertEqual(voted["n_low_confidence"], 1)
+        self.assertEqual(
+            ensemble.disagreement_level(voted, 3), ensemble.BLOCKING
+        )
+
+        words = blocking_review.open_words(voted)
+
+        self.assertEqual(len(words), 1)
+        word = words[0]
+        self.assertEqual(
+            (word["token"], word["start"], word["length"]), ("or", 4, 2)
+        )
+        self.assertEqual(
+            [r["word"] for r in word["readings"]],
+            ["or", "[c]ontract or", "I contract or"],
+        )
+
+    def test_a_word_one_engine_alone_read_is_a_warning_card_on_the_spot(self):
+        """Two engines read the block alike; the third read a star-page
+        number off the margin before ``included``. The vote drops it
+        with no mark, and the warnings review opens it on ``included``
+        rather than on the whole block."""
+        voted = read(
+            "board that included Benson",
+            "board that included Benson",
+            "board that 1490 included Benson",
+        )
+        self.assertEqual(voted["agreement"], ensemble.MAJORITY)
+        self.assertEqual(blocking_review.open_words(voted), [])
+
+        words = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(len(words), 1)
+        word = words[0]
+        self.assertEqual(
+            (word["token"], word["start"], word["length"]), ("included", 11, 8)
+        )
+        self.assertEqual(
+            [r["word"] for r in word["readings"]],
+            ["included", "included", "1490 included"],
+        )
+        self.assertEqual(
+            (word["before"], word["after"]), ("board that", "Benson")
+        )
+
+    def test_a_run_after_the_last_word_is_the_last_words_card(self):
+        voted = read("the end", "the end", "the end 1491")
+
+        words = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual([w["token"] for w in words], ["end"])
+        self.assertEqual(
+            [r["word"] for r in words[0]["readings"]],
+            ["end", "end", "end 1491"],
+        )
+
+    def test_the_cards_follow_the_shown_text_when_the_first_engine_is_odd(
+        self,
+    ):
+        """Two engines agree against the first-ranked one: the shown
+        text is theirs, and the card's offsets are into that text."""
+        voted = read("a b c", "a x c", "a x c")
+        self.assertEqual(voted["agreement"], ensemble.MAJORITY)
+        self.assertEqual(voted["text"], "a x c")
+
+        words = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(len(words), 1)
+        self.assertEqual(
+            (words[0]["token"], words[0]["start"], words[0]["length"]),
+            ("x", 2, 1),
+        )
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in words[0]["readings"]],
+            [("mistral_ocr", "x"), ("dots_mocr", "b"), ("surya", "x")],
         )
 
     def test_a_block_a_majority_settled_has_no_open_word(self):
@@ -334,6 +425,93 @@ def finding(page, check, pk):
 
 
 class TestCards(TestCase):
+    def test_a_block_one_engine_did_not_read_is_no_card(self):
+        """Two engines read the block alike and the third drew no box
+        there: nothing to choose, so the block gets no card and the
+        page's finding keeps its own."""
+        group = group_of(
+            unit("dots_mocr", 0, BODY_A_PT, "the same words"),
+            unit("surya", 0, BODY_A_PT, "the same words"),
+        )
+        group.update(ensemble.resolve(group))
+        group.update(
+            {
+                "id": 2,
+                "level": ensemble.WARNING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        document = {
+            "pages": [
+                {
+                    "page_in_opinion": 0,
+                    "engines": ["dots_mocr", "mistral_ocr", "surya"],
+                    "groups": [group],
+                }
+            ]
+        }
+        findings = [finding(0, OpinionCheck.ENGINES_DISAGREE, 22)]
+
+        cards = blocking_review.cards(document, findings, ensemble.WARNING)
+
+        self.assertEqual([c["kind"] for c in cards], ["link"])
+
+    def test_a_line_end_hyphen_is_no_difference(self):
+        """Mistral keeps the page's line breaks as ``Depart- ment`` (a
+        space or a newline after the hyphen); the others join the word.
+        No card for that alone; a real difference beside it keeps its
+        card."""
+        for broken in ("Depart- ment", "Depart-\nment"):
+            voted = read(
+                "the Department of Protection",
+                f"the {broken} of Protection",
+                "the Department of Protection",
+            )
+            self.assertEqual(
+                blocking_review.open_words(voted, blocking_review.MAJORITY),
+                [],
+                broken,
+            )
+
+        voted = read(
+            "the Department of Protection",
+            "the Depart- ment of Protecton",
+            "the Department of Protection",
+        )
+        words = blocking_review.open_words(voted, blocking_review.MAJORITY)
+        self.assertEqual([w["token"] for w in words], ["Protection"])
+
+    def test_a_lone_insertion_is_a_word_card_of_the_warnings_review(self):
+        """The whole-block card is for a table or for too many open
+        words; a star-page number one engine read is one small card."""
+        group = read(
+            "board that included Benson",
+            "board that included Benson",
+            "board that 1490 included Benson",
+        )
+        group.update(
+            {
+                "id": 7,
+                "level": ensemble.WARNING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        document = {"pages": [{"page_in_opinion": 0, "groups": [group]}]}
+        findings = [finding(0, OpinionCheck.ENGINES_DISAGREE, 21)]
+
+        cards = blocking_review.cards(document, findings, ensemble.WARNING)
+
+        self.assertEqual([c["kind"] for c in cards], ["word"])
+        self.assertEqual(cards[0]["token"], "included")
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]],
+            ["included", "included", "1490 included"],
+        )
+
     def test_a_word_a_single_block_and_a_finding_of_another_check(self):
         split = read(
             "the court held that", "the court heId that", "the court hold that"
@@ -456,9 +634,10 @@ class TestCards(TestCase):
             (OpinionCheck.UNDETECTED_TEXT, 15, ensemble.WARNING),
         )
 
-    def test_a_warning_group_with_no_settled_word_is_a_block_card(self):
+    def test_a_warning_group_whose_readers_agree_is_no_card(self):
         """A silent engine makes a WARNING group with every reading
-        alike: one block card whose rows all read as shown."""
+        alike: nothing to decide, so no card for the block, and the
+        page's finding keeps its own one-line card."""
         quiet = read("a b c", "a b c")
         quiet.update(
             {
@@ -478,12 +657,8 @@ class TestCards(TestCase):
             ensemble.WARNING,
         )
 
-        self.assertEqual([c["kind"] for c in cards], ["block"])
-        self.assertEqual(cards[0]["silent"], ["surya"])
-        self.assertEqual(cards[0]["open"], 0)
-        self.assertEqual(
-            [r["text"] for r in cards[0]["readings"]], ["a b c", "a b c"]
-        )
+        self.assertEqual([c["kind"] for c in cards], ["link"])
+        self.assertEqual(cards[0]["finding_pk"], 14)
 
     def test_a_table_is_one_block_card_with_every_reading(self):
         table = read("a b c", "x y z", "p q r")
