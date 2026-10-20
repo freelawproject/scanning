@@ -3088,13 +3088,69 @@ def _apply_order(ordered: list[dict], edit: dict) -> int:
     return len(boxes) - len(landed)
 
 
+def _kept_open(read_back: dict, text: str) -> list[dict]:
+    """Return the tokens of a person's text, the vote's flags kept on
+    the words the person left as they were.
+
+    **An edit fixes words and vouches for no other.** A text edit
+    carries the whole block, because that is the one edit there is,
+    but a person who answered one card of the blocking review read one
+    word, and a person who retyped a block in the edit box may have
+    read it all or fixed one typo. So a word the vote left open
+    (``low_confidence``) that stands in the new text as it stood keeps
+    its token, its flag and its base position, and the block is still
+    a card until each such word is chosen, typed or kept; a word the
+    person wrote anew carries nothing, because they judged it. The
+    words are aligned by the keys of :func:`compare_word`, equal runs
+    alone: a changed word at the same place is a judgement, not a
+    carry. A ``majority`` flag carries the same way, for the warnings
+    review. A group that was not voted has no tokens, and its text was
+    the whole of what the person judged.
+
+    :param read_back: :func:`resolve` of the group, the engines' own.
+    :param text: The text the person wrote, folded.
+    :returns: One token per word of ``text``.
+    :rtype: list[dict]
+    """
+    voted = [t for t in read_back.get("tokens") or [] if t.get("text")]
+    if not voted:
+        return []
+    words = text.split()
+    matcher = SequenceMatcher(
+        None,
+        [compare_word(t["text"]) for t in voted],
+        [compare_word(w) for w in words],
+        autojunk=False,
+    )
+    carried: dict[int, dict] = {}
+    for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
+        if tag != "equal":
+            continue
+        for offset in range(i2 - i1):
+            carried[j1 + offset] = voted[i1 + offset]
+    tokens: list[dict] = []
+    for index, word in enumerate(words):
+        token: dict = {"text": word}
+        old = carried.get(index)
+        if old:
+            for flag in ("low_confidence", "majority", "inserted"):
+                if old.get(flag):
+                    token[flag] = True
+            if "position" in old:
+                token["position"] = old["position"]
+        tokens.append(token)
+    return tokens
+
+
 def _human_read(read_back: dict, edit: dict) -> dict:
     """Return the read of a group whose text a person wrote.
 
     The marks of the engines' text carry to the words of the new text
     that :func:`union_marks` aligns with them, so an italic case name
     the curator did not touch keeps its italic. A table becomes a
-    paragraph: its rows are the engines', and the text is not.
+    paragraph: its rows are the engines', and the text is not. The
+    open words of the vote the person left as they were carry too
+    (:func:`_kept_open`), so the block stays a card for them.
 
     :param read_back: :func:`resolve` of the group.
     :param edit: The entry of the ``TEXT`` edit.
@@ -3110,6 +3166,7 @@ def _human_read(read_back: dict, edit: dict) -> dict:
         # The items carry like the marks: a word the curator kept
         # still starts its item (#428).
         marks, kind_of_list = _with_items(text, marks, readings, 1)
+    tokens = _kept_open(read_back, text)
     return {
         **read_back,
         "agreement": HUMAN,
@@ -3117,8 +3174,10 @@ def _human_read(read_back: dict, edit: dict) -> dict:
         "agreeing": [],
         "silent": [],
         "text": text,
-        "tokens": [],
-        "n_low_confidence": 0,
+        "tokens": tokens,
+        "n_low_confidence": sum(
+            1 for token in tokens if token.get("low_confidence")
+        ),
         "marks": marks,
         "kind": markup.PARAGRAPH if kind == markup.TABLE else kind,
         "list": kind_of_list,
@@ -3542,7 +3601,7 @@ def build_page(
             entry["counts"][level] += 1
         if level == BLOCKING and read_back["agreement"] == SINGLE:
             entry["counts"]["single_engine"] += 1
-        if level == BLOCKING and read_back["agreement"] == VOTED:
+        if level == BLOCKING and read_back["agreement"] in (VOTED, HUMAN):
             entry["counts"]["no_majority"] += 1
         if name == FOOTNOTES:
             entry["counts"]["footnote_groups"] += 1
@@ -3687,8 +3746,13 @@ def _differs(group: dict, engines: int) -> bool:
     :rtype: bool
     """
     if group["agreement"] == HUMAN:
-        # A person wrote this text against the page (#376).
-        return False
+        # A person wrote this text against the page (#376), and
+        # vouched for the words they changed: a word the vote left
+        # open, or settled over one engine, that they left as it was
+        # is still that (``_kept_open``).
+        return bool(group.get("n_low_confidence")) or any(
+            token.get("majority") for token in group.get("tokens") or []
+        )
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True
     return len(group.get("engines") or {}) < engines
@@ -3709,8 +3773,10 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     (``n_low_confidence``): a block of a hundred words that the engines
     split three ways over one spelling and one quote mark is settled
     word for word, and a block whose every word a majority settled is
-    the same fact as a block a majority read whole. Every other place
-    :func:`_differs` answers for is a warning.
+    the same fact as a block a majority read whole. A block a person
+    wrote (``HUMAN``) blocks for the open words they left as they
+    were, warns for the majority words they left, and for nothing
+    else. Every other place :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -3721,7 +3787,7 @@ def disagreement_level(group: dict, engines: int) -> str | None:
         return None
     if group["agreement"] == SINGLE:
         return BLOCKING
-    if group["agreement"] == VOTED and group.get("n_low_confidence"):
+    if group["agreement"] in (VOTED, HUMAN) and group.get("n_low_confidence"):
         return BLOCKING
     return WARNING
 

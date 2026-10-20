@@ -54,6 +54,35 @@ class TestOpenWords(TestCase):
             (word["before"], word["after"]), ("the court", "that")
         )
 
+    def test_a_block_a_person_wrote_keeps_the_open_words_they_left(self):
+        """One card answered, the other stays: the open word the person
+        left as it was is placed in the person's text, with the same
+        readings, and a word they changed is no card."""
+        voted = read(
+            "the court held that",
+            "the court heId that",
+            "the court hold that",
+        )
+        kept = ensemble._human_read(voted, {"text": "a court held that day"})
+        words = blocking_review.open_words(kept)
+
+        self.assertEqual(len(words), 1)
+        word = words[0]
+        self.assertEqual(
+            (word["token"], word["start"], word["length"]), ("held", 8, 4)
+        )
+        self.assertEqual(
+            [r["word"] for r in word["readings"]], ["held", "heId", "hold"]
+        )
+        self.assertEqual(
+            (word["before"], word["after"]), ("a court", "that day")
+        )
+
+        answered = ensemble._human_read(
+            voted, {"text": "the court ruled that"}
+        )
+        self.assertEqual(blocking_review.open_words(answered), [])
+
     def test_a_block_a_majority_settled_has_no_open_word(self):
         self.assertEqual(
             blocking_review.open_words(read("a b c", "a b c", "a x c")), []
@@ -753,7 +782,8 @@ class TestTheBlockingPage(ScanningTestCase):
         self.clean = OpinionFactory(
             scan=self.scan,
             status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
-            first_printed_page=50,
+            # Past the factory's own sequence, whatever ran before.
+            first_printed_page=self.waiting.first_printed_page + 1000,
         )
         # A warning holds nothing.
         OpinionFindingFactory(opinion=self.clean)

@@ -175,7 +175,10 @@ class TestTheGate(ApprovalTestCase):
         )
 
     def test_an_edited_block_leaves_no_card(self):
-        """A text edit is the other answer to a blocking card (#376)."""
+        """A text edit is the other answer to a blocking card (#376),
+        for the open words it changes: one that leaves an open word
+        as it was keeps the card, one that answers every open word
+        leaves none."""
         from scanning.models import OpinionEdit
 
         group = self.split_group()
@@ -183,7 +186,21 @@ class TestTheGate(ApprovalTestCase):
             kind=OpinionEdit.Kind.TEXT,
             box_pt=group["box_pt"],
             base_text=group["text"],
-            text="body A 1",
+            text="body A 1.",
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(
+            [f.check_name for f in self.blocking()],
+            [OpinionCheck.NO_MAJORITY],
+        )
+
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A one.",
         )
         self.opinion.refresh_from_db()
         ensemble.rerun(self.opinion)

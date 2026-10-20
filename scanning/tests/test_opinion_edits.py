@@ -136,11 +136,16 @@ class TestTheTextEdit(TestCase):
         ]
         return dots, mistral
 
-    def test_the_text_is_the_curators_and_the_block_no_disagreement(self):
+    def test_the_text_is_the_curators_and_the_open_words_it_left_stay(self):
+        """An edit fixes words and vouches for no other: the two words
+        the vote left open (``court``/``cour``, ``that``/``tbat``) stand
+        in the new text as they stood, so the block is still a card
+        for them, and the word the person wrote carries nothing."""
         dots, mistral = self.disagree()
         base = page_with(dots, mistral)
         group = group_at(base, BODY_A_PT)
         self.assertEqual(group["level"], ensemble.BLOCKING)
+        self.assertEqual(group["n_low_confidence"], 2)
 
         page = page_with(
             dots,
@@ -159,13 +164,67 @@ class TestTheTextEdit(TestCase):
         edited = group_at(page, BODY_A_PT)
         self.assertEqual(edited["text"], "The court held that it")
         self.assertEqual(edited["agreement"], ensemble.HUMAN)
-        self.assertIsNone(edited["level"])
+        self.assertEqual(edited["level"], ensemble.BLOCKING)
+        self.assertEqual(edited["n_low_confidence"], 2)
+        self.assertEqual(
+            [
+                (t["text"], t.get("position"))
+                for t in edited["tokens"]
+                if t.get("low_confidence")
+            ],
+            [("court", 1), ("that", 3)],
+        )
+        self.assertEqual(edited["tokens"][-1], {"text": "it"})
         self.assertEqual(edited["human"]["by"], "curator")
         self.assertEqual(edited["human"]["edit_id"], 1)
         self.assertTrue(page["text"].startswith("The court held that it"))
-        self.assertEqual(page["counts"]["differing"], 0)
+        self.assertEqual(page["counts"]["differing"], 1)
+        self.assertEqual(page["counts"]["no_majority"], 1)
         self.assertEqual(page["counts"][ensemble.HUMAN], 1)
         self.assertEqual(page["unresolved_edits"], [])
+        self.assertEqual(
+            [
+                (d["agreement"], d["level"])
+                for d in ensemble._disagreements(page)
+            ],
+            [(ensemble.HUMAN, ensemble.BLOCKING)],
+        )
+
+    def test_an_edit_that_answers_every_open_word_settles_the_block(self):
+        dots, mistral = self.disagree()
+        group = group_at(page_with(dots, mistral), BODY_A_PT)
+
+        page = page_with(
+            dots,
+            mistral,
+            [
+                entry(
+                    OpinionEdit.Kind.TEXT,
+                    BODY_A_PT,
+                    base_text=group["text"],
+                    text="The courts held this",
+                    section=ensemble.BODY,
+                )
+            ],
+        )
+
+        edited = group_at(page, BODY_A_PT)
+        self.assertEqual(edited["agreement"], ensemble.HUMAN)
+        self.assertIsNone(edited["level"])
+        self.assertEqual(edited["n_low_confidence"], 0)
+        self.assertEqual(
+            [t["text"] for t in edited["tokens"]],
+            ["The", "courts", "held", "this"],
+        )
+        self.assertFalse(
+            any(
+                t.get("low_confidence") or t.get("majority")
+                for t in edited["tokens"]
+            )
+        )
+        self.assertEqual(page["counts"]["differing"], 0)
+        self.assertEqual(page["counts"]["no_majority"], 0)
+        self.assertEqual(page["counts"][ensemble.HUMAN], 1)
         self.assertEqual(ensemble._disagreements(page), [])
 
     def test_the_readings_of_the_engines_stay_on_the_block(self):
@@ -807,7 +866,9 @@ class TestTheWriteWithEdits(EditTestCase):
             kind=OpinionEdit.Kind.TEXT,
             box_pt=group["box_pt"],
             base_text=group["text"],
-            text="body A 1, as printed",
+            # Both open words of the block are answered: ``bodies`` and
+            # ``one``; a text that kept them would keep the card.
+            text="bodies A one, as printed",
         )
         self.opinion.refresh_from_db()
 
@@ -820,7 +881,7 @@ class TestTheWriteWithEdits(EditTestCase):
             ensemble.document_key(self.opinion).endswith("ensemble.e1.json")
         )
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
-        self.assertIn("body A 1, as printed", row.text)
+        self.assertIn("bodies A one, as printed", row.text)
         self.assertEqual(self.stored()["edit_revision"], 1)
         self.assertFalse(
             OpinionFinding.objects.filter(
@@ -1129,6 +1190,58 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.ensemble_edit_revision, 1)
 
+    def test_a_second_text_edit_answers_the_next_open_word(self):
+        """The blocking review answers one card at a time, and a block
+        can hold several: the first edit leaves the block a card for
+        the open word it did not touch, the second supersedes the
+        first over the engines' text, and a block with no open word
+        left takes no further edit."""
+        group = self.split_group()
+        self.assertEqual(group["text"], "body A 1")
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="bodies A 1",
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["agreement"], ensemble.HUMAN)
+        self.assertEqual(edited["level"], ensemble.BLOCKING)
+        self.assertEqual(edited["n_low_confidence"], 1)
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="bodies A one",
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        standing = OpinionEdit.objects.filter(
+            kind=OpinionEdit.Kind.TEXT, withdrawn_at__isnull=True
+        )
+        self.assertEqual(standing.count(), 1)
+        self.assertEqual(standing.get().base_text, "body A 1")
+        self.assertEqual(standing.get().text, "bodies A one")
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["text"], "bodies A one")
+        self.assertIsNone(edited["level"])
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="bodies A one more",
+        )
+
+        self.assertAnswered(response, 409, messages.ERROR)
+        self.assertEqual(
+            response.json()["message"], views_api.EDIT_HUMAN_ALREADY_MESSAGE
+        )
+
     def test_a_unanimous_block_takes_no_text_edit(self):
         response = self.post(
             "edit_opinion_text",
@@ -1154,14 +1267,18 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         self.assertFalse(OpinionEdit.objects.exists())
 
     def test_an_edited_block_asks_for_the_undo_first(self):
+        """A block a person wrote with no open word left takes no
+        further edit; one with an open word left does (the test
+        above)."""
         group = self.split_group()
         self.post(
             "edit_opinion_text",
             page_in_opinion=0,
             group_id=group["id"],
-            text="body A one",
+            text="bodies A one",
         )
         edited = next(g for g in self.page()["groups"] if g.get("human"))
+        self.assertIsNone(edited["level"])
 
         response = self.post(
             "edit_opinion_text",

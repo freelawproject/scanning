@@ -1105,7 +1105,9 @@
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
         });
-        if (!(group.agreement === 'voted' && tokens.length)) {
+        var marked = group.agreement === 'voted'
+            || group.agreement === 'human';
+        if (!(marked && tokens.length)) {
             markedNodes(
                 target, (group.text || '').slice(from, to),
                 clipMarks(group.marks, from, to - from)
