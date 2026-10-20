@@ -611,6 +611,35 @@ class TestTheInputDigest(TestCase):
         )
         self.assertEqual(self.a.redacted_pdf_revision, self.a.glue_revision)
 
+    def test_an_unbuilt_row_stays_due_through_an_unchanged_creation(self):
+        """A volume sent back before its opinions were built, and
+        approved again with nothing changed: the rows keep their
+        revision, and the ones whose stamps were behind are still owed,
+        because what is owed is read off the stamps, never off the
+        creation."""
+        from scanning import ensemble, opinion_ocr, opinion_pdf
+
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.PROCESSING,
+            ocr_glue_revision=None,
+            ensemble_revision=None,
+            redacted_pdf_revision=None,
+        )
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        before = self.revisions()
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 0)
+        self.assertEqual(self.revisions(), before)
+        self.b.refresh_from_db()
+        self.assertEqual(self.b.status, OpinionReviewStatus.PROCESSING)
+        self.assertIn(self.b, opinion_ocr.due())
+        self.assertIn(self.b, opinion_pdf.owed())
+        self.assertNotIn(self.a, opinion_ocr.due())
+        self.assertNotIn(self.a, opinion_pdf.owed())
+
     def test_a_redaction_on_one_page_rebuilds_that_opinion_alone(self):
         a_before, b_before = self.revisions()
         make_redaction(self.scan, page_index=4)
