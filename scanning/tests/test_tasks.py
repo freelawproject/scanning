@@ -192,6 +192,37 @@ class TestLocks(TransactionTestCase):
                     [locks.NAMESPACE, locks.key("glue_runs")],
                 )
 
+    def test_a_locked_body_runs_under_its_lock(self):
+        """The fresh connection is opened before the lock, never inside
+        the body, or the session that holds the lock would be closed
+        under the running pass."""
+        other = connections.create_connection("default")
+        self.addCleanup(other.close)
+        seen = []
+
+        @tasks.locked("probe")
+        def body():
+            with other.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_try_advisory_lock(%s, %s)",
+                    [locks.NAMESPACE, locks.key("probe")],
+                )
+                seen.append(cursor.fetchone()[0])
+            return 1
+
+        self.assertEqual(body(), 1)
+        self.assertEqual(seen, [False])
+        with other.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_try_advisory_lock(%s, %s)",
+                [locks.NAMESPACE, locks.key("probe")],
+            )
+            self.assertTrue(cursor.fetchone()[0])
+            cursor.execute(
+                "SELECT pg_advisory_unlock(%s, %s)",
+                [locks.NAMESPACE, locks.key("probe")],
+            )
+
     def test_the_three_opinion_passes_share_one_lock(self):
         """They share the local mirror, and one of them releases it."""
         other = connections.create_connection("default")

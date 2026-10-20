@@ -111,7 +111,9 @@ def _fresh_connection() -> None:
 
     The daemon did the same before every tick: a pooled connection
     that died while the worker waited on a socket for minutes raises on
-    first use, and a fresh one is cheap next to any pass.
+    first use, and a fresh one is cheap next to any pass. A locked task
+    gets it from :func:`locked`, before the lock; the unlocked ones
+    call it themselves.
 
     :return: None.
     """
@@ -129,6 +131,10 @@ def locked(name: str):
     def decorate(fn):
         @functools.wraps(fn)
         def run(*args, **kwargs):
+            # Before the lock, never inside the body: the lock is a
+            # session lock on this connection, and closing the
+            # connection would free it under the running pass.
+            _fresh_connection()
             with locks.held(name) as held:
                 if not held:
                     logger.info("%s: another worker runs it; skipped", name)
@@ -177,7 +183,6 @@ def enqueue_runs() -> int:
     """
     from scanning import dots_mocr, yolo
 
-    _fresh_connection()
     # The same sweeps as ``submit_external_jobs``; a third engine's
     # sweep (#500) is one more line here and there.
     started = yolo.enqueue_missing_runs() + dots_mocr.enqueue_missing_runs()
@@ -195,7 +200,6 @@ def _submit(provider: str) -> int:
     """
     from scanning import jobs
 
-    _fresh_connection()
     return jobs.submit_pending(providers=(provider,)).submitted
 
 
@@ -257,7 +261,6 @@ def sweep_jobs() -> int:
     """
     from scanning import ticks
 
-    _fresh_connection()
     completed = ticks.sweep().completed
     if completed:
         nudge(merge_conversions, glue_runs)
@@ -274,7 +277,6 @@ def merge_conversions() -> int:
     """
     from scanning import ticks
 
-    _fresh_connection()
     finished = sum(ticks.merge_conversions().values())
     if finished:
         nudge(glue_runs, score_pages)
@@ -295,24 +297,23 @@ def glue_runs() -> int:
     """
     from scanning import ticks
 
-    _fresh_connection()
     return sum(ticks.glue_runs().values())
 
 
-@app.task(name="scanning.tasks.prepare_opinions", queue=QUEUE_FAST)
+@app.task(name="scanning.tasks.prepare_opinions", queue=QUEUE_OPINIONS)
 @locked(OPINION_MIRROR_LOCK)
 def prepare_opinions() -> int:
     """Write the opinions' documents and open their reviews.
 
-    Under the mirror lock: the OCR glue reads the volume's documents
-    through the same local mirror the PDF pass releases.
+    On the opinions queue and under the mirror lock: the OCR glue
+    reads the volume's documents through the same local mirror the
+    PDF pass releases, so it must run on that pod.
 
     :returns: The sum of what the passes did.
     :rtype: int
     """
     from scanning import ticks
 
-    _fresh_connection()
     done = sum(ticks.prepare_opinions().values())
     if done:
         nudge(build_opinion_pdfs, cut_figures)
@@ -329,7 +330,6 @@ def score_pages() -> int:
     """
     from scanning.badpage import scoring
 
-    _fresh_connection()
     return scoring.run_tick()
 
 
@@ -343,7 +343,6 @@ def cut_figures() -> int:
     """
     from scanning import opinion_figures
 
-    _fresh_connection()
     return opinion_figures.run_tick()
 
 
@@ -357,21 +356,36 @@ def build_opinion_pdfs() -> int:
     """
     from scanning import opinion_pdf
 
-    _fresh_connection()
     return opinion_pdf.run_tick()
 
 
 @app.task(name="scanning.tasks.cleanup_tmp", queue=QUEUE_FAST)
 def cleanup_tmp() -> int:
-    """Sweep this pod's stale processing directories and the abandoned
-    uploads. The daemon sends one per queue, because every pod has its
-    own ``/tmp``.
+    """Sweep this pod's stale processing directories. The daemon sends
+    one per queue, because every pod has its own ``/tmp``; the
+    abandoned uploads are :func:`recover_uploads`'s, once.
 
     :returns: 0, for the shape of the other ticks.
     :rtype: int
     """
     _fresh_connection()
-    call_command("cleanup_processing_tmp")
+    call_command("cleanup_processing_tmp", no_uploads=True)
+    return 0
+
+
+@app.task(name="scanning.tasks.recover_uploads", queue=QUEUE_FAST)
+@locked("recover_uploads")
+def recover_uploads() -> int:
+    """Recover or delete the abandoned direct uploads, once per interval.
+
+    A database sweep and not a pod's, so one locked task and never one
+    per queue: two copies would both queue the same upload, and the
+    second would put a running pipeline back to QUEUED.
+
+    :returns: 0, for the shape of the other ticks.
+    :rtype: int
+    """
+    call_command("cleanup_processing_tmp", uploads_only=True)
     return 0
 
 
