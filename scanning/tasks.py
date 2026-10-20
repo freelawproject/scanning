@@ -63,6 +63,49 @@ QUEUES = (QUEUE_FAST, QUEUE_IO, QUEUE_HEAVY, QUEUE_OPINIONS)
 OPINION_MIRROR_LOCK = "opinion_mirror"
 
 
+def queue_depth(queue: str) -> int | None:
+    """Return how many messages wait on a queue, or ``None`` when the
+    broker cannot say.
+
+    CourtListener's ``get_queue_length`` without the priority steps,
+    which these queues do not use: one ``LLEN`` on the Redis list the
+    queue is. A broker fault or a non-Redis transport answers ``None``,
+    and the caller sends as if the queue were empty.
+
+    :param queue: A queue name of :data:`QUEUES`.
+    :returns: The depth, or ``None``.
+    :rtype: int | None
+    """
+    try:
+        with app.connection_for_read() as connection:
+            return int(connection.default_channel.client.llen(queue))
+    except Exception:
+        logger.warning("could not read the depth of %s", queue, exc_info=True)
+        return None
+
+
+def has_room(queue: str) -> bool:
+    """Return whether a send to the queue is under the depth cap.
+
+    The throttle (#503): CourtListener's ``CeleryThrottle`` waits for a
+    queue to drain before a command enqueues more; the senders here are
+    the daemon's clock and the views, which cannot wait, so they skip
+    the send instead. Nothing is lost: every message is a tick or a
+    claim, and the rows hold the work until the queue drains.
+
+    :param queue: A queue name of :data:`QUEUES`.
+    :returns: Whether to send.
+    :rtype: bool
+    """
+    depth = queue_depth(queue)
+    if depth is None or depth < int(settings.CELERY_QUEUE_MAX_DEPTH):
+        return True
+    logger.warning(
+        "queue %s holds %d messages, at the cap; not sending", queue, depth
+    )
+    return False
+
+
 def _fresh_connection() -> None:
     """Open a fresh database connection for this task.
 
@@ -358,9 +401,12 @@ class Tick:
     def send(self) -> bool:
         """Send the tick, with its interval as its expiry.
 
-        :returns: Whether it was sent; a broker fault is a warning.
+        :returns: Whether it was sent; a full queue (:func:`has_room`)
+            or a broker fault is a warning.
         :rtype: bool
         """
+        if not has_room(self.queue):
+            return False
         try:
             self.task.apply_async(queue=self.queue, expires=self.interval())
         except Exception:
@@ -509,7 +555,7 @@ def dispatch_scan(scan_pk: int, action: str) -> bool:
     :returns: Whether a task was sent.
     :rtype: bool
     """
-    if not settings.CELERY_ENABLED:
+    if not settings.CELERY_ENABLED or not has_room(QUEUE_HEAVY):
         return False
     try:
         run_scan.apply_async(

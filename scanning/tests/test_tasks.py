@@ -44,6 +44,11 @@ def _no_connection_reset(test):
 class TestTicks(TestCase):
     """``TICKS`` is the daemon's schedule."""
 
+    def setUp(self):
+        patcher = patch("scanning.tasks.queue_depth", return_value=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_every_tick_task_is_in_the_table_on_a_known_queue(self):
         tasks_in_table = {tick.task for tick in tasks.TICKS}
         for task in TICK_TASKS:
@@ -85,6 +90,59 @@ class TestTicks(TestCase):
         for task in (*TICK_TASKS, tasks.run_scan):
             with self.subTest(task=task.name):
                 self.assertEqual(app.tasks[task.name].name, task.name)
+
+
+class TestThrottle(TestCase):
+    """A send is skipped while its queue is at the depth cap."""
+
+    def setUp(self):
+        _no_connection_reset(self)
+
+    @override_settings(CELERY_ENABLED=True, CELERY_QUEUE_MAX_DEPTH=10)
+    def test_a_full_queue_skips_the_tick_and_the_dispatch(self):
+        tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
+        with (
+            patch("scanning.tasks.queue_depth", return_value=10),
+            patch.object(tasks.glue_runs, "apply_async") as send_tick,
+            patch.object(tasks.run_scan, "apply_async") as send_scan,
+            self.assertLogs("scanning.tasks", level="WARNING"),
+        ):
+            self.assertFalse(tick.send())
+            self.assertFalse(
+                tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE)
+            )
+        send_tick.assert_not_called()
+        send_scan.assert_not_called()
+
+    @override_settings(CELERY_ENABLED=True, CELERY_QUEUE_MAX_DEPTH=10)
+    def test_a_queue_under_the_cap_sends(self):
+        tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
+        with (
+            patch("scanning.tasks.queue_depth", return_value=9),
+            patch.object(tasks.glue_runs, "apply_async") as send_tick,
+        ):
+            self.assertTrue(tick.send())
+        send_tick.assert_called_once()
+
+    @override_settings(CELERY_ENABLED=True, CELERY_QUEUE_MAX_DEPTH=10)
+    def test_an_unreadable_depth_sends(self):
+        """The throttle never holds work back on a broker it cannot ask."""
+        tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
+        with (
+            patch("scanning.tasks.queue_depth", return_value=None),
+            patch.object(tasks.glue_runs, "apply_async") as send_tick,
+        ):
+            self.assertTrue(tick.send())
+        send_tick.assert_called_once()
+
+    def test_a_broker_fault_reads_as_unknown_depth(self):
+        with (
+            patch.object(
+                tasks.app, "connection_for_read", side_effect=OSError("down")
+            ),
+            self.assertLogs("scanning.tasks", level="WARNING"),
+        ):
+            self.assertIsNone(tasks.queue_depth("fast"))
 
 
 class TestLocks(TransactionTestCase):
@@ -169,6 +227,9 @@ class TestNudges(TestCase):
 
     def setUp(self):
         _no_connection_reset(self)
+        patcher = patch("scanning.tasks.queue_depth", return_value=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_nothing_is_sent_while_celery_is_off(self):
         with patch.object(tasks.glue_runs, "apply_async") as send:
@@ -222,6 +283,11 @@ class TestNudges(TestCase):
 
 class TestDispatch(TestCase):
     """``dispatch_scan`` and ``submit_soon``."""
+
+    def setUp(self):
+        patcher = patch("scanning.tasks.queue_depth", return_value=0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_nothing_is_sent_while_celery_is_off(self):
         with patch.object(tasks.run_scan, "apply_async") as send:

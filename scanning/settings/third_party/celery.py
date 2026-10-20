@@ -46,6 +46,13 @@ CELERY_BROKER_TRANSPORT_OPTIONS = {
         "CELERY_VISIBILITY_TIMEOUT", default=4 * 60 * 60
     ),
 }
+#: The throttle (#503), CourtListener's ``CeleryThrottle`` for senders
+#: that cannot sleep: a tick or a dispatch is not sent while its queue
+#: already holds this many messages, because the rows are the queue of
+#: record and the next tick finds them. It bounds the broker's memory
+#: at about a kilobyte a message per queue, whatever a bulk re-queue or
+#: a worker outage does.
+CELERY_QUEUE_MAX_DEPTH = env.int("CELERY_QUEUE_MAX_DEPTH", default=500)
 #: Celery retries nothing: the rows carry the attempt counters.
 CELERY_TASK_DEFAULT_QUEUE = "fast"
 CELERY_TASK_CREATE_MISSING_QUEUES = True
