@@ -1066,6 +1066,30 @@ class TestTheVote(TestCase):
         self.assertFalse(included.get("low_confidence"))
         self.assertFalse(included.get("disputed_before"))
 
+    def test_a_run_of_a_mark_with_no_key_is_no_lone_run(self):
+        """One engine read a bullet the others did not: a mark with no
+        key, so the spot reads as the base's. No ``lone`` mark, no
+        card, and a block a person wrote stays settled."""
+        answer = ensemble.resolve(self.read("a b c", "a b c", "a \u2022 b c"))
+
+        self.assertFalse(
+            any(t.get("lone") or t.get("lone_after") for t in answer["tokens"])
+        )
+
+    def test_a_hyphen_break_confirms_the_word(self):
+        """``Depart- ment`` is ``Department`` with the page's line
+        break kept: the engine confirmed the word, so no ``majority``
+        mark and no card."""
+        answer = ensemble.resolve(
+            self.read(
+                "the Department of",
+                "the Depart- ment of",
+                "the Department of",
+            )
+        )
+
+        self.assertFalse(any(t.get("majority") for t in answer["tokens"]))
+
     def test_a_run_one_engine_alone_read_marks_nothing(self):
         answer = ensemble.resolve(
             self.read("two or more", "two or more", "two 1490 or more")

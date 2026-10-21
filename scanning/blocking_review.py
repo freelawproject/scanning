@@ -20,8 +20,6 @@ the guess, and the card says so.
 
 from __future__ import annotations
 
-import re
-
 from scanning import ensemble, markup
 
 #: The height of one printed line, in points: the estimate every crop
@@ -124,23 +122,16 @@ def _reading(
     return entry[1]
 
 
-#: A hyphen an engine kept at a line end, with the break as a space or
-#: a newline: ``Depart- ment``. Mistral writes the page's line breaks
-#: so; the others join the word. Not a difference worth a card.
-_HYPHEN_BREAK = re.compile(r"(?<=\w)-\s(?=\w)")
-
-
-def dehyphenated(text: str) -> str:
-    """Return ``text`` with every line-end hyphen joined."""
-    return _HYPHEN_BREAK.sub("", text)
+dehyphenated = ensemble.dehyphenated
 
 
 def _hyphens_alone(base_words: str, readings: list[dict]) -> bool:
     """Return whether every other reading of a span is the base's
-    words but for line-end hyphens."""
-    want = ensemble.compare_text(dehyphenated(base_words))
+    reading of it (``ensemble.same_spot``: but for a line-end hyphen,
+    a space, a mark with no key)."""
+    want = ensemble.compare_text(base_words)
     return all(
-        ensemble.compare_text(dehyphenated(r["word"])) == want
+        ensemble.same_spot(ensemble.compare_text(r["word"]), want)
         for r in readings[1:]
     )
 
@@ -183,17 +174,28 @@ def _span_at(at: dict, ends: dict[int, int], position: int) -> tuple[int, int]:
     return position, position
 
 
-def _span_reading(at: dict, first: int, last: int) -> str:
-    """Return one engine's words over the base positions ``first`` to
-    ``last``: a joined span once, at its head, and a word per position
-    elsewhere."""
+def _spot_reading(
+    at: dict, inserted: dict, first: int, last: int, tail: bool
+) -> str:
+    """Return one engine's reading of the base positions ``first`` to
+    ``last``: at each position the words it read there that the base
+    did not, then its word (a joined span once, at its head), and the
+    words after the last when ``tail``. Every place the vote compared
+    is in the row, so the words that made a card red can be picked."""
     words = []
     for position in range(first, last + 1):
+        run = _run_words(inserted, position)
+        if run:
+            words.append(run)
         for entry in at.get(position) or []:
             if isinstance(entry, ensemble.Carried):
                 continue
             if entry[1]:
                 words.append(entry[1])
+    if tail:
+        run = _run_words(inserted, last + 1)
+        if run:
+            words.append(run)
     return " ".join(words)
 
 
@@ -384,18 +386,12 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
             "token"
         ].get("lone_after")
         for name, (at, inserted) in candidates.items():
-            run_before = _run_words(inserted, first)
-            run_after = _run_words(inserted, last + 1) if tail else ""
-            word = " ".join(
-                part
-                for part in (
-                    run_before,
-                    _span_reading(at, first, last),
-                    run_after,
-                )
-                if part
+            readings.append(
+                {
+                    "engine": name,
+                    "word": _spot_reading(at, inserted, first, last, tail),
+                }
             )
-            readings.append({"engine": name, "word": word})
         if flag == MAJORITY and _hyphens_alone(readings[0]["word"], readings):
             # ``Depart- ment`` against ``Department``: the engine kept
             # the page's line-end hyphen. Nothing to decide.

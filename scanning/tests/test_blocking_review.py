@@ -370,6 +370,27 @@ class TestOpenWords(TestCase):
         cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
         self.assertEqual([(c["token"], c["start"]) for c in cards], [("x", 2)])
 
+    def test_a_widened_span_shows_every_engines_run_inside_it(self):
+        """Mistral joined ``Ill. Adm. Code`` into one word, so the card
+        of the spot before ``Code`` spans all three; Surya's ``1490``
+        sits inside that span, and its row must show it, or the words
+        that made the card red could not be picked."""
+        voted = read(
+            "Ill. Adm. Code x",
+            "Ill.Adm.Code x",
+            "Ill. Adm. 1490 Code y",
+        )
+        self.assertEqual(voted["agreement"], ensemble.VOTED)
+
+        words = blocking_review.open_words(voted)
+
+        card = next(w for w in words if "Code" in w["token"])
+        self.assertEqual(card["token"], "Ill. Adm. Code")
+        self.assertEqual(
+            [r["word"] for r in card["readings"]],
+            ["Ill. Adm. Code", "Ill.Adm.Code", "Ill. Adm. 1490 Code"],
+        )
+
     def test_a_block_a_majority_settled_has_no_open_word(self):
         self.assertEqual(
             blocking_review.open_words(read("a b c", "a b c", "a x c")), []

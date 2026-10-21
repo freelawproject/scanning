@@ -2720,7 +2720,11 @@ def vote_words(
         disputed_before = (
             not put_in
             and len(spot_keys) >= 3
-            and len(set(spot_keys)) == len(spot_keys)
+            and all(
+                not same_spot(a, b)
+                for i, a in enumerate(spot_keys)
+                for b in spot_keys[i + 1 :]
+            )
             and any(inserted.get(position) for inserted in inserts)
         )
         # A run one engine alone read here, the others alike: dropped,
@@ -2731,6 +2735,9 @@ def vote_words(
             not put_in
             and not disputed_before
             and any(inserted.get(position) for inserted in inserts)
+            # A run whose only word is a mark with no key reads as
+            # the base's spot: nothing to decide, no card.
+            and any(not same_spot(spot_keys[0], k) for k in spot_keys[1:])
         )
         if position == len(base):
             if tokens and disputed_before:
@@ -2759,11 +2766,16 @@ def vote_words(
                     ),
                     "position": position,
                 }
-                if count < total:
+                confirmed = len(readings) == total and all(
+                    same_spot(key, winner) for key, _ in readings
+                )
+                if count < total and not confirmed:
                     # Short of every engine of the group, and not short
                     # of the readings: an engine that carried its
                     # reading elsewhere (#391) confirmed nothing, so
-                    # its silence must not read as one more voice.
+                    # its silence must not read as one more voice. A
+                    # reading that is the winner but for a line-end
+                    # hyphen confirmed it.
                     token["majority"] = True
                 if disputed_before:
                     token["low_confidence"] = True
@@ -3294,6 +3306,36 @@ def _kept_open(
 
 #: A word of a person's text, the split :func:`_kept_open` places by.
 _WORD = re.compile(r"\S+")
+
+#: A hyphen an engine kept at a line end, with the break as a space or
+#: a newline: ``Depart- ment``. Mistral writes the page's line breaks
+#: so; the others join the word. Not a difference.
+_HYPHEN_BREAK = re.compile(r"(?<=\w)-\s(?=\w)")
+
+
+def dehyphenated(text: str) -> str:
+    """Return ``text`` with every line-end hyphen joined."""
+    return _HYPHEN_BREAK.sub("", text)
+
+
+def same_spot(key: str, other: str) -> bool:
+    """Return whether two readings of a spot are the same reading.
+
+    The keys of :func:`compare_word`, joined by spaces for a run; a
+    line-end hyphen is joined (:func:`dehyphenated`) and the spaces
+    are dropped, so ``depart- ment`` is ``department`` and a run whose
+    only word is a mark with no key is nothing. The one rule the vote
+    (``vote_words``) and the cards (``blocking_review.open_words``)
+    read, so a block's level and its cards agree on what is open.
+
+    :param key: One reading of the spot.
+    :param other: Another.
+    :returns: Whether they read alike.
+    :rtype: bool
+    """
+    return dehyphenated(key).replace(" ", "") == dehyphenated(other).replace(
+        " ", ""
+    )
 
 
 def _human_read(
