@@ -1293,7 +1293,13 @@ class TestTheTextReviewPromotion(TestCase):
     def test_the_pass_promotes_the_rows_that_qualify(self):
         """The safety net: either pass can be the last one to write."""
         self.ready()
-        waiting = OpinionFactory(scan=self.scan, first_printed_page=900)
+        # A page beside the fixture's own: the factory numbers pages by
+        # a sequence over the whole run, and a fixed number collides
+        # with it whenever the run has made that many opinions before.
+        waiting = OpinionFactory(
+            scan=self.scan,
+            first_printed_page=self.opinion.first_printed_page + 1,
+        )
 
         self.assertEqual(opinions.promote_ready_opinions(), 1)
 
