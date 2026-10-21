@@ -647,14 +647,26 @@ def _is_heading(paragraph: dict, spans: list[dict]) -> bool:
 
 def _closer_share(paragraph: dict, spans: list[dict]) -> float:
     """Return the share of a paragraph's characters that spans of
-    :data:`CLOSER_LABELS` cover."""
+    :data:`CLOSER_LABELS` cover.
+
+    A ``heading`` span counts beside a closer label: on a caption line
+    in capitals or italics the model changes the label word by word
+    (the flicker of :func:`_one_caption_label`), and reads "Appeal
+    from the Circuit Court of Mercer County, The Honorable ..., Judge,
+    Civil Action No. ..." as ``heading`` then ``history``. The
+    syllabus paragraphs carry no span, so a heading span alone, with
+    no caption label beside it, is a heading and closes nothing.
+    """
     length = len((paragraph.get("text") or "").strip(_EDGE))
     if not length:
         return 0.0
+    labels = CLOSER_LABELS
+    if any(span["label"] in CLOSER_LABELS for span in spans):
+        labels = CLOSER_LABELS | {HEADING}
     covered = sum(
         max(0, span["end"] - span["start"])
         for span in spans
-        if span["label"] in CLOSER_LABELS
+        if span["label"] in labels
     )
     return min(covered / length, 1.0)
 

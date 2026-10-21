@@ -2156,6 +2156,59 @@ class TestTheSyllabus(TestCase):
 
         self.assertEqual(len(root.findall("syllabus")), 3)
 
+    def test_a_caption_line_read_as_heading_then_history_closes_the_run(self):
+        """The flicker of #474 on the W. Va. appeal line: ``heading``
+        over most of it and ``history`` over its tail."""
+        appeal = (
+            "Appeal from the Circuit Court of Mercer County, The Honorable "
+            "William J. Sadler, Judge, Civil Action No. 15-D-24"
+        )
+        document = doc(
+            *self.caption(),
+            para("Syllabus by the Court", kind="heading"),
+            para("1. A statute is read as a whole."),
+            para(appeal, kind="heading"),
+            para(self.COUNSEL),
+            para("WORKMAN, JUSTICE:", kind="heading"),
+            para(self.BODY),
+        )
+        cut = appeal.index("Judge, Civil")
+        spans = [
+            *self.caption_spans(),
+            span(4, 0, cut, "heading"),
+            span(4, cut, len(appeal), "history"),
+            span(5, 0, len(self.COUNSEL), "attorneys"),
+            span(6, 0, 17, "author"),
+        ]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), ["1. A statute is read as a whole."]
+        )
+        # The line is written as the tagger left it, outside the run.
+        line = root.find("heading")
+        self.assertEqual("".join(line.itertext()), appeal)
+        self.assertIsNotNone(line.find("history"))
+
+    def test_a_heading_alone_inside_the_run_closes_nothing(self):
+        tail, tail_spans = self.tail(6)
+        document = doc(
+            *self.caption(),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+            para("Held", kind="heading"),
+            para(self.HELD),
+            *tail,
+        )
+        spans = [*self.caption_spans(), span(4, 0, 4, "heading"), *tail_spans]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, "Held", self.HELD]
+        )
+
     def test_the_stamp_on_the_heading_opens_the_run(self):
         """The ``SYLLABUS`` detection over the heading, carried by the
         ensemble and the approved text; the heading is consumed."""
