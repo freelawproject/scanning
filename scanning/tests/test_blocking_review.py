@@ -166,6 +166,31 @@ class TestOpenWords(TestCase):
             [("mistral_ocr", "dog"), ("dots_mocr", ""), ("surya", "dog")],
         )
 
+    def test_a_bare_mark_the_base_read_is_no_row_of_a_gap_card(self):
+        """``* * *`` has no key and no vote token, so it is not a
+        dropped word: the base's row of the gap after it is empty, and
+        choosing a row never writes the mark a second time."""
+        voted = read("a b * * * c x", "a b * * * 1490 c y", "a b * * * c z")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        gap = next(c for c in cards if c.get("gap"))
+        self.assertEqual(
+            [r["word"] for r in gap["readings"]], ["", "1490", ""]
+        )
+
+    def test_a_run_before_a_bare_mark_is_on_the_gap_card_after_it(self):
+        """The vote carries the gap past the marks to ``c``, so the
+        card's rows read the runs over the whole gap."""
+        voted = read("a b * * * c x", "a b 1490 * * * c y", "a b * * * c z")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        gap = next(c for c in cards if c.get("gap"))
+        self.assertEqual(
+            [r["word"] for r in gap["readings"]], ["", "1490", ""]
+        )
+
     def test_a_run_after_the_last_word_is_a_card_after_it(self):
         voted = read("a b", "a c", "a b 1490")
 

@@ -124,9 +124,12 @@ def _reading(
 
 def _run_words(inserted: dict, position: int) -> str:
     """Return the words one engine read at a base position that the
-    base did not, as the engine wrote them, or "" for none."""
+    base did not, as the engine wrote them, or "" for none. A run that
+    is only a mark has no key and reads as nothing, the vote's rule."""
     runs = inserted.get(position) or []
-    return " ".join(word for run in runs for _, word in run)
+    return " ".join(
+        word for run in runs if any(key for key, _ in run) for _, word in run
+    )
 
 
 def _span_ends(at: dict) -> dict[int, int]:
@@ -428,8 +431,12 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 ),
                 default=-1,
             )
+            # A base word with no vote token is dropped; a bare mark
+            # has no key and no token either, and is no word.
             dropped = [
-                p for p in range(last_base + 1, position) if p not in voted_at
+                p
+                for p in range(last_base + 1, position)
+                if p not in voted_at and base_pairs[p][0]
             ]
             readings = [
                 {
@@ -445,9 +452,12 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                             continue
                         if reading[1]:
                             read_there.append(reading[1])
-                run = _run_words(inserted, position)
-                if run:
-                    read_there.append(run)
+                # The runs over the whole gap: the vote carries a gap
+                # past a bare mark to the next word with a token.
+                for p in range(last_base + 1, position + 1):
+                    run = _run_words(inserted, p)
+                    if run:
+                        read_there.append(run)
                 readings.append({"engine": name, "word": " ".join(read_there)})
             words.append(
                 {
