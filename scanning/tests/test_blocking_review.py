@@ -86,6 +86,86 @@ class TestOpenWords(TestCase):
             [("dots_mocr", "1490"), ("mistral_ocr", ""), ("surya", "")],
         )
 
+    def test_a_gap_beside_a_changed_word_keeps_its_card(self):
+        voted = read("a b c d", "a z c d", "a b W c d")
+        kept = ensemble._human_read(
+            voted, {"text": "a z c d", "span": [2, 3]}, voted["engines"]
+        )
+
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+
+        gap = next(c for c in cards if c.get("gap"))
+        self.assertEqual((gap["start"], gap["after"]), (4, "c d"))
+        self.assertEqual([r["word"] for r in gap["readings"]], ["", "", "W"])
+
+    def test_a_gap_before_a_word_a_person_rewrote_keeps_its_card(self):
+        voted = read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+        kept = ensemble._human_read(
+            voted, {"text": "two of more", "span": [4, 6]}, voted["engines"]
+        )
+
+        cards = blocking_review.open_words(kept)
+
+        self.assertEqual(
+            [(c.get("gap"), c["start"]) for c in cards], [(True, 4)]
+        )
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]],
+            ["", "[c]ontract", "I contract"],
+        )
+
+    def test_the_stored_block_of_a_person_names_the_engine_of_its_positions(
+        self,
+    ):
+        """Through the build, not ``_human_read`` alone: the first
+        engine dissents from the agreeing pair, the shown text is the
+        pair's, and after a word answer the stored block carries the
+        engine its tokens count against, so the cards of the words
+        left open read the right rows at the right places."""
+        from scanning.tests.test_ensemble import engine_page
+
+        texts = {
+            "dots_mocr": "a sat x",
+            "mistral_ocr": "a dog sat y",
+            "surya": "a dog sat y",
+        }
+        pages = {
+            name: engine_page([unit(name, 0, BODY_A_PT, text)])
+            for name, text in texts.items()
+        }
+        edit = {
+            "id": 1,
+            "kind": "text",
+            "source_edit_id": None,
+            "source_page": 2,
+            "page_in_opinion": 0,
+            "box_pt": BODY_A_PT,
+            "section": ensemble.BODY,
+            "base_text": "a dog sat y",
+            "text": "a dog sat z",
+            "order": [],
+            "quoted": None,
+            "span": [10, 11],
+            "by": "curator",
+            "at": "",
+        }
+
+        page = ensemble.build_page(pages, 0, edits=[edit])
+
+        group = page["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.HUMAN)
+        self.assertEqual(group["base"], "mistral_ocr")
+        cards = blocking_review.open_words(group, blocking_review.MAJORITY)
+        self.assertEqual(
+            [(c["token"], c["start"]) for c in cards], [("dog", 2)]
+        )
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in cards[0]["readings"]],
+            [("mistral_ocr", "dog"), ("dots_mocr", ""), ("surya", "dog")],
+        )
+
     def test_a_run_after_the_last_word_is_a_card_after_it(self):
         voted = read("a b", "a c", "a b 1490")
 
@@ -970,6 +1050,22 @@ class TestTheCardsEndpoint(EditTestCase, ScanningTestCase):
         back = self.client.get(self.url()).json()
         self.assertTrue(
             any(c.get("box_pt") == card["box_pt"] for c in back["cards"])
+        )
+
+    def test_the_counts_mode_answers_both_lengths_from_one_read(self):
+        data = self.client.get(self.url() + "?counts=1").json()
+
+        self.assertEqual(data["status"], "ok")
+        self.assertNotIn("cards", data)
+        self.assertEqual(
+            data["counts"][ensemble.BLOCKING],
+            len(self.client.get(self.url()).json()["cards"]),
+        )
+        self.assertEqual(
+            data["counts"][ensemble.WARNING],
+            len(
+                self.client.get(self.url() + "?level=warning").json()["cards"]
+            ),
         )
 
     def test_the_level_of_the_cards_is_read_off_the_query(self):

@@ -975,6 +975,85 @@ class TestTheVote(TestCase):
         # ``alpha`` alone is the no-majority place.
         self.assertEqual(answer["n_low_confidence"], 1)
 
+    def test_a_changed_neighbour_leaves_the_gap_open(self):
+        """The person answered the word before the gap, ``b`` to ``z``,
+        and never looked at the gap: it stays, on the same word, with
+        its base position. A replacement is not an insertion."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a z c d", "span": [2, 3]}, group["engines"]
+        )
+
+        c = next(t for t in kept["tokens"] if t["text"] == "c")
+        self.assertEqual(c.get("gap"), ensemble.WARNING)
+        self.assertEqual(c.get("gap_at"), 2)
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+
+    def test_the_word_after_the_gap_rewritten_keeps_the_gap(self):
+        """The gap is before ``or``; the person wrote ``of`` there. The
+        gap is still unjudged, so it lands on ``of`` and still blocks."""
+        group = self.read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "two of more", "span": [4, 6]}, group["engines"]
+        )
+
+        of = next(t for t in kept["tokens"] if t["text"] == "of")
+        self.assertEqual(of.get("gap"), ensemble.BLOCKING)
+        self.assertEqual(of.get("gap_at"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
+    def test_the_last_word_rewritten_keeps_the_gap_after_it(self):
+        group = self.read("a b", "a c", "a b 1490")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a c", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertEqual(kept["tokens"][-1].get("gap_after"), ensemble.WARNING)
+
+    def test_a_word_the_engines_joined_is_no_gap(self):
+        """``con tract`` against ``contract`` twice: the head takes the
+        joined reading and the tail is dropped as its own, but it is
+        in the text inside the joined word, so the place is no gap."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("con tract"),
+            [ensemble._pairs("contract"), ensemble._pairs("contract")],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["contract"])
+        self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_two_answers_the_second_beside_the_gap_hold_together(self):
+        """The gap is filled first, then the word right before it is
+        answered: the gap stays filled, because the insertion is in
+        the text whatever its neighbour became."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        first = ensemble._human_read(
+            answer, {"text": "a b W c d", "span": [4, 4]}, group["engines"]
+        )
+        self.assertFalse(any("gap" in t for t in first["tokens"]))
+        self.assertEqual(
+            [t["text"] for t in first["tokens"] if t.get("majority")], ["b"]
+        )
+
+        second = ensemble._human_read(
+            answer, {"text": "a z W c d", "span": [2, 3]}, group["engines"]
+        )
+        self.assertFalse(any("gap" in t for t in second["tokens"]))
+        self.assertIsNone(ensemble.disagreement_level(second, 3))
+
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("a b"),

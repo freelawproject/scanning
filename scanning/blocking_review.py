@@ -246,15 +246,23 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
         for name in present
         if name != base
     ]
+    voted, _ = ensemble.vote_words(base_pairs, [pairs for _, pairs in others])
     if group.get("agreement") == ensemble.HUMAN:
         # A person wrote the text; the open words they left as they
         # were are the document's own tokens, each at its base
         # position (``ensemble._kept_open``), placed in that text.
         tokens = group.get("tokens") or []
     else:
-        tokens, _ = ensemble.vote_words(
-            base_pairs, [pairs for _, pairs in others]
-        )
+        tokens = voted
+    # The base positions the vote kept a word for: a base word with no
+    # token is one the vote dropped, and the gap card before the next
+    # kept word shows it. The vote's own tokens, never the person's,
+    # whose rewritten word carries no position.
+    voted_at = {
+        t["position"]
+        for t in voted
+        if t.get("position") is not None and not t.get("inserted")
+    }
     candidates = {
         name: ensemble._candidates(base_pairs, pairs) for name, pairs in others
     }
@@ -391,13 +399,17 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     level = ensemble.BLOCKING if flag == LOW_CONFIDENCE else ensemble.WARNING
     for entry in placed:
         token = entry["token"]
-        if token.get("position") is None:
-            continue
         for key in ("gap", "gap_after"):
             if token.get(key) != level:
                 continue
             after_word = key == "gap_after"
-            position = len(base_pairs) if after_word else token["position"]
+            # The base position the gap stands before: the token's
+            # own, or ``gap_at`` on a word a person wrote in place of
+            # the vote's (``ensemble._kept_open``).
+            at = token.get("gap_at", token.get("position"))
+            if not after_word and at is None:
+                continue
+            position = len(base_pairs) if after_word else at
             index = entry["index"]
             before, after = (
                 context(index + 1, index)
@@ -416,7 +428,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 ),
                 default=-1,
             )
-            dropped = range(last_base + 1, position)
+            dropped = [
+                p for p in range(last_base + 1, position) if p not in voted_at
+            ]
             readings = [
                 {
                     "engine": base,

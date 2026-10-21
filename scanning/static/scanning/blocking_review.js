@@ -83,9 +83,13 @@
         return field ? field.value : '';
     }
 
-    /** The key a card keeps across reloads: its kind, page, block and offset. */
+    /** The key a card keeps across reloads: its kind, page, block,
+     *  offset and span. A gap card starts where the word after it
+     *  starts, so the span tells the two apart; the finding stays
+     *  last, the Undo of a dismissal reads it there. */
     function keyOf(card) {
-        return [card.kind, card.page_in_opinion, card.group_id, card.start, card.finding_pk].join(':');
+        return [card.kind, card.page_in_opinion, card.group_id, card.start,
+            card.gap ? 'gap' : (card.length || 0), card.finding_pk].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────

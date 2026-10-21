@@ -3057,18 +3057,21 @@
      *  server's number is the finding count until the cards endpoint
      *  answers with the real one. */
     function bindCardCounts() {
-        document.querySelectorAll('[data-card-count-url]').forEach(function (link) {
-            var url = link.dataset.cardCountUrl
-                + (link.dataset.cardLevel === 'warning' ? '?level=warning' : '');
-            fetch(url, { credentials: 'same-origin' })
-                .then(function (response) { return response.ok ? response.json() : null; })
-                .then(function (data) {
-                    if (!data || data.status !== 'ok' || !data.cards) { return; }
+        var links = Array.prototype.slice.call(document.querySelectorAll('[data-card-count-url]'));
+        if (!links.length) { return; }
+        // One request for both numbers: the endpoint reads the document
+        // once and answers the two lengths, no card over the wire.
+        fetch(links[0].dataset.cardCountUrl + '?counts=1', { credentials: 'same-origin' })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (data) {
+                if (!data || data.status !== 'ok' || !data.counts) { return; }
+                links.forEach(function (link) {
                     var count = link.querySelector('[data-card-count]');
-                    if (count) { count.textContent = data.cards.length; }
-                })
-                .catch(function () { /* the finding count stays */ });
-        });
+                    var value = data.counts[link.dataset.cardLevel];
+                    if (count && typeof value === 'number') { count.textContent = value; }
+                });
+            })
+            .catch(function () { /* the finding count stays */ });
     }
 
     document.addEventListener('DOMContentLoaded', function () {

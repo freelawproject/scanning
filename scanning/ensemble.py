@@ -2724,19 +2724,27 @@ def vote_words(
                 tokens[-1]["gap_after"] = pending
             break
         readings = [base[position]]
+        # The engines that truly read nothing here, as against the ones
+        # whose reading of this word is inside a span the head took
+        # (#391): those vote to drop the word too, but the word is in
+        # the text, inside the joined reading, and the place is no gap.
+        read_nothing = 0
         for vote in votes:
             for reading in vote.get(position, []):
                 cast = _vote_of(reading, chosen)
                 if cast is not None:
                     readings.append(cast)
+                    if cast == ("", "") and not isinstance(reading, Carried):
+                        read_nothing += 1
         winner, count = Counter(key for key, _ in readings).most_common(1)[0]
         if count >= quorum:
             chosen[position] = winner
-            if not winner and base[position][0]:
-                # A majority read nothing where the base read a word:
-                # the word is dropped, and the place is a gap like a
-                # run's, the other way round, so the drop is shown. A
-                # mark with no key is not a word, and makes no gap.
+            if not winner and base[position][0] and read_nothing >= quorum:
+                # A majority truly read nothing where the base read a
+                # word: the word is dropped, and the place is a gap
+                # like a run's, the other way round, so the drop is
+                # shown. A mark with no key is not a word, and makes
+                # no gap.
                 pending = pending or WARNING
             if winner:
                 # "" is the reading of a majority that dropped the word,
@@ -3163,12 +3171,14 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     majority words with it. A whole-block judgement never comes here
     (:func:`_human_read`).
 
-    A gap (``gap``, ``gap_after``) carries only while it is still a
-    gap: the word before it in the person's text is the word before it
-    in the vote. A person who put words in the gap answered it,
-    whatever they put, and a gap after the last word is answered by
-    anything written after that word. So an answer to a gap card holds
-    on every rebuild, with no record of the answer beyond the text.
+    A gap (``gap``, ``gap_after``) carries by its place, onto whatever
+    word now stands after it, unless the person put words into it: a
+    pure insertion there, or a rewrite of a neighbour that grew by a
+    word an engine read in that gap. A rewritten neighbour alone is
+    a replacement, not an insertion, so the gap stays open and still
+    a card. So an answer to a gap card holds on every rebuild, with
+    no record of the answer beyond the text, and an answer beside a
+    gap never closes it unseen.
 
     :param read_back: :func:`resolve` of the group, the engines' own.
     :param text: The text the person wrote, folded.
@@ -3178,36 +3188,42 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     :rtype: list[dict]
     """
     voted = [t for t in read_back.get("tokens") or [] if t.get("text")]
-    if not voted and read_back.get("agreement") == MAJORITY and engines:
-        present = [
+    present = (
+        [
             name
             for name in _ranked(engines)
             if compare_text(engines[name]["text"])
         ]
-        # From the side of the engine whose text is shown, the rule of
-        # ``blocking_review.open_words``, so the positions the tokens
-        # carry count the words of the text a card is placed in.
-        first = read_back.get("source")
-        if first not in present and present:
-            first = present[0]
-        if len(present) >= 2:
-            base = _pairs(engines[first]["text"])
-            others = [
-                _pairs(engines[name]["text"])
-                for name in present
-                if name != first
-            ]
-            # The vote is from the first engine's side, so a word the
-            # majority read and the first engine missed comes back
-            # ``low_confidence``; the majority settled it, and only
-            # the ``majority`` flag is a card of such a block
-            # (``blocking_review.open_words``). A block two engines
-            # read alike can stay a warning and never become blocking.
-            voted = [
-                {k: v for k, v in t.items() if k != "low_confidence"}
-                for t in vote_words(base, others)[0]
-                if t.get("text")
-            ]
+        if engines
+        else []
+    )
+    # The engine whose text is shown, the rule of
+    # ``blocking_review.open_words``: the vote of a block a majority
+    # read alike runs from its side, so the positions the tokens carry
+    # count the words of the text a card is placed in.
+    first = read_back.get("source")
+    if first not in present and present:
+        first = present[0]
+    if (
+        not voted
+        and read_back.get("agreement") == MAJORITY
+        and len(present) >= 2
+    ):
+        base = _pairs(engines[first]["text"])
+        others = [
+            _pairs(engines[name]["text"]) for name in present if name != first
+        ]
+        # The vote is from the shown engine's side, so a word the
+        # majority read and that engine missed comes back
+        # ``low_confidence``; the majority settled it, and only the
+        # ``majority`` flag is a card of such a block
+        # (``blocking_review.open_words``). A block two engines read
+        # alike can stay a warning and never become blocking.
+        voted = [
+            {k: v for k, v in t.items() if k != "low_confidence"}
+            for t in vote_words(base, others)[0]
+            if t.get("text")
+        ]
     if not voted:
         return []
     run_index: int | None = None
@@ -3224,14 +3240,71 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         [compare_word(w) for w in words],
         autojunk=False,
     )
-    carried: dict[int, dict] = {}
-    voted_index: dict[int, int] = {}
-    for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
-        if tag != "equal":
+    # What the engines read in each gap, by the base position the gap
+    # stands before: the keys of their runs there, and the base's own
+    # words the vote dropped. A person's extra word that is one of
+    # them went into that gap.
+    in_gaps: dict[int, set[str]] = {}
+    base_pairs = _pairs(engines[first]["text"]) if first in present else []
+    for name in present:
+        if name == first:
             continue
-        for offset in range(i2 - i1):
-            carried[j1 + offset] = voted[i1 + offset]
-            voted_index[j1 + offset] = i1 + offset
+        _at, inserted = _candidates(base_pairs, _pairs(engines[name]["text"]))
+        for at, runs in inserted.items():
+            in_gaps.setdefault(at, set()).update(
+                key for run in runs for key, _ in run if key
+            )
+    kept_at = sorted(
+        {
+            t["position"]
+            for t in voted
+            if "position" in t and not t.get("inserted")
+        }
+    )
+    for at, (key, _) in enumerate(base_pairs):
+        if key and at not in kept_at:
+            after = next((q for q in kept_at if q > at), len(base_pairs))
+            in_gaps.setdefault(after, set()).add(key)
+
+    def gap_at(boundary: int) -> int | None:
+        """The base position of the gap before voted token
+        ``boundary``; past the last token, the end of the base."""
+        if boundary >= len(voted):
+            return len(base_pairs) if base_pairs else None
+        return voted[boundary].get("position")
+
+    carried: dict[int, dict] = {}
+    # Where each voted token stands in the person's text: its own
+    # place when the word is unchanged, its replacement's when the
+    # person changed it, nowhere when they deleted it. And the voted
+    # positions before which the person put words in: a pure
+    # insertion, or a replacement that grew by a word an engine read
+    # in the gap beside it. A changed neighbour alone is a
+    # replacement, not an insertion, and leaves the gap open.
+    landed: dict[int, int | None] = {}
+    filled: set[int] = set()
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                carried[j1 + offset] = voted[i1 + offset]
+                landed[i1 + offset] = j1 + offset
+        elif tag == "replace":
+            for offset in range(i2 - i1):
+                landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
+            if j2 - j1 > i2 - i1:
+                extra = {compare_word(w) for w in words[j1:j2]} - {
+                    compare_word(t["text"]) for t in voted[i1:i2]
+                }
+                for boundary in (i2, i1):
+                    at = gap_at(boundary)
+                    if at is not None and extra & in_gaps.get(at, set()):
+                        filled.add(boundary)
+                        break
+        elif tag == "insert":
+            filled.add(i1)
+        else:
+            for offset in range(i2 - i1):
+                landed[i1 + offset] = None
     tokens: list[dict] = []
     for index, word in enumerate(words):
         token: dict = {"text": word}
@@ -3243,13 +3316,35 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             for key in ("position", "run_index"):
                 if key in old:
                     token[key] = old[key]
-            before = voted_index.get(index - 1) if index else -1
-            if old.get("gap") and before == voted_index[index] - 1:
-                token["gap"] = old["gap"]
-            if old.get("gap_after") and index == len(words) - 1:
-                token["gap_after"] = old["gap_after"]
         tokens.append(token)
+    # A gap lands by its place, on whatever word now stands after it,
+    # unless the person put words in it; the gap after the last word
+    # lands on the person's last word.
+    for i, old in enumerate(voted):
+        if old.get("gap") and i not in filled and landed.get(i) is not None:
+            _land_gap(
+                tokens[landed[i]], "gap", old["gap"], old.get("position")
+            )
+        if old.get("gap_after") and len(voted) not in filled and tokens:
+            _land_gap(tokens[-1], "gap_after", old["gap_after"], None)
     return tokens
+
+
+def _land_gap(token: dict, key: str, level: str, position: int | None) -> None:
+    """Put a gap's level on a token of a person's text.
+
+    Blocking over warning when two gaps land on one word. ``gap_at``
+    is the base position the gap stands before, which the cards read
+    when the word itself is not the vote's (``blocking_review.open_words``).
+
+    :param token: The token of the person's word.
+    :param key: ``"gap"`` or ``"gap_after"``.
+    :param level: The gap's level.
+    :param position: The base position of the word after the gap.
+    """
+    token[key] = BLOCKING if BLOCKING in (token.get(key), level) else level
+    if key == "gap" and position is not None:
+        token["gap_at"] = position
 
 
 def _human_read(
@@ -3674,6 +3769,9 @@ def build_page(
                 "end": end,
                 "agreement": read_back["agreement"],
                 "source": read_back["source"],
+                # A person's block: the engine its tokens' positions
+                # count against (``_human_read``), which the cards read.
+                "base": read_back.get("base"),
                 "agreeing": read_back["agreeing"],
                 "alignment_iou": group["alignment_iou"],
                 "weak": group["weak"],
