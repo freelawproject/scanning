@@ -5,11 +5,11 @@ from .project.dots_mocr import *
 from .project.logging import *
 from .project.mistral import *
 from .project.observability import *
+from .project.perpendiculars import *
 from .project.processing_storage import *
 from .project.runpod import *
 from .project.security import *
 from .project.sharding import *
-from .project.perpendiculars import *
 from .project.surya import *
 from .project.tagger import *
 from .project.testing import *
