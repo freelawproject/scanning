@@ -191,6 +191,38 @@ class TestOpenWords(TestCase):
             [r["word"] for r in gap["readings"]], ["", "1490", ""]
         )
 
+    def test_a_gap_card_after_a_rewritten_word_shows_its_own_runs(self):
+        """Two gaps, before ``b`` and before ``c``, and the person
+        rewrote ``b``: the card before ``c`` is bounded by the vote's
+        own positions, so its rows hold ``Y`` and never the other gap's
+        ``X``, and the card on the rewritten word holds ``X``."""
+        voted = read("a b c d", "a X b Y c d", "a b c d")
+        kept = ensemble._human_read(
+            voted, {"text": "a z c d", "span": [2, 3]}, voted["engines"]
+        )
+
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+
+        gaps = [c for c in cards if c.get("gap")]
+        self.assertEqual(
+            [(g["start"], [r["word"] for r in g["readings"]]) for g in gaps],
+            [(2, ["", "X", ""]), (4, ["", "Y", ""])],
+        )
+
+    def test_a_gap_card_never_shows_a_run_the_vote_put_in(self):
+        """``1490`` was read by two engines and went in; ``W`` by one
+        alone and was dropped, past the marks. The card before ``c``
+        shows ``W`` and not ``1490``, which is in the text already."""
+        voted = read(
+            "a b * * * c x", "a b 1490 * * * c y", "a b 1490 * * * W c z"
+        )
+        self.assertIn("1490", voted["text"])
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        gap = next(c for c in cards if c.get("gap"))
+        self.assertEqual([r["word"] for r in gap["readings"]], ["", "", "W"])
+
     def test_a_run_after_the_last_word_is_a_card_after_it(self):
         voted = read("a b", "a c", "a b 1490")
 
