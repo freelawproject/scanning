@@ -1121,6 +1121,23 @@ class TestTheVote(TestCase):
         c = next(t for t in kept["tokens"] if t["text"] == "c")
         self.assertEqual(c.get("gap"), ensemble.WARNING)
 
+    def test_a_run_with_a_stray_mark_is_the_same_run(self):
+        """Two engines read ``smith`` where the base read nothing, one
+        of them with a bullet beside it: one reading of a majority, so
+        the word goes in and the bullet does not, and no gap."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("a b"),
+            [
+                ensemble._pairs("a smith b"),
+                ensemble._pairs("a smith \u2022 b"),
+            ],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["a", "smith", "b"])
+        self.assertTrue(tokens[1].get("inserted"))
+        self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
+        self.assertEqual(disputed, 1)
+
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("a b"),

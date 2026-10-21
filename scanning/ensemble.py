@@ -2676,9 +2676,19 @@ def vote_words(
             for inserted in inserts
             for run in inserted.get(position, [])
         ]
-        counted = Counter(keys for keys, _ in runs)
+        # A run is counted by its keys with the marks left out: a mark
+        # (``*``, ``•``, ``___``) has no key and reads as nothing, the
+        # rule of a keyless base word, so ``smith`` and ``smith •`` are
+        # one reading, and a run that is only marks is no run at all.
+        # The gap vote below folds the same way, so both judge one
+        # reading.
+        counted = Counter(
+            tuple(key for key in keys if key) for keys, _ in runs
+        )
         dropped = False
         for keys, count in counted.items():
+            if not keys:
+                continue
             # A run the base does not have: ``count`` engines read it
             # and ``total - count`` did not. A majority of them puts it
             # in; a tie puts it in too, because the same tie on a word
@@ -2686,14 +2696,16 @@ def vote_words(
             # two engines make every difference a tie. A minority is
             # dropped, the reading of the majority.
             if count < quorum and count * 2 != total:
-                # A run that is only a mark (``*``, ``•``, ``___``) has
-                # no key and reads as nothing, the rule of a keyless
-                # base word: it makes no gap.
-                if any(keys):
-                    dropped = True
+                dropped = True
                 continue
-            words = next(words for other, words in runs if other == keys)
-            for word in words:
+            run_keys, run_words = next(
+                (k, w)
+                for k, w in runs
+                if tuple(key for key in k if key) == keys
+            )
+            for key, word in zip(run_keys, run_words, strict=True):
+                if not key:
+                    continue
                 add(
                     {
                         "text": word,
@@ -2705,7 +2717,7 @@ def vote_words(
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
-            disputed += len(words)
+            disputed += len(keys)
         if dropped:
             # The gap is a spot: each engine's reading of it is the
             # keys of its run here, and nothing for the base and for

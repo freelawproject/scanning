@@ -122,11 +122,21 @@ def _reading(
     return entry[1]
 
 
-def _run_words(inserted: dict, position: int) -> str:
+def _run_words(inserted: dict, position: int, put_in: dict) -> str:
     """Return the words one engine read at a base position that the
-    base did not, as the engine wrote them, or "" for none."""
+    base did not and the vote dropped, as the engine wrote them, or ""
+    for none. A run that is only a mark has no key and reads as
+    nothing, the vote's rule; a run the vote put in is in the text as
+    inserted tokens already (``put_in``, by position), and a row that
+    showed it would write it twice."""
     runs = inserted.get(position) or []
-    return " ".join(word for run in runs for _, word in run)
+    return " ".join(
+        word
+        for run in runs
+        if any(key for key, _ in run)
+        and tuple(key for key, _ in run if key) != put_in.get(position)
+        for _, word in run
+    )
 
 
 def _span_ends(at: dict) -> dict[int, int]:
@@ -263,6 +273,14 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
         for t in voted
         if t.get("position") is not None and not t.get("inserted")
     }
+    # The runs the vote put in, by position: the keys of its inserted
+    # tokens there, which a gap card's rows must not show again.
+    put_in: dict[int, tuple] = {}
+    for t in voted:
+        if t.get("inserted") and t.get("position") is not None:
+            put_in[t["position"]] = put_in.get(t["position"], ()) + (
+                ensemble.compare_word(t["text"]),
+            )
     candidates = {
         name: ensemble._candidates(base_pairs, pairs) for name, pairs in others
     }
@@ -419,17 +437,16 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
             # The base positions inside the gap: the words the base
             # read there that a majority dropped, between the base
             # word before the gap and the one after it.
-            last_base = max(
-                (
-                    e["token"]["position"]
-                    for e in placed[: index + (1 if after_word else 0)]
-                    if e["run_index"] is None
-                    and e["token"].get("position") is not None
-                ),
-                default=-1,
-            )
+            # The gap runs from the vote's last kept word before this
+            # position: the vote's own positions, never the person's
+            # tokens, whose rewritten word carries none.
+            last_base = max((p for p in voted_at if p < position), default=-1)
+            # A base word with no vote token is dropped; a bare mark
+            # has no key and no token either, and is no word.
             dropped = [
-                p for p in range(last_base + 1, position) if p not in voted_at
+                p
+                for p in range(last_base + 1, position)
+                if p not in voted_at and base_pairs[p][0]
             ]
             readings = [
                 {
@@ -445,9 +462,12 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                             continue
                         if reading[1]:
                             read_there.append(reading[1])
-                run = _run_words(inserted, position)
-                if run:
-                    read_there.append(run)
+                # The runs over the whole gap: the vote carries a gap
+                # past a bare mark to the next word with a token.
+                for p in range(last_base + 1, position + 1):
+                    run = _run_words(inserted, p, put_in)
+                    if run:
+                        read_there.append(run)
                 readings.append({"engine": name, "word": " ".join(read_there)})
             words.append(
                 {
