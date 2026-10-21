@@ -101,6 +101,13 @@ boxes lists as blockquotes (#211), so a run that
 :data:`LIST_READERS` engines read as a list is the ``BLOCKQUOTE_LIST``
 card, which warns and changes nothing.
 
+**The syllabus (#518).** The OCR glue freezes the ``SYLLABUS``
+detection, the model's box over the heading line that opens a
+syllabus, as ``zones.syllabus``, and :func:`syllabus_start` stamps the
+body group the zone covers :data:`SYLLABUS_SHARE` of. The stamp names
+the start alone: the extent of the syllabus is read off the tagger's
+spans in ``casebody``, which the approved text carries the stamp to.
+
 **A seventh step, the list (#428).** The OCR glue takes the bullet off
 every list item and writes one ``li`` mark per item, because the
 engines agree on the words and not on the glyph (``*``, ``•``, a
@@ -202,7 +209,9 @@ logger = logging.getLogger(__name__)
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
 #: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
-SCHEMA_VERSION = 12
+#: 13 stamps ``syllabus_start`` on the body group under the syllabus
+#: zone, and writes that zone beside the other two (#518).
+SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -278,6 +287,17 @@ FOOTNOTE_SHARE = 0.5
 #: The name of the blockquote zone of a page, the key the OCR glue
 #: writes it under (``opinion_ocr.ZONES``, #411).
 BLOCKQUOTES = "blockquotes"
+
+#: The name of the syllabus zone of a page, the key the OCR glue
+#: writes it under (``opinion_ocr.ZONES``, #518): the detection over
+#: the heading line that opens a syllabus.
+SYLLABUS = "syllabus"
+
+#: The share of a group's box the syllabus zone must cover for the
+#: group to open the syllabus (#518). The value of the footnote zone:
+#: the zone is the model's box over one heading line, and the group
+#: under it is that line, so the two boxes are nearly one.
+SYLLABUS_SHARE = 0.5
 
 #: The share of a group's box the blockquote zone must cover for the
 #: group to be in the quote (#411). The value of the footnote zone: an
@@ -2308,6 +2328,30 @@ def list_readers(group: dict) -> list[str]:
     )
 
 
+def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
+    """Return whether one aligned group opens a syllabus (#518).
+
+    **The one rule**, the shape of :func:`quoted`: a body group the
+    syllabus zone covers :data:`SYLLABUS_SHARE` of. The zone is the
+    ``SYLLABUS`` detection of the run, the model's box over the
+    heading line that opens a syllabus, or a curator's own box in
+    review 2, so the stamp says where a syllabus starts and nothing
+    about where it ends: the final XML reads the extent off the
+    tagger's spans (``casebody.syllabus_range``). A footnote is never
+    a syllabus, so a group in the footnotes is not stamped.
+
+    :param group: One group of :func:`align_page`, with its
+        ``section`` set.
+    :param zones: The page's syllabus zones, in points.
+    :rtype: bool
+    """
+    return (
+        group.get("section", BODY) == BODY
+        and bool(zones)
+        and zone_share(group["box_pt"], zones) >= SYLLABUS_SHARE
+    )
+
+
 def blockquote_runs(groups: list[dict]) -> list[dict]:
     """Return the blockquotes of one page, one per run of quoted groups
     (#411).
@@ -3324,7 +3368,7 @@ def build_page(
         "pdf_page": first.get("pdf_page"),
         "source": first.get("source"),
         "frame": None,
-        "zones": {FOOTNOTES: [], BLOCKQUOTES: []},
+        "zones": {FOOTNOTES: [], BLOCKQUOTES: [], SYLLABUS: []},
         "text": "",
         "footnotes": "",
         # One entry per blockquote of the body text (#411).
@@ -3384,7 +3428,8 @@ def build_page(
     }
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
-    entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes}
+    starts = _zones_of(read, SYLLABUS)
+    entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes, SYLLABUS: starts}
     groups = align_page(units, width, height, zones)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
@@ -3421,6 +3466,7 @@ def build_page(
             # it to the footnotes and none makes it a quote.
             group["section"], group["footnote_doubt"] = BODY, False
             group["blockquote"] = group["_zone_blockquote"] = False
+            group["syllabus_start"] = False
             by_section[BODY].append(group)
             continue
         group["section"], group["footnote_doubt"] = section(group, zones)
@@ -3445,6 +3491,7 @@ def build_page(
             # A person said whether the whole block is a quote, so the
             # zone does not decide (#419). A span waits for the text.
             group["blockquote"] = bool(quote.get("quoted"))
+        group["syllabus_start"] = syllabus_start(group, starts)
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
@@ -3587,6 +3634,7 @@ def build_page(
                 "blockquote": group["blockquote"],
                 "quote_span": quote_span,
                 "quote_edit": (quote or {}).get("id"),
+                "syllabus_start": group["syllabus_start"],
                 "list_by": list_readers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
@@ -3731,6 +3779,7 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
         "blockquote": False,
         "quote_span": None,
         "quote_edit": None,
+        "syllabus_start": False,
         "list_by": [],
         "box_pt": box,
         "start": offset,

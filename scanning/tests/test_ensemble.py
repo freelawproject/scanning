@@ -2723,11 +2723,13 @@ def read_units(*specs) -> list[dict]:
     return units
 
 
-def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
+def engine_page(
+    units_of_engine: list[dict], zones=(), quotes=(), starts=()
+) -> dict:
     """One engine's page of an opinion document, for ``build_page``.
 
-    ``zones`` are the footnote zones and ``quotes`` the blockquote
-    zones, in points.
+    ``zones`` are the footnote zones, ``quotes`` the blockquote zones
+    and ``starts`` the syllabus zones, in points.
     """
     return {
         "page_in_opinion": 0,
@@ -2735,7 +2737,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
         "pdf_page": 2,
         "source": {"kind": "original", "pdf_page": 2},
         "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
-        "zones": {"footnotes": list(zones), "blockquotes": list(quotes)},
+        "zones": {
+            "footnotes": list(zones),
+            "blockquotes": list(quotes),
+            "syllabus": list(starts),
+        },
         "units": [
             {
                 "id": u["id"],
@@ -2753,11 +2759,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
     }
 
 
-def build(units, zones=(), quotes=()) -> dict:
+def build(units, zones=(), quotes=(), starts=()) -> dict:
     """The ensemble of one page read by the two engines of ``units``."""
     pages = {
         engine: engine_page(
-            [u for u in units if u["engine"] == engine], zones, quotes
+            [u for u in units if u["engine"] == engine], zones, quotes, starts
         )
         for engine in ("dots_mocr", "mistral_ocr")
     }
@@ -2926,7 +2932,8 @@ class TestTheTwoTexts(TestCase):
         )
         self.assertEqual(page["footnotes"], "1. left note")
         self.assertEqual(
-            page["zones"], {"footnotes": [FOOT_ZONE], "blockquotes": []}
+            page["zones"],
+            {"footnotes": [FOOT_ZONE], "blockquotes": [], "syllabus": []},
         )
 
     def test_without_a_zone_the_footnote_stays_in_the_body(self):
@@ -3054,7 +3061,11 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         self.assertEqual(page["footnotes"], "body B 2")
         self.assertEqual(
             page["zones"],
-            {"footnotes": [to_pt(self.BAND_B)], "blockquotes": []},
+            {
+                "footnotes": [to_pt(self.BAND_B)],
+                "blockquotes": [],
+                "syllabus": [],
+            },
         )
         # The first page masks its header, above the caption.
         self.assertEqual(document["pages"][0]["text"], "body A 1\n\nbody B 1")
@@ -3809,6 +3820,68 @@ def paragraphs(*specs) -> list[dict]:
                 )
             )
     return units
+
+
+class TestTheSyllabusStart(TestCase):
+    """``ensemble.syllabus_start`` (#518): the zone stamps the body
+    group under it, and the stamp names the start alone."""
+
+    HEADING = (50, 100, 300, 120)
+    FIRST = (50, 125, 300, 300)
+
+    def test_the_group_under_the_zone_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [zone_over(self.HEADING)])
+
+    def test_without_a_zone_no_group_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [False, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [])
+
+    def test_a_footnote_is_never_a_syllabus(self):
+        note = (50, 600, 300, 700)
+        page = build(
+            read_units((note, "1. a note")),
+            zones=[FOOT_ZONE],
+            starts=[zone_over(note)],
+        )
+
+        self.assertEqual(page["groups"][0]["section"], ensemble.FOOTNOTES)
+        self.assertFalse(page["groups"][0]["syllabus_start"])
+
+    def test_the_share_is_of_the_group(self):
+        group = ensemble.align_page(
+            read_units((self.FIRST, "The company is global.")),
+            WIDTH,
+            HEIGHT,
+        )[0]
+        group["section"] = ensemble.BODY
+        # A one-line zone over the first line of a long paragraph: the
+        # box the model draws over a heading never covers a paragraph.
+        thin = [50.0, 125.0, 300.0, 140.0]
+
+        self.assertFalse(ensemble.syllabus_start(group, [thin]))
+        self.assertTrue(
+            ensemble.syllabus_start(group, [zone_over(self.FIRST)])
+        )
 
 
 class TestTheQuotedRule(TestCase):
