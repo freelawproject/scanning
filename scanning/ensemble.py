@@ -2622,6 +2622,19 @@ def vote_words(
     tie. A word only a minority read is dropped, which is the reading
     of the majority.
 
+    **A gap is a spot.** Where a run was dropped, what each engine read
+    in the gap is a reading like a word's: the base's is nothing, and
+    so is that of an engine with no run there. Two alike against one is
+    ``"gap": "warning"`` on the word after the gap, the star-page
+    number one engine read; no two alike is ``"gap": "blocking"`` and
+    counts as a position with no majority (``or`` against
+    ``[c]ontract or`` against ``I contract or``). A run after the last
+    word puts the level on that word as ``gap_after``. None of the runs
+    goes in; the card sits on the gap and shows them
+    (``blocking_review.open_words``). The other way round is the same
+    gap: a word the base read where a majority read nothing is dropped,
+    and the place is a warning gap, so the drop is shown too.
+
     :param base: The base engine's ``(key, word)`` pairs.
     :param others: The other engines' pairs.
     :returns: ``(tokens, how many positions had no majority)``.
@@ -2643,6 +2656,17 @@ def vote_words(
     # The key the answer holds at each base position the vote has
     # passed, which a carried reading of a later position reads (#391).
     chosen: dict[int, str] = {}
+    # The level of a gap not yet written on a token: the next token
+    # appended carries it as ``gap``, the last one as ``gap_after``.
+    pending: str | None = None
+
+    def add(token: dict) -> None:
+        nonlocal pending
+        if pending:
+            token["gap"] = pending
+            pending = None
+        tokens.append(token)
+
     for position in range(len(base) + 1):
         runs: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
             (
@@ -2653,6 +2677,7 @@ def vote_words(
             for run in inserted.get(position, [])
         ]
         counted = Counter(keys for keys, _ in runs)
+        dropped = False
         for keys, count in counted.items():
             # A run the base does not have: ``count`` engines read it
             # and ``total - count`` did not. A majority of them puts it
@@ -2661,22 +2686,42 @@ def vote_words(
             # two engines make every difference a tie. A minority is
             # dropped, the reading of the majority.
             if count < quorum and count * 2 != total:
+                dropped = True
                 continue
             words = next(words for other, words in runs if other == keys)
-            tokens += [
-                {
-                    "text": word,
-                    "low_confidence": True,
-                    "inserted": True,
-                    "position": position,
-                }
-                for word in words
-            ]
+            for word in words:
+                add(
+                    {
+                        "text": word,
+                        "low_confidence": True,
+                        "inserted": True,
+                        "position": position,
+                    }
+                )
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
             disputed += len(words)
+        if dropped:
+            # The gap is a spot: each engine's reading of it is the
+            # keys of its run here, and nothing for the base and for
+            # an engine with no run. A majority alike is a warning on
+            # the gap; none is blocking, and counts like a word no
+            # majority settled.
+            in_gap = [""] + [
+                " ".join(
+                    key for run in inserted.get(position, []) for key, _ in run
+                )
+                for inserted in inserts
+            ]
+            alike = Counter(in_gap).most_common(1)[0][1]
+            level = WARNING if alike >= quorum else BLOCKING
+            if level == BLOCKING:
+                disputed += 1
+            pending = BLOCKING if BLOCKING in (pending, level) else WARNING
         if position == len(base):
+            if pending and tokens:
+                tokens[-1]["gap_after"] = pending
             break
         readings = [base[position]]
         for vote in votes:
@@ -2687,6 +2732,12 @@ def vote_words(
         winner, count = Counter(key for key, _ in readings).most_common(1)[0]
         if count >= quorum:
             chosen[position] = winner
+            if not winner and base[position][0]:
+                # A majority read nothing where the base read a word:
+                # the word is dropped, and the place is a gap like a
+                # run's, the other way round, so the drop is shown. A
+                # mark with no key is not a word, and makes no gap.
+                pending = pending or WARNING
             if winner:
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
@@ -2702,11 +2753,11 @@ def vote_words(
                     # reading elsewhere (#391) confirmed nothing, so
                     # its silence must not read as one more voice.
                     token["majority"] = True
-                tokens.append(token)
+                add(token)
         else:
             chosen[position] = base[position][0]
             disputed += 1
-            tokens.append(
+            add(
                 {
                     "text": base[position][1],
                     "low_confidence": True,
@@ -3112,6 +3163,13 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     majority words with it. A whole-block judgement never comes here
     (:func:`_human_read`).
 
+    A gap (``gap``, ``gap_after``) carries only while it is still a
+    gap: the word before it in the person's text is the word before it
+    in the vote. A person who put words in the gap answered it,
+    whatever they put, and a gap after the last word is answered by
+    anything written after that word. So an answer to a gap card holds
+    on every rebuild, with no record of the answer beyond the text.
+
     :param read_back: :func:`resolve` of the group, the engines' own.
     :param text: The text the person wrote, folded.
     :param engines: The group's ``engines``, for a block the vote left
@@ -3126,9 +3184,19 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             for name in _ranked(engines)
             if compare_text(engines[name]["text"])
         ]
+        # From the side of the engine whose text is shown, the rule of
+        # ``blocking_review.open_words``, so the positions the tokens
+        # carry count the words of the text a card is placed in.
+        first = read_back.get("source")
+        if first not in present and present:
+            first = present[0]
         if len(present) >= 2:
-            base = _pairs(engines[present[0]]["text"])
-            others = [_pairs(engines[name]["text"]) for name in present[1:]]
+            base = _pairs(engines[first]["text"])
+            others = [
+                _pairs(engines[name]["text"])
+                for name in present
+                if name != first
+            ]
             # The vote is from the first engine's side, so a word the
             # majority read and the first engine missed comes back
             # ``low_confidence``; the majority settled it, and only
@@ -3157,11 +3225,13 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         autojunk=False,
     )
     carried: dict[int, dict] = {}
+    voted_index: dict[int, int] = {}
     for tag, i1, i2, j1, _j2 in matcher.get_opcodes():
         if tag != "equal":
             continue
         for offset in range(i2 - i1):
             carried[j1 + offset] = voted[i1 + offset]
+            voted_index[j1 + offset] = i1 + offset
     tokens: list[dict] = []
     for index, word in enumerate(words):
         token: dict = {"text": word}
@@ -3173,6 +3243,11 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             for key in ("position", "run_index"):
                 if key in old:
                     token[key] = old[key]
+            before = voted_index.get(index - 1) if index else -1
+            if old.get("gap") and before == voted_index[index] - 1:
+                token["gap"] = old["gap"]
+            if old.get("gap_after") and index == len(words) - 1:
+                token["gap_after"] = old["gap_after"]
         tokens.append(token)
     return tokens
 
@@ -3216,12 +3291,18 @@ def _human_read(
         **read_back,
         "agreement": HUMAN,
         "source": HUMAN,
+        # The engine the tokens' positions count against, for the
+        # cards (``blocking_review.open_words``).
+        "base": read_back.get("source"),
         "agreeing": [],
         "silent": [],
         "text": text,
         "tokens": tokens,
         "n_low_confidence": sum(
-            1 for token in tokens if token.get("low_confidence")
+            1
+            for token in tokens
+            if token.get("low_confidence")
+            or BLOCKING in (token.get("gap"), token.get("gap_after"))
         ),
         "marks": marks,
         "kind": markup.PARAGRAPH if kind == markup.TABLE else kind,
@@ -3796,7 +3877,8 @@ def _differs(group: dict, engines: int) -> bool:
         # open, or settled over one engine, that they left as it was
         # is still that (``_kept_open``).
         return bool(group.get("n_low_confidence")) or any(
-            token.get("majority") for token in group.get("tokens") or []
+            token.get("majority") or token.get("gap") or token.get("gap_after")
+            for token in group.get("tokens") or []
         )
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True

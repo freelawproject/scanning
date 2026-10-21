@@ -1269,6 +1269,27 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
             response.json()["message"], views_api.EDIT_HUMAN_ALREADY_MESSAGE
         )
 
+    def test_a_gap_answer_sends_an_empty_span(self):
+        """The words of a gap card go in at the gap: the span judged
+        is the offset alone, and the edit is a word answer."""
+        group = self.split_group()
+        self.assertEqual(group["text"], "body A 1")
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="body 1490 A 1",
+            span=[5, 5],
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        edit = OpinionEdit.objects.get()
+        self.assertEqual(edit.span, [5, 5])
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["agreement"], ensemble.HUMAN)
+        self.assertEqual(edited["text"], "body 1490 A 1")
+
     def test_a_span_outside_the_text_is_refused(self):
         group = self.split_group()
 

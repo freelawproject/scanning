@@ -597,6 +597,9 @@
 
     function describe(card) {
         if (card.level === 'warning') {
+            if (card.kind === 'word' && card.gap) {
+                return 'one engine read words here that the others did not: keep the gap or put them in';
+            }
             if (card.kind === 'word') {
                 return 'a majority settled this word over one engine: bless it or pick the other reading';
             }
@@ -607,6 +610,7 @@
                     + ': keep it as shown or pick a reading';
             }
         }
+        if (card.kind === 'word' && card.gap) { return 'no two engines agree on what is in this gap'; }
         if (card.kind === 'word') { return 'no two engines agree on a word'; }
         if (card.kind === 'block') {
             return (card.table ? 'a table' : 'a block') + ' with ' + card.open
@@ -622,7 +626,15 @@
     function snippet(card) {
         var p = el('p', 'bk-snippet');
         p.appendChild(document.createTextNode('… ' + card.before + ' '));
-        p.appendChild(el('mark', null, card.token));
+        if (card.gap) {
+            // A gap between two words: some engine read words here
+            // that the shown engine did not.
+            var gap = el('mark', 'bk-gap', '[ ]');
+            gap.title = 'A gap: an engine read words here that the shown engine did not';
+            p.appendChild(gap);
+        } else {
+            p.appendChild(el('mark', null, card.token));
+        }
         p.appendChild(document.createTextNode(' ' + card.after + ' …'));
         return p;
     }
@@ -676,7 +688,7 @@
         // blocking card nothing chose it, it stands by the engines'
         // rank, so no row carries a tick and the choice is the
         // person's. Choosing the shown reading keeps the text as shown.
-        var inText = value !== '' && (card.kind === 'word'
+        var inText = card.gap ? value === '' : value !== '' && (card.kind === 'word'
             ? fold(value) === fold(card.token)
             : fold(value) === fold(card.text));
         var shown = inText && level !== 'blocking';
@@ -695,8 +707,10 @@
         button.appendChild(val);
         button.addEventListener('click', function () {
             markChosen(node, button);
-            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))) {
-                // Right as shown: the page's card waits for its siblings.
+            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))
+                    || (card.gap && value === '')) {
+                // Right as shown (a gap kept empty): the page's card
+                // waits for its siblings.
                 section.keep(card, node);
                 return;
             }
@@ -710,14 +724,16 @@
         label.appendChild(el('span', 'bk-who', 'you'));
         var input = el('input');
         input.type = 'text';
-        input.placeholder = card.kind === 'word'
-            ? 'Type what the page says and press Return'
-            : 'Type the whole block as the page has it and press Return';
+        input.placeholder = card.gap
+            ? 'Type the words the page has in the gap and press Return'
+            : card.kind === 'word'
+                ? 'Type what the page says and press Return'
+                : 'Type the whole block as the page has it and press Return';
         input.addEventListener('keydown', function (event) {
             if (event.key !== 'Enter') { return; }
             event.preventDefault();
             var value = fold(input.value);
-            if (!value && card.kind === 'single') { return; }
+            if (!value && (card.kind === 'single' || card.gap)) { return; }
             markChosen(node, label);
             choose(section, card, node, value);
         });
@@ -735,7 +751,10 @@
      *  leaves the text as shown keeps the card. */
     function choose(section, card, node, value) {
         var text;
-        if (card.kind === 'word') {
+        if (card.kind === 'word' && card.gap) {
+            // The words go into the gap; the text around it stays.
+            text = fold(card.text.slice(0, card.start) + ' ' + value + ' ' + card.text.slice(card.start));
+        } else if (card.kind === 'word') {
             text = fold(card.text.slice(0, card.start) + value + card.text.slice(card.start + card.length));
         } else {
             // A single block or a whole block: the value is the text.

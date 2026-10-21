@@ -672,6 +672,10 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             # alone; they walk the opinions of the text review only.
             "blocking_walk_url": walk_url("opinion_blocking_review"),
             "warning_walk_url": walk_url("opinion_warning_review"),
+            # The walk buttons count their cards, which the cards
+            # endpoint answers: a finding is one row per page, and a
+            # page makes a card per open word or gap.
+            "cards_url": address("opinion_blocking_cards"),
             # The three addresses the script reads (#365). They are
             # routes and not presigned URLs: each one is minted per
             # request, and a URL signed at render time would die in an
