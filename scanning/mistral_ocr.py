@@ -336,34 +336,24 @@ def render_dpi(page: fitz.Page) -> int:
 
 
 def render_shard_pages(
-    pdf_path: Path,
-    whiteout: bool = False,
-    marks: dict[int, list[list[int]]] | None = None,
+    pdf_path: Path, whiteout: bool = False
 ) -> Iterator[tuple[int, bytes]]:
     """Render every page of one shard, in order.
 
     With ``whiteout``, the perpendiculars are painted out of each page
-    before it is encoded (``scanning/perpendiculars.py``), and their
-    boxes go into ``marks`` by page, so the parallel pagination is
-    parked with the read and not lost.
+    before it is encoded (``scanning/perpendiculars.py``).
 
     :param pdf_path: The downloaded shard.
     :param whiteout: Whether to paint the perpendiculars out.
-    :param marks: Where the painted marks go, by ``page_no``.
     :returns: ``(page_no, png)`` per page, ``page_no`` counted from
         zero inside the shard.
     :rtype: Iterator[tuple[int, bytes]]
     """
     with fitz.open(str(pdf_path)) as doc:
         for page_no, page in enumerate(doc):
-            if not whiteout:
-                yield page_no, render_page(page)
-                continue
-            image, found = perpendiculars.paint(
-                _page_image(page), render_dpi(page)
-            )
-            if marks is not None:
-                marks[page_no] = found
+            image = _page_image(page)
+            if whiteout:
+                image = perpendiculars.paint(image, render_dpi(page))
             yield page_no, _png(image)
 
 
@@ -406,9 +396,6 @@ class _Submission:
     files: list[str] = field(default_factory=list)
     page_count: int = 0
     duration_ms: int = 0
-    #: The perpendiculars painted out of each page, by page, when the
-    #: whiteout was on; None when it was off.
-    perpendiculars: dict[int, list[list[int]]] | None = None
 
 
 def _delete_files(file_ids: list[str]) -> None:
@@ -475,10 +462,8 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
             lines = []
-            whiteout = bool(settings.PERPENDICULARS_WHITEOUT)
-            marks: dict[int, list[list[int]]] | None = {} if whiteout else None
             for page_no, png in render_shard_pages(
-                pdf_path, whiteout=whiteout, marks=marks
+                pdf_path, whiteout=bool(settings.PERPENDICULARS_WHITEOUT)
             ):
                 file_id = mistral_client.upload_file(
                     f"{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
@@ -512,7 +497,6 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
         files=files,
         page_count=len(lines),
         duration_ms=int((time.monotonic() - started) * 1000),
-        perpendiculars=marks,
     )
 
 
@@ -548,14 +532,6 @@ def _apply_outcome(
     if exc is None and submission is not None:
         meta = dict(job.provider_meta or {})
         meta["files"] = list(submission.files)
-        if submission.perpendiculars is not None:
-            # The perpendiculars painted out of the pages, by page: the
-            # parallel pagination, parked with the read.
-            meta["perpendiculars"] = {
-                str(page_no): boxes
-                for page_no, boxes in submission.perpendiculars.items()
-            }
-            meta["perpendiculars_version"] = perpendiculars.VERSION
         meta["submission"] = {
             "page_count": submission.page_count,
             "duration_ms": submission.duration_ms,

@@ -6,9 +6,9 @@ reads the glyph: dots.mocr drops it with its number, Mistral dresses
 the number as a stray ``1`` or markup (``1$_{505}$``), Surya misreads
 both as letters (``I48``, ``los``), and the ensemble's vote gets three
 readings of one spot, a Blocking Card per mark. The marks are found on
-the page image before any engine reads it and painted over, and their
-boxes are kept with the read, so the parallel pagination is parked,
-not lost.
+the page image before any engine reads it and painted over; the
+parallel pagination is left out of the read, the printed page numbers
+of the running heads are untouched.
 
 No Django import: this module is copied into the dots.mocr and Surya
 worker images next to their handlers, like ``runpod_common.py``, and
@@ -25,10 +25,6 @@ import cv2
 import numpy as np
 from PIL import Image
 
-#: Raise when the find or the paint changes: a result carries it, so a
-#: read under an older rule can be told from one under this.
-VERSION = 1
-
 #: Rows above the bar that hold the stem and the subscript digits.
 STEM_ROWS = 16
 
@@ -36,21 +32,20 @@ STEM_ROWS = 16
 Mark = tuple[int, int, int, int, int]
 
 
-def paint(image: Image.Image, dpi: int) -> tuple[Image.Image, list[list[int]]]:
-    """Return the page with its marks painted over, and the marks.
+def paint(image: Image.Image, dpi: int) -> Image.Image:
+    """Return the page with its marks painted over.
 
     The one call the three render paths make. An image with no mark
     comes back as it was.
 
     :param image: The rendered page, any PIL mode.
     :param dpi: The render resolution.
-    :returns: ``(image, marks)``, each mark ``[x, y, w, h, stem]`` in
-        the image's pixels.
+    :returns: The page, painted.
     """
     found = find(image, dpi)
     if not found:
-        return image, []
-    return whiteout(image, found, dpi), [list(mark) for mark in found]
+        return image
+    return whiteout(image, found, dpi)
 
 
 def find(image: Image.Image, dpi: int) -> list[Mark]:

@@ -63,10 +63,8 @@ class TestFind(SimpleTestCase):
 class TestPaint(SimpleTestCase):
     def test_the_mark_and_its_digits_are_painted_and_the_word_stays(self):
         img = page_with_mark(word_at=700)
-        painted, marks = perpendiculars.paint(Image.fromarray(img), DPI)
+        painted = perpendiculars.paint(Image.fromarray(img), DPI)
 
-        self.assertEqual(len(marks), 1)
-        self.assertEqual(marks[0][2:4], [50, 6])
         out = np.asarray(painted.convert("L"))
         self.assertEqual(ink(out[970:1010, 590:660]), 0, "the T stays")
         self.assertEqual(ink(out[980:1001, 618:652]), 0, "the digits stay")
@@ -78,7 +76,5 @@ class TestPaint(SimpleTestCase):
 
     def test_a_page_with_no_mark_comes_back_as_it_was(self):
         blank = Image.new("RGB", (W, H), "white")
-        painted, marks = perpendiculars.paint(blank, DPI)
 
-        self.assertEqual(marks, [])
-        self.assertIs(painted, blank)
+        self.assertIs(perpendiculars.paint(blank, DPI), blank)

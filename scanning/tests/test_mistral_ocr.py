@@ -252,12 +252,10 @@ class TestRender(ScanningTestCase):
         self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
         self.assertEqual(img.getpixel((1600, 2100)), (255, 255, 255))
 
-    def test_the_whiteout_paints_the_perpendiculars_and_keeps_their_boxes(
-        self,
-    ):
+    def test_the_whiteout_paints_the_perpendiculars_out(self):
         """A page with one perpendicular drawn as print: a bar 50 by 6
-        px at 200 dpi with a stem 12 px in. Painted out, and its box
-        in ``marks``; without the whiteout the stem is in the PNG."""
+        px at 200 dpi with a stem 12 px in. Painted out; without the
+        whiteout the stem is in the PNG."""
         pdf = self.tmp / "perpendicular.pdf"
         black = (0, 0, 0)
         with fitz.open() as doc:
@@ -270,13 +268,8 @@ class TestRender(ScanningTestCase):
             )
             doc.save(str(pdf))
 
-        marks: dict = {}
-        pages = list(
-            mistral_ocr.render_shard_pages(pdf, whiteout=True, marks=marks)
-        )
+        pages = list(mistral_ocr.render_shard_pages(pdf, whiteout=True))
 
-        self.assertEqual(len(marks[0]), 1)
-        self.assertEqual(marks[0][0][:2], [600, 1000])
         painted = png_image(pages[0][1])
         self.assertEqual(painted.getpixel((613, 990)), (255, 255, 255))
         plain = png_image(next(mistral_ocr.render_shard_pages(pdf))[1])

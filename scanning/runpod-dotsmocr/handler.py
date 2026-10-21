@@ -798,12 +798,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 round(page.rect.height * dpi / 72),
                 dpi,
             )
-        # The perpendiculars, painted out of the render every
-        # rung reads, and kept with the page: the parallel pagination
-        # is parked, not lost.
-        perps: list[list[int]] | None = None
+        # The perpendiculars, painted out of the render every rung
+        # reads (``perpendiculars.py``).
         if whiteout_perpendiculars:
-            origin_image, perps = perpendiculars.paint(origin_image, dpi)
+            origin_image = perpendiculars.paint(origin_image, dpi)
 
         def _infer(page_image) -> dict:
             """Run one rung: inference plus post-process on one render.
@@ -876,10 +874,6 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 "input_height": input_height,
                 "origin_width": origin_image.width,
                 "origin_height": origin_image.height,
-                "perpendiculars": perps,
-                "perpendiculars_version": (
-                    perpendiculars.VERSION if whiteout_perpendiculars else None
-                ),
                 "completion_tokens": completion_tokens,
                 # The answer as the model wrote it, on every page (#238).
                 # ``cells`` below is upstream's parsed and rescaled copy
