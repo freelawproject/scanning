@@ -2332,7 +2332,10 @@ def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
     """Return whether one aligned group opens a syllabus (#518).
 
     **The one rule**, the shape of :func:`quoted`: a body group the
-    syllabus zone covers :data:`SYLLABUS_SHARE` of. The zone is the
+    syllabus zone covers :data:`SYLLABUS_SHARE` of. The build stamps
+    the first such group of each zone in the reading order and no
+    other, so a box taller than the heading line opens one run. The
+    zone is the
     ``SYLLABUS`` detection of the run, the model's box over the
     heading line that opens a syllabus, or a curator's own box in
     review 2, so the stamp says where a syllabus starts and nothing
@@ -3491,11 +3494,26 @@ def build_page(
             # A person said whether the whole block is a quote, so the
             # zone does not decide (#419). A span waits for the text.
             group["blockquote"] = bool(quote.get("quoted"))
-        group["syllabus_start"] = syllabus_start(group, starts)
+        group["syllabus_start"] = False
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
     ) + place_footnotes(by_section[FOOTNOTES], width, height, boundary)
+    # One start per zone (#518): the first body group under it in the
+    # reading order. A box taller than the heading line covers the
+    # paragraphs under it too, and a stamp on each would part a
+    # paragraph a column cut (``paragraphs._joins``).
+    for zone in starts:
+        opener = next(
+            (
+                group
+                for group in ordered
+                if not group.get("figure") and syllabus_start(group, [zone])
+            ),
+            None,
+        )
+        if opener is not None:
+            opener["syllabus_start"] = True
     for edit in edits:
         if edit["kind"] != OpinionEdit.Kind.ORDER:
             continue

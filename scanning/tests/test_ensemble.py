@@ -3843,6 +3843,21 @@ class TestTheSyllabusStart(TestCase):
         )
         self.assertEqual(page["zones"]["syllabus"], [zone_over(self.HEADING)])
 
+    def test_a_tall_zone_stamps_its_first_group_alone(self):
+        """A curator's box over the heading and the paragraphs under
+        it opens one run: a stamp on each would part the paragraphs."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING, self.FIRST)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+
     def test_without_a_zone_no_group_is_stamped(self):
         page = build(
             paragraphs(
