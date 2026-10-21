@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import perpendiculars
 import requests
 import runpod
 import runpod_common
@@ -904,13 +905,21 @@ def _lost_content(page: dict) -> bool:
     return divs > (parsed if isinstance(parsed, int) else 0)
 
 
-def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
+def _page_from_read(
+    page_idx: int,
+    image,
+    result,
+    records: list[dict],
+    perps: list[list[int]] | None = None,
+) -> dict:
     """Assemble one page dict from a read and the requests it made.
 
     :param page_idx: The 0-based page index in the shard.
     :param image: The render the model saw.
     :param result: surya's ``PageOCRResult``.
     :param records: The recorder's notes for this read.
+    :param perps: The perpendiculars painted out of the render, or
+        None when the whiteout was off.
     :returns: The page dict, without the ladder bookkeeping
         (``attempts``, ``duration_ms``) the caller adds.
     :rtype: dict
@@ -927,6 +936,12 @@ def _page_from_read(page_idx: int, image, result, records: list[dict]) -> dict:
         "page_no": page_idx,
         "origin_width": image.width,
         "origin_height": image.height,
+        # The perpendiculars painted out before the read, in this
+        # render's pixels; None when the whiteout was off.
+        "perpendiculars": perps,
+        "perpendiculars_version": (
+            perpendiculars.VERSION if perps is not None else None
+        ),
         "blocks": blocks,
         "text": "\n".join(texts),
         # The answer as the model wrote it, on every page: what a later
@@ -1028,6 +1043,11 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     dpi = coerce_input("dpi", inputs.get("dpi", DEFAULT_DPI), int)
     if dpi < 36 or dpi > 600:
         raise BadInputError(f"dpi must be between 36 and 600, got {dpi}")
+    # Paint the perpendiculars out of every render before the
+    # model reads it (``perpendiculars.py``), when the daemon asks.
+    whiteout_perpendiculars = bool(
+        inputs.get("whiteout_perpendiculars", False)
+    )
     num_threads = coerce_input(
         "num_threads", inputs.get("num_threads", DEFAULT_NUM_THREADS), int
     )
@@ -1074,6 +1094,11 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         records: list[dict] = []
         try:
             image = _render_page(_doc()[page_idx], dpi)
+            # The perpendiculars, painted out of the render and
+            # kept with the page: the parallel pagination is parked.
+            perps: list[list[int]] | None = None
+            if whiteout_perpendiculars:
+                image, perps = perpendiculars.paint(image, dpi)
             page: dict | None = None
             for attempt in range(1, EMPTY_READS + 1):
                 _LOG.open()
@@ -1085,7 +1110,7 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                     result = recognizer([image], full_page=True)[0]
                 finally:
                     records = _LOG.close()
-                page = _page_from_read(page_idx, image, result, records)
+                page = _page_from_read(page_idx, image, result, records, perps)
                 _account_for_raw(page, parse_full_page_html)
                 page["attempts"] = attempt
                 if not _is_empty(page["blocks"]):

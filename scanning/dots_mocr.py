@@ -169,6 +169,10 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
         "result_key": job.result_key,
         "prompt_mode": PROMPT_MODE,
         "dpi": DPI,
+        # Paint the perpendiculars out of the render before the
+        # model reads it (``perpendiculars.py``); a worker built before the
+        # flag ignores it.
+        "whiteout_perpendiculars": bool(settings.PERPENDICULARS_WHITEOUT),
         **tuning,
     }
 

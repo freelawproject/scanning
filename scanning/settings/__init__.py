@@ -9,6 +9,7 @@ from .project.processing_storage import *
 from .project.runpod import *
 from .project.security import *
 from .project.sharding import *
+from .project.perpendiculars import *
 from .project.surya import *
 from .project.tagger import *
 from .project.testing import *

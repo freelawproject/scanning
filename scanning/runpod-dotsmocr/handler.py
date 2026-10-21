@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import layout_json
+import perpendiculars
 import requests
 import runpod
 import runpod_common
@@ -688,6 +689,11 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             f"Expected one of {sorted(_ALLOWED_PROMPT_MODES)}"
         )
     dpi = coerce_input("dpi", inputs.get("dpi", DEFAULT_DPI), int)
+    # Paint the perpendiculars out of every render before the
+    # model reads it (``perpendiculars.py``), when the daemon asks.
+    whiteout_perpendiculars = bool(
+        inputs.get("whiteout_perpendiculars", False)
+    )
     num_threads = coerce_input(
         "num_threads", inputs.get("num_threads", DEFAULT_NUM_THREADS), int
     )
@@ -792,6 +798,12 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 round(page.rect.height * dpi / 72),
                 dpi,
             )
+        # The perpendiculars, painted out of the render every
+        # rung reads, and kept with the page: the parallel pagination
+        # is parked, not lost.
+        perps: list[list[int]] | None = None
+        if whiteout_perpendiculars:
+            origin_image, perps = perpendiculars.paint(origin_image, dpi)
 
         def _infer(page_image) -> dict:
             """Run one rung: inference plus post-process on one render.
@@ -864,6 +876,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 "input_height": input_height,
                 "origin_width": origin_image.width,
                 "origin_height": origin_image.height,
+                "perpendiculars": perps,
+                "perpendiculars_version": (
+                    perpendiculars.VERSION if whiteout_perpendiculars else None
+                ),
                 "completion_tokens": completion_tokens,
                 # The answer as the model wrote it, on every page (#238).
                 # ``cells`` below is upstream's parsed and rescaled copy

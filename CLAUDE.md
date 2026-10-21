@@ -361,6 +361,8 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 
 ## Worker images
 
+- The perpendiculars, West's inverted-T parallel-pagination marks, are painted out of every render before an engine reads it when `PERPENDICULARS_WHITEOUT` is on (`scanning/perpendiculars.py`, no Django import, copied into the dots.mocr and Surya images beside their handlers; the daemon paints its own Mistral render). One flag: the daemon writes `whiteout_perpendiculars` into the dots and Surya job inputs, and a worker built before it ignores it. Every painted page keeps its marks (`perpendiculars` and `perpendiculars_version` on the page result; Mistral's on the row's `provider_meta`), so the parallel pagination is parked, not lost. The flag is in no run identity: turning it on re-pays no read
+
 - The scaffold is in `runpod_common`, once: Sentry, the result envelope, `execute_action`. Only `BadInputError` maps to `BAD_INPUT`. Without `result_url` a worker answers inline
 - YOLO: only `bl_warm.pt` is baked, and the handler passes no `imgsz` (the checkpoint carries 1024). No CUDA base layer
 - dots.mocr: `DPI = 200` and `PROMPT_MODE` are module constants; `HANDLER_MAX_COMPLETION_TOKENS = 6144`; the retry ladder changes only the render (deterministic); the layout repair (`layout_json.py`, no Django import, copied into the image) runs before the ladder; `raw` is never written over
