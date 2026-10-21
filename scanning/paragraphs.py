@@ -28,6 +28,11 @@ paragraph when all four are true:
    (#428): it is the next item, not the rest of the one above.
 4. The text says the sentence goes on (:func:`continues`).
 
+A group the ensemble stamped ``syllabus_start`` (#518) starts a block
+whatever the four say, and its paragraph carries the stamp: the final
+XML opens the syllabus there, and a join would hide the start inside
+the paragraph above.
+
 A column that ends at the end of a sentence, with a capital letter at
 the top of the next, is a break the rule keeps. The legacy pipeline
 read the indent of the first line to tell it apart; a group box has no
@@ -55,7 +60,14 @@ approval.
 
 import re
 
-#: Version of the approved object this module writes.
+#: Version of the approved object this module writes. The
+#: ``syllabus_start`` stamp of a paragraph (#518) is an addition under
+#: this version and no new one: the export and the tagger refuse an
+#: object of another version (``tagger.check_approved``), and the
+#: rewrite moves a row only when its key changes, so a new number
+#: would refuse every stored text with no command to write it again.
+#: A text without the stamp opens its syllabus by the heading's words
+#: alone (``casebody.syllabus_range``).
 APPROVED_SCHEMA = 1
 
 #: Version of the join rule and of the footnote rule. It is in the
@@ -231,6 +243,8 @@ def _joins(before: dict | None, after: dict) -> str | None:
         return None
     if kind == LIST_ITEM and _starts_item(below):
         return None
+    if below.get("syllabus_start"):
+        return None
     if not continues(_before_mark(above), below.get("text") or ""):
         return None
     return edge
@@ -273,6 +287,7 @@ def _paragraph(item: dict, text: str | None = None, marks=None) -> dict:
     paragraph = {
         "kind": group.get("kind") or "paragraph",
         "blockquote": bool(group.get("blockquote")),
+        "syllabus_start": bool(group.get("syllabus_start")),
         "text": text,
         "marks": [dict(mark) for mark in marks],
         "pages": [item["page"]],
