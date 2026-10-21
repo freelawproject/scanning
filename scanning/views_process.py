@@ -2071,6 +2071,30 @@ def opinion_blocking_cards(
             {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
             status=409,
         )
+    if request.GET.get("counts") == "1":
+        # The review page's walk buttons: both counts from one read of
+        # the document, and no card goes over the wire.
+        return JsonResponse(
+            {
+                "status": "ok",
+                "counts": {
+                    ensemble.BLOCKING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.blocking_findings(opinion)),
+                            ensemble.BLOCKING,
+                        )
+                    ),
+                    ensemble.WARNING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.warning_findings(opinion)),
+                            ensemble.WARNING,
+                        )
+                    ),
+                },
+            }
+        )
     # The warnings review asks for its own cards (``?level=warning``),
     # over the open warning findings; the blocking review is the
     # default. ``blocking_open`` goes with either, so the page keeps

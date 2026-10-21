@@ -30,6 +30,176 @@ def read(*texts) -> dict:
 
 # ── the open words ───────────────────────────────────────────────────
 class TestOpenWords(TestCase):
+    def test_a_run_one_engine_alone_read_is_a_warning_card_on_the_gap(self):
+        """The star-page number: the card sits on the gap before
+        ``included``, with a zero-length span there, and its rows are
+        nothing, nothing and ``1490``. The answer goes into the gap."""
+        voted = read("a included b", "a included c", "a 1490 included b")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        gap = cards[0]
+        self.assertTrue(gap["gap"])
+        self.assertEqual(
+            (gap["start"], gap["length"], gap["token"]), (2, 0, "")
+        )
+        self.assertEqual((gap["before"], gap["after"]), ("a", "included b"))
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in gap["readings"]],
+            [("dots_mocr", ""), ("mistral_ocr", ""), ("surya", "1490")],
+        )
+        self.assertEqual(gap["crop_span"], [2, 8])
+        # The word a majority settled over one engine is its own card.
+        self.assertEqual([c["token"] for c in cards[1:]], ["b"])
+        self.assertEqual(blocking_review.open_words(voted), [])
+
+    def test_a_gap_no_two_engines_read_alike_is_a_blocking_card(self):
+        voted = read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+
+        cards = blocking_review.open_words(voted)
+
+        self.assertEqual(len(cards), 1)
+        gap = cards[0]
+        self.assertTrue(gap["gap"])
+        self.assertEqual((gap["start"], gap["length"]), (4, 0))
+        self.assertEqual(
+            [r["word"] for r in gap["readings"]],
+            ["", "[c]ontract", "I contract"],
+        )
+        self.assertEqual(
+            blocking_review.open_words(voted, blocking_review.MAJORITY), []
+        )
+
+    def test_a_word_a_majority_dropped_is_a_card_on_its_gap(self):
+        voted = read(
+            "two 1490 or more alpha", "two or more beta", "two or more gamma"
+        )
+        self.assertEqual(voted["text"], "two or more alpha")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual([(c["token"], c["start"]) for c in cards], [("", 4)])
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in cards[0]["readings"]],
+            [("dots_mocr", "1490"), ("mistral_ocr", ""), ("surya", "")],
+        )
+
+    def test_a_gap_beside_a_changed_word_keeps_its_card(self):
+        voted = read("a b c d", "a z c d", "a b W c d")
+        kept = ensemble._human_read(
+            voted, {"text": "a z c d", "span": [2, 3]}, voted["engines"]
+        )
+
+        cards = blocking_review.open_words(kept, blocking_review.MAJORITY)
+
+        gap = next(c for c in cards if c.get("gap"))
+        self.assertEqual((gap["start"], gap["after"]), (4, "c d"))
+        self.assertEqual([r["word"] for r in gap["readings"]], ["", "", "W"])
+
+    def test_a_gap_before_a_word_a_person_rewrote_keeps_its_card(self):
+        voted = read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+        kept = ensemble._human_read(
+            voted, {"text": "two of more", "span": [4, 6]}, voted["engines"]
+        )
+
+        cards = blocking_review.open_words(kept)
+
+        self.assertEqual(
+            [(c.get("gap"), c["start"]) for c in cards], [(True, 4)]
+        )
+        self.assertEqual(
+            [r["word"] for r in cards[0]["readings"]],
+            ["", "[c]ontract", "I contract"],
+        )
+
+    def test_the_stored_block_of_a_person_names_the_engine_of_its_positions(
+        self,
+    ):
+        """Through the build, not ``_human_read`` alone: the first
+        engine dissents from the agreeing pair, the shown text is the
+        pair's, and after a word answer the stored block carries the
+        engine its tokens count against, so the cards of the words
+        left open read the right rows at the right places."""
+        from scanning.tests.test_ensemble import engine_page
+
+        texts = {
+            "dots_mocr": "a sat x",
+            "mistral_ocr": "a dog sat y",
+            "surya": "a dog sat y",
+        }
+        pages = {
+            name: engine_page([unit(name, 0, BODY_A_PT, text)])
+            for name, text in texts.items()
+        }
+        edit = {
+            "id": 1,
+            "kind": "text",
+            "source_edit_id": None,
+            "source_page": 2,
+            "page_in_opinion": 0,
+            "box_pt": BODY_A_PT,
+            "section": ensemble.BODY,
+            "base_text": "a dog sat y",
+            "text": "a dog sat z",
+            "order": [],
+            "quoted": None,
+            "span": [10, 11],
+            "by": "curator",
+            "at": "",
+        }
+
+        page = ensemble.build_page(pages, 0, edits=[edit])
+
+        group = page["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.HUMAN)
+        self.assertEqual(group["base"], "mistral_ocr")
+        cards = blocking_review.open_words(group, blocking_review.MAJORITY)
+        self.assertEqual(
+            [(c["token"], c["start"]) for c in cards], [("dog", 2)]
+        )
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in cards[0]["readings"]],
+            [("mistral_ocr", "dog"), ("dots_mocr", ""), ("surya", "dog")],
+        )
+
+    def test_a_run_after_the_last_word_is_a_card_after_it(self):
+        voted = read("a b", "a c", "a b 1490")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(
+            [(c["token"], c["start"], c["length"]) for c in cards],
+            [("b", 2, 1), ("", 3, 0)],
+        )
+        gap = cards[1]
+        self.assertTrue(gap["gap"])
+        self.assertEqual((gap["before"], gap["after"]), ("a b", ""))
+        self.assertEqual(
+            [r["word"] for r in gap["readings"]], ["", "", "1490"]
+        )
+
+    def test_the_cards_are_placed_in_the_shown_text(self):
+        """Two engines read ``the dog sat`` and the first read ``the
+        sat``: the shown text is theirs, and the card of ``dog`` is a
+        word a majority settled over the first engine, at its offset
+        in the shown text, never a run the first engine lacks."""
+        voted = read("the sat", "the dog sat", "the dog sat")
+        self.assertEqual(voted["text"], "the dog sat")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(
+            [(c["token"], c["start"]) for c in cards], [("dog", 4)]
+        )
+        self.assertEqual(
+            [(r["engine"], r["word"]) for r in cards[0]["readings"]],
+            [("mistral_ocr", "dog"), ("dots_mocr", ""), ("surya", "dog")],
+        )
+
     def test_the_word_no_two_engines_agree_on_with_every_reading(self):
         words = blocking_review.open_words(
             read(
@@ -139,16 +309,16 @@ class TestOpenWords(TestCase):
         )
 
     def test_a_block_a_majority_read_alike_never_becomes_blocking(self):
-        """The re-vote for the carry is from the first engine's side, so
-        a word the majority read and the first engine missed (``x``)
-        comes back as a word no majority settled; the majority settled
-        it, so the carry drops that flag and the block stays a
-        warning for the majority word left (``h``)."""
+        """The re-vote for the carry is from the shown engine's side,
+        the agreeing pair's, so a word the pair read and the first
+        engine missed (``x``) is a word a majority settled over one
+        engine, a warning like ``e`` and ``h``; nothing of a block two
+        engines read alike is ever blocking, before or after an answer."""
         voted = read("a b c d g", "a b x c e h", "a b x c e h")
         self.assertEqual(voted["agreement"], ensemble.MAJORITY)
         cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
-        self.assertEqual([c["token"] for c in cards], ["e", "h"])
-        first = cards[0]
+        self.assertEqual([c["token"] for c in cards], ["x", "e", "h"])
+        first = cards[1]
 
         kept = ensemble._human_read(
             voted,
@@ -174,7 +344,7 @@ class TestOpenWords(TestCase):
                     kept, blocking_review.MAJORITY
                 )
             ],
-            ["h"],
+            ["x", "h"],
         )
 
     def test_a_block_a_majority_read_alike_keeps_its_majority_words(self):
@@ -334,6 +504,30 @@ def finding(page, check, pk):
 
 
 class TestCards(TestCase):
+    def test_a_gap_card_is_cropped_at_the_word_beside_it(self):
+        group = read("a included b", "a included c", "a 1490 included b")
+        group.update(
+            {
+                "id": 3,
+                "level": ensemble.WARNING,
+                "section": ensemble.BODY,
+                "column": "L",
+                "box_pt": [36, 100, 288, 133],
+            }
+        )
+        document = {"pages": [{"page_in_opinion": 0, "groups": [group]}]}
+
+        cards = blocking_review.cards(
+            document,
+            [finding(0, OpinionCheck.ENGINES_DISAGREE, 9)],
+            ensemble.WARNING,
+        )
+
+        self.assertEqual([c["kind"] for c in cards], ["word", "word"])
+        self.assertTrue(cards[0]["gap"])
+        self.assertIsNotNone(cards[0]["crop"]["highlight"])
+        self.assertEqual(cards[0]["finding_pk"], 9)
+
     def test_a_word_a_single_block_and_a_finding_of_another_check(self):
         split = read(
             "the court held that", "the court heId that", "the court hold that"
@@ -856,6 +1050,22 @@ class TestTheCardsEndpoint(EditTestCase, ScanningTestCase):
         back = self.client.get(self.url()).json()
         self.assertTrue(
             any(c.get("box_pt") == card["box_pt"] for c in back["cards"])
+        )
+
+    def test_the_counts_mode_answers_both_lengths_from_one_read(self):
+        data = self.client.get(self.url() + "?counts=1").json()
+
+        self.assertEqual(data["status"], "ok")
+        self.assertNotIn("cards", data)
+        self.assertEqual(
+            data["counts"][ensemble.BLOCKING],
+            len(self.client.get(self.url()).json()["cards"]),
+        )
+        self.assertEqual(
+            data["counts"][ensemble.WARNING],
+            len(
+                self.client.get(self.url() + "?level=warning").json()["cards"]
+            ),
         )
 
     def test_the_level_of_the_cards_is_read_off_the_query(self):

@@ -1140,6 +1140,19 @@
                 span.title = 'A majority chose this word, and not'
                     + ' every engine read it so.';
             }
+            if (token.gap || token.gap_after) {
+                // A gap beside this word: some engine read words there
+                // that the shown engine did not, and they are not in
+                // the text. The level is the gap's own.
+                var gapLevel = token.gap || token.gap_after;
+                span.classList.add(gapLevel === 'blocking' ? 'ensemble-low' : 'ensemble-voted');
+                span.title = (token.gap_after ? 'After' : 'Before') + ' this word an engine'
+                    + ' read words the shown engine did not'
+                    + (gapLevel === 'blocking'
+                        ? ', and no two engines read the same there.'
+                        : '; the other engines read nothing there.')
+                    + ' None of them is in the text; the readings show them.';
+            }
             if (!first) {
                 // The separator the text holds there: a line break a
                 // person kept (``opinion_edits.fold``) stays one.
@@ -3039,6 +3052,28 @@
             });
     }
 
+    /** The walk buttons count their cards: a finding is one row per
+     *  page, and a page makes a card per open word or gap, so the
+     *  server's number is the finding count until the cards endpoint
+     *  answers with the real one. */
+    function bindCardCounts() {
+        var links = Array.prototype.slice.call(document.querySelectorAll('[data-card-count-url]'));
+        if (!links.length) { return; }
+        // One request for both numbers: the endpoint reads the document
+        // once and answers the two lengths, no card over the wire.
+        fetch(links[0].dataset.cardCountUrl + '?counts=1', { credentials: 'same-origin' })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (data) {
+                if (!data || data.status !== 'ok' || !data.counts) { return; }
+                links.forEach(function (link) {
+                    var count = link.querySelector('[data-card-count]');
+                    var value = data.counts[link.dataset.cardLevel];
+                    if (count && typeof value === 'number') { count.textContent = value; }
+                });
+            })
+            .catch(function () { /* the finding count stays */ });
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('opinion-review');
         if (!root) { return; }
@@ -3047,6 +3082,7 @@
         bindRerun();
         bindApproval();
         bindFindings();
+        bindCardCounts();
         bindZoom();
         bindQuiet();
         bindHelp();

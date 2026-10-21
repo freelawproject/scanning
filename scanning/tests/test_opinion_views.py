@@ -542,6 +542,18 @@ class TestOpinionReview(ScanningTestCase):
         self.assertEqual(response.context["open_to_check"], 2)
         self.assertEqual(response.context["open_warnings"], 1)
         self.assertContains(response, "Check these before the approval")
+        # The walk buttons count their cards through the cards
+        # endpoint: the numbers above are findings, and a page makes
+        # a card per open word or gap.
+        self.assertEqual(
+            response.context["cards_url"],
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+        self.assertContains(response, 'data-card-level="blocking"')
+        self.assertContains(response, 'data-card-level="warning"')
 
     def test_the_back_link_keeps_the_filters(self):
         response = self.client.get(self.url, {"scan": self.scan.pk})

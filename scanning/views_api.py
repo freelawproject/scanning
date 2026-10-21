@@ -1656,7 +1656,7 @@ def edit_opinion_text(
     # of the blocking review sends its word's, and the build then
     # keeps the block's other open words open (``ensemble._kept_open``);
     # the block card and the edit box send none, a whole-block
-    # judgement.
+    # judgement. A gap card's span is empty: the words go in there.
     span = body.get("span")
     if span is not None and (
         not isinstance(span, list)
@@ -1664,7 +1664,7 @@ def edit_opinion_text(
         or not all(
             isinstance(v, int) and not isinstance(v, bool) for v in span
         )
-        or not 0 <= span[0] < span[1] <= len(group["text"])
+        or not 0 <= span[0] <= span[1] <= len(group["text"])
     ):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     edit = opinion_edits.supersede(
