@@ -3180,12 +3180,16 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
 
     A gap (``gap``, ``gap_after``) carries by its place, onto whatever
     word now stands after it, unless the person put words into it: a
-    pure insertion there, or a rewrite of a neighbour that grew by a
-    word an engine read in that gap. A rewritten neighbour alone is
-    a replacement, not an insertion, so the gap stays open and still
-    a card. So an answer to a gap card holds on every rebuild, with
-    no record of the answer beyond the text, and an answer beside a
-    gap never closes it unseen.
+    pure insertion there; a rewrite of a neighbour that grew by any
+    word, typed or picked, unless it is the same words split or joined
+    another way; or a rewrite of any length that holds a word an
+    engine read in that gap, which is a fill with the word before it
+    deleted. A rewritten neighbour alone is a replacement, not an
+    insertion, so the gap stays open and still a card. So an answer
+    to a gap card holds on every rebuild, with no record of the answer
+    beyond the text, and an answer beside a gap never closes it
+    unseen. The one stroke the text cannot read, a typed fill with
+    its neighbour deleted at once, leaves the card open, the safe way.
 
     :param read_back: :func:`resolve` of the group, the engines' own.
     :param text: The text the person wrote, folded.
@@ -3298,15 +3302,27 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         elif tag == "replace":
             for offset in range(i2 - i1):
                 landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
-            if j2 - j1 > i2 - i1:
-                extra = {compare_word(w) for w in words[j1:j2]} - {
-                    compare_word(t["text"]) for t in voted[i1:i2]
-                }
-                for boundary in (i2, i1):
-                    at = gap_at(boundary)
-                    if at is not None and extra & in_gaps.get(at, set()):
-                        filled.add(boundary)
-                        break
+            human_keys = [compare_word(w) for w in words[j1:j2]]
+            voted_keys = [compare_word(t["text"]) for t in voted[i1:i2]]
+            extra = set(human_keys) - set(voted_keys)
+            # More words than were replaced, and not the same words
+            # split or joined another way: the person put words in,
+            # whatever they typed. The gaps the span touches are the
+            # one after it, the walk's order, then the one before it.
+            grown = j2 - j1 > i2 - i1 and "".join(human_keys) != "".join(
+                voted_keys
+            )
+            touched = [b for b in (i2, i1) if _has_gap(voted, b)]
+            # A new word that is what an engine read in the gap fills
+            # it whatever the span's length: a fill with the word
+            # before it deleted is a replacement of the same length.
+            matched = [
+                b for b in touched if extra & in_gaps.get(gap_at(b), set())
+            ]
+            if matched:
+                filled.add(matched[0])
+            elif grown and touched:
+                filled.add(touched[0])
         elif tag == "insert":
             filled.add(i1)
         else:
@@ -3335,6 +3351,15 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         if old.get("gap_after") and len(voted) not in filled and tokens:
             _land_gap(tokens[-1], "gap_after", old["gap_after"], None)
     return tokens
+
+
+def _has_gap(voted: list[dict], boundary: int) -> bool:
+    """Return whether the vote flagged the gap before voted token
+    ``boundary``, or after the last token when ``boundary`` is past
+    it."""
+    if boundary < len(voted):
+        return bool(voted[boundary].get("gap"))
+    return bool(voted) and bool(voted[-1].get("gap_after"))
 
 
 def _land_gap(token: dict, key: str, level: str, position: int | None) -> None:

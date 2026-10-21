@@ -1075,6 +1075,52 @@ class TestTheVote(TestCase):
         b = next(t for t in answer["tokens"] if t["text"] == "b")
         self.assertEqual(b.get("gap"), ensemble.WARNING)
 
+    def test_a_typed_fill_holds_when_the_neighbour_is_answered(self):
+        """The person typed a word no engine read into the gap, then
+        answered the word before it: the rewrite grew by a word, so the
+        gap is filled whatever the word is."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        second = ensemble._human_read(
+            answer, {"text": "a z TYPED c d", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertFalse(any("gap" in t for t in second["tokens"]))
+        self.assertIsNone(ensemble.disagreement_level(second, 3))
+
+    def test_a_fill_with_the_neighbour_deleted_is_a_fill(self):
+        """``W`` in the gap and ``b`` taken out in one stroke read as a
+        replacement of the same length: the new word is what an engine
+        read in the gap, so the gap is filled."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a W c d", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertFalse(any("gap" in t for t in kept["tokens"]))
+
+    def test_a_word_split_beside_a_gap_fills_nothing(self):
+        """``Mayer-Wittmann`` written as ``Mayer- Wittmann`` grew by a
+        word that is the same word split: the gap after it stays."""
+        group = self.read(
+            "a Mayer-Wittmann c d",
+            "a Mayer-Wittmann c e",
+            "a Mayer-Wittmann W c d",
+        )
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "a Mayer- Wittmann c d", "span": [2, 16]},
+            group["engines"],
+        )
+
+        c = next(t for t in kept["tokens"] if t["text"] == "c")
+        self.assertEqual(c.get("gap"), ensemble.WARNING)
+
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("a b"),
