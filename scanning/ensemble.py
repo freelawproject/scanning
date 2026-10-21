@@ -107,6 +107,11 @@ syllabus, as ``zones.syllabus``, and :func:`syllabus_start` stamps the
 body group the zone covers :data:`SYLLABUS_SHARE` of. The stamp names
 the start alone: the extent of the syllabus is read off the tagger's
 spans in ``casebody``, which the approved text carries the stamp to.
+The heading's words are the second signal (``casebody.is_syllabus_heading``),
+and :func:`syllabus_doubts` names each place the two disagree: a box
+on a block that is no syllabus heading, or on no block, and a syllabus
+heading with no box. Each is the ``SYLLABUS_UNSURE`` card, a warning
+that gates nothing; a page where both agree raises none.
 
 **A seventh step, the list (#428).** The OCR glue takes the bullet off
 every list item and writes one ``li`` mark per item, because the
@@ -175,7 +180,7 @@ from django.db import transaction
 from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
-from scanning import detections, markup, opinion_ocr, s3_sync
+from scanning import casebody, detections, markup, opinion_ocr, s3_sync
 from scanning.models import (
     Issue,
     Opinion,
@@ -210,7 +215,8 @@ logger = logging.getLogger(__name__)
 #: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
 #: 13 stamps ``syllabus_start`` on the body group under the syllabus
-#: zone, and writes that zone beside the other two (#518).
+#: zone, writes that zone beside the other two, and gives the page its
+#: ``syllabus_doubt`` entries (#518).
 SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
@@ -363,6 +369,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
+        OpinionCheck.SYLLABUS_UNSURE,
         OpinionCheck.UNRESOLVED_EDIT,
         # No writer since the pictures are review 2's boxes: here so
         # the rebuild deletes the rows written before.
@@ -2355,6 +2362,51 @@ def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
     )
 
 
+def syllabus_doubts(
+    groups: list[dict], zones: list[list[float]]
+) -> list[dict]:
+    """Return each place the two syllabus signals disagree (#518).
+
+    **The one rule** of the ``SYLLABUS_UNSURE`` card. A stamped group
+    whose words are no syllabus heading (``casebody.is_syllabus_heading``)
+    is a ``box`` doubt: the model, or a curator, drew the box on other
+    text, and the final XML opens the syllabus there. A zone with no
+    stamped group under it is a ``box`` doubt with no text. A body
+    heading whose words are a syllabus heading and that carries no
+    stamp is a ``heading`` doubt: the model drew no box, and the final
+    XML opens the syllabus at the words alone. A box on a heading with
+    the words is the clean case and no doubt.
+
+    :param groups: The page's kept groups (the document's entries).
+    :param zones: The page's syllabus zones, in points.
+    :returns: ``[{"doubt": "box" | "heading", "text": the block's
+        first words}, ...]``, in reading order.
+    :rtype: list[dict]
+    """
+    doubts = []
+    stamped = [g for g in groups if g.get("syllabus_start")]
+    for group in stamped:
+        if not casebody.is_syllabus_heading(group.get("text")):
+            doubts.append({"doubt": "box", "text": _first_words(group)})
+    if zones and not stamped:
+        doubts.append({"doubt": "box", "text": ""})
+    for group in groups:
+        if (
+            group.get("section", BODY) == BODY
+            and group.get("kind") == markup.HEADING
+            and not group.get("syllabus_start")
+            and casebody.is_syllabus_heading(group.get("text"))
+        ):
+            doubts.append({"doubt": "heading", "text": _first_words(group)})
+    return doubts
+
+
+def _first_words(group: dict, limit: int = 8) -> str:
+    """Return the first words of a group's text."""
+    words = (group.get("text") or "").split()
+    return " ".join(words[:limit]) + (" ..." if len(words) > limit else "")
+
+
 def blockquote_runs(groups: list[dict]) -> list[dict]:
     """Return the blockquotes of one page, one per run of quoted groups
     (#411).
@@ -3016,6 +3068,9 @@ def _counts() -> dict:
         "undetected_agreed": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
+        # The places the two syllabus signals disagree (#518), the
+        # ``SYLLABUS_UNSURE`` card.
+        "syllabus_doubt": 0,
         "blockquotes": 0,
         "blockquote_lists": 0,
         "lists": 0,
@@ -3727,6 +3782,10 @@ def build_page(
             group["below"] = blocks_below(texts, group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
+    entry["syllabus_doubt"] = syllabus_doubts(
+        entry["groups"], entry["zones"][SYLLABUS]
+    )
+    entry["counts"]["syllabus_doubt"] = len(entry["syllabus_doubt"])
     entry["blockquotes"] = blockquote_runs(sequence)
     entry["counts"]["blockquotes"] = len(entry["blockquotes"])
     entry["lists"] = list_runs(sequence)
@@ -4461,6 +4520,27 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("syllabus_doubt"):
+            # The two signals of the syllabus disagree (#518): a
+            # warning the reader dismisses, and a log line so the case
+            # is looked at later.
+            card = _card(
+                opinion,
+                page_number,
+                OpinionCheck.SYLLABUS_UNSURE,
+                Issue.Severity.WARNING,
+                _syllabus_message(page),
+                standing,
+            )
+            cards.append(card)
+            if card.dismissal is None:
+                logger.error(
+                    "%s of scan %s, page %s: %s",
+                    opinion,
+                    opinion.scan_id,
+                    page_number + 1,
+                    card.message,
+                )
         if counts.get("figures") or counts.get("figure_partial"):
             cards.append(
                 _card(
@@ -4637,6 +4717,30 @@ def _footnote_message(page: dict) -> str:
         f"{named} read {count} block(s) of this page as a footnote, but no "
         "footnote detection covers them. They are in the body text."
     )
+
+
+def _syllabus_message(page: dict) -> str:
+    """Return the line of one ``SYLLABUS_UNSURE`` card (#518)."""
+    lines = []
+    for doubt in page.get("syllabus_doubt") or []:
+        if doubt["doubt"] == "heading":
+            lines.append(
+                f'The heading "{doubt["text"]}" has no SYLLABUS detection: '
+                "the final XML opens the syllabus at its words. Draw the "
+                "box in step 2 if the model missed it."
+            )
+        elif doubt["text"]:
+            lines.append(
+                f'A SYLLABUS detection sits on "{doubt["text"]}", which is '
+                "no syllabus heading: the final XML opens the syllabus "
+                "there. Move or dismiss the box in step 2 if it is wrong."
+            )
+        else:
+            lines.append(
+                "A SYLLABUS detection covers no block of text. Move or "
+                "dismiss the box in step 2."
+            )
+    return " ".join(lines)
 
 
 #: How many words of a group the ``BLOCKQUOTE_LIST`` card quotes.

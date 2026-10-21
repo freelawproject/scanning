@@ -122,7 +122,7 @@ HEAD_MATTER_LABELS = frozenset({
 #: element per paragraph, which it joins. Not a tagger label.
 SYLLABUS = "syllabus"
 #: The words of a heading that opens a syllabus, folded by
-#: :func:`_heading_words`: the Supreme Court Reporter prints the first,
+#: :func:`heading_words`: the Supreme Court Reporter prints the first,
 #: N.W.2d, S.E.2d, F.4th and A.3d the second. A closed table: the
 #: detection opens a syllabus under any other wording.
 SYLLABUS_HEADINGS = frozenset({"syllabus", "syllabus by the court"})
@@ -626,12 +626,22 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
 _LETTERS = re.compile(r"[^a-z]+")
 
 
+def heading_words(text: str | None) -> str:
+    """Return the words of a text, letters alone, one space between
+    them: "Syllabus *" and "SYLLABUS." both read ``syllabus``."""
+    return " ".join(_LETTERS.sub(" ", (text or "").lower()).split())
+
+
+def is_syllabus_heading(text: str | None) -> bool:
+    """Return whether a text is the heading that opens a syllabus, by
+    its words (:data:`SYLLABUS_HEADINGS`). The one test of the words,
+    read by :func:`syllabus_range` and by the ensemble's card
+    (``ensemble.syllabus_doubts``, #518)."""
+    return heading_words(text) in SYLLABUS_HEADINGS
+
+
 def _heading_words(paragraph: dict) -> str:
-    """Return the words of a paragraph, letters alone, one space
-    between them: "Syllabus *" and "SYLLABUS." both read ``syllabus``."""
-    return " ".join(
-        _LETTERS.sub(" ", (paragraph.get("text") or "").lower()).split()
-    )
+    return heading_words(paragraph.get("text"))
 
 
 def _is_heading(paragraph: dict, spans: list[dict]) -> bool:

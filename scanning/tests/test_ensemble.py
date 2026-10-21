@@ -32,6 +32,7 @@ from django.urls import reverse
 from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
+    DISMISSABLE_OPINION_CHECKS,
     Issue,
     Opinion,
     OpinionCheck,
@@ -3186,6 +3187,66 @@ class TestTheFootnoteCard(TestTheFindings):
         self.assertIn(OpinionCheck.FOOTNOTE_UNSURE, ensemble.ENSEMBLE_CHECKS)
 
 
+class TestTheSyllabusCard(TestTheFindings):
+    """The ``SYLLABUS_UNSURE`` card (#518): a warning where the box and
+    the heading disagree, and a log line."""
+
+    def doubted(self, *doubts) -> list[OpinionFinding]:
+        page = page_of(syllabus_doubt=len(doubts))
+        page["syllabus_doubt"] = list(doubts)
+        with self.assertLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_a_heading_with_no_box_is_a_warning(self):
+        cards = self.doubted({"doubt": "heading", "text": "Syllabus"})
+
+        self.assertEqual([c.check_name for c in cards], ["syllabus_unsure"])
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertEqual(cards[0].page_in_opinion, 0)
+        self.assertIn(
+            'The heading "Syllabus" has no SYLLABUS detection',
+            cards[0].message,
+        )
+
+    def test_a_box_on_other_words_names_them(self):
+        cards = self.doubted({"doubt": "box", "text": "Ford is global ..."})
+
+        self.assertIn(
+            'A SYLLABUS detection sits on "Ford is global ..."',
+            cards[0].message,
+        )
+
+    def test_a_box_over_no_block_says_so(self):
+        cards = self.doubted({"doubt": "box", "text": ""})
+
+        self.assertIn("covers no block of text", cards[0].message)
+
+    def test_no_doubt_is_no_card(self):
+        cards = self.rebuild()
+
+        self.assertEqual(cards, [])
+
+    def test_a_standing_dismissal_mutes_the_card_and_the_log(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.SYLLABUS_UNSURE,
+        )
+        page = page_of(syllabus_doubt=1)
+        page["syllabus_doubt"] = [{"doubt": "heading", "text": "Syllabus"}]
+
+        with self.assertNoLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own_and_dismissable(self):
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, ensemble.ENSEMBLE_CHECKS)
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, DISMISSABLE_OPINION_CHECKS)
+
+
 class TestTheBracketToken(EnsembleTestCase):
     """The bracket a box redacts never reaches the text (#373)."""
 
@@ -3856,6 +3917,60 @@ class TestTheSyllabusStart(TestCase):
 
         self.assertEqual(
             [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+
+    def test_a_box_on_the_heading_is_no_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(page["syllabus_doubt"], [])
+        self.assertEqual(page["counts"]["syllabus_doubt"], 0)
+
+    def test_a_box_on_other_words_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Summary", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.FIRST)],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "box", "text": "The company is global."}],
+        )
+        self.assertEqual(page["counts"]["syllabus_doubt"], 1)
+
+    def test_a_syllabus_heading_with_no_box_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (
+                    self.HEADING,
+                    "Syllabus by the Court",
+                    ("heading", "heading"),
+                ),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "heading", "text": "Syllabus by the Court"}],
+        )
+
+    def test_a_box_over_no_block_is_a_doubt(self):
+        page = build(
+            paragraphs((self.FIRST, "The company is global.")),
+            starts=[[400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
         )
 
     def test_without_a_zone_no_group_is_stamped(self):
