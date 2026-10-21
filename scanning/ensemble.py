@@ -2686,7 +2686,11 @@ def vote_words(
             # two engines make every difference a tie. A minority is
             # dropped, the reading of the majority.
             if count < quorum and count * 2 != total:
-                dropped = True
+                # A run that is only a mark (``*``, ``•``, ``___``) has
+                # no key and reads as nothing, the rule of a keyless
+                # base word: it makes no gap.
+                if any(keys):
+                    dropped = True
                 continue
             words = next(words for other, words in runs if other == keys)
             for word in words:
@@ -2710,7 +2714,10 @@ def vote_words(
             # majority settled.
             in_gap = [""] + [
                 " ".join(
-                    key for run in inserted.get(position, []) for key, _ in run
+                    key
+                    for run in inserted.get(position, [])
+                    for key, _ in run
+                    if key
                 )
                 for inserted in inserts
             ]

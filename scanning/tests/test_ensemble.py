@@ -1054,6 +1054,27 @@ class TestTheVote(TestCase):
         self.assertFalse(any("gap" in t for t in second["tokens"]))
         self.assertIsNone(ensemble.disagreement_level(second, 3))
 
+    def test_a_run_that_is_only_a_mark_makes_no_gap(self):
+        """A bullet, a section-break line or a rule one engine alone
+        read between two words has no key and reads as nothing, so
+        the place is no gap and no card; a word beside it still is."""
+        for mark in ("\u2022", "* * *", "____"):
+            answer = ensemble.resolve(
+                self.read("a b c x", "a b c y", f"a {mark} b c z")
+            )
+            self.assertFalse(
+                any("gap" in t or "gap_after" in t for t in answer["tokens"]),
+                mark,
+            )
+            self.assertEqual(answer["n_low_confidence"], 1, mark)
+        # Beside a real run the mark still counts as nothing: one engine
+        # read ``Z`` and the others nothing, a warning gap.
+        answer = ensemble.resolve(
+            self.read("a b x", "a Z b y", "a \u2022 b z")
+        )
+        b = next(t for t in answer["tokens"] if t["text"] == "b")
+        self.assertEqual(b.get("gap"), ensemble.WARNING)
+
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("a b"),
