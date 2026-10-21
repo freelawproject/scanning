@@ -2111,15 +2111,13 @@ class TestTheSyllabus(TestCase):
         self.assertEqual(
             self.syllabus_texts(root), [self.FIRST, self.HELD, self.POINT]
         )
-        self.assertNotIn(
-            "Syllabus", xml.split("<opinion")[0].split("<syllabus")[0]
-        )
         head = [child.tag for child in root if child.tag != "opinion"]
         self.assertEqual(
             head,
             [
                 "court",
                 "decisiondate",
+                "heading",
                 "syllabus",
                 "syllabus",
                 "syllabus",
@@ -2186,8 +2184,9 @@ class TestTheSyllabus(TestCase):
         self.assertEqual(
             self.syllabus_texts(root), ["1. A statute is read as a whole."]
         )
-        # The line is written as the tagger left it, outside the run.
-        line = root.find("heading")
+        # The line is written as the tagger left it, outside the run,
+        # after the syllabus heading, which keeps its place.
+        line = root.findall("heading")[1]
         self.assertEqual("".join(line.itertext()), appeal)
         self.assertIsNotNone(line.find("history"))
 
@@ -2219,7 +2218,24 @@ class TestTheSyllabus(TestCase):
         _xml, root = build(document, *spans)
 
         self.assertEqual(len(root.findall("syllabus")), 3)
-        self.assertEqual(root.findall("heading"), [])
+        self.assertEqual(root.find("heading").text, "Syllabus")
+
+    def test_the_heading_keeps_its_page_number_and_its_footnote_mark(self):
+        """The star number is a citation anchor and the mark is the
+        reference of the syllabus note: neither may go with the run."""
+        document, spans = self.scotus()
+        # The heading opens page 503, and the run goes on under it.
+        for paragraph in document["body"][2:]:
+            paragraph["pages"] = [1]
+
+        _xml, root = build(document, *spans)
+
+        heading = root.find("heading")
+        self.assertEqual(
+            [child.tag for child in heading], ["page-number", "footnotemark"]
+        )
+        self.assertEqual(heading.find("page-number").get("label"), "503")
+        self.assertEqual(root.findall("syllabus")[0].find("page-number"), None)
 
     def test_a_stamp_with_other_words_starts_the_run_at_that_paragraph(self):
         """A curator's box over the first paragraph of the syllabus."""
@@ -2307,6 +2323,51 @@ class TestTheSyllabus(TestCase):
         self.assertEqual(root.findall("syllabus"), [])
         self.assertEqual(len(root.findall(".//heading")), 1)
 
+    def test_a_per_curiam_with_a_dissent_keeps_its_text(self):
+        """The first author span of a per curiam is the dissent's: a
+        stamp or a heading in the per curiam's own text opens nothing,
+        and a run with no closer stops at the end of the head matter."""
+        document = doc(
+            *self.caption(),
+            para("The per curiam opens here.", syllabus_start=True),
+            para("Syllabus", kind="heading"),
+            para("More of the per curiam."),
+            para("Justice THOMAS, dissenting."),
+            para("I respectfully dissent."),
+        )
+        spans = [*self.caption_spans(), span(5, 0, 27, "author")]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(root.findall(".//syllabus"), [])
+        opinions = root.findall("opinion")
+        self.assertEqual(
+            [o.get("type") for o in opinions], ["majority", "dissent"]
+        )
+        self.assertEqual(
+            [p.text for p in opinions[0].findall("p")],
+            ["The per curiam opens here.", "More of the per curiam."],
+        )
+
+    def test_a_per_curiam_with_a_dissent_still_takes_a_closed_syllabus(self):
+        document = doc(
+            *self.caption(),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+            para(self.COUNSEL),
+            para("The per curiam opens here."),
+            para("Justice THOMAS, dissenting."),
+        )
+        spans = [
+            *self.caption_spans(),
+            span(4, 0, len(self.COUNSEL), "attorneys"),
+            span(6, 0, 27, "author"),
+        ]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(self.syllabus_texts(root), [self.FIRST])
+
     def test_no_heading_and_no_stamp_is_no_syllabus(self):
         tail, tail_spans = self.tail(3)
         document = doc(*self.caption(), para(self.FIRST), *tail)
@@ -2356,7 +2417,9 @@ class TestTheSyllabus(TestCase):
             [n.get("label") for n in root.find("opinion").findall("footnote")],
             ["*"],
         )
-        self.assertNotIn("footnotemark", xml.split("<opinion")[0])
+        self.assertIn(
+            "<footnotemark>*</footnotemark>", xml.split("<opinion")[0]
+        )
 
     def test_the_display_tints_the_syllabus(self):
         document, spans = self.scotus()

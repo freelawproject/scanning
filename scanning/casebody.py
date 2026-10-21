@@ -45,8 +45,9 @@ or a head-matter heading whose words are in :data:`SYLLABUS_HEADINGS`,
 and the end is the first later paragraph that the caption spans cover
 most of (the disposition line, the vote line, the attorneys), else the
 author line. Each paragraph of the run is one ``<syllabus>`` element
-with no span inside it, the CAP shape; the heading is consumed. The
-run is head matter whatever :func:`head_matter_end` says.
+with no span inside it, the CAP shape; the heading keeps its place,
+its page number and its footnote mark. The run is head matter whatever
+:func:`head_matter_end` says.
 
 **The text is the text the tagger read.** The approved text keeps a
 ``\\n`` where a line or a column ended, and a word cut there. The XML
@@ -671,40 +672,62 @@ def _closer_share(paragraph: dict, spans: list[dict]) -> float:
     return min(covered / length, 1.0)
 
 
+def _bound(body: list[dict], by: dict[int, list[dict]], split: int) -> int:
+    """Return the paragraph the syllabus can never reach.
+
+    The first author line when it is the majority's. A per curiam has
+    no author line, and its first ``author`` span is a dissent's
+    (:func:`head_matter_end`), so the bound is then ``split``, the end
+    of the head matter: a stamp or a heading inside the per curiam's
+    own text opens nothing, and a run with no closer never takes the
+    majority for the syllabus.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param split: :func:`head_matter_end`.
+    :rtype: int
+    """
+    author = _first_author(body, by)
+    if author == len(body):
+        return split
+    words = role_text(body, by, author)
+    if _type_of(words, OPINION_TYPES) in SEPARATE_TYPES:
+        return split
+    return author
+
+
 def syllabus_range(
     body: list[dict], by: dict[int, list[dict]], split: int
-) -> tuple[int | None, range]:
-    """Return the heading that opens the syllabus, and its paragraphs.
+) -> range:
+    """Return the paragraphs of the syllabus, empty for none.
 
-    **The start** is the first paragraph before the first author line
-    that the ensemble stamped ``syllabus_start`` (the ``SYLLABUS``
-    detection of the run, or a curator's box in review 2), or that is
-    a heading whose words are in :data:`SYLLABUS_HEADINGS`. A start
-    with those words is the heading: it is consumed, and the run
-    begins after it. A stamped start with other words is the first
-    paragraph of the syllabus itself (a box a curator drew over the
-    text), and the run begins at it.
+    **The start** is the first paragraph before :func:`_bound` that the
+    ensemble stamped ``syllabus_start`` (the ``SYLLABUS`` detection of
+    the run, or a curator's box in review 2), or that is a heading
+    whose words are in :data:`SYLLABUS_HEADINGS`. A start with those
+    words is the heading: it keeps its place, with its page number and
+    its footnote mark, and the run begins after it. A stamped start
+    with other words is the first paragraph of the syllabus itself (a
+    box a curator drew over the text), and the run begins at it.
 
     **The end** is the first later paragraph that spans of
     :data:`CLOSER_LABELS` cover :data:`CLOSER_SHARE` of: the
     disposition line, the vote line or the attorneys. With no such
-    paragraph the run ends at the author line, and with no author line
-    either (a per curiam) at ``split``, so a syllabus never runs into
-    an opinion the spans do not mark off. An empty run is no syllabus,
-    and nothing is consumed.
+    paragraph the run ends at the bound: the majority's author line,
+    or the end of the head matter when there is none, so a syllabus
+    never runs into an opinion the spans do not mark off.
 
     :param body: The body paragraphs.
     :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
     :param split: :func:`head_matter_end`.
-    :returns: The index of the consumed heading, or None, and the
-        range of the syllabus paragraphs, empty for none.
-    :rtype: tuple[int | None, range]
+    :returns: The range of the syllabus paragraphs.
+    :rtype: range
     """
-    author = _first_author(body, by)
+    bound = _bound(body, by, split)
     start = next(
         (
             index
-            for index, paragraph in enumerate(body[:author])
+            for index, paragraph in enumerate(body[:bound])
             if paragraph.get("syllabus_start")
             or (
                 _is_heading(paragraph, by.get(index, []))
@@ -714,20 +737,18 @@ def syllabus_range(
         None,
     )
     if start is None:
-        return None, range(0)
+        return range(0)
     heading = _heading_words(body[start]) in SYLLABUS_HEADINGS
     first = start + 1 if heading else start
     end = next(
         (
             index
-            for index in range(first, author)
+            for index in range(first, bound)
             if _closer_share(body[index], by.get(index, [])) >= CLOSER_SHARE
         ),
-        author if author < len(body) else max(split, first),
+        bound,
     )
-    if end <= first:
-        return None, range(0)
-    return (start if heading else None), range(first, end)
+    return range(first, max(end, first))
 
 
 def _syllabus_paragraph(
@@ -1522,7 +1543,7 @@ def build(
     )
     by = _spans_by_paragraph(body, spans)
     split = head_matter_end(body, by)
-    heading, syllabus = syllabus_range(body, by, split)
+    syllabus = syllabus_range(body, by, split)
     # The syllabus is head matter wherever the caption ends.
     split = max(split, syllabus.stop) if syllabus else split
     body = _plain_head_matter(body, split)
@@ -1632,7 +1653,7 @@ def build(
             [
                 block
                 for at, block in enumerate(blocks[:split])
-                if at not in cited and at != heading
+                if at not in cited
             ],
             "  ",
         )
