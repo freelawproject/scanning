@@ -579,10 +579,15 @@ step 3 turns it off again.
    into the `scanning-env` secret as `CELERY_BROKER_URL`, with
    `CELERY_ENABLED` still off. Roll the workers out: they connect and
    sit idle.
-3. Set `CELERY_ENABLED=True` in the secret and restart the daemon and
-   the web deployments. The daemon reads the switch at start and its
-   first log line then says "sending ticks to Celery"; the web pods
-   start sending a task for every button press.
+3. Set `CELERY_ENABLED=True` in the secret and restart the daemon,
+   the web deployments and the four workers. Every process reads the
+   switch at start: the daemon's first log line then says "sending
+   ticks to Celery", the web pods start sending a task for every
+   button press, and the workers start sending the next pass when a
+   step finishes, which they do not do while they hold the old value.
+   Turning the switch off is the same restart of all three, or the
+   workers keep sending to each other beside a daemon that runs the
+   passes itself.
 4. Check the worker logs show ticks received every few seconds, the
    queue depths read zero (`LLEN fast` and the other three on the
    broker), and a button press reaches a worker within a second.
