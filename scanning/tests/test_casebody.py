@@ -2015,3 +2015,435 @@ class TestTheHeadMatterHasNoBold(TestCase):
 
         self.assertEqual(json.dumps(approved_doc, sort_keys=True), before)
         self.assertEqual(json.dumps(spans, sort_keys=True), spans_before)
+
+
+class TestTheSyllabus(TestCase):
+    """``casebody.syllabus_range`` (#518): the untagged run under its
+    heading is the syllabus, one element per paragraph."""
+
+    SYLLABUS = "Syllabus *"
+    FIRST = "Ford Motor Company is a global auto company."
+    HELD = "Held: The connection is close enough. Pp. 1023-1032."
+    POINT = "(a) The Due Process Clause limits a state court, No. 19-368."
+    DISPOSITION = "No. 19-368, 395 Mont. 478, affirmed."
+    VOTE = "KAGAN, J., delivered the opinion of the Court."
+    COUNSEL = "Sean Marotta, Washington, DC, for the petitioner."
+    AUTHOR = "Justice KAGAN delivered the opinion of the Court."
+    BODY = "In each of these two cases, a state court held so."
+
+    COURT = "Supreme Court of the United States."
+    DATE = "Decided March 25, 2021"
+
+    def caption(self):
+        return [para(self.COURT), para(self.DATE)]
+
+    def caption_spans(self):
+        return [
+            span(0, 0, len(self.COURT), "court"),
+            span(1, 0, len(self.DATE), "datefiled"),
+        ]
+
+    def tail(self, at):
+        """The disposition line, the vote line, the attorneys and the
+        author, from paragraph ``at``."""
+        paragraphs = [
+            para(self.DISPOSITION),
+            para(self.VOTE),
+            para(self.COUNSEL),
+            para(self.AUTHOR),
+            para(self.BODY),
+        ]
+        spans = [
+            span(at, 0, len("No. 19-368"), "docketnumber"),
+            span(
+                at, len("No. 19-368, "), len(self.DISPOSITION), "disposition"
+            ),
+            span(at + 1, 0, len(self.VOTE), "judges"),
+            span(at + 2, 0, len(self.COUNSEL), "attorneys"),
+            span(at + 3, 0, len(self.AUTHOR), "author"),
+        ]
+        return paragraphs, spans
+
+    def scotus(self, heading=None, **fields):
+        heading = heading or para(
+            self.SYLLABUS, kind="heading", marks=[mark(9, 10, "sup")], **fields
+        )
+        tail, tail_spans = self.tail(6)
+        document = doc(
+            *self.caption(),
+            heading,
+            para(self.FIRST),
+            para(self.HELD, marks=[mark(0, 5, "em")]),
+            para(self.POINT),
+            *tail,
+            footnotes=[
+                note(
+                    "*",
+                    text="The syllabus constitutes no part of the opinion.",
+                )
+            ],
+        )
+        spans = [
+            *self.caption_spans(),
+            # A party at the start of a syllabus paragraph, and a
+            # citation the tagger reads as a docket number inside one.
+            span(3, 0, len("Ford Motor Company"), "party"),
+            span(
+                5,
+                self.POINT.index("No. 19-368"),
+                self.POINT.index("No. 19-368") + len("No. 19-368"),
+                "docketnumber",
+            ),
+            *tail_spans,
+        ]
+        return document, spans
+
+    def syllabus_texts(self, root):
+        return [
+            "".join(element.itertext()) for element in root.findall("syllabus")
+        ]
+
+    def test_the_run_under_the_heading_is_the_syllabus(self):
+        document, spans = self.scotus()
+
+        xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, self.HELD, self.POINT]
+        )
+        head = [child.tag for child in root if child.tag != "opinion"]
+        self.assertEqual(
+            head,
+            [
+                "court",
+                "decisiondate",
+                "heading",
+                "syllabus",
+                "syllabus",
+                "syllabus",
+                "p",
+                "judges",
+                "attorneys",
+            ],
+        )
+        # The disposition line closes the run and keeps its spans.
+        closer = root.findall("p")[0]
+        self.assertEqual(
+            [child.tag for child in closer], ["docketnumber", "disposition"]
+        )
+
+    def test_a_span_inside_the_syllabus_writes_no_element(self):
+        document, spans = self.scotus()
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            [
+                [child.tag for child in element]
+                for element in root.findall("syllabus")
+            ],
+            [[], ["em"], []],
+        )
+
+    def test_a_party_at_the_start_of_a_paragraph_does_not_close_the_run(self):
+        document, spans = self.scotus()
+        spans = [s for s in spans if s["label"] != "party"]
+        spans.append(span(3, 0, len("Ford Motor Company"), "party"))
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(len(root.findall("syllabus")), 3)
+
+    def test_a_caption_line_read_as_heading_then_history_closes_the_run(self):
+        """The flicker of #474 on the W. Va. appeal line: ``heading``
+        over most of it and ``history`` over its tail."""
+        appeal = (
+            "Appeal from the Circuit Court of Mercer County, The Honorable "
+            "William J. Sadler, Judge, Civil Action No. 15-D-24"
+        )
+        document = doc(
+            *self.caption(),
+            para("Syllabus by the Court", kind="heading"),
+            para("1. A statute is read as a whole."),
+            para(appeal, kind="heading"),
+            para(self.COUNSEL),
+            para("WORKMAN, JUSTICE:", kind="heading"),
+            para(self.BODY),
+        )
+        cut = appeal.index("Judge, Civil")
+        spans = [
+            *self.caption_spans(),
+            span(4, 0, cut, "heading"),
+            span(4, cut, len(appeal), "history"),
+            span(5, 0, len(self.COUNSEL), "attorneys"),
+            span(6, 0, 17, "author"),
+        ]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), ["1. A statute is read as a whole."]
+        )
+        # The line is written as the tagger left it, outside the run,
+        # after the syllabus heading, which keeps its place.
+        line = root.findall("heading")[1]
+        self.assertEqual("".join(line.itertext()), appeal)
+        self.assertIsNotNone(line.find("history"))
+
+    def test_a_heading_alone_inside_the_run_closes_nothing(self):
+        tail, tail_spans = self.tail(6)
+        document = doc(
+            *self.caption(),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+            para("Held", kind="heading"),
+            para(self.HELD),
+            *tail,
+        )
+        spans = [*self.caption_spans(), span(4, 0, 4, "heading"), *tail_spans]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, "Held", self.HELD]
+        )
+
+    def test_the_stamp_on_the_heading_opens_the_run(self):
+        """The ``SYLLABUS`` detection over the heading, carried by the
+        ensemble and the approved text; the heading is consumed."""
+        document, spans = self.scotus(syllabus_start=True)
+        document["body"][2]["text"] = "Syllabus"
+        document["body"][2]["marks"] = []
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(len(root.findall("syllabus")), 3)
+        self.assertEqual(root.find("heading").text, "Syllabus")
+
+    def test_the_heading_keeps_its_page_number_and_its_footnote_mark(self):
+        """The star number is a citation anchor and the mark is the
+        reference of the syllabus note: neither may go with the run."""
+        document, spans = self.scotus()
+        # The heading opens page 503, and the run goes on under it.
+        for paragraph in document["body"][2:]:
+            paragraph["pages"] = [1]
+
+        _xml, root = build(document, *spans)
+
+        heading = root.find("heading")
+        self.assertEqual(
+            [child.tag for child in heading], ["page-number", "footnotemark"]
+        )
+        self.assertEqual(heading.find("page-number").get("label"), "503")
+        self.assertEqual(root.findall("syllabus")[0].find("page-number"), None)
+
+    def test_a_stamped_caption_line_falls_through_to_the_heading(self):
+        """A box drawn a line high stamps the date line, which the
+        caption spans close at once; the heading below opens the run."""
+        document, spans = self.scotus()
+        document["body"][1]["syllabus_start"] = True
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, self.HELD, self.POINT]
+        )
+        self.assertEqual(root.find("decisiondate").text, self.DATE)
+
+    def test_a_stamp_with_other_words_starts_the_run_at_that_paragraph(self):
+        """A curator's box over the first paragraph of the syllabus."""
+        tail, tail_spans = self.tail(5)
+        document = doc(
+            *self.caption(),
+            para(self.FIRST, syllabus_start=True),
+            para(self.HELD),
+            para(self.POINT),
+            *tail,
+        )
+
+        _xml, root = build(document, *self.caption_spans(), *tail_spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, self.HELD, self.POINT]
+        )
+
+    def test_syllabus_by_the_court_with_numbered_points(self):
+        """The wording of N.W.2d and S.E.2d, with no footnote, and the
+        points as list items: one element each, with no item in it."""
+        tail, tail_spans = self.tail(5)
+        document = doc(
+            *self.caption(),
+            para("SYLLABUS BY THE COURT", kind="heading"),
+            para(
+                "1. Statutes. A statute is read as a whole.",
+                kind="list_item",
+                marks=[mark(0, 42, "li")],
+                list="ol",
+            ),
+            para(
+                "2. Appeal and Error. The court reviews de novo.",
+                kind="list_item",
+                marks=[mark(0, 47, "li")],
+                list="ol",
+            ),
+            *tail,
+        )
+
+        xml, root = build(document, *self.caption_spans(), *tail_spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root),
+            [
+                "1. Statutes. A statute is read as a whole.",
+                "2. Appeal and Error. The court reviews de novo.",
+            ],
+        )
+        self.assertNotIn("<li>", xml)
+        self.assertNotIn("<ol>", xml)
+
+    def test_without_a_closer_the_run_ends_at_the_author_line(self):
+        document = doc(
+            *self.caption(),
+            para(self.SYLLABUS, kind="heading", marks=[mark(9, 10, "sup")]),
+            para(self.FIRST),
+            para(self.HELD),
+            para(self.AUTHOR),
+            para(self.BODY),
+            footnotes=[note("*")],
+        )
+        spans = [*self.caption_spans(), span(5, 0, len(self.AUTHOR), "author")]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(self.syllabus_texts(root), [self.FIRST, self.HELD])
+        opinion = root.find("opinion")
+        self.assertEqual(opinion[0].tag, "author")
+        self.assertEqual(opinion.findall("syllabus"), [])
+
+    def test_with_no_closer_and_no_author_nothing_is_written(self):
+        """A per curiam whose spans mark off no end: the run would
+        swallow the opinion, so the heading stays a heading."""
+        document = doc(
+            *self.caption(),
+            para(self.SYLLABUS, kind="heading", marks=[mark(9, 10, "sup")]),
+            para(self.FIRST),
+            para(self.BODY),
+            footnotes=[note("*")],
+        )
+
+        _xml, root = build(document, *self.caption_spans())
+
+        self.assertEqual(root.findall("syllabus"), [])
+        self.assertEqual(len(root.findall(".//heading")), 1)
+
+    def test_a_per_curiam_with_a_dissent_keeps_its_text(self):
+        """The first author span of a per curiam is the dissent's: a
+        stamp or a heading in the per curiam's own text opens nothing,
+        and a run with no closer stops at the end of the head matter."""
+        document = doc(
+            *self.caption(),
+            para("The per curiam opens here.", syllabus_start=True),
+            para("Syllabus", kind="heading"),
+            para("More of the per curiam."),
+            para("Justice THOMAS, dissenting."),
+            para("I respectfully dissent."),
+        )
+        spans = [*self.caption_spans(), span(5, 0, 27, "author")]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(root.findall(".//syllabus"), [])
+        opinions = root.findall("opinion")
+        self.assertEqual(
+            [o.get("type") for o in opinions], ["majority", "dissent"]
+        )
+        self.assertEqual(
+            [p.text for p in opinions[0].findall("p")],
+            ["The per curiam opens here.", "More of the per curiam."],
+        )
+
+    def test_a_per_curiam_with_a_dissent_still_takes_a_closed_syllabus(self):
+        document = doc(
+            *self.caption(),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+            para(self.COUNSEL),
+            para("The per curiam opens here."),
+            para("Justice THOMAS, dissenting."),
+        )
+        spans = [
+            *self.caption_spans(),
+            span(4, 0, len(self.COUNSEL), "attorneys"),
+            span(6, 0, 27, "author"),
+        ]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(self.syllabus_texts(root), [self.FIRST])
+
+    def test_no_heading_and_no_stamp_is_no_syllabus(self):
+        tail, tail_spans = self.tail(3)
+        document = doc(*self.caption(), para(self.FIRST), *tail)
+
+        _xml, root = build(document, *self.caption_spans(), *tail_spans)
+
+        self.assertEqual(root.findall("syllabus"), [])
+
+    def test_a_syllabus_heading_inside_the_opinion_is_no_opener(self):
+        document = doc(
+            *self.caption(),
+            para(self.AUTHOR),
+            para(self.BODY),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+        )
+        spans = [*self.caption_spans(), span(2, 0, len(self.AUTHOR), "author")]
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(root.findall(".//syllabus"), [])
+
+    def test_a_citation_line_of_the_syllabus_stays_in_it(self):
+        tail, tail_spans = self.tail(5)
+        cite = (
+            "Bristol-Myers Squibb Co. v. Superior Court, 582 U.S. 255 (2017)."
+        )
+        document = doc(
+            *self.caption(),
+            para("Syllabus", kind="heading"),
+            para(self.FIRST),
+            para(cite),
+            *tail,
+        )
+
+        _xml, root = build(document, *self.caption_spans(), *tail_spans)
+
+        self.assertEqual(root.findall("citation"), [])
+        self.assertEqual(self.syllabus_texts(root), [self.FIRST, cite])
+
+    def test_the_footnote_of_the_heading_goes_with_the_first_opinion(self):
+        document, spans = self.scotus()
+
+        xml, root = build(document, *spans)
+
+        self.assertEqual(
+            [n.get("label") for n in root.find("opinion").findall("footnote")],
+            ["*"],
+        )
+        self.assertIn(
+            "<footnotemark>*</footnotemark>", xml.split("<opinion")[0]
+        )
+
+    def test_the_display_tints_the_syllabus(self):
+        document, spans = self.scotus()
+
+        xml, _root = build(document, *spans)
+
+        self.assertIn('data-role="syllabus"', casebody.display_html(xml))
+
+    def test_the_schema_says_so(self):
+        document, spans = self.scotus()
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(root.get("schema"), "2")

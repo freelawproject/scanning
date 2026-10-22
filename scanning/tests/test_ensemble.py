@@ -32,6 +32,7 @@ from django.urls import reverse
 from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
+    DISMISSABLE_OPINION_CHECKS,
     Issue,
     Opinion,
     OpinionCheck,
@@ -3041,11 +3042,13 @@ def read_units(*specs) -> list[dict]:
     return units
 
 
-def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
+def engine_page(
+    units_of_engine: list[dict], zones=(), quotes=(), starts=()
+) -> dict:
     """One engine's page of an opinion document, for ``build_page``.
 
-    ``zones`` are the footnote zones and ``quotes`` the blockquote
-    zones, in points.
+    ``zones`` are the footnote zones, ``quotes`` the blockquote zones
+    and ``starts`` the syllabus zones, in points.
     """
     return {
         "page_in_opinion": 0,
@@ -3053,7 +3056,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
         "pdf_page": 2,
         "source": {"kind": "original", "pdf_page": 2},
         "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
-        "zones": {"footnotes": list(zones), "blockquotes": list(quotes)},
+        "zones": {
+            "footnotes": list(zones),
+            "blockquotes": list(quotes),
+            "syllabus": list(starts),
+        },
         "units": [
             {
                 "id": u["id"],
@@ -3071,11 +3078,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
     }
 
 
-def build(units, zones=(), quotes=()) -> dict:
+def build(units, zones=(), quotes=(), starts=()) -> dict:
     """The ensemble of one page read by the two engines of ``units``."""
     pages = {
         engine: engine_page(
-            [u for u in units if u["engine"] == engine], zones, quotes
+            [u for u in units if u["engine"] == engine], zones, quotes, starts
         )
         for engine in ("dots_mocr", "mistral_ocr")
     }
@@ -3244,7 +3251,8 @@ class TestTheTwoTexts(TestCase):
         )
         self.assertEqual(page["footnotes"], "1. left note")
         self.assertEqual(
-            page["zones"], {"footnotes": [FOOT_ZONE], "blockquotes": []}
+            page["zones"],
+            {"footnotes": [FOOT_ZONE], "blockquotes": [], "syllabus": []},
         )
 
     def test_without_a_zone_the_footnote_stays_in_the_body(self):
@@ -3372,7 +3380,11 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         self.assertEqual(page["footnotes"], "body B 2")
         self.assertEqual(
             page["zones"],
-            {"footnotes": [to_pt(self.BAND_B)], "blockquotes": []},
+            {
+                "footnotes": [to_pt(self.BAND_B)],
+                "blockquotes": [],
+                "syllabus": [],
+            },
         )
         # The first page masks its header, above the caption.
         self.assertEqual(document["pages"][0]["text"], "body A 1\n\nbody B 1")
@@ -3491,6 +3503,66 @@ class TestTheFootnoteCard(TestTheFindings):
 
     def test_the_check_is_the_rebuild_s_own(self):
         self.assertIn(OpinionCheck.FOOTNOTE_UNSURE, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheSyllabusCard(TestTheFindings):
+    """The ``SYLLABUS_UNSURE`` card (#518): a warning where the box and
+    the heading disagree, and a log line."""
+
+    def doubted(self, *doubts) -> list[OpinionFinding]:
+        page = page_of(syllabus_doubt=len(doubts))
+        page["syllabus_doubt"] = list(doubts)
+        with self.assertLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_a_heading_with_no_box_is_a_warning(self):
+        cards = self.doubted({"doubt": "heading", "text": "Syllabus"})
+
+        self.assertEqual([c.check_name for c in cards], ["syllabus_unsure"])
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertEqual(cards[0].page_in_opinion, 0)
+        self.assertIn(
+            'The heading "Syllabus" has no SYLLABUS detection',
+            cards[0].message,
+        )
+
+    def test_a_box_on_other_words_names_them(self):
+        cards = self.doubted({"doubt": "box", "text": "Ford is global ..."})
+
+        self.assertIn(
+            'A SYLLABUS detection sits on "Ford is global ..."',
+            cards[0].message,
+        )
+
+    def test_a_box_over_no_block_says_so(self):
+        cards = self.doubted({"doubt": "box", "text": ""})
+
+        self.assertIn("covers no block of text", cards[0].message)
+
+    def test_no_doubt_is_no_card(self):
+        cards = self.rebuild()
+
+        self.assertEqual(cards, [])
+
+    def test_a_standing_dismissal_mutes_the_card_and_the_log(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.SYLLABUS_UNSURE,
+        )
+        page = page_of(syllabus_doubt=1)
+        page["syllabus_doubt"] = [{"doubt": "heading", "text": "Syllabus"}]
+
+        with self.assertNoLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own_and_dismissable(self):
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, ensemble.ENSEMBLE_CHECKS)
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, DISMISSABLE_OPINION_CHECKS)
 
 
 class TestTheBracketToken(EnsembleTestCase):
@@ -4127,6 +4199,179 @@ def paragraphs(*specs) -> list[dict]:
                 )
             )
     return units
+
+
+class TestTheSyllabusStart(TestCase):
+    """``ensemble.syllabus_start`` (#518): the zone stamps the body
+    group under it, and the stamp names the start alone."""
+
+    HEADING = (50, 100, 300, 120)
+    FIRST = (50, 125, 300, 300)
+
+    def test_the_group_under_the_zone_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [zone_over(self.HEADING)])
+
+    def test_a_tall_zone_stamps_its_first_group_alone(self):
+        """A curator's box over the heading and the paragraphs under
+        it opens one run: a stamp on each would part the paragraphs."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING, self.FIRST)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+
+    def test_a_dropped_opener_passes_the_stamp_to_the_next_kept_group(self):
+        """A stray mark a redaction takes, under a box taller than the
+        heading: the kept heading under it opens the run."""
+        stray = (50, 95, 300, 99)
+        page = build(
+            paragraphs(
+                (
+                    stray,
+                    "x",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(stray, self.HEADING)],
+        )
+
+        self.assertEqual(
+            [(g["text"], g["syllabus_start"]) for g in page["groups"]],
+            [("Syllabus *", True), ("The company is global.", False)],
+        )
+        self.assertEqual(page["syllabus_doubt"], [])
+
+    def test_two_zones_are_judged_apart(self):
+        """A page two cases share: the zone that stamped nothing is a
+        doubt although the other stamped the heading."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING), [400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
+        )
+
+    def test_a_box_on_the_heading_is_no_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(page["syllabus_doubt"], [])
+        self.assertEqual(page["counts"]["syllabus_doubt"], 0)
+
+    def test_a_box_on_other_words_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Summary", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.FIRST)],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "box", "text": "The company is global."}],
+        )
+        self.assertEqual(page["counts"]["syllabus_doubt"], 1)
+
+    def test_a_syllabus_heading_with_no_box_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (
+                    self.HEADING,
+                    "Syllabus by the Court",
+                    ("heading", "heading"),
+                ),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "heading", "text": "Syllabus by the Court"}],
+        )
+
+    def test_a_box_over_no_block_is_a_doubt(self):
+        page = build(
+            paragraphs((self.FIRST, "The company is global.")),
+            starts=[[400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
+        )
+
+    def test_without_a_zone_no_group_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [False, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [])
+
+    def test_a_footnote_is_never_a_syllabus(self):
+        note = (50, 600, 300, 700)
+        page = build(
+            read_units((note, "1. a note")),
+            zones=[FOOT_ZONE],
+            starts=[zone_over(note)],
+        )
+
+        self.assertEqual(page["groups"][0]["section"], ensemble.FOOTNOTES)
+        self.assertFalse(page["groups"][0]["syllabus_start"])
+
+    def test_the_share_is_of_the_group(self):
+        group = ensemble.align_page(
+            read_units((self.FIRST, "The company is global.")),
+            WIDTH,
+            HEIGHT,
+        )[0]
+        group["section"] = ensemble.BODY
+        # A one-line zone over the first line of a long paragraph: the
+        # box the model draws over a heading never covers a paragraph.
+        thin = [50.0, 125.0, 300.0, 140.0]
+
+        self.assertFalse(ensemble.syllabus_start(group, [thin]))
+        self.assertTrue(
+            ensemble.syllabus_start(group, [zone_over(self.FIRST)])
+        )
 
 
 class TestTheQuotedRule(TestCase):

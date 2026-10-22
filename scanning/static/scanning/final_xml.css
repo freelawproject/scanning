@@ -50,6 +50,7 @@
 [data-role="disposition"] { --c: #99cc88; }
 [data-role="history"] { --c: #77bbbb; }
 [data-role="heading"] { --c: #a8b6c2; }
+[data-role="syllabus"] { --c: #c9b27a; }
 
 /* ── The bar: the view toggle and the file links ─────────────────────── */
 .cb-bar {

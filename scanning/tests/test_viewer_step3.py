@@ -375,6 +375,21 @@ class TestTheHandFootnoteBandIsNoZone(SimpleTestCase):
         self.assertIn(".ensemble-zone.ensemble-hand-zone", STYLES.read_text())
 
 
+class TestTheSyllabusZoneIsDrawn(SimpleTestCase):
+    """The box over the heading that opens a syllabus (#518) is drawn
+    like the other zones, with a rule of its own, and takes no hit."""
+
+    def test_the_zone_is_drawn_from_the_page_and_has_a_rule(self):
+        source = VIEWER.read_text()
+        drawn = source[source.index("function drawBoxes(") :]
+        drawn = drawn[: drawn.index("\n    }\n")]
+        self.assertIn("(page.zones || {}).syllabus", drawn)
+        self.assertIn("'ensemble-zone ensemble-syllabus-zone'", drawn)
+        self.assertIn(
+            ".ensemble-zone.ensemble-syllabus-zone", STYLES.read_text()
+        )
+
+
 class TestTheGuideOpensOnAPressAlone(SimpleTestCase):
     """The "?" of the text review opens the guide, and nothing else
     does (#419): the guide of review 2 opens once per session."""

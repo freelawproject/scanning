@@ -2303,7 +2303,7 @@ class TestThePdfCarry(OpinionOcrTestCase):
 BAND = (100, 1600, 1600, 2100)
 
 #: The zones of a page no detection drew on (#399, #411).
-NO_ZONES = {"footnotes": [], "blockquotes": []}
+NO_ZONES = {"footnotes": [], "blockquotes": [], "syllabus": []}
 
 
 def footnote_band(scan, run, page_index, box=BAND) -> Detection:
@@ -2347,7 +2347,11 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
             ]
             self.assertEqual(
                 document["pages"][1]["zones"],
-                {"footnotes": [to_pt(BAND)], "blockquotes": []},
+                {
+                    "footnotes": [to_pt(BAND)],
+                    "blockquotes": [],
+                    "syllabus": [],
+                },
             )
             self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
         manifest = self.uploads[
@@ -2411,6 +2415,105 @@ class TestTheFootnoteZone(OpinionOcrTestCase):
 QUOTE = (260, 700, 800, 900)
 
 
+SYLLABUS_LINE = (280, 380, 820, 440)
+
+
+class TestTheSyllabusZone(OpinionOcrTestCase):
+    """The ``SYLLABUS`` detections of the run, frozen on every page
+    (#518): the box over the heading line that opens a syllabus."""
+
+    def heading(self, page_index, **fields) -> Detection:
+        values = {
+            "apply_run": self.apply_run,
+            "label": opinion_ocr.SYLLABUS_LABEL,
+            "label_id": int(Label.SYLLABUS),
+            "page_index": page_index,
+            "source_page": page_index + 1,
+            "confidence": 0.75,
+            "x0": SYLLABUS_LINE[0],
+            "y0": SYLLABUS_LINE[1],
+            "x1": SYLLABUS_LINE[2],
+            "y1": SYLLABUS_LINE[3],
+            "img_width": IMG_W,
+            "img_height": IMG_H,
+        }
+        values.update(fields)
+        return model_row(self.scan, **values)
+
+    def test_the_box_is_a_zone_in_points_on_every_engine_page(self):
+        self.heading(2)
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in ("dots_mocr", "mistral_ocr"):
+            document = self.uploads[
+                opinion_ocr.engine_key(self.opinion, engine)
+            ]
+            self.assertEqual(
+                document["pages"][1]["zones"],
+                {
+                    "footnotes": [],
+                    "blockquotes": [],
+                    "syllabus": [to_pt(SYLLABUS_LINE)],
+                },
+            )
+            self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
+        manifest = self.uploads[
+            opinion_ocr.engine_key(self.opinion, "manifest")
+        ]
+        counts = manifest["engines"]["dots_mocr"]["counts"]
+        self.assertEqual(counts["syllabus_zones"], 1)
+
+    def test_a_box_in_the_neighbour_s_region_is_no_zone(self):
+        """The next case's syllabus on a shared page: the box sits
+        under the outside mask, like the header above the caption on
+        the first page, and is the neighbour's."""
+        above = {
+            "x0": HEADER[0],
+            "y0": HEADER[1],
+            "x1": HEADER[2],
+            "y1": HEADER[3],
+        }
+        self.heading(1, **above)
+        self.heading(2, **above)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][0]["zones"]["syllabus"], [])
+        self.assertEqual(
+            written["pages"][1]["zones"]["syllabus"], [to_pt(HEADER)]
+        )
+
+    def test_a_low_model_box_is_a_zone_too(self):
+        """No floor: the model draws the box at 0.75 on the SCOTUS
+        volumes, and a curator who disagrees dismisses it."""
+        self.heading(2, confidence=0.3)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["syllabus"], [to_pt(SYLLABUS_LINE)]
+        )
+
+    def test_a_hand_drawn_box_is_a_zone(self):
+        self.heading(2, confidence=1.0, model_name=Detection.ModelName.MANUAL)
+
+        written = self.write()
+
+        self.assertEqual(
+            written["pages"][1]["zones"]["syllabus"], [to_pt(SYLLABUS_LINE)]
+        )
+
+    def test_a_withdrawn_box_is_no_zone(self):
+        row = self.heading(2)
+        row.active = False
+        row.save(update_fields=["active"])
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][1]["zones"], NO_ZONES)
+
+
 class TestTheBlockquoteZone(OpinionOcrTestCase):
     """The ``BLOCKQUOTE`` detections of the run, frozen on every page
     at the confidence floor or above it."""
@@ -2445,7 +2548,11 @@ class TestTheBlockquoteZone(OpinionOcrTestCase):
             ]
             self.assertEqual(
                 document["pages"][1]["zones"],
-                {"footnotes": [to_pt(BAND)], "blockquotes": [to_pt(QUOTE)]},
+                {
+                    "footnotes": [to_pt(BAND)],
+                    "blockquotes": [to_pt(QUOTE)],
+                    "syllabus": [],
+                },
             )
             self.assertEqual(document["pages"][0]["zones"], NO_ZONES)
         manifest = self.uploads[

@@ -37,6 +37,18 @@ CAP element and keep their own name. The spans are read through
 engines read a caption as one block, and the stored spans stay as the
 tagger wrote them. The head matter has no bold (#474).
 
+**The syllabus is the untagged run under its heading (#518).** The
+tagger has no label for it, so :func:`syllabus_range` reads it off two
+signals: the start is the paragraph the ensemble stamped
+``syllabus_start`` (the ``SYLLABUS`` detection over the heading line)
+or a head-matter heading whose words are in :data:`SYLLABUS_HEADINGS`,
+and the end is the first later paragraph that the caption spans cover
+most of (the disposition line, the vote line, the attorneys), else the
+author line. Each paragraph of the run is one ``<syllabus>`` element
+with no span inside it, the CAP shape; the heading keeps its place,
+its page number and its footnote mark. The run is head matter whatever
+:func:`head_matter_end` says.
+
 **The text is the text the tagger read.** The approved text keeps a
 ``\\n`` where a line or a column ended, and a word cut there. The XML
 writes the characters of ``markup.projected_characters``, the rule of
@@ -84,8 +96,9 @@ ELEMENTS = {
 #: The version of the document :func:`build` writes, the ``schema``
 #: attribute of ``<casebody>``. Raise it when the same two inputs give
 #: another XML: the export (``final_xml``, #408) then writes every
-#: stored document again, and CourtListener reads the number.
-SCHEMA = 1
+#: stored document again, and CourtListener reads the number. 2 writes
+#: the syllabus (#518).
+SCHEMA = 2
 
 #: The CAP element that holds a run of ``party`` and ``separator``.
 PARTIES = "parties"
@@ -103,6 +116,23 @@ HEAD_MATTER_LABELS = frozenset({
     "party", "separator", "docketnumber", "court", "datefiled",
     "otherdate", "attorneys", "history",
 })  # fmt: skip
+
+#: The element of a paragraph of the syllabus (#518), the CAP element
+#: CourtListener's importer reads into ``OpinionCluster.syllabus``, one
+#: element per paragraph, which it joins. Not a tagger label.
+SYLLABUS = "syllabus"
+#: The words of a heading that opens a syllabus, folded by
+#: :func:`heading_words`: the Supreme Court Reporter prints the first,
+#: N.W.2d, S.E.2d, F.4th and A.3d the second. A closed table: the
+#: detection opens a syllabus under any other wording.
+SYLLABUS_HEADINGS = frozenset({"syllabus", "syllabus by the court"})
+#: The labels whose spans close the syllabus: a caption line, the vote
+#: line, the disposition. A paragraph they cover :data:`CLOSER_SHARE`
+#: of ends the run; a span that merely appears does not, because a
+#: syllabus paragraph can start with a party name, and the tagger
+#: reads a citation inside the run as ``docketnumber``.
+CLOSER_LABELS = HEAD_MATTER_LABELS | frozenset({JUDGES, "disposition"})
+CLOSER_SHARE = 0.5
 
 #: The element of a citation of the case (#435), the one CourtListener's
 #: importer reads (``import_scanned_opinions.get_citation_strings``).
@@ -541,6 +571,19 @@ def _spans_by_paragraph(body: list[dict], spans: list[dict]) -> dict:
     }
 
 
+def _first_author(body: list[dict], by: dict[int, list[dict]]) -> int:
+    """Return the first paragraph with an ``author`` span, or the
+    length of the body when none has one."""
+    return next(
+        (
+            index
+            for index in sorted(by)
+            if any(span["label"] == AUTHOR for span in by[index])
+        ),
+        len(body),
+    )
+
+
 def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     """Return the index of the first paragraph of the opinion.
 
@@ -558,14 +601,7 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
     :returns: The index.
     :rtype: int
     """
-    author = next(
-        (
-            index
-            for index in sorted(by)
-            if any(span["label"] == AUTHOR for span in by[index])
-        ),
-        len(body),
-    )
+    author = _first_author(body, by)
     run = 0
     while run < author and run in by:
         run += 1
@@ -584,6 +620,173 @@ def head_matter_end(body: list[dict], by: dict[int, list[dict]]) -> int:
         )
     ]
     return max(run, caption[-1] + 1) if caption else run
+
+
+# ── The syllabus (#518) ─────────────────────────────────────────────
+_LETTERS = re.compile(r"[^a-z]+")
+
+
+def heading_words(text: str | None) -> str:
+    """Return the words of a text, letters alone, one space between
+    them: "Syllabus *" and "SYLLABUS." both read ``syllabus``."""
+    return " ".join(_LETTERS.sub(" ", (text or "").lower()).split())
+
+
+def is_syllabus_heading(text: str | None) -> bool:
+    """Return whether a text is the heading that opens a syllabus, by
+    its words (:data:`SYLLABUS_HEADINGS`). The one test of the words,
+    read by :func:`syllabus_range` and by the ensemble's card
+    (``ensemble.syllabus_doubts``, #518)."""
+    return heading_words(text) in SYLLABUS_HEADINGS
+
+
+def _heading_words(paragraph: dict) -> str:
+    return heading_words(paragraph.get("text"))
+
+
+def _is_heading(paragraph: dict, spans: list[dict]) -> bool:
+    """Return whether a paragraph is a heading: by its kind, or by a
+    ``heading`` span that covers it whole."""
+    if paragraph.get("kind") == markup.HEADING:
+        return True
+    text = paragraph.get("text") or ""
+    return any(
+        span["label"] == HEADING and _covers(text, span["start"], span["end"])
+        for span in spans
+    )
+
+
+def _closer_share(paragraph: dict, spans: list[dict]) -> float:
+    """Return the share of a paragraph's characters that spans of
+    :data:`CLOSER_LABELS` cover.
+
+    A ``heading`` span counts beside a closer label: on a caption line
+    in capitals or italics the model changes the label word by word
+    (the flicker of :func:`_one_caption_label`), and reads "Appeal
+    from the Circuit Court of Mercer County, The Honorable ..., Judge,
+    Civil Action No. ..." as ``heading`` then ``history``. The
+    syllabus paragraphs carry no span, so a heading span alone, with
+    no caption label beside it, is a heading and closes nothing.
+    """
+    length = len((paragraph.get("text") or "").strip(_EDGE))
+    if not length:
+        return 0.0
+    labels = CLOSER_LABELS
+    if any(span["label"] in CLOSER_LABELS for span in spans):
+        labels = CLOSER_LABELS | {HEADING}
+    covered = sum(
+        max(0, span["end"] - span["start"])
+        for span in spans
+        if span["label"] in labels
+    )
+    return min(covered / length, 1.0)
+
+
+def _bound(body: list[dict], by: dict[int, list[dict]], split: int) -> int:
+    """Return the paragraph the syllabus can never reach.
+
+    The first author line when it is the majority's. A per curiam has
+    no author line, and its first ``author`` span is a dissent's
+    (:func:`head_matter_end`), so the bound is then ``split``, the end
+    of the head matter: a stamp or a heading inside the per curiam's
+    own text opens nothing, and a run with no closer never takes the
+    majority for the syllabus.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph.
+    :param split: :func:`head_matter_end`.
+    :rtype: int
+    """
+    author = _first_author(body, by)
+    if author == len(body):
+        return split
+    words = role_text(body, by, author)
+    if _type_of(words, OPINION_TYPES) in SEPARATE_TYPES:
+        return split
+    return author
+
+
+def syllabus_range(
+    body: list[dict], by: dict[int, list[dict]], split: int
+) -> range:
+    """Return the paragraphs of the syllabus, empty for none.
+
+    **The start** is the first paragraph before :func:`_bound` that the
+    ensemble stamped ``syllabus_start`` (the ``SYLLABUS`` detection of
+    the run, or a curator's box in review 2), or that is a heading
+    whose words are in :data:`SYLLABUS_HEADINGS`, and whose run holds a
+    paragraph: a stamped caption line closes itself and falls through
+    to the heading below. A start with those
+    words is the heading: it keeps its place, with its page number and
+    its footnote mark, and the run begins after it. A stamped start
+    with other words is the first paragraph of the syllabus itself (a
+    box a curator drew over the text), and the run begins at it.
+
+    **The end** is the first later paragraph that spans of
+    :data:`CLOSER_LABELS` cover :data:`CLOSER_SHARE` of: the
+    disposition line, the vote line or the attorneys. With no such
+    paragraph the run ends at the bound: the majority's author line,
+    or the end of the head matter when there is none, so a syllabus
+    never runs into an opinion the spans do not mark off.
+
+    :param body: The body paragraphs.
+    :param by: The spans of each paragraph (:func:`_spans_by_paragraph`).
+    :param split: :func:`head_matter_end`.
+    :returns: The range of the syllabus paragraphs.
+    :rtype: range
+    """
+    bound = _bound(body, by, split)
+    starts = [
+        index
+        for index, paragraph in enumerate(body[:bound])
+        if paragraph.get("syllabus_start")
+        or (
+            _is_heading(paragraph, by.get(index, []))
+            and _heading_words(paragraph) in SYLLABUS_HEADINGS
+        )
+    ]
+    # The first start whose run holds a paragraph: a box drawn a line
+    # high stamps the caption line above the heading, which closes
+    # itself, and the heading below it opens the run instead.
+    for start in starts:
+        heading = _heading_words(body[start]) in SYLLABUS_HEADINGS
+        first = start + 1 if heading else start
+        end = next(
+            (
+                index
+                for index in range(first, bound)
+                if _closer_share(body[index], by.get(index, []))
+                >= CLOSER_SHARE
+            ),
+            bound,
+        )
+        if end > first:
+            return range(first, end)
+    return range(0)
+
+
+def _syllabus_paragraph(
+    paragraph: dict, labels: frozenset[str], breaks: dict[int, str]
+) -> tuple[str, str]:
+    """Write one paragraph of the syllabus: a ``syllabus`` element
+    with the text's marks and page numbers, no span inside it and no
+    list item, the CAP shape. A picture or a table keeps its element."""
+    plain = dict(
+        paragraph,
+        kind=(
+            paragraph["kind"]
+            if paragraph.get("kind") in (markup.FIGURE, markup.TABLE)
+            else "paragraph"
+        ),
+        blockquote=False,
+        marks=[
+            mark
+            for mark in paragraph.get("marks") or []
+            if mark.get("kind") != markup.ITEM
+        ],
+    )
+    name, inner = _paragraph(plain, [], labels, breaks)
+    return (SYLLABUS if name == "p" else name), inner
 
 
 # ── The repair of the spans (#474) ──────────────────────────────────
@@ -1354,6 +1557,9 @@ def build(
     )
     by = _spans_by_paragraph(body, spans)
     split = head_matter_end(body, by)
+    syllabus = syllabus_range(body, by, split)
+    # The syllabus is head matter wherever the caption ends.
+    split = max(split, syllabus.stop) if syllabus else split
     body = _plain_head_matter(body, split)
     notes = approved.get("footnotes") or []
     labels = frozenset(
@@ -1377,12 +1583,17 @@ def build(
     blocks: list[tuple[str, str]] = []
     last_page = None
     for index, paragraph in enumerate(body):
-        name, inner = _paragraph(
-            paragraph,
-            by.get(index, []),
-            labels,
-            breaks_of(paragraph, last_page),
-        )
+        if index in syllabus:
+            name, inner = _syllabus_paragraph(
+                paragraph, labels, breaks_of(paragraph, last_page)
+            )
+        else:
+            name, inner = _paragraph(
+                paragraph,
+                by.get(index, []),
+                labels,
+                breaks_of(paragraph, last_page),
+            )
         blocks.append((name, inner))
         pages = paragraph.get("pages") or []
         if pages:
@@ -1404,7 +1615,12 @@ def build(
             at += 1
         return out
 
-    cited = citation_paragraphs(body, by, split)
+    # A syllabus paragraph is the syllabus, whatever eyecite reads in it.
+    cited = [
+        index
+        for index in citation_paragraphs(body, by, split)
+        if index not in syllabus
+    ]
     cites = [_escape(citation)] if citation else []
     # The printed characters alone: a citation is a string the importer
     # hands eyecite, and a bold or an italic adds nothing to it.

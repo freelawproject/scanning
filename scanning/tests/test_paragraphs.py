@@ -269,6 +269,30 @@ class TestTheBody(TestCase):
 
         self.assertEqual(len(paragraphs.body(doc)), 2)
 
+    def test_a_syllabus_start_never_joins_and_carries_its_stamp(self):
+        """A box over the first syllabus paragraph (#518): the join
+        would hide the start inside the paragraph above."""
+        doc = document(
+            page(
+                0,
+                [
+                    group(0, "the sentence goes on and"),
+                    group(1, "on here", column="R", syllabus_start=True),
+                    group(2, "then this", column="R"),
+                ],
+            )
+        )
+
+        entries = paragraphs.body(doc)
+
+        self.assertEqual(
+            [e["text"] for e in entries],
+            ["the sentence goes on and", "on here", "then this"],
+        )
+        self.assertEqual(
+            [e["syllabus_start"] for e in entries], [False, True, False]
+        )
+
     def test_a_blockquote_joins_a_blockquote_alone(self):
         doc = document(
             page(
