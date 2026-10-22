@@ -172,6 +172,99 @@ def _t_box(
     )
 
 
+def _trailing_digits(
+    bw: np.ndarray, mark: Mark, scale: float = 1.0
+) -> tuple[int, int, int, int] | None:
+    """For a mark inside a word, the box of the page number printed
+    after the word (``pan⊥demic],754``): the first run of subscript
+    glyphs before the first word space to the right of the stem.
+
+    Measured at 200 dpi against the bar's row: letters' feet sit 7-8 px
+    above it, the digits reach from 15 px above to 2 px above, so they
+    hang below the letters and are 10-19 px tall (``290`` and ``224``
+    are 18); a descender hangs but is twice as tall; a comma hangs but
+    is half as tall.
+
+    :returns: ``(left, top, right, bottom)``, or None for no number.
+    """
+    x, y, w, _h, _stem = mark  # the bar's box; the stem comes from _t_box
+    s = scale
+    rows = int(STEM_ROWS * s)
+    top0 = y - rows
+    _, _, start, _ = _t_box(bw, mark, s)
+    span = bw[top0 : y + int(2 * s), start : start + int(220 * s)].copy() > 0
+    span[rows - 1 :, : max(0, x + w + int(2 * s) - start)] = False  # the bar
+    ink = span.any(axis=0)
+    runs: list[tuple[int, int, int, int]] = []
+    c = 0
+    while c < len(ink):
+        if not ink[c]:
+            g = c
+            while c < len(ink) and not ink[c]:
+                c += 1
+            if runs and c - g >= int(5 * s):
+                break  # a word space: the number comes before it
+            continue
+        a = c
+        while c < len(ink) and ink[c]:
+            c += 1
+        r = np.where(span[:, a:c].any(axis=1))[0]
+        # Top and bottom relative to the bar row.
+        runs.append((a, c, int(r[0]) - rows, int(r[-1]) - rows))
+
+    def ok(a, b, t, bot) -> bool:
+        """A number: top 19 to 11 px above the bar row, bottom within
+        6 px above it or 3 below, 10-19 px tall, up to four digits
+        wide."""
+        return (
+            -int(9.5 * s) <= t <= -int(5.5 * s)
+            and -int(3 * s) <= bot <= int(1.5 * s)
+            and int(5 * s) <= bot - t + 1 <= int(9.5 * s)
+            and int(2.5 * s) <= b - a <= int(20 * s)
+        )
+
+    def digit_part(run):
+        """The run if it is a number, else its tail after the last
+        column of letter height (the first digit usually touches the
+        letter before it), else None."""
+        a, b, t, bot = run
+        if ok(a, b, t, bot):
+            return (a, b, t, bot)
+        tops = [
+            int(np.argmax(span[:, i])) - rows if span[:, i].any() else 0
+            for i in range(a, b)
+        ]
+        letter_cols = [i for i, tp in enumerate(tops) if tp <= -int(10 * s)]
+        if not letter_cols:
+            return None
+        a2 = a + letter_cols[-1] + 1
+        if a2 >= b:
+            return None
+        r = np.where(span[:, a2:b].any(axis=1))[0]
+        t2, bot2 = int(r[0]) - rows, int(r[-1]) - rows
+        return (a2, b, t2, bot2) if ok(a2, b, t2, bot2) else None
+
+    for i, run in enumerate(runs):
+        part = digit_part(run)
+        if part is None:
+            continue
+        left, right, t, bot = part
+        j = i + 1
+        while j < len(runs) and runs[j][0] - right < int(2.5 * s):
+            nxt = digit_part(runs[j])
+            if nxt is None or nxt[0] != runs[j][0]:
+                break
+            right, t, bot = nxt[1], min(t, nxt[2]), max(bot, nxt[3])
+            j += 1
+        return (
+            start + left - int(1.5 * s),
+            y + t - int(1.5 * s),
+            start + right + int(1.5 * s),
+            y + bot + int(1.5 * s),
+        )
+    return None
+
+
 def _whiteout(
     image: np.ndarray, found: list[Mark], scale: float = 1.0
 ) -> np.ndarray:
@@ -181,8 +274,9 @@ def _whiteout(
     digits from the stem rightward to the first blank column after the
     digits, capped a few pixels past the bar's end, because the digits
     often touch the next word. Inside a word: the T alone, stem columns
-    and bar rows, so the letters on both sides and the number after the
-    word stay as printed."""
+    and bar rows, so the letters on both sides stay as printed, and the
+    number printed after the word (:func:`_trailing_digits`), which
+    would otherwise ride into the read glued to the word."""
     out = image.copy()
     bw = _binarize(image)
     m = max(1, int(round(scale)))
@@ -199,6 +293,10 @@ def _whiteout(
             cv2.rectangle(
                 out, (x - 2 * m, y - m), (x + w + m, bottom), white, -1
             )  # the bar
+            digits = _trailing_digits(bw, mark, scale)
+            if digits:
+                # The number after the word.
+                cv2.rectangle(out, digits[:2], digits[2:], white, -1)
             continue
         cv2.rectangle(
             out, (x - 4 * m, y - m), (x + w + m, y + h + m), white, -1
