@@ -353,6 +353,35 @@ class TestClaimPriority(TestCase):
         self.assertEqual(claimed, [waiting.pk, upload.pk, fresh.pk])
 
 
+class TestStaleSweepRace(TestCase):
+    """The sweep's cutoff stays in the UPDATE (#503)."""
+
+    def test_a_claim_refreshed_after_the_read_is_not_requeued(self):
+        """Two workers sweep at once: one re-queues the stale scan, a
+        third claims it with a fresh stamp, and the other sweep's
+        write must not take that claim back."""
+        from django.db.models import QuerySet
+
+        from scanning.management.commands import process_next_scan
+
+        old = timezone.now() - timedelta(hours=2)
+        stale = ScanFactory(status=Status.PROCESSING)
+        fresh = ScanFactory(status=Status.PROCESSING)
+        Scan.objects.filter(pk=stale.pk).update(processed_at=old)
+        Scan.objects.filter(pk=fresh.pk).update(processed_at=timezone.now())
+        # The read saw both as stale; by the write, ``fresh`` was
+        # claimed again.
+        with patch.object(
+            QuerySet, "values_list", return_value=[stale.pk, fresh.pk]
+        ):
+            process_next_scan.recover_stale()
+        stale.refresh_from_db()
+        fresh.refresh_from_db()
+        self.assertEqual(stale.status, Status.QUEUED)
+        self.assertEqual(fresh.status, Status.PROCESSING)
+        self.assertEqual(fresh.interruption_count, 0)
+
+
 class TestHeartbeat(TestCase):
     """A running action stamps its claim (#503)."""
 
