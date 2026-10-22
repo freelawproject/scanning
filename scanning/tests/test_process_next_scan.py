@@ -388,7 +388,7 @@ class TestHeartbeat(TestCase):
                 "stamp_heartbeat",
                 side_effect=lambda pk, action=None: beats.append(pk) or 1,
             ),
-            patch("django.db.connection.close"),
+            patch.object(process_next_scan, "close_thread_connection"),
         ):
             with process_next_scan.heartbeat(7, interval=0.01):
                 time.sleep(0.1)
@@ -397,6 +397,37 @@ class TestHeartbeat(TestCase):
         self.assertGreater(count, 2)
         self.assertEqual(set(beats), {7})
         self.assertEqual(len(beats), count)
+
+    def test_a_failed_beat_closes_its_connection_and_beats_again(self):
+        """A dropped session would fail every later beat the same way."""
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        outcomes = iter([RuntimeError("closed"), 1, 1, 1, 1, 1, 1, 1, 1, 1])
+
+        def stamp(pk, action=None):
+            result = next(outcomes, 1)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        with (
+            patch.object(
+                process_next_scan, "stamp_heartbeat", side_effect=stamp
+            ),
+            patch.object(
+                process_next_scan, "close_thread_connection"
+            ) as close,
+            self.assertLogs(
+                "scanning.management.commands.process_next_scan",
+                level="WARNING",
+            ),
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.08)
+        # Once after the failed beat, once when the block ended.
+        self.assertEqual(close.call_count, 2)
 
     def test_the_dispatch_runs_the_action_under_a_heartbeat(self):
         from scanning.management.commands import process_next_scan

@@ -223,6 +223,17 @@ def _claim_filter(scan_pk: int, action: str | None) -> dict:
     return where
 
 
+def close_thread_connection() -> None:
+    """Close the calling thread's database connection, so its next
+    query opens a fresh one.
+
+    :return: None.
+    """
+    from django.db import connection
+
+    connection.close()
+
+
 def stamp_heartbeat(scan_pk: int, action: str | None = None) -> int:
     """Refresh the claim stamp of a scan still PROCESSING for ``action``.
 
@@ -249,16 +260,17 @@ def heartbeat(
 
     The thread has a database connection of its own (Django's are per
     thread) and closes it when the block ends. A failed stamp is logged
-    and the next one is tried: the sweep tolerates a missed beat, and
-    an action must never die of its own heartbeat.
+    and its connection closed, so the next beat opens a fresh one: a
+    session dropped under a long action (a failover, an idle kill)
+    would otherwise fail every later beat the same way, and the sweep
+    would take the live scan. The sweep tolerates a missed beat, and an
+    action must never die of its own heartbeat.
 
     :param scan_pk: The claimed scan.
     :param interval: Seconds between beats; ``HEARTBEAT_SECONDS``.
     :param action: The action it was claimed for; see :func:`_claim_filter`.
     :return: A context manager.
     """
-    from django.db import connection
-
     stop = threading.Event()
     period = HEARTBEAT_SECONDS if interval is None else interval
 
@@ -275,8 +287,9 @@ def heartbeat(
                         period,
                         exc_info=True,
                     )
+                    close_thread_connection()
         finally:
-            connection.close()
+            close_thread_connection()
 
     thread = threading.Thread(
         target=beat, name=f"heartbeat-{scan_pk}", daemon=True
