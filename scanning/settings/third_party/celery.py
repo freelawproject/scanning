@@ -65,6 +65,8 @@ CELERY_QUEUE_MAX_DEPTH = env.int("CELERY_QUEUE_MAX_DEPTH", default=500)
 CELERY_TASK_DEFAULT_QUEUE = "fast"
 CELERY_TASK_CREATE_MISSING_QUEUES = True
 CELERY_TIMEZONE = "UTC"
-#: The worker reopens the connection per task; the daemon did the same
-#: with ``connections.close_all()`` per tick.
+#: Logging is Django's ``LOGGING`` alone. Off, Celery leaves the root
+#: logger's handlers in place; it would still add one of its own, so
+#: ``scanning.celery_init`` answers its ``setup_logging`` signal with
+#: nothing, or every record is written twice.
 CELERY_WORKER_HIJACK_ROOT_LOGGER = False

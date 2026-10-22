@@ -89,6 +89,16 @@ class TestTicks(TestCase):
         ):
             self.assertFalse(tick.send())
 
+    def test_celery_leaves_logging_to_django(self):
+        """A receiver on ``setup_logging`` is what stops Celery from
+        adding its handler to the root logger beside Django's."""
+        from celery.signals import setup_logging
+
+        from scanning import celery_init
+
+        self.assertTrue(setup_logging.has_listeners())
+        self.assertTrue(callable(celery_init._leave_logging_to_django))
+
     def test_every_task_is_registered_on_the_app(self):
         from scanning.celery_init import app
 

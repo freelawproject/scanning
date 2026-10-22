@@ -27,9 +27,24 @@ The queues (``scanning.tasks``):
 import os
 
 from celery import Celery
+from celery.signals import setup_logging
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "scanning.settings")
 
 app = Celery("scanning")
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks(["scanning"])
+
+
+@setup_logging.connect
+def _leave_logging_to_django(**kwargs) -> None:
+    """Keep Celery's handler off the root logger.
+
+    A receiver on this signal is what tells Celery not to configure
+    logging at all; ``worker_hijack_root_logger=False`` alone only
+    keeps Django's handlers, beside Celery's own, and every record is
+    then written twice. Django's ``LOGGING`` is the one configuration.
+
+    :param kwargs: The signal's arguments, unused.
+    :return: None.
+    """
