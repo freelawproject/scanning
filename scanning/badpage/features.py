@@ -685,11 +685,45 @@ def _init(path):
     _DOC = fitz.open(path)
 
 
-def _work(pageno):
+def _render(doc, pageno):
+    """Return the grey render of a page, the image every measure reads."""
     import fitz
-    pix = _DOC[pageno - 1].get_pixmap(dpi=DPI, colorspace=fitz.csGRAY)
-    gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
-    return pageno, page_features(gray)
+    pix = doc[pageno - 1].get_pixmap(dpi=DPI, colorspace=fitz.csGRAY)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
+
+
+def _work(pageno):
+    return pageno, page_features(_render(_DOC, pageno))
+
+
+def in_process() -> bool:
+    """Return whether this process must measure without a pool (#519).
+
+    A daemonic process may not start a child: the stdlib refuses the
+    pool with ``daemonic processes are not allowed to have children``.
+    A Celery prefork child is one, so the score would fail there on
+    every volume; the daemon's own process is not.
+
+    :returns: Whether the current process is daemonic.
+    :rtype: bool
+    """
+    return bool(mp.current_process().daemon)
+
+
+def _features_in_process(path):
+    """Measure every page in this process, one open document, no pool.
+
+    :param path: The PDF to measure.
+    :returns: The features of every page, keyed by 1-based page.
+    :rtype: dict[int, dict]
+    """
+    import fitz
+
+    rows = {}
+    with fitz.open(path) as doc:
+        for pageno in range(1, len(doc) + 1):
+            rows[pageno] = page_features(_render(doc, pageno))
+    return rows
 
 
 def features_of_pdf(path, jobs=None):
@@ -697,15 +731,21 @@ def features_of_pdf(path, jobs=None):
 
     One worker process per CPU by default, each with its own open
     document; the pool is the parallelism, so OpenCV runs one thread
-    per worker.
+    per worker. With ``jobs`` of 1, or in a process that may not have
+    children (:func:`in_process`), the pages are measured here, one
+    after the other: the same render and the same measures, so the
+    scores are the pool's.
 
     :param path: The PDF to measure.
-    :param jobs: Worker processes; None is the CPU count.
+    :param jobs: Worker processes; None is the CPU count, 1 is this
+        process alone.
     :returns: The features of every page, keyed by 1-based page.
     :rtype: dict[int, dict]
     """
     import fitz
 
+    if jobs == 1 or in_process():
+        return _features_in_process(path)
     with fitz.open(path) as doc:
         n = len(doc)
     rows = {}

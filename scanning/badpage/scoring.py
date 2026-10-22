@@ -129,7 +129,8 @@ def score_pdf(path, jobs: int | None = None) -> dict[int, float]:
     entry point.
 
     :param path: The PDF to score, the review-1 bitonal copy.
-    :param jobs: Worker processes for the render; None is the CPU count.
+    :param jobs: Worker processes for the render; None is the CPU count,
+        1 is this process alone (``features.features_of_pdf``).
     :returns: ``{page: score}``, scores rounded to four places.
     :rtype: dict[int, float]
     """
