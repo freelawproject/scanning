@@ -376,8 +376,11 @@
             }
             self.approved = true;
             self.node.classList.add('bk-approved');
-            self.cardsNode.replaceChildren(note(answer.data.message || 'Approved.', 'ok'));
-            self.metaNode.textContent = 'approved';
+            // The approval stands either way; a warning says the
+            // tagger did not start, and the review page is the retry.
+            var warned = answer.data.level === 'warning';
+            self.cardsNode.replaceChildren(note(answer.data.message || 'Approved.', warned ? 'warn' : 'ok'));
+            self.metaNode.textContent = warned ? 'approved, tagger not started' : 'approved';
             countAll();
             focusNextCard();
         });
@@ -419,6 +422,11 @@
             }
             self.approved = true;
             self.node.classList.add('bk-approved');
+            if (answer.data.level === 'warning') {
+                self.state.textContent = answer.data.message || 'approved, tagger not started';
+                self.state.classList.add('bk-warn');
+                return;
+            }
             self.state.textContent = 'approved';
             self.state.classList.add('bk-ok');
         });

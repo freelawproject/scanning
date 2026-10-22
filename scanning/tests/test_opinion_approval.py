@@ -623,6 +623,7 @@ class TestTheEndpoints(ApprovalTestCase, ScanningTestCase):
         self.assertEqual(
             message, f"{APPROVED_TEXT_MESSAGE} {TAG_STARTED_MESSAGE}"
         )
+        self.assertEqual(response.json()["level"], "success")
         self.assertEqual(self.said(response), [(messages.SUCCESS, message)])
 
     @override_settings(**{**TAGGER, "RUNPOD_TAGGER_ENDPOINT_ID": ""})
@@ -663,6 +664,31 @@ class TestTheEndpoints(ApprovalTestCase, ScanningTestCase):
         message = response.json()["message"]
         self.assertTrue(message.startswith(APPROVED_TEXT_MESSAGE))
         self.assertIn("no body", message)
+        self.assertEqual(response.json()["level"], "warning")
+        self.assertEqual(self.said(response), [(messages.WARNING, message)])
+
+    @override_settings(**TAGGER)
+    def test_an_unexpected_fault_of_the_tagger_keeps_the_approval(self):
+        """The bucket's HEAD, its PUT and the row creation are not the
+        two errors the start reads: any of them after the swap is a
+        warning, never a 500 that reads as a failed approval."""
+        self.dismiss_blocking()
+
+        with patch(
+            "scanning.tagger.ensure_tag_jobs",
+            side_effect=RuntimeError("throttled"),
+        ):
+            response = self.post("approve_opinion_text")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["level"], "warning")
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        message = response.json()["message"]
+        self.assertTrue(message.startswith(APPROVED_TEXT_MESSAGE))
+        self.assertNotIn("throttled", message)
         self.assertEqual(self.said(response), [(messages.WARNING, message)])
 
     @override_settings(**TAGGER)

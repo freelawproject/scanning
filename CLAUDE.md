@@ -145,7 +145,7 @@ State is `Scan.status`. The stages, and where each runs:
 - Row writes are compare-and-swaps (`jobs._write`); no lock is held across an HTTP call. The rival writer is the web process (`abandon_open` from the re-queue, the deletion, `start_dots_mocr`)
 - Mark the row SUBMITTED before the request. Doctor is sync: a lost answer is recovered with an S3 HEAD on `result_key` (`sweep_jobs`), never by a resubmit. `result_key` is scoped to run, shard and attempt
 - Intake has no cap, and the queue ceiling (`DAEMON_JOB_MAX_QUEUE_SECONDS`) is stamped at the attempt's first claim, not at row creation (#218). Never restore one without the other. The `IN_PROGRESS` crossing replaces it with the execution deadline; a defer (409/429) costs no attempt and moves no deadline
-- `abandon_open` is scoped by stage and every caller passes CONVERT. COMPLETED is in `OPEN_JOB_STATUSES`, so an unscoped call cancels paid results. Only the admin deletion cancels a detect run
+- `abandon_open` is scoped by stage and every caller passes CONVERT, but the tagger, which scopes it by `opinion` and by the open statuses alone (`tagger.abandon_run`, #499) to replace a run over an earlier approved text. COMPLETED is in `OPEN_JOB_STATUSES`, so an unscoped call cancels paid results. Only the admin deletion cancels a detect run
 - A RunPod job nothing will read is cancelled (`_cancel_provider_job`), including a job whose id arrives after the row was cancelled
 - Results go to S3 through a presigned PUT signed with the content type (`application/json`, `application/pdf`), never inline. A summary carries no `pages`
 - `poll_once` never raises and never sleeps; `status=None` means "learned nothing". A 404 from `/status` asks S3 before it writes the job off

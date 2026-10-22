@@ -1255,6 +1255,15 @@ class TestTheBlockingPage(ScanningTestCase):
             chain.index("confirmApproval("), chain.index("button.disabled")
         )
 
+    def test_the_script_shows_a_tagger_fault_as_a_warning(self):
+        """The approval answers ``level`` (#499), and both approve
+        paths of the page read it: a fault of the tagger is never
+        drawn in the success tone."""
+        source = SCRIPT.read_text()
+        self.assertEqual(source.count("answer.data.level === 'warning'"), 2)
+        self.assertIn("warned ? 'warn' : 'ok'", source)
+        self.assertIn("self.state.classList.add('bk-warn')", source)
+
     def test_the_warnings_page_lists_the_opinions_with_a_warning(self):
         """The one with a warning alone is listed, the one with a
         blocking card alone is not, nothing is ready, and the cards

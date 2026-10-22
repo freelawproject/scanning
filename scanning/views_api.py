@@ -2091,8 +2091,10 @@ def approve_opinion_text(
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :param opinion_pk: The ``Opinion`` primary key.
-    :return: ``{status, message}``; 404 for an opinion of another scan,
-        400 for a body the page does not send, 409 for a refusal.
+    :return: ``{status, message, key, level}``, where ``level`` is
+        ``warning`` when the tagger did not start; 404 for an opinion of
+        another scan, 400 for a body the page does not send, 409 for a
+        refusal.
     """
     from scanning import opinion_review, s3_sync, tagger
 
@@ -2138,17 +2140,40 @@ def approve_opinion_text(
     # row holds the status and the key it wrote. A fault of the tagger
     # is a line beside the approval and never a refusal, because the
     # approval stands; its retry is the button of the review page.
+    # Any fault: the bucket's HEAD and PUT of the input and the row
+    # creation are not the two errors the helper reads, and a 500 here
+    # would read as an approval that failed.
     opinion.status = OpinionReviewStatus.TEXT_REVIEW_DONE
     opinion.approved_text_key = key
     message = APPROVED_TEXT_MESSAGE
     level = messages.SUCCESS
     if tagger.enabled():
-        tagged, line = _tag_approved_text(request, opinion)
+        try:
+            tagged, line = _tag_approved_text(request, opinion)
+        except Exception:
+            logger.exception(
+                "%s of scan %s: the tagger did not start after the "
+                "approval by %s",
+                opinion,
+                pk,
+                request.user,
+            )
+            tagged = False
+            line = TAG_FAILED_MESSAGE.format(reason="an unexpected fault")
         message = f"{APPROVED_TEXT_MESSAGE} {line}"
         if not tagged:
             level = messages.WARNING
     messages.add_message(request, level, message)
-    return JsonResponse({"status": "ok", "message": message, "key": key})
+    # ``level`` is for a page that shows the answer without a reload
+    # (the blocking review): a tagger fault must not read as a success.
+    return JsonResponse(
+        {
+            "status": "ok",
+            "message": message,
+            "key": key,
+            "level": "warning" if level == messages.WARNING else "success",
+        }
+    )
 
 
 @login_required
@@ -2192,6 +2217,10 @@ def _tag_approved_text(
     set of rules. The gate: an approved text, the switches of the
     stage, the bucket, and a state of ``tagger.state`` that a start can
     move (no run, a dead one, or a run over an earlier approved text).
+    A run in flight holds the start only while it reads this text
+    (``tagger.describes``): one over an earlier text is cancelled
+    (``tagger.abandon_run``) and replaced, or the new text would wait
+    on a glue that ends in ``TextMoved`` and never be tagged.
 
     A start that finds its result paid for already starts no job: a
     second approval of the same text, a result carried from an earlier
@@ -2216,11 +2245,17 @@ def _tag_approved_text(
     if not s3_sync.s3_active():
         return False, ENSEMBLE_BUCKET_MESSAGE
     state = tagger.state(opinion)
-    if state == tagger.RUNNING:
-        return False, TAG_RUNNING_MESSAGE
     if state == tagger.DONE:
         return False, TAG_DONE_MESSAGE
     try:
+        if state == tagger.RUNNING:
+            live = tagger.live_tag_jobs(opinion)
+            if live and tagger.describes(live[0], opinion):
+                return False, TAG_RUNNING_MESSAGE
+            tagger.abandon_run(
+                opinion,
+                f"replaced by a run over {opinion.approved_text_key}",
+            )
         rows = tagger.ensure_tag_jobs(opinion)
     except tagger.TaggerInputError as exc:
         logger.warning(

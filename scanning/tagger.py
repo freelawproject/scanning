@@ -362,6 +362,50 @@ def ensure_tag_jobs(
     )
 
 
+def describes(row: ExternalJob, opinion: Opinion) -> bool:
+    """Return whether a row's run read the text the opinion holds now.
+
+    The test :func:`glue_run` makes before it places, made ahead of a
+    start (#499): a run in flight over an earlier approved text is no
+    reason to wait, because its glue ends in :class:`TextMoved`, and
+    the new text would stay untagged.
+
+    :param row: A row of the opinion's live run.
+    :param opinion: The row's opinion, with ``approved_text_key``.
+    :returns: Whether the digest of the row's identity is the digest
+        of the approved text's projection.
+    :rtype: bool
+    :raises TaggerInputError: If the approved text does not load.
+    """
+    approved = load_approved(opinion.approved_text_key)
+    digest = text_digest(project(approved).text)
+    return digest == (row.input_manifest or {}).get("digest")
+
+
+def abandon_run(opinion: Opinion, reason: str) -> int:
+    """Cancel the open rows of one opinion's tagger run (#499).
+
+    ``jobs.abandon_open`` scoped by opinion and by the statuses a job
+    is still owed under: a ``COMPLETED`` row is a paid result and
+    stays, because a later approval of its text carries it. Called
+    before a new run over another text, so the wave pays nothing for a
+    job nothing will read.
+
+    :param opinion: The opinion whose run is replaced.
+    :param reason: Recorded on each row.
+    :returns: How many rows were cancelled.
+    :rtype: int
+    """
+    return jobs.abandon_open(
+        opinion.scan_id,
+        reason,
+        stage=STAGE,
+        engine=ENGINE,
+        statuses=frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES,
+        opinion=opinion,
+    )
+
+
 def live_tag_jobs(opinion: Opinion) -> list[ExternalJob]:
     """Return the opinion's live tagger run.
 
