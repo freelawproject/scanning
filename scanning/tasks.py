@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from celery.signals import worker_ready
 from django.conf import settings
 from django.core.management import call_command
-from django.db import connections, transaction
+from django.db import OperationalError, connections, transaction
 
 from scanning import locks
 from scanning.celery_init import app
@@ -177,6 +177,43 @@ def _fresh_connection() -> None:
     connections.close_all()
 
 
+#: A fresh TCP and TLS connection per task, so an occasional connect
+#: failure (a lost close_notify on a Postgres or pgbouncer blip) is
+#: expected and retried, as the tick commands did (#116).
+MAX_DB_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 0.5
+
+
+def db_retried(fn):
+    """Retry the body on a transient database error, then give up
+    with a warning and no exception: a self-healing blip must not be
+    an ERROR event, and the next tick runs the pass again.
+
+    :param fn: A task body that returns a count.
+    :returns: The wrapped body.
+    """
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        for attempt in range(MAX_DB_RETRIES):
+            try:
+                return fn(*args, **kwargs)
+            except OperationalError as exc:
+                if attempt == MAX_DB_RETRIES - 1:
+                    logger.warning(
+                        "%s: DB connection failed after %d attempts: %s",
+                        fn.__name__,
+                        attempt + 1,
+                        exc,
+                    )
+                    return 0
+                time.sleep(RETRY_BACKOFF_SECONDS * (attempt + 1))
+                _fresh_connection()
+        return 0
+
+    return run
+
+
 def locked(name: str):
     """Run the task body under the named advisory lock, or skip it.
 
@@ -198,7 +235,7 @@ def locked(name: str):
                     return 0
                 return fn(*args, **kwargs)
 
-        return run
+        return db_retried(run)
 
     return decorate
 
@@ -207,6 +244,7 @@ def locked(name: str):
 
 
 @app.task(name="scanning.tasks.claim_scans", queue=QUEUE_HEAVY)
+@db_retried
 def claim_scans() -> int:
     """Recover the stale claims, then claim and run one queued scan.
 
@@ -417,6 +455,7 @@ def build_opinion_pdfs() -> int:
 
 
 @app.task(name="scanning.tasks.cleanup_tmp", queue=QUEUE_FAST)
+@db_retried
 def cleanup_tmp() -> int:
     """Sweep this pod's stale processing directories. The daemon sends
     one per queue, because every pod has its own ``/tmp``; the
@@ -593,6 +632,7 @@ def _nudge_after(action: str) -> None:
 
 
 @app.task(name="scanning.tasks.run_scan", queue=QUEUE_HEAVY)
+@db_retried
 def run_scan(scan_pk: int, action: str) -> bool:
     """Run the next queued scan by rank, woken by a view that queued one.
 

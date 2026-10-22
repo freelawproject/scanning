@@ -325,6 +325,64 @@ class TestLocks(TransactionTestCase):
                 )
 
 
+class TestDbRetries(TestCase):
+    """A transient database error is retried, then a warning (#116)."""
+
+    def setUp(self):
+        _no_connection_reset(self)
+        patcher = patch("scanning.tasks.time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_blip_is_retried_and_the_pass_runs(self):
+        from django.db import OperationalError
+
+        from scanning.jobs import SweepSummary
+
+        with patch(
+            "scanning.ticks.sweep",
+            side_effect=[
+                OperationalError("closed"),
+                SweepSummary(completed=2),
+            ],
+        ):
+            self.assertEqual(tasks.sweep_jobs(), 2)
+
+    def test_a_lasting_fault_is_a_warning_and_not_an_error(self):
+        from django.db import OperationalError
+
+        with (
+            patch(
+                "scanning.ticks.sweep", side_effect=OperationalError("closed")
+            ),
+            self.assertLogs("scanning.tasks", level="WARNING") as logs,
+        ):
+            self.assertEqual(tasks.sweep_jobs(), 0)
+        self.assertTrue(
+            any("after 3 attempts" in line for line in logs.output)
+        )
+
+    def test_the_scan_task_is_retried_too(self):
+        from django.db import OperationalError
+
+        scan = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.CREATE_OPINIONS
+        )
+        with (
+            patch(
+                "scanning.management.commands.process_next_scan.claim_next",
+                side_effect=[
+                    OperationalError("closed"),
+                    (scan, QueuedAction.CREATE_OPINIONS),
+                ],
+            ),
+            patch("scanning.management.commands.process_next_scan.dispatch"),
+        ):
+            self.assertTrue(
+                tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
+            )
+
+
 class TestNudges(TestCase):
     """A finished step sends the pass that reads what it wrote."""
 
