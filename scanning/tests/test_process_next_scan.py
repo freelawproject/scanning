@@ -386,7 +386,7 @@ class TestHeartbeat(TestCase):
             patch.object(
                 process_next_scan,
                 "stamp_heartbeat",
-                side_effect=lambda pk: beats.append(pk) or 1,
+                side_effect=lambda pk, action=None: beats.append(pk) or 1,
             ),
             patch("django.db.connection.close"),
         ):
@@ -407,5 +407,59 @@ class TestHeartbeat(TestCase):
             patch("scanning.services.run_create_opinions") as run,
         ):
             process_next_scan.dispatch(scan, QueuedAction.CREATE_OPINIONS)
-        beat.assert_called_once_with(scan.pk)
+        beat.assert_called_once_with(
+            scan.pk, action=QueuedAction.CREATE_OPINIONS
+        )
         run.assert_called_once_with(scan.pk)
+
+    def test_the_stamp_and_the_error_name_their_own_claim(self):
+        """A scan re-queued for the next action and claimed by another
+        worker is neither stamped nor failed by the first (#503)."""
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(
+            status=Status.PROCESSING,
+            queued_action=QueuedAction.CREATE_OPINIONS,
+        )
+        self.assertEqual(
+            process_next_scan.stamp_heartbeat(
+                scan.pk, QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+            ),
+            0,
+        )
+        self.assertEqual(
+            process_next_scan.stamp_heartbeat(
+                scan.pk, QueuedAction.CREATE_OPINIONS
+            ),
+            1,
+        )
+        with (
+            patch.object(process_next_scan, "heartbeat"),
+            patch(
+                "scanning.services.run_compute_then_create_opinions",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            process_next_scan.dispatch(
+                scan, QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+            )
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.PROCESSING)
+
+    def test_the_error_arm_fails_its_own_claim(self):
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(
+            status=Status.PROCESSING,
+            queued_action=QueuedAction.CREATE_OPINIONS,
+        )
+        with (
+            patch.object(process_next_scan, "heartbeat"),
+            patch(
+                "scanning.services.run_create_opinions",
+                side_effect=RuntimeError("boom"),
+            ),
+        ):
+            process_next_scan.dispatch(scan, QueuedAction.CREATE_OPINIONS)
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.ERROR)

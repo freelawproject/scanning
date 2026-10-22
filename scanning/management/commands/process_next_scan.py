@@ -197,24 +197,53 @@ def claim_next(scan_pk: int | None = None, action: str | None = None):
 HEARTBEAT_SECONDS = 60
 
 
-def stamp_heartbeat(scan_pk: int) -> int:
-    """Refresh the claim stamp of a scan still PROCESSING.
+def _claim_filter(scan_pk: int, action: str | None) -> dict:
+    """Return the filter that names this worker's claim: the scan,
+    PROCESSING, and the action it was claimed for.
+
+    The action is the guard against another worker's claim (#503): an
+    action that re-queues the scan for the next one
+    (``run_compute_then_create_opinions``) lets a second worker claim
+    it while the first is still inside ``dispatch``, and PROCESSING
+    alone would then describe the second worker's claim as well.
 
     :param scan_pk: The claimed scan.
-    :returns: Rows written: 1, or 0 once the scan left PROCESSING.
+    :param action: The ``QueuedAction`` it was claimed for, or ``None``
+        to match any.
+    :returns: Keyword arguments for ``Scan.objects.filter``.
+    :rtype: dict
+    """
+    from scanning.models import QueuedAction, Status
+
+    where: dict = {"pk": scan_pk, "status": Status.PROCESSING}
+    if action == QueuedAction.FULL_PIPELINE:
+        where["queued_action__in"] = ("", action)
+    elif action is not None:
+        where["queued_action"] = action
+    return where
+
+
+def stamp_heartbeat(scan_pk: int, action: str | None = None) -> int:
+    """Refresh the claim stamp of a scan still PROCESSING for ``action``.
+
+    :param scan_pk: The claimed scan.
+    :param action: The action it was claimed for; see :func:`_claim_filter`.
+    :returns: Rows written: 1, or 0 once the scan left the claim.
     :rtype: int
     """
     from django.utils import timezone
 
-    from scanning.models import Scan, Status
+    from scanning.models import Scan
 
-    return Scan.objects.filter(pk=scan_pk, status=Status.PROCESSING).update(
+    return Scan.objects.filter(**_claim_filter(scan_pk, action)).update(
         processed_at=timezone.now()
     )
 
 
 @contextmanager
-def heartbeat(scan_pk: int, interval: float | None = None):
+def heartbeat(
+    scan_pk: int, interval: float | None = None, action: str | None = None
+):
     """Stamp the scan every ``interval`` seconds from a thread, for the
     block.
 
@@ -225,6 +254,7 @@ def heartbeat(scan_pk: int, interval: float | None = None):
 
     :param scan_pk: The claimed scan.
     :param interval: Seconds between beats; ``HEARTBEAT_SECONDS``.
+    :param action: The action it was claimed for; see :func:`_claim_filter`.
     :return: A context manager.
     """
     from django.db import connection
@@ -236,7 +266,7 @@ def heartbeat(scan_pk: int, interval: float | None = None):
         try:
             while not stop.wait(period):
                 try:
-                    if not stamp_heartbeat(scan_pk):
+                    if not stamp_heartbeat(scan_pk, action):
                         return
                 except Exception:
                     logger.warning(
@@ -327,20 +357,17 @@ def dispatch(scan, action) -> None:
         return
 
     try:
-        with heartbeat(scan.pk):
+        with heartbeat(scan.pk, action=action):
             fn(scan.pk)
     except Exception:
         logger.exception("Scan %s (%s) failed", scan.pk, action)
-        current = (
-            Scan.objects.filter(pk=scan.pk)
-            .values_list("status", flat=True)
-            .first()
+        # Guarded by the action too (#503): an action that re-queued
+        # the scan for the next one before it raised may see another
+        # worker's claim here, and that claim is not ours to fail.
+        Scan.objects.filter(**_claim_filter(scan.pk, action)).update(
+            status=Status.ERROR,
+            progress_message="Unexpected error (check logs)",
         )
-        if current == Status.PROCESSING:
-            Scan.objects.filter(pk=scan.pk).update(
-                status=Status.ERROR,
-                progress_message="Unexpected error (check logs)",
-            )
 
 
 class Command(BaseCommand):
