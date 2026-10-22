@@ -388,7 +388,7 @@ class TestDispatch(TestCase):
         send.assert_called_once_with(
             (7, QueuedAction.COMPUTE_REDACTIONS),
             queue=tasks.QUEUE_HEAVY,
-            expires=3600.0,
+            expires=600.0,
         )
 
     @override_settings(CELERY_ENABLED=True)
