@@ -83,9 +83,13 @@
         return field ? field.value : '';
     }
 
-    /** The key a card keeps across reloads: its kind, page, block and offset. */
+    /** The key a card keeps across reloads: its kind, page, block,
+     *  offset and span. A gap card starts where the word after it
+     *  starts, so the span tells the two apart; the finding stays
+     *  last, the Undo of a dismissal reads it there. */
     function keyOf(card) {
-        return [card.kind, card.page_in_opinion, card.group_id, card.start, card.finding_pk].join(':');
+        return [card.kind, card.page_in_opinion, card.group_id, card.start,
+            card.gap ? 'gap' : (card.length || 0), card.finding_pk].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────
@@ -187,6 +191,11 @@
             page_in_opinion: card.page_in_opinion,
             group_id: card.group_id,
             text: text,
+            // The span judged: a word card answers its word, and the
+            // block's other open words stay open; a block card
+            // answers the block.
+            span: card.kind === 'word'
+                ? [card.start, card.start + card.length] : null,
             glue_revision: this.opinion.glue_revision,
             edit_revision: this.opinion.edit_revision
         }).then(function (answer) {
@@ -453,7 +462,16 @@
             var height = Math.max(1, y1 - y0);
             canvas.width = width;
             canvas.height = height;
-            canvas.getContext('2d').drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            var context = canvas.getContext('2d');
+            context.drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            // The blocks of a cover card, outlined where the engines
+            // read them: the box is a fact of the document, not a guess.
+            (card.boxes || []).forEach(function (b) {
+                context.strokeStyle = '#dc2626';
+                context.lineWidth = 2;
+                context.strokeRect(b[0] * SCALE - x0, b[1] * SCALE - y0,
+                    (b[2] - b[0]) * SCALE, (b[3] - b[1]) * SCALE);
+            });
         }).catch(function (error) {
             wrap.replaceChildren(note('The scan did not load: ' + error.message, 'error'));
         });
@@ -471,6 +489,14 @@
         header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
         node.appendChild(header);
         if (card.kind === 'link') {
+            node.appendChild(note(card.message));
+        } else if (card.kind === 'cover') {
+            // The redacted page around the blocks a box covers in part,
+            // each outlined: a word that shows past the box is a
+            // redaction drawn short.
+            var coverWrap = el('div', 'bk-cropwrap');
+            coverWrap.appendChild(el('canvas'));
+            node.appendChild(coverWrap);
             node.appendChild(note(card.message));
         } else {
             // The crop alone, no highlight: the line is a guess from the
@@ -510,6 +536,16 @@
             release.title = 'Open this card again';
             release.addEventListener('click', function () { section.release(card); });
             footer.appendChild(release);
+        } else if (card.kind === 'cover' && card.dismiss_url) {
+            var covered = el('button', 'btn-outline text-xs', 'Looks right');
+            covered.type = 'button';
+            covered.title = 'Dismiss this card: no word shows past the'
+                + ' redaction in the outlined block(s)';
+            covered.addEventListener('click', function () {
+                covered.disabled = true;
+                section.dismiss(card, node);
+            });
+            footer.appendChild(covered);
         } else if (card.kind === 'link' && card.dismiss_url) {
             // A card that only points at the page: once the page was
             // looked at, the dismissal closes it, with the Undo of
@@ -565,6 +601,9 @@
 
     function describe(card) {
         if (card.level === 'warning') {
+            if (card.kind === 'word' && card.gap) {
+                return 'one engine read words here that the others did not: keep the gap or put them in';
+            }
             if (card.kind === 'word') {
                 return 'a majority settled this word over one engine: bless it or pick the other reading';
             }
@@ -575,19 +614,31 @@
                     + ': keep it as shown or pick a reading';
             }
         }
+        if (card.kind === 'word' && card.gap) { return 'no two engines agree on what is in this gap'; }
         if (card.kind === 'word') { return 'no two engines agree on a word'; }
         if (card.kind === 'block') {
             return (card.table ? 'a table' : 'a block') + ' with ' + card.open
                 + ' word(s) no two engines agree on: pick a reading';
         }
         if (card.kind === 'single') { return 'one engine alone read this block (' + card.engine + ')'; }
+        if (card.kind === 'cover') {
+            return 'a box covers part of the outlined block(s): does any word show past it?';
+        }
         return card.check_label || card.check;
     }
 
     function snippet(card) {
         var p = el('p', 'bk-snippet');
         p.appendChild(document.createTextNode('… ' + card.before + ' '));
-        p.appendChild(el('mark', null, card.token));
+        if (card.gap) {
+            // A gap between two words: some engine read words here
+            // that the shown engine did not.
+            var gap = el('mark', 'bk-gap', '[ ]');
+            gap.title = 'A gap: an engine read words here that the shown engine did not';
+            p.appendChild(gap);
+        } else {
+            p.appendChild(el('mark', null, card.token));
+        }
         p.appendChild(document.createTextNode(' ' + card.after + ' …'));
         return p;
     }
@@ -636,12 +687,15 @@
         button.type = 'button';
         button.appendChild(el('span', 'bk-who', engine));
         var val = el('span', 'bk-val');
-        // The reading that is in the text now, marked: the majority's
-        // word in the warnings review, the shown block or word in the
-        // blocking one. Choosing it keeps the text as shown.
-        var shown = value !== '' && (card.kind === 'word'
+        // The reading that is in the text now, marked with a tick in
+        // the warnings review alone: there a majority chose it. On a
+        // blocking card nothing chose it, it stands by the engines'
+        // rank, so no row carries a tick and the choice is the
+        // person's. Choosing the shown reading keeps the text as shown.
+        var inText = card.gap ? value === '' : value !== '' && (card.kind === 'word'
             ? fold(value) === fold(card.token)
             : fold(value) === fold(card.text));
+        var shown = inText && level !== 'blocking';
         if (value === '') {
             val.appendChild(el('span', 'bk-nothing', 'read nothing here'));
         } else {
@@ -657,8 +711,10 @@
         button.appendChild(val);
         button.addEventListener('click', function () {
             markChosen(node, button);
-            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))) {
-                // Right as shown: the page's card waits for its siblings.
+            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))
+                    || (card.gap && value === '')) {
+                // Right as shown (a gap kept empty): the page's card
+                // waits for its siblings.
                 section.keep(card, node);
                 return;
             }
@@ -672,14 +728,16 @@
         label.appendChild(el('span', 'bk-who', 'you'));
         var input = el('input');
         input.type = 'text';
-        input.placeholder = card.kind === 'word'
-            ? 'Type what the page says and press Return'
-            : 'Type the whole block as the page has it and press Return';
+        input.placeholder = card.gap
+            ? 'Type the words the page has in the gap and press Return'
+            : card.kind === 'word'
+                ? 'Type what the page says and press Return'
+                : 'Type the whole block as the page has it and press Return';
         input.addEventListener('keydown', function (event) {
             if (event.key !== 'Enter') { return; }
             event.preventDefault();
             var value = fold(input.value);
-            if (!value && card.kind === 'single') { return; }
+            if (!value && (card.kind === 'single' || card.gap)) { return; }
             markChosen(node, label);
             choose(section, card, node, value);
         });
@@ -697,7 +755,10 @@
      *  leaves the text as shown keeps the card. */
     function choose(section, card, node, value) {
         var text;
-        if (card.kind === 'word') {
+        if (card.kind === 'word' && card.gap) {
+            // The words go into the gap; the text around it stays.
+            text = fold(card.text.slice(0, card.start) + ' ' + value + ' ' + card.text.slice(card.start));
+        } else if (card.kind === 'word') {
             text = fold(card.text.slice(0, card.start) + value + card.text.slice(card.start + card.length));
         } else {
             // A single block or a whole block: the value is the text.

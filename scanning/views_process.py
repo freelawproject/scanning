@@ -48,6 +48,7 @@ from scanning import (
     stats,
     surya,
     tagger,
+    tasks,
     yolo,
 )
 from scanning.badpage import scoring as badpage_scoring
@@ -63,6 +64,7 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     Opinion,
@@ -2071,6 +2073,30 @@ def opinion_blocking_cards(
             {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
             status=409,
         )
+    if request.GET.get("counts") == "1":
+        # The review page's walk buttons: both counts from one read of
+        # the document, and no card goes over the wire.
+        return JsonResponse(
+            {
+                "status": "ok",
+                "counts": {
+                    ensemble.BLOCKING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.blocking_findings(opinion)),
+                            ensemble.BLOCKING,
+                        )
+                    ),
+                    ensemble.WARNING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.warning_findings(opinion)),
+                            ensemble.WARNING,
+                        )
+                    ),
+                },
+            }
+        )
     # The warnings review asks for its own cards (``?level=warning``),
     # over the open warning findings; the blocking review is the
     # default. ``blocking_open`` goes with either, so the page keeps
@@ -3635,6 +3661,8 @@ class ShardRead:
     :ivar create: The row creator. **This is what costs money**, which
         is why the AST test of ``TestKnownEnqueuePaths`` pins the
         modules that name one.
+    :ivar provider: The ``JobProvider`` whose wave sends the rows, so
+        the button can send that wave now (``tasks.submit_soon``, #503).
     """
 
     name: str
@@ -3646,6 +3674,7 @@ class ShardRead:
     is_enabled: Callable[[], bool]
     run_summary: Callable[[Scan], dict | None]
     create: Callable[[Scan, dict], list[ExternalJob]]
+    provider: str
 
 
 def _shard_reads() -> dict[str, ShardRead]:
@@ -3673,6 +3702,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
+            provider=JobProvider.RUNPOD,
         ),
         JobEngine.MISTRAL_OCR: ShardRead(
             name="start_mistral_ocr",
@@ -3686,6 +3716,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=mistral_ocr.enabled,
             run_summary=mistral_ocr.run_summary,
             create=mistral_ocr.ensure_extract_jobs,
+            provider=JobProvider.MISTRAL,
         ),
     }
 
@@ -3770,6 +3801,7 @@ def _start_shard_read(
         queued,
     )
     if queued:
+        tasks.submit_soon(spec.provider)
         messages.success(
             request,
             f"Queued {spec.label} for {queued} part(s) of this volume. "

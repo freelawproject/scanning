@@ -59,6 +59,7 @@
      data-bbox="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"
      data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
      {% if issue.metadata.detection_id %}data-detection-id="{{ issue.metadata.detection_id }}"{% endif %}
+     {% if issue.metadata.redaction_id and issue.metadata.cover %}data-redaction-id="{{ issue.metadata.redaction_id }}" data-cover="{{ issue.metadata.cover.0 }},{{ issue.metadata.cover.1 }},{{ issue.metadata.cover.2 }},{{ issue.metadata.cover.3 }}"{% endif %}
      {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% elif issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' %}data-guess="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"{% endif %}
      onclick="highlightDetection(this)"
      {% elif issue.nav_pdf_index is not None %}
@@ -89,6 +90,10 @@
             onclick="event.stopPropagation(); addGuessedDetection(this)">+ column</button>
     <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Add a footnote box over this block: the footnote line the page's footnote box stopped short of. The opinion text takes it as a footnote. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
+    {% endif %}
+    {% if issue.check_name == 'redaction_cuts_text' and issue.metadata.redaction_id and issue.metadata.cover %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Grow the box over the whole line, so no word of it prints beside the box. A computed box becomes a hand-drawn one the next compute keeps. The card goes now."
+            onclick="event.stopPropagation(); coverCutLine(this)">Cover the line</button>
     {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
     {% if issue.metadata.conf < 1 %}

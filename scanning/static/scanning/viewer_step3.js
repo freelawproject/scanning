@@ -1105,7 +1105,9 @@
         var tokens = (group.tokens || []).filter(function (token) {
             return token.text;
         });
-        if (!(group.agreement === 'voted' && tokens.length)) {
+        var marked = group.agreement === 'voted'
+            || group.agreement === 'human';
+        if (!(marked && tokens.length)) {
             markedNodes(
                 target, (group.text || '').slice(from, to),
                 clipMarks(group.marks, from, to - from)
@@ -1138,7 +1140,27 @@
                 span.title = 'A majority chose this word, and not'
                     + ' every engine read it so.';
             }
-            if (!first) { target.appendChild(document.createTextNode(' ')); }
+            if (token.gap || token.gap_after) {
+                // A gap beside this word: some engine read words there
+                // that the shown engine did not, and they are not in
+                // the text. The level is the gap's own.
+                var gapLevel = token.gap || token.gap_after;
+                span.classList.add(gapLevel === 'blocking' ? 'ensemble-low' : 'ensemble-voted');
+                span.title = (token.gap_after ? 'After' : 'Before') + ' this word an engine'
+                    + ' read words the shown engine did not'
+                    + (gapLevel === 'blocking'
+                        ? ', and no two engines read the same there.'
+                        : '; the other engines read nothing there.')
+                    + ' None of them is in the text; the readings show them.';
+            }
+            if (!first) {
+                // The separator the text holds there: a line break a
+                // person kept (``opinion_edits.fold``) stays one.
+                var between = (group.text || '').charAt(start - 1);
+                target.appendChild(document.createTextNode(
+                    between === '\n' ? '\n' : ' '
+                ));
+            }
             first = false;
             target.appendChild(span);
         });
@@ -2263,9 +2285,10 @@
         var same = sectionGroups(page, section);
         var place = same.indexOf(group);
         var orderEdit = (page.order_edits || {})[section];
-        // A picture takes a move and a drop alone (#463): it has no
-        // text, it is no footnote and no quote, the refusals of the
-        // three other edit views.
+        // A picture takes a move alone (#463): it is an IMAGE box of the
+        // redaction review, so it has no text, it is no footnote and no
+        // quote, and it is not for this review to take out; the edit
+        // views refuse all four.
         var figure = group.kind === 'figure';
 
         if (group.human) {
@@ -2312,7 +2335,6 @@
             ));
         }
         if (figure) {
-            bar.appendChild(dropButton(page, group, true));
             return;
         }
         var other = section === FOOTNOTES ? BODY : FOOTNOTES;
@@ -2357,33 +2379,30 @@
             ));
         }
         quoteButtons(bar, page, group);
-        bar.appendChild(dropButton(page, group, false));
+        bar.appendChild(dropButton(page, group));
     }
 
     /**
      * Return the button that takes a block out of the text, a ``DROP``
-     * edit. A picture (#463) takes it too: a stamp, a seal or a blot one
-     * engine drew as a picture is no picture of the opinion.
+     * edit. A picture takes none (#463): it is a box of the redaction
+     * review, and the drop view refuses it.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
-     * @param {boolean} figure - Whether the group is a picture.
      * @returns {HTMLElement} The button.
      */
-    function dropButton(page, group, figure) {
+    function dropButton(page, group) {
         return barButton(
-            figure ? 'Not a picture' : 'Not text',
-            figure
-                ? 'Take this picture out of the text: it is not a picture'
-                    + ' of the opinion (a stamp, a seal, a blot)'
-                : 'Take this block out of the text: it is not text of the'
-                    + ' opinion (the bleed-through of the page behind, a'
-                    + ' stray mark)',
+            'Not text',
+            'Take this block out of the text: it is not text of the'
+                + ' opinion (the bleed-through of the page behind, a'
+                + ' stray mark)',
             function (button) {
-                if (!window.confirm('Take this ' + (figure ? 'picture' : 'block')
-                        + ' out of the text? It is left out of the opinion'
-                        + ' until the edit is undone from the list under'
-                        + ' the page\'s label.')) { return; }
+                if (!window.confirm('Take this block out of the text? It is'
+                        + ' left out of the opinion until the edit is undone'
+                        + ' from the list under the page\'s label.')) {
+                    return;
+                }
                 postEdit(endpoint('editDropUrl'), {
                     page_in_opinion: page.page_in_opinion,
                     group_id: group.id
@@ -3033,6 +3052,28 @@
             });
     }
 
+    /** The walk buttons count their cards: a finding is one row per
+     *  page, and a page makes a card per open word or gap, so the
+     *  server's number is the finding count until the cards endpoint
+     *  answers with the real one. */
+    function bindCardCounts() {
+        var links = Array.prototype.slice.call(document.querySelectorAll('[data-card-count-url]'));
+        if (!links.length) { return; }
+        // One request for both numbers: the endpoint reads the document
+        // once and answers the two lengths, no card over the wire.
+        fetch(links[0].dataset.cardCountUrl + '?counts=1', { credentials: 'same-origin' })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (data) {
+                if (!data || data.status !== 'ok' || !data.counts) { return; }
+                links.forEach(function (link) {
+                    var count = link.querySelector('[data-card-count]');
+                    var value = data.counts[link.dataset.cardLevel];
+                    if (count && typeof value === 'number') { count.textContent = value; }
+                });
+            })
+            .catch(function () { /* the finding count stays */ });
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('opinion-review');
         if (!root) { return; }
@@ -3041,6 +3082,7 @@
         bindRerun();
         bindApproval();
         bindFindings();
+        bindCardCounts();
         bindZoom();
         bindQuiet();
         bindHelp();

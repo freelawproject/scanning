@@ -51,7 +51,7 @@ from pathlib import Path
 from django.conf import settings
 from django.utils import timezone
 
-from scanning import jobs, runpod_client, s3_sync
+from scanning import jobs, runpod_client, s3_sync, tasks
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -864,11 +864,9 @@ def write_apply_state(detect_jobs: list[ExternalJob], state: dict) -> None:
     :param state: The state to store.
     :return: None.
     """
-    head = detect_jobs[0]
-    meta = head.provider_meta or {}
-    meta["apply"] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    jobs.swap_provider_meta(
+        detect_jobs[0], lambda meta: meta.update(apply=state)
+    )
 
 
 def record_apply_start(detect_jobs: list[ExternalJob]) -> None:
@@ -1067,6 +1065,9 @@ def queue_ready_runs() -> int:
             continue
         state["queued_at"] = timezone.now().isoformat()
         write_apply_state(rows, state)
+        # After the ledger write, never before: the worker's own
+        # ledger writes start as soon as it claims (#503).
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         logger.info(
             "Queued the redaction computation for scan %s (detection run %s)",
             scan.pk,

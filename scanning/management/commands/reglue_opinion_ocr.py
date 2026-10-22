@@ -106,6 +106,16 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--with-pictures",
+            action="store_true",
+            help=(
+                "Of the named volumes (or of every volume with --all), glue "
+                "again only the opinions whose pages hold a live IMAGE box "
+                "of their run, or whose text holds a picture: the rows a "
+                "change of the picture rule moves."
+            ),
+        )
+        parser.add_argument(
             "--dry-run",
             action="store_true",
             help="Report what would move, and change nothing.",
@@ -131,7 +141,13 @@ class Command(BaseCommand):
                 "name the scans, pass --all, or pass --opinion: one of the "
                 "three"
             )
+        with_pictures = options["with_pictures"]
         if opinion_pks:
+            if with_pictures:
+                raise CommandError(
+                    "--with-pictures narrows a volume walk; it does not go "
+                    "with --opinion"
+                )
             self._opinions(opinion_pks, dry_run, carry_pdf)
             return
         if options["all"]:
@@ -145,7 +161,31 @@ class Command(BaseCommand):
             scan = Scan.objects.filter(pk=pk).first()
             if scan is None:
                 raise CommandError(f"scan {pk} does not exist")
-            if dry_run:
+            if with_pictures:
+                rows = list(opinion_ocr.picture_rows(scan))
+                if dry_run:
+                    count, pdfs = (
+                        len(rows),
+                        (
+                            sum(opinion_pdf.is_written(row) for row in rows)
+                            if carry_pdf
+                            else 0
+                        ),
+                    )
+                    said = "would glue"
+                else:
+                    summary = (
+                        opinion_ocr.reglue_opinions(rows, carry_pdf=carry_pdf)
+                        if rows
+                        else opinion_ocr.ReglueSummary()
+                    )
+                    count, pdfs = summary.moved, summary.carried
+                    said = "glued"
+                self.stdout.write(
+                    f"scan {pk}: {said} {count} opinion(s) with pictures "
+                    f"again, {pdfs} PDF(s) carried"
+                )
+            elif dry_run:
                 rows = list(opinion_ocr.reglue_rows(scan))
                 count = len(rows)
                 pdfs = (

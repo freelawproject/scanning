@@ -801,8 +801,13 @@ class Scan(AbstractDateTimeModel):
         # PRE-increment value via CASE/WHEN (no read-then-write race). A
         # pre-increment `>= max` is a post-increment `> max`, so a scan is
         # allowed `max_interruptions` re-queues before it is flagged. The
-        # PROCESSING guard means we never stomp a scan already moved on.
-        Scan.objects.filter(pk__in=pks, status=Status.PROCESSING).update(
+        # PROCESSING guard means we never stomp a scan already moved on,
+        # and the caller's own filter stays in the UPDATE (#503): the
+        # stale sweep runs on every worker at once, and a scan another
+        # worker re-queued and a third claimed again between the read
+        # above and this write carries a fresh ``processed_at`` that the
+        # sweep's cutoff no longer matches.
+        queryset.filter(pk__in=pks, status=Status.PROCESSING).update(
             interruption_count=models.F("interruption_count") + 1,
             status=models.Case(
                 models.When(
@@ -1113,6 +1118,10 @@ class CheckName(models.TextChoices):
         "uncovered_editors_note",
         "Editor's note not covered by a redaction",
     )
+    REDACTION_CUTS_TEXT = (
+        "redaction_cuts_text",
+        "Redaction covers part of a line of text",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1186,6 +1195,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
         CheckName.UNCOVERED_EDITORS_NOTE,
         CheckName.UNDETECTED_TEXT,
+        CheckName.REDACTION_CUTS_TEXT,
     }
 )
 
@@ -2669,6 +2679,11 @@ class OpinionCheck(models.TextChoices):
         "figure_one_engine",
         "One engine alone drew a picture",
     )
+    # Every page that holds a picture of the text (#463): a person reads
+    # the picture and the text around it against the PDF.
+    # ``FIGURE_ONE_ENGINE`` has no writer since the pictures are review
+    # 2's boxes, and the ensemble's rebuild deletes its rows.
+    FIGURE_TO_CHECK = "figure_to_check", "A picture to check"
 
 
 #: The checks a curator may dismiss. The two stale checks are facts
@@ -3036,6 +3051,17 @@ class Opinion(AbstractDateTimeModel):
             "When the cut of this row's pictures last failed, of either "
             "kind (#463). The row is not due again before "
             "opinion_pdf.retry_after() has passed."
+        ),
+    )
+    input_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "A digest of everything the row's OCR documents and redacted "
+            "PDF are built from (opinions.input_digest), stamped by the "
+            "creation. A later creation that computes the same digest "
+            "keeps the revision; blank on a row from before the rule."
         ),
     )
     notes = models.TextField(blank=True, default="")

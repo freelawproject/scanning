@@ -1622,6 +1622,46 @@ def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
     return int(run_ledger(rows, key).get("attempts") or 0)
 
 
+#: How many times a ``provider_meta`` swap is tried before it gives up.
+META_SWAP_ATTEMPTS = 5
+
+
+def swap_provider_meta(row: ExternalJob, mutate) -> dict:
+    """Change a row's ``provider_meta`` by compare-and-swap (#503).
+
+    The ledgers of the passes (the glue counters, the apply state, the
+    tagger's glue count) are keys of one JSON field, and a plain save
+    of the field writes over whatever another pass wrote beside the
+    key since the read. With the passes on several workers that is
+    live, so the write goes as ``UPDATE ... WHERE provider_meta = <what
+    was read>``, read again and tried again on a lost swap, and the
+    last try writes anyway, because a lost counter is better than a
+    pass that never records its failure.
+
+    :param row: The row; its ``provider_meta`` is refreshed in place.
+    :param mutate: ``mutate(meta) -> None``, applied to a copy of the
+        current dict.
+    :returns: The dict written.
+    :rtype: dict
+    """
+    for attempt in range(META_SWAP_ATTEMPTS):
+        current = (
+            ExternalJob.objects.filter(pk=row.pk)
+            .values_list("provider_meta", flat=True)
+            .first()
+        )
+        new = dict(current or {})
+        mutate(new)
+        last = attempt == META_SWAP_ATTEMPTS - 1
+        query = ExternalJob.objects.filter(pk=row.pk)
+        if not last:
+            query = query.filter(provider_meta=current)
+        if query.update(provider_meta=new):
+            row.provider_meta = new
+            return new
+    raise AssertionError("unreachable: the last try is unguarded")
+
+
 def bump_run_ledger(
     rows: list[ExternalJob], key: str, exc: Exception
 ) -> tuple[int, ExternalJob]:
@@ -1644,20 +1684,22 @@ def bump_run_ledger(
     :rtype: tuple[int, ExternalJob]
     """
     head = rows[0]
-    meta = dict(head.provider_meta or {})
-    state = dict(meta.get(key) or {})
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta[key] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
-    return attempts, head
+    written: dict = {}
+
+    def bump(meta: dict) -> None:
+        state = dict(meta.get(key) or {})
+        state.update(
+            {
+                "attempts": int(state.get("attempts") or 0) + 1,
+                "last_error": str(exc)[:500],
+                "last_attempt_at": timezone.now().isoformat(),
+            }
+        )
+        meta[key] = state
+        written.update(state)
+
+    swap_provider_meta(head, bump)
+    return int(written["attempts"]), head
 
 
 @dataclass
@@ -3026,8 +3068,15 @@ def _submit_runpod_engine_wave(
         setattr(summary, result, getattr(summary, result) + 1)
 
 
-def submit_pending(limit: int | None = None) -> SubmitSummary:
+def submit_pending(
+    limit: int | None = None, providers: tuple[str, ...] | None = None
+) -> SubmitSummary:
     """Submit one wave per provider and record what happened.
+
+    ``providers`` names the waves to run, in the table's order; ``None``
+    runs them all, the daemon's serial tick. A Celery tick task names
+    one (#503), so the doctor wave holding its sockets and the Mistral
+    wave rendering a shard each block only their own queue.
 
     Each provider counts its own in-flight rows against its own cap, so
     one saturated endpoint cannot starve another. Doctor's ceiling is
@@ -3048,18 +3097,23 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
+    :param providers: The ``JobProvider`` values whose waves run, or
+        ``None`` for every one.
     :returns: Counts of what the tick did, summed over the waves.
     :rtype: SubmitSummary
     """
     summary = SubmitSummary()
-    providers = _providers()
+    table = _providers()
+    if providers is None:
+        providers = tuple(table)
+    specs = {name: table[name] for name in providers}
     if not s3_sync.s3_active():
         # Every provider reads its input from the bucket -- through a
         # presigned GET, or downloaded by the daemon -- so without S3
         # the shards were never uploaded: every request would 404 and
         # burn a job's whole retry budget under a misleading code. Say
         # so once instead.
-        if any(spec.is_enabled() for spec in providers.values()):
+        if any(spec.is_enabled() for spec in specs.values()):
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -3071,7 +3125,7 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     # The table's insertion order is the wave order (see
     # ``_providers``): what a person waits behind goes first, and the
     # wave nothing waits behind goes last.
-    for spec in providers.values():
+    for spec in specs.values():
         if spec.is_enabled():
             spec.submit_wave(summary, limit)
     return summary

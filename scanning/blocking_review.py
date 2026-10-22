@@ -54,6 +54,16 @@ WORD = "word"
 BLOCK = "block"
 SINGLE = "single"
 LINK = "link"
+#: A ``cover`` card is a ``PARTIAL_REDACTION`` finding: the crop of the
+#: blocks a box covers in part, each outlined, over the redacted page,
+#: so a person sees whether any word shows past the box. "Looks right"
+#: dismisses it.
+COVER = "cover"
+
+#: The least crop of a ``cover`` card, in points: a column's width and
+#: five lines, so a block of one word shows the redaction beside it.
+COVER_MIN_WIDTH_PT = 220.0
+COVER_MIN_HEIGHT_PT = 5 * LINE_PT
 
 #: A voted block with more open words than this is one ``block`` card
 #: and not a card per word: 71 words of a table Mistral read as noise
@@ -110,6 +120,23 @@ def _reading(
         head = at.get(entry.head) or []
         return head[0][1] if head else READ_NOTHING
     return entry[1]
+
+
+def _run_words(inserted: dict, position: int, put_in: dict) -> str:
+    """Return the words one engine read at a base position that the
+    base did not and the vote dropped, as the engine wrote them, or ""
+    for none. A run that is only a mark has no key and reads as
+    nothing, the vote's rule; a run the vote put in is in the text as
+    inserted tokens already (``put_in``, by position), and a row that
+    showed it would write it twice."""
+    runs = inserted.get(position) or []
+    return " ".join(
+        word
+        for run in runs
+        if any(key for key, _ in run)
+        and tuple(key for key, _ in run if key) != put_in.get(position)
+        for _, word in run
+    )
 
 
 def _span_ends(at: dict) -> dict[int, int]:
@@ -170,7 +197,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     each carries the base position it answers for. Each other engine's
     word at that position comes from the same alignment the vote used
     (``ensemble._candidates``), so the rows of the card are the votes
-    that were cast.
+    that were cast. A block a person wrote keeps the open words they
+    left as they were, as the document's own tokens, placed in the
+    person's text: an answer to one card closes that card alone.
 
     **A card covers the span the engines joined.** dots.mocr writes
     ``Ill. Adm. Code`` as three words and the others as one, so the
@@ -183,6 +212,16 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     engine's words over the whole span: the answer replaces the span.
     A word of a run the base did not read is a card of its own.
 
+    **A gap is a card of its own** (``gap`` on the entry): a place some
+    engine read words at that the base did not, which did not go in,
+    or where the base read words a majority dropped. The card sits on
+    the gap, ``start`` the offset of the word after it (or the end of
+    the last word) and ``length`` 0, its rows are what each engine
+    read there with "" for nothing (the base's row holds its dropped
+    words), and the answer goes into the gap: an insertion, never a
+    rewrite of the word beside it. The level of the gap picks the
+    review it opens in.
+
     :param group: One group of a stamped ensemble document.
     :param flag: The flag of the tokens to open.
     :returns: One entry per open place: ``{start, length, token,
@@ -191,9 +230,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     :rtype: list[dict]
     """
     agreements = (
-        (ensemble.VOTED, ensemble.MAJORITY)
+        (ensemble.VOTED, ensemble.MAJORITY, ensemble.HUMAN)
         if flag == MAJORITY
-        else (ensemble.VOTED,)
+        else (ensemble.VOTED, ensemble.HUMAN)
     )
     if group.get("agreement") not in agreements:
         return []
@@ -201,40 +240,84 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     if len(present) < 2:
         return []
     engines = group["engines"]
-    base = present[0]
+    # The base is the engine whose text is shown, so a card's offsets
+    # are offsets into that text: a block a majority read alike shows
+    # the first agreeing engine's, which need not rank first of all
+    # that read. A person's block names the engine its tokens count
+    # against (``ensemble._human_read``); one from before that stamp
+    # counted against the first that read.
+    source = group.get("source")
+    if group.get("agreement") == ensemble.HUMAN:
+        source = group.get("base")
+    base = source if source in present else present[0]
     base_pairs = ensemble._pairs(engines[base]["text"])
     others = [
-        (name, ensemble._pairs(engines[name]["text"])) for name in present[1:]
+        (name, ensemble._pairs(engines[name]["text"]))
+        for name in present
+        if name != base
     ]
-    tokens, _ = ensemble.vote_words(base_pairs, [pairs for _, pairs in others])
+    voted, _ = ensemble.vote_words(base_pairs, [pairs for _, pairs in others])
+    if group.get("agreement") == ensemble.HUMAN:
+        # A person wrote the text; the open words they left as they
+        # were are the document's own tokens, each at its base
+        # position (``ensemble._kept_open``), placed in that text.
+        tokens = group.get("tokens") or []
+    else:
+        tokens = voted
+    # The base positions the vote kept a word for: a base word with no
+    # token is one the vote dropped, and the gap card before the next
+    # kept word shows it. The vote's own tokens, never the person's,
+    # whose rewritten word carries no position.
+    voted_at = {
+        t["position"]
+        for t in voted
+        if t.get("position") is not None and not t.get("inserted")
+    }
+    # The runs the vote put in, by position: the keys of its inserted
+    # tokens there, which a gap card's rows must not show again.
+    put_in: dict[int, tuple] = {}
+    for t in voted:
+        if t.get("inserted") and t.get("position") is not None:
+            put_in[t["position"]] = put_in.get(t["position"], ()) + (
+                ensemble.compare_word(t["text"]),
+            )
     candidates = {
         name: ensemble._candidates(base_pairs, pairs) for name, pairs in others
     }
     ends = {name: _span_ends(at) for name, (at, _) in candidates.items()}
     shown = [token["text"] for token in tokens if token["text"]]
 
-    # Every token with its offset, its index among the shown words and
-    # its place in an inserted run.
+    # Every token with its offset in the group's text, its index among
+    # the shown words and its place in an inserted run.
+    text = group.get("text") or " ".join(shown)
     placed: list[dict] = []
     offset = 0
     run_index: int | None = None
     for token in tokens:
         if not token["text"]:
             continue
-        if token.get("inserted"):
+        if "run_index" in token:
+            # A block a person wrote: the place of an inserted word in
+            # its run is carried on the token (``ensemble._kept_open``),
+            # because the person may have changed its neighbour.
+            run_index = token["run_index"]
+        elif token.get("inserted"):
             run_index = 0 if run_index is None else run_index + 1
         else:
             run_index = None
+        start = text.find(token["text"], offset)
+        if start < 0:
+            start = offset
         placed.append(
             {
                 "token": token,
-                "start": offset,
-                "end": offset + len(token["text"]),
+                "start": start,
+                "end": start + len(token["text"]),
                 "index": len(placed),
                 "run_index": run_index,
             }
         )
-        offset += len(token["text"]) + 1
+        offset = start + len(token["text"])
 
     def context(first_index: int, last_index: int) -> tuple[str, str]:
         return (
@@ -248,7 +331,11 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     spans: list[list[int]] = []
     for entry in placed:
         token = entry["token"]
-        if not token.get(flag) or entry["run_index"] is not None:
+        if (
+            not token.get(flag)
+            or entry["run_index"] is not None
+            or token.get("position") is None
+        ):
             continue
         first = last = token["position"]
         for name, (at, _) in candidates.items():
@@ -265,6 +352,7 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
             e
             for e in placed
             if e["run_index"] is None
+            and e["token"].get("position") is not None
             and first <= e["token"]["position"] <= last
         ]
         if not covered:
@@ -297,7 +385,11 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     # The words of a run the base did not read, one card each.
     for entry in placed:
         token = entry["token"]
-        if not token.get(flag) or entry["run_index"] is None:
+        if (
+            not token.get(flag)
+            or entry["run_index"] is None
+            or token.get("position") is None
+        ):
             continue
         position = token["position"]
         before, after = context(entry["index"], entry["index"])
@@ -321,7 +413,79 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 "readings": readings,
             }
         )
-    words.sort(key=lambda w: w["start"])
+    # The gaps, one card each, on the gap itself.
+    level = ensemble.BLOCKING if flag == LOW_CONFIDENCE else ensemble.WARNING
+    for entry in placed:
+        token = entry["token"]
+        for key in ("gap", "gap_after"):
+            if token.get(key) != level:
+                continue
+            after_word = key == "gap_after"
+            # The base position the gap stands before: the token's
+            # own, or ``gap_at`` on a word a person wrote in place of
+            # the vote's (``ensemble._kept_open``).
+            at = token.get("gap_at", token.get("position"))
+            if not after_word and at is None:
+                continue
+            position = len(base_pairs) if after_word else at
+            index = entry["index"]
+            before, after = (
+                context(index + 1, index)
+                if after_word
+                else context(index, index - 1)
+            )
+            # The base positions inside the gap: the words the base
+            # read there that a majority dropped, between the base
+            # word before the gap and the one after it.
+            # The gap runs from the vote's last kept word before this
+            # position: the vote's own positions, never the person's
+            # tokens, whose rewritten word carries none.
+            last_base = max((p for p in voted_at if p < position), default=-1)
+            # A base word with no vote token is dropped; a bare mark
+            # has no key and no token either, and is no word.
+            dropped = [
+                p
+                for p in range(last_base + 1, position)
+                if p not in voted_at and base_pairs[p][0]
+            ]
+            readings = [
+                {
+                    "engine": base,
+                    "word": " ".join(base_pairs[p][1] for p in dropped),
+                }
+            ]
+            for name, (at, inserted) in candidates.items():
+                read_there = []
+                for p in dropped:
+                    for reading in at.get(p) or []:
+                        if isinstance(reading, ensemble.Carried):
+                            continue
+                        if reading[1]:
+                            read_there.append(reading[1])
+                # The runs over the whole gap: the vote carries a gap
+                # past a bare mark to the next word with a token.
+                for p in range(last_base + 1, position + 1):
+                    run = _run_words(inserted, p, put_in)
+                    if run:
+                        read_there.append(run)
+                readings.append({"engine": name, "word": " ".join(read_there)})
+            words.append(
+                {
+                    "start": entry["end"] if after_word else entry["start"],
+                    "length": 0,
+                    "gap": True,
+                    "token": "",
+                    "before": before,
+                    "after": after,
+                    "readings": readings,
+                    # The crop is cut at the word beside the gap.
+                    "crop_span": [
+                        entry["start"],
+                        entry["end"] - entry["start"],
+                    ],
+                }
+            )
+    words.sort(key=lambda w: (w["start"], w["length"]))
     return words
 
 
@@ -390,6 +554,57 @@ def block_crop(box: list[float]) -> dict:
         "highlight": None,
         "line": None,
         "lines": max(1, round((y1 - y0) / LINE_PT)),
+    }
+
+
+def _cover_card(page: dict, finding) -> dict | None:
+    """Return the ``cover`` card of a page's ``PARTIAL_REDACTION`` card.
+
+    The blocks are the page's partial drops the card counts (a drop of
+    a group that lost a bracket token is in ``partial_bracket`` and not
+    the card's, ``ensemble._partial_message``), each with the box the
+    alignment found. The crop is their union, :data:`CROP_PAD_PT` wider
+    and a line taller on each side, so the edge of the redaction shows.
+    None when the document records no box for them (a document written
+    before the drops carried one): the link card stands in.
+
+    :param page: The page of the stamped document.
+    :param finding: The page's open ``PARTIAL_REDACTION`` finding.
+    :returns: The card, or None.
+    :rtype: dict | None
+    """
+    boxes = [
+        drop["box_pt"]
+        for drop in page.get("dropped") or []
+        if drop.get("partial")
+        and not drop.get("bracket")
+        and drop.get("box_pt")
+    ]
+    if not boxes:
+        return None
+    x0 = min(b[0] for b in boxes) - CROP_PAD_PT
+    y0 = min(b[1] for b in boxes) - LINE_PT
+    x1 = max(b[2] for b in boxes) + CROP_PAD_PT
+    y1 = max(b[3] for b in boxes) + LINE_PT
+    # A block of a word or two is shown with the page around it, or the
+    # crop is a few letters blown up and nothing can be judged.
+    grow_x = max(0.0, COVER_MIN_WIDTH_PT - (x1 - x0)) / 2
+    grow_y = max(0.0, COVER_MIN_HEIGHT_PT - (y1 - y0)) / 2
+    return {
+        **_link_card(finding),
+        "kind": COVER,
+        "boxes": boxes,
+        "crop": {
+            "crop": [
+                round(max(0.0, x0 - grow_x), 2),
+                round(max(0.0, y0 - grow_y), 2),
+                round(x1 + grow_x, 2),
+                round(y1 + grow_y, 2),
+            ],
+            "highlight": None,
+            "line": None,
+            "lines": None,
+        },
     }
 
 
@@ -526,8 +741,10 @@ def cards(
                         "crop": crop_of(
                             group["box_pt"],
                             len(group["text"]),
-                            word["start"],
-                            word["length"],
+                            *(
+                                word.get("crop_span")
+                                or (word["start"], word["length"])
+                            ),
                         ),
                     }
                 )
@@ -537,6 +754,11 @@ def cards(
         for finding in page_findings:
             if finding.pk in answered:
                 continue
+            if finding.check_name == OpinionCheck.PARTIAL_REDACTION:
+                cover = _cover_card(page, finding)
+                if cover is not None:
+                    out.append(cover)
+                    continue
             # A card the groups did not answer, the ``NO_MAJORITY`` card
             # of a page whose blocks hold no open word included: a text
             # written under another rule. The card is still open and
@@ -603,8 +825,10 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
                         "crop": crop_of(
                             group["box_pt"],
                             len(group["text"]),
-                            word["start"],
-                            word["length"],
+                            *(
+                                word.get("crop_span")
+                                or (word["start"], word["length"])
+                            ),
                         ),
                     }
                 )
@@ -626,7 +850,16 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
     for finding in page_findings:
         if finding.pk in answered:
             continue
-        out.append({**_link_card(finding), "level": ensemble.WARNING})
+        # A text built before the card blocked keeps it as a warning
+        # until its next build; it is the same card here.
+        cover = (
+            _cover_card(page, finding)
+            if finding.check_name == OpinionCheck.PARTIAL_REDACTION
+            else None
+        )
+        out.append(
+            {**(cover or _link_card(finding)), "level": ensemble.WARNING}
+        )
     return out
 
 

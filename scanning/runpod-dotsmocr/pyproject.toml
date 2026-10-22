@@ -16,6 +16,9 @@ dependencies = [
     "pillow>=10",
     "pymupdf>=1.25",
     "numpy",
+    # The perpendiculars whiteout (``perpendiculars.py``) is OpenCV over
+    # the rendered page; headless, since the worker has no display.
+    "opencv-python-headless",
     "pydantic>=2",
     "tqdm",
     # svg_utils imports cairosvg at module scope and is pulled in by

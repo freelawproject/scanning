@@ -52,7 +52,7 @@ import fitz
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import page_edits, s3_sync
+from scanning import page_edits, s3_sync, tasks
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -1773,6 +1773,7 @@ def queue_ready_scans() -> int:
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
             queued += claimed
+            tasks.dispatch_scan(scan.pk, QueuedAction.APPLY_PAGE_EDITS)
     return queued
 
 

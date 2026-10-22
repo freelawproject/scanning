@@ -525,6 +525,81 @@ automatically.
 Custom component classes: `.btn-primary`, `.btn-outline`, `.btn-danger`,
 `.btn-ghost`, `.card`, `.input-text`, `.alert-*`, `.badge-*` (status badges).
 
+### Running the passes on Celery (#503)
+
+By default the daemon (`run_daemon`) runs every pass in one serial
+loop. With `CELERY_ENABLED=True` the daemon becomes the clock: on each
+pass's interval it sends a task instead of running the pass, the
+workers run the tasks on four queues (`fast`, `io`, `heavy`,
+`opinions`), and a button press sends its own task instead of waiting
+for a poll. The database stays the queue of record, so the broker
+never holds work that cannot be found again in the rows.
+
+Locally the broker and one worker for every queue come up under the
+`celery` compose profile, beside the daemon:
+
+```bash
+CELERY_ENABLED=True docker compose -f docker/scanning/docker-compose.yml --profile celery up scanning-redis scanning-celery-worker scanning-daemon
+```
+
+In production each queue is its own deployment of the daemon image
+(`command: worker` with `CELERY_QUEUES=<queue>`), and the one daemon
+deployment stays as the clock. The `heavy` queue is the one that
+scales by replica count.
+
+A worker run natively on macOS needs `--pool threads`: the default
+prefork pool spawns rather than forks there and fails every task.
+Linux, the compose path and production fork.
+
+#### Turning it on in production
+
+The switch is off after a merge: the daemon runs every pass itself,
+the views send nothing, and the deploy workflow skips a worker
+deployment that does not exist yet. Three things change with the
+switch off all the same: a running action stamps its claim every
+minute from a thread, and the stale sweep re-queues a claim after ten
+minutes without a stamp instead of an hour; a Mistral shard claimed
+and lost mid-render waits thirty minutes before its retry, where it
+was retried at once; and every process imports the Celery package at
+start. Turning it on is four steps, in this order, and the reverse of
+step 3 turns it off again.
+
+1. Infra creates the four worker deployments from the daemon image
+   (`freelawproject/scanning:<sha>-daemon`), each with
+   `command: ["worker"]`, its own `CELERY_QUEUES` (`fast`, `io`,
+   `heavy` or `opinions`) set on the deployment and not in the shared
+   secret, and the container named like the deployment, which is
+   what the workflow's `kubectl set image` expects. One replica each;
+   `heavy` is the one to scale. Give `heavy` a
+   `terminationGracePeriodSeconds` that covers the longest apply,
+   because a worker's shutdown waits for its running task and a pod
+   killed past the grace period leaves its scan to the ten-minute
+   stale sweep.
+2. Infra creates a Redis for the scanning namespace, and its URL goes
+   into the `scanning-env` secret as `CELERY_BROKER_URL`, with
+   `CELERY_ENABLED` still off. Roll the workers out: they connect and
+   sit idle.
+3. Set `CELERY_ENABLED=True` in the secret and restart the daemon,
+   the web deployments and the four workers. Every process reads the
+   switch at start: the daemon's first log line then says "sending
+   ticks to Celery", the web pods start sending a task for every
+   button press, and the workers start sending the next pass when a
+   step finishes, which they do not do while they hold the old value.
+   Turning the switch off is the same restart of all three, or the
+   workers keep sending to each other beside a daemon that runs the
+   passes itself.
+4. Check the worker logs show ticks received every few seconds, the
+   queue depths read zero (`LLEN fast` and the other three on the
+   broker), and a button press reaches a worker within a second.
+
+Work in flight at the switch is not lost: every state is in the rows
+and in S3. A scan the daemon was running is re-queued by its shutdown
+and claimed by a heavy worker within seconds, which runs that action
+again from the start; queued scans are claimed the same way; external
+jobs already submitted are polled by the workers' sweep where the
+daemon left them. A Mistral shard the daemon was rendering at that
+moment waits the thirty minutes of the lost-claim clock, then retries.
+
 ### Testing RunPod Locally
 
 The daemon can offload the two GPU-heavy blackletter steps (`detect` and

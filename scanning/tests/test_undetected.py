@@ -638,3 +638,189 @@ class TestTheCard(ScanningTestCase):
         findings.rebuild(self.scan, run=None)
         self.assertIsNotNone(self.cards().get().dismissal_id)
         self.assertEqual(ReviewDismissal.objects.count(), 1)
+
+
+#: A line of text in the reader's render: x 108-540 pt, y 360-378 pt.
+LINE = [300.0, 1000.0, 1500.0, 1050.0]
+
+
+class TestTheCutLine(ScanningTestCase):
+    """``cut_lines``: a black redaction that covers part of a line."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = make_scan()
+
+    def write(self, *cells):
+        undetected.write_rows(self.scan, document(page(0, *cells)), None)
+
+    def found(self):
+        return list(undetected.cut_lines(self.scan, None))
+
+    def test_a_box_that_stops_short_of_a_line_is_a_card(self):
+        """The editor's note of 218 A.3d: the box ends before the line."""
+        box = make_redaction(
+            self.scan,
+            rect_type="EDITORIAL",
+            x0=100.0,
+            y0=355.0,
+            x1=470.0,
+            y1=385.0,
+        )
+        self.write(cell("the words of the line", LINE))
+
+        [finding] = self.found()
+
+        self.assertEqual(finding["check_name"], CheckName.REDACTION_CUTS_TEXT)
+        self.assertEqual(finding["target"], Issue.Target.REDACTION)
+        self.assertEqual(finding["page_number"], 1)
+        meta = finding["metadata"]
+        self.assertEqual(meta["redaction_id"], box.pk)
+        self.assertEqual(meta["label"], "EDITORIAL")
+        self.assertEqual(meta["bbox"], LINE)
+        self.assertEqual(meta["source_page"], 1)
+        # The box grown over the line, in points: what "Cover the line"
+        # moves it to.
+        self.assertEqual(meta["cover"], [100.0, 355.0, 540.0, 385.0])
+        self.assertTrue(
+            opinion_ocr.EXCLUDE_SHARE <= meta["share"] < opinion_ocr.FULL_SHARE
+        )
+        self.assertIn("An editor's note box covers", finding["message"])
+
+    def test_the_message_quotes_no_word_of_the_line(self):
+        """The line is partly under the box: its words may be redacted."""
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=470.0, y1=385.0)
+        self.write(cell("Secret words under the box", LINE))
+
+        [finding] = self.found()
+
+        self.assertNotIn("Secret", finding["message"])
+
+    def test_a_box_over_the_whole_line_is_no_card(self):
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=560.0, y1=385.0)
+        self.write(cell("the words of the line", LINE))
+
+        self.assertEqual(self.found(), [])
+
+    def test_a_box_beside_the_line_is_no_card(self):
+        make_redaction(self.scan, x0=100.0, y0=500.0, x1=560.0, y1=530.0)
+        self.write(cell("the words of the line", LINE))
+
+        self.assertEqual(self.found(), [])
+
+    def test_a_glyphs_box_and_a_white_box_make_no_card(self):
+        """A bracket, a key and a divider cover a symbol; a white box is
+        a margin or the running head."""
+        for rect_type in ("HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER"):
+            make_redaction(
+                self.scan,
+                rect_type=rect_type,
+                x0=100.0,
+                y0=355.0,
+                x1=300.0,
+                y1=385.0,
+            )
+        make_redaction(
+            self.scan,
+            rect_type="margin",
+            fill="white",
+            x0=100.0,
+            y0=355.0,
+            x1=300.0,
+            y1=385.0,
+        )
+        self.write(cell("the words of the line", LINE))
+
+        self.assertEqual(self.found(), [])
+
+    def test_a_white_box_over_the_rest_of_the_line_makes_it_covered(self):
+        """Review 3 measures every visible box: a headnote box over the
+        start of the line and the margin strip over the rest cover it
+        whole, so the glue reads no partial cover and no card asks."""
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=330.0, y1=385.0)
+        make_redaction(
+            self.scan,
+            rect_type="margin",
+            fill="white",
+            x0=330.0,
+            y0=355.0,
+            x1=612.0,
+            y1=385.0,
+        )
+        self.write(cell("the words of the line", LINE))
+
+        self.assertEqual(self.found(), [])
+
+    def test_a_speck_is_no_card(self):
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=470.0, y1=385.0)
+        self.write(cell("a.", LINE))
+
+        self.assertEqual(self.found(), [])
+
+    def test_the_running_heads_line_is_no_card(self):
+        """Review 3 takes the head whole and the whiteout covers it, so
+        a headnote box drawn up into it hides no text."""
+        head = [300.0, 50.0, 1500.0, 90.0]
+        make_detection(
+            self.scan,
+            "PAGE_HEADER",
+            x0=head[0],
+            y0=head[1],
+            x1=head[2],
+            y1=head[3],
+        )
+        make_redaction(self.scan, x0=100.0, y0=10.0, x1=300.0, y1=40.0)
+        self.write(cell("THE RUNNING HEAD OF THE PAGE", head))
+
+        self.assertEqual(self.found(), [])
+
+    def test_a_cell_that_runs_off_the_page_is_cut_at_its_box_first(self):
+        """The glue cuts a reader's cell that runs past the page at the
+        box that holds it (``opinion_ocr.fit_overrun``). Measured raw,
+        the line read half covered and "Cover the line" stretched the
+        box past the page edge; fitted, the box covers it whole."""
+        column(self.scan, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=580.0, y1=385.0)
+        self.write(
+            cell("the words of the line", [300.0, 1000.0, 2400.0, 1050.0])
+        )
+
+        self.assertEqual(self.found(), [])
+
+    def test_the_cover_of_a_line_that_runs_off_the_page_stays_on_it(self):
+        column(self.scan, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        make_redaction(self.scan, x0=100.0, y0=355.0, x1=400.0, y1=385.0)
+        self.write(
+            cell("the words of the line", [300.0, 1000.0, 2400.0, 1050.0])
+        )
+
+        [finding] = self.found()
+
+        self.assertLessEqual(finding["metadata"]["cover"][2], 612.0)
+        self.assertLessEqual(finding["metadata"]["bbox"][2], 1700.0)
+
+    def test_the_rebuild_writes_the_card_and_a_move_over_the_line_ends_it(
+        self,
+    ):
+        make_boundary(
+            self.scan,
+            make_detection(self.scan, "CASE_CAPTION", page_index=1),
+            make_detection(self.scan, "KEY_ICON", page_index=1),
+        )
+        box = make_redaction(self.scan, x0=100.0, y0=355.0, x1=470.0, y1=385.0)
+        self.write(cell("the words of the line", LINE))
+
+        findings.rebuild(self.scan)
+        issue = Issue.objects.get(
+            scan=self.scan, check_name=CheckName.REDACTION_CUTS_TEXT
+        )
+        cover = issue.metadata["cover"]
+        box.x1 = cover[2]
+        box.save()
+        findings.rebuild(self.scan)
+
+        self.assertFalse(
+            Issue.objects.filter(
+                scan=self.scan, check_name=CheckName.REDACTION_CUTS_TEXT
+            ).exists()
+        )
