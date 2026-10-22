@@ -115,7 +115,11 @@ def queue_depth(queue: str) -> int | None:
     """
     try:
         with _pooled_connection() as connection:
-            return int(connection.default_channel.client.llen(queue))
+            client = getattr(connection.default_channel, "client", None)
+            if client is None or not hasattr(client, "llen"):
+                # Not Redis: the depth is unknown and that is no fault.
+                return None
+            return int(client.llen(queue))
     except Exception:
         _broker_failed()
         logger.warning("could not read the depth of %s", queue, exc_info=True)

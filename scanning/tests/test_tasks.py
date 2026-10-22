@@ -205,6 +205,19 @@ class TestThrottle(TestCase):
         ):
             self.assertIsNone(tasks.queue_depth("fast"))
 
+    def test_a_transport_with_no_redis_client_is_an_unknown_depth(self):
+        """Not a fault: nothing is held back for 30 seconds."""
+        from unittest.mock import MagicMock
+
+        channel = MagicMock(spec=[])  # no ``client`` attribute
+        connection = MagicMock()
+        connection.default_channel = channel
+        pooled = MagicMock()
+        pooled.__enter__.return_value = connection
+        with patch("scanning.tasks._pooled_connection", return_value=pooled):
+            self.assertIsNone(tasks.queue_depth("fast"))
+        self.assertTrue(tasks._broker_ok())
+
     def test_the_depth_is_read_over_a_pooled_connection(self):
         from unittest.mock import MagicMock
 
