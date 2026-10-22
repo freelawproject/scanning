@@ -2464,6 +2464,26 @@ class TestTheSyllabusZone(OpinionOcrTestCase):
         counts = manifest["engines"]["dots_mocr"]["counts"]
         self.assertEqual(counts["syllabus_zones"], 1)
 
+    def test_a_box_in_the_neighbour_s_region_is_no_zone(self):
+        """The next case's syllabus on a shared page: the box sits
+        under the outside mask, like the header above the caption on
+        the first page, and is the neighbour's."""
+        above = {
+            "x0": HEADER[0],
+            "y0": HEADER[1],
+            "x1": HEADER[2],
+            "y1": HEADER[3],
+        }
+        self.heading(1, **above)
+        self.heading(2, **above)
+
+        written = self.write()
+
+        self.assertEqual(written["pages"][0]["zones"]["syllabus"], [])
+        self.assertEqual(
+            written["pages"][1]["zones"]["syllabus"], [to_pt(HEADER)]
+        )
+
     def test_a_low_model_box_is_a_zone_too(self):
         """No floor: the model draws the box at 0.75 on the SCOTUS
         volumes, and a curator who disagrees dismisses it."""
