@@ -1721,7 +1721,11 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     """
     from scanning import locks
 
-    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True):
+    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True) as held:
+        if not held:
+            # A holder's dead session, until the server reaps it: the
+            # next tick applies the numbers.
+            return False
         return _run_compute_issues(scan, result_key)
 
 

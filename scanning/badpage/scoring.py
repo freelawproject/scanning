@@ -390,10 +390,12 @@ def score_scan(scan, pdf, jobs: int | None = None) -> dict[int, float]:
     # (``services.run_compute_issues``, #503): the two run on different
     # workers now, and the apply must not read the scores before the
     # stamp and open the review after the status check below.
-    with locks.held(ISSUES_LOCK, wait=True):
+    with locks.held(ISSUES_LOCK, wait=True) as held:
+        # The stamp lands either way; without the lock the rebuild is
+        # left to the next one, because the apply may be mid-write.
         stamp(scan, scores)
         scan.refresh_from_db()
-        if scan.ocr_results and scan.status in REVIEW_STATUSES:
+        if held and scan.ocr_results and scan.status in REVIEW_STATUSES:
             # The stamp is the fact and it is written; a rebuild that
             # fails must not read as a failed score, and the next
             # recompute or page-number rebuild writes the cards anyway.

@@ -277,6 +277,41 @@ class TestLocks(TransactionTestCase):
                     [locks.NAMESPACE, locks.key("glue_runs")],
                 )
 
+    def test_the_locking_session_is_bounded_by_keepalives(self):
+        """A vanished client's lock is freed by the server in about a
+        minute and a half, not two hours."""
+        with locks.held("bounded"):
+            with connections["default"].cursor() as cursor:
+                cursor.execute("SHOW tcp_keepalives_idle")
+                self.assertEqual(cursor.fetchone()[0], "60")
+                cursor.execute("SHOW tcp_keepalives_count")
+                self.assertEqual(cursor.fetchone()[0], "3")
+
+    def test_the_blocking_path_gives_up_after_the_wait(self):
+        other = connections.create_connection("default")
+        self.addCleanup(other.close)
+        with other.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_lock(%s, %s)",
+                [locks.NAMESPACE, locks.key("slow")],
+            )
+        try:
+            with (
+                patch.object(locks, "WAIT_TIMEOUT_SECONDS", 1),
+                self.assertLogs("scanning.locks", level="WARNING"),
+            ):
+                with locks.held("slow", wait=True) as held:
+                    self.assertFalse(held)
+            with connections["default"].cursor() as cursor:
+                cursor.execute("SHOW lock_timeout")
+                self.assertEqual(cursor.fetchone()[0], "0")
+        finally:
+            with other.cursor() as cursor:
+                cursor.execute(
+                    "SELECT pg_advisory_unlock(%s, %s)",
+                    [locks.NAMESPACE, locks.key("slow")],
+                )
+
     def test_a_locked_body_runs_under_its_lock(self):
         """The fresh connection is opened before the lock, never inside
         the body, or the session that holds the lock would be closed
