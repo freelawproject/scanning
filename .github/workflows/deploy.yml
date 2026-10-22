@@ -190,7 +190,8 @@ jobs:
 
       # The deployment exists only once infra creates it: until then
       # the leg is skipped, so a deploy never fails on the switch
-      # being off.
+      # being off. `set image` names the container, so each worker
+      # deployment's container must be named like its deployment.
       - name: Rollout ${{ matrix.deployment }}
         run: |
           if kubectl get -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} >/dev/null 2>&1; then

@@ -70,6 +70,7 @@ services:
     image: redis:7-alpine
     networks:
       - scanning_net
+    profiles: ["celery"]
 
   # Celery worker (#503): every queue in one container for dev. In
   # production each queue is its own deployment (CELERY_QUEUES). The

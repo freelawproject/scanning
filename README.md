@@ -547,6 +547,10 @@ In production each queue is its own deployment of the daemon image
 deployment stays as the clock. The `heavy` queue is the one that
 scales by replica count.
 
+A worker run natively on macOS needs `--pool threads`: the default
+prefork pool spawns rather than forks there and fails every task.
+Linux, the compose path and production fork.
+
 ### Testing RunPod Locally
 
 The daemon can offload the two GPU-heavy blackletter steps (`detect` and
