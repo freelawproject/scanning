@@ -46,7 +46,7 @@ from dataclasses import dataclass
 from celery.signals import worker_ready
 from django.conf import settings
 from django.core.management import call_command
-from django.db import connections
+from django.db import connections, transaction
 
 from scanning import locks
 from scanning.celery_init import app
@@ -612,22 +612,43 @@ def run_scan(scan_pk: int, action: str) -> bool:
 
 
 def dispatch_scan(scan_pk: int, action: str) -> bool:
-    """Send the task that runs a scan a view just queued.
+    """Send the task that runs a scan a view just queued, once the
+    write that queued it is committed.
 
     Called after the view's compare-and-swap to QUEUED, never before:
     the task claims by the same swap, and a scan that is not QUEUED
-    for ``action`` when it runs is left alone. The message expires
-    after ``DAEMON_PROCESSING_TIMEOUT``, so one from before an outage
-    never claims a scan queued much later: the tick claims that one.
-    A no-op when Celery is off, and a logged warning when the broker
-    is unreachable, because the tick finds the row either way.
+    for ``action`` when it runs is left alone. The send waits for the
+    commit (``transaction.on_commit``), because the admin's actions
+    run inside one and the worker reads committed rows: sent earlier,
+    the task would find the scan not yet QUEUED and the tick would
+    take it seconds later. Outside a transaction the send is at once.
+    A no-op when Celery is off; the send itself swallows a broker
+    fault, because the tick finds the row either way.
+
+    :param scan_pk: The scan that is now QUEUED.
+    :param action: The ``QueuedAction`` the caller wrote.
+    :returns: Whether a send was scheduled.
+    :rtype: bool
+    """
+    if not settings.CELERY_ENABLED:
+        return False
+    transaction.on_commit(functools.partial(_send_scan, scan_pk, action))
+    return True
+
+
+def _send_scan(scan_pk: int, action: str) -> bool:
+    """Send the scan task now; see :func:`dispatch_scan`.
+
+    The message expires after ``DAEMON_PROCESSING_TIMEOUT``, so one
+    from before an outage never claims a scan queued much later: the
+    tick claims that one.
 
     :param scan_pk: The scan that is now QUEUED.
     :param action: The ``QueuedAction`` the caller wrote.
     :returns: Whether a task was sent.
     :rtype: bool
     """
-    if not settings.CELERY_ENABLED or not has_room(QUEUE_HEAVY):
+    if not has_room(QUEUE_HEAVY):
         return False
     try:
         run_scan.apply_async(

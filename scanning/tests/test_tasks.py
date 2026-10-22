@@ -121,11 +121,10 @@ class TestThrottle(TestCase):
             patch.object(tasks.glue_runs, "apply_async") as send_tick,
             patch.object(tasks.run_scan, "apply_async") as send_scan,
             self.assertLogs("scanning.tasks", level="WARNING"),
+            self.captureOnCommitCallbacks(execute=True),
         ):
             self.assertFalse(tick.send())
-            self.assertFalse(
-                tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE)
-            )
+            tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE)
         send_tick.assert_not_called()
         send_scan.assert_not_called()
 
@@ -160,20 +159,21 @@ class TestThrottle(TestCase):
                 tasks.run_scan, "apply_async", side_effect=OSError("down")
             ) as send,
             self.assertLogs("scanning.tasks", level="INFO"),
+            self.captureOnCommitCallbacks(execute=True),
         ):
-            self.assertFalse(
-                tasks.dispatch_scan(1, QueuedAction.FULL_PIPELINE)
-            )
-            self.assertFalse(
-                tasks.dispatch_scan(2, QueuedAction.FULL_PIPELINE)
-            )
-            tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
-            self.assertFalse(tick.send())
+            tasks.dispatch_scan(1, QueuedAction.FULL_PIPELINE)
+            tasks.dispatch_scan(2, QueuedAction.FULL_PIPELINE)
+        # One attempt for two scans: the second was held back.
         send.assert_called_once()
+        self.assertFalse(tasks._broker_ok())
+        tick = next(t for t in tasks.TICKS if t.name == "glue_runs")
+        with self.assertLogs("scanning.tasks", level="INFO"):
+            self.assertFalse(tick.send())
         tasks.reset_broker_backoff()
         with (
             patch("scanning.tasks.queue_depth", return_value=0),
             patch.object(tasks.run_scan, "apply_async") as send,
+            self.captureOnCommitCallbacks(execute=True),
         ):
             self.assertTrue(tasks.dispatch_scan(3, QueuedAction.FULL_PIPELINE))
         send.assert_called_once()
@@ -403,7 +403,10 @@ class TestDispatch(TestCase):
 
     @override_settings(CELERY_ENABLED=True)
     def test_the_scan_task_is_sent_to_the_heavy_queue(self):
-        with patch.object(tasks.run_scan, "apply_async") as send:
+        with (
+            patch.object(tasks.run_scan, "apply_async") as send,
+            self.captureOnCommitCallbacks(execute=True),
+        ):
             self.assertTrue(
                 tasks.dispatch_scan(7, QueuedAction.COMPUTE_REDACTIONS)
             )
@@ -421,10 +424,26 @@ class TestDispatch(TestCase):
                 tasks.run_scan, "apply_async", side_effect=OSError("down")
             ),
             self.assertLogs("scanning.tasks", level="WARNING"),
+            self.captureOnCommitCallbacks(execute=True),
         ):
-            self.assertFalse(
-                tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE)
-            )
+            self.assertTrue(tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE))
+        self.assertFalse(tasks._broker_ok())
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_the_send_waits_for_the_commit(self):
+        """The admin's actions run inside a transaction, and the worker
+        reads committed rows: a task sent before the commit finds the
+        scan not yet QUEUED."""
+        with (
+            patch.object(tasks.run_scan, "apply_async") as send,
+            self.captureOnCommitCallbacks() as callbacks,
+        ):
+            self.assertTrue(tasks.dispatch_scan(7, QueuedAction.FULL_PIPELINE))
+            send.assert_not_called()
+        self.assertEqual(len(callbacks), 1)
+        with patch.object(tasks.run_scan, "apply_async") as send:
+            callbacks[0]()
+        send.assert_called_once()
 
     @override_settings(CELERY_ENABLED=True)
     def test_a_provider_wave_is_sent_to_its_own_queue(self):
