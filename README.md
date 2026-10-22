@@ -551,6 +551,44 @@ A worker run natively on macOS needs `--pool threads`: the default
 prefork pool spawns rather than forks there and fails every task.
 Linux, the compose path and production fork.
 
+#### Turning it on in production
+
+The switch is off after a merge: the daemon runs every pass itself,
+the views send nothing, and the deploy workflow skips a worker
+deployment that does not exist yet. Turning it on is four steps, in
+this order, and the reverse of step 3 turns it off again.
+
+1. Infra creates the four worker deployments from the daemon image
+   (`freelawproject/scanning:<sha>-daemon`), each with
+   `command: ["worker"]`, its own `CELERY_QUEUES` (`fast`, `io`,
+   `heavy` or `opinions`) set on the deployment and not in the shared
+   secret, and the container named like the deployment, which is
+   what the workflow's `kubectl set image` expects. One replica each;
+   `heavy` is the one to scale. Give `heavy` a
+   `terminationGracePeriodSeconds` that covers the longest apply,
+   because a worker's shutdown waits for its running task and a pod
+   killed past the grace period leaves its scan to the ten-minute
+   stale sweep.
+2. Infra creates a Redis for the scanning namespace, and its URL goes
+   into the `scanning-env` secret as `CELERY_BROKER_URL`, with
+   `CELERY_ENABLED` still off. Roll the workers out: they connect and
+   sit idle.
+3. Set `CELERY_ENABLED=True` in the secret and restart the daemon and
+   the web deployments. The daemon reads the switch at start and its
+   first log line then says "sending ticks to Celery"; the web pods
+   start sending a task for every button press.
+4. Check the worker logs show ticks received every few seconds, the
+   queue depths read zero (`LLEN fast` and the other three on the
+   broker), and a button press reaches a worker within a second.
+
+Work in flight at the switch is not lost: every state is in the rows
+and in S3. A scan the daemon was running is re-queued by its shutdown
+and claimed by a heavy worker within seconds, which runs that action
+again from the start; queued scans are claimed the same way; external
+jobs already submitted are polled by the workers' sweep where the
+daemon left them. A Mistral shard the daemon was rendering at that
+moment waits the thirty minutes of the lost-claim clock, then retries.
+
 ### Testing RunPod Locally
 
 The daemon can offload the two GPU-heavy blackletter steps (`detect` and
