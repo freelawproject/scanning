@@ -2237,6 +2237,19 @@ class TestTheSyllabus(TestCase):
         self.assertEqual(heading.find("page-number").get("label"), "503")
         self.assertEqual(root.findall("syllabus")[0].find("page-number"), None)
 
+    def test_a_stamped_caption_line_falls_through_to_the_heading(self):
+        """A box drawn a line high stamps the date line, which the
+        caption spans close at once; the heading below opens the run."""
+        document, spans = self.scotus()
+        document["body"][1]["syllabus_start"] = True
+
+        _xml, root = build(document, *spans)
+
+        self.assertEqual(
+            self.syllabus_texts(root), [self.FIRST, self.HELD, self.POINT]
+        )
+        self.assertEqual(root.find("decisiondate").text, self.DATE)
+
     def test_a_stamp_with_other_words_starts_the_run_at_that_paragraph(self):
         """A curator's box over the first paragraph of the syllabus."""
         tail, tail_spans = self.tail(5)

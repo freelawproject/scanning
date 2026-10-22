@@ -714,7 +714,9 @@ def syllabus_range(
     **The start** is the first paragraph before :func:`_bound` that the
     ensemble stamped ``syllabus_start`` (the ``SYLLABUS`` detection of
     the run, or a curator's box in review 2), or that is a heading
-    whose words are in :data:`SYLLABUS_HEADINGS`. A start with those
+    whose words are in :data:`SYLLABUS_HEADINGS`, and whose run holds a
+    paragraph: a stamped caption line closes itself and falls through
+    to the heading below. A start with those
     words is the heading: it keeps its place, with its page number and
     its footnote mark, and the run begins after it. A stamped start
     with other words is the first paragraph of the syllabus itself (a
@@ -734,31 +736,33 @@ def syllabus_range(
     :rtype: range
     """
     bound = _bound(body, by, split)
-    start = next(
-        (
-            index
-            for index, paragraph in enumerate(body[:bound])
-            if paragraph.get("syllabus_start")
-            or (
-                _is_heading(paragraph, by.get(index, []))
-                and _heading_words(paragraph) in SYLLABUS_HEADINGS
-            )
-        ),
-        None,
-    )
-    if start is None:
-        return range(0)
-    heading = _heading_words(body[start]) in SYLLABUS_HEADINGS
-    first = start + 1 if heading else start
-    end = next(
-        (
-            index
-            for index in range(first, bound)
-            if _closer_share(body[index], by.get(index, [])) >= CLOSER_SHARE
-        ),
-        bound,
-    )
-    return range(first, max(end, first))
+    starts = [
+        index
+        for index, paragraph in enumerate(body[:bound])
+        if paragraph.get("syllabus_start")
+        or (
+            _is_heading(paragraph, by.get(index, []))
+            and _heading_words(paragraph) in SYLLABUS_HEADINGS
+        )
+    ]
+    # The first start whose run holds a paragraph: a box drawn a line
+    # high stamps the caption line above the heading, which closes
+    # itself, and the heading below it opens the run instead.
+    for start in starts:
+        heading = _heading_words(body[start]) in SYLLABUS_HEADINGS
+        first = start + 1 if heading else start
+        end = next(
+            (
+                index
+                for index in range(first, bound)
+                if _closer_share(body[index], by.get(index, []))
+                >= CLOSER_SHARE
+            ),
+            bound,
+        )
+        if end > first:
+            return range(first, end)
+    return range(0)
 
 
 def _syllabus_paragraph(
