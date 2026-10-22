@@ -148,6 +148,12 @@ def has_room(queue: str) -> bool:
             "broker fault %ss ago at most; not sending", BROKER_BACKOFF_SECONDS
         )
         return False
+    # The depth counts expired ticks too: with every worker of a
+    # queue busy past a tick's interval, the list fills with ticks
+    # nobody will run, and at the cap a button's dispatch is skipped
+    # as well. It heals in a second: the first free worker discards
+    # the expired messages on receipt, and the next clock tick or the
+    # claim tick finds the row.
     depth = queue_depth(queue)
     if depth is None or depth < int(settings.CELERY_QUEUE_MAX_DEPTH):
         return True
@@ -553,8 +559,10 @@ def nudge(*ticks) -> int:
     """
     if not settings.CELERY_ENABLED:
         return 0
-    by_task = {tick.task: tick for tick in TICKS}
-    return sum(1 for task in ticks if by_task[task].send())
+    wanted = set(ticks)
+    # Every entry of the task, not one: ``cleanup_tmp`` has an entry
+    # per queue, and a dict keyed by task would keep the last alone.
+    return sum(1 for tick in TICKS if tick.task in wanted and tick.send())
 
 
 def _nudge_after(action: str) -> None:

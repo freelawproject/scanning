@@ -356,6 +356,19 @@ class TestNudges(TestCase):
         self.assertEqual(merge.call_args.kwargs["queue"], tasks.QUEUE_HEAVY)
 
     @override_settings(CELERY_ENABLED=True)
+    def test_a_nudge_sends_every_entry_of_the_task(self):
+        """``cleanup_tmp`` has one entry per queue."""
+        with (
+            patch("scanning.tasks.queue_depth", return_value=0),
+            patch.object(tasks.cleanup_tmp, "apply_async") as send,
+        ):
+            self.assertEqual(tasks.nudge(tasks.cleanup_tmp), len(tasks.QUEUES))
+        self.assertEqual(
+            sorted(c.kwargs["queue"] for c in send.call_args_list),
+            sorted(tasks.QUEUES),
+        )
+
+    @override_settings(CELERY_ENABLED=True)
     def test_a_sweep_that_completed_nothing_sends_nothing(self):
         from scanning.jobs import SweepSummary
 
