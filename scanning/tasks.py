@@ -743,7 +743,7 @@ def submit_soon(provider: str) -> bool:
     """Send the wave of a provider now, after a button created its rows.
 
     The read buttons (``start_dots_mocr``, ``start_mistral_ocr``,
-    ``start_surya_ocr``, ``start_caselaw_tagger``) create PENDING rows
+    ``start_caselaw_tagger``) create PENDING rows
     the next submit tick would send; this sends that tick now. Same
     rules as :func:`dispatch_scan`.
 
