@@ -3919,6 +3919,48 @@ class TestTheSyllabusStart(TestCase):
             [g["syllabus_start"] for g in page["groups"]], [True, False]
         )
 
+    def test_a_dropped_opener_passes_the_stamp_to_the_next_kept_group(self):
+        """A stray mark a redaction takes, under a box taller than the
+        heading: the kept heading under it opens the run."""
+        stray = (50, 95, 300, 99)
+        page = build(
+            paragraphs(
+                (
+                    stray,
+                    "x",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(stray, self.HEADING)],
+        )
+
+        self.assertEqual(
+            [(g["text"], g["syllabus_start"]) for g in page["groups"]],
+            [("Syllabus *", True), ("The company is global.", False)],
+        )
+        self.assertEqual(page["syllabus_doubt"], [])
+
+    def test_two_zones_are_judged_apart(self):
+        """A page two cases share: the zone that stamped nothing is a
+        doubt although the other stamped the heading."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING), [400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
+        )
+
     def test_a_box_on_the_heading_is_no_doubt(self):
         page = build(
             paragraphs(

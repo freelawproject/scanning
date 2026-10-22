@@ -2340,9 +2340,10 @@ def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
 
     **The one rule**, the shape of :func:`quoted`: a body group the
     syllabus zone covers :data:`SYLLABUS_SHARE` of. The build stamps
-    the first such group of each zone in the reading order and no
-    other, so a box taller than the heading line opens one run. The
-    zone is the
+    the first kept group of each zone in the order the page is written
+    and no other (:func:`_take_zone`), so a box taller than the heading
+    line opens one run, and a dropped block under it takes no stamp.
+    The zone is the
     ``SYLLABUS`` detection of the run, the model's box over the
     heading line that opens a syllabus, or a curator's own box in
     review 2, so the stamp says where a syllabus starts and nothing
@@ -2360,6 +2361,17 @@ def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
         and bool(zones)
         and zone_share(group["box_pt"], zones) >= SYLLABUS_SHARE
     )
+
+
+def _take_zone(group: dict, open_zones: list[list[float]]) -> bool:
+    """Stamp one kept group with the first open syllabus zone it opens,
+    and close that zone. The zones are taken in the order the page is
+    written, one group each."""
+    for zone in open_zones:
+        if syllabus_start(group, [zone]):
+            open_zones.remove(zone)
+            return True
+    return False
 
 
 def syllabus_doubts(
@@ -2388,8 +2400,13 @@ def syllabus_doubts(
     for group in stamped:
         if not casebody.is_syllabus_heading(group.get("text")):
             doubts.append({"doubt": "box", "text": _first_words(group)})
-    if zones and not stamped:
-        doubts.append({"doubt": "box", "text": ""})
+    for zone in zones:
+        # Each zone on its own: a page two cases share can hold two.
+        if not any(
+            zone_share(group["box_pt"], [zone]) >= SYLLABUS_SHARE
+            for group in stamped
+        ):
+            doubts.append({"doubt": "box", "text": ""})
     for group in groups:
         if (
             group.get("section", BODY) == BODY
@@ -3524,7 +3541,6 @@ def build_page(
             # it to the footnotes and none makes it a quote.
             group["section"], group["footnote_doubt"] = BODY, False
             group["blockquote"] = group["_zone_blockquote"] = False
-            group["syllabus_start"] = False
             by_section[BODY].append(group)
             continue
         group["section"], group["footnote_doubt"] = section(group, zones)
@@ -3549,26 +3565,10 @@ def build_page(
             # A person said whether the whole block is a quote, so the
             # zone does not decide (#419). A span waits for the text.
             group["blockquote"] = bool(quote.get("quoted"))
-        group["syllabus_start"] = False
         by_section[group["section"]].append(group)
     ordered = place(
         by_section[BODY], width, height, boundary=boundary
     ) + place_footnotes(by_section[FOOTNOTES], width, height, boundary)
-    # One start per zone (#518): the first body group under it in the
-    # reading order. A box taller than the heading line covers the
-    # paragraphs under it too, and a stamp on each would part a
-    # paragraph a column cut (``paragraphs._joins``).
-    for zone in starts:
-        opener = next(
-            (
-                group
-                for group in ordered
-                if not group.get("figure") and syllabus_start(group, [zone])
-            ),
-            None,
-        )
-        if opener is not None:
-            opener["syllabus_start"] = True
     for edit in edits:
         if edit["kind"] != OpinionEdit.Kind.ORDER:
             continue
@@ -3582,6 +3582,13 @@ def build_page(
     # blockquote runs (#411): a dropped paragraph outside every quote
     # still parts two quotes.
     sequence: list[dict] = []
+    # One start per syllabus zone (#518): the first kept group under
+    # it, in the order the page is written, after the drops and the
+    # order edits. A box taller than the heading line covers the
+    # paragraphs under it too, and a stamp on each would part a
+    # paragraph a column cut (``paragraphs._joins``); a stray mark the
+    # box covers first is dropped and must not take the stamp.
+    open_zones = list(starts)
     for group in ordered:
         if group.get("figure") and not group["excluded"]:
             entry["groups"].append(
@@ -3692,6 +3699,7 @@ def build_page(
                 quote_span = [int(v) for v in quote["span"]]
                 group["blockquote"] = False
         name = group["section"]
+        stamped = _take_zone(group, open_zones)
         start = offsets[name]
         end = start + len(read_back["text"])
         offsets[name] = end + len(PARAGRAPH_GAP)
@@ -3707,7 +3715,7 @@ def build_page(
                 "blockquote": group["blockquote"],
                 "quote_span": quote_span,
                 "quote_edit": (quote or {}).get("id"),
-                "syllabus_start": group["syllabus_start"],
+                "syllabus_start": stamped,
                 "list_by": list_readers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
