@@ -2075,7 +2075,15 @@ def approve_opinion_text(
     gate is ``opinion_review.check_gate``: the status, a text that holds
     every edit, the revisions the page was drawn at, and no open
     blocking card (``opinion_review.blocking_findings``). A warning
-    card does not block; the button asks for a confirm.
+    card does not block; the button asks for a confirm, which names
+    the cost of the tagger.
+
+    The approved text goes to the tagger in the same request (#499,
+    ``_tag_approved_text``), where the stage is on: a job on RunPod,
+    or the spans placed at once when a run of the same text paid for
+    them already. The tagger's line comes after the approval's in the
+    message, and a fault there is a warning and never a refusal: the
+    text is approved, and the button of the review page is the retry.
 
     Every answer is a Django message too, and the viewer reloads the
     page to show it (#376).
@@ -2086,7 +2094,7 @@ def approve_opinion_text(
     :return: ``{status, message}``; 404 for an opinion of another scan,
         400 for a body the page does not send, 409 for a refusal.
     """
-    from scanning import opinion_review, s3_sync
+    from scanning import opinion_review, s3_sync, tagger
 
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
@@ -2126,10 +2134,21 @@ def approve_opinion_text(
             count=refusal.count
         )
         return _edit_refusal(request, message)
-    messages.success(request, APPROVED_TEXT_MESSAGE)
-    return JsonResponse(
-        {"status": "ok", "message": APPROVED_TEXT_MESSAGE, "key": key}
-    )
+    # The tagger follows the approval (#499): the swap landed, so the
+    # row holds the status and the key it wrote. A fault of the tagger
+    # is a line beside the approval and never a refusal, because the
+    # approval stands; its retry is the button of the review page.
+    opinion.status = OpinionReviewStatus.TEXT_REVIEW_DONE
+    opinion.approved_text_key = key
+    message = APPROVED_TEXT_MESSAGE
+    level = messages.SUCCESS
+    if tagger.enabled():
+        tagged, line = _tag_approved_text(request, opinion)
+        message = f"{APPROVED_TEXT_MESSAGE} {line}"
+        if not tagged:
+            level = messages.WARNING
+    messages.add_message(request, level, message)
+    return JsonResponse({"status": "ok", "message": message, "key": key})
 
 
 @login_required
@@ -2163,6 +2182,84 @@ def reopen_opinion_text(
     return JsonResponse({"status": "ok", "message": REOPENED_TEXT_MESSAGE})
 
 
+def _tag_approved_text(
+    request: HttpRequest, opinion: Opinion
+) -> tuple[bool, str]:
+    """Start the tagger of an approved text, or place its paid spans.
+
+    The one path to ``tagger.ensure_tag_jobs`` (#272, #499), shared by
+    the approval and the press of the review page, so both hold one
+    set of rules. The gate: an approved text, the switches of the
+    stage, the bucket, and a state of ``tagger.state`` that a start can
+    move (no run, a dead one, or a run over an earlier approved text).
+
+    A start that finds its result paid for already starts no job: a
+    second approval of the same text, a result carried from an earlier
+    run, or a glue the tick gave up on. ``tagger.place`` puts the spans
+    on the approved text in this request, and a fault is its answer.
+
+    :param request: The HTTP request, for the log.
+    :param opinion: The ``Opinion`` row, with ``scan``.
+    :return: ``(ok, message)``: whether a job started or the spans were
+        placed, and the line that says what happened.
+    """
+    from scanning import s3_sync, tagger
+
+    pk = opinion.scan_id
+    if (
+        opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
+        or not opinion.approved_text_key
+    ):
+        return False, TAG_NOT_APPROVED_MESSAGE
+    if not tagger.enabled():
+        return False, TAG_DISABLED_MESSAGE
+    if not s3_sync.s3_active():
+        return False, ENSEMBLE_BUCKET_MESSAGE
+    state = tagger.state(opinion)
+    if state == tagger.RUNNING:
+        return False, TAG_RUNNING_MESSAGE
+    if state == tagger.DONE:
+        return False, TAG_DONE_MESSAGE
+    try:
+        rows = tagger.ensure_tag_jobs(opinion)
+    except tagger.TaggerInputError as exc:
+        logger.warning(
+            "%s of scan %s: the tagger start by %s did not start: %s",
+            opinion,
+            pk,
+            request.user,
+            exc,
+        )
+        return False, TAG_FAILED_MESSAGE.format(reason=exc)
+    message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
+        # A result that is paid for already: carried from an earlier
+        # run of the same text, a glue the tick gave up on, or a second
+        # approval of the same text. No job runs, so the spans are
+        # placed now, and a fault is the answer of this start.
+        try:
+            tagger.place(opinion, rows[0])
+        except tagger.TaggerGlueError as exc:
+            logger.warning(
+                "%s of scan %s: the tagger start by %s did not place the "
+                "spans: %s",
+                opinion,
+                pk,
+                request.user,
+                exc,
+            )
+            return False, TAG_GLUE_FAILED_MESSAGE.format(reason=exc)
+        message = TAG_PLACED_MESSAGE
+    logger.info(
+        "%s of scan %s: %s started the tagger (run %s)",
+        opinion,
+        pk,
+        request.user,
+        rows[0].run if rows else None,
+    )
+    return True, message
+
+
 @login_required
 @require_POST
 def start_caselaw_tagger(
@@ -2170,16 +2267,11 @@ def start_caselaw_tagger(
 ) -> JsonResponse:
     """Start the tagger job of one approved opinion (#272).
 
-    The one creator of the tagger rows: nothing enqueues them on a
-    tick. Any logged-in user presses it, the rule of the approval. The
-    gate is in the view: an approved text, the switches of the stage,
-    the bucket, and a state of ``tagger.state`` that a press can move
-    (no run, a dead one, or a run over an earlier approved text).
-
-    A press that finds its result paid for already starts no job: a
-    second approval of the same text, a result carried from an earlier
-    run, or a glue the tick gave up on. ``tagger.place`` puts the spans
-    on the approved text in this request, and a fault is its answer.
+    The retry of the tagger since #499: the approval starts it, and
+    this press is for a dead run, a run over an earlier approved text,
+    or an opinion approved before the approval did. Any logged-in user
+    presses it, the rule of the approval, and ``_tag_approved_text``
+    holds the gate and the start. Its confirm names the cost.
 
     Every answer is a Django message too, and the viewer reloads the
     page to show it.
@@ -2190,8 +2282,6 @@ def start_caselaw_tagger(
     :return: ``{status, message}``; 404 for an opinion of another scan,
         409 for a refusal.
     """
-    from scanning import s3_sync, tagger
-
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan")
@@ -2199,59 +2289,9 @@ def start_caselaw_tagger(
     )
     if opinion is None:
         return _edit_refusal(request, EDIT_NOT_FOUND_MESSAGE, 404)
-    if (
-        opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE
-        or not opinion.approved_text_key
-    ):
-        return _edit_refusal(request, TAG_NOT_APPROVED_MESSAGE)
-    if not tagger.enabled():
-        return _edit_refusal(request, TAG_DISABLED_MESSAGE)
-    if not s3_sync.s3_active():
-        return _edit_refusal(request, ENSEMBLE_BUCKET_MESSAGE)
-    state = tagger.state(opinion)
-    if state == tagger.RUNNING:
-        return _edit_refusal(request, TAG_RUNNING_MESSAGE)
-    if state == tagger.DONE:
-        return _edit_refusal(request, TAG_DONE_MESSAGE)
-    try:
-        rows = tagger.ensure_tag_jobs(opinion)
-    except tagger.TaggerInputError as exc:
-        logger.warning(
-            "%s of scan %s: the tagger press by %s did not start: %s",
-            opinion,
-            pk,
-            request.user,
-            exc,
-        )
-        return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
-    message = TAG_STARTED_MESSAGE
-    if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
-        # A result that is paid for already: carried from an earlier
-        # run of the same text, a glue the tick gave up on, or a second
-        # approval of the same text. No job runs, so the spans are
-        # placed now, and a fault is the answer of this press.
-        try:
-            tagger.place(opinion, rows[0])
-        except tagger.TaggerGlueError as exc:
-            logger.warning(
-                "%s of scan %s: the tagger press by %s did not place the "
-                "spans: %s",
-                opinion,
-                pk,
-                request.user,
-                exc,
-            )
-            return _edit_refusal(
-                request, TAG_GLUE_FAILED_MESSAGE.format(reason=exc)
-            )
-        message = TAG_PLACED_MESSAGE
-    logger.info(
-        "%s of scan %s: %s started the tagger (run %s)",
-        opinion,
-        pk,
-        request.user,
-        rows[0].run if rows else None,
-    )
+    tagged, message = _tag_approved_text(request, opinion)
+    if not tagged:
+        return _edit_refusal(request, message)
     messages.success(request, message)
     return JsonResponse({"status": "ok", "message": message})
 

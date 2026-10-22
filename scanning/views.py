@@ -473,6 +473,9 @@ def opinion_blocking_review(
             if warnings
             else "Blocking review",
             "card_word": "warning" if warnings else "blocking",
+            # The approval sends the text to the tagger (#499): the
+            # confirms of the page name the cost where the stage is on.
+            "tags_on_approval": tagger.enabled(),
             "current_scan": current["scan"],
             "list_url": reverse("opinion_list")
             + (f"?{urlencode(list_query)}" if list_query else ""),
@@ -714,6 +717,10 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
                 and ensemble.is_written(opinion)
                 and not review2_open
             ),
+            # The approval sends the text to the tagger (#499), a paid
+            # job, so the confirm of the button names the cost where
+            # the stage is on and promises no run where it is off.
+            "tags_on_approval": tagger.enabled(),
             # The redaction review of the volume is open again (#240):
             # the approval refuses, so the page says why it offers none.
             "review2_open": review2_open,
@@ -737,9 +744,9 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
                 and opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE
             ),
             "reopen_url": address("reopen_opinion_text"),
-            # The tagger (#272): offered on an approved text where a
-            # press can move ``tagger.state``, the gate of
-            # ``views_api.start_caselaw_tagger``.
+            # The tagger (#272): the retry since #499, offered on an
+            # approved text where a press can move ``tagger.state``,
+            # the gate of ``views_api._tag_approved_text``.
             "tag_state": tag_state,
             "can_tag": (
                 opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE

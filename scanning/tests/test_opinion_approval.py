@@ -28,18 +28,28 @@ from scanning import (
     opinion_findings,
     opinion_review,
     paragraphs,
+    runpod_client,
     tagger,
 )
 from scanning.factories import OpinionFindingFactory, ScanFactory
 from scanning.models import (
+    ExternalJob,
     Issue,
+    JobStage,
+    JobStatus,
     Opinion,
     OpinionCheck,
     OpinionReviewStatus,
 )
 from scanning.tests.test_opinion_edits import EditTestCase
 from scanning.tests.test_opinion_ocr import PRINTED
+from scanning.tests.test_tagger import TAGGER
 from scanning.tests.test_views import ScanningTestCase
+from scanning.views_api import (
+    APPROVED_TEXT_MESSAGE,
+    TAG_PLACED_MESSAGE,
+    TAG_STARTED_MESSAGE,
+)
 
 
 @override_settings(OPINION_ENSEMBLE_MIN_ENGINES=2)
@@ -583,6 +593,124 @@ class TestTheEndpoints(ApprovalTestCase, ScanningTestCase):
 
         self.assertEqual(response.status_code, 404)
 
+    # ── the tagger follows the approval (#499) ──────────────────────
+    def tag_rows(self):
+        return list(
+            ExternalJob.objects.filter(
+                opinion=self.opinion, stage=JobStage.TAG
+            ).order_by("run")
+        )
+
+    @override_settings(**TAGGER)
+    def test_an_approval_starts_the_tagger(self):
+        """The approved text goes to the tagger in the request: one
+        row, its input written, and the tagger's line after the
+        approval's in the message."""
+        self.dismiss_blocking()
+
+        response = self.post("approve_opinion_text")
+
+        self.assertEqual(response.status_code, 200)
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        rows = self.tag_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, JobStatus.PENDING)
+        self.assertIn(rows[0].input_key, self.objects)
+        message = response.json()["message"]
+        self.assertEqual(
+            message, f"{APPROVED_TEXT_MESSAGE} {TAG_STARTED_MESSAGE}"
+        )
+        self.assertEqual(self.said(response), [(messages.SUCCESS, message)])
+
+    @override_settings(**{**TAGGER, "RUNPOD_TAGGER_ENDPOINT_ID": ""})
+    def test_an_approval_with_the_stage_off_starts_no_run(self):
+        self.dismiss_blocking()
+
+        response = self.post("approve_opinion_text")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.tag_rows(), [])
+        self.assertEqual(response.json()["message"], APPROVED_TEXT_MESSAGE)
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+    @override_settings(**TAGGER)
+    def test_a_tagger_fault_keeps_the_approval_and_warns(self):
+        """The approval stands whatever the tagger does: its fault is
+        a warning beside the approval's line, never a refusal, and
+        the button of the review page is the retry."""
+        self.dismiss_blocking()
+
+        with patch(
+            "scanning.tagger.ensure_tag_jobs",
+            side_effect=tagger.TaggerInputError("no body"),
+        ):
+            response = self.post("approve_opinion_text")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "ok")
+        self.opinion.refresh_from_db()
+        self.assertEqual(
+            self.opinion.status, OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        self.assertTrue(self.opinion.approved_text_key)
+        self.assertEqual(self.tag_rows(), [])
+        message = response.json()["message"]
+        self.assertTrue(message.startswith(APPROVED_TEXT_MESSAGE))
+        self.assertIn("no body", message)
+        self.assertEqual(self.said(response), [(messages.WARNING, message)])
+
+    @override_settings(**TAGGER)
+    def test_a_second_approval_of_the_same_text_places_the_spans(self):
+        """A reopen and an approval of the same text reuse the paid
+        run: the spans are placed in the request, and no job starts."""
+        self.dismiss_blocking()
+        self.post("approve_opinion_text")
+        row = self.tag_rows()[0]
+        row.result_key = f"{tagger.prefix(self.opinion)}r{row.run}-s0-a1.json"
+        row.status = JobStatus.COMPLETED
+        row.attempt = 1
+        row.save()
+        self.objects[row.result_key] = {
+            "schema_version": runpod_client.RESULT_SCHEMA_VERSION,
+            "action": "tag",
+            "scan_pk": self.scan.pk,
+            "result_key": row.result_key,
+            "payload": {
+                "sequences": [
+                    {
+                        "id": tagger.sequence_id(self.opinion),
+                        "token_count": 40,
+                        "window_count": 1,
+                        "spans": [],
+                    }
+                ],
+                "sequence_count": 1,
+                "failed_sequences": [],
+                "model": "freelawproject/caselaw-block-tagger",
+                "max_tokens": 8192,
+            },
+        }
+        self.assertEqual(tagger.finish_ready_runs(), 1)
+        self.client.force_login(self.make_staff_user())
+        self.post("reopen_opinion_text")
+
+        response = self.post("approve_opinion_text")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["message"],
+            f"{APPROVED_TEXT_MESSAGE} {TAG_PLACED_MESSAGE}",
+        )
+        self.assertEqual([r.pk for r in self.tag_rows()], [row.pk])
+        self.opinion.refresh_from_db()
+        self.assertTrue(tagger.is_written(self.opinion))
+
     def test_the_reopen_is_for_staff_alone(self):
         self.dismiss_blocking()
         self.post("approve_opinion_text")
@@ -663,6 +791,28 @@ class TestThePage(ApprovalTestCase, ScanningTestCase):
         self.assertTrue(response.context["can_reopen"])
         self.assertNotContains(response, 'id="approve-text"')
         self.assertContains(response, 'id="reopen-text"')
+
+    @override_settings(**TAGGER)
+    def test_the_button_names_the_cost_where_the_tagger_is_on(self):
+        """The approval sends the text to a paid job (#499): the page
+        says so, for the confirm of the script and the title."""
+        self.dismiss_blocking()
+
+        response = self.page_context()
+
+        self.assertTrue(response.context["tags_on_approval"])
+        self.assertContains(response, 'data-tagger-on-approval="1"')
+        self.assertContains(response, "incurs costs $$$")
+
+    @override_settings(**{**TAGGER, "RUNPOD_TAGGER_ENDPOINT_ID": ""})
+    def test_the_button_promises_no_run_where_the_tagger_is_off(self):
+        self.dismiss_blocking()
+
+        response = self.page_context()
+
+        self.assertFalse(response.context["tags_on_approval"])
+        self.assertContains(response, 'data-tagger-on-approval="0"')
+        self.assertNotContains(response, "incurs costs $$$")
 
     def test_an_edit_not_built_holds_the_button_with_the_reason(self):
         """The endpoint refuses it (``NOT_BUILT``), so the page does."""

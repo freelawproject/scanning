@@ -36,9 +36,15 @@ The pieces, in the shape of ``dots_mocr.py`` and ``yolo.py``:
   stamps the ledger (:func:`is_written`) and consumes the row. The
   result object is kept.
 
-Nothing enqueues this stage on a tick. The button of the review page
-(``views_api.start_caselaw_tagger``) is the one caller of
-:func:`ensure_tag_jobs`, pinned by ``TestKnownEnqueuePaths``.
+Nothing enqueues this stage on a tick. The approval of the text
+(``views_api.approve_opinion_text``, #499) and the button of the review
+page (``views_api.start_caselaw_tagger``, the retry) are the two
+presses, both through ``views_api._tag_approved_text``, the one caller
+of :func:`ensure_tag_jobs`, pinned by ``TestKnownEnqueuePaths``. Each
+confirms the cost in the browser, the rule of the paid buttons of
+step 1: one job is one opinion, a few seconds of GPU, and the price is
+the cold start and the idle tail of the endpoint, which approvals
+within its idle timeout share.
 """
 
 from __future__ import annotations

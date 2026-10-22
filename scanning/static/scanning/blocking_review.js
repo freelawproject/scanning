@@ -30,6 +30,23 @@
     /** The level the page walks: 'blocking', or 'warning' for the
      *  warnings review, which gates nothing (``data-level``). */
     var level = 'blocking';
+
+    /** The confirm of an approval (#499). The approval sends the
+     *  approved text to the case-law block tagger on RunPod, a paid
+     *  job, so the page asks first, the rule of the paid buttons of
+     *  step 1, and the "Approve all ready" button asks once for its
+     *  whole chain. Nothing to ask where the server says the stage is
+     *  off (``data-tagger-on-approval``): the approval then starts no
+     *  run, and a confirm that named a cost would promise one. */
+    function confirmApproval(count) {
+        if (!root || root.dataset.taggerOnApproval !== '1') { return true; }
+        var asked = count > 1
+            ? 'Approve the text of these ' + count + ' opinions and send each '
+                + 'to the case-law block tagger on RunPod?'
+            : 'Approve the text of this opinion and send it to the case-law '
+                + 'block tagger on RunPod?';
+        return window.confirm(asked + ' This will incur costs $$$.');
+    }
     var sections = [];
 
     function el(tag, className, text) {
@@ -119,7 +136,9 @@
         this.pages = {};
         this.approved = false;
         var self = this;
-        this.approveButton.addEventListener('click', function () { self.approve(); });
+        this.approveButton.addEventListener('click', function () {
+            if (confirmApproval(1)) { self.approve(); }
+        });
     }
 
     Section.prototype.load = function () {
@@ -377,7 +396,9 @@
         this.button = node.querySelector('[data-role="approve-one"]');
         this.approved = false;
         var self = this;
-        this.button.addEventListener('click', function () { self.approve().then(countAll); });
+        this.button.addEventListener('click', function () {
+            if (confirmApproval(1)) { self.approve().then(countAll); }
+        });
     }
 
     Ready.prototype.ready = function () { return !this.approved; };
@@ -407,11 +428,12 @@
 
     /** Approve every section and every ready row that is ready, one
      *  after the next: one request at a time, each judged by the
-     *  server's own gate. */
+     *  server's own gate, after one confirm that counts them. */
     function approveAllReady() {
         var button = root.querySelector('[data-role="approve-all"]');
         var ready = sections.filter(function (section) { return section.ready(); })
             .concat(readyRows.filter(function (row) { return row.ready(); }));
+        if (!ready.length || !confirmApproval(ready.length)) { return; }
         if (button) { button.disabled = true; }
         ready.reduce(function (chain, item) {
             return chain.then(function () { return item.approve(); });
