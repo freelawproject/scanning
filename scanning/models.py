@@ -801,8 +801,13 @@ class Scan(AbstractDateTimeModel):
         # PRE-increment value via CASE/WHEN (no read-then-write race). A
         # pre-increment `>= max` is a post-increment `> max`, so a scan is
         # allowed `max_interruptions` re-queues before it is flagged. The
-        # PROCESSING guard means we never stomp a scan already moved on.
-        Scan.objects.filter(pk__in=pks, status=Status.PROCESSING).update(
+        # PROCESSING guard means we never stomp a scan already moved on,
+        # and the caller's own filter stays in the UPDATE (#503): the
+        # stale sweep runs on every worker at once, and a scan another
+        # worker re-queued and a third claimed again between the read
+        # above and this write carries a fresh ``processed_at`` that the
+        # sweep's cutoff no longer matches.
+        queryset.filter(pk__in=pks, status=Status.PROCESSING).update(
             interruption_count=models.F("interruption_count") + 1,
             status=models.Case(
                 models.When(

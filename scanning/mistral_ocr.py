@@ -151,6 +151,12 @@ MAX_CONCURRENCY = 16
 #: its geometry), waits for a measurement on a real volume.
 MAX_SUBMITS_PER_TICK = 1
 
+#: How long a claimed row may go without a batch id before the sweep
+#: calls the claim lost (#503): the render and the uploads of the
+#: largest shard, with room. Under the serial daemon the sweep never
+#: ran during a wave, so the answer used to be "at once".
+LOST_CLAIM_AFTER = timedelta(minutes=30)
+
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
 #: uploads the shard's pages again.
@@ -646,10 +652,12 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     """Poll one batch and apply what it said.
 
     The provider table's ``sweep_job`` for Mistral. A row with no
-    ``external_id`` is a claim the daemon lost mid-submission: the
-    scheduler is serial, so no wave is running while this sweeps, and
-    a claimed row with no id will never get one. It is retried at once
-    rather than waited on for a day.
+    ``external_id`` is a claim the wave lost mid-submission, or a shard
+    the wave is still rendering on another worker (#503): the two are
+    told apart by the clock alone, :data:`LOST_CLAIM_AFTER` since the
+    claim, because the sweep and the wave no longer share one serial
+    scheduler. Past it, the row is retried rather than waited on for a
+    day.
 
     A row polled inside :data:`POLL_INTERVAL` is left alone, and its
     deadline is judged all the same.
@@ -660,12 +668,18 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     :return: None.
     """
     if not job.external_id:
+        if job.submitted_at and (now - job.submitted_at) < LOST_CLAIM_AFTER:
+            # The wave may still be rendering this shard on another
+            # worker (#503): the sweep and the wave are no longer one
+            # serial scheduler. The id lands when the batch is created.
+            summary.pending += 1
+            return
         jobs.count_sweep_outcome(
             summary,
             jobs._retry_or_fail(
                 job,
                 "LOST_CLAIM",
-                "claimed, but the daemon stopped before the batch was created",
+                "claimed, but the worker stopped before the batch was created",
                 now,
             ),
         )

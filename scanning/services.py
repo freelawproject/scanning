@@ -43,7 +43,7 @@ from django.conf import settings
 from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
-from scanning import boundaries, undetected
+from scanning import boundaries, tasks, undetected
 from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
@@ -253,6 +253,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     scan.save()
     flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
+    tasks.dispatch_scan(scan.pk, QueuedAction.FULL_PIPELINE)
 
 
 def recover_pending_upload(pending) -> bool:
@@ -308,7 +309,14 @@ def _update_progress(
     :param total: Total step count, if applicable.
     :param kwargs: Additional Scan fields to update.
     """
-    updates = {"progress_message": message[:255]}
+    # The heartbeat (#503): ``processed_at`` is the claim stamp the
+    # stale sweep reads (``process_next_scan.recover_stale``), and a
+    # progress write refreshes it, so a long action on one of several
+    # workers is never swept for being old while it reports progress.
+    updates = {
+        "progress_message": message[:255],
+        "processed_at": timezone.now(),
+    }
     if current is not None:
         updates["progress_current"] = current
     if total is not None:
@@ -1699,6 +1707,29 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Apply the page numbers under the lock the bad-page score shares.
+
+    See :func:`_run_compute_issues`. The score (``badpage.scoring
+    .score_scan``) stamps and rebuilds under the same lock (#503), so
+    this apply never reads the scores before the stamp and opens the
+    review after the score's status check.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed.
+    :rtype: bool
+    """
+    from scanning import locks
+
+    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True) as held:
+        if not held:
+            # A holder's dead session, until the server reaps it: the
+            # next tick applies the numbers.
+            return False
+        return _run_compute_issues(scan, result_key)
+
+
+def _run_compute_issues(scan: "Scan", result_key: str) -> bool:
     """Read page numbers off a glued dots.mocr run and rebuild Issues.
 
     The apply step of issues #149/#204, called by
@@ -2405,6 +2436,7 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         progress_total=0,
     )
     if queued:
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         return True, (
             "Queued. The redactions are computed on the server, and this "
             "page reloads when they are ready."
@@ -2462,7 +2494,7 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
             f"The redactions are computed, with {open_findings} open "
             "finding(s). The opinions are queued for creation."
         )
-    Scan.objects.filter(
+    moved = Scan.objects.filter(
         pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
     ).update(
         status=Status.QUEUED,
@@ -2471,6 +2503,8 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
         progress_current=0,
         progress_total=0,
     )
+    if moved:
+        tasks.dispatch_scan(scan_pk, QueuedAction.CREATE_OPINIONS)
 
 
 def _park_after_redactions(

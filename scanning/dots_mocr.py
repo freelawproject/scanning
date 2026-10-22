@@ -974,11 +974,9 @@ def _write_apply_state(analyze_jobs: list[ExternalJob], state: dict) -> None:
     :param state: The state to store.
     :return: None.
     """
-    head = analyze_jobs[0]
-    meta = head.provider_meta or {}
-    meta["apply"] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    jobs.swap_provider_meta(
+        analyze_jobs[0], lambda meta: meta.update(apply=state)
+    )
 
 
 def _record_apply_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
