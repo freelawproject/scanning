@@ -555,8 +555,14 @@ Linux, the compose path and production fork.
 
 The switch is off after a merge: the daemon runs every pass itself,
 the views send nothing, and the deploy workflow skips a worker
-deployment that does not exist yet. Turning it on is four steps, in
-this order, and the reverse of step 3 turns it off again.
+deployment that does not exist yet. Three things change with the
+switch off all the same: a running action stamps its claim every
+minute from a thread, and the stale sweep re-queues a claim after ten
+minutes without a stamp instead of an hour; a Mistral shard claimed
+and lost mid-render waits thirty minutes before its retry, where it
+was retried at once; and every process imports the Celery package at
+start. Turning it on is four steps, in this order, and the reverse of
+step 3 turns it off again.
 
 1. Infra creates the four worker deployments from the daemon image
    (`freelawproject/scanning:<sha>-daemon`), each with
