@@ -197,12 +197,24 @@ class TestThrottle(TestCase):
 
     def test_a_broker_fault_reads_as_unknown_depth(self):
         with (
-            patch.object(
-                tasks.app, "connection_for_read", side_effect=OSError("down")
+            patch(
+                "scanning.tasks._pooled_connection",
+                side_effect=OSError("down"),
             ),
             self.assertLogs("scanning.tasks", level="WARNING"),
         ):
             self.assertIsNone(tasks.queue_depth("fast"))
+
+    def test_the_depth_is_read_over_a_pooled_connection(self):
+        from unittest.mock import MagicMock
+
+        connection = MagicMock()
+        connection.default_channel.client.llen.return_value = 3
+        pooled = MagicMock()
+        pooled.__enter__.return_value = connection
+        with patch("scanning.tasks._pooled_connection", return_value=pooled):
+            self.assertEqual(tasks.queue_depth("fast"), 3)
+        connection.default_channel.client.llen.assert_called_once_with("fast")
 
 
 class TestLocks(TransactionTestCase):

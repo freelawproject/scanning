@@ -104,20 +104,30 @@ def queue_depth(queue: str) -> int | None:
 
     CourtListener's ``get_queue_length`` without the priority steps,
     which these queues do not use: one ``LLEN`` on the Redis list the
-    queue is. A broker fault or a non-Redis transport answers ``None``,
-    and the caller sends as if the queue were empty.
+    queue is, over a connection from the app's pool, as theirs, so the
+    clock's hundred sends a minute cost no hundred connects. A broker
+    fault or a non-Redis transport answers ``None``, and the caller
+    sends as if the queue were empty.
 
     :param queue: A queue name of :data:`QUEUES`.
     :returns: The depth, or ``None``.
     :rtype: int | None
     """
     try:
-        with app.connection_for_read() as connection:
+        with _pooled_connection() as connection:
             return int(connection.default_channel.client.llen(queue))
     except Exception:
         _broker_failed()
         logger.warning("could not read the depth of %s", queue, exc_info=True)
         return None
+
+
+def _pooled_connection():
+    """Return a broker connection from the app's pool, as a context.
+
+    :returns: A context manager over a ``kombu.Connection``.
+    """
+    return app.pool.acquire(block=True)
 
 
 def has_room(queue: str) -> bool:
