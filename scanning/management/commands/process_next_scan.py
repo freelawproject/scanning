@@ -132,23 +132,19 @@ def _claim_rank():
     )
 
 
-def claim_next(scan_pk: int | None = None, action: str | None = None):
-    """Atomically claim the next queued scan, or the one named, and
-    mark it PROCESSING.
+def claim_next():
+    """Atomically claim the next queued scan by rank and mark it
+    PROCESSING.
 
     The claim is ``SELECT ... FOR UPDATE SKIP LOCKED`` over
     ``status=QUEUED``, so any number of workers may call it at once
-    and each gets its own scan. With ``scan_pk`` the claim is the
-    dispatch of a button press (``tasks.run_scan``, #503): the scan is
-    claimed only if it is still QUEUED, so a tick that took it first
-    costs the press nothing. With ``action`` too, only if it still
-    carries the action the sender wrote, so a message from before an
-    admin re-queue never runs the old action; a blank action is the
-    full pipeline.
+    and each gets its own scan. The one claim rule, for the tick and
+    for a scan task alike (``tasks.run_scan``, #503): a task names the
+    scan a view queued, but it claims by ``CLAIM_PRIORITY`` like the
+    tick, so a person's upload never waits behind a dispatched backfill
+    apply, and a message from before a re-queue runs the row's current
+    action and never the message's.
 
-    :param scan_pk: A scan to claim, or ``None`` for the next by rank.
-    :param action: The ``QueuedAction`` the sender wrote, with
-        ``scan_pk`` alone.
     :return: ``(scan, action)`` for the claimed scan, or ``None`` if no
         scan is queued.
     :rtype: tuple | None
@@ -159,22 +155,13 @@ def claim_next(scan_pk: int | None = None, action: str | None = None):
     from scanning.models import QueuedAction, Scan, Status
 
     with transaction.atomic():
-        queued = Scan.objects.select_for_update(skip_locked=True).filter(
-            status=Status.QUEUED
+        scan = (
+            Scan.objects.select_for_update(skip_locked=True)
+            .filter(status=Status.QUEUED)
+            .annotate(claim_rank=_claim_rank())
+            .order_by("claim_rank", "date_created")
+            .first()
         )
-        if scan_pk is not None:
-            queued = queued.filter(pk=scan_pk)
-            if action == QueuedAction.FULL_PIPELINE:
-                queued = queued.filter(queued_action__in=("", action))
-            elif action is not None:
-                queued = queued.filter(queued_action=action)
-            scan = queued.first()
-        else:
-            scan = (
-                queued.annotate(claim_rank=_claim_rank())
-                .order_by("claim_rank", "date_created")
-                .first()
-            )
         if scan is None:
             return None
 

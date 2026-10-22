@@ -594,26 +594,39 @@ def _nudge_after(action: str) -> None:
 
 @app.task(name="scanning.tasks.run_scan", queue=QUEUE_HEAVY)
 def run_scan(scan_pk: int, action: str) -> bool:
-    """Claim the scan a view queued, if it is still queued for the
-    action the view wrote, and run it.
+    """Run the next queued scan by rank, woken by a view that queued one.
+
+    The message names the scan and the action the view wrote, for the
+    log; the claim is the tick's (``claim_next``, by ``CLAIM_PRIORITY``),
+    so a person's upload goes before a backfill apply dispatched
+    earlier, and a scan queued again for another action since runs
+    that action and never the message's.
 
     :param scan_pk: The scan the view moved to QUEUED.
     :param action: The ``QueuedAction`` it wrote.
-    :returns: Whether this task ran it. ``False`` when a tick, or a
-        second delivery of this message, took it first, or when the
-        scan was queued again for another action since.
+    :returns: Whether this task ran a scan. ``False`` when nothing was
+        QUEUED: a tick, or a second delivery of this message, took it.
     :rtype: bool
     """
     from scanning.management.commands import process_next_scan
 
     _fresh_connection()
-    claimed = process_next_scan.claim_next(scan_pk, action)
+    claimed = process_next_scan.claim_next()
     if claimed is None:
         logger.info(
-            "scan %s was not QUEUED for %s when its task ran", scan_pk, action
+            "nothing was QUEUED when the task of scan %s (%s) ran",
+            scan_pk,
+            action,
         )
         return False
     scan, action = claimed
+    if scan.pk != scan_pk:
+        logger.info(
+            "the task of scan %s ran scan %s (%s), which ranks first",
+            scan_pk,
+            scan.pk,
+            action,
+        )
     process_next_scan.dispatch(scan, action)
     _nudge_after(action)
     return True

@@ -503,21 +503,39 @@ class TestRunScan(TestCase):
             )
         dispatch.assert_not_called()
 
-    def test_a_scan_queued_again_for_another_action_is_left_alone(self):
+    def test_a_scan_queued_again_for_another_action_runs_that_action(self):
         """A message from before an admin re-queue never runs the old
-        action."""
+        action: the claim runs what the row says."""
         scan = ScanFactory(
             status=Status.QUEUED, queued_action=QueuedAction.FULL_PIPELINE
         )
         with patch(
             "scanning.management.commands.process_next_scan.dispatch"
         ) as dispatch:
-            self.assertFalse(
+            self.assertTrue(
                 tasks.run_scan(scan.pk, QueuedAction.CREATE_OPINIONS)
             )
-        dispatch.assert_not_called()
-        scan.refresh_from_db()
-        self.assertEqual(scan.status, Status.QUEUED)
+        claimed, action = dispatch.call_args.args
+        self.assertEqual(claimed.pk, scan.pk)
+        self.assertEqual(action, QueuedAction.FULL_PIPELINE)
+
+    def test_an_upload_goes_before_the_apply_whose_message_arrived_first(self):
+        """The message is a wake-up; the rank is the tick's, so a
+        person's upload never waits behind a dispatched backfill."""
+        apply = ScanFactory(
+            status=Status.QUEUED, queued_action=QueuedAction.APPLY_PAGE_EDITS
+        )
+        upload = ScanFactory(status=Status.QUEUED, queued_action="")
+        with patch(
+            "scanning.management.commands.process_next_scan.dispatch"
+        ) as dispatch:
+            self.assertTrue(
+                tasks.run_scan(apply.pk, QueuedAction.APPLY_PAGE_EDITS)
+            )
+        claimed, _ = dispatch.call_args.args
+        self.assertEqual(claimed.pk, upload.pk)
+        apply.refresh_from_db()
+        self.assertEqual(apply.status, Status.QUEUED)
 
     def test_a_blank_action_is_the_full_pipeline(self):
         scan = ScanFactory(status=Status.QUEUED, queued_action="")
