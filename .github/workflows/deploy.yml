@@ -190,11 +190,16 @@ jobs:
 
       # The deployment exists only once infra creates it: until then
       # the leg is skipped, so a deploy never fails on the switch
-      # being off. `set image` names the container, so each worker
-      # deployment's container must be named like its deployment.
+      # being off. Only a missing deployment skips: any other kubectl
+      # error (auth, the API) fails the leg, as the web and daemon
+      # legs do, or a worker would keep an old image in silence.
+      # `set image` names the container, so each worker deployment's
+      # container must be named like its deployment.
       - name: Rollout ${{ matrix.deployment }}
         run: |
-          if kubectl get -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} >/dev/null 2>&1; then
+          set -e
+          found=$(kubectl get -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} --ignore-not-found -o name)
+          if [ -n "$found" ]; then
             kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} ${{ matrix.deployment }}=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
             kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }}
           else
