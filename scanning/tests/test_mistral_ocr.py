@@ -252,6 +252,29 @@ class TestRender(ScanningTestCase):
         self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
         self.assertEqual(img.getpixel((1600, 2100)), (255, 255, 255))
 
+    def test_the_whiteout_paints_the_perpendiculars_out(self):
+        """A page with one perpendicular drawn as print: a bar 50 by 6
+        px at 200 dpi with a stem 12 px in. Painted out; without the
+        whiteout the stem is in the PNG."""
+        pdf = self.tmp / "perpendicular.pdf"
+        black = (0, 0, 0)
+        with fitz.open() as doc:
+            page = doc.new_page(width=612, height=792)
+            page.draw_rect(
+                fitz.Rect(216, 360, 234, 362.2), color=black, fill=black
+            )
+            page.draw_rect(
+                fitz.Rect(220.3, 351, 221.4, 360), color=black, fill=black
+            )
+            doc.save(str(pdf))
+
+        pages = list(mistral_ocr.render_shard_pages(pdf, whiteout=True))
+
+        painted = png_image(pages[0][1])
+        self.assertEqual(painted.getpixel((613, 990)), (255, 255, 255))
+        plain = png_image(next(mistral_ocr.render_shard_pages(pdf))[1])
+        self.assertEqual(plain.getpixel((613, 990)), (0, 0, 0))
+
     def test_shard_pages_are_rendered_in_order(self):
         pdf = self.tmp / "shard.pdf"
         write_pdf(pdf, pages=3)
