@@ -64,6 +64,8 @@ WRITE_VIEWS = (
 REVIEW3_WRITE_VIEWS = (
     "approve_opinion_text",
     "dismiss_opinion_finding",
+    "give_back_opinion_footnotes",
+    "keep_opinion_footnotes",
     "reopen_opinion_text",
     "restore_opinion_finding",
 )
@@ -87,6 +89,8 @@ WRITE_CALLS = (
     "approve_text",
     "reopen_text",
     "dismiss",
+    "give_back",
+    "keep",
     "restore",
     "withdraw_stale",
     "rebuild",
