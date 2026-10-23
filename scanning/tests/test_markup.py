@@ -406,6 +406,79 @@ class TestTheOffsets(SimpleTestCase):
         )
 
 
+class TestTypography(SimpleTestCase):
+    """The engines spell alike what they read alike: an empty bracket
+    pair, a run of periods, a reporter abbreviation."""
+
+    def test_an_empty_bracket_pair_is_one_space_with_no_space_before(self):
+        for read in ('"execute[] its', '"execute[ ] its', '"execute [  ] its'):
+            self.assertEqual(
+                markup.parse_markdown(read).text, '"execute[ ] its', read
+            )
+
+    def test_a_bracket_with_content_keeps_its_space(self):
+        self.assertEqual(
+            markup.parse_markdown("the court [sic] held").text,
+            "the court [sic] held",
+        )
+
+    def test_a_run_of_periods_has_no_space_inside_and_keeps_its_count(self):
+        self.assertEqual(
+            markup.parse_markdown("word . . . word. . . . end").text,
+            "word ... word.... end",
+        )
+        self.assertEqual(markup.parse_markdown("a \u2026 b").text, "a ... b")
+
+    def test_four_periods_attach_to_the_word_before_them(self):
+        for read in ("repleading.... If", "repleading . . . . If", "repleading. . . . If"):
+            self.assertEqual(
+                markup.parse_markdown(read).text, "repleading.... If", read
+            )
+        self.assertEqual(
+            markup.parse_markdown("word . . . word").text, "word ... word"
+        )
+        self.assertEqual(
+            markup.parse_markdown("3.5 percent. Id. at 7.").text,
+            "3.5 percent. Id. at 7.",
+        )
+
+    def test_the_text_keeps_the_prints_spelling_of_a_reporter(self):
+        for text in ("142 S.Ct. 2094, 12 N. E. 2d 5", "Pa.Super. and the U. S. court"):
+            self.assertEqual(markup.parse_markdown(text).text, text)
+
+    def test_the_vote_reads_the_spellings_of_a_reporter_as_one(self):
+        self.assertEqual(
+            markup.respell("142 S.Ct. 2094, 12 N. E. 2d 5"),
+            "142 S. Ct. 2094, 12 N.E.2d 5",
+        )
+        self.assertEqual(
+            markup.respell("12 Pa.Super. 5, 338 U. S. at 543, x [] y . . . z"),
+            "12 Pa. Super. 5, 338 U.S. at 543, x[ ] y ... z",
+        )
+
+    def test_a_reporter_folds_only_in_the_shape_of_a_citation(self):
+        for text in (
+            "Mr. N. C. Smith. Inc. Plaintiff. See id.",
+            "Long Mfg. N. C., Inc., 665 F.2d 61",
+            "the U. S. court held",
+        ):
+            self.assertEqual(markup.respell(text), text, text)
+
+    def test_the_marks_follow_the_respelled_text(self):
+        parsed = markup.parse_markdown("*execute [ ]* its, *word . . . word*")
+        self.assertEqual(parsed.text, "execute[ ] its, word ... word")
+        self.assertEqual(
+            [(m.kind, parsed.text[m.start : m.end]) for m in parsed.marks],
+            [("em", "execute[ ]"), ("em", "word ... word")],
+        )
+
+    def test_the_same_rules_in_html(self):
+        self.assertEqual(
+            markup.parse_html("<p>word . . . word[ ] 1 S.Ct. 2</p>").text,
+            "word ... word[ ] 1 S.Ct. 2",
+        )
+
+
 class TestTheBlockMark(SimpleTestCase):
     """A blockquote is written once, at its edges (#411)."""
 

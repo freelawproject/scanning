@@ -345,6 +345,154 @@ def _normalize_whitespace(out: _Out) -> None:
     out.chars, out.flags = chars, flags
 
 
+#: The reporter spellings that differ from their canonical name by
+#: spaces alone, out of eyecite's ``reporters_db``: ``S.Ct.`` is
+#: a variation of ``S. Ct.``, ``U. S.`` one of ``U.S.``. Read by the
+#: vote's fold (:func:`respell`) and never by the parse: the text keeps
+#: the print's spelling, the comparison reads both as one.
+_REPORTER_SPELLINGS: dict[str, str] | None = None
+_REPORTER_PATTERN: re.Pattern[str] | None = None
+
+
+def _reporter_spellings() -> tuple[dict[str, str], re.Pattern[str]]:
+    global _REPORTER_SPELLINGS, _REPORTER_PATTERN
+    if _REPORTER_PATTERN is None:
+        from reporters_db import VARIATIONS_ONLY
+
+        spellings = {
+            variation: canonical[0]
+            for variation, canonical in VARIATIONS_ONLY.items()
+            if len(canonical) == 1
+            and variation != canonical[0]
+            and variation.replace(" ", "") == canonical[0].replace(" ", "")
+        }
+        longest_first = sorted(spellings, key=len, reverse=True)
+        _REPORTER_SPELLINGS = spellings
+        # The shape of a citation: a volume number before the reporter,
+        # a page number (or ``at`` and one) after it. ``Mr. N. C. Smith``
+        # and ``Long Mfg. N. C., Inc.`` are not between two numbers.
+        _REPORTER_PATTERN = re.compile(
+            r"(?<=\d )(?:"
+            + "|".join(re.escape(key) for key in longest_first)
+            + r")(?= (?:at )?\d)"
+        )
+    return _REPORTER_SPELLINGS, _REPORTER_PATTERN
+
+
+#: An empty bracket pair, with the space before it: the mark of an
+#: altered quotation (``execute[ ] its``), which the engines write as
+#: ``[]``, ``[ ]`` and `` [ ]``.
+_EMPTY_BRACKETS = re.compile(r" ?\[[ \n]*\]")
+#: A run of two periods or more with whitespace between them: ``. . .``
+#: beside ``...``, ``. . . .`` beside ``....``.
+_SPACED_DOTS = re.compile(r"\.(?:[ \n]*\.)+")
+#: The space before a run of four periods or more: a sentence end and
+#: an omission, so the first period is the word's (``repleading....``);
+#: a run of three keeps the space before it (``word ... word``).
+_SPACE_BEFORE_FOUR_DOTS = re.compile(r"(?<=\S) (?=\.{4})")
+_ELLIPSIS = "\u2026"
+
+
+def respell(text: str) -> str:
+    """Return the text as the vote compares it: the rules of
+    :func:`_normalize_typography`, plus a reporter abbreviation spelled
+    as ``reporters_db`` spells it (``S.Ct.`` and ``S. Ct.`` are one key).
+
+    The string twin of the parse's pass, for a reader that compares and
+    never shows: ``ensemble.compare_text`` folds its key through it, so
+    a text written before the rules (an edit's ``base_text``, an older
+    document) still reads as the same text, and two engines that spell
+    a citation apart read the same words. Never the text itself: the
+    print's spelling of a citation stays.
+
+    :param text: Any text.
+    :returns: The text with the three spellings made alike.
+    :rtype: str
+    """
+    spellings, reporters = _reporter_spellings()
+    text = text.replace(_ELLIPSIS, "...")
+    text = _EMPTY_BRACKETS.sub("[ ]", text)
+    text = _SPACED_DOTS.sub(lambda m: "." * m.group().count("."), text)
+    text = _SPACE_BEFORE_FOUR_DOTS.sub("", text)
+    return reporters.sub(lambda m: spellings[m.group()], text)
+
+
+def _respell(out: _Out, start: int, end: int, replacement: str) -> None:
+    """Replace ``out.chars[start:end]`` by ``replacement``, whose
+    non-space characters are the span's own in order: each keeps its
+    flags, and a space takes what its neighbours share, the rule of
+    :func:`_normalize_whitespace`.
+    """
+    source = [
+        (char, flag)
+        for char, flag in zip(out.chars[start:end], out.flags[start:end])
+        if not char.isspace()
+    ]
+    if [char for char in replacement if not char.isspace()] != [
+        char for char, _ in source
+    ]:
+        # Not a respelling of this span: leave it as the engine wrote it.
+        return
+    chars: list[str] = []
+    flags: list[frozenset[str]] = []
+    taken = 0
+    for char in replacement:
+        if char.isspace():
+            chars.append(char)
+            flags.append(frozenset())
+            continue
+        _, flag = source[taken]
+        taken += 1
+        chars.append(char)
+        flags.append(flag)
+    for index, char in enumerate(chars):
+        if char.isspace() and 0 < index < len(chars) - 1:
+            flags[index] = flags[index - 1] & flags[index + 1]
+    out.chars[start:end] = chars
+    out.flags[start:end] = flags
+
+
+def _normalize_typography(out: _Out) -> None:
+    """Spell alike what the engines spell apart, after the
+    whitespace contract and before the marks are read.
+
+    Two rules, each over a shape the engines read the same and write
+    differently, so the word vote stops seeing a difference that is
+    none: an empty bracket pair is ``[ ]`` with no space before it; a
+    run of periods has no space inside, a run of four or more none
+    before it either, and ``\u2026`` is ``...``. The characters of the
+    print never change, only the spaces between them (the ellipsis
+    character aside), so every mark stays on its word.
+
+    A reporter abbreviation is **not** respelled here: on one volume of
+    158 F.4th the three engines agree with the print's ``S.Ct.`` 5,954
+    times, and the dozen spaced misreads are the vote's to settle. So
+    the reporter table is :func:`respell`'s alone, the fold of
+    ``ensemble.compare_text``, and the text keeps the print's spelling.
+    """
+    if _ELLIPSIS in out.chars:
+        chars: list[str] = []
+        flags: list[frozenset[str]] = []
+        for char, flag in zip(out.chars, out.flags, strict=True):
+            if char == _ELLIPSIS:
+                chars.extend("...")
+                flags.extend([flag] * 3)
+            else:
+                chars.append(char)
+                flags.append(flag)
+        out.chars, out.flags = chars, flags
+    rules = (
+        (_EMPTY_BRACKETS, lambda m: "[ ]"),
+        (_SPACED_DOTS, lambda m: "." * m.group().count(".")),
+        (_SPACE_BEFORE_FOUR_DOTS, lambda m: ""),
+    )
+    for pattern, spell in rules:
+        text = "".join(out.chars)
+        # From the end, so an earlier span's offsets stay put.
+        for match in reversed(list(pattern.finditer(text))):
+            _respell(out, match.start(), match.end(), spell(match))
+
+
 def item_marks(text: str, starts: list[int]) -> list[Mark]:
     """Return one :data:`ITEM` mark per item of ``text`` (#428).
 
@@ -394,6 +542,7 @@ def marks_of(flags: list[frozenset[str]]) -> list[Mark]:
 
 def _finish(out: _Out) -> Parsed:
     _normalize_whitespace(out)
+    _normalize_typography(out)
     text = "".join(out.chars)
     starts = [i for i, flag in enumerate(out.flags) if _ITEM_FLAG in flag]
     marks = marks_of(out.flags)

@@ -510,7 +510,11 @@ def compare_text(text: str) -> str:
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
-    return _WS.sub(" ", folded).strip()
+    # The parse spells an empty bracket pair, a dot run and a reporter
+    # alike (``markup._normalize_typography``); a text from before it,
+    # an edit's ``base_text`` or an older document, reads as the same
+    # text here.
+    return markup.respell(_WS.sub(" ", folded).strip())
 
 
 def compare_word(word: str) -> str:
