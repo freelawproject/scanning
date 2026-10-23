@@ -1,8 +1,13 @@
+import time
 from http import HTTPStatus
 from typing import NoReturn
 
+from django.conf import settings
 from django.db import OperationalError, connections
 from django.http import HttpRequest, HttpResponse, JsonResponse
+
+from scanning import daemon_heartbeat, tasks, worker_heartbeat
+from scanning.celery_init import app
 
 
 def check_postgresql() -> bool:
@@ -44,6 +49,101 @@ def health_check(request: HttpRequest) -> JsonResponse:
 
     return JsonResponse(
         {"is_postgresql_up": is_postgresql_up},
+        status=status,
+    )
+
+
+def celery_queues(request: HttpRequest) -> JsonResponse:
+    """Return how many messages wait on each Celery queue.
+
+    CourtListener's ``/monitoring/celery-queues/``: a flat
+    ``{queue: depth}`` for an uptime monitor to alert on, one ``LLEN``
+    per queue of ``tasks.QUEUES``. A depth the broker could not give is
+    ``null`` and the answer a 500. With ``CELERY_ENABLED`` off nothing
+    is sent to a queue, so the answer is an empty 200.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: The depths (200), or a 500 when one is unknown.
+    :rtype: JsonResponse
+    """
+    if not settings.CELERY_ENABLED:
+        return JsonResponse({})
+    depths = {queue: tasks.queue_depth(queue) for queue in tasks.QUEUES}
+    status = HTTPStatus.OK
+    if any(depth is None for depth in depths.values()):
+        status = HTTPStatus.INTERNAL_SERVER_ERROR
+    return JsonResponse(depths, status=status)
+
+
+def celery_workers(request: HttpRequest) -> JsonResponse:
+    """Return the live workers of each Celery queue.
+
+    Read off the heartbeat keys the workers write
+    (``scanning.worker_heartbeat``), so a request broadcasts nothing.
+    A queue of ``tasks.QUEUES`` that no live worker consumes is in
+    ``missing`` and the answer a 500, as is a broker that cannot be
+    read. With ``CELERY_ENABLED`` off no worker is expected: 200.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: ``celery_enabled``, ``queues`` (queue to node names) and
+        ``missing``; 200 when every queue has a worker, else 500.
+    :rtype: JsonResponse
+    """
+    if not settings.CELERY_ENABLED:
+        return JsonResponse({"celery_enabled": False})
+    try:
+        workers = worker_heartbeat.live_workers(app)
+    except Exception:
+        workers = None
+    if workers is None:
+        return JsonResponse(
+            {"celery_enabled": True, "error": "the broker could not be read"},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    queues: dict[str, list[str]] = {queue: [] for queue in tasks.QUEUES}
+    for worker in workers:
+        for queue in worker.get("queues", ()):
+            queues.setdefault(queue, []).append(worker.get("hostname", "?"))
+    for hostnames in queues.values():
+        hostnames.sort()
+    missing = [queue for queue in tasks.QUEUES if not queues[queue]]
+    status = HTTPStatus.INTERNAL_SERVER_ERROR if missing else HTTPStatus.OK
+    return JsonResponse(
+        {"celery_enabled": True, "queues": queues, "missing": missing},
+        status=status,
+    )
+
+
+def daemon_heartbeat_view(request: HttpRequest) -> JsonResponse:
+    """Return whether the daemon's loop still turns.
+
+    Read off the stamp ``run_daemon`` writes from its loop
+    (``scanning.daemon_heartbeat``). With ``CELERY_ENABLED`` on the
+    daemon is the clock, and a live worker with no clock runs nothing,
+    so this is the third check beside the workers and the depths.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: ``mode``, ``age_seconds`` and ``stale_after``; 200 when
+        the stamp is fresh, 500 when it is stale or missing.
+    :rtype: JsonResponse
+    """
+    stamp = daemon_heartbeat.read()
+    if stamp is None:
+        return JsonResponse(
+            {"error": "the daemon never beat"},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    mode = stamp.get("mode", daemon_heartbeat.MODE_SERIAL)
+    age = max(0.0, time.time() - float(stamp.get("at", 0)))
+    limit = daemon_heartbeat.stale_after(mode)
+    status = (
+        HTTPStatus.OK if age <= limit else HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+    return JsonResponse(
+        {"mode": mode, "age_seconds": round(age, 1), "stale_after": limit},
         status=status,
     )
 

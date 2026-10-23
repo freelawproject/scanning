@@ -35,6 +35,9 @@ and the deployment stay; the shutdown re-queues nothing, because the
 workers hold the scans, and the mirror release at start is the
 ``opinions`` worker's. The daemon's own passes never block the clock.
 
+The loop stamps ``scanning.daemon_heartbeat`` at most every 15 seconds,
+in both modes, and ``/monitoring/daemon/`` reads the stamp.
+
 Known limitation of the serial mode: a long task delays the others
 by however long it runs -- a submit wave blocks scan claiming for the
 length of its slowest request, and a multi-minute pipeline run blocks
@@ -63,6 +66,8 @@ from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import OperationalError
+
+from scanning import daemon_heartbeat
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +228,20 @@ class Command(BaseCommand):
         if not self.celery:
             self._release_at_start()
 
+        beat_mode = (
+            daemon_heartbeat.MODE_CELERY
+            if self.celery
+            else daemon_heartbeat.MODE_SERIAL
+        )
+        last_beat = None
         while not self.shutdown:
             now = time.monotonic()
+            if (
+                last_beat is None
+                or now - last_beat >= daemon_heartbeat.INTERVAL_SECONDS
+            ):
+                daemon_heartbeat.beat(beat_mode)
+                last_beat = now
             for task in schedule:
                 if not task.due(now):
                     continue

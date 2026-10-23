@@ -268,3 +268,38 @@ class TestCeleryMode(TestCase):
         self.assertTrue(cmd.shutdown)
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PROCESSING)
+
+
+class TestDaemonHeartbeat(TestCase):
+    """The loop stamps the heartbeat in both modes (#503)."""
+
+    def _run_once(self):
+        cmd = Command()
+        beats = []
+
+        def fake_sleep(seconds):
+            cmd.shutdown = True
+
+        with (
+            patch(
+                "scanning.management.commands.run_daemon.daemon_heartbeat.beat",
+                side_effect=beats.append,
+            ),
+            patch("scanning.management.commands.run_daemon.call_command"),
+            patch("scanning.tasks.Tick.send"),
+            patch("scanning.management.commands.run_daemon.signal.signal"),
+            patch(
+                "scanning.management.commands.run_daemon.time.sleep",
+                side_effect=fake_sleep,
+            ),
+            patch("scanning.opinion_pdf.release_mirrors"),
+        ):
+            cmd.handle()
+        return beats
+
+    def test_the_serial_loop_beats(self):
+        self.assertEqual(self._run_once(), ["serial"])
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_the_clock_beats(self):
+        self.assertEqual(self._run_once(), ["celery"])
