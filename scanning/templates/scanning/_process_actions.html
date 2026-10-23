@@ -67,7 +67,12 @@ reach step 2.
   viewer paid RunPod for every page again. The endpoint
   (``start_dots_mocr``) stays for a staff POST.
   {% endcomment %}
-  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" %}
+  {% comment %}
+  The "Run Mistral OCR" button is gone (#341): the daemon's sweep
+  (``mistral_ocr.enqueue_missing_runs``) starts the read, so the bar
+  shows the run and no button.
+  {% endcomment %}
+  {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" files_slug="mistral" %}
   {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" %}
   {% if yolo_run %}
   <span class="text-sm text-gray-600 mr-2" title="Detection run {{ yolo_run.run }}: {{ yolo_run.label }}">

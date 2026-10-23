@@ -3,13 +3,15 @@ One OCR engine's control on the step-1 bar, staff-only for the button.
 Included once per engine by _process_actions.html: Mistral (#191) and
 Surya (#364).
 
-The two differ in five values only, so they share this file rather
-than a copy of it (#364). The caller passes:
+The two share this file rather than a copy of it (#364). The caller
+passes:
 
   run         - the run summary of that engine's rows, or None
   label       - what a line calls the engine ("Mistral OCR")
-  start_url   - the name of the POST route that creates the rows
   files_slug  - the GLUED_OUTPUTS slug of the files index
+  start_url   - the name of the POST route that creates the rows, or
+                nothing for an engine the daemon starts by itself
+                (Mistral, #341), which then gets the line and no button
   title       - the button's hover text
   confirm     - the question the browser asks before the POST
 
@@ -23,7 +25,7 @@ Neither stage moves a scan status, so its state comes from the run
 summary and never from `is_processing`. That summary still renders
 after the run ends, so a historical run stays readable.
 
-The button has no review-state gate, because both reads are over the
+A button has no review-state gate, because both reads are over the
 original shards: what they need exists from the moment the pipeline
 cut them, and nothing later in the pipeline moves a page they name.
 Every press can start real paid work, so the button is staff-only and
@@ -45,7 +47,7 @@ message.
   {% endif %}
 </span>
 {% endif %}
-{% if user.is_staff and not run.open %}
+{% if start_url and user.is_staff and not run.open %}
 <form method="post" action="{% url start_url scan.pk %}" class="inline">
   {% csrf_token %}
   <button type="submit" class="btn-outline text-sm" title="{{ title }}" onclick="return confirm('{{ confirm|escapejs }}');">{% if run %}Re-run {{ label }}{% else %}Run {{ label }}{% endif %}</button>

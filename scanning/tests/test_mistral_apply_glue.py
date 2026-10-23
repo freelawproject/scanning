@@ -1,12 +1,12 @@
 """Tests for the Mistral read of a corrected volume (issue #245).
 
 The stage joins a built apply run (#224) long after it was built: the
-read starts by hand today, and after the second review once #336
-lands. So the rows of the edited pages are created by the collect pass
+read is started by the daemon's sweep (#341), outside the build. So
+the rows of the edited pages are created by the collect pass
 rather than by the build, and the document is written outside
 ``apply.glues_due``. Under test:
 
-- a row is created only for a volume somebody chose to read
+- a row is created only for a volume whose Mistral read is glued
 - the document is the corrected volume's page space: a deleted page is
   gone, an edited page comes from its own result
 - a run with no structural edit aliases the volume document
