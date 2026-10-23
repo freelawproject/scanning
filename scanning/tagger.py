@@ -591,13 +591,17 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
 def _record_glue_failure(row: ExternalJob, exc: Exception) -> None:
     """Count a glue failure on the row, loud at the crossing into "out
     of tries" and quiet after, the dots.mocr glue's shape."""
-    meta = dict(row.provider_meta or {})
-    glue = dict(meta.get("glue") or {})
-    glue["attempts"] = int(glue.get("attempts") or 0) + 1
-    glue["last_error"] = str(exc)[:500]
-    glue["last_attempt_at"] = timezone.now().isoformat()
-    meta["glue"] = glue
-    ExternalJob.objects.filter(pk=row.pk).update(provider_meta=meta)
+    glue: dict = {}
+
+    def bump(meta: dict) -> None:
+        glue.clear()
+        glue.update(meta.get("glue") or {})
+        glue["attempts"] = int(glue.get("attempts") or 0) + 1
+        glue["last_error"] = str(exc)[:500]
+        glue["last_attempt_at"] = timezone.now().isoformat()
+        meta["glue"] = dict(glue)
+
+    jobs.swap_provider_meta(row, bump)
     log = (
         logger.error
         if glue["attempts"] >= GLUE_MAX_ATTEMPTS

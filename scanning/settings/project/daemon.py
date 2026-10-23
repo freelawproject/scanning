@@ -5,8 +5,14 @@ env = environ.FileAwareEnv()
 # How often (in seconds) the daemon checks for queued scans.
 DAEMON_POLL_INTERVAL = env.int("DAEMON_POLL_INTERVAL", default=5)
 
-# How long (in seconds) before a PROCESSING scan is considered stale.
-DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=3600)
+# How long (in seconds) a PROCESSING scan may go without a heartbeat
+# before it is considered stale and re-queued. A running action stamps
+# ``processed_at`` every ``process_next_scan.HEARTBEAT_SECONDS`` (60),
+# so this covers a few missed beats and not the longest action (#503):
+# a scan whose worker was killed (a deploy past the grace period, an
+# OOM) comes back in ten minutes instead of an hour. It is also the
+# expiry of the scan task's message.
+DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=600)
 
 # How many times the daemon may re-queue a single scan after being killed or
 # timing out mid-pipeline before giving up and flagging it ERROR_INTERRUPTED.

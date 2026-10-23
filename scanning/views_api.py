@@ -2267,6 +2267,13 @@ def _tag_approved_text(
         )
         return False, TAG_FAILED_MESSAGE.format(reason=exc)
     message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status == JobStatus.PENDING:
+        # A new row: wake the RunPod wave now (#503), so the job never
+        # waits an interval, from the approval and the press alike.
+        from scanning import tasks
+        from scanning.models import JobProvider
+
+        tasks.submit_soon(JobProvider.RUNPOD)
     if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
         # A result that is paid for already: carried from an earlier
         # run of the same text, a glue the tick gave up on, or a second
