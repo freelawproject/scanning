@@ -10,7 +10,7 @@ from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
-from scanning import apply, jobs
+from scanning import apply, jobs, tasks
 from scanning.models import (
     ApplyRun,
     BracketReading,
@@ -549,7 +549,10 @@ class ScanAdmin(admin.ModelAdmin):
         # stale ``queued_action`` left over from before the cutover would
         # make the daemon park the scan with the pipeline-paused message
         # instead of recovering it.
-        updated = queryset.filter(status__in=statuses).update(
+        pks = list(
+            queryset.filter(status__in=statuses).values_list("pk", flat=True)
+        )
+        updated = queryset.filter(pk__in=pks, status__in=statuses).update(
             status=Status.QUEUED,
             queued_action=QueuedAction.FULL_PIPELINE,
             progress_message=progress_message,
@@ -557,6 +560,8 @@ class ScanAdmin(admin.ModelAdmin):
             progress_total=0,
             **counter_resets,
         )
+        for pk in pks:
+            tasks.dispatch_scan(pk, QueuedAction.FULL_PIPELINE)
         if not updated:
             self.message_user(
                 request, no_match_message, level=messages.WARNING

@@ -284,23 +284,34 @@ a.doc-name:hover { text-decoration: underline; }
     position: relative;
 }
 
-/* Zoom toolbar — floats at the top-left of the viewer panel.
-   Sticky on both axes so it stays visible when horizontal overflow
-   appears at zoom > 1. */
+/* Zoom toolbar — a column pinned at the top-left of the viewer panel,
+   over the grey gutter beside the pages. Sticky on both axes so it
+   stays visible when horizontal overflow appears at zoom > 1. The
+   sticky box itself has no size, so the column takes no height in the
+   flow: a row across the top sat over the first page of every volume,
+   and a column in the flow would have pushed that page down by its
+   own height. The stack inside it is what shows. */
 .zoom-toolbar {
     position: sticky;
     top: 0;
     left: 0;
+    width: 0;
+    height: 0;
+    overflow: visible;
+    z-index: 30;
+}
+.zoom-toolbar .zoom-stack {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
     width: max-content;
-    margin-bottom: 12px;
-    padding: 4px 8px;
+    max-width: 150px;
+    padding: 6px;
     background: rgba(40, 42, 45, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 6px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    z-index: 30;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     backdrop-filter: blur(4px);
 }
@@ -314,6 +325,7 @@ a.doc-name:hover { text-decoration: underline; }
     line-height: 1.2;
     cursor: pointer;
     min-width: 28px;
+    text-align: center;
 }
 .zoom-toolbar .zoom-btn:hover { background: #4b5056; }
 .zoom-toolbar .zoom-btn:active { background: #2f3337; }
@@ -338,6 +350,7 @@ a.doc-name:hover { text-decoration: underline; }
     font-size: 12px;
     line-height: 1.2;
     cursor: pointer;
+    max-width: 100%;
 }
 .zoom-toolbar .zoom-select:hover { background: #4b5056; }
 .zoom-toolbar .zoom-select:disabled {
@@ -347,6 +360,7 @@ a.doc-name:hover { text-decoration: underline; }
 .zoom-toolbar .zoom-select option:disabled { color: #9ca3af; }
 .zoom-toolbar .zoom-pct {
     color: #f3f4f6;
+    text-align: center;
     font-size: 12px;
     min-width: 44px;
     text-align: center;
@@ -1145,6 +1159,15 @@ a.doc-name:hover { text-decoration: underline; }
     line-height: 1.5;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
+/* Under the step-2 toolbar column the panel opens beside the stack,
+   not under it: the stack is its positioned ancestor. Scoped here,
+   because the text review's guide shares the rule and must keep
+   hanging under its own "?" (the panel over its toggle could not be
+   closed). */
+.zoom-toolbar .viewer-help-panel {
+    top: 0;
+    left: calc(100% + 6px);
+}
 .viewer-help-panel h3 {
     margin: 8px 0 4px;
     font-size: 11px;
@@ -1364,6 +1387,22 @@ a.doc-name:hover { text-decoration: underline; }
 h3.ensemble-group {
     font-size: 14px;
     font-weight: 600;
+}
+/* A picture of the text (#463): drawn at its printed width, never
+   wider than the column. */
+figure.ensemble-group[data-kind="figure"] {
+    margin: 0.5rem 0;
+}
+img.ensemble-figure {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+}
+.ensemble-figure-missing {
+    font-size: 0.75rem;
+    font-style: italic;
+    opacity: 0.7;
 }
 div.ensemble-group[data-kind="list_item"] {
     margin-left: 1.2em;
@@ -1815,6 +1854,8 @@ div.ensemble-group[data-kind="list_item"] {
 .cr-box.cr-faint { border-color: #b7791f; background: rgba(183, 121, 31, 0.12); color: #b7791f; }
 .cr-box.cr-frozen { cursor: default; opacity: 0.6; }
 .cr-anchor { position: absolute; box-sizing: border-box; border: 2px dashed #6b7280; pointer-events: none; }
+/* The block a text card's footnote answer takes, inside a wider guess. */
+.cr-block { position: absolute; box-sizing: border-box; border: 2px dotted #2563eb; pointer-events: none; }
 .cr-other { position: absolute; box-sizing: border-box; border: 1px solid rgba(107, 114, 128, 0.55); pointer-events: none; }
 .cr-other.cr-own { border-color: rgba(46, 125, 50, 0.7); }
 .cr-other.cr-mine { border-width: 2px; border-color: #2e7d32; }

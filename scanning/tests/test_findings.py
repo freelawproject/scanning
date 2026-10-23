@@ -231,6 +231,53 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(row.metadata["source_page"], 2)
         self.assertIn(f"page {inside.page_index + 1}", row.message)
 
+    def test_the_guess_keeps_off_the_case_number_and_the_next_key(self):
+        """A column of orders: the case number sits at the top of the
+        caption and the next key icon ends it. The box starts a little
+        under the number and ends a little above the key, so the
+        curator who adds it trims nothing."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        span = make_boundary(scan, caption, key)
+        inside = make_detection(scan, "KEY_ICON", 1, y0=300.0, y1=390.0)
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            1,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=2000.0,
+        )
+        # The number of the next case, under the key, 440 to 470.
+        make_detection(
+            scan,
+            "CASE_SEQUENCE",
+            1,
+            label_id=int(Label.CASE_SEQUENCE),
+            x0=400.0,
+            y0=440.0,
+            x1=430.0,
+            y1=470.0,
+        )
+        # The key that closes that case, 1200 to 1290.
+        make_detection(
+            scan, "KEY_ICON", 1, x0=100.0, y0=1200.0, x1=340.0, y1=1290.0
+        )
+
+        findings.rebuild(scan)
+
+        rows = scan.issues.filter(check_name=CheckName.MISSING_CAPTION)
+        card = next(r for r in rows if r.metadata["key_bbox"][1] == inside.y0)
+        self.assertEqual(card.metadata["runs_on"], span.pk)
+        # Half a key height under the key is 435; the number ends at
+        # 470, and the box starts 0.05 key heights (4.5) under it; the
+        # next key starts at 1200, and the box ends 0.3 key heights
+        # (27) above it.
+        self.assertEqual(card.metadata["bbox"], [90.0, 474.5, 800.0, 1173.0])
+
     def test_a_second_box_over_a_paired_key_is_an_unmatched_key(self):
         """Two boxes over one icon: the pairing skipped the second, and
         it is the warning, not a missed caption inside the opinion the

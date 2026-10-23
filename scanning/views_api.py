@@ -428,6 +428,14 @@ EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
 )
 EDIT_QUOTE_TABLE_MESSAGE = "A table holds no blockquote."
+#: A picture of the text (#463) takes a move alone: it is a curated
+#: IMAGE box of review 2, so it has no text, it is no footnote and no
+#: quote, and it is not for review 3 to take out.
+EDIT_FIGURE_MESSAGE = (
+    "A picture takes no edit but a move (Move up or Move down). It is "
+    "an IMAGE box of the redaction review: dismiss it there and compute "
+    "again."
+)
 EDIT_QUOTE_NO_WORD_MESSAGE = (
     "Select at least one word of the block, then save."
 )
@@ -477,6 +485,10 @@ APPROVE_REFUSED_MESSAGES = {
     "moved": (
         "The text or the findings of this opinion changed during the "
         "approval. The page was loaded again: look and approve again."
+    ),
+    "figures": (
+        "A picture of this opinion is not cut yet, so the approved text "
+        "was not written. Wait a minute and approve again."
     ),
 }
 REOPENED_TEXT_MESSAGE = (
@@ -1769,7 +1781,10 @@ def edit_opinion_text(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
-    if group.get("human"):
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
+    human = group.get("human") or {}
+    if human and group.get("level") is None:
         return _edit_refusal(request, EDIT_HUMAN_ALREADY_MESSAGE)
     if group.get("level") is None:
         return _edit_refusal(request, EDIT_UNANIMOUS_MESSAGE)
@@ -1788,6 +1803,21 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
+    # The span the person judged, in the text they saw: the word card
+    # of the blocking review sends its word's, and the build then
+    # keeps the block's other open words open (``ensemble._kept_open``);
+    # the block card and the edit box send none, a whole-block
+    # judgement. A gap card's span is empty: the words go in there.
+    span = body.get("span")
+    if span is not None and (
+        not isinstance(span, list)
+        or len(span) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) for v in span
+        )
+        or not 0 <= span[0] <= span[1] <= len(group["text"])
+    ):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     edit = opinion_edits.supersede(
         opinion,
         request.user,
@@ -1797,8 +1827,13 @@ def edit_opinion_text(
         page_in_opinion=page["page_in_opinion"],
         box_pt=group["box_pt"],
         section=group.get("section") or ensemble.BODY,
-        base_text=group["text"],
+        # A second edit on a block a person wrote, for an open word
+        # the first left as it was, judges the engines' text the first
+        # judged, and supersedes it: the build compares ``base_text``
+        # with the engines' reading, never with the person's.
+        base_text=human.get("base_text") or group["text"],
         text=text,
+        span=span,
         glue_revision=opinion.glue_revision,
     )
     logger.info(
@@ -1833,7 +1868,7 @@ def edit_opinion_section(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: ``{status, message}``; 404, 400 or 409 on a refusal.
     """
-    from scanning import ensemble, opinion_edits
+    from scanning import ensemble, markup, opinion_edits
     from scanning.models import OpinionEdit
 
     context = _edit_context(request, pk, opinion_pk)
@@ -1844,6 +1879,8 @@ def edit_opinion_section(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     section = body.get("section")
     if section not in (ensemble.BODY, ensemble.FOOTNOTES):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
@@ -1918,6 +1955,8 @@ def edit_opinion_blockquote(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     quoted = body.get("quoted")
     span = body.get("span")
     if not isinstance(quoted, bool):
@@ -2000,7 +2039,7 @@ def edit_opinion_drop(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: ``{status, message}``; 404, 400 or 409 on a refusal.
     """
-    from scanning import ensemble, opinion_edits
+    from scanning import ensemble, markup, opinion_edits
     from scanning.models import OpinionEdit
 
     context = _edit_context(request, pk, opinion_pk)
@@ -2011,6 +2050,10 @@ def edit_opinion_drop(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
+    # A picture takes no drop (#463): it is a box a person kept in
+    # review 2, and the words under it stay out whatever review 3 says.
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     row = opinion_edits.supersede(
         opinion,
         request.user,
@@ -2333,6 +2376,11 @@ def start_caselaw_tagger(
         )
         return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
     message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status == JobStatus.PENDING:
+        from scanning import tasks
+        from scanning.models import JobProvider
+
+        tasks.submit_soon(JobProvider.RUNPOD)
     if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
         # A result that is paid for already: carried from an earlier
         # run of the same text, a glue the tick gave up on, or a second

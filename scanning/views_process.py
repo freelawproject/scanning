@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from blackletter.models import Label
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -47,6 +48,7 @@ from scanning import (
     stats,
     surya,
     tagger,
+    tasks,
     yolo,
 )
 from scanning.badpage import scoring as badpage_scoring
@@ -62,6 +64,7 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     Opinion,
@@ -987,6 +990,13 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                         "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
                         "img_w": md["img_width"],
                         "img_h": md["img_height"],
+                        # The row's + adds the guess as a caption box
+                        # (``addMissingCaption``), with the label the
+                        # finding names and never one the script spells.
+                        "label": md.get("label", Label.CASE_CAPTION.name),
+                        "label_id": md.get(
+                            "label_id", Label.CASE_CAPTION.value
+                        ),
                     }
                 )
             missing_count += len(op["missing"])
@@ -1071,6 +1081,10 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 engine["available"] for engine in ocr_engines
             ),
             "opinions": opinions,
+            # The text card's footnote answer writes this label (the
+            # server's table, never a script's copy of it).
+            "footnote_label": Label.FOOTNOTES.name,
+            "footnote_label_id": Label.FOOTNOTES.value,
             "opinion_count": opinion_count,
             "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
@@ -2059,6 +2073,30 @@ def opinion_blocking_cards(
             {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
             status=409,
         )
+    if request.GET.get("counts") == "1":
+        # The review page's walk buttons: both counts from one read of
+        # the document, and no card goes over the wire.
+        return JsonResponse(
+            {
+                "status": "ok",
+                "counts": {
+                    ensemble.BLOCKING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.blocking_findings(opinion)),
+                            ensemble.BLOCKING,
+                        )
+                    ),
+                    ensemble.WARNING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.warning_findings(opinion)),
+                            ensemble.WARNING,
+                        )
+                    ),
+                },
+            }
+        )
     # The warnings review asks for its own cards (``?level=warning``),
     # over the open warning findings; the blocking review is the
     # default. ``blocking_open`` goes with either, so the page keeps
@@ -2139,6 +2177,67 @@ def opinion_ensemble_url(
         )
     return _presigned_opinion_object(
         ensemble.document_key(opinion), opinion.glue_revision, opinion.pk
+    )
+
+
+#: The 404 of ``opinion_figure_url`` before the daemon cut the pictures
+#: of the text (#463), and its 400 for an address the page did not send.
+OPINION_FIGURE_NOT_CUT_MESSAGE = (
+    "The pictures of this opinion are not cut yet. The daemon cuts them "
+    "from the original after the text is written."
+)
+OPINION_FIGURE_BAD_REQUEST_MESSAGE = "Name the picture by its page and box."
+
+
+@login_required
+def opinion_figure_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read one picture of the text from (#463).
+
+    The review page draws each picture of the text in its place. It
+    names the picture as the ensemble document does, by its volume page
+    (``page``) and its box (``box``, four numbers), and the key is
+    built here by ``opinion_figures.key``, the one rule for it, so the
+    browser spells no path. ``opinion_figures.is_written`` is the one
+    rule for "the pictures exist".
+
+    :param request: The HTTP request, with ``page`` and ``box``.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, a 400 for an address
+        the page did not send, or a 404.
+    """
+    from scanning import opinion_figures
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("apply_run"), pk=opinion_pk, scan=scan
+    )
+    try:
+        page_index = int(request.GET.get("page", ""))
+        box = [float(value) for value in request.GET.get("box", "").split(",")]
+    except ValueError:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if page_index < 0 or len(box) != 4:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if not opinion.figure_digest or not opinion_figures.is_written(opinion):
+        return _json_404(
+            OPINION_FIGURE_NOT_CUT_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    run_label = opinion.apply_run.label if opinion.apply_run else ""
+    return _presigned_opinion_object(
+        opinion_figures.key(
+            opinion, run_label, {"page_index": page_index, "box_pt": box}
+        ),
+        opinion.glue_revision,
+        opinion.pk,
     )
 
 
@@ -3562,6 +3661,8 @@ class ShardRead:
     :ivar create: The row creator. **This is what costs money**, which
         is why the AST test of ``TestKnownEnqueuePaths`` pins the
         modules that name one.
+    :ivar provider: The ``JobProvider`` whose wave sends the rows, so
+        the button can send that wave now (``tasks.submit_soon``, #503).
     """
 
     name: str
@@ -3573,6 +3674,7 @@ class ShardRead:
     is_enabled: Callable[[], bool]
     run_summary: Callable[[Scan], dict | None]
     create: Callable[[Scan, dict], list[ExternalJob]]
+    provider: str
 
 
 def _shard_reads() -> dict[str, ShardRead]:
@@ -3597,6 +3699,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
+            provider=JobProvider.RUNPOD,
         ),
         JobEngine.MISTRAL_OCR: ShardRead(
             name="start_mistral_ocr",
@@ -3610,6 +3713,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=mistral_ocr.enabled,
             run_summary=mistral_ocr.run_summary,
             create=mistral_ocr.ensure_extract_jobs,
+            provider=JobProvider.MISTRAL,
         ),
         JobEngine.SURYA: ShardRead(
             name="start_surya_ocr",
@@ -3621,6 +3725,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=surya.enabled,
             run_summary=surya.run_summary,
             create=surya.ensure_extract_jobs,
+            provider=JobProvider.RUNPOD,
         ),
     }
 
@@ -3705,6 +3810,7 @@ def _start_shard_read(
         queued,
     )
     if queued:
+        tasks.submit_soon(spec.provider)
         messages.success(
             request,
             f"Queued {spec.label} for {queued} part(s) of this volume. "
@@ -5266,7 +5372,6 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: The rendered page.
     """
-    from blackletter.models import Label
 
     scan = get_object_or_404(Scan, pk=pk)
     flags = _review_flags(scan)

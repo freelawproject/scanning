@@ -1153,6 +1153,26 @@ document.addEventListener('DOMContentLoaded', function () {
         detDrawDragState = null;
     }
 
+    // While the Add popup is open, Enter is its Add button and Esc its
+    // Cancel: a box dropped by a double click or drawn by hand is
+    // confirmed without reaching for the mouse. A field being typed in
+    // keeps both keys; the popup's own select does not, so Enter on it
+    // adds the label it shows.
+    document.addEventListener('keydown', function (e) {
+        if (!detDrawPopup) return;
+        if (e.key !== 'Enter' && e.key !== 'Escape') return;
+        var tag = e.target && e.target.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.key === 'Escape') {
+            _cancelDetDraw();
+            return;
+        }
+        var confirm = detDrawPopup.querySelector('.det-draw-confirm');
+        if (confirm && !confirm.disabled) confirm.click();
+    });
+
     function activateDrawMode(pageDiv, pdfIndex) {
         if (activeDrawPageDiv === pageDiv) {
             _deactivateDrawMode();
@@ -1395,6 +1415,12 @@ document.addEventListener('DOMContentLoaded', function () {
 
         popup.querySelector('.det-draw-cancel-btn').addEventListener('click', _cancelDetDraw);
         popup.querySelector('.det-draw-confirm').addEventListener('click', function () {
+            // One add per popup: the button is off while the request
+            // is out, so a held Enter or a second click posts nothing.
+            // A refusal closes the popup; a transport fault turns the
+            // button back on.
+            if (this.disabled) return;
+            this.disabled = true;
             var labelName = popup.querySelector('.det-draw-label-select').value;
             _confirmDetDraw(pageDiv, pdfIndex, labelName);
         });
@@ -1477,6 +1503,13 @@ document.addEventListener('DOMContentLoaded', function () {
             // started here: an auto re-pair on every added box would
             // interrupt the reviewer in the middle of their edits. The
             // view names the button that does start it (#305/#322).
+        })
+        .catch(function () {
+            // A transport fault: the popup is still open, so the button
+            // comes back on for another try.
+            var confirm = detDrawPopup && detDrawPopup.querySelector('.det-draw-confirm');
+            if (confirm) confirm.disabled = false;
+            showToast('Failed to add detection');
         });
     }
 
@@ -2129,6 +2162,25 @@ document.addEventListener('DOMContentLoaded', function () {
             if (window.refreshFindings) window.refreshFindings();
         }).catch(function() { showToast('Failed to save the box'); });
     }
+
+    // A box moved from outside the page's own handles (the sidebar's
+    // "Cover the line" of a redaction_cuts_text card): the row the
+    // server answered takes the new place, and the page is drawn again.
+    window.applyRedactionMove = function(pageIndex, oldId, newId, bbox) {
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            (entry.rects || []).forEach(function(rect) {
+                if (rect.id !== oldId) return;
+                rect.x0 = bbox.x0; rect.y0 = bbox.y0;
+                rect.x1 = bbox.x1; rect.y1 = bbox.y1;
+                if (newId !== undefined && newId !== oldId) {
+                    rect.id = newId;
+                    rect.origin = 'human';
+                }
+            });
+        });
+        drawRedactionOverlaysForPage(pageIndex);
+    };
 
     function drawRedactionOverlaysForPage(pdfIndex) {
         if (!redactionRects || !redactionsVisible) return;

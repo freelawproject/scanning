@@ -180,7 +180,11 @@ function holdAside() {
             e.preventDefault();
             _currentOpinionIdx = Math.max(_currentOpinionIdx - 1, 0);
             cards[_currentOpinionIdx].click();
-        } else if (e.key === "ArrowDown") {
+        } else if (e.key === "ArrowDown" || e.key === "PageDown") {
+            // One page at a time, to its top: the next page whose top
+            // is below the viewer's. Page Down is the same move, so a
+            // screenful never lands mid-page. The jump settles after
+            // the lazy render, the rule of scrollPageIntoView.
             e.preventDefault();
             _clearDim();
             var pages = document.querySelectorAll(".lazy-page");
@@ -188,14 +192,13 @@ function holdAside() {
             if (viewer && pages.length) {
                 var vTop = viewer.getBoundingClientRect().top;
                 for (var i = 0; i < pages.length; i++) {
-                    var diff = pages[i].getBoundingClientRect().top - vTop;
-                    if (diff > 5) {
-                        viewer.scrollBy({ top: diff, behavior: "smooth" });
+                    if (pages[i].getBoundingClientRect().top - vTop > 5) {
+                        window.scrollPageIntoView(pages[i]);
                         break;
                     }
                 }
             }
-        } else if (e.key === "ArrowUp") {
+        } else if (e.key === "ArrowUp" || e.key === "PageUp") {
             e.preventDefault();
             _clearDim();
             var pages = document.querySelectorAll(".lazy-page");
@@ -203,9 +206,8 @@ function holdAside() {
             if (viewer && pages.length) {
                 var vTop = viewer.getBoundingClientRect().top;
                 for (var i = pages.length - 1; i >= 0; i--) {
-                    var diff = pages[i].getBoundingClientRect().top - vTop;
-                    if (diff < -5) {
-                        viewer.scrollBy({ top: diff, behavior: "smooth" });
+                    if (pages[i].getBoundingClientRect().top - vTop < -5) {
+                        window.scrollPageIntoView(pages[i]);
                         break;
                     }
                 }
@@ -348,20 +350,131 @@ function highlightDetection(el) {
 // as the drawer. The endpoint rebuilt the findings, so the card goes
 // when the section is fetched again: a live bracket box covers the
 // reading. The viewer draws the row at once.
-function addGuessedDetection(btn) {
+function addGuessedDetection(btn, variant) {
     var d = _getDetectionData(btn);
     if (!d || !d.guess) return;
     var cfg = window.SCAN_CONFIG;
+    // The text card's second answer: a footnote box over the block
+    // itself, with the label the card carries from the server. The
+    // column add takes the card's guess, the column the block sits in
+    // on a page with no column box.
+    var footnote = variant === "footnote";
+    if (footnote && !(cfg.footnoteLabel && cfg.footnoteLabelId)) {
+        // Never fall back to a column box: the page did not say which
+        // label a footnote is, so the press does nothing.
+        showToast("The page carries no footnote label; reload it.", "error");
+        return;
+    }
+    var label = btn.textContent;
     btn.disabled = true;
     btn.textContent = "...";
     var det = {
         page_index: d.pageIndex,
-        label: d.label,
-        label_id: d.labelId,
+        label: footnote ? cfg.footnoteLabel : d.label,
+        label_id: footnote ? cfg.footnoteLabelId : d.labelId,
         confidence: 1.0,
-        bbox: d.guess,
+        bbox: footnote ? d.bbox : d.guess,
         img_width: d.imgW,
         img_height: d.imgH,
+    };
+    fetch("/scans/" + cfg.docId + "/add-single-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify(det),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && (data.message || data.error)) || "Could not add the box");
+                return;
+            }
+            if (data.added === false) {
+                if (window.adoptDetection) window.adoptDetection(data.replaced_id, data.detection_id);
+            } else if (window.addDetectionRow) {
+                det.id = data.detection_id;
+                window.addDetectionRow(det);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not add the box");
+        });
+}
+
+// "Cover the line" of a card about a redaction that covers part of a
+// line of text: the box is moved to cover the whole line (the card's
+// ``cover``, the box grown over the reader's cell), through the same
+// endpoint as a drag of its handles. A computed box becomes a
+// hand-drawn one the next compute keeps, and the endpoint rebuilt the
+// findings, so the card goes.
+function coverCutLine(btn) {
+    var row = btn.closest("[data-redaction-id]");
+    if (!row) return;
+    var cfg = window.SCAN_CONFIG;
+    var id = parseInt(row.dataset.redactionId);
+    var cover = row.dataset.cover.split(",").map(function (v) { return parseFloat(v); });
+    var bbox = { x0: cover[0], y0: cover[1], x1: cover[2], y1: cover[3] };
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/move/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+        body: JSON.stringify(bbox),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not move the box");
+                return;
+            }
+            if (window.applyRedactionMove) {
+                window.applyRedactionMove(parseInt(row.dataset.pageIndex), id, data.id, bbox);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not move the box");
+        });
+}
+
+// The "+" of a missing-caption row under an opinion card: a caption
+// box drawn where the card guesses the caption is (the row's boxes,
+// the ones a click flashes), through the same endpoint as the drawer.
+// The guess is usually the right shape and nearly the right place, so
+// the curator places it with one press and resizes it on the page when
+// it is off. The endpoint rebuilt the findings, and a live caption box
+// in the pairing's place answers the card; the row says so, because
+// the opinion cards are drawn with the page and are not fetched again.
+function addMissingCaption(btn) {
+    var row = btn.closest(".missing-opinion");
+    if (!row || !row.dataset.boxes) return;
+    var cfg = window.SCAN_CONFIG;
+    var box = row.dataset.boxes.split(",").map(function (s) { return parseFloat(s.trim()); });
+    if (box.length !== 4 || box.some(isNaN)) return;
+    btn.disabled = true;
+    btn.textContent = "...";
+    var det = {
+        page_index: parseInt(row.dataset.pdfIndex),
+        label: row.dataset.label,
+        label_id: parseInt(row.dataset.labelId),
+        confidence: 1.0,
+        bbox: box,
+        img_width: parseInt(row.dataset.imgW),
+        img_height: parseInt(row.dataset.imgH),
     };
     fetch("/scans/" + cfg.docId + "/add-single-detection/", {
         method: "POST",
@@ -384,6 +497,14 @@ function addGuessedDetection(btn) {
             } else if (window.addDetectionRow) {
                 det.id = data.detection_id;
                 window.addDetectionRow(det);
+            }
+            btn.remove();
+            row.classList.add("opacity-60");
+            var tag = row.querySelector(".bg-red-600");
+            if (tag) {
+                tag.textContent = "caption added";
+                tag.classList.remove("bg-red-600");
+                tag.classList.add("bg-green-600");
             }
             showSaved(data);
             refreshFindings();

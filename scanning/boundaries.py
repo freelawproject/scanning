@@ -722,10 +722,14 @@ def add(
 def column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
     """Return the x, in points, that divides the two columns of each page.
 
-    From the live ``TEXT_COLUMN`` rows of the page, the rule of
-    blackletter's ``_column_bounds_pdf``: the middle of the gap between
-    the leftmost and the rightmost box. A page with fewer than two boxes
-    has one column and is absent.
+    From the live ``TEXT_COLUMN`` rows of the page, grouped into its
+    columns first (``columns.column_groups``, the rule of the gutter
+    passes): the middle of the gap between the left group's right edge
+    and the right group's left edge. A box narrower than its column (a
+    block a curator added over a paragraph) joins its column's group
+    and moves nothing, where the two boxes with the outermost centres
+    would have put the divide inside a column. A page with fewer than
+    two groups has one column and is absent.
 
     :param scan: The scan.
     :param page_indexes: The pages to answer for.
@@ -738,15 +742,20 @@ def column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
         scan=scan, label="TEXT_COLUMN", page_index__in=page_indexes
     ):
         columns.setdefault(row.page_index, []).append(row)
+    from scanning.columns import column_groups
+
     boundaries: dict[int, float] = {}
     for page_index, rows in columns.items():
         if len(rows) < 2:
             continue
-        rows.sort(key=lambda r: (r.x0 + r.x1) / 2)
-        left, right = rows[0], rows[-1]
-        px = (left.x1 + right.x0) / 2
+        groups = column_groups([(r.x0, r.x1) for r in rows])
+        if len(groups) < 2:
+            continue
+        left_edge = max(rows[i].x1 for i in groups[0])
+        right_edge = min(rows[i].x0 for i in groups[1])
+        px = (left_edge + right_edge) / 2
         boundaries[page_index] = to_points(
-            px, 0, left.img_width, left.img_height
+            px, 0, rows[0].img_width, rows[0].img_height
         )[0]
     return boundaries
 

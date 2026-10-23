@@ -434,11 +434,14 @@ body.boundary-pick .opinion-nav.picking {
       {% for m in op.missing %}
       <div class="ml-4 mb-1 rounded border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-2 py-1 text-xs cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40 missing-opinion"
            data-pdf-index="{{ m.idx }}" data-boxes="{{ m.boxes }}" data-img-w="{{ m.img_w }}" data-img-h="{{ m.img_h }}" data-issue-pk="{{ m.issue_pk }}"
+           data-label="{{ m.label }}" data-label-id="{{ m.label_id }}"
            onclick="event.stopPropagation(); goToPage(this)"
-           title="The key icon on page {{ m.key_num }} closes the opinion above, and no caption box follows it, so this opinion has no start. Click to show where the caption is likely to be, then draw the caption box there; the next compute starts the opinion on it.">
+           title="The key icon on page {{ m.key_num }} closes the opinion above, and no caption box follows it, so this opinion has no start. Click to show where the caption is likely to be, then draw the caption box there, or press + to add it where the card guesses; the next compute starts the opinion on it.">
         <span class="font-bold text-red-700 dark:text-red-300">?</span>
         <span class="text-[10px] px-1 rounded bg-red-600 text-white">missing</span>
         <span class="text-gray-700 dark:text-gray-300">Pages {{ m.num }}&ndash;{{ m.end_num }}: no caption box after the key on page {{ m.key_num }}</span>
+        <button class="ml-1 px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700 missing-add" title="Add a caption box where the card guesses the caption is, the box the row flashes. Resize it on the page if it is off; the next compute starts the opinion on it."
+                onclick="event.stopPropagation(); addMissingCaption(this)">+</button>
       </div>
       {% endfor %}
       {% if op.image_pages %}
@@ -498,7 +501,14 @@ body.boundary-pick .opinion-nav.picking {
       <div id="preview-banner"
            class="flex items-center gap-2 text-xs px-3 py-1.5 border-b border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
            hidden></div>
+      {% comment %}
+        The toolbar is a column at the top-left of the panel, over the
+        grey gutter beside the pages, and takes no height in the flow:
+        a row across the top sat over the first page of every volume.
+        The sticky box is empty; the stack inside it is what shows.
+      {% endcomment %}
       <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
+       <div class="zoom-stack">
         <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>
         <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>
         <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
@@ -543,6 +553,7 @@ body.boundary-pick .opinion-nav.picking {
                 title="What the overlays and the detection boxes do">?</button>
         {% include "scanning/_viewer_help.html" %}
         {% endif %}
+       </div>
       </div>
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
@@ -578,6 +589,9 @@ var SCAN_CONFIG = {
     csrfToken: document.querySelector('[name=csrfmiddlewaretoken]').value,
     docId: {{ scan.pk }},
     step: {{ step }},
+    // The label the text card's "+ footnote" writes (#49x).
+    footnoteLabel: "{{ footnote_label }}",
+    footnoteLabelId: {{ footnote_label_id|default:"null" }},
     deletedPages: {{ deleted_pages_json|safe }},
     // The pages a curator moved (#261), keyed by page, with the original
     // page each one now follows (0 for before page 1).

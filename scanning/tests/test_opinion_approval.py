@@ -191,6 +191,40 @@ class TestTheGate(ApprovalTestCase):
         self.assertEqual(self.blocking(), [])
         self.approve()
 
+    def test_a_word_answer_keeps_the_card_for_the_open_word_it_left(self):
+        """A word card's answer (the edit's ``span``) vouches for its
+        word alone: the block's other open word still blocks."""
+        from scanning.models import OpinionEdit
+
+        group = self.split_group()
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A 1",
+            span=[0, 4],
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(
+            [f.check_name for f in self.blocking()],
+            [OpinionCheck.NO_MAJORITY],
+        )
+
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A one",
+            span=[9, 10],
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(self.blocking(), [])
+        self.approve()
+
 
 class TestTheWrite(ApprovalTestCase):
     def setUp(self):

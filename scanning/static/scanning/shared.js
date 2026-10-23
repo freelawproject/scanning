@@ -813,15 +813,26 @@ function drawExistingRedactions(overlay, pageRedactions, scale) {
 // at a placeholder height and grow to their true height once rasterized, which
 // shifts everything below them; so after jumping we re-align until the target
 // stops moving (capped) instead of animating through every page in between.
+// One settle loop at a time: a new jump cancels the retry of the one before,
+// and a retry that no longer owns the target does nothing, or two quick
+// arrow presses had two loops pulling the view each to its own page, and the
+// next press measured "next page" from wherever the loser left it.
+var _settleTimer = null;
+var _settleTarget = null;
 window.scrollPageIntoView = function (el) {
     if (!el) return;
+    if (_settleTimer) { clearTimeout(_settleTimer); _settleTimer = null; }
+    _settleTarget = el;
     var tries = 0;
     (function settle() {
+        if (_settleTarget !== el) return;
         var before = el.getBoundingClientRect().top;
         el.scrollIntoView({ block: 'start' });
         var after = el.getBoundingClientRect().top;
         if (++tries < 10 && Math.abs(after - before) > 2) {
-            setTimeout(settle, 90);
+            _settleTimer = setTimeout(settle, 90);
+        } else {
+            _settleTimer = null;
         }
     })();
 };

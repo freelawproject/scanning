@@ -169,6 +169,10 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
         "result_key": job.result_key,
         "prompt_mode": PROMPT_MODE,
         "dpi": DPI,
+        # Paint the perpendiculars out of the render before the
+        # model reads it (``perpendiculars.py``); a worker built before the
+        # flag ignores it.
+        "whiteout_perpendiculars": bool(settings.PERPENDICULARS_WHITEOUT),
         **tuning,
     }
 
@@ -970,11 +974,9 @@ def _write_apply_state(analyze_jobs: list[ExternalJob], state: dict) -> None:
     :param state: The state to store.
     :return: None.
     """
-    head = analyze_jobs[0]
-    meta = head.provider_meta or {}
-    meta["apply"] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
+    jobs.swap_provider_meta(
+        analyze_jobs[0], lambda meta: meta.update(apply=state)
+    )
 
 
 def _record_apply_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:

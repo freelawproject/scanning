@@ -178,7 +178,8 @@ logger = logging.getLogger(__name__)
 #: (#419); 7 takes the bullet of a list item off its text and marks
 #: every item with an ``li`` mark (#428); 8 names a unit the
 #: first-page footnote mask takes (:data:`NEIGHBOUR_FOOTNOTES`, #457)
-#: and the zones it takes (:data:`TAKEN_FOOTNOTES`).
+#: and the zones it takes (:data:`TAKEN_FOOTNOTES`), and gives a
+#: picture unit the ``figure`` kind (#463).
 SCHEMA_VERSION = 8
 
 #: The redaction types whose box can delete the bracket token of the
@@ -263,6 +264,33 @@ ZONES: dict[str, Zone] = {
 #: the viewer draws a zone of the page's own notes alone.
 TAKEN_FOOTNOTES = "footnotes_taken"
 
+#: The verdict of a unit on the running head's line: the height of a
+#: ``PAGE_HEADER``, ``STATE_ABBREVIATION`` or ``PAGE_NUMBER`` detection
+#: of the page holds nothing of the opinion, so a unit at least
+#: :data:`HEAD_LINE_SHARE` of whose height lies inside one is taken
+#: whole, whatever box covers it and whoever read it. A unit that runs
+#: on from the head into the body is mostly below it, and the other
+#: rules judge it, so a block an engine merged is never dropped whole.
+RUNNING_HEAD = "running_head"
+HEAD_LINE_LABELS = frozenset(
+    {
+        Label.PAGE_HEADER.name,
+        Label.STATE_ABBREVIATION.name,
+        Label.PAGE_NUMBER.name,
+    }
+)
+HEAD_LINE_SHARE = 0.5
+#: A unit that holds a head line whole is the line's too, when it is no
+#: taller than this many times the line: an engine draws the page
+#: number's box with air above it. A block an engine merged from the
+#: head into the body is far taller, and the other rules judge it.
+HEAD_LINE_MAX_SCALE = 2.0
+#: The share of a head line a unit must hold for that: the whole line,
+#: with a little tolerance for the engine's edge. Half of it is not
+#: holding it: a body unit that clips the bottom of the head line and
+#: runs a line below is the opinion's, and the other rules judge it.
+HEAD_LINE_HELD = 0.9
+
 #: The verdict of a unit where the detections drew nothing: the
 #: bleed-through of the page behind, which the engines read as words.
 #: A page's columns, its footnote band, its head and its pictures are
@@ -293,6 +321,15 @@ EXCLUDE_SHARE = 0.10
 #: the ``PARTIAL_REDACTION`` card of #334 asks a human to look.
 FULL_SHARE = 0.90
 
+#: The verdict of a unit under a curated picture: a live ``IMAGE`` box
+#: of the run covers :data:`FIGURE_SHARE` or more of it. The pictures
+#: of an opinion's text are those boxes, the ones a person saw and kept
+#: in review 2, and never the engines' own picture labels: a table a
+#: curator boxed as a picture goes into the text as the picture, and
+#: the words the engines read inside it stay out.
+PICTURE = "picture"
+FIGURE_SHARE = 0.5
+
 #: How far inside each edge of a cell the share is measured, in
 #: points. An engine's cell carries air around its letters and a
 #: redaction box hugs the ink, so the box starts a few points inside
@@ -304,6 +341,16 @@ FULL_SHARE = 0.90
 #: anything. A cell narrower than four times this on an axis keeps
 #: half of itself on that axis.
 EDGE_PT = 3.0
+
+#: A gap between two boxes no wider than this hides no line of print,
+#: so the share counts it as covered (:func:`bridge_seams`). Review 2
+#: draws one black box per headnote, and where one headnote ends and
+#: the next begins the two boxes leave a hairline of white paper, two
+#: points wide, that runs through the engine's cell for the heading
+#: below it; measured as uncovered, that hairline put every heading of
+#: a volume a point under :data:`FULL_SHARE` and raised a partial-cover
+#: card for a block the boxes cover whole.
+SEAM_PT = EDGE_PT
 
 #: How many rows one tick writes, all of one scan. One row is a cut of
 #: about four pages, a geometry over about 800 units and 30 boxes and
@@ -406,7 +453,10 @@ class EngineSpec:
         kind (a ``Section-header`` is a heading whether or not the
         engine wrote ``##``), each mapped to a ``markup.BLOCK_KINDS``
         value. Mistral's ``title`` names the caption's party names
-        too; the ensemble's majority answers that, not this table.
+        too; the ensemble's majority answers that, not this table. No
+        picture label is here (#463): the pictures of the text are
+        review 2's boxes, and a unit an engine labels a picture is
+        parsed as the paragraph it reads, bullets and all.
     """
 
     name: str
@@ -716,6 +766,11 @@ class ScanInputs:
     printed: dict[int, str] = field(default_factory=dict)
     zones: dict[str, dict[int, list]] = field(default_factory=dict)
     shared_pages: dict[int, float] = field(default_factory=dict)
+    #: ``{page_index: [picture]}``, the curated pictures in render
+    #: pixels (:func:`curated_pictures`), each with its own render size;
+    #: :func:`pictures_pt` puts them in points once the page size is
+    #: known, the rule of the zones.
+    pictures: dict[int, list[dict]] = field(default_factory=dict)
 
 
 def load_inputs(scan: Scan) -> ScanInputs:
@@ -790,6 +845,12 @@ def load_inputs(scan: Scan) -> ScanInputs:
             "y1",
             "img_width",
             "img_height",
+            # The junk rule of :func:`curated_pictures` reads these
+            # three: loaded here, or Django loads each with a query
+            # per row.
+            "model_name",
+            "found_by",
+            "label_id",
         )
         .order_by("page_index", "y0", "x0")
     ):
@@ -801,7 +862,178 @@ def load_inputs(scan: Scan) -> ScanInputs:
     # not once per row: the rule walks every live boundary.
     live = boundaries.live(scan)
     inputs.shared_pages = boundaries.shared_first_pages(scan, live, live)
+    inputs.pictures = curated_pictures(inputs)
     return inputs
+
+
+#: The fields of a detection row the junk rule of :func:`kept_pictures`
+#: reads, loaded with the row so the rule costs no query per row.
+PICTURE_FIELDS = (
+    "id",
+    "page_index",
+    "label",
+    "label_id",
+    "confidence",
+    "x0",
+    "y0",
+    "x1",
+    "y1",
+    "img_width",
+    "img_height",
+    "model_name",
+    "found_by",
+)
+
+
+def kept_pictures(rows_by_page: dict[int, list]) -> dict[int, list[dict]]:
+    """Return the curated pictures of some pages, in render pixels.
+
+    **The one rule of a picture of the text (#463).** The live ``IMAGE``
+    detections of the run, the boxes review 2 kept (the model's, a
+    curator's own, none a curator dismissed), less the junk the viewer
+    and the compute drop too (``services.drop_junk_entries``): the glue
+    sees the boxes the curator saw and decided on, and a twin the model
+    drew over a caption, which no screen shows, is no picture. The glue
+    (:func:`curated_pictures`), the re-glue's filter
+    (:func:`picture_rows`) and the opinions list
+    (``opinions.picture_counts``) all read it.
+
+    :param rows_by_page: ``{page_index: [Detection]}``, every live row
+        of each page, whatever its label: the junk rule judges an image
+        box against the text boxes beside it. The rows of one run.
+    :returns: ``{page_index: [{"id", "bbox", "img_width",
+        "img_height"}]}``, the box as the junk rule left it.
+    :rtype: dict[int, list[dict]]
+    """
+    from scanning.services import drop_junk_entries
+
+    entries = []
+    for page_index, rows in rows_by_page.items():
+        for row in rows:
+            manual = (
+                getattr(row, "model_name", "") == Detection.ModelName.MANUAL
+            )
+            entries.append(
+                {
+                    "id": getattr(row, "pk", None),
+                    "page_index": page_index,
+                    "label": row.label,
+                    "label_id": getattr(row, "label_id", None),
+                    "confidence": row.confidence,
+                    "bbox": [row.x0, row.y0, row.x1, row.y1],
+                    "img_width": row.img_width,
+                    "img_height": row.img_height,
+                    "found_by": "" if manual else getattr(row, "found_by", ""),
+                }
+            )
+    if not any(e["label"] == Label.IMAGE.name for e in entries):
+        return {}
+    drop_junk_entries(entries)
+    pictures: dict[int, list[dict]] = {}
+    for entry in entries:
+        if entry["label"] != Label.IMAGE.name:
+            continue
+        pictures.setdefault(entry["page_index"], []).append(
+            {
+                "id": entry["id"],
+                "bbox": entry["bbox"],
+                "img_width": entry["img_width"],
+                "img_height": entry["img_height"],
+            }
+        )
+    return pictures
+
+
+def curated_pictures(inputs: ScanInputs) -> dict[int, list[dict]]:
+    """Return the pictures of every page of the inputs, in render pixels.
+
+    :func:`kept_pictures` over every live detection of the run.
+
+    :param inputs: The inputs, with ``detected`` read.
+    :returns: ``{page_index: [picture]}``.
+    :rtype: dict[int, list[dict]]
+    """
+    return kept_pictures(inputs.detected)
+
+
+def pictures_pt(pictures: list[dict], size: tuple[float, float]) -> list[dict]:
+    """Return one page's pictures in points, as :func:`covered_share`
+    measures them.
+
+    One box per picture, off the row's own render size against the page
+    size, the rule of :func:`zones_pt` and of the frame, so the glue,
+    the frame and the cut read one box: a zero render size falls back
+    to the render density.
+
+    :param pictures: The page's entries of :func:`kept_pictures`.
+    :param size: The page size in points.
+    :returns: ``[{"x0", "y0", "x1", "y1", "id"}]``.
+    :rtype: list[dict]
+    """
+    rects = []
+    for picture in pictures:
+        bbox = picture["bbox"]
+        width, height = picture["img_width"], picture["img_height"]
+        x0, y0 = boundaries.to_points(bbox[0], bbox[1], width, height, *size)
+        x1, y1 = boundaries.to_points(bbox[2], bbox[3], width, height, *size)
+        box = as_box([x0, y0, x1, y1])
+        if box is None:
+            continue
+        rects.append(
+            {
+                "x0": round(box[0], 2),
+                "y0": round(box[1], 2),
+                "x1": round(box[2], 2),
+                "y1": round(box[3], 2),
+                "id": picture["id"],
+            }
+        )
+    return rects
+
+
+def picture_pages(run_ids) -> dict[int, list[int]]:
+    """Return the page of every curated picture of some runs.
+
+    :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
+    two queries, the image boxes and then every live row of their pages,
+    which the junk rule judges them against.
+
+    :param run_ids: The ``ApplyRun`` ids.
+    :returns: ``{run id: [page_index, ...]}``, one entry per picture;
+        a run with none is absent.
+    :rtype: dict[int, list[int]]
+    """
+    pairs = set(
+        Detection.objects.live()
+        .filter(apply_run_id__in=set(run_ids), label=Label.IMAGE.name)
+        .order_by()
+        .values_list("apply_run_id", "page_index")
+    )
+    if not pairs:
+        return {}
+    by_run: dict[int, dict[int, list]] = {}
+    for run_id, pages in _pages_by_run(pairs).items():
+        for row in (
+            Detection.objects.live()
+            .filter(apply_run_id=run_id, page_index__in=pages)
+            .only(*PICTURE_FIELDS)
+        ):
+            by_run.setdefault(run_id, {}).setdefault(
+                row.page_index, []
+            ).append(row)
+    out: dict[int, list[int]] = {}
+    for run_id, rows_by_page in by_run.items():
+        for page_index, pictures in kept_pictures(rows_by_page).items():
+            out.setdefault(run_id, []).extend([page_index] * len(pictures))
+    return out
+
+
+def _pages_by_run(pairs) -> dict[int, list[int]]:
+    """Group ``(run id, page_index)`` pairs by run."""
+    pages: dict[int, list[int]] = {}
+    for run_id, page_index in sorted(pairs):
+        pages.setdefault(run_id, []).append(page_index)
+    return pages
 
 
 def _printed_numbers(scan: Scan, run) -> dict[int, str]:
@@ -929,6 +1161,94 @@ def as_box(value) -> list[float] | None:
     return [x0, y0, x1, y1]
 
 
+def clamp_box(
+    box: list[float] | None, width: float, height: float
+) -> list[float] | None:
+    """Hold a box inside its page, or return None when nothing is left.
+
+    No cell is ever past the page. A reader writes the odd box past
+    the edge (a footnote cell of 452 P.3d ten pages wide, x to 11,387
+    on a 1,700-pixel render), and a box judged as drawn is covered by
+    a sliver of itself, so the unit is dropped and the card flashes a
+    box wider than the page. A box with nothing on the page is no
+    box: its unit is unjudged, left out of the text and counted in
+    the manifest. :func:`fit_overrun` is the rule the readers call,
+    which cuts an overrun at the detection box that holds the cell
+    first and comes here for the rest.
+
+    :param box: ``[x0, y0, x1, y1]`` with area, or None.
+    :param width: The page's width in the box's space.
+    :param height: The page's height in the box's space.
+    :returns: The box held inside ``[0, width]`` and ``[0, height]``,
+        or None when the box is None or lies wholly outside the page.
+    :rtype: list[float] | None
+    """
+    if box is None:
+        return None
+    x0 = min(max(box[0], 0.0), width)
+    y0 = min(max(box[1], 0.0), height)
+    x1 = min(max(box[2], 0.0), width)
+    y1 = min(max(box[3], 0.0), height)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def fit_overrun(
+    box: list[float] | None,
+    width: float,
+    height: float,
+    rects: list[dict] | None,
+) -> list[float] | None:
+    """Cut the part of a box that runs past the page at the box that holds it.
+
+    A reader's box that starts inside a detection box and runs off the
+    page almost always ends where that box ends: the footnote cell of
+    452 P.3d written ten pages wide starts inside the footnote box and
+    is the rest of its line. So each side that runs past the page is
+    cut at the far edge of the detection boxes that overlap the part of
+    the cell on the page; a side no box reaches is held at the page
+    edge (:func:`clamp_box`), and a box wholly off the page is pinned
+    to the margin it ran over. One rule for the glue's verdict and the
+    review-2 card, over the same frame.
+
+    :param box: ``[x0, y0, x1, y1]`` with area, or None.
+    :param width: The page's width in the box's space.
+    :param height: The page's height in the box's space.
+    :param rects: The page's frame, ``{"x0", "y0", "x1", "y1"}`` dicts
+        in the box's space, or None.
+    :returns: The fitted box, or None for None.
+    :rtype: list[float] | None
+    """
+    if box is None:
+        return None
+    x0, y0, x1, y1 = box
+    over = (x0 < 0, y0 < 0, x1 > width, y1 > height)
+    if not any(over):
+        return list(box)
+    inside = clamp_box(box, width, height)
+    if inside is None or not rects:
+        return inside
+    holders = [
+        r
+        for r in rects
+        if min(inside[2], r["x1"]) > max(inside[0], r["x0"])
+        and min(inside[3], r["y1"]) > max(inside[1], r["y0"])
+    ]
+    if not holders:
+        return inside
+    if over[0]:
+        x0 = min(r["x0"] for r in holders)
+    if over[1]:
+        y0 = min(r["y0"] for r in holders)
+    if over[2]:
+        x1 = max(r["x1"] for r in holders)
+    if over[3]:
+        y1 = max(r["y1"] for r in holders)
+    fitted = clamp_box([x0, y0, x1, y1], width, height)
+    return fitted if fitted is not None else inside
+
+
 def _number(value) -> bool:
     """Return whether ``value`` is a real number."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -1017,27 +1337,77 @@ def covered_share(
     area = (core[2] - core[0]) * (core[3] - core[1])
     if area <= 0:
         return 0.0, None
-    best, hit = 0.0, None
-    clipped: list[list[float]] = []
-    for rect in rects:
-        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
-        if other is None:
-            continue
-        clip = [
+
+    def clip(other: list[float]) -> list[float] | None:
+        piece = [
             max(core[0], other[0]),
             max(core[1], other[1]),
             min(core[2], other[2]),
             min(core[3], other[3]),
         ]
-        if clip[2] <= clip[0] or clip[3] <= clip[1]:
+        if piece[2] <= piece[0] or piece[3] <= piece[1]:
+            return None
+        return piece
+
+    best, hit = 0.0, None
+    boxes: list[list[float]] = []
+    for rect in rects:
+        other = as_box([rect["x0"], rect["y0"], rect["x1"], rect["y1"]])
+        if other is None:
             continue
-        clipped.append(clip)
-        share = (clip[2] - clip[0]) * (clip[3] - clip[1]) / area
+        boxes.append(other)
+        piece = clip(other)
+        if piece is None:
+            continue
+        share = (piece[2] - piece[0]) * (piece[3] - piece[1]) / area
         if share > best:
             best, hit = share, rect
-    if not clipped:
+    if hit is None:
         return 0.0, None
-    return min(1.0, union_area(clipped) / area), hit
+    # The seams are bridged between the whole boxes and only then cut
+    # to the core: a seam just past the core's edge leaves the box
+    # beyond it outside the core, and a bridge between the cut pieces
+    # would find no neighbour to reach (218 A.3d, a headnote line read
+    # 85% covered across a 2.2 pt seam). Only the boxes within a seam
+    # of the core can bridge into it, so the pairwise pass runs over
+    # those few and not over every box of the page.
+    near = [
+        box
+        for box in boxes
+        if box[0] < core[2] + SEAM_PT
+        and box[2] > core[0] - SEAM_PT
+        and box[1] < core[3] + SEAM_PT
+        and box[3] > core[1] - SEAM_PT
+    ]
+    pieces = [piece for piece in map(clip, bridge_seams(near)) if piece]
+    return min(1.0, union_area(pieces) / area), hit
+
+
+def bridge_seams(boxes: list[list[float]]) -> list[list[float]]:
+    """Return ``boxes`` with the seams between neighbours filled in.
+
+    Two boxes that overlap in one axis and stand apart in the other by
+    :data:`SEAM_PT` or less get a third box over the gap between them,
+    so the union reads them as one cover. A gap that narrow cannot hold
+    a line of print, and for the question the share answers, "could a
+    word be hiding where no box is?", it is no gap at all.
+
+    :param boxes: ``[x0, y0, x1, y1]`` lists, in points.
+    :returns: The boxes, plus one bridge per seam.
+    :rtype: list[list[float]]
+    """
+    bridges: list[list[float]] = []
+    for i, a in enumerate(boxes):
+        for b in boxes[i + 1 :]:
+            x0, x1 = max(a[0], b[0]), min(a[2], b[2])
+            y0, y1 = max(a[1], b[1]), min(a[3], b[3])
+            if x1 > x0 and y1 <= y0 and y0 - y1 <= SEAM_PT:
+                # One above the other: fill the strip between them.
+                bridges.append([x0, y1, x1, y0])
+            elif y1 > y0 and x1 <= x0 and x0 - x1 <= SEAM_PT:
+                # Side by side: fill the strip between them.
+                bridges.append([x1, y0, x0, y1])
+    return boxes + bridges
 
 
 def is_bracket_box(rect: dict, box: list[float]) -> bool:
@@ -1152,6 +1522,7 @@ def verdict(
     height_pt: float | None = None,
     label: str = "",
     frame: list[dict] | None = None,
+    head_lines: list[tuple[float, float]] | None = None,
 ) -> tuple[dict | None, float]:
     """Return one unit's ``(exclusion, share)``.
 
@@ -1159,7 +1530,10 @@ def verdict(
     names itself; else a neighbour's mask that does, the footnote mask
     of a shared first page under its own reason (#457); else the printed
     page number, when the unit sits in the head or the foot zone and
-    one of its lines ends in the approved number of its page (#396);
+    one of its lines ends in the approved number of its page (#396).
+    A cover below :data:`FULL_SHARE` on the page number's unit is the
+    page number's verdict, whole, and never a partial cover: the
+    running head's whiteout cuts the number out on purpose;
     else the frame, when the detections of the page cover less than
     :data:`UNDETECTED_SHARE` of the unit (:data:`UNDETECTED`); else
     nothing. The share is the larger of the two boxes' shares, so a
@@ -1185,14 +1559,26 @@ def verdict(
     :param label: The unit's label, as the engine wrote it.
     :param frame: The page's detections (:func:`page_frame`), or None
         for a page the rule does not judge.
+    :param head_lines: The heights of the running head's line
+        (:func:`head_lines`), ``(top, bottom)`` in points.
     :returns: The verdict.
     :rtype: tuple[dict | None, float]
     """
     if box_pt is None:
         return {"reason": UNJUDGED}, 0.0
+    if on_head_line(box_pt, head_lines):
+        return {"reason": RUNNING_HEAD}, 1.0
     red_share, hit = covered_share(box_pt, rects)
     out_share, mask = covered_share(box_pt, masks)
     share = max(red_share, out_share)
+    page_number = is_page_number(box_pt, text, printed, height_pt, label)
+    if page_number and share < FULL_SHARE:
+        # A cover that is only partial on the page number's unit: the
+        # running head's whiteout stops at the number on purpose, and
+        # an engine that read the abbreviation and the number as one
+        # unit has half of it under the box. The unit is furniture
+        # whole, never words a reader loses to a box drawn short.
+        return {"reason": PAGE_NUMBER, "printed": printed}, 1.0
     if (
         hit is not None
         and red_share >= EXCLUDE_SHARE
@@ -1212,7 +1598,7 @@ def verdict(
                 else "outside"
             )
         }
-    elif is_page_number(box_pt, text, printed, height_pt, label):
+    elif page_number:
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
     elif undetected(box_pt, frame):
@@ -1221,6 +1607,64 @@ def verdict(
     else:
         exclusion = None
     return exclusion, round(share, 4)
+
+
+def head_lines(
+    rows: list, size: tuple[float, float]
+) -> list[tuple[float, float]]:
+    """Return the heights of the running head's line on one page.
+
+    One ``(top, bottom)`` per ``PAGE_HEADER``, ``STATE_ABBREVIATION``
+    and ``PAGE_NUMBER`` detection of the page (:data:`HEAD_LINE_LABELS`),
+    in points, off each row's own render size (:func:`zones_pt`). The
+    page number counts: it sits on the line of the head or the foot,
+    and a unit of its height is furniture too. Only a box in the head or
+    the foot band (``page_numbers.edge_in_band``): a box of these labels
+    the model drew in the body would take every unit at its height.
+
+    :param rows: The page's live detections.
+    :param size: The page size in points.
+    :returns: The spans, in no order.
+    :rtype: list[tuple[float, float]]
+    """
+    heads = [row for row in rows if row.label in HEAD_LINE_LABELS]
+    return [
+        (box[1], box[3])
+        for box in zones_pt(heads, size)
+        if page_numbers.edge_in_band(box, size[1])
+    ]
+
+
+def on_head_line(
+    box_pt: list[float], spans: list[tuple[float, float]] | None
+) -> bool:
+    """Return whether a unit lies on the running head's line.
+
+    :data:`HEAD_LINE_SHARE` of the unit's height or more inside one of
+    the spans of :func:`head_lines`; or the span held whole
+    (:data:`HEAD_LINE_HELD` of it inside the unit), when the unit is no
+    taller than :data:`HEAD_LINE_MAX_SCALE` times the span.
+
+    :param box_pt: The unit's box in points.
+    :param spans: The page's head-line spans, or None.
+    :returns: Whether the unit is the running head's.
+    :rtype: bool
+    """
+    height = box_pt[3] - box_pt[1]
+    if not spans or height <= 0:
+        return False
+    for top, bottom in spans:
+        overlap = min(box_pt[3], bottom) - max(box_pt[1], top)
+        if overlap >= HEAD_LINE_SHARE * height:
+            return True
+        line = bottom - top
+        if (
+            line > 0
+            and overlap >= HEAD_LINE_HELD * line
+            and height <= HEAD_LINE_MAX_SCALE * line
+        ):
+            return True
+    return False
 
 
 def undetected(box_pt: list[float], frame: list[dict] | None) -> bool:
@@ -1355,6 +1799,8 @@ def build_document(
         "headings": 0,
         "list_items": 0,
         "tables": 0,
+        "figures": 0,
+        "under_picture": 0,
     }
     for offset in range(opinion.page_count):
         page_index = opinion.start_page_index + offset
@@ -1419,6 +1865,16 @@ def build_document(
             if size
             else None
         )
+        picture_rects = (
+            pictures_pt(inputs.pictures.get(page_index, []), size)
+            if size
+            else []
+        )
+        head_spans = (
+            head_lines(inputs.detected.get(page_index, []), size)
+            if size
+            else []
+        )
         for index, unit in enumerate(page.get(spec.units_key) or []):
             if not isinstance(unit, dict):
                 continue
@@ -1432,6 +1888,10 @@ def build_document(
                     round(box[2] * sx, 2),
                     round(box[3] * sy, 2),
                 ]
+                # A box the reader ran past the page is cut at the
+                # detection box that holds it (``fit_overrun``), the
+                # rule the review-2 card reads too.
+                box_pt = fit_overrun(box_pt, size[0], size[1], frame_rects)
             # The engine's markup becomes marks over a plain text
             # (#404), and the bracket strip runs on that text: Surya's
             # markup is in its ``html``, where the token sits behind a
@@ -1465,7 +1925,30 @@ def build_document(
                 size[1] if size else None,
                 label,
                 frame_rects,
+                head_spans,
             )
+            picture_share, picture = (
+                covered_share(box_pt, picture_rects)
+                if exclusion is None and box_pt is not None and picture_rects
+                else (0.0, None)
+            )
+            if picture is not None and picture_share >= FIGURE_SHARE:
+                # Under a curated picture: the picture goes into the
+                # text in its place, and the words the engine read
+                # inside it stay out (:data:`PICTURE`). Only a unit the
+                # verdict kept: a redaction or the neighbour's mask
+                # over the unit names itself first and keeps its own
+                # rules, partial card included, because a picture's
+                # words may uncover a reading (``ensemble._things_under``)
+                # and a redacted one must never ride out with them. The
+                # share stays the measured one. The box is review 2's
+                # decision, and nothing in review 3 frees the words.
+                exclusion = {
+                    "reason": PICTURE,
+                    "detection_id": picture.get("id"),
+                }
+                share = picture_share
+                counts["under_picture"] += 1
             counts["units"] += 1
             if exclusion is not None and exclusion["reason"] == UNJUDGED:
                 counts["unjudged"] += 1
@@ -1493,6 +1976,54 @@ def build_document(
             if removed:
                 out["removed"] = removed
             entry["units"].append(out)
+        # The pictures of the page: one ``figure`` unit per curated box,
+        # on every engine's page alike, so the ensemble's picture groups
+        # are the boxes a person kept and nothing else.
+        for picture in picture_rects:
+            box_pt = [
+                picture["x0"],
+                picture["y0"],
+                picture["x1"],
+                picture["y1"],
+            ]
+            # Under a redaction or the neighbour's mask the picture goes
+            # like a block the box took, and the ensemble drops it: the
+            # rules of :func:`verdict`, over the box with no text.
+            exclusion, share = verdict(
+                box_pt,
+                rects,
+                page_masks,
+                "",
+                printed,
+                size[1],
+                "image",
+                frame_rects,
+            )
+            entry["units"].append(
+                {
+                    "id": len(entry["units"]),
+                    "type": "image",
+                    "text": "",
+                    "marks": [],
+                    "kind": markup.FIGURE,
+                    # In the engine's frame like every other unit's box.
+                    "bbox": (
+                        [
+                            round(box_pt[0] * frame[0] / size[0]),
+                            round(box_pt[1] * frame[1] / size[1]),
+                            round(box_pt[2] * frame[0] / size[0]),
+                            round(box_pt[3] * frame[1] / size[1]),
+                        ]
+                        if frame
+                        else None
+                    ),
+                    "box_pt": box_pt,
+                    "exclusion": exclusion,
+                    "share": share,
+                    "figure": {"detection_id": picture.get("id")},
+                }
+            )
+            counts["figures"] += 1
         pages.append(entry)
 
     return {
@@ -1779,6 +2310,56 @@ def reglue_rows(scan: Scan | None = None) -> QuerySet:
     if scan is not None:
         rows = rows.filter(scan=scan)
     return rows.order_by("scan_id", "first_printed_page", "index_in_page")
+
+
+def picture_rows(scan: Scan) -> list[Opinion]:
+    """Return the rows of ``scan`` a change of the picture rule moves.
+
+    Of :func:`reglue_rows`: an opinion whose page span holds a curated
+    picture (:func:`picture_pages`, the glue's own rule), or whose text
+    holds a picture already (``figure_digest``), because the rule reads
+    the first and wrote the second; one whose glue is written but whose
+    ensemble has not read it yet, because that glue carries the
+    engines' own picture labels as ``figure`` units, which the ensemble
+    trusts as the glue wrote them; and one with a standing ``DROP``
+    edit, because under the engines' labels a person took a stamp or a
+    blot out with "Not a picture", and that drop lands again only once
+    the glue has written the unit as the text it is (a picture takes no
+    drop). Every other opinion glues the same, so ``reglue_opinion_ocr
+    --with-pictures`` leaves it alone.
+
+    :param scan: The scan.
+    :returns: The rows, in the order of :func:`reglue_rows`.
+    :rtype: list[Opinion]
+    """
+    from scanning.models import OpinionEdit
+
+    rows = list(reglue_rows(scan))
+    pages = picture_pages({row.apply_run_id for row in rows})
+    dropped = set(
+        OpinionEdit.objects.filter(
+            opinion__in=rows,
+            kind=OpinionEdit.Kind.DROP,
+            withdrawn_at__isnull=True,
+        ).values_list("opinion_id", flat=True)
+    )
+    picked = []
+    for row in rows:
+        unread_glue = (
+            row.ocr_glue_revision == row.glue_revision
+            and row.ensemble_revision != row.ocr_glue_revision
+        )
+        if (
+            row.figure_digest
+            or unread_glue
+            or row.pk in dropped
+            or any(
+                row.start_page_index <= page <= row.end_page_index
+                for page in pages.get(row.apply_run_id, ())
+            )
+        ):
+            picked.append(row)
+    return picked
 
 
 def reglue(scan: Scan, carry_pdf: bool = True) -> ReglueSummary:

@@ -411,6 +411,27 @@ def band_of(bbox: list, height: int | float) -> str | None:
     return None
 
 
+def edge_in_band(bbox: list, height: int | float) -> bool:
+    """Say whether a detection starts in the head or ends in the foot.
+
+    The test of a running head's own box (``opinion_ocr.head_lines``,
+    ``text_fit.widen_running_heads``), beside :func:`band_of`, the test
+    of a unit: the model draws the head's box to the ink of a two-line
+    head, so its bottom passes :data:`HEAD_BAND` on a fifth of the pages
+    of 218 A.3d by under half a percent of the page, and its top never
+    leaves it. A ``PAGE_HEADER`` box drawn in the body passes neither.
+
+    :param bbox: The box, ``[x0, y0, x1, y1]``.
+    :param height: The page's height, the space the box lives in.
+    :returns: Whether the top is in the head band or the bottom in the
+        foot band.
+    :rtype: bool
+    """
+    if len(bbox) < 4 or not height:
+        return False
+    return bbox[1] < HEAD_BAND * height or bbox[3] > FOOT_BAND * height
+
+
 def is_head_or_foot_label(label: str | None) -> bool:
     """Say whether an engine's label names the head or the foot (#396).
 

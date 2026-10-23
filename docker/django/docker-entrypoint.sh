@@ -23,6 +23,17 @@ case "$1" in
     fi
     exec python manage.py run_daemon
     ;;
+'worker')
+    # A Celery worker (#503). CELERY_QUEUES names the queues it serves
+    # (fast, io, heavy, opinions); CELERY_CONCURRENCY the processes.
+    # A heavy process is recycled after a few tasks, because fitz and
+    # blackletter hold memory a long volume leaves behind.
+    exec celery -A scanning worker \
+        --queues "${CELERY_QUEUES:-fast,io,heavy,opinions}" \
+        --concurrency "${CELERY_CONCURRENCY:-2}" \
+        --max-tasks-per-child "${CELERY_MAX_TASKS_PER_CHILD:-20}" \
+        --loglevel "${CELERY_LOGLEVEL:-info}"
+    ;;
 'web-prod')
     mkdir -p /opt/scanning/scanning/assets/media/processed
     chown -R www-data:www-data /opt/scanning/scanning/assets/media

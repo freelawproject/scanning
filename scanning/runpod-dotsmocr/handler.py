@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import layout_json
+import perpendiculars
 import requests
 import runpod
 import runpod_common
@@ -688,6 +689,11 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             f"Expected one of {sorted(_ALLOWED_PROMPT_MODES)}"
         )
     dpi = coerce_input("dpi", inputs.get("dpi", DEFAULT_DPI), int)
+    # Paint the perpendiculars out of every render before the
+    # model reads it (``perpendiculars.py``), when the daemon asks.
+    whiteout_perpendiculars = bool(
+        inputs.get("whiteout_perpendiculars", False)
+    )
     num_threads = coerce_input(
         "num_threads", inputs.get("num_threads", DEFAULT_NUM_THREADS), int
     )
@@ -792,6 +798,10 @@ def _action_parse(job: dict, inputs: dict, tmp_dir: Path) -> dict:
                 round(page.rect.height * dpi / 72),
                 dpi,
             )
+        # The perpendiculars, painted out of the render every rung
+        # reads (``perpendiculars.py``).
+        if whiteout_perpendiculars:
+            origin_image = perpendiculars.paint(origin_image, dpi)
 
         def _infer(page_image) -> dict:
             """Run one rung: inference plus post-process on one render.

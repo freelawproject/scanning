@@ -83,9 +83,13 @@
         return field ? field.value : '';
     }
 
-    /** The key a card keeps across reloads: its kind, page, block and offset. */
+    /** The key a card keeps across reloads: its kind, page, block,
+     *  offset and span. A gap card starts where the word after it
+     *  starts, so the span tells the two apart; the finding stays
+     *  last, the Undo of a dismissal reads it there. */
     function keyOf(card) {
-        return [card.kind, card.page_in_opinion, card.group_id, card.start, card.finding_pk].join(':');
+        return [card.kind, card.page_in_opinion, card.group_id, card.start,
+            card.gap ? 'gap' : (card.length || 0), card.finding_pk].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────
@@ -187,6 +191,11 @@
             page_in_opinion: card.page_in_opinion,
             group_id: card.group_id,
             text: text,
+            // The span judged: a word card answers its word, and the
+            // block's other open words stay open; a block card
+            // answers the block.
+            span: card.kind === 'word'
+                ? [card.start, card.start + card.length] : null,
             glue_revision: this.opinion.glue_revision,
             edit_revision: this.opinion.edit_revision
         }).then(function (answer) {
@@ -445,6 +454,9 @@
         var canvas = wrap.querySelector('canvas');
         var box = card.crop.crop;
         section.getPage(card.page_in_opinion + 1).then(function (pageCanvas) {
+            // The whole page when the card is opened (f): the crop is a
+            // guess at the line, and the page says where the guess sits.
+            if (card.full) { box = [0, 0, pageCanvas.width / SCALE, pageCanvas.height / SCALE]; }
             var x0 = Math.max(0, Math.floor(box[0] * SCALE));
             var y0 = Math.max(0, Math.floor(box[1] * SCALE));
             var x1 = Math.min(pageCanvas.width, Math.ceil(box[2] * SCALE));
@@ -453,7 +465,25 @@
             var height = Math.max(1, y1 - y0);
             canvas.width = width;
             canvas.height = height;
-            canvas.getContext('2d').drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            var context = canvas.getContext('2d');
+            context.drawImage(pageCanvas, x0, y0, width, height, 0, 0, width, height);
+            // The blocks of a cover card, outlined where the engines
+            // read them: the box is a fact of the document, not a guess.
+            (card.boxes || []).forEach(function (b) {
+                context.strokeStyle = '#dc2626';
+                context.lineWidth = 2;
+                context.strokeRect(b[0] * SCALE - x0, b[1] * SCALE - y0,
+                    (b[2] - b[0]) * SCALE, (b[3] - b[1]) * SCALE);
+            });
+            // On the whole page, the crop itself is outlined, so the eye
+            // finds the line the card is about.
+            if (card.full && !(card.boxes || []).length) {
+                var c = card.crop.crop;
+                context.strokeStyle = '#2f5d8a';
+                context.lineWidth = 2;
+                context.strokeRect(c[0] * SCALE - x0, c[1] * SCALE - y0,
+                    (c[2] - c[0]) * SCALE, (c[3] - c[1]) * SCALE);
+            }
         }).catch(function (error) {
             wrap.replaceChildren(note('The scan did not load: ' + error.message, 'error'));
         });
@@ -463,20 +493,57 @@
     var ENGINE_ROWS = ['r0', 'r1', 'r2'];
 
     function cardNode(section, card, index, total, answer) {
-        var node = el('article', 'bk-card bk-' + card.kind + (card.kind === 'block' ? ' bk-single' : ''));
+        // An answered or kept card is never the open one: it is greyed
+        // and the next card is the reader's.
+        if (card.full && (answer || section.kept[keyOf(card)])) { card.full = false; }
+        var node = el('article', 'bk-card bk-' + card.kind + (card.kind === 'block' ? ' bk-single' : '')
+            + (card.full ? ' cr-expanded' : ''));
         node.dataset.key = keyOf(card);
         if (answer) { node.classList.add('bk-done', 'bk-answered'); }
         var header = el('header');
         header.appendChild(el('span', 'bk-step', 'Fix ' + index + ' of ' + total));
         header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
+        if (card.kind !== 'link' && card.crop) {
+            // The whole page and back, as the step-2 card review has it
+            // (f, Esc back): a crop is a guess at the line, and the
+            // page is where a reader checks the guess.
+            var full = el('button', 'cr-full-btn', card.full ? 'Back to the crop (Esc)' : 'Full page');
+            full.type = 'button';
+            full.dataset.key = 'f';
+            full.title = 'Key: f';
+            full.addEventListener('click', function (event) {
+                event.stopPropagation();
+                // In place, on this node alone: a render would rebuild
+                // every card of the opinion and wipe what is typed.
+                card.full = !card.full;
+                node.classList.toggle('cr-expanded', card.full);
+                var cropWrap = node.querySelector('.bk-cropwrap');
+                if (cropWrap) {
+                    cropWrap.classList.toggle('cr-cropwrap', card.full);
+                    cropWrap.classList.toggle('cr-fullpage', card.full);
+                }
+                full.textContent = card.full ? 'Back to the crop (Esc)' : 'Full page';
+                drawCrop(section, card);
+                setActive(node);
+            });
+            header.appendChild(full);
+        }
         node.appendChild(header);
         if (card.kind === 'link') {
+            node.appendChild(note(card.message));
+        } else if (card.kind === 'cover') {
+            // The redacted page around the blocks a box covers in part,
+            // each outlined: a word that shows past the box is a
+            // redaction drawn short.
+            var coverWrap = el('div', 'bk-cropwrap' + (card.full ? ' cr-cropwrap cr-fullpage' : ''));
+            coverWrap.appendChild(el('canvas'));
+            node.appendChild(coverWrap);
             node.appendChild(note(card.message));
         } else {
             // The crop alone, no highlight: the line is a guess from the
             // word's place in the block's text, and a box drawn on a
             // guess points at the wrong words more often than not.
-            var wrap = el('div', 'bk-cropwrap');
+            var wrap = el('div', 'bk-cropwrap' + (card.full ? ' cr-cropwrap cr-fullpage' : ''));
             wrap.appendChild(el('canvas'));
             node.appendChild(wrap);
             if (card.kind === 'word') { node.appendChild(snippet(card)); }
@@ -510,6 +577,16 @@
             release.title = 'Open this card again';
             release.addEventListener('click', function () { section.release(card); });
             footer.appendChild(release);
+        } else if (card.kind === 'cover' && card.dismiss_url) {
+            var covered = el('button', 'btn-outline text-xs', 'Looks right');
+            covered.type = 'button';
+            covered.title = 'Dismiss this card: no word shows past the'
+                + ' redaction in the outlined block(s)';
+            covered.addEventListener('click', function () {
+                covered.disabled = true;
+                section.dismiss(card, node);
+            });
+            footer.appendChild(covered);
         } else if (card.kind === 'link' && card.dismiss_url) {
             // A card that only points at the page: once the page was
             // looked at, the dismissal closes it, with the Undo of
@@ -565,6 +642,9 @@
 
     function describe(card) {
         if (card.level === 'warning') {
+            if (card.kind === 'word' && card.gap) {
+                return 'one engine read words here that the others did not: keep the gap or put them in';
+            }
             if (card.kind === 'word') {
                 return 'a majority settled this word over one engine: bless it or pick the other reading';
             }
@@ -575,19 +655,31 @@
                     + ': keep it as shown or pick a reading';
             }
         }
+        if (card.kind === 'word' && card.gap) { return 'no two engines agree on what is in this gap'; }
         if (card.kind === 'word') { return 'no two engines agree on a word'; }
         if (card.kind === 'block') {
             return (card.table ? 'a table' : 'a block') + ' with ' + card.open
                 + ' word(s) no two engines agree on: pick a reading';
         }
         if (card.kind === 'single') { return 'one engine alone read this block (' + card.engine + ')'; }
+        if (card.kind === 'cover') {
+            return 'a box covers part of the outlined block(s): does any word show past it?';
+        }
         return card.check_label || card.check;
     }
 
     function snippet(card) {
         var p = el('p', 'bk-snippet');
         p.appendChild(document.createTextNode('… ' + card.before + ' '));
-        p.appendChild(el('mark', null, card.token));
+        if (card.gap) {
+            // A gap between two words: some engine read words here
+            // that the shown engine did not.
+            var gap = el('mark', 'bk-gap', '[ ]');
+            gap.title = 'A gap: an engine read words here that the shown engine did not';
+            p.appendChild(gap);
+        } else {
+            p.appendChild(el('mark', null, card.token));
+        }
         p.appendChild(document.createTextNode(' ' + card.after + ' …'));
         return p;
     }
@@ -636,12 +728,15 @@
         button.type = 'button';
         button.appendChild(el('span', 'bk-who', engine));
         var val = el('span', 'bk-val');
-        // The reading that is in the text now, marked: the majority's
-        // word in the warnings review, the shown block or word in the
-        // blocking one. Choosing it keeps the text as shown.
-        var shown = value !== '' && (card.kind === 'word'
+        // The reading that is in the text now, marked with a tick in
+        // the warnings review alone: there a majority chose it. On a
+        // blocking card nothing chose it, it stands by the engines'
+        // rank, so no row carries a tick and the choice is the
+        // person's. Choosing the shown reading keeps the text as shown.
+        var inText = card.gap ? value === '' : value !== '' && (card.kind === 'word'
             ? fold(value) === fold(card.token)
             : fold(value) === fold(card.text));
+        var shown = inText && level !== 'blocking';
         if (value === '') {
             val.appendChild(el('span', 'bk-nothing', 'read nothing here'));
         } else {
@@ -657,8 +752,10 @@
         button.appendChild(val);
         button.addEventListener('click', function () {
             markChosen(node, button);
-            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))) {
-                // Right as shown: the page's card waits for its siblings.
+            if (card.kind === 'single' || (card.kind === 'block' && fold(value) === fold(card.text))
+                    || (card.gap && value === '')) {
+                // Right as shown (a gap kept empty): the page's card
+                // waits for its siblings.
                 section.keep(card, node);
                 return;
             }
@@ -672,14 +769,17 @@
         label.appendChild(el('span', 'bk-who', 'you'));
         var input = el('input');
         input.type = 'text';
-        input.placeholder = card.kind === 'word'
-            ? 'Type what the page says and press Return'
-            : 'Type the whole block as the page has it and press Return';
+        input.placeholder = card.gap
+            ? 'Type the words the page has in the gap and press Return'
+            : card.kind === 'word'
+                ? 'Type what the page says and press Return'
+                : 'Type the whole block as the page has it and press Return';
         input.addEventListener('keydown', function (event) {
             if (event.key !== 'Enter') { return; }
+            answeredByMouse = false;
             event.preventDefault();
             var value = fold(input.value);
-            if (!value && card.kind === 'single') { return; }
+            if (!value && (card.kind === 'single' || card.gap)) { return; }
             markChosen(node, label);
             choose(section, card, node, value);
         });
@@ -697,7 +797,10 @@
      *  leaves the text as shown keeps the card. */
     function choose(section, card, node, value) {
         var text;
-        if (card.kind === 'word') {
+        if (card.kind === 'word' && card.gap) {
+            // The words go into the gap; the text around it stays.
+            text = fold(card.text.slice(0, card.start) + ' ' + value + ' ' + card.text.slice(card.start));
+        } else if (card.kind === 'word') {
             text = fold(card.text.slice(0, card.start) + value + card.text.slice(card.start + card.length));
         } else {
             // A single block or a whole block: the value is the text.
@@ -765,9 +868,10 @@
             }
         }
         setActive(next);
-        if (next) {
+        if (next && !answeredByMouse) {
             window.setTimeout(function () { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 120);
         }
+        answeredByMouse = false;
     }
 
     function setActive(card) {
@@ -799,9 +903,33 @@
         }
     }
 
+    var TYPING_IN = { INPUT: true, TEXTAREA: true, SELECT: true };
+
+    // Whether the last answer came by mouse. A click answers in place:
+    // the reader is where the mouse is, and a scroll under it is a
+    // jump. Return moves on to the next open card, as before. Read off
+    // the click itself: a real click has a detail count, the click()
+    // that Return sends through onKey has none.
+    var answeredByMouse = false;
+
     function onKey(event) {
+        // The browser's own shortcuts (Cmd+F, Ctrl+F, Alt+...) are not ours.
+        if (event.metaKey || event.ctrlKey || event.altKey) { return; }
+        var typing = Boolean(document.activeElement && TYPING_IN[document.activeElement.tagName]);
+        var opened = root.querySelector('.bk-card.cr-expanded');
+        if (opened && event.key === 'Escape') {
+            event.preventDefault();
+            opened.querySelector('.cr-full-btn').click();
+            return;
+        }
+        if (!typing && (event.key === 'f' || event.key === 'F')) {
+            // f closes the open card, else opens the card in view.
+            var target = opened || root.querySelector('.bk-card.bk-active') || cardInView();
+            var button = target && target.querySelector('.cr-full-btn');
+            if (button) { event.preventDefault(); button.click(); }
+            return;
+        }
         if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Enter') { return; }
-        var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
         if (typing && event.key === 'Enter') { return; }
         var card = root.querySelector('.bk-card.bk-active') || cardInView();
         if (!card) { return; }
@@ -831,6 +959,9 @@
             return new Section(node);
         });
         document.addEventListener('keydown', onKey);
+        // Before any button's own handler: the answer that follows
+        // knows which hand it came from.
+        root.addEventListener('click', function (event) { answeredByMouse = event.detail > 0; }, true);
         var approveAll = root.querySelector('[data-role="approve-all"]');
         if (approveAll) { approveAll.addEventListener('click', approveAllReady); }
         readyRows = Array.prototype.slice.call(root.querySelectorAll('.bk-ready')).map(function (node) {
