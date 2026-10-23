@@ -270,6 +270,11 @@ HEAD_LINE_LABELS = frozenset(
     }
 )
 HEAD_LINE_SHARE = 0.5
+#: A unit that holds a head line whole is the line's too, when it is no
+#: taller than this many times the line: an engine draws the page
+#: number's box with air above it. A block an engine merged from the
+#: head into the body is far taller, and the other rules judge it.
+HEAD_LINE_MAX_SCALE = 2.0
 
 #: The verdict of a unit where the detections drew nothing: the
 #: bleed-through of the page behind, which the engines read as words.
@@ -1496,7 +1501,10 @@ def verdict(
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
     names itself; else a neighbour's mask that does; else the printed
     page number, when the unit sits in the head or the foot zone and
-    one of its lines ends in the approved number of its page (#396);
+    one of its lines ends in the approved number of its page (#396).
+    A cover below :data:`FULL_SHARE` on the page number's unit is the
+    page number's verdict, whole, and never a partial cover: the
+    running head's whiteout cuts the number out on purpose;
     else the frame, when the detections of the page cover less than
     :data:`UNDETECTED_SHARE` of the unit (:data:`UNDETECTED`); else
     nothing. The share is the larger of the two boxes' shares, so a
@@ -1534,6 +1542,14 @@ def verdict(
     red_share, hit = covered_share(box_pt, rects)
     out_share, _ = covered_share(box_pt, masks)
     share = max(red_share, out_share)
+    page_number = is_page_number(box_pt, text, printed, height_pt, label)
+    if page_number and share < FULL_SHARE:
+        # A cover that is only partial on the page number's unit: the
+        # running head's whiteout stops at the number on purpose, and
+        # an engine that read the abbreviation and the number as one
+        # unit has half of it under the box. The unit is furniture
+        # whole, never words a reader loses to a box drawn short.
+        return {"reason": PAGE_NUMBER, "printed": printed}, 1.0
     if (
         hit is not None
         and red_share >= EXCLUDE_SHARE
@@ -1547,7 +1563,7 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
-    elif is_page_number(box_pt, text, printed, height_pt, label):
+    elif page_number:
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
     elif undetected(box_pt, frame):
@@ -1590,7 +1606,9 @@ def on_head_line(
     """Return whether a unit lies on the running head's line.
 
     :data:`HEAD_LINE_SHARE` of the unit's height or more inside one of
-    the spans of :func:`head_lines`.
+    the spans of :func:`head_lines`; or that share of the span inside
+    the unit, when the unit is no taller than :data:`HEAD_LINE_MAX_SCALE`
+    times the span.
 
     :param box_pt: The unit's box in points.
     :param spans: The page's head-line spans, or None.
@@ -1600,11 +1618,18 @@ def on_head_line(
     height = box_pt[3] - box_pt[1]
     if not spans or height <= 0:
         return False
-    return any(
-        min(box_pt[3], bottom) - max(box_pt[1], top)
-        >= HEAD_LINE_SHARE * height
-        for top, bottom in spans
-    )
+    for top, bottom in spans:
+        overlap = min(box_pt[3], bottom) - max(box_pt[1], top)
+        if overlap >= HEAD_LINE_SHARE * height:
+            return True
+        line = bottom - top
+        if (
+            line > 0
+            and overlap >= HEAD_LINE_SHARE * line
+            and height <= HEAD_LINE_MAX_SCALE * line
+        ):
+            return True
+    return False
 
 
 def undetected(box_pt: list[float], frame: list[dict] | None) -> bool:
