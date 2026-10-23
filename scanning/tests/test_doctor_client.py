@@ -132,6 +132,21 @@ class TestRequestShape(SimpleTestCase):
                 doctor_client.convert_bitonal("in", "out")
         self.assertEqual(post.call_args.kwargs["headers"], {})
 
+    def test_an_unsendable_token_is_terminal(self):
+        # requests raises before anything leaves, so the row must not be
+        # left in flight waiting for a result that was never requested.
+        with override_settings(DOCTOR_AUTH_TOKEN="bad\ntoken"):
+            with patch(
+                "scanning.doctor_client.requests.post",
+                side_effect=requests.exceptions.InvalidHeader("newline"),
+            ):
+                with self.assertRaises(doctor_client.DoctorError) as ctx:
+                    doctor_client.convert_bitonal("in", "out")
+        self.assertNotIsInstance(
+            ctx.exception, doctor_client.DoctorTransientError
+        )
+        self.assertEqual(ctx.exception.error_code, "BAD_AUTH_TOKEN")
+
     def test_a_trailing_slash_on_the_host_is_not_doubled(self):
         with override_settings(DOCTOR_HOST="http://doctor:5050/"):
             with patch(

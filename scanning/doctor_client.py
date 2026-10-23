@@ -212,6 +212,14 @@ def convert_bitonal(
                 int(settings.DOCTOR_READ_TIMEOUT),
             ),
         )
+    except requests.exceptions.InvalidHeader as exc:
+        # requests refused the token before sending anything, so this is
+        # a configuration error, not an unanswered request: terminal, or
+        # every shard would wait out its deadline on a bad secret.
+        raise DoctorError(
+            f"DOCTOR_AUTH_TOKEN is not a valid header value: {exc}",
+            error_code="BAD_AUTH_TOKEN",
+        ) from exc
     except requests.ConnectTimeout as exc:
         # Provably never reached the application, so nothing is running
         # and nothing will be uploaded: safe to resubmit at once.

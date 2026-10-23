@@ -41,8 +41,9 @@ DOCTOR_HOST = env.str(
 
 # Sent as "Authorization: Bearer <token>" on every doctor request. Doctor
 # ignores the header until its own DOCTOR_AUTH_TOKENS is set, so this can
-# be deployed first; blank sends nothing.
-DOCTOR_AUTH_TOKEN = env.str("DOCTOR_AUTH_TOKEN", default="")
+# be deployed first; blank sends nothing. Stripped because a secret read
+# from a file usually ends in a newline, which no HTTP client will send.
+DOCTOR_AUTH_TOKEN = env.str("DOCTOR_AUTH_TOKEN", default="").strip()
 
 # Rasterization resolution and grayscale threshold. These are the
 # values the retired in-process pass used (``blackletter.api.bitonal``
