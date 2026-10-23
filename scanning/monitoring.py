@@ -1,3 +1,4 @@
+import time
 from http import HTTPStatus
 from typing import NoReturn
 
@@ -5,7 +6,7 @@ from django.conf import settings
 from django.db import OperationalError, connections
 from django.http import HttpRequest, HttpResponse, JsonResponse
 
-from scanning import tasks, worker_heartbeat
+from scanning import daemon_heartbeat, tasks, worker_heartbeat
 from scanning.celery_init import app
 
 
@@ -111,6 +112,38 @@ def celery_workers(request: HttpRequest) -> JsonResponse:
     status = HTTPStatus.INTERNAL_SERVER_ERROR if missing else HTTPStatus.OK
     return JsonResponse(
         {"celery_enabled": True, "queues": queues, "missing": missing},
+        status=status,
+    )
+
+
+def daemon_heartbeat_view(request: HttpRequest) -> JsonResponse:
+    """Return whether the daemon's loop still turns.
+
+    Read off the stamp ``run_daemon`` writes from its loop
+    (``scanning.daemon_heartbeat``). With ``CELERY_ENABLED`` on the
+    daemon is the clock, and a live worker with no clock runs nothing,
+    so this is the third check beside the workers and the depths.
+
+    :param request: The incoming HTTP request.
+    :type request: HttpRequest
+    :returns: ``mode``, ``age_seconds`` and ``stale_after``; 200 when
+        the stamp is fresh, 500 when it is stale or missing.
+    :rtype: JsonResponse
+    """
+    stamp = daemon_heartbeat.read()
+    if stamp is None:
+        return JsonResponse(
+            {"error": "the daemon never beat"},
+            status=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
+    mode = stamp.get("mode", daemon_heartbeat.MODE_SERIAL)
+    age = max(0.0, time.time() - float(stamp.get("at", 0)))
+    limit = daemon_heartbeat.stale_after(mode)
+    status = (
+        HTTPStatus.OK if age <= limit else HTTPStatus.INTERNAL_SERVER_ERROR
+    )
+    return JsonResponse(
+        {"mode": mode, "age_seconds": round(age, 1), "stale_after": limit},
         status=status,
     )
 

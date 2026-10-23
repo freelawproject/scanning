@@ -6,6 +6,7 @@ from django.urls import include, path
 from scanning.monitoring import (
     celery_queues,
     celery_workers,
+    daemon_heartbeat_view,
     health_check,
     heartbeat,
     sentry_fail,
@@ -660,6 +661,7 @@ urlpatterns = [
     path("monitoring/health-check/", health_check, name="health_check"),
     path("monitoring/celery-queues/", celery_queues, name="celery_queues"),
     path("monitoring/celery-workers/", celery_workers, name="celery_workers"),
+    path("monitoring/daemon/", daemon_heartbeat_view, name="daemon_heartbeat"),
     path("sentry/error/", sentry_fail, name="sentry_fail"),
 ]
 
