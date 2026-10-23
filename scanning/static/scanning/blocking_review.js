@@ -776,6 +776,7 @@
                 : 'Type the whole block as the page has it and press Return';
         input.addEventListener('keydown', function (event) {
             if (event.key !== 'Enter') { return; }
+            answeredByMouse = false;
             event.preventDefault();
             var value = fold(input.value);
             if (!value && (card.kind === 'single' || card.gap)) { return; }
@@ -867,9 +868,10 @@
             }
         }
         setActive(next);
-        if (next && autoJump()) {
+        if (next && !answeredByMouse) {
             window.setTimeout(function () { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 120);
         }
+        answeredByMouse = false;
     }
 
     function setActive(card) {
@@ -903,17 +905,12 @@
 
     var TYPING_IN = { INPUT: true, TEXTAREA: true, SELECT: true };
 
-    // Whether an answer scrolls the next open card into view. A
-    // per-viewer convenience, remembered in this browser alone: a
-    // reader answering with the mouse is jumped around by it, a reader
-    // on the keys wants it. Storage may be blocked; then it is on.
-    var AUTOJUMP_KEY = 'bk-autojump';
-    function autoJump() {
-        try { return window.localStorage.getItem(AUTOJUMP_KEY) !== 'off'; } catch (e) { return true; }
-    }
-    function setAutoJump(on) {
-        try { window.localStorage.setItem(AUTOJUMP_KEY, on ? 'on' : 'off'); } catch (e) { /* not remembered */ }
-    }
+    // Whether the last answer came by mouse. A click answers in place:
+    // the reader is where the mouse is, and a scroll under it is a
+    // jump. Return moves on to the next open card, as before. Read off
+    // the click itself: a real click has a detail count, the click()
+    // that Return sends through onKey has none.
+    var answeredByMouse = false;
 
     function onKey(event) {
         // The browser's own shortcuts (Cmd+F, Ctrl+F, Alt+...) are not ours.
@@ -962,11 +959,9 @@
             return new Section(node);
         });
         document.addEventListener('keydown', onKey);
-        var jump = root.querySelector('[data-role="autojump"]');
-        if (jump) {
-            jump.checked = autoJump();
-            jump.addEventListener('change', function () { setAutoJump(jump.checked); });
-        }
+        // Before any button's own handler: the answer that follows
+        // knows which hand it came from.
+        root.addEventListener('click', function (event) { answeredByMouse = event.detail > 0; }, true);
         var approveAll = root.querySelector('[data-role="approve-all"]');
         if (approveAll) { approveAll.addEventListener('click', approveAllReady); }
         readyRows = Array.prototype.slice.call(root.querySelectorAll('.bk-ready')).map(function (node) {
