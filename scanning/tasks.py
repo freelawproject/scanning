@@ -275,16 +275,21 @@ def claim_scans() -> int:
 @app.task(name="scanning.tasks.enqueue_runs", queue=QUEUE_FAST)
 @locked("enqueue_runs")
 def enqueue_runs() -> int:
-    """Start the detection and OCR runs of every new shard set.
+    """Start the detection, OCR and Surya runs of every new shard set.
 
     :returns: How many runs started.
     :rtype: int
     """
-    from scanning import dots_mocr, yolo
+    from scanning import dots_mocr, surya, yolo
 
-    # The same sweeps as ``submit_external_jobs``; a third engine's
-    # sweep (#500) is one more line here and there.
-    started = yolo.enqueue_missing_runs() + dots_mocr.enqueue_missing_runs()
+    # The same sweeps as ``submit_external_jobs`` (#250, #327, #500).
+    # All three engines go out on the RunPod wave, so one nudge sends
+    # every row they created.
+    started = (
+        yolo.enqueue_missing_runs()
+        + dots_mocr.enqueue_missing_runs()
+        + surya.enqueue_missing_runs()
+    )
     if started:
         nudge(submit_runpod)
     return started
@@ -743,9 +748,9 @@ def submit_soon(provider: str) -> bool:
     """Send the wave of a provider now, after a button created its rows.
 
     The read buttons (``start_dots_mocr``, ``start_mistral_ocr``,
-    ``start_caselaw_tagger``) create PENDING rows
-    the next submit tick would send; this sends that tick now. Same
-    rules as :func:`dispatch_scan`.
+    ``start_caselaw_tagger``) create PENDING rows the next submit tick
+    would send; this sends that tick now. Same rules as
+    :func:`dispatch_scan`.
 
     :param provider: A ``JobProvider`` value.
     :returns: Whether a task was sent.
