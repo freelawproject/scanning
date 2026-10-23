@@ -641,7 +641,9 @@ class TestTheVerdict(OpinionOcrTestCase):
             )
         )
 
-    def test_a_cover_that_is_partial_on_the_page_number_is_the_page_number(self):
+    def test_a_cover_that_is_partial_on_the_page_number_is_the_page_number(
+        self,
+    ):
         """The running head's whiteout stops at the page number on
         purpose, and an engine that read the abbreviation and the number
         as one unit has half of it under the box. That is the page
@@ -662,9 +664,7 @@ class TestTheVerdict(OpinionOcrTestCase):
         )
         self.assertEqual(header["share"], 1.0)
         self.assertEqual(document["counts"]["partial"], 0)
-        self.assertNotEqual(
-            header["exclusion"].get("redaction_id"), page.pk
-        )
+        self.assertNotEqual(header["exclusion"].get("redaction_id"), page.pk)
 
     def test_a_head_box_in_the_body_takes_nothing(self):
         """A ``PAGE_HEADER`` box the model drew in the body is no head
