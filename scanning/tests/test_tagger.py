@@ -30,7 +30,7 @@ from scanning.models import (
     Status,
 )
 from scanning.tests.test_views import ScanningTestCase
-from scanning.views_api import TAG_PLACED_MESSAGE
+from scanning.views_api import TAG_PLACED_MESSAGE, TAG_STARTED_MESSAGE
 
 TAGGER = {
     "RUNPOD_ENABLED": True,
@@ -593,6 +593,44 @@ class TestTheButton(_S3Case):
 
         self.assertEqual(response.status_code, 409)
         self.assertEqual(len(tag_jobs(self.opinion)), 1)
+
+    def test_a_running_run_over_an_earlier_text_is_replaced(self):
+        """A run in flight holds the start only while it reads this
+        text (#499): one over an earlier approval is cancelled, and
+        the new text gets its own run."""
+        first = tagger.ensure_tag_jobs(self.opinion)[0]
+        ExternalJob.objects.filter(pk=first.pk).update(
+            status=JobStatus.SUBMITTED
+        )
+        self.approve_again("Jane ROE, Appellant,", "v.", "STATE, Appellee.")
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"], TAG_STARTED_MESSAGE)
+        first.refresh_from_db()
+        self.assertEqual(first.status, JobStatus.CANCELLED)
+        rows = tag_jobs(self.opinion)
+        self.assertEqual([r.run for r in rows], [1, 2])
+        self.assertEqual(rows[-1].status, JobStatus.PENDING)
+        self.assertNotEqual(rows[-1].input_key, first.input_key)
+
+    def test_a_replaced_run_leaves_the_other_opinions_alone(self):
+        other = OpinionFactory(
+            scan=self.scan,
+            first_printed_page=600,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            approved_text_key=APPROVED_KEY + ".other",
+        )
+        self.stored[other.approved_text_key] = approved("Other text.")
+        theirs = tagger.ensure_tag_jobs(other)[0]
+        tagger.ensure_tag_jobs(self.opinion)
+        self.approve_again("Jane ROE, Appellant,", "v.", "STATE, Appellee.")
+
+        self.post()
+
+        theirs.refresh_from_db()
+        self.assertEqual(theirs.status, JobStatus.PENDING)
 
     def test_a_tagged_text_is_refused(self):
         self.finished_row()

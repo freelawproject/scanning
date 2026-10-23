@@ -3278,6 +3278,7 @@ def abandon_open(
     engine: str | None = None,
     statuses: frozenset = OPEN_JOB_STATUSES,
     apply_run=None,
+    opinion=None,
 ) -> int:
     """Cancel a scan's open jobs, optionally for one engine only.
 
@@ -3318,6 +3319,9 @@ def abandon_open(
         runs down with it. The default keeps the volume-run behaviour:
         an unscoped call still reaches every row, apply rows included,
         which is what the admin scan deletion wants.
+    :param opinion: Limit to the rows of one opinion, for an
+        opinion-level stage (#499): the tagger replaces the open run of
+        one opinion and must leave the runs of the others alone.
     :returns: How many rows were cancelled.
     :rtype: int
     """
@@ -3326,6 +3330,8 @@ def abandon_open(
         rows = rows.filter(stage=stage)
     if engine is not None:
         rows = rows.filter(engine=engine)
+    if opinion is not None:
+        rows = rows.filter(opinion=opinion)
     if apply_run is not None:
         rows = rows.filter(apply_run=apply_run)
     elif stage is not None or engine is not None:

@@ -1,8 +1,9 @@
 """The blocking review: the cards, the crop estimate, the two views."""
 
+import pathlib
 from types import SimpleNamespace
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from scanning import blocking_review, ensemble
@@ -14,7 +15,15 @@ from scanning.factories import (
 from scanning.models import Issue, OpinionCheck, OpinionReviewStatus
 from scanning.tests.test_ensemble import BODY_A_PT, group_of, unit
 from scanning.tests.test_opinion_edits import EditTestCase
+from scanning.tests.test_tagger import TAGGER
 from scanning.tests.test_views import ScanningTestCase
+
+SCRIPT = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "static"
+    / "scanning"
+    / "blocking_review.js"
+)
 
 ENGINES = ("dots_mocr", "mistral_ocr", "surya")
 
@@ -1213,6 +1222,47 @@ class TestTheBlockingPage(ScanningTestCase):
                 kwargs={"pk": self.scan.pk, "opinion_pk": self.waiting.pk},
             ),
         )
+
+    @override_settings(**TAGGER)
+    def test_the_page_says_the_approval_tags_where_the_stage_is_on(self):
+        """The approval sends the text to a paid job (#499): the page
+        says so, and the script asks before each approval."""
+        answer = self.client.get(
+            reverse("opinion_blocking_review") + f"?scan={self.scan.pk}"
+        )
+
+        self.assertContains(answer, 'data-tagger-on-approval="1"')
+
+    @override_settings(**{**TAGGER, "RUNPOD_TAGGER_ENDPOINT_ID": ""})
+    def test_the_page_promises_no_run_where_the_stage_is_off(self):
+        answer = self.client.get(
+            reverse("opinion_blocking_review") + f"?scan={self.scan.pk}"
+        )
+
+        self.assertContains(answer, 'data-tagger-on-approval="0"')
+
+    def test_every_approval_of_the_script_asks_first(self):
+        """One confirm before each approval and one before the whole
+        chain of "Approve all ready", read off the page's flag (#499)."""
+        source = SCRIPT.read_text()
+        self.assertIn("root.dataset.taggerOnApproval !== '1'", source)
+        self.assertIn("This will incur costs $$$.", source)
+        self.assertEqual(source.count("if (confirmApproval(1))"), 2)
+        chain = source[source.index("function approveAllReady(") :]
+        chain = chain[: chain.index("\n    }\n")]
+        self.assertIn("confirmApproval(ready.length)", chain)
+        self.assertLess(
+            chain.index("confirmApproval("), chain.index("button.disabled")
+        )
+
+    def test_the_script_shows_a_tagger_fault_as_a_warning(self):
+        """The approval answers ``level`` (#499), and both approve
+        paths of the page read it: a fault of the tagger is never
+        drawn in the success tone."""
+        source = SCRIPT.read_text()
+        self.assertEqual(source.count("answer.data.level === 'warning'"), 2)
+        self.assertIn("warned ? 'warn' : 'ok'", source)
+        self.assertIn("self.state.classList.add('bk-warn')", source)
 
     def test_the_warnings_page_lists_the_opinions_with_a_warning(self):
         """The one with a warning alone is listed, the one with a

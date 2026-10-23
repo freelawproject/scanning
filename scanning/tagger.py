@@ -36,9 +36,15 @@ The pieces, in the shape of ``dots_mocr.py`` and ``yolo.py``:
   stamps the ledger (:func:`is_written`) and consumes the row. The
   result object is kept.
 
-Nothing enqueues this stage on a tick. The button of the review page
-(``views_api.start_caselaw_tagger``) is the one caller of
-:func:`ensure_tag_jobs`, pinned by ``TestKnownEnqueuePaths``.
+Nothing enqueues this stage on a tick. The approval of the text
+(``views_api.approve_opinion_text``, #499) and the button of the review
+page (``views_api.start_caselaw_tagger``, the retry) are the two
+presses, both through ``views_api._tag_approved_text``, the one caller
+of :func:`ensure_tag_jobs`, pinned by ``TestKnownEnqueuePaths``. Each
+confirms the cost in the browser, the rule of the paid buttons of
+step 1: one job is one opinion, a few seconds of GPU, and the price is
+the cold start and the idle tail of the endpoint, which approvals
+within its idle timeout share.
 """
 
 from __future__ import annotations
@@ -352,6 +358,50 @@ def ensure_tag_jobs(
         fingerprint=opinion.scan.source_fingerprint or "",
         reuse_results=True,
         force_new_run=force_new_run,
+        opinion=opinion,
+    )
+
+
+def describes(row: ExternalJob, opinion: Opinion) -> bool:
+    """Return whether a row's run read the text the opinion holds now.
+
+    The test :func:`glue_run` makes before it places, made ahead of a
+    start (#499): a run in flight over an earlier approved text is no
+    reason to wait, because its glue ends in :class:`TextMoved`, and
+    the new text would stay untagged.
+
+    :param row: A row of the opinion's live run.
+    :param opinion: The row's opinion, with ``approved_text_key``.
+    :returns: Whether the digest of the row's identity is the digest
+        of the approved text's projection.
+    :rtype: bool
+    :raises TaggerInputError: If the approved text does not load.
+    """
+    approved = load_approved(opinion.approved_text_key)
+    digest = text_digest(project(approved).text)
+    return digest == (row.input_manifest or {}).get("digest")
+
+
+def abandon_run(opinion: Opinion, reason: str) -> int:
+    """Cancel the open rows of one opinion's tagger run (#499).
+
+    ``jobs.abandon_open`` scoped by opinion and by the statuses a job
+    is still owed under: a ``COMPLETED`` row is a paid result and
+    stays, because a later approval of its text carries it. Called
+    before a new run over another text, so the wave pays nothing for a
+    job nothing will read.
+
+    :param opinion: The opinion whose run is replaced.
+    :param reason: Recorded on each row.
+    :returns: How many rows were cancelled.
+    :rtype: int
+    """
+    return jobs.abandon_open(
+        opinion.scan_id,
+        reason,
+        stage=STAGE,
+        engine=ENGINE,
+        statuses=frozenset({JobStatus.PENDING}) | IN_FLIGHT_JOB_STATUSES,
         opinion=opinion,
     )
 

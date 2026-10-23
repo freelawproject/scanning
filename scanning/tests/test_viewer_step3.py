@@ -356,6 +356,30 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
         self.assertIn("locked.editor = { area: area", editor)
 
 
+class TestTheApprovalNamesTheCost(SimpleTestCase):
+    """The approval sends the text to a paid RunPod job (#499), so the
+    confirm names the cost, the rule of the paid buttons of step 1."""
+
+    def test_the_approval_asks_once_with_the_warnings_and_the_cost(self):
+        source = VIEWER.read_text()
+        bind = source[source.index("function bindApproval(") :]
+        bind = bind[: bind.index("\n    }\n")]
+        self.assertIn("approve.dataset.openWarnings", bind)
+        self.assertIn("approve.dataset.taggerOnApproval === '1'", bind)
+        self.assertIn("window.confirm(asked)", bind)
+        self.assertEqual(bind.count("This will incur costs $$$."), 2)
+
+    def test_the_retry_asks_before_the_paid_press(self):
+        source = VIEWER.read_text()
+        bind = source[source.index("function bindApproval(") :]
+        bind = bind[: bind.index("\n    }\n")]
+        tag = bind[bind.index("getElementById('start-tagger')") :]
+        self.assertIn("window.confirm('Send the approved text", tag)
+        self.assertLess(
+            tag.index("window.confirm("), tag.index("tag.disabled = true")
+        )
+
+
 class TestTheHandFootnoteBandIsNoZone(SimpleTestCase):
     """A footnote a person set gets a band of its own (#419)."""
 

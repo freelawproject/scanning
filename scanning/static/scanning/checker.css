@@ -1828,6 +1828,7 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-note { font-size: 13px; color: #6b7280; margin: 4px 0; }
 .bk-note.bk-error { color: #b3261e; }
 .bk-note.bk-ok { color: #2e7d32; font-weight: 600; }
+.bk-note.bk-warn, .bk-state.bk-warn { color: #b26a00; font-weight: 600; }
 .bk-single .bk-val { font-size: 15px; line-height: 1.45; max-height: 9em; overflow: auto; }
 .bk-opinion.bk-approved { opacity: 0.6; }
 .bk-card.bk-answered { opacity: 0.7; border-left: 6px solid #2e7d32; }
