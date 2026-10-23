@@ -111,6 +111,27 @@ class TestRequestShape(SimpleTestCase):
         )
         self.assertEqual(post.call_args.kwargs["timeout"], (5, 300))
 
+    def test_the_bearer_token_is_sent_when_configured(self):
+        with override_settings(DOCTOR_AUTH_TOKEN="s3cret"):
+            with patch(
+                "scanning.doctor_client.requests.post",
+                return_value=_response(200, SUCCESS_BODY),
+            ) as post:
+                doctor_client.convert_bitonal("in", "out")
+        self.assertEqual(
+            post.call_args.kwargs["headers"],
+            {"Authorization": "Bearer s3cret"},
+        )
+
+    def test_no_token_sends_no_auth_header(self):
+        with override_settings(DOCTOR_AUTH_TOKEN=""):
+            with patch(
+                "scanning.doctor_client.requests.post",
+                return_value=_response(200, SUCCESS_BODY),
+            ) as post:
+                doctor_client.convert_bitonal("in", "out")
+        self.assertEqual(post.call_args.kwargs["headers"], {})
+
     def test_a_trailing_slash_on_the_host_is_not_doubled(self):
         with override_settings(DOCTOR_HOST="http://doctor:5050/"):
             with patch(

@@ -39,6 +39,11 @@ DOCTOR_HOST = env.str(
     default="http://cl-doctor.court-listener.svc.cluster.local:5050",
 )
 
+# Sent as "Authorization: Bearer <token>" on every doctor request. Doctor
+# ignores the header until its own DOCTOR_AUTH_TOKENS is set, so this can
+# be deployed first; blank sends nothing.
+DOCTOR_AUTH_TOKEN = env.str("DOCTOR_AUTH_TOKEN", default="")
+
 # Rasterization resolution and grayscale threshold. These are the
 # values the retired in-process pass used (``blackletter.api.bitonal``
 # defaults, never overridden), so a converted volume matches every

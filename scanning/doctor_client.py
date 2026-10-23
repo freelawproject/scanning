@@ -131,6 +131,16 @@ def _redact(url: str) -> str:
     return f"{base}?***" if query else base
 
 
+def _auth_headers() -> dict[str, str]:
+    """The bearer token doctor requires once its own setting is on.
+
+    :returns: The ``Authorization`` header, or nothing while
+        ``DOCTOR_AUTH_TOKEN`` is blank.
+    """
+    token = settings.DOCTOR_AUTH_TOKEN
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def convert_bitonal(
     input_url: str,
     output_url: str,
@@ -196,6 +206,7 @@ def convert_bitonal(
         response = requests.post(
             url,
             data=payload,
+            headers=_auth_headers(),
             timeout=(
                 int(settings.DOCTOR_CONNECT_TIMEOUT),
                 int(settings.DOCTOR_READ_TIMEOUT),
