@@ -493,6 +493,9 @@
     var ENGINE_ROWS = ['r0', 'r1', 'r2'];
 
     function cardNode(section, card, index, total, answer) {
+        // An answered or kept card is never the open one: it is greyed
+        // and the next card is the reader's.
+        if (card.full && (answer || section.kept[keyOf(card)])) { card.full = false; }
         var node = el('article', 'bk-card bk-' + card.kind + (card.kind === 'block' ? ' bk-single' : '')
             + (card.full ? ' cr-expanded' : ''));
         node.dataset.key = keyOf(card);
@@ -510,10 +513,18 @@
             full.title = 'Key: f';
             full.addEventListener('click', function (event) {
                 event.stopPropagation();
+                // In place, on this node alone: a render would rebuild
+                // every card of the opinion and wipe what is typed.
                 card.full = !card.full;
-                section.render();
-                var again = section.cardsNode.querySelector('[data-key="' + keyOf(card) + '"]');
-                if (again) { setActive(again); }
+                node.classList.toggle('cr-expanded', card.full);
+                var cropWrap = node.querySelector('.bk-cropwrap');
+                if (cropWrap) {
+                    cropWrap.classList.toggle('cr-cropwrap', card.full);
+                    cropWrap.classList.toggle('cr-fullpage', card.full);
+                }
+                full.textContent = card.full ? 'Back to the crop (Esc)' : 'Full page';
+                drawCrop(section, card);
+                setActive(node);
             });
             header.appendChild(full);
         }
@@ -890,17 +901,22 @@
         }
     }
 
+    var TYPING_IN = { INPUT: true, TEXTAREA: true, SELECT: true };
+
     function onKey(event) {
-        var typing = document.activeElement && document.activeElement.tagName === 'INPUT';
+        // The browser's own shortcuts (Cmd+F, Ctrl+F, Alt+...) are not ours.
+        if (event.metaKey || event.ctrlKey || event.altKey) { return; }
+        var typing = Boolean(document.activeElement && TYPING_IN[document.activeElement.tagName]);
         var opened = root.querySelector('.bk-card.cr-expanded');
-        if (opened && (event.key === 'Escape' || event.key === 'f' || event.key === 'F')) {
+        if (opened && event.key === 'Escape') {
             event.preventDefault();
             opened.querySelector('.cr-full-btn').click();
             return;
         }
         if (!typing && (event.key === 'f' || event.key === 'F')) {
-            var toOpen = root.querySelector('.bk-card.bk-active') || cardInView();
-            var button = toOpen && toOpen.querySelector('.cr-full-btn');
+            // f closes the open card, else opens the card in view.
+            var target = opened || root.querySelector('.bk-card.bk-active') || cardInView();
+            var button = target && target.querySelector('.cr-full-btn');
             if (button) { event.preventDefault(); button.click(); }
             return;
         }
