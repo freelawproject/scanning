@@ -100,7 +100,7 @@ from django.conf import settings
 from django.utils import timezone
 from PIL import Image
 
-from scanning import dots_mocr, jobs, mistral_client, s3_sync
+from scanning import dots_mocr, jobs, mistral_client, perpendiculars, s3_sync
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -164,6 +164,12 @@ SWEEP_SCANS_PER_TICK = 2
 #: ``committed_manifest`` refused, left alone for
 #: ``jobs.REFUSAL_RETRY_SECONDS``. Tests clear it.
 _REFUSED: dict[int, tuple[float, int]] = {}
+
+#: How long a claimed row may go without a batch id before the sweep
+#: calls the claim lost (#503): the render and the uploads of the
+#: largest shard, with room. Under the serial daemon the sweep never
+#: ran during a wave, so the answer used to be "at once".
+LOST_CLAIM_AFTER = timedelta(minutes=30)
 
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
@@ -364,38 +370,64 @@ def page_no_of(line_id) -> int | None:
 
 
 # ── the render ──────────────────────────────────────────────────────
-def render_page(page: fitz.Page) -> bytes:
-    """Render one page as the ensemble's canonical PNG.
+def _page_image(page: fitz.Page) -> Image.Image:
+    """Render one page as the ensemble's canonical image.
 
     ``pipeline/core/render.py`` line for line: zoom the page to
     ``RENDER_W`` wide, render RGB with no alpha, resize to exactly
     ``RENDER_W`` x ``RENDER_H`` when the page is another size.
-
-    :param page: The fitz page.
-    :returns: PNG bytes.
-    :rtype: bytes
     """
     zoom = RENDER_W / page.rect.width
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
     img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
     if img.size != (RENDER_W, RENDER_H):
         img = img.resize((RENDER_W, RENDER_H))
+    return img
+
+
+def _png(img: Image.Image) -> bytes:
     buffer = io.BytesIO()
     img.save(buffer, format="PNG")
     return buffer.getvalue()
 
 
-def render_shard_pages(pdf_path: Path) -> Iterator[tuple[int, bytes]]:
+def render_page(page: fitz.Page) -> bytes:
+    """Render one page as the ensemble's canonical PNG.
+
+    :param page: The fitz page.
+    :returns: PNG bytes.
+    :rtype: bytes
+    """
+    return _png(_page_image(page))
+
+
+def render_dpi(page: fitz.Page) -> int:
+    """Return the resolution the canonical render has: ``RENDER_W``
+    over the page's width in inches, 200 for US Letter."""
+    width_in = page.rect.width / 72 if page.rect.width else 8.5
+    return int(round(RENDER_W / width_in))
+
+
+def render_shard_pages(
+    pdf_path: Path, whiteout: bool = False
+) -> Iterator[tuple[int, bytes]]:
     """Render every page of one shard, in order.
 
+    With ``whiteout``, the perpendiculars are painted out of each page
+    before it is encoded (``scanning/perpendiculars.py``).
+
     :param pdf_path: The downloaded shard.
+    :param whiteout: Whether to paint the perpendiculars out.
     :returns: ``(page_no, png)`` per page, ``page_no`` counted from
         zero inside the shard.
     :rtype: Iterator[tuple[int, bytes]]
     """
     with fitz.open(str(pdf_path)) as doc:
         for page_no, page in enumerate(doc):
-            yield page_no, render_page(page)
+            image = _page_image(page)
+            if whiteout:
+                image = perpendiculars.paint(image, render_dpi(page))
+            yield page_no, _png(image)
 
 
 # ── the deadline ────────────────────────────────────────────────────
@@ -503,7 +535,9 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
             lines = []
-            for page_no, png in render_shard_pages(pdf_path):
+            for page_no, png in render_shard_pages(
+                pdf_path, whiteout=bool(settings.PERPENDICULARS_WHITEOUT)
+            ):
                 file_id = mistral_client.upload_file(
                     f"{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
                 )
@@ -685,10 +719,12 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     """Poll one batch and apply what it said.
 
     The provider table's ``sweep_job`` for Mistral. A row with no
-    ``external_id`` is a claim the daemon lost mid-submission: the
-    scheduler is serial, so no wave is running while this sweeps, and
-    a claimed row with no id will never get one. It is retried at once
-    rather than waited on for a day.
+    ``external_id`` is a claim the wave lost mid-submission, or a shard
+    the wave is still rendering on another worker (#503): the two are
+    told apart by the clock alone, :data:`LOST_CLAIM_AFTER` since the
+    claim, because the sweep and the wave no longer share one serial
+    scheduler. Past it, the row is retried rather than waited on for a
+    day.
 
     A row polled inside :data:`POLL_INTERVAL` is left alone, and its
     deadline is judged all the same.
@@ -699,12 +735,18 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     :return: None.
     """
     if not job.external_id:
+        if job.submitted_at and (now - job.submitted_at) < LOST_CLAIM_AFTER:
+            # The wave may still be rendering this shard on another
+            # worker (#503): the sweep and the wave are no longer one
+            # serial scheduler. The id lands when the batch is created.
+            summary.pending += 1
+            return
         jobs.count_sweep_outcome(
             summary,
             jobs._retry_or_fail(
                 job,
                 "LOST_CLAIM",
-                "claimed, but the daemon stopped before the batch was created",
+                "claimed, but the worker stopped before the batch was created",
                 now,
             ),
         )

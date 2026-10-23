@@ -60,7 +60,9 @@ import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass
+from statistics import median
 
+from blackletter.models import Label
 from django.db import transaction
 
 from scanning import boundaries, detections
@@ -428,17 +430,26 @@ def missing(
     # candidate is judged against brackets that come after it.
     named: dict[int, set[int]] = {}
     uncovered: list[tuple[BracketReading, OpinionBoundary]] = []
+    samples: list[tuple[float, float, float, float]] = []
     for reading in readings:
         opinion = opinion_of(reading, ordered, columns)
         if opinion is None:
             continue
-        if any(
-            _covers(row, reading) for row in boxes.get(reading.page_index, [])
-        ):
+        cover = next(
+            (
+                row
+                for row in boxes.get(reading.page_index, [])
+                if _covers(row, reading)
+            ),
+            None,
+        )
+        if cover is not None:
             named.setdefault(opinion.pk, set()).update(reading.numbers)
+            samples.append(_shape_sample(cover, reading))
         else:
             uncovered.append((reading, opinion))
 
+    shape = _bracket_shape(samples)
     for reading, opinion in uncovered:
         covered = named.get(opinion.pk, set())
         # An opinion whose brackets the model found none of says
@@ -454,15 +465,77 @@ def missing(
         if covered and min(reading.numbers) > max(covered) + 1:
             # Above the sequence: a page number, not a headnote.
             continue
-        yield _finding(reading, holes)
+        yield _finding(reading, holes, _guess(reading, shape))
 
 
-def _finding(reading: BracketReading, holes: list[int]) -> dict:
+#: The bracket's place in its cell when the volume has no model
+#: bracket to measure it from, as shares of the cell's width: the
+#: paragraph indent, the token's width and its height. Measured on
+#: 722 S.W.3d, where a 550 px cell holds a 51 by 30 px bracket 32 px
+#: in from its edge.
+DEFAULT_SHAPE = (0.06, 0.0, 0.09, 0.055)
+
+
+def _shape_sample(row: Detection, reading: BracketReading) -> tuple:
+    """Return where ``row`` sits in ``reading``'s cell, as shares of its width.
+
+    The offset of the box from the cell's top-left corner and the
+    box's size, each divided by the cell's width, so that a cell of
+    another width places its own bracket by the same type.
+    """
+    width = max(float(reading.x1 - reading.x0), 1.0)
+    sx = float(reading.img_width) / float(row.img_width or reading.img_width)
+    sy = float(reading.img_height) / float(
+        row.img_height or reading.img_height
+    )
+    return (
+        (row.x0 * sx - reading.x0) / width,
+        (row.y0 * sy - reading.y0) / width,
+        (row.x1 - row.x0) * sx / width,
+        (row.y1 - row.y0) * sy / width,
+    )
+
+
+def _bracket_shape(samples: list[tuple]) -> tuple:
+    """Return the volume's bracket shape: the median of each measure.
+
+    The brackets the model did find say where a bracket sits in a
+    paragraph of this volume's type; with none found, the shape of
+    722 S.W.3d stands in.
+    """
+    if not samples:
+        return DEFAULT_SHAPE
+    return tuple(median(sample[i] for sample in samples) for i in range(4))
+
+
+def _guess(reading: BracketReading, shape: tuple) -> list[float]:
+    """Return where the missed bracket is, inside the reading's cell.
+
+    The cell is the paragraph; the bracket is its first token. The
+    guess is the volume's bracket shape laid at the cell's top-left
+    corner, held inside the cell, so the card can flash the token and
+    not the paragraph, and an "add" can draw the box there.
+    """
+    x0, y0, x1, y1 = (float(v) for v in reading.bbox)
+    width = max(x1 - x0, 1.0)
+    dx, dy, w, h = (share * width for share in shape)
+    gx0 = min(max(x0 + dx, x0), x1)
+    gy0 = min(max(y0 + dy, y0), y1)
+    gx1 = min(max(gx0 + w, gx0 + 1.0), x1)
+    gy1 = min(max(gy0 + h, gy0 + 1.0), y1)
+    return [round(v, 1) for v in (gx0, gy0, gx1, gy1)]
+
+
+def _finding(
+    reading: BracketReading, holes: list[int], guess: list[float]
+) -> dict:
     """Build the finding dict of one missed bracket.
 
-    The metadata is what ``findings.address_of`` keys a dismissal by,
-    and what ``_getDetectionData`` in ``viewer_sidebar.js`` reads off a
-    detection card.
+    The metadata is what ``findings.address_of`` keys a dismissal by
+    (``bbox``, the cell), and what ``_getDetectionData`` in
+    ``viewer_sidebar.js`` reads off a detection card. ``guess`` is the
+    bracket's own place in the cell, the box the card flashes and the
+    box its "add" draws as a ``HEADNOTE_BRACKET`` detection.
     """
     numbers = ", ".join(str(n) for n in holes)
     plural = "s" if len(holes) > 1 else ""
@@ -484,5 +557,7 @@ def _finding(reading: BracketReading, holes: list[int]) -> dict:
             "source_page": reading.source_page,
             "raw": reading.raw,
             "numbers": holes,
+            "guess": guess,
+            "label_id": Label[BRACKET_LABEL].value,
         },
     }

@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% comment %}
+  The card review of review 2 (card_review.py): the missed headnote
+  brackets, the missed captions and the image boxes of one volume, one
+  after the next. The cards come from scan_review_cards, the crops from
+  the PDF step 2 draws through pdf.js, and every write goes to step 2's
+  own endpoints (the add, the approval, the resize, the dismissal), so
+  the viewer and this page hold one set of rules.
+{% endcomment %}
+
+{% block title %}Card review · {{ scan.volume }} {{ scan.reporter.cite_name }} - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
+
+{% block content %}
+<div id="card-review">
+  {% csrf_token %}
+  {{ config|json_script:"card-review-config" }}
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
+    <h1 class="text-2xl font-bold">Card review <span class="text-base font-normal text-gray-500 dark:text-gray-400">{{ scan.volume }} {{ scan.reporter.cite_name }} · scan #{{ scan.pk }}</span></h1>
+    <span class="flex flex-wrap items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
+      <span><b data-role="total">…</b> card(s) · <b data-role="done">0</b> answered · <b data-role="skipped">0</b> skipped</span>
+      <a href="{{ step2_url }}" class="btn-ghost text-sm">Open step 2</a>
+      <button type="button" class="btn-outline text-sm" data-role="undo-edit" style="display:none" title="Take back the last box moved or resized from a card (u)"></button>
+      <button type="button" class="btn-outline text-sm" data-role="reload" title="Read the cards again">Reload the cards</button>
+      <button type="button" class="btn-primary text-sm" data-role="recompute"
+              title="Measure the redactions again: the pairing, the redaction boxes and the margins follow the boxes added here. It runs on the daemon.">Recompute redactions</button>
+    </span>
+  </div>
+  <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
+    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards.
+    Drag a box at its edges to resize it, inside it to move it. Click the label of any other box on the crop to move or resize that one instead (<kbd>Return</kbd> saves it, <kbd>Esc</kbd> leaves it): a card is often answered by pulling a box of the page out to the text.
+    A bracket, a caption or a column box is added where its box lies; a faint bracket box is approved or taken out; an image box is kept, pulled in to the picture, or taken out; a block of text in no box is covered by the column box added over it, by a footnote box added over it, or by the page's own column box pulled over it.
+    Every answer is step 2's own write, with its Undo. A box added here reaches the redactions at the next recompute.
+  </p>
+  <p class="bk-note" data-role="compute-note"></p>
+  {% if not review_open %}
+  <p class="bk-note bk-error">Review 2 is not open for this volume, so every answer here is refused.</p>
+  {% endif %}
+  <div data-role="cards-note"></div>
+
+  <section class="card mb-6" data-group="caption">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Captions <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A caption the model did not box after a key icon. The box is where it is likely to be: move it onto the caption and add it, and the next recompute starts an opinion there.</span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading…</p></div>
+  </section>
+
+  <section class="card mb-6" data-group="bracket">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Headnote brackets <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either.</span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading…</p></div>
+  </section>
+
+  <section class="card mb-6" data-group="text">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Text in no box <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A block of print the reader saw that no box covers, a footnote line outside the footnote box included. The opinion text leaves out what the boxes miss: add a column box over the block (resize it first if it is short), or pull the page's own column box over it (click the box's label on the crop and drag its edge); or say it is not text (the print of the leaf behind, a stray mark).</span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading…</p></div>
+  </section>
+
+  <section class="card mb-6" data-group="image">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Images <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">An image box the model drew and nobody has judged. The opinion PDF pastes the original scan of the box over the page, so a box over text pastes a photograph of the text.</span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading…</p></div>
+  </section>
+</div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
+<script src="{% static 'scanning/card_review.js' %}"></script>
+{% endblock %}

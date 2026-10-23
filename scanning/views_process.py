@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
-from botocore.exceptions import BotoCoreError, ClientError
+from blackletter.models import Label
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -32,9 +32,11 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     boundaries,
+    card_review,
     casebody,
     detections,
     dots_mocr,
+    final_xml,
     findings,
     jobs,
     mistral_ocr,
@@ -46,6 +48,7 @@ from scanning import (
     stats,
     surya,
     tagger,
+    tasks,
     yolo,
 )
 from scanning.badpage import scoring as badpage_scoring
@@ -61,6 +64,7 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     Opinion,
@@ -929,6 +933,74 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
+    # An opinion the pairing could not start. A key icon inside a
+    # computed span closes an opinion whose caption box the model did
+    # not draw (``missing_caption``, ``findings._unmatched_findings``),
+    # so the opinion before it runs on to the next key and the list
+    # shows one card where there are two opinions. Each such finding
+    # goes under the card that runs on past it, as a row of its own:
+    # the pages the missing opinion holds (from the card's guess of the
+    # caption's page to the next missing key, or the span's end), and
+    # the guess box to flash, so the curator knows where to draw. The
+    # card names that opinion (``runs_on``, the boundary pk the rule
+    # found by reading order); a match by page would list it under
+    # every opinion of a page that holds several.
+    missing_count = 0
+    if opinions and not preview:
+        open_missing = [
+            row
+            for row in Issue.objects.filter(
+                scan=scan, check_name=CheckName.MISSING_CAPTION
+            ).order_by("page_number", "pk")
+            if not row.is_dismissed and row.metadata.get("bbox")
+        ]
+        for op in opinions:
+            op["missing"] = []
+            if op["dismissed"]:
+                continue
+            ep = op.get(
+                "end_page", op.get("key_page", op.get("caption_page", 0))
+            )
+            inside = [
+                row
+                for row in open_missing
+                if row.metadata.get("runs_on") == op["id"]
+            ]
+            for pos, row in enumerate(inside):
+                md = row.metadata
+                idx = md["page_index"]
+                end = (
+                    inside[pos + 1].metadata.get(
+                        "key_page_index",
+                        inside[pos + 1].metadata["page_index"],
+                    )
+                    if pos + 1 < len(inside)
+                    else ep
+                )
+                op["missing"].append(
+                    {
+                        "issue_pk": row.pk,
+                        "idx": idx,
+                        "num": idx_to_logical.get(idx, idx + 1),
+                        "end_num": idx_to_logical.get(end, end + 1),
+                        "key_num": idx_to_logical.get(
+                            md.get("key_page_index", idx),
+                            md.get("key_page_index", idx) + 1,
+                        ),
+                        "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
+                        "img_w": md["img_width"],
+                        "img_h": md["img_height"],
+                        # The row's + adds the guess as a caption box
+                        # (``addMissingCaption``), with the label the
+                        # finding names and never one the script spells.
+                        "label": md.get("label", Label.CASE_CAPTION.name),
+                        "label_id": md.get(
+                            "label_id", Label.CASE_CAPTION.value
+                        ),
+                    }
+                )
+            missing_count += len(op["missing"])
+
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -1009,7 +1081,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 engine["available"] for engine in ocr_engines
             ),
             "opinions": opinions,
+            # The text card's footnote answer writes this label (the
+            # server's table, never a script's copy of it).
+            "footnote_label": Label.FOOTNOTES.name,
+            "footnote_label_id": Label.FOOTNOTES.value,
             "opinion_count": opinion_count,
+            "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
@@ -1845,6 +1922,19 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
     "writes one per tick after the redaction review is approved."
 )
 
+#: The blocking review asks for the cards of an opinion whose text is
+#: not written yet.
+OPINION_TEXT_NOT_WRITTEN_MESSAGE = (
+    'The text of this opinion is not written yet. Press "Read the OCR '
+    'documents again" on its review page, or wait for the daemon.'
+)
+
+#: The blocking review asks for the cards with no bucket to read.
+OPINION_BUCKET_OFF_MESSAGE = (
+    "The text of this opinion is in the bucket, and this server has no "
+    "bucket to read it from."
+)
+
 #: The 404 of ``opinion_ensemble_url`` before the pass has written the
 #: ensemble document at the live revision (#365).
 OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE = (
@@ -1935,6 +2025,127 @@ def opinion_pdf_url(
 
 
 @login_required
+def opinion_blocking_cards(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return the cards of the blocking review of one opinion.
+
+    ``blocking_review.cards`` over the stamped ensemble document and
+    the open blocking findings (``opinion_review.blocking_findings``,
+    the rule of the gate). The answer carries the two revisions the
+    document was drawn at, which every write of the review page asks
+    for, and the dismissal URL of each card that has one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, opinion, cards}``; 404 for an opinion of
+        another scan, 409 while the text is not written or the bucket
+        is off.
+    """
+    from scanning import blocking_review, ensemble, opinion_review, s3_sync
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan", "apply_run"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    if not ensemble.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.read_document(opinion)
+    except ensemble.TransientFault:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    if request.GET.get("counts") == "1":
+        # The review page's walk buttons: both counts from one read of
+        # the document, and no card goes over the wire.
+        return JsonResponse(
+            {
+                "status": "ok",
+                "counts": {
+                    ensemble.BLOCKING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.blocking_findings(opinion)),
+                            ensemble.BLOCKING,
+                        )
+                    ),
+                    ensemble.WARNING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.warning_findings(opinion)),
+                            ensemble.WARNING,
+                        )
+                    ),
+                },
+            }
+        )
+    # The warnings review asks for its own cards (``?level=warning``),
+    # over the open warning findings; the blocking review is the
+    # default. ``blocking_open`` goes with either, so the page keeps
+    # the approval to the gate whatever it walks.
+    level = (
+        ensemble.WARNING
+        if request.GET.get("level") == ensemble.WARNING
+        else ensemble.BLOCKING
+    )
+    open_findings = (
+        opinion_review.warning_findings
+        if level == ensemble.WARNING
+        else opinion_review.blocking_findings
+    )
+    findings = list(open_findings(opinion).order_by("page_in_opinion", "pk"))
+    cards = blocking_review.cards(document, findings, level)
+    for card in cards:
+        if card.get("finding_pk"):
+            kwargs = {
+                "pk": pk,
+                "opinion_pk": opinion.pk,
+                "finding_pk": card["finding_pk"],
+            }
+            card["dismiss_url"] = reverse(
+                "dismiss_opinion_finding", kwargs=kwargs
+            )
+            # The way back from a dismissal, the review page's Undo.
+            card["restore_url"] = reverse(
+                "restore_opinion_finding", kwargs=kwargs
+            )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "level": level,
+            "blocking_open": opinion_review.blocking_findings(opinion).count(),
+            "opinion": {
+                "pk": opinion.pk,
+                "label": str(opinion),
+                "status": opinion.status,
+                "page_count": opinion.page_count,
+                "glue_revision": opinion.glue_revision,
+                "edit_revision": opinion.ensemble_edit_revision,
+            },
+            "cards": cards,
+        }
+    )
+
+
+@login_required
 def opinion_ensemble_url(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> JsonResponse:
@@ -1966,6 +2177,67 @@ def opinion_ensemble_url(
         )
     return _presigned_opinion_object(
         ensemble.document_key(opinion), opinion.glue_revision, opinion.pk
+    )
+
+
+#: The 404 of ``opinion_figure_url`` before the daemon cut the pictures
+#: of the text (#463), and its 400 for an address the page did not send.
+OPINION_FIGURE_NOT_CUT_MESSAGE = (
+    "The pictures of this opinion are not cut yet. The daemon cuts them "
+    "from the original after the text is written."
+)
+OPINION_FIGURE_BAD_REQUEST_MESSAGE = "Name the picture by its page and box."
+
+
+@login_required
+def opinion_figure_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read one picture of the text from (#463).
+
+    The review page draws each picture of the text in its place. It
+    names the picture as the ensemble document does, by its volume page
+    (``page``) and its box (``box``, four numbers), and the key is
+    built here by ``opinion_figures.key``, the one rule for it, so the
+    browser spells no path. ``opinion_figures.is_written`` is the one
+    rule for "the pictures exist".
+
+    :param request: The HTTP request, with ``page`` and ``box``.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, a 400 for an address
+        the page did not send, or a 404.
+    """
+    from scanning import opinion_figures
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("apply_run"), pk=opinion_pk, scan=scan
+    )
+    try:
+        page_index = int(request.GET.get("page", ""))
+        box = [float(value) for value in request.GET.get("box", "").split(",")]
+    except ValueError:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if page_index < 0 or len(box) != 4:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if not opinion.figure_digest or not opinion_figures.is_written(opinion):
+        return _json_404(
+            OPINION_FIGURE_NOT_CUT_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    run_label = opinion.apply_run.label if opinion.apply_run else ""
+    return _presigned_opinion_object(
+        opinion_figures.key(
+            opinion, run_label, {"page_index": page_index, "box_pt": box}
+        ),
+        opinion.glue_revision,
+        opinion.pk,
     )
 
 
@@ -2250,7 +2522,8 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
     """Build the final XML of an opinion from its two objects (#432).
 
     The spans must be over the approved text the row names now
-    (``tagger.is_written``), the one rule of the tagger's ledger.
+    (``tagger.is_written``), the one rule of the tagger's ledger. The
+    build is ``final_xml.render``, the one the export stores (#408).
 
     :param opinion: The opinion, with ``scan__reporter``.
     :returns: The XML, and the spans object for the legend.
@@ -2267,34 +2540,19 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
             )
         )
     try:
-        approved = tagger.load_approved(opinion.approved_text_key)
-        tags = s3_sync.download_json_object(opinion.tag_key)
-        if not isinstance(tags, dict):
-            raise casebody.CasebodyError(
-                f"{opinion.tag_key} is not a spans object"
-            )
-        citation = _main_citation(opinion)
-        return casebody.build(approved, tags, citation), tags
-    except (
-        tagger.TaggerInputError,
-        casebody.CasebodyError,
-        BotoCoreError,
-        ClientError,
-        ValueError,
-    ) as exc:
+        return final_xml.render(opinion)
+    except (final_xml.FinalXmlError, final_xml.TransientFault) as exc:
         # The reason goes to the log alone: an S3 fault's text is the
         # client library's, and no answer of this route repeats it. A
         # writing whose type is not read is an error, so Sentry tells a
         # developer to add its words to ``casebody.OPINION_TYPES`` (#442).
-        log = (
-            logger.error
-            if isinstance(exc, casebody.OpinionTypeError)
-            else logger.warning
-        )
+        # ``final_xml.render`` wraps it, so the cause names it.
+        unread_type = isinstance(exc.__cause__, casebody.OpinionTypeError)
+        log = logger.error if unread_type else logger.warning
         log("%s: the final XML was not built: %s", opinion, exc)
         message = (
             FINAL_XML_TYPE_MESSAGE.format(opinion=opinion)
-            if isinstance(exc, casebody.OpinionTypeError)
+            if unread_type
             else FINAL_XML_REFUSED_MESSAGE.format(opinion=opinion)
         )
         raise _FinalXmlRefused(
@@ -2303,42 +2561,6 @@ def _final_xml(opinion: Opinion) -> tuple[str, dict]:
                 status=409,
             )
         ) from exc
-
-
-#: The reporters whose citation eyecite did not read, logged once per
-#: process: the final XML is built at every request.
-_UNREAD_REPORTERS: set[str] = set()
-
-
-def _main_citation(opinion: Opinion) -> str:
-    """Return the citation of an opinion in its scan's reporter (#435).
-
-    A reporter missing from ``Reporter.CITE_MAP`` gives a name eyecite
-    does not read, and CourtListener's importer drops the citation, so
-    the miss is logged for a developer to add the abbreviation, once
-    per reporter (:data:`_UNREAD_REPORTERS`).
-
-    :param opinion: The opinion, with ``scan__reporter``.
-    :rtype: str
-    """
-    scan = opinion.scan
-    citation = casebody.main_citation(
-        scan.volume, scan.reporter.cite_name, opinion.first_printed_page
-    )
-    short_name = scan.reporter.short_name
-    if (
-        short_name not in _UNREAD_REPORTERS
-        and casebody.full_citation(citation) is None
-    ):
-        _UNREAD_REPORTERS.add(short_name)
-        logger.error(
-            "%s: eyecite does not read the citation %r; add the reporter "
-            "%r to Reporter.CITE_MAP",
-            opinion,
-            citation,
-            short_name,
-        )
-    return citation
 
 
 def _final_xml_name(opinion: Opinion) -> str:
@@ -2379,14 +2601,53 @@ def serve_opinion_final_xml(
 
 
 @login_required
+def serve_opinion_exported_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the stored final XML of one opinion (#408).
+
+    The object CourtListener reads, at ``final_xml.key``. A developer's
+    route, so it redirects (#243/#262). A 404 while no object is stored
+    (``final_xml.is_stored``). The object may be older than the row:
+    after a rewrite of the approved text it holds the text approved
+    before, until a tagger run of the new one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not final_xml.is_stored(opinion):
+        return _json_404(
+            f"The final XML of {opinion} is not exported.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    object_key = final_xml.key(opinion)
+    return _redirect_to_object(
+        scan,
+        "opinion-exported-xml",
+        object_key,
+        filename=_final_xml_name(opinion),
+        missing_message=(
+            f"The final XML of {opinion} is stamped, but {object_key} is "
+            "not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
 def opinion_final_xml(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> HttpResponse:
     """Show the final XML of one opinion, for display and debugging (#432).
 
     Two views of one document: every element drawn as a box with its
-    name, and the XML text. Nothing is stored; the export for
-    CourtListener is #408.
+    name, and the XML text. Built at this request; the export for
+    CourtListener stores the same build (``final_xml``, #408).
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -2557,6 +2818,23 @@ def opinion_file_index(
             "key": None,
             "url": reverse(
                 "serve_opinion_final_xml",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    # The same build, stored for CourtListener (#408) at a key of the
+    # two ids, outside the glue prefix.
+    files.append(
+        {
+            "name": "exported.xml",
+            "output": "opinion-exported-xml",
+            "written": final_xml.is_stored(opinion),
+            # False while the object holds older inputs than the row:
+            # the pass writes it again, or a tagger run is owed.
+            "current": final_xml.is_written(opinion),
+            "key": final_xml.key(opinion),
+            "url": reverse(
+                "serve_opinion_exported_xml",
                 kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
             ),
         }
@@ -3382,6 +3660,8 @@ class ShardRead:
     :ivar create: The row creator. **This is what costs money**, which
         is why the AST test of ``TestKnownEnqueuePaths`` pins the
         modules that name one.
+    :ivar provider: The ``JobProvider`` whose wave sends the rows, so
+        the button can send that wave now (``tasks.submit_soon``, #503).
     """
 
     name: str
@@ -3393,6 +3673,7 @@ class ShardRead:
     is_enabled: Callable[[], bool]
     run_summary: Callable[[Scan], dict | None]
     create: Callable[[Scan, dict], list[ExternalJob]]
+    provider: str
 
 
 def _shard_reads() -> dict[str, ShardRead]:
@@ -3420,6 +3701,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
+            provider=JobProvider.RUNPOD,
         ),
         JobEngine.SURYA: ShardRead(
             name="start_surya_ocr",
@@ -3431,6 +3713,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=surya.enabled,
             run_summary=surya.run_summary,
             create=surya.ensure_extract_jobs,
+            provider=JobProvider.RUNPOD,
         ),
     }
 
@@ -3515,6 +3798,7 @@ def _start_shard_read(
         queued,
     )
     if queued:
+        tasks.submit_soon(spec.provider)
         messages.success(
             request,
             f"Queued {spec.label} for {queued} part(s) of this volume. "
@@ -5024,3 +5308,80 @@ def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
         return
     if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
         services.recalculate_issues(scan)
+
+
+#: The writes the card review answers through (``card_review``), by URL
+#: name: step 2's own, so the two pages hold one set of rules.
+CARD_REVIEW_WRITES = (
+    "add_single_detection",
+    "approve_detection",
+    "update_detection",
+    "delete_detection",
+    "restore_detection",
+    "dismiss_finding",
+    "restore_finding",
+    "compute_redactions_api",
+)
+
+
+@login_required
+def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Review the boxes of a volume one after the next (``card_review``).
+
+    The brackets the reader saw, the captions the model missed and the
+    image boxes it drew, each a crop of the page with the box on it
+    and two or three buttons. **The page writes nothing of its own**:
+    the browser asks :func:`scan_review_cards` for the cards and
+    answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
+    so the viewer and this page hold one set of rules. The crops are
+    cut from the PDF step 2 draws, chosen by the rule step 2 reads
+    (``final_space``).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: The rendered page.
+    """
+
+    scan = get_object_or_404(Scan, pk=pk)
+    flags = _review_flags(scan)
+    kwargs = {"pk": scan.pk}
+    pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
+    review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
+    config = {
+        "scan": scan.pk,
+        # The labels a drawn box may take: the server's own table, so
+        # the page keeps no copy of ``LABEL_IDS`` (#343).
+        "labels": [{"name": label.name, "id": label.value} for label in Label],
+        "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        "cards_url": reverse("scan_review_cards", kwargs=kwargs),
+        "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
+        "review_open": review_open,
+        "urls": {
+            name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
+        },
+    }
+    return render(
+        request,
+        "scanning/scan_card_review.html",
+        {
+            "scan": scan,
+            "config": config,
+            "review_open": review_open,
+            "step2_url": config["step2_url"],
+        },
+    )
+
+
+@login_required
+def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the cards of the card review of one volume.
+
+    ``card_review.cards`` over the open findings and the live model
+    image rows: rows alone, no S3 read and no render.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, cards}``.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})

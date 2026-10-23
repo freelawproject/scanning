@@ -30,7 +30,7 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
-from scanning import layout_json, runpod_common
+from scanning import layout_json, perpendiculars, runpod_common
 
 _HANDLER_PATH = (
     Path(__file__).resolve().parent.parent / "runpod-dotsmocr" / "handler.py"
@@ -51,6 +51,8 @@ def _load_handler():
         # #242, shared with the daemon's glue.
         "runpod_common": runpod_common,
         "layout_json": layout_json,
+        # The perpendiculars whiteout, copied next to the handler too.
+        "perpendiculars": perpendiculars,
     }
     # ``shutil.which("nvidia-smi")`` -> None makes ``_preload()`` take
     # the no-GPU path regardless of the machine running the tests.

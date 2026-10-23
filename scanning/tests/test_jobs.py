@@ -1463,3 +1463,50 @@ class TestDurationLogging(ScanningTestCase):
             self.assertFalse(jobs._complete(job, None, timezone.now()))
 
         self.assertNotIn("completed in", "\n".join(logs.output))
+
+
+class TestSwapProviderMeta(ScanningTestCase):
+    """A ledger write never erases what another pass wrote beside it
+    (#503)."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.row = ExternalJobFactory(
+            scan=self.scan, provider_meta={"glue": {"attempts": 1}}
+        )
+
+    def test_a_key_is_changed_and_the_others_kept(self):
+        jobs.swap_provider_meta(self.row, lambda m: m.update(apply={"a": 1}))
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "apply": {"a": 1}},
+        )
+
+    def test_a_write_that_lands_between_the_read_and_the_swap_survives(self):
+        """The first swap loses, the second reads the other's write."""
+        rival_written = []
+
+        def rival_then_mine(meta):
+            if not rival_written:
+                ExternalJob.objects.filter(pk=self.row.pk).update(
+                    provider_meta={"glue": {"attempts": 1}, "rival": True}
+                )
+                rival_written.append(True)
+            meta["mine"] = True
+
+        jobs.swap_provider_meta(self.row, rival_then_mine)
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "rival": True, "mine": True},
+        )
+
+    def test_the_run_ledger_counts_through_the_swap(self):
+        attempts, head = jobs.bump_run_ledger(
+            [self.row], "glue", RuntimeError("boom")
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(head.provider_meta["glue"]["attempts"], 2)
+        self.assertEqual(head.provider_meta["glue"]["last_error"], "boom")

@@ -27,6 +27,7 @@ every refused write: :func:`approve_text` refuses on its own, so a
 caller that is not the view cannot skip it.
 """
 
+import base64
 import logging
 from datetime import UTC, datetime
 
@@ -35,7 +36,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from scanning import apply, ensemble, paragraphs, s3_sync
+from scanning import apply, ensemble, opinion_figures, paragraphs, s3_sync
 from scanning.models import (
     UNDISMISSABLE_OPINION_CHECKS,
     Issue,
@@ -63,6 +64,7 @@ OLD_DOCUMENT = "old_document"
 NO_PAGE_NUMBERS = "no_page_numbers"
 BUCKET = "bucket"
 MOVED = "moved"
+FIGURES = "figures"
 REVIEW2_OPEN = "review2_open"
 
 
@@ -102,6 +104,33 @@ def blocking_filter() -> Q:
     return Q(dismissal__isnull=True) & (
         Q(severity=Issue.Severity.ERROR)
         | Q(check_name__in=UNDISMISSABLE_OPINION_CHECKS)
+    )
+
+
+def warning_filter() -> Q:
+    """Return the filter of an open warning card.
+
+    The twin of :func:`blocking_filter` for the warnings review, which
+    walks these cards one after the next and gates nothing: an open
+    card of WARNING severity that a dismissal can close.
+
+    :returns: A ``Q`` over ``OpinionFinding``.
+    """
+    return (
+        Q(dismissal__isnull=True)
+        & Q(severity=Issue.Severity.WARNING)
+        & ~Q(check_name__in=UNDISMISSABLE_OPINION_CHECKS)
+    )
+
+
+def warning_findings(opinion: Opinion):
+    """Return the open warning cards of one opinion (:func:`warning_filter`).
+
+    :param opinion: The opinion.
+    :returns: A queryset of ``OpinionFinding`` rows.
+    """
+    return OpinionFinding.objects.filter(opinion=opinion).filter(
+        warning_filter()
     )
 
 
@@ -197,6 +226,50 @@ def _document(opinion: Opinion) -> dict:
     return document
 
 
+def _embed_figures(opinion: Opinion, document: dict, text: dict) -> None:
+    """Put each picture of the approved body in its paragraph (#463).
+
+    The cut of ``opinion_figures``, as base64 JPEG, beside the size it
+    has on the page, so the approved object holds the picture and the
+    final XML is built from it and the spans alone. The box found the
+    cut and leaves the object: the approved text holds no geometry.
+
+    :param opinion: The row, with ``scan``.
+    :param document: The stamped ensemble document the text came from.
+    :param text: The approved object; its ``body`` is changed in place.
+    :raises ApprovalRefused: When a cut is missing, or the bucket did
+        not answer.
+    """
+    index_of = {
+        page.get("page_in_opinion"): page.get("page_index")
+        for page in document.get("pages") or []
+    }
+    run_label = document.get("apply_run") or ""
+    for paragraph in text.get("body") or []:
+        if paragraph.get("kind") != paragraphs.FIGURE:
+            continue
+        figure = paragraph.get("figure") or {}
+        place = {
+            "page_index": index_of.get((paragraph.get("pages") or [None])[0]),
+            "box_pt": figure.pop("box_pt", None) or [],
+        }
+        if place["page_index"] is None or len(place["box_pt"]) != 4:
+            raise ApprovalRefused(FIGURES, "a picture has no place")
+        key = opinion_figures.key(opinion, run_label, place)
+        try:
+            data = s3_sync.download_bytes_object(key)
+        except ClientError as exc:
+            code = str((exc.response.get("Error") or {}).get("Code", ""))
+            if code in {"NoSuchKey", "404"}:
+                raise ApprovalRefused(FIGURES, f"{key} is missing") from exc
+            raise ApprovalRefused(BUCKET, f"the read of {key}: {exc}") from exc
+        except BotoCoreError as exc:
+            raise ApprovalRefused(BUCKET, f"the read of {key}: {exc}") from exc
+        figure["content_type"] = opinion_figures.CONTENT_TYPE
+        figure["data"] = base64.b64encode(data).decode("ascii")
+        paragraph["figure"] = figure
+
+
 def _put(key: str, text: dict) -> bool:
     """Write the approved text once, and say whether this call wrote it.
 
@@ -252,6 +325,12 @@ def check_gate(
         raise ApprovalRefused(REVIEW2_OPEN)
     if not ensemble.is_written(opinion):
         raise ApprovalRefused(NOT_WRITTEN)
+    if not opinion_figures.is_written(opinion):
+        # The key of a cut holds the place of the picture and not its
+        # ledger (#463): a redaction added over a picture leaves the
+        # old cut at that key until the daemon cuts it again, and the
+        # approval would embed what the redaction hides.
+        raise ApprovalRefused(FIGURES)
     if opinion.edit_revision != opinion.ensemble_edit_revision:
         # An edit the text does not hold yet: its build failed, so the
         # text is not what the curator decided.
@@ -292,6 +371,7 @@ def approve_text(
         getattr(user, "username", "") or "",
         now.isoformat(),
     )
+    _embed_figures(opinion, document, text)
     key = approved_key(opinion, opinion.ensemble_edit_revision, now)
     wrote = _put(key, text)
 
@@ -369,7 +449,8 @@ def rewrite_text(opinion: Opinion) -> str | None:
     joins them otherwise. That document stays in the bucket, because an
     approved row is never built again. The new object keeps who
     approved and when, and the row moves to it by a compare-and-swap
-    over the key it held.
+    over the key it held. When the spans carry, the stored final XML is
+    marked for the export to write again (``final_xml_schema`` None).
 
     :param opinion: An approved row, with ``scan`` and ``apply_run``.
     :returns: The new key, or None when the row holds it already.
@@ -394,6 +475,7 @@ def rewrite_text(opinion: Opinion) -> str | None:
         opinion.approved_by.username if opinion.approved_by else "",
         opinion.approved_at.isoformat() if opinion.approved_at else "",
     )
+    _embed_figures(opinion, document, text)
     wrote = _put(key, text)
     carry = _spans_still_fit(opinion, text)
     match = {}
@@ -401,6 +483,13 @@ def rewrite_text(opinion: Opinion) -> str | None:
     if carry:
         match["tagged_text_key"] = opinion.tagged_text_key
         fields["tagged_text_key"] = key
+        # The spans stay, so the stored final XML still reads as current
+        # (``final_xml.is_written`` compares the spans key). Its text is
+        # the old object: mark the content unknown, and the export writes
+        # the new footnotes (#408). The new text is a new input, so a
+        # row the pass stopped trying is tried again.
+        fields["final_xml_schema"] = None
+        fields["final_xml_attempts"] = 0
     moved = Opinion.objects.filter(
         pk=opinion.pk,
         status=OpinionReviewStatus.TEXT_REVIEW_DONE,

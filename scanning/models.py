@@ -801,8 +801,13 @@ class Scan(AbstractDateTimeModel):
         # PRE-increment value via CASE/WHEN (no read-then-write race). A
         # pre-increment `>= max` is a post-increment `> max`, so a scan is
         # allowed `max_interruptions` re-queues before it is flagged. The
-        # PROCESSING guard means we never stomp a scan already moved on.
-        Scan.objects.filter(pk__in=pks, status=Status.PROCESSING).update(
+        # PROCESSING guard means we never stomp a scan already moved on,
+        # and the caller's own filter stays in the UPDATE (#503): the
+        # stale sweep runs on every worker at once, and a scan another
+        # worker re-queued and a third claimed again between the read
+        # above and this write carries a fresh ``processed_at`` that the
+        # sweep's cutoff no longer matches.
+        queryset.filter(pk__in=pks, status=Status.PROCESSING).update(
             interruption_count=models.F("interruption_count") + 1,
             status=models.Case(
                 models.When(
@@ -1092,6 +1097,7 @@ class CheckName(models.TextChoices):
         "Caption not matched to an opinion",
     )
     UNCOVERED_PAGES = "uncovered_pages", "Pages not covered by an opinion"
+    MISSING_CAPTION = ("missing_caption", "Opinion starts with no caption box")
     UNCOVERED_HEADNOTE = (
         "uncovered_headnote",
         "Headnote not covered by a redaction",
@@ -1103,6 +1109,18 @@ class CheckName(models.TextChoices):
     LOW_CONFIDENCE_HEADNOTE_BRACKET = (
         "low_confidence_headnote_bracket",
         "Headnote bracket under the redaction gate",
+    )
+    UNDETECTED_TEXT = (
+        "undetected_text",
+        "Text in no box",
+    )
+    UNCOVERED_EDITORS_NOTE = (
+        "uncovered_editors_note",
+        "Editor's note not covered by a redaction",
+    )
+    REDACTION_CUTS_TEXT = (
+        "redaction_cuts_text",
+        "Redaction covers part of a line of text",
     )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
@@ -1171,9 +1189,13 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNMATCHED_KEY_ICON,
         CheckName.UNMATCHED_CAPTION,
         CheckName.UNCOVERED_PAGES,
+        CheckName.MISSING_CAPTION,
         CheckName.UNCOVERED_HEADNOTE,
         CheckName.MISSING_HEADNOTE_BRACKET,
         CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+        CheckName.UNCOVERED_EDITORS_NOTE,
+        CheckName.UNDETECTED_TEXT,
+        CheckName.REDACTION_CUTS_TEXT,
     }
 )
 
@@ -2415,10 +2437,193 @@ class BracketReading(AbstractDateTimeModel):
         return f"{self.raw} p.{self.page_index + 1}"
 
 
+class EditorialReading(AbstractDateTimeModel):
+    """One editor's note the OCR read, inside one cell (#450).
+
+    West's ``[Editor's Note: ...]`` is the publisher's text and must be
+    redacted, and nothing told a curator that the model had missed one.
+    This row is the reading, stored so that ``findings.rebuild`` can
+    compare it with the redaction and detection rows without an S3
+    read (``editorial.uncovered``).
+
+    A disposable row, the rule of ``BracketReading``: every compute
+    replaces the scan's set (``editorial.write_rows``), and a curator
+    never writes one.
+
+    **The box is the note's band, not the cell.** dots.mocr measures a
+    paragraph and the note is often its first lines, so the box is the
+    cell's width and the note's share of its height
+    (``editorial.note_band``). The address is the source page, the rule
+    of ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="editorial_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="editorial_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="editorial_readings",
+        help_text=(
+            "The page edit whose one-page shard this cell is on. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    x0 = models.FloatField()
+    y0 = models.FloatField()
+    x1 = models.FloatField()
+    y1 = models.FloatField()
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+
+    text = models.TextField(
+        help_text="The note as dots.mocr wrote it, for the card.",
+    )
+
+    class Meta:
+        ordering = ["page_index", "y0", "x0"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_editorial_scan_run_page",
+            ),
+        ]
+
+    @property
+    def bbox(self) -> list[float]:
+        """The note's band, in the pixels of the detection render."""
+        return [self.x0, self.y0, self.x1, self.y1]
+
+    def __str__(self):
+        return f"{self.text[:40]} p.{self.page_index + 1}"
+
+
 # ── The third review: the opinions of a volume ────────────────────────
 #
 # Issue #335. The models alone. Nothing writes them yet: the creation of
 # the rows is #336 and the review interface is #334.
+
+
+class TextReading(AbstractDateTimeModel):
+    """The text cells of one page, as the OCR read them (``undetected``).
+
+    The opinion text drops a unit the detections of its page do not
+    cover (``opinion_ocr.UNDETECTED``), and nothing told a curator in
+    review 2 that a block of print lay outside every box. This row is
+    the reader's measure of the page, stored so that ``findings.rebuild``
+    can compare it with the ``Detection`` rows without an S3 read
+    (``undetected.uncovered``).
+
+    **One row per page, not per cell.** A volume holds twenty thousand
+    cells and every rebuild reads them all, so ``cells`` is the list:
+    one ``{"box", "kind", "text"}`` per cell with a box and some text,
+    the box in the pixels of the reader's own render (``img_width`` by
+    ``img_height``), ``kind`` the dots.mocr category and ``text`` its
+    first characters, for the card.
+
+    A disposable row, the rule of ``BracketReading``: every compute
+    replaces the scan's set (``undetected.write_rows``), and a curator
+    never writes one. The address is the source page, the rule of
+    ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="text_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="text_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="text_readings",
+        help_text=(
+            "The page edit whose one-page shard this page is. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+
+    page_index = models.PositiveIntegerField(db_index=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    cells = models.JSONField(
+        default=list,
+        help_text=(
+            "The text cells of the page: ``[{box, kind, text}, ...]``, "
+            "the box in the pixels of the reader's render."
+        ),
+    )
+
+    class Meta:
+        ordering = ["page_index"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_textread_scan_run_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{len(self.cells or [])} cell(s) p.{self.page_index + 1}"
 
 
 class OpinionReviewStatus(models.TextChoices):
@@ -2453,6 +2658,10 @@ class OpinionCheck(models.TextChoices):
         "partial_redaction",
         "A redaction covers part of a cell",
     )
+    UNDETECTED_TEXT = (
+        "undetected_text",
+        "Text where the detections drew nothing",
+    )
     PAGE_NOT_READ = "page_not_read", "This page has no text"
     FOOTNOTE_UNSURE = (
         "footnote_unsure",
@@ -2466,6 +2675,15 @@ class OpinionCheck(models.TextChoices):
         "unresolved_edit",
         "A human edit no longer fits the text",
     )
+    FIGURE_ONE_ENGINE = (
+        "figure_one_engine",
+        "One engine alone drew a picture",
+    )
+    # Every page that holds a picture of the text (#463): a person reads
+    # the picture and the text around it against the PDF.
+    # ``FIGURE_ONE_ENGINE`` has no writer since the pictures are review
+    # 2's boxes, and the ensemble's rebuild deletes its rows.
+    FIGURE_TO_CHECK = "figure_to_check", "A picture to check"
 
 
 #: The checks a curator may dismiss. The two stale checks are facts
@@ -2744,6 +2962,34 @@ class Opinion(AbstractDateTimeModel):
             "equal (``tagger.is_written``)."
         ),
     )
+    final_xml_tag_key = models.CharField(
+        max_length=512,
+        blank=True,
+        default="",
+        help_text=(
+            "The ``tag_key`` the exported final XML was built from "
+            "(#408), at ``export/{scan}/{opinion}.xml``. Blank: no "
+            "object is stored. The export is current when it equals "
+            "``tag_key`` and ``final_xml_schema`` is ``casebody.SCHEMA`` "
+            "(``final_xml.is_written``)."
+        ),
+    )
+    final_xml_schema = models.PositiveSmallIntegerField(
+        null=True,
+        blank=True,
+        help_text=(
+            "The ``casebody.SCHEMA`` the exported final XML was built "
+            "with (#408). Null: no object is stored."
+        ),
+    )
+    final_xml_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed exports of the final XML that the objects explain "
+            "(#408); a transient S3 fault counts none. Reset when the "
+            "spans are placed again and when the export is written."
+        ),
+    )
     redacted_pdf_revision = models.PositiveSmallIntegerField(
         null=True,
         blank=True,
@@ -2770,6 +3016,52 @@ class Opinion(AbstractDateTimeModel):
             "(#336). The row is not due again before "
             "opinion_pdf.retry_after() has passed. Cleared when the PDF "
             "is written."
+        ),
+    )
+    figure_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "A digest of the pictures of the ensemble document (#463), "
+            "stamped by the ensemble: blank when the text holds none."
+        ),
+    )
+    figures_cut_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The figure_digest the pictures were cut at (#463). Equal to "
+            "figure_digest, or a blank figure_digest: every picture is "
+            "cut, the one rule opinion_figures.is_written reads."
+        ),
+    )
+    figure_attempts = models.PositiveSmallIntegerField(
+        default=0,
+        help_text=(
+            "Failed cuts of this row's pictures that the rows explain "
+            "(#463). At opinion_figures.MAX_ATTEMPTS the row goes to ERROR."
+        ),
+    )
+    figures_attempted_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        help_text=(
+            "When the cut of this row's pictures last failed, of either "
+            "kind (#463). The row is not due again before "
+            "opinion_pdf.retry_after() has passed."
+        ),
+    )
+    input_digest = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "A digest of everything the row's OCR documents and redacted "
+            "PDF are built from (opinions.input_digest), stamped by the "
+            "creation. A later creation that computes the same digest "
+            "keeps the revision; blank on a row from before the rule."
         ),
     )
     notes = models.TextField(blank=True, default="")
@@ -3191,11 +3483,14 @@ class OpinionFinding(AbstractDateTimeModel):
 class OpinionEdit(AbstractDateTimeModel):
     """One human edit of the text of one opinion (#376).
 
-    Four kinds: the text of one block (``TEXT``), the section of one
+    Five kinds: the text of one block (``TEXT``), the section of one
     block (``SECTION``: the body or the footnotes), the order of the
-    blocks of one section of one page (``ORDER``), and the blockquote of
+    blocks of one section of one page (``ORDER``), the blockquote of
     one block (``BLOCKQUOTE``, #419): the whole block, or one span of
-    its text.
+    its text, and a block that is not text (``DROP``): the bleed-through
+    of the page behind, a stray mark, the label of a picture, which the
+    engines read as words and no redaction covers, so a person takes it
+    out and the build leaves it out.
 
     **The address plus a copy of the box, never the group id.** The id
     of a group in the ensemble document is its place on the page, and
@@ -3222,6 +3517,7 @@ class OpinionEdit(AbstractDateTimeModel):
         SECTION = "section", "Section of a block"
         ORDER = "order", "Order of the blocks of a page"
         BLOCKQUOTE = "blockquote", "Blockquote of a block"
+        DROP = "drop", "Block that is not text"
 
     opinion = models.ForeignKey(
         Opinion,
@@ -3249,8 +3545,8 @@ class OpinionEdit(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text=(
-            "TEXT and SECTION: a copy of the block's box, in the points "
-            "of the volume page."
+            "TEXT, SECTION, BLOCKQUOTE and DROP: a copy of the block's "
+            "box, in the points of the volume page."
         ),
     )
     section = models.CharField(

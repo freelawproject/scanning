@@ -252,6 +252,29 @@ class TestRender(ScanningTestCase):
         self.assertEqual(img.getpixel((400, 400)), (0, 0, 0))
         self.assertEqual(img.getpixel((1600, 2100)), (255, 255, 255))
 
+    def test_the_whiteout_paints_the_perpendiculars_out(self):
+        """A page with one perpendicular drawn as print: a bar 50 by 6
+        px at 200 dpi with a stem 12 px in. Painted out; without the
+        whiteout the stem is in the PNG."""
+        pdf = self.tmp / "perpendicular.pdf"
+        black = (0, 0, 0)
+        with fitz.open() as doc:
+            page = doc.new_page(width=612, height=792)
+            page.draw_rect(
+                fitz.Rect(216, 360, 234, 362.2), color=black, fill=black
+            )
+            page.draw_rect(
+                fitz.Rect(220.3, 351, 221.4, 360), color=black, fill=black
+            )
+            doc.save(str(pdf))
+
+        pages = list(mistral_ocr.render_shard_pages(pdf, whiteout=True))
+
+        painted = png_image(pages[0][1])
+        self.assertEqual(painted.getpixel((613, 990)), (255, 255, 255))
+        plain = png_image(next(mistral_ocr.render_shard_pages(pdf))[1])
+        self.assertEqual(plain.getpixel((613, 990)), (0, 0, 0))
+
     def test_shard_pages_are_rendered_in_order(self):
         pdf = self.tmp / "shard.pdf"
         write_pdf(pdf, pages=3)
@@ -943,11 +966,25 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(summary.retried, 1)
         self.assertEqual(self.job.error_code, "DEADLINE_EXCEEDED")
 
-    def test_a_claim_with_no_batch_id_is_a_lost_claim(self):
-        # The scheduler is serial: a SUBMITTED row with no id at sweep
-        # time is a claim the daemon died holding.
+    def test_a_fresh_claim_with_no_batch_id_is_still_rendering(self):
+        # The sweep and the wave no longer share one serial scheduler
+        # (#503): a SUBMITTED row with no id inside LOST_CLAIM_AFTER is
+        # a shard another worker is rendering now.
         ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
         summary, mocks = self._sweep(mistral_client.BatchOutcome(status=None))
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        mocks["poll"].assert_not_called()
+
+    def test_an_old_claim_with_no_batch_id_is_a_lost_claim(self):
+        # Past the clock, a claim with no id is one a worker died holding.
+        ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
+        summary, mocks = self._sweep(
+            mistral_client.BatchOutcome(status=None),
+            now=timezone.now() + mistral_ocr.LOST_CLAIM_AFTER,
+        )
         self.assertEqual(summary.retried, 1)
         self.job.refresh_from_db()
         self.assertEqual(self.job.status, JobStatus.PENDING)

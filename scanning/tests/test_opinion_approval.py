@@ -22,7 +22,9 @@ from django.test import override_settings
 from django.urls import reverse
 
 from scanning import (
+    casebody,
     ensemble,
+    final_xml,
     opinion_findings,
     opinion_review,
     paragraphs,
@@ -182,6 +184,40 @@ class TestTheGate(ApprovalTestCase):
             box_pt=group["box_pt"],
             base_text=group["text"],
             text="body A 1",
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(self.blocking(), [])
+        self.approve()
+
+    def test_a_word_answer_keeps_the_card_for_the_open_word_it_left(self):
+        """A word card's answer (the edit's ``span``) vouches for its
+        word alone: the block's other open word still blocks."""
+        from scanning.models import OpinionEdit
+
+        group = self.split_group()
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A 1",
+            span=[0, 4],
+        )
+        self.opinion.refresh_from_db()
+        ensemble.rerun(self.opinion)
+
+        self.assertEqual(
+            [f.check_name for f in self.blocking()],
+            [OpinionCheck.NO_MAJORITY],
+        )
+
+        self.write_edit(
+            kind=OpinionEdit.Kind.TEXT,
+            box_pt=group["box_pt"],
+            base_text=group["text"],
+            text="bodies A one",
+            span=[9, 10],
         )
         self.opinion.refresh_from_db()
         ensemble.rerun(self.opinion)
@@ -427,10 +463,20 @@ class TestTheRewrite(ApprovalTestCase):
         )
         self.opinion.refresh_from_db()
 
+    def exported(self):
+        """The final XML of the tagged text, stored (#408)."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            final_xml_tag_key="spans.json",
+            final_xml_schema=casebody.SCHEMA,
+            final_xml_attempts=final_xml.MAX_ATTEMPTS,
+        )
+        self.opinion.refresh_from_db()
+
     def test_a_rewrite_that_keeps_the_body_keeps_the_spans(self):
         """A rule that changes only the footnotes (#442) leaves every
         span on its paragraph, so the final XML stays."""
         self.tag()
+        self.exported()
 
         with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):
             key = opinion_review.rewrite_text(self.opinion)
@@ -439,9 +485,15 @@ class TestTheRewrite(ApprovalTestCase):
         self.assertEqual(self.opinion.approved_text_key, key)
         self.assertEqual(self.opinion.tagged_text_key, key)
         self.assertTrue(tagger.is_written(self.opinion))
+        # The stored final XML holds the old footnotes: owed again (#408).
+        self.assertEqual(self.opinion.final_xml_tag_key, "spans.json")
+        self.assertIsNone(self.opinion.final_xml_schema)
+        self.assertEqual(self.opinion.final_xml_attempts, 0)
+        self.assertFalse(final_xml.is_written(self.opinion))
 
     def test_a_rewrite_that_moves_the_body_drops_the_spans(self):
         self.tag()
+        self.exported()
         moved = [{"text": "Another flow.", "marks": []}]
 
         with (
@@ -454,6 +506,11 @@ class TestTheRewrite(ApprovalTestCase):
         self.assertEqual(self.opinion.approved_text_key, key)
         self.assertEqual(self.opinion.tagged_text_key, self.first)
         self.assertFalse(tagger.is_written(self.opinion))
+        # The old object stays, and the stamp says what it holds (#408).
+        self.assertEqual(self.opinion.final_xml_schema, casebody.SCHEMA)
+        self.assertEqual(
+            self.opinion.final_xml_attempts, final_xml.MAX_ATTEMPTS
+        )
 
     def test_the_dry_run_changes_nothing(self):
         with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):

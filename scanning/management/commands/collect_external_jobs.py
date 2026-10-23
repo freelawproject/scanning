@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Thirteen passes, in order.
+Seventeen passes in four groups (``scanning.ticks``), in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -124,6 +124,13 @@ a pass of its own, the twin of pass 7 for a scan. It takes a row
 back to ``PROCESSING`` too, because a re-glue raises the revision and
 leaves the status where it was.
 
+**15. ``final_xml.export_due()`` stores the final XML of the approved
+opinions (#408).** For an opinion whose text review is done and whose
+spans are over the approved text, it writes the build of the review
+page at ``export/{scan}/{opinion}.xml``, the key CourtListener
+reads, and stamps the row. It deletes the object of a row that stopped
+being exportable (a reopen) first. Writes no status.
+
 Examples:
 
     # Run one confirm tick and exit.
@@ -171,40 +178,12 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import (
-            apply,
-            bitonal,
-            dots_mocr,
-            ensemble,
-            jobs,
-            mistral_ocr,
-            opinion_ocr,
-            opinions,
-            review_states,
-            surya,
-            tagger,
-            yolo,
-        )
+        from scanning import ticks
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
-                summary = jobs.sweep_jobs()
-                finished = bitonal.finish_ready_scans()
-                glued = dots_mocr.finish_ready_runs()
-                applied = dots_mocr.apply_ready_runs()
-                detected = yolo.finish_ready_runs()
-                tagged = tagger.finish_ready_runs()
-                applied_edits = apply.queue_ready_scans()
-                queued = yolo.queue_ready_runs()
-                promoted = review_states.promote_ready_scans()
-                extracted = mistral_ocr.finish_ready_runs()
-                extracted_applies = mistral_ocr.finish_ready_applies()
-                read_surya = surya.finish_ready_runs()
-                surya_applies = surya.finish_ready_applies()
-                glued_opinions = opinion_ocr.glue_due()
-                read_opinions = ensemble.run_tick()
-                ready_opinions = opinions.promote_ready_opinions()
+                summary, counts = ticks.collect()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -225,37 +204,25 @@ class Command(BaseCommand):
                 summary.retried,
                 summary.failed,
                 summary.errors,
-                finished,
-                glued,
-                applied,
-                detected,
-                tagged,
-                applied_edits,
-                queued,
-                promoted,
-                extracted,
-                extracted_applies,
-                read_surya,
-                surya_applies,
-                glued_opinions,
-                read_opinions,
-                ready_opinions,
+                *counts.values(),
             )
         ):
+            c = counts
             self.stdout.write(
                 f"Completed {summary.completed}, retried {summary.retried}, "
                 f"failed {summary.failed}, still waiting {summary.pending}, "
-                f"check errors {summary.errors}; finished {finished} "
-                f"scan(s), glued {glued} OCR run(s), applied {applied}, "
-                f"merged {detected} detection run(s), glued {tagged} "
-                f"tagger run(s), queued {applied_edits} page edit "
-                f"apply(s) and {queued} "
-                f"redaction computation(s), opened {promoted} redaction "
-                f"review(s), glued {extracted} Mistral run(s) and "
-                f"{extracted_applies} corrected volume(s), glued "
-                f"{read_surya} Surya run(s) and {surya_applies} "
+                f"check errors {summary.errors}; finished {c['finished']} "
+                f"scan(s), glued {c['glued']} OCR run(s), applied {c['applied']}, "
+                f"merged {c['detected']} detection run(s), glued {c['tagged']} "
+                f"tagger run(s), queued {c['applied_edits']} page edit "
+                f"apply(s) and {c['queued']} "
+                f"redaction computation(s), opened {c['promoted']} redaction "
+                f"review(s), glued {c['extracted']} Mistral run(s) and "
+                f"{c['extracted_applies']} corrected volume(s), glued "
+                f"{c['read_surya']} Surya run(s) and {c['surya_applies']} "
                 f"corrected volume(s), wrote the OCR "
-                f"documents of {glued_opinions} opinion(s), wrote the "
-                f"text of {read_opinions} opinion(s), opened {ready_opinions} "
-                f"text review(s)"
+                f"documents of {c['glued_opinions']} opinion(s), wrote the "
+                f"text of {c['read_opinions']} opinion(s), opened {c['ready_opinions']} "
+                f"text review(s), exported or withdrew the final XML of "
+                f"{c['exported']} opinion(s)"
             )

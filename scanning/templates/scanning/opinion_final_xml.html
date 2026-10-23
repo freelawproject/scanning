@@ -5,8 +5,8 @@
   The final XML of one opinion (#432), for display and debugging.
 
   Built at this request from the approved text (#375) and the tagger's
-  spans (#272) by `casebody.build`; nothing is stored, and the export
-  for CourtListener is #408. Two views of the one document, in the
+  spans (#272) by `final_xml.render`, the build the export for
+  CourtListener stores (#408). Two views of the one document, in the
   style of centralia's review sheet: the reading (the opinion as it
   reads, its tags tinted by role) and the XML. A toggle shows one at a
   time, and `r` and `x` press it. Both are escaped by `casebody`, and
@@ -31,7 +31,7 @@
   {% if opinion.index_in_page %}<span class="text-base font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
 </h1>
 <p class="text-sm text-gray-500 dark:text-gray-400 mb-3">
-  The approved text with {{ span_count }} span{{ span_count|pluralize }} of tagger run {{ run }}{% if model %} ({{ model }}){% endif %}, in the CAP casebody shape. Built now, stored nowhere.
+  The approved text with {{ span_count }} span{{ span_count|pluralize }} of tagger run {{ run }}{% if model %} ({{ model }}){% endif %}, in the CAP casebody shape. The counts below are the tagger's; the build repairs the spans first, so the document can hold fewer. Built now, stored nowhere.
 </p>
 
 <ul class="cb-chips" aria-label="The labels of the spans">

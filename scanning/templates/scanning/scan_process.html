@@ -383,7 +383,7 @@ body.boundary-pick .opinion-nav.picking {
       </div>
       {% endif %}
       {% if opinions %}
-      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinion_count }})</h2>
+      <h2 class="text-sm font-bold mb-2">Opinions ({{ opinion_count }}){% if missing_count %} <span class="text-red-600 dark:text-red-400 font-normal" title="A key icon closes an opinion, and no caption box follows it: the opinion after it has no start. Each is a red row under the opinion that runs on past it.">+ {{ missing_count }} missing</span>{% endif %}</h2>
       {% comment %}
         One card per boundary row (#240 PR C). A dismissed computed
         boundary stays in the list, muted, with its undo; a boundary the
@@ -404,6 +404,7 @@ body.boundary-pick .opinion-nav.picking {
             <span class="font-bold">{{ forloop.counter }}</span>
             {% if op.origin == "human" %}<span class="text-[10px] px-1 rounded bg-purple-100 text-purple-800 dark:bg-purple-900/40 dark:text-purple-200" title="Drawn by a curator">curator</span>{% endif %}
             {% if op.dismissed %}<span class="text-[10px] px-1 rounded bg-gray-200 text-gray-700 dark:bg-gray-700 dark:text-gray-200" title="Dismissed by a curator">dismissed</span>{% endif %}
+            {% if op.missing %}<span class="text-[10px] px-1 rounded bg-red-600 text-white" title="This opinion runs on past a key icon on page {{ op.missing.0.key_num }}: the opinion after that key has no caption box, so it has no start. See the red row below.">runs on</span>{% endif %}
             {% if op.has_image %}<span title="Contains image(s)">🖼️</span>{% endif %}
             <span class="text-gray-600 dark:text-gray-300">Pages {% if op.first_page_number %}{{ op.first_page_number }}&ndash;{{ op.last_page_number }}{% else %}{{ op.caption_page|add:1 }}&ndash;{{ op.key_page|add:1 }}{% endif %} ({{ op.page_count }} pg)</span>
           </span>
@@ -422,6 +423,27 @@ body.boundary-pick .opinion-nav.picking {
           </span>
         </div>
       </div>
+      {% comment %}
+        The opinions the pairing could not start (``missing_caption``):
+        one red row per key icon inside this span with no caption box
+        after it. Not an ``.opinion-nav`` card, so the scroll tracking
+        and the opinions JSON keep their index. A click flashes the
+        card's guess of where the caption is (``goToPage`` over
+        ``data-boxes``, as an image chip does).
+      {% endcomment %}
+      {% for m in op.missing %}
+      <div class="ml-4 mb-1 rounded border border-red-300 dark:border-red-800 bg-red-50 dark:bg-red-900/20 px-2 py-1 text-xs cursor-pointer hover:bg-red-100 dark:hover:bg-red-900/40 missing-opinion"
+           data-pdf-index="{{ m.idx }}" data-boxes="{{ m.boxes }}" data-img-w="{{ m.img_w }}" data-img-h="{{ m.img_h }}" data-issue-pk="{{ m.issue_pk }}"
+           data-label="{{ m.label }}" data-label-id="{{ m.label_id }}"
+           onclick="event.stopPropagation(); goToPage(this)"
+           title="The key icon on page {{ m.key_num }} closes the opinion above, and no caption box follows it, so this opinion has no start. Click to show where the caption is likely to be, then draw the caption box there, or press + to add it where the card guesses; the next compute starts the opinion on it.">
+        <span class="font-bold text-red-700 dark:text-red-300">?</span>
+        <span class="text-[10px] px-1 rounded bg-red-600 text-white">missing</span>
+        <span class="text-gray-700 dark:text-gray-300">Pages {{ m.num }}&ndash;{{ m.end_num }}: no caption box after the key on page {{ m.key_num }}</span>
+        <button class="ml-1 px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700 missing-add" title="Add a caption box where the card guesses the caption is, the box the row flashes. Resize it on the page if it is off; the next compute starts the opinion on it."
+                onclick="event.stopPropagation(); addMissingCaption(this)">+</button>
+      </div>
+      {% endfor %}
       {% if op.image_pages %}
       <div class="ml-4 mb-1 flex flex-wrap gap-0.5">
         {% for pg in op.image_pages %}
@@ -479,7 +501,14 @@ body.boundary-pick .opinion-nav.picking {
       <div id="preview-banner"
            class="flex items-center gap-2 text-xs px-3 py-1.5 border-b border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-900/30 text-blue-800 dark:text-blue-200"
            hidden></div>
+      {% comment %}
+        The toolbar is a column at the top-left of the panel, over the
+        grey gutter beside the pages, and takes no height in the flow:
+        a row across the top sat over the first page of every volume.
+        The sticky box is empty; the stack inside it is what shows.
+      {% endcomment %}
       <div class="zoom-toolbar" role="toolbar" aria-label="PDF zoom">
+       <div class="zoom-stack">
         <button type="button" class="zoom-btn" data-zoom-action="out" title="Zoom out" aria-label="Zoom out">&minus;</button>
         <span id="zoom-pct" class="zoom-pct" aria-live="polite">100%</span>
         <button type="button" class="zoom-btn" data-zoom-action="in" title="Zoom in" aria-label="Zoom in">+</button>
@@ -524,6 +553,7 @@ body.boundary-pick .opinion-nav.picking {
                 title="What the overlays and the detection boxes do">?</button>
         {% include "scanning/_viewer_help.html" %}
         {% endif %}
+       </div>
       </div>
       <div id="pdf-viewer"
            data-pdf-url="{% if step == 3 %}{% elif final_space %}{% url 'serve_final_pdf' scan.pk %}{% else %}{% url 'serve_scan_pdf' scan.pk %}{% endif %}"
@@ -559,6 +589,9 @@ var SCAN_CONFIG = {
     csrfToken: document.querySelector('[name=csrfmiddlewaretoken]').value,
     docId: {{ scan.pk }},
     step: {{ step }},
+    // The label the text card's "+ footnote" writes (#49x).
+    footnoteLabel: "{{ footnote_label }}",
+    footnoteLabelId: {{ footnote_label_id|default:"null" }},
     deletedPages: {{ deleted_pages_json|safe }},
     // The pages a curator moved (#261), keyed by page, with the original
     // page each one now follows (0 for before page 1).

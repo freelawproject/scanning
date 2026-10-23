@@ -5,8 +5,14 @@ env = environ.FileAwareEnv()
 # How often (in seconds) the daemon checks for queued scans.
 DAEMON_POLL_INTERVAL = env.int("DAEMON_POLL_INTERVAL", default=5)
 
-# How long (in seconds) before a PROCESSING scan is considered stale.
-DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=3600)
+# How long (in seconds) a PROCESSING scan may go without a heartbeat
+# before it is considered stale and re-queued. A running action stamps
+# ``processed_at`` every ``process_next_scan.HEARTBEAT_SECONDS`` (60),
+# so this covers a few missed beats and not the longest action (#503):
+# a scan whose worker was killed (a deploy past the grace period, an
+# OOM) comes back in ten minutes instead of an hour. It is also the
+# expiry of the scan task's message.
+DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=600)
 
 # How many times the daemon may re-queue a single scan after being killed or
 # timing out mid-pipeline before giving up and flagging it ERROR_INTERRUPTED.
@@ -42,6 +48,14 @@ DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
 # tick, is the throughput knob. About 300 opinions a volume at one per
 # 5 seconds is 25 minutes, in the background.
 DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
+
+# How often (in seconds) the daemon cuts the pictures of one opinion's
+# text from the original scan (#463). Few opinions print a picture, so
+# most ticks read one query and stop; the first cut of a volume pulls a
+# shard, inside the serial loop, the hazard of the PDF pass.
+DAEMON_OPINION_FIGURE_INTERVAL = env.int(
+    "DAEMON_OPINION_FIGURE_INTERVAL", default=10
+)
 
 # How often (in seconds) the daemon scores one volume with the bad-page
 # model (#436), and with how many worker processes. The tick blocks the

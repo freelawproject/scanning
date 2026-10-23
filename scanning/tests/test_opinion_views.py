@@ -7,6 +7,7 @@ pages keep their tests in ``test_views.py``, under their new names.
 
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.urls import reverse
 
 from scanning import stats
@@ -27,6 +28,7 @@ from scanning.models import (
     OpinionReviewStatus,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -192,6 +194,49 @@ class TestOpinionList(ScanningTestCase):
         row = response.context["page_obj"][0]
         self.assertEqual((row.open_findings, row.stale_findings), (0, 0))
 
+    def tag(self, status=OpinionReviewStatus.TEXT_REVIEW_DONE):
+        """Give the opinion an approved text and its spans."""
+        key = "processing/1/jobs/opinions/412.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=status,
+            approved_text_key=key,
+            tagged_text_key=key,
+            tag_key="processing/1/jobs/opinions/412.0/tag/spans.json",
+        )
+
+    def xml_url(self):
+        return reverse(
+            "opinion_final_xml",
+            kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+        )
+
+    def test_a_tagged_opinion_links_its_final_xml(self):
+        self.tag()
+
+        response = self.client.get(
+            reverse("opinion_list"),
+            {"status": OpinionReviewStatus.TEXT_REVIEW_DONE},
+        )
+
+        self.assertContains(response, self.xml_url())
+
+    def test_an_opinion_with_no_spans_links_no_final_xml(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
+    def test_a_reopened_opinion_links_no_final_xml(self):
+        """The rule of the review page's link: the text review is done."""
+        self.tag(status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
     def test_the_badge_costs_no_query_per_row(self):
         """The count is one grouped query, whatever the row count."""
         for index in range(4):
@@ -210,6 +255,95 @@ class TestOpinionList(ScanningTestCase):
                 index_in_page=0,
             )
         with self.assertNumQueries(7):
+            self.client.get(reverse("opinion_list"))
+
+    def pictured(self):
+        """A run, and the opinion over its pages 3 to 5 (indexes 2-4)."""
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            apply_run=run, start_page_index=2, end_page_index=4
+        )
+        return run
+
+    def test_the_pictures_column_counts_review_2s_image_boxes(self):
+        run = self.pictured()
+        for page in (2, 4):
+            model_row(
+                self.scan,
+                apply_run=run,
+                page_index=page,
+                label="IMAGE",
+                label_id=int(Label.IMAGE),
+            )
+        # Outside the span, another label, and a box the curator
+        # dismissed: none of them is a picture of this opinion.
+        model_row(
+            self.scan, apply_run=run, page_index=5, label="IMAGE", label_id=8
+        )
+        model_row(self.scan, apply_run=run, page_index=3)
+        model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            active=False,
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        row = response.context["page_obj"][0]
+        self.assertEqual(row.pictures, 2)
+        self.assertContains(response, ">Pictures</th>")
+
+    def test_a_junk_box_is_no_picture(self):
+        """The column counts the glue's pictures: a box the junk rule
+        drops from every screen is not one."""
+        run = self.pictured()
+        row = model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+        )
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_an_opinion_with_no_picture_shows_a_dash(self):
+        self.pictured()
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_the_pictures_cost_one_query_per_page(self):
+        run = self.pictured()
+        for index in range(4):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=500 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
+            self.client.get(reverse("opinion_list"))
+
+        for index in range(20):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=600 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
 
@@ -408,6 +542,18 @@ class TestOpinionReview(ScanningTestCase):
         self.assertEqual(response.context["open_to_check"], 2)
         self.assertEqual(response.context["open_warnings"], 1)
         self.assertContains(response, "Check these before the approval")
+        # The walk buttons count their cards through the cards
+        # endpoint: the numbers above are findings, and a page makes
+        # a card per open word or gap.
+        self.assertEqual(
+            response.context["cards_url"],
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+        self.assertContains(response, 'data-card-level="blocking"')
+        self.assertContains(response, 'data-card-level="warning"')
 
     def test_the_back_link_keeps_the_filters(self):
         response = self.client.get(self.url, {"scan": self.scan.pk})
@@ -716,12 +862,14 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "approved.json",
                 "tags.json",
                 "final.xml",
+                "exported.xml",
             ],
         )
         # The approved text and the tagger's spans over it are outside
         # the glue prefix (#272, #431), and blank before they exist; the
-        # final XML (#432) is built at each request and has no key.
-        for entry in body["files"][:-3]:
+        # final XML (#432) is built at each request and has no key, and
+        # its export (#408) is at a key of the two ids.
+        for entry in body["files"][:-4]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"

@@ -1125,7 +1125,9 @@ def _retry_or_fail(
 
 
 # ── creating the work ───────────────────────────────────────────────
-def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
+def _shard_specs(
+    scan, manifest: dict, identity_extra: dict | None = None
+) -> list[tuple[str, dict]]:
     """Describe the work today's shard set asks for, in page order.
 
     One ``(input_key, identity)`` pair per shard. The identity is what
@@ -1144,9 +1146,16 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     built from: that is what keeps two edits' shards apart when both
     hold one page of the same size.
 
+    ``identity_extra`` is what an engine adds about its own output
+    rather than about the shard: detection's ``label_set`` (#338),
+    which says that the result holds every class the adapter carries.
+    Two reads of one shard under different values are different work,
+    so the carry refuses a result read under another value.
+
     :param scan: The scan the shards belong to.
     :param manifest: The shard manifest from :mod:`scanning.sharding`,
         or the apply's (:func:`scanning.apply.shard_manifest`).
+    :param identity_extra: Fields to add to every shard's identity.
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
@@ -1166,21 +1175,29 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
         }
         if "edit_id" in entry:
             identity["edit_id"] = entry["edit_id"]
+        identity.update(identity_extra or {})
         specs.append(
             (entry.get("key") or f"{prefix}{entry['name']}", identity)
         )
     return specs
 
 
+#: Identity fields a row written before them may lack and still
+#: describe today's shard (:func:`_identity_matches`).
+LENIENT_IDENTITY_KEYS = ("size_bytes", "label_set")
+
+
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """Return whether a row's stored identity describes today's spec.
 
-    Exact equality, with one lenient case: a row written before
-    ``size_bytes`` joined the identity has every other field, and
-    demanding the missing field would read every pre-deploy run as
-    stale -- a re-queue would then re-pay work that is plainly the
-    same. The carry path (:func:`_reusable_results`) does **not** get
-    this leniency, because there the missing field is the proof.
+    Exact equality, with one lenient case: a row written before a field
+    of :data:`LENIENT_IDENTITY_KEYS` joined the identity has every other
+    field, and demanding the missing one would read every pre-deploy
+    run as stale -- a re-queue would then re-pay work that is plainly
+    the same, and a detection run read before ``label_set`` (#338)
+    would be re-paid by any tick that asks for it. The carry path
+    (:func:`_reusable_results`) does **not** get this leniency, because
+    there the missing field is the proof.
 
     :param stored: The row's ``input_manifest``.
     :param identity: Today's identity for the same shard position.
@@ -1189,7 +1206,13 @@ def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """
     if stored == identity:
         return True
-    legacy = {k: v for k, v in identity.items() if k != "size_bytes"}
+    if stored is None:
+        return False
+    legacy = {
+        k: v
+        for k, v in identity.items()
+        if k in stored or k not in LENIENT_IDENTITY_KEYS
+    }
     return stored == legacy
 
 
@@ -1599,6 +1622,46 @@ def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
     return int(run_ledger(rows, key).get("attempts") or 0)
 
 
+#: How many times a ``provider_meta`` swap is tried before it gives up.
+META_SWAP_ATTEMPTS = 5
+
+
+def swap_provider_meta(row: ExternalJob, mutate) -> dict:
+    """Change a row's ``provider_meta`` by compare-and-swap (#503).
+
+    The ledgers of the passes (the glue counters, the apply state, the
+    tagger's glue count) are keys of one JSON field, and a plain save
+    of the field writes over whatever another pass wrote beside the
+    key since the read. With the passes on several workers that is
+    live, so the write goes as ``UPDATE ... WHERE provider_meta = <what
+    was read>``, read again and tried again on a lost swap, and the
+    last try writes anyway, because a lost counter is better than a
+    pass that never records its failure.
+
+    :param row: The row; its ``provider_meta`` is refreshed in place.
+    :param mutate: ``mutate(meta) -> None``, applied to a copy of the
+        current dict.
+    :returns: The dict written.
+    :rtype: dict
+    """
+    for attempt in range(META_SWAP_ATTEMPTS):
+        current = (
+            ExternalJob.objects.filter(pk=row.pk)
+            .values_list("provider_meta", flat=True)
+            .first()
+        )
+        new = dict(current or {})
+        mutate(new)
+        last = attempt == META_SWAP_ATTEMPTS - 1
+        query = ExternalJob.objects.filter(pk=row.pk)
+        if not last:
+            query = query.filter(provider_meta=current)
+        if query.update(provider_meta=new):
+            row.provider_meta = new
+            return new
+    raise AssertionError("unreachable: the last try is unguarded")
+
+
 def bump_run_ledger(
     rows: list[ExternalJob], key: str, exc: Exception
 ) -> tuple[int, ExternalJob]:
@@ -1621,20 +1684,22 @@ def bump_run_ledger(
     :rtype: tuple[int, ExternalJob]
     """
     head = rows[0]
-    meta = dict(head.provider_meta or {})
-    state = dict(meta.get(key) or {})
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta[key] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
-    return attempts, head
+    written: dict = {}
+
+    def bump(meta: dict) -> None:
+        state = dict(meta.get(key) or {})
+        state.update(
+            {
+                "attempts": int(state.get("attempts") or 0) + 1,
+                "last_error": str(exc)[:500],
+                "last_attempt_at": timezone.now().isoformat(),
+            }
+        )
+        meta[key] = state
+        written.update(state)
+
+    swap_provider_meta(head, bump)
+    return int(written["attempts"]), head
 
 
 @dataclass
@@ -2217,6 +2282,7 @@ def ensure_shard_jobs(
     force_new_run: bool = False,
     carry_stable_holes: bool = True,
     apply_run=None,
+    identity_extra: dict | None = None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -2267,6 +2333,7 @@ def ensure_shard_jobs(
         scoped by it, and the run number still comes from the one
         sequence of :meth:`ExternalJob.next_run`, so the unique key
         holds unchanged.
+    :param identity_extra: See :func:`_shard_specs`.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -2287,7 +2354,7 @@ def ensure_shard_jobs(
     )
     return ensure_run_jobs(
         scan,
-        _shard_specs(scan, manifest),
+        _shard_specs(scan, manifest, identity_extra),
         stage=stage,
         engine=engine,
         provider=provider,
@@ -2981,8 +3048,15 @@ def _submit_runpod_engine_wave(
         setattr(summary, result, getattr(summary, result) + 1)
 
 
-def submit_pending(limit: int | None = None) -> SubmitSummary:
+def submit_pending(
+    limit: int | None = None, providers: tuple[str, ...] | None = None
+) -> SubmitSummary:
     """Submit one wave per provider and record what happened.
+
+    ``providers`` names the waves to run, in the table's order; ``None``
+    runs them all, the daemon's serial tick. A Celery tick task names
+    one (#503), so the doctor wave holding its sockets and the Mistral
+    wave rendering a shard each block only their own queue.
 
     Each provider counts its own in-flight rows against its own cap, so
     one saturated endpoint cannot starve another. Doctor's ceiling is
@@ -3003,18 +3077,23 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
+    :param providers: The ``JobProvider`` values whose waves run, or
+        ``None`` for every one.
     :returns: Counts of what the tick did, summed over the waves.
     :rtype: SubmitSummary
     """
     summary = SubmitSummary()
-    providers = _providers()
+    table = _providers()
+    if providers is None:
+        providers = tuple(table)
+    specs = {name: table[name] for name in providers}
     if not s3_sync.s3_active():
         # Every provider reads its input from the bucket -- through a
         # presigned GET, or downloaded by the daemon -- so without S3
         # the shards were never uploaded: every request would 404 and
         # burn a job's whole retry budget under a misleading code. Say
         # so once instead.
-        if any(spec.is_enabled() for spec in providers.values()):
+        if any(spec.is_enabled() for spec in specs.values()):
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -3026,7 +3105,7 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     # The table's insertion order is the wave order (see
     # ``_providers``): what a person waits behind goes first, and the
     # wave nothing waits behind goes last.
-    for spec in providers.values():
+    for spec in specs.values():
         if spec.is_enabled():
             spec.submit_wave(summary, limit)
     return summary

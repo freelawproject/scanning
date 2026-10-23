@@ -69,6 +69,23 @@
       for a confirm. The script sends the revisions of the text it
       drew, so the curator approves the text they saw.
     {% endcomment %}
+    {% comment %}
+      The two card walks of this opinion alone: the blocking review
+      and the warnings review, offered while a card of their kind is
+      open and the opinion is in the text review (blocking_walk_url).
+    {% endcomment %}
+    {% if open_to_check and blocking_walk_url %}
+    <a href="{{ blocking_walk_url }}" class="btn-outline text-sm" title="Walk the blocking cards of this opinion, one word at a time"
+       data-card-count-url="{{ cards_url }}" data-card-level="blocking">
+      <i class="fa-solid fa-layer-group"></i> Blocking cards (<span data-card-count>{{ open_to_check }}</span>)
+    </a>
+    {% endif %}
+    {% if open_warnings and warning_walk_url %}
+    <a href="{{ warning_walk_url }}" class="btn-outline text-sm" title="Walk the warning cards of this opinion, one word at a time"
+       data-card-count-url="{{ cards_url }}" data-card-level="warning">
+      <i class="fa-solid fa-layer-group"></i> Warning cards (<span data-card-count>{{ open_warnings }}</span>)
+    </a>
+    {% endif %}
     {% if can_approve %}
     <button type="button" id="approve-text" class="btn-primary text-sm"
             data-open-warnings="{{ open_warnings }}"
@@ -196,11 +213,13 @@
      class="opinion-review grid grid-cols-1 lg:grid-cols-2 gap-2 px-2 pb-4"
      data-pdf-url-endpoint="{{ pdf_url_endpoint }}"
      data-ensemble-url-endpoint="{{ ensemble_url_endpoint }}"
+     data-figure-url-endpoint="{{ figure_url_endpoint }}"
      data-rerun-url="{{ rerun_url }}"
      data-can-edit="{% if can_edit %}1{% endif %}"
      data-edit-text-url="{{ edit_text_url }}"
      data-edit-section-url="{{ edit_section_url }}"
      data-edit-blockquote-url="{{ edit_blockquote_url }}"
+     data-edit-drop-url="{{ edit_drop_url }}"
      data-edit-move-url="{{ edit_move_url }}"
      data-edit-withdraw-url="{{ edit_withdraw_url }}"
      data-approve-url="{{ approve_url }}"
