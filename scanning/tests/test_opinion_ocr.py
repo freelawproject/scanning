@@ -640,6 +640,22 @@ class TestTheVerdict(OpinionOcrTestCase):
                 [0, line[0] - height, 300, line[1] + 2 * height], [line]
             )
         )
+        # Holding half the line is not holding it: a body unit that
+        # clips the bottom of the head line and runs a line and a half
+        # below is the opinion's, and so is one under a two-line head
+        # that holds the second head line and two body lines.
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, line[0] + 0.5 * height, 300, line[1] + 1.5 * height],
+                [line],
+            )
+        )
+        two_lines = (line[0], line[1] + height)
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, line[1], 300, line[1] + 3 * height], [two_lines]
+            )
+        )
 
     def test_a_cover_that_is_partial_on_the_page_number_is_the_page_number(
         self,

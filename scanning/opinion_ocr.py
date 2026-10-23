@@ -275,6 +275,11 @@ HEAD_LINE_SHARE = 0.5
 #: number's box with air above it. A block an engine merged from the
 #: head into the body is far taller, and the other rules judge it.
 HEAD_LINE_MAX_SCALE = 2.0
+#: The share of a head line a unit must hold for that: the whole line,
+#: with a little tolerance for the engine's edge. Half of it is not
+#: holding it: a body unit that clips the bottom of the head line and
+#: runs a line below is the opinion's, and the other rules judge it.
+HEAD_LINE_HELD = 0.9
 
 #: The verdict of a unit where the detections drew nothing: the
 #: bleed-through of the page behind, which the engines read as words.
@@ -1606,9 +1611,9 @@ def on_head_line(
     """Return whether a unit lies on the running head's line.
 
     :data:`HEAD_LINE_SHARE` of the unit's height or more inside one of
-    the spans of :func:`head_lines`; or that share of the span inside
-    the unit, when the unit is no taller than :data:`HEAD_LINE_MAX_SCALE`
-    times the span.
+    the spans of :func:`head_lines`; or the span held whole
+    (:data:`HEAD_LINE_HELD` of it inside the unit), when the unit is no
+    taller than :data:`HEAD_LINE_MAX_SCALE` times the span.
 
     :param box_pt: The unit's box in points.
     :param spans: The page's head-line spans, or None.
@@ -1625,7 +1630,7 @@ def on_head_line(
         line = bottom - top
         if (
             line > 0
-            and overlap >= HEAD_LINE_SHARE * line
+            and overlap >= HEAD_LINE_HELD * line
             and height <= HEAD_LINE_MAX_SCALE * line
         ):
             return True
