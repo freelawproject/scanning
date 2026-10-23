@@ -462,6 +462,38 @@ class TestNudges(TestCase):
         self.assertEqual(merge.call_args.kwargs["queue"], tasks.QUEUE_HEAVY)
 
     @override_settings(CELERY_ENABLED=True)
+    def test_the_sweep_task_runs_every_sweep_and_sends_the_runpod_wave(self):
+        """The three sweeps of the submit tick (#250, #327, #500), and
+        one nudge, because every engine of theirs is on RunPod."""
+        with (
+            patch(
+                "scanning.yolo.enqueue_missing_runs", return_value=1
+            ) as yolo,
+            patch(
+                "scanning.dots_mocr.enqueue_missing_runs", return_value=0
+            ) as dots,
+            patch(
+                "scanning.surya.enqueue_missing_runs", return_value=1
+            ) as surya,
+            patch.object(tasks.submit_runpod, "apply_async") as send,
+        ):
+            self.assertEqual(tasks.enqueue_runs(), 2)
+        for sweep in (yolo, dots, surya):
+            sweep.assert_called_once()
+        send.assert_called_once()
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_sweep_task_that_started_nothing_sends_nothing(self):
+        with (
+            patch("scanning.yolo.enqueue_missing_runs", return_value=0),
+            patch("scanning.dots_mocr.enqueue_missing_runs", return_value=0),
+            patch("scanning.surya.enqueue_missing_runs", return_value=0),
+            patch.object(tasks.submit_runpod, "apply_async") as send,
+        ):
+            self.assertEqual(tasks.enqueue_runs(), 0)
+        send.assert_not_called()
+
+    @override_settings(CELERY_ENABLED=True)
     def test_a_nudge_sends_every_entry_of_the_task(self):
         """``cleanup_tmp`` has one entry per queue."""
         with (

@@ -22,13 +22,15 @@ downloads the shard from a presigned GET, renders each page at
 :data:`DPI`, reads it whole, and PUTs one JSON envelope to the key the
 claim signed.
 
-Who starts it: the staff-only button (``views_process.start_surya_ocr``,
-#364), and nothing else. No tick and no pipeline arm creates a Surya
-row, because every row is paid GPU work.
+Who starts it: the daemon's sweep (:func:`enqueue_missing_runs`,
+#500), once per shard set from the upload on, under the rule of the
+detection and dots.mocr sweeps. It replaced the staff button of #364.
+A dead run is re-run by the ``enqueue_surya_ocr`` command alone, never
+by a tick, because every row is paid GPU work.
 
 The glues are the three of #368, and they follow the Mistral stage
-(#245) rather than dots.mocr, because the read starts by hand and
-later than the review-1 approval:
+(#245) rather than dots.mocr, because the read is started outside the
+pipeline's arms and lands before the build or long after it:
 
 - the volume document (:func:`finish_ready_runs`), in the page space of
   the original;
@@ -165,10 +167,10 @@ def ensure_extract_jobs(
     """Return the live Surya jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
 
-    Idempotent, so a second press of the button is a no-op rather than
-    a second run over shards already read. A run holding a dead row
-    (failed, cancelled, expired) is replaced instead, since nothing will
-    move it again.
+    Idempotent, so a second sweep of the same shard set is a no-op
+    rather than a second run over shards already read. A run holding a
+    dead row (failed, cancelled, expired) is replaced instead, since
+    nothing will move it again.
 
     A replacement run does not re-read shards already read: a shard
     whose identity is unchanged and whose result object is still on S3
@@ -211,6 +213,68 @@ def ensure_extract_jobs(
         force_new_run=force_new_run,
         carry_stable_holes=False,
         apply_run=apply_run,
+    )
+
+
+#: ``scan pk -> (retry at, times refused)``: the scans whose shard set
+#: ``committed_manifest`` refused, left alone for
+#: ``jobs.REFUSAL_RETRY_SECONDS``. Tests clear it.
+_REFUSED: dict[int, tuple[float, int]] = {}
+
+
+def enqueue_missing_runs() -> int:
+    """Start the Surya read over every shard set that has no run yet
+    (issue #500).
+
+    The third sweep of the submit tick, after detection's (#250) and
+    dots.mocr's (#327), under their rule and over their statuses
+    (``yolo.SWEEP_STATUSES``, from the upload to the end of review 2):
+    a scan whose current shard set has no Surya volume row at all,
+    alive or dead, gets exactly one run, and a dead run under that
+    fingerprint is not re-run by a tick: ``SURYA_MAX_ATTEMPTS`` were
+    spent on a shard, and every attempt is paid. The
+    ``enqueue_surya_ocr`` command is that staff decision. This replaced
+    the staff button of #364, so a new upload, the backlog and a volume
+    uploaded while the endpoint id was blank all get their read with no
+    press.
+
+    The read starts at the upload, like the other two, because it is
+    over the original shards: a page a curator deletes in review 1 is
+    in the set either way (the run reads every page of the original,
+    and the pages a curator changes are paid again by
+    :func:`finish_ready_applies`), so no later start saves a page, and
+    an early one gives the page-number fill of #351 its Surya document
+    while review 1 is open. ``REDACTION_REVIEW_DONE`` is out with the
+    other two sweeps: its opinions are glued, and no pass glues them
+    again for a late read, so an approved volume with no run is read by
+    naming it to ``enqueue_surya_ocr`` and then running
+    ``reglue_opinion_ocr``. A volume a staff reopen puts back in review
+    2 is swept like any other, and the re-approval glues its opinions
+    again, so that read is used.
+
+    The pass renders nothing and calls no RunPod endpoint: it writes
+    rows, and the RunPod wave sends them, ``SURYA_MAX_CONCURRENCY`` in
+    flight at once. That cap bounds the volumes looked at per tick too,
+    as the other two sweeps use theirs. An environment that must not
+    spend leaves ``RUNPOD_SURYA_ENDPOINT_ID`` blank, and then this
+    starts nothing.
+
+    :returns: How many runs were started.
+    :rtype: int
+    """
+    from scanning import yolo
+
+    if not enabled() or not s3_sync.s3_active():
+        return 0
+    return jobs.enqueue_missing_runs(
+        stage=JobStage.EXTRACT,
+        engine=JobEngine.SURYA,
+        create=ensure_extract_jobs,
+        statuses=yolo.SWEEP_STATUSES,
+        cap=settings.SURYA_MAX_CONCURRENCY,
+        refused=_REFUSED,
+        label="Surya OCR run",
+        log=logger,
     )
 
 
@@ -631,8 +695,9 @@ def ensure_extract_apply_jobs(scan, run) -> list[ExternalJob]:
     (#224). This is where they are read.
 
     Created here rather than in ``apply._ensure_rows`` for the two
-    reasons of the Mistral twin (#245). The read starts long after the
-    build, so the build usually has no Surya run to join. And
+    reasons of the Mistral twin (#245). The read is started by the
+    sweep (#500), outside the build, so the build usually has no Surya
+    run to join. And
     ``_ensure_rows`` refuses the whole corrected volume when a stage it
     needs is off (``apply.GateClosedError``), which must never happen
     for a stage an environment may simply not pay for.
@@ -833,10 +898,10 @@ def finish_ready_applies() -> int:
     one-page rows if it has none, and writes the corrected volume's
     document once every row has answered.
 
-    **A volume nobody read with Surya pays nothing here.** The
-    candidate is the glued volume run, which only the staff button
-    starts (``views_process.start_surya_ocr``), so this pass creates a
-    paid row only for a volume somebody chose to read.
+    **A volume with no glued Surya run pays nothing here.** The
+    candidate is the glued volume run, which the sweep starts
+    (:func:`enqueue_missing_runs`, #500), so this pass reads the edited
+    pages of every volume the sweep read, and of no other.
 
     Not part of ``apply.glues_due`` on purpose (#245, #368). That
     trigger takes a scan in ``PAGE_COMPLETENESS_REVIEW_DONE`` alone,

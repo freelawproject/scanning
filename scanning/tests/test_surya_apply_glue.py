@@ -1,12 +1,12 @@
 """Tests for the Surya read of a corrected volume (issue #368).
 
 The twin of ``test_mistral_apply_glue``, because the stage is the twin:
-Surya joins a built apply run (#224) long after it was built, since the
-read starts by hand. So the rows of the edited pages are created by the
-collect pass rather than by the build, and the document is written
-outside ``apply.glues_due``. Under test:
+Surya joins a built apply run (#224) outside the build, since the read
+is started by the daemon's sweep (#500). So the rows of the edited
+pages are created by the collect pass rather than by the build, and
+the document is written outside ``apply.glues_due``. Under test:
 
-- a row is created only for a volume somebody chose to read
+- a row is created only for a volume whose Surya read is glued
 - the document is the corrected volume's page space: a deleted page is
   gone, an edited page comes from its own result
 - a run with no structural edit aliases the volume document

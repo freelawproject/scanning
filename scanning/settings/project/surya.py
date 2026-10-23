@@ -21,31 +21,28 @@ import environ
 
 env = environ.FileAwareEnv()
 
-# Master switch for **dispatching** Surya shards to RunPod.
+# Master switch for the Surya stage: whether the daemon's sweep creates
+# its rows and the wave dispatches them to RunPod.
 #
-# Read the verb carefully: this gates whether the daemon submits rows
-# that already exist. It does not create anything, and turning it on
-# starts no work on its own.
+# Since #500 the sweep (``surya.enqueue_missing_runs``) starts one run
+# per shard set by itself, from the upload on, so with this on and the
+# endpoint id below set, every volume up to the end of review 2 that
+# has no run is read, newest first, and every new upload after it. The
+# row creators are pinned by the AST test of ``TestKnownEnqueuePaths``
+# (the sweep, the corrected-volume pass and ``enqueue_surya_ocr``), so
+# a new caller is a deliberate change and never an accident.
 #
-# Nothing auto-creates a Surya row, and that is structural rather than
-# a promise: ``surya.ensure_extract_jobs`` is the only thing that
-# creates these rows, and ``views_process.start_surya_ocr`` -- the
-# staff-only button -- is its only caller. The AST test of
-# ``TestKnownEnqueuePaths`` holds that line, so a future daemon caller
-# has to update it deliberately rather than add one by accident.
-#
-# On by default, therefore, so a deploy needs no secret-store change to
-# make the button work. The cost stays deliberate because a person
-# still has to press it, and because the endpoint id below is blank
-# until an operator sets it.
+# On by default, so a deploy needs no secret-store change beyond the
+# endpoint id. An environment that must not spend leaves that id blank,
+# or sets this to false, and then the sweep starts nothing.
 SURYA_ENABLED = env.bool("SURYA_ENABLED", default=True)
 
 # The engine's own RunPod serverless endpoint id (from the RunPod
 # console). Per engine, not per account: each engine is a separate
 # endpoint on the shared key, with its own image, its own GPU class and
 # its own worker cap. Blank turns this engine off without touching the
-# others, which is what every environment holds until the endpoint of
-# #320 exists.
+# others, and is what an environment that must not pay for the read
+# holds.
 RUNPOD_SURYA_ENDPOINT_ID = env.str("RUNPOD_SURYA_ENDPOINT_ID", default="")
 
 # How many shards may be in flight at once, which is also how many rows

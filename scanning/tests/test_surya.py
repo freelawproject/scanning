@@ -10,7 +10,8 @@ here. What is tested here is what makes Surya its own engine:
 - rows at ``EXTRACT``/``SURYA`` that do not collide with Mistral's
 - a hole that is never carried, stable or not
 - a wave counted against this engine's own cap
-- the button that is the only thing which creates a row
+- the sweep that starts the read (#500), one run per shard set, and
+  the bar that shows the run and offers no button
 
 No HTTP and no S3: ``runpod_client`` and the S3 helpers are patched.
 """
@@ -375,10 +376,219 @@ class TestTheWave(ScanningTestCase):
         self.assertFalse(jobs.has_unread_pages(row))
 
 
-# ── the button ──────────────────────────────────────────────────────
+# ── the sweep that starts the read (#500) ──────────────────────────
 @override_settings(**SURYA)
-class TestStartSuryaOcr(ScanningTestCase):
-    """The only thing that creates a Surya row."""
+class TestEnqueueMissingRuns(ScanningTestCase):
+    """The daemon starts the Surya read (#500), under the rule of the
+    detection and dots.mocr sweeps: one run per shard set, ever. It
+    replaced the staff button of #364.
+    """
+
+    FINGERPRINT = "2048:20"
+
+    def setUp(self):
+        super().setUp()
+        self.manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        surya._REFUSED.clear()
+        self.addCleanup(surya._REFUSED.clear)
+
+    def _scan(
+        self,
+        status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW,
+        fingerprint=None,
+    ):
+        return ScanFactory(
+            page_count=20,
+            status=status,
+            source_fingerprint=(
+                self.FINGERPRINT if fingerprint is None else fingerprint
+            ),
+        )
+
+    def _sweep(self, s3=True, manifest=True, **overrides):
+        with (
+            override_settings(**overrides),
+            patch("scanning.s3_sync.s3_active", return_value=s3),
+            patch(
+                "scanning.sharding.committed_manifest",
+                return_value=(
+                    (self.manifest, "") if manifest else (None, "refused")
+                ),
+            ) as committed,
+            patch("scanning.runpod_client.submit_job") as submit,
+        ):
+            started = surya.enqueue_missing_runs()
+        self.committed = committed
+        self.submit = submit
+        return started
+
+    def test_a_volume_with_no_read_gets_one_run(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.surya", level="INFO") as logs:
+            self.assertEqual(self._sweep(), 1)
+        rows = surya_jobs(scan)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.status for r in rows}, {JobStatus.PENDING})
+        self.assertEqual({r.provider for r in rows}, {JobProvider.RUNPOD})
+        self.assertEqual(
+            {r.source_fingerprint for r in rows}, {self.FINGERPRINT}
+        )
+        self.assertIn("Started Surya OCR run 1", "".join(logs.output))
+
+    def test_the_sweep_calls_no_runpod_endpoint(self):
+        # Rows only: the wave claims, signs and submits.
+        self._scan()
+        self._sweep()
+        self.submit.assert_not_called()
+
+    def test_the_sweep_never_cuts_shards(self):
+        self._scan()
+        with patch("scanning.sharding.ensure_shards") as cut:
+            self._sweep()
+        cut.assert_not_called()
+
+    def test_a_shard_set_is_read_once(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(), 1)
+        first = [r.pk for r in surya_jobs(scan)]
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual([r.pk for r in surya_jobs(scan)], first)
+        self.committed.assert_not_called()
+
+    def test_a_dead_run_is_not_re_run_by_a_tick(self):
+        # Every attempt is paid: a dead run waits for a person
+        # (``enqueue_surya_ocr``).
+        scan = self._scan()
+        self._sweep()
+        ExternalJob.objects.filter(scan=scan).update(status=JobStatus.FAILED)
+        self.assertEqual(self._sweep(), 0)
+        self.assertEqual(
+            {r.status for r in surya_jobs(scan)}, {JobStatus.FAILED}
+        )
+
+    def test_a_re_cut_shard_set_gets_a_run(self):
+        scan = self._scan()
+        self._sweep()
+        ExternalJob.objects.filter(scan=scan).update(status=JobStatus.CONSUMED)
+        scan.source_fingerprint = "4096:20"
+        scan.save(update_fields=["source_fingerprint"])
+        self.manifest = make_manifest(shard_count=4, pages_per_shard=5)
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            self.assertEqual(self._sweep(), 1)
+        live = surya.live_extract_jobs(scan)
+        self.assertEqual(len(live), 4)
+        self.assertEqual({r.source_fingerprint for r in live}, {"4096:20"})
+
+    def test_an_apply_run_row_answers_for_no_shard_set(self):
+        # The one-page rows of a corrected volume are not a volume run.
+        from scanning.models import ApplyRun
+
+        scan = self._scan()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        jobs.ensure_shard_jobs(
+            scan,
+            make_manifest(shard_count=1, pages_per_shard=1),
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.SURYA,
+            provider=JobProvider.RUNPOD,
+            reuse_results=True,
+            apply_run=run,
+        )
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(len(surya.live_extract_jobs(scan)), 2)
+
+    def test_a_mistral_run_answers_for_no_surya_run(self):
+        # The same stage, another engine: ``engine`` is in the key.
+        scan = self._scan()
+        mistral_ocr.ensure_extract_jobs(scan, self.manifest)
+        self.assertEqual(self._sweep(), 1)
+        self.assertEqual(len(surya_jobs(scan)), 2)
+
+    def test_a_volume_without_a_shard_set_is_not_swept(self):
+        self._scan(fingerprint="")
+        self.assertEqual(self._sweep(), 0)
+        self.committed.assert_not_called()
+
+    def test_a_status_outside_the_sweep_is_left_alone(self):
+        # The detection sweep's rule (#250): the pipeline owns a QUEUED
+        # or PROCESSING scan and may re-cut its set; ERROR and every
+        # status past review 2 come back through the re-queue. An
+        # approved volume's opinions are glued, and no pass glues them
+        # again for a late read.
+        for status in (
+            Status.QUEUED,
+            Status.PROCESSING,
+            Status.REDACTION_REVIEW_DONE,
+            Status.ERROR,
+            Status.APPROVED,
+        ):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 0)
+                self.assertEqual(surya_jobs(scan), [])
+
+    def test_every_sweep_status_is_swept(self):
+        # From the upload to the end of review 2, the detection sweep's
+        # set: the read is over the original shards, which exist from
+        # the moment the pipeline cut them, and a page deleted in
+        # review 1 is in that set either way.
+        from scanning import yolo
+
+        for status in sorted(yolo.SWEEP_STATUSES):
+            with self.subTest(status=status):
+                scan = self._scan(status=status)
+                self.assertEqual(self._sweep(), 1)
+                self.assertEqual(len(surya_jobs(scan)), 2)
+
+    def test_no_endpoint_no_sweep(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(RUNPOD_SURYA_ENDPOINT_ID=""), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(surya_jobs(scan), [])
+
+    def test_the_stage_switch_off_no_sweep(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(SURYA_ENABLED=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(surya_jobs(scan), [])
+
+    def test_no_s3_no_sweep(self):
+        scan = self._scan()
+        self.assertEqual(self._sweep(s3=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(surya_jobs(scan), [])
+
+    def test_a_few_volumes_per_tick_newest_first(self):
+        scans = [self._scan() for _ in range(3)]
+        self.assertEqual(self._sweep(SURYA_MAX_CONCURRENCY=2), 2)
+        self.assertEqual(
+            [scan.pk for scan in scans if surya_jobs(scan)],
+            [scans[1].pk, scans[2].pk],
+        )
+        self.assertEqual(self._sweep(SURYA_MAX_CONCURRENCY=2), 1)
+        self.assertTrue(all(len(surya_jobs(scan)) == 2 for scan in scans))
+
+    def test_a_refused_shard_set_is_looked_at_once(self):
+        scan = self._scan()
+        with self.assertLogs("scanning.surya", level="INFO") as logs:
+            self.assertEqual(self._sweep(manifest=False), 0)
+        self.assertIn("refused", "".join(logs.output))
+        self.assertEqual(self._sweep(manifest=False), 0)
+        self.committed.assert_not_called()
+        self.assertEqual(surya_jobs(scan), [])
+
+    def test_the_sweep_writes_no_scan_status(self):
+        scan = self._scan(status=Status.READY_FOR_REDACTION_REVIEW)
+        self._sweep()
+        scan.refresh_from_db()
+        self.assertEqual(scan.status, Status.READY_FOR_REDACTION_REVIEW)
+
+
+# ── the step-1 bar (#500) ───────────────────────────────────────────
+@override_settings(**SURYA)
+class TestProcessBar(ScanningTestCase):
+    """The bar shows the Surya run and offers no button: the daemon
+    starts the read (#500)."""
 
     def setUp(self):
         super().setUp()
@@ -386,143 +596,47 @@ class TestStartSuryaOcr(ScanningTestCase):
         self.scan = ScanFactory(
             page_count=20, status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW
         )
-        self.url = reverse("start_surya_ocr", kwargs={"pk": self.scan.pk})
-        self.manifest = make_manifest(shard_count=2, pages_per_shard=10)
+        self.url = reverse("process_actions", kwargs={"pk": self.scan.pk})
 
-    _UNSET = object()
-
-    def _committed(self, manifest=_UNSET, reason=""):
-        return patch(
-            "scanning.sharding.committed_manifest",
-            return_value=(
-                self.manifest if manifest is self._UNSET else manifest,
-                reason,
-            ),
-        )
-
-    def _press(self, user=None):
+    def _bar(self, user=None):
         self.client.force_login(user or self.staff)
-        return self.client.post(self.url)
+        return self.client.get(f"{self.url}?step=1").json()["html"]
 
-    def _messages(self, response):
-        return [str(m) for m in response.wsgi_request._messages]
-
-    def test_staff_press_creates_one_row_per_shard(self):
-        with self._committed():
-            response = self._press()
-        self.assertRedirects(
-            response,
-            reverse("scan_process", kwargs={"pk": self.scan.pk}),
-            fetch_redirect_response=False,
+    def test_the_run_shows_on_the_bar(self):
+        surya.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=10)
         )
-        self.assertEqual(len(surya_jobs(self.scan)), 2)
-        self.assertIn("Queued Surya OCR", self._messages(response)[0])
+        self.assertIn("Surya OCR running", self._bar())
 
-    def test_the_request_never_calls_runpod(self):
-        with (
-            self._committed(),
-            patch("scanning.runpod_client.submit_job") as submit,
-        ):
-            self._press()
-        submit.assert_not_called()
-
-    def test_the_request_never_cuts_shards(self):
-        with (
-            self._committed(),
-            patch("scanning.sharding.ensure_shards") as cut,
-        ):
-            self._press()
-        cut.assert_not_called()
-
-    def test_a_non_staff_user_is_refused(self):
-        with self._committed():
-            response = self._press(self.make_user())
-        self.assertEqual(surya_jobs(self.scan), [])
-        self.assertIn("Only staff", self._messages(response)[0])
-
-    def test_an_anonymous_user_is_redirected_to_login(self):
-        response = self.client.post(self.url)
-        self.assertEqual(response.status_code, 302)
-        self.assertIn("/login", response["Location"])
-
-    def test_a_get_is_rejected(self):
-        self.client.force_login(self.staff)
-        self.assertEqual(self.client.get(self.url).status_code, 405)
-
-    def test_no_endpoint_is_refused(self):
-        with (
-            override_settings(RUNPOD_SURYA_ENDPOINT_ID=""),
-            self._committed(),
-        ):
-            response = self._press()
-        self.assertEqual(surya_jobs(self.scan), [])
-        self.assertIn("RUNPOD_SURYA_ENDPOINT_ID", self._messages(response)[0])
-
-    def test_a_manifest_with_no_shard_is_refused(self):
-        # ``ensure_extract_jobs`` then creates no row, and the "already
-        # read" line would address ``created[0]`` and raise.
-        empty = {**self.manifest, "shards": []}
-        with self._committed(manifest=empty):
-            response = self._press()
-        self.assertEqual(surya_jobs(self.scan), [])
-        self.assertIn("no part to read", self._messages(response)[-1])
-
-    def test_no_committed_shard_set_is_refused(self):
-        with self._committed(manifest=None, reason="no shard set"):
-            response = self._press()
-        self.assertEqual(surya_jobs(self.scan), [])
-        self.assertIn("no shard set", self._messages(response)[0])
-
-    def test_a_second_press_while_a_run_is_open_is_refused(self):
-        with self._committed():
-            self._press()
-            first = [r.pk for r in surya_jobs(self.scan)]
-            response = self._press()
-        self.assertEqual([r.pk for r in surya_jobs(self.scan)], first)
-        self.assertIn("already going", self._messages(response)[-1])
-
-    def test_a_press_after_a_finished_run_reuses_it(self):
-        with self._committed():
-            self._press()
-            rows = surya_jobs(self.scan)
-            ExternalJob.objects.filter(pk__in=[r.pk for r in rows]).update(
-                status=JobStatus.COMPLETED,
-                result_key="jobs/extract/surya/r1-s0-a1.json",
-            )
-            with (
-                patch("scanning.s3_sync.s3_active", return_value=True),
-                patch("scanning.s3_sync.object_exists", return_value=True),
-            ):
-                response = self._press()
-        self.assertEqual(len(surya_jobs(self.scan)), 2)
-        self.assertIn("already read", self._messages(response)[-1])
-
-    def test_the_bar_offers_the_button_to_staff(self):
-        # Beside the Mistral control on the step-1 bar, because both
-        # read the original shards.
-        url = reverse("process_actions", kwargs={"pk": self.scan.pk})
-        self.client.force_login(self.staff)
+    def test_staff_keeps_the_files_link(self):
+        surya.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=10)
+        )
         self.assertIn(
-            "Run Surya OCR",
-            self.client.get(f"{url}?step=1").json()["html"],
+            reverse(
+                "glued_output_index",
+                kwargs={"pk": self.scan.pk, "output": "surya"},
+            ),
+            self._bar(),
         )
 
-    def test_the_bar_offers_a_curator_no_button(self):
-        url = reverse("process_actions", kwargs={"pk": self.scan.pk})
-        self.client.force_login(self.make_user())
-        self.assertNotIn(
-            "Run Surya OCR",
-            self.client.get(f"{url}?step=1").json()["html"],
-        )
+    def test_nobody_is_offered_a_surya_button(self):
+        for user in (self.staff, self.make_user()):
+            with self.subTest(staff=user.is_staff):
+                html = self._bar(user)
+                self.assertNotIn("Run Surya OCR", html)
+                self.assertNotIn("Re-run Surya OCR", html)
+                self.assertNotIn("start-surya", html)
 
-    def test_the_run_shows_on_the_process_page(self):
-        with self._committed():
-            self._press()
-        self.client.force_login(self.staff)
-        response = self.client.get(
-            reverse("process_actions", kwargs={"pk": self.scan.pk})
-        )
-        self.assertIn("Surya OCR running", response.json()["html"])
+    def test_the_mistral_button_stays(self):
+        with override_settings(MISTRAL_API_KEY="key"):
+            self.assertIn("Run Mistral OCR", self._bar())
+
+    def test_the_route_is_gone(self):
+        from django.urls import NoReverseMatch
+
+        with self.assertRaises(NoReverseMatch):
+            reverse("start_surya_ocr", kwargs={"pk": self.scan.pk})
 
 
 # ── the files index ─────────────────────────────────────────────────
@@ -608,7 +722,9 @@ class TestTheFilesIndex(ScanningTestCase):
 
 # ── the shared control ──────────────────────────────────────────────
 class TestTheEngineControl(ScanningTestCase):
-    """The template both OCR buttons render from (#364)."""
+    """The template both OCR controls render from (#364). The Surya
+    control passes no ``start_url`` since #500, so the button under
+    test is the Mistral one."""
 
     def test_the_confirm_text_is_escaped_for_javascript(self):
         # The text lands inside a JavaScript string. HTML escaping is
@@ -622,9 +738,9 @@ class TestTheEngineControl(ScanningTestCase):
                 "scan": ScanFactory(),
                 "user": self.make_staff_user(),
                 "run": None,
-                "label": "Surya OCR",
-                "start_url": "start_surya_ocr",
-                "files_slug": "surya",
+                "label": "Mistral OCR",
+                "start_url": "start_mistral_ocr",
+                "files_slug": "mistral",
                 "title": "t",
                 "confirm": "Read Mistral's pages?",
             },
