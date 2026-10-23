@@ -427,6 +427,32 @@ class TestHeartbeat(TestCase):
         self.assertEqual(set(beats), {7})
         self.assertEqual(len(beats), count)
 
+    def _daemon_beats_under_an_action(self):
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        with (
+            patch.object(process_next_scan, "stamp_heartbeat", return_value=1),
+            patch.object(process_next_scan, "close_thread_connection"),
+            patch("scanning.daemon_heartbeat.beat") as beat,
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.05)
+        return beat
+
+    @override_settings(CELERY_ENABLED=False)
+    def test_a_serial_action_beats_for_the_daemon(self):
+        """The serial loop is held by the action, and still alive."""
+        beat = self._daemon_beats_under_an_action()
+        self.assertTrue(beat.called)
+        beat.assert_called_with("serial")
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_worker_action_never_beats_for_the_clock(self):
+        """A live worker must not hide a dead clock."""
+        self._daemon_beats_under_an_action().assert_not_called()
+
     def test_a_failed_beat_closes_its_connection_and_beats_again(self):
         """A dropped session would fail every later beat the same way."""
         import time

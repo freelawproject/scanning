@@ -214,6 +214,14 @@ class TestDaemonHeartbeatView(TestCase):
     def test_a_cache_fault_never_raises_from_the_beat(self):
         with (
             patch("scanning.daemon_heartbeat.cache.set", side_effect=OSError),
+            patch("scanning.daemon_heartbeat.connections.close_all") as close,
             self.assertLogs("scanning.daemon_heartbeat", level="WARNING"),
         ):
             daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
+        # A dropped session would fail every later beat the same way.
+        close.assert_called_once_with()
+
+    def test_a_good_beat_keeps_its_connection(self):
+        with patch("scanning.daemon_heartbeat.connections.close_all") as close:
+            daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
+        close.assert_not_called()

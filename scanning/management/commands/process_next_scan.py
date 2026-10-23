@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
@@ -258,6 +259,8 @@ def heartbeat(
     :param action: The action it was claimed for; see :func:`_claim_filter`.
     :return: A context manager.
     """
+    from scanning import daemon_heartbeat
+
     stop = threading.Event()
     period = HEARTBEAT_SECONDS if interval is None else interval
 
@@ -267,6 +270,10 @@ def heartbeat(
                 try:
                     if not stamp_heartbeat(scan_pk, action):
                         return
+                    if not settings.CELERY_ENABLED:
+                        # The serial loop is held by this action, and
+                        # the clock's beat follows the action's.
+                        daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
                 except Exception:
                     logger.warning(
                         "heartbeat of scan %s failed; next beat in %ss",
