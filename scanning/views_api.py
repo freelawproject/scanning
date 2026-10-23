@@ -404,13 +404,13 @@ EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
 )
 EDIT_QUOTE_TABLE_MESSAGE = "A table holds no blockquote."
-#: A picture of the text (#463) takes a move alone: it is a curated
-#: IMAGE box of review 2, so it has no text, it is no footnote and no
-#: quote, and it is not for review 3 to take out.
+#: A picture of the text (#463) takes a move and a section alone (#486):
+#: it is a curated IMAGE box of review 2, so it has no text and is no
+#: quote, and it is not for review 3 to take out; a footnote can hold it.
 EDIT_FIGURE_MESSAGE = (
-    "A picture takes no edit but a move (Move up or Move down). It is "
-    "an IMAGE box of the redaction review: dismiss it there and compute "
-    "again."
+    "A picture takes a move or a section alone (Move up, Move down, Put "
+    "in the footnotes or Put in the body text). It is an IMAGE box of the "
+    "redaction review: dismiss it there and compute again."
 )
 EDIT_QUOTE_NO_WORD_MESSAGE = (
     "Select at least one word of the block, then save."
@@ -1706,7 +1706,8 @@ def edit_opinion_section(
     """Put one block of an opinion in the body or in the footnotes (#376).
 
     Every block takes it, a unanimous one too: the edit moves the
-    block and not its words. A block put in the footnotes takes the
+    block and not its words. A picture takes it too (#486): a footnote
+    can hold one. A block put in the footnotes takes the
     body blocks below it too (#419): the ids are the ``below`` of the
     stamped document, ``ensemble.blocks_below``, and each block gets a
     ``SECTION`` edit of its own, so each has its own Undo. The body
@@ -1717,7 +1718,7 @@ def edit_opinion_section(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: ``{status, message}``; 404, 400 or 409 on a refusal.
     """
-    from scanning import ensemble, markup, opinion_edits
+    from scanning import ensemble, opinion_edits
     from scanning.models import OpinionEdit
 
     context = _edit_context(request, pk, opinion_pk)
@@ -1728,8 +1729,6 @@ def edit_opinion_section(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
-    if group.get("kind") == markup.FIGURE:
-        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     section = body.get("section")
     if section not in (ensemble.BODY, ensemble.FOOTNOTES):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)

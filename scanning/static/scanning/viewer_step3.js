@@ -2285,10 +2285,10 @@
         var same = sectionGroups(page, section);
         var place = same.indexOf(group);
         var orderEdit = (page.order_edits || {})[section];
-        // A picture takes a move alone (#463): it is an IMAGE box of the
-        // redaction review, so it has no text, it is no footnote and no
-        // quote, and it is not for this review to take out; the edit
-        // views refuse all four.
+        // A picture takes a move and a section alone (#463, #486): it
+        // is an IMAGE box of the redaction review, so it has no text and
+        // is no quote, and it is not for this review to take out; the
+        // three other edit views refuse it. A footnote can hold it.
         var figure = group.kind === 'figure';
 
         if (group.human) {
@@ -2334,9 +2334,6 @@
                 }
             ));
         }
-        if (figure) {
-            return;
-        }
         var other = section === FOOTNOTES ? BODY : FOOTNOTES;
         // The body blocks below this one go to the footnotes with it
         // (#419). The build names them (``ensemble.blocks_below``), and
@@ -2377,6 +2374,9 @@
                     withdrawEdit(group.section_edit, button);
                 }
             ));
+        }
+        if (figure) {
+            return;
         }
         quoteButtons(bar, page, group);
         bar.appendChild(dropButton(page, group));
