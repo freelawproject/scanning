@@ -3,7 +3,13 @@ from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 
-from scanning.monitoring import health_check, heartbeat, sentry_fail
+from scanning.monitoring import (
+    celery_queues,
+    celery_workers,
+    health_check,
+    heartbeat,
+    sentry_fail,
+)
 from scanning.views import (
     claim_scan,
     confirm_scan_upload,
@@ -652,6 +658,8 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("monitoring/heartbeat/", heartbeat, name="heartbeat"),
     path("monitoring/health-check/", health_check, name="health_check"),
+    path("monitoring/celery-queues/", celery_queues, name="celery_queues"),
+    path("monitoring/celery-workers/", celery_workers, name="celery_workers"),
     path("sentry/error/", sentry_fail, name="sentry_fail"),
 ]
 
