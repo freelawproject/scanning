@@ -1238,6 +1238,36 @@ class TestStartButton(ScanningTestCase):
         )
         self.assertIn("Mistral OCR running", response.json()["html"])
 
+    def test_a_failed_part_of_an_open_run_says_the_run_goes_on(self):
+        # One part failed while the other is still running (#534): the
+        # line says both, because the button stays hidden until the run
+        # ends, and "failed" alone read as a run with no way back.
+        with self._committed():
+            self._press()
+        failed, running = extract_jobs(self.scan)
+        ExternalJob.objects.filter(pk=failed.pk).update(
+            status=JobStatus.FAILED, error_code="LOST_CLAIM"
+        )
+        self.client.force_login(self.staff)
+        html = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn(
+            "Mistral OCR: 1 of 2 part(s) failed (LOST_CLAIM), 1 still "
+            "running; re-run once they end",
+            " ".join(html.split()),
+        )
+        self.assertNotIn("Re-run Mistral OCR", html)
+
+        ExternalJob.objects.filter(pk=running.pk).update(
+            status=JobStatus.CONSUMED
+        )
+        html = self.client.get(
+            reverse("process_actions", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("Mistral OCR failed on 1 of 2 part(s)", html)
+        self.assertIn("Re-run Mistral OCR", html)
+
     def test_the_bar_offers_the_button_to_staff(self):
         # Beside the dots.mocr control on the step-1 bar, because the
         # read is over the same shards that control reads.
