@@ -292,3 +292,53 @@ class TestBestEffort(SimpleTestCase):
         with patcher, self.assertLogs("scanning.mistral_client", "WARNING"):
             mistral_client.delete_file("file-1")
         sdk.files.delete.assert_called_once_with(file_id="file-1")
+
+
+@override_settings(**MISTRAL)
+class TestFindFiles(SimpleTestCase):
+    """The files a killed submit left are found by their names (#534)."""
+
+    def _file(self, file_id, filename):
+        return _sdk_object(id=file_id, filename=filename)
+
+    def test_only_names_under_the_prefix_are_kept(self):
+        # Mistral's search may match more loosely than a prefix; the
+        # check here keeps another attempt's file out of the delete.
+        patcher, sdk = _client()
+        sdk.files.list.return_value = _sdk_object(
+            data=[
+                self._file("f0", "scan7-job3-a1-p0.png"),
+                self._file("f1", "scan7-job3-a1-manifest.jsonl"),
+                self._file("x", "scan7-job3-a12-p0.png"),
+                self._file("y", "other-scan7-job3-a1-p0.png"),
+            ]
+        )
+        with patcher:
+            found = mistral_client.find_files("scan7-job3-a1-")
+        self.assertEqual(found, ["f0", "f1"])
+        sdk.files.list.assert_called_once_with(
+            page=0,
+            page_size=mistral_client.LIST_PAGE_SIZE,
+            search="scan7-job3-a1-",
+        )
+
+    def test_a_full_page_reads_the_next(self):
+        patcher, sdk = _client()
+        full = [
+            self._file(f"f{i}", f"p-{i}")
+            for i in range(mistral_client.LIST_PAGE_SIZE)
+        ]
+        sdk.files.list.side_effect = [
+            _sdk_object(data=full),
+            _sdk_object(data=[self._file("last", "p-last")]),
+        ]
+        with patcher:
+            found = mistral_client.find_files("p-")
+        self.assertEqual(len(found), mistral_client.LIST_PAGE_SIZE + 1)
+        self.assertEqual(sdk.files.list.call_args.kwargs["page"], 1)
+
+    def test_a_failure_finds_nothing_and_never_raises(self):
+        patcher, sdk = _client()
+        sdk.files.list.side_effect = _StatusError(500)
+        with patcher, self.assertLogs("scanning.mistral_client", "WARNING"):
+            self.assertEqual(mistral_client.find_files("scan7-"), [])
