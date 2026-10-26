@@ -64,6 +64,8 @@ from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import OperationalError
 
+from scanning import stopping
+
 logger = logging.getLogger(__name__)
 
 
@@ -226,6 +228,9 @@ class Command(BaseCommand):
         while not self.shutdown:
             now = time.monotonic()
             for task in schedule:
+                if self.shutdown:
+                    # The rest of the round would be killed half done.
+                    break
                 if not task.due(now):
                     continue
                 try:
@@ -250,10 +255,13 @@ class Command(BaseCommand):
     def _handle_signal(self, signum, frame):
         """Set the shutdown flag on receipt of a termination signal.
 
-        Also re-queues any PROCESSING scans so they retry on the next
-        daemon tick instead of waiting out ``DAEMON_PROCESSING_TIMEOUT``,
-        and reports the shutdown to Sentry to help diagnose unexpected
-        kills (deploys, OOM, container restarts).
+        Also asks the running pass to stop (``stopping.request``, #534):
+        the Mistral wave reads it between its uploads and hands its row
+        back before the grace period ends. Re-queues any PROCESSING
+        scans so they retry on the next daemon tick instead of waiting
+        out ``DAEMON_PROCESSING_TIMEOUT``, and reports the shutdown to
+        Sentry to help diagnose unexpected kills (deploys, OOM,
+        container restarts).
 
         :param signum: The signal number received.
         :param frame: The interrupted stack frame.
@@ -261,6 +269,7 @@ class Command(BaseCommand):
         """
         self.stdout.write(f"Received signal {signum}, shutting down...")
         self.shutdown = True
+        stopping.request()
 
         if getattr(self, "celery", False):
             # The workers hold the scans, and a worker's own shutdown
