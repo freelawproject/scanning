@@ -17,9 +17,11 @@ so the beat works in both modes. The two modes have two limits:
   for longer than any limit, so the action's own heartbeat thread
   (``process_next_scan.heartbeat``) stamps here too, with the switch
   off alone: with it on that thread runs in a worker, and a worker's
-  beat must never hide a dead clock. The limit is then
-  ``DAEMON_PROCESSING_TIMEOUT``, the rule the stale sweep reads off the
-  same thread; the other passes hold the loop for minutes at most.
+  beat must never hide a dead clock, and only for
+  ``DAEMON_MAX_ACTION_SECONDS``, so a hung action still goes stale. The
+  limit is then ``DAEMON_PROCESSING_TIMEOUT``, the rule the stale sweep
+  reads off the same thread; the other passes hold the loop for
+  minutes at most.
 """
 
 from __future__ import annotations

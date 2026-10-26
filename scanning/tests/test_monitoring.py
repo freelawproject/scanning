@@ -103,6 +103,8 @@ class TestHeartbeat(TestCase):
 @override_settings(CELERY_ENABLED=True)
 class TestCeleryWorkersView(TestCase):
     def setUp(self):
+        tasks.reset_broker_backoff()
+        self.addCleanup(tasks.reset_broker_backoff)
         self.redis = FakeRedis()
         patcher = _fake_pool(self.redis)
         patcher.start()
@@ -137,6 +139,17 @@ class TestCeleryWorkersView(TestCase):
         self.assertEqual(response.status_code, 500)
         self.assertIn("error", response.json())
 
+    def test_a_fault_holds_the_next_probes_off_the_broker(self):
+        with (
+            patch.object(app.pool, "acquire", side_effect=OSError("down")),
+            self.assertLogs("scanning.monitoring", level="WARNING"),
+        ):
+            self._get()
+        with patch.object(app.pool, "acquire") as acquire:
+            response = self._get()
+        self.assertEqual(response.status_code, 500)
+        acquire.assert_not_called()
+
     @override_settings(CELERY_ENABLED=False)
     def test_the_switch_off_expects_no_worker(self):
         response = self._get()
@@ -162,6 +175,19 @@ class TestCeleryQueuesView(TestCase):
             response = self.client.get(reverse("celery_queues"))
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json(), dict.fromkeys(tasks.QUEUES, None))
+
+    def test_the_first_unknown_depth_ends_the_reads(self):
+        with patch("scanning.tasks.queue_depth", return_value=None) as depth:
+            self.client.get(reverse("celery_queues"))
+        depth.assert_called_once_with(tasks.QUEUES[0])
+
+    def test_inside_the_backoff_no_depth_is_read(self):
+        tasks._broker_failed()
+        with patch("scanning.tasks.queue_depth") as depth:
+            response = self.client.get(reverse("celery_queues"))
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.json(), dict.fromkeys(tasks.QUEUES, None))
+        depth.assert_not_called()
 
     @override_settings(CELERY_ENABLED=False)
     def test_the_switch_off_reads_no_broker(self):

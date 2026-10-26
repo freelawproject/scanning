@@ -1,3 +1,4 @@
+import logging
 import time
 from http import HTTPStatus
 from typing import NoReturn
@@ -8,6 +9,8 @@ from django.http import HttpRequest, HttpResponse, JsonResponse
 
 from scanning import daemon_heartbeat, tasks, worker_heartbeat
 from scanning.celery_init import app
+
+logger = logging.getLogger(__name__)
 
 
 def check_postgresql() -> bool:
@@ -59,8 +62,11 @@ def celery_queues(request: HttpRequest) -> JsonResponse:
     CourtListener's ``/monitoring/celery-queues/``: a flat
     ``{queue: depth}`` for an uptime monitor to alert on, one ``LLEN``
     per queue of ``tasks.QUEUES``. A depth the broker could not give is
-    ``null`` and the answer a 500. With ``CELERY_ENABLED`` off nothing
-    is sent to a queue, so the answer is an empty 200.
+    ``null`` and the answer a 500. The first unknown depth ends the
+    reads, and inside ``tasks.BROKER_BACKOFF_SECONDS`` after a broker
+    fault none is made, so a hung broker costs a probe one timeout at
+    most, as it costs a view's send. With ``CELERY_ENABLED`` off
+    nothing is sent to a queue, so the answer is an empty 200.
 
     :param request: The incoming HTTP request.
     :type request: HttpRequest
@@ -69,7 +75,12 @@ def celery_queues(request: HttpRequest) -> JsonResponse:
     """
     if not settings.CELERY_ENABLED:
         return JsonResponse({})
-    depths = {queue: tasks.queue_depth(queue) for queue in tasks.QUEUES}
+    depths = dict.fromkeys(tasks.QUEUES)
+    if tasks._broker_ok():
+        for queue in tasks.QUEUES:
+            depths[queue] = tasks.queue_depth(queue)
+            if depths[queue] is None:
+                break
     status = HTTPStatus.OK
     if any(depth is None for depth in depths.values()):
         status = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -83,7 +94,8 @@ def celery_workers(request: HttpRequest) -> JsonResponse:
     (``scanning.worker_heartbeat``), so a request broadcasts nothing.
     A queue of ``tasks.QUEUES`` that no live worker consumes is in
     ``missing`` and the answer a 500, as is a broker that cannot be
-    read. With ``CELERY_ENABLED`` off no worker is expected: 200.
+    read or faulted inside ``tasks.BROKER_BACKOFF_SECONDS``. With
+    ``CELERY_ENABLED`` off no worker is expected: 200.
 
     :param request: The incoming HTTP request.
     :type request: HttpRequest
@@ -93,10 +105,15 @@ def celery_workers(request: HttpRequest) -> JsonResponse:
     """
     if not settings.CELERY_ENABLED:
         return JsonResponse({"celery_enabled": False})
-    try:
-        workers = worker_heartbeat.live_workers(app)
-    except Exception:
-        workers = None
+    workers = None
+    if tasks._broker_ok():
+        try:
+            workers = worker_heartbeat.live_workers(app)
+        except Exception:
+            tasks._broker_failed()
+            logger.warning(
+                "could not read the worker heartbeats", exc_info=True
+            )
     if workers is None:
         return JsonResponse(
             {"celery_enabled": True, "error": "the broker could not be read"},
