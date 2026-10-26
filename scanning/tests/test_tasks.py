@@ -255,6 +255,25 @@ class TestLocks(TransactionTestCase):
                 [locks.NAMESPACE, locks.key("spec")],
             )
 
+    def test_is_held_reads_the_lock_without_taking_it(self):
+        """The Mistral sweep asks whether a wave is alive (#534)."""
+        other = connections.create_connection("default")
+        self.addCleanup(other.close)
+        self.assertFalse(locks.is_held("alive"))
+        with other.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_lock(%s, %s)",
+                [locks.NAMESPACE, locks.key("alive")],
+            )
+        self.assertTrue(locks.is_held("alive"))
+        self.assertFalse(locks.is_held("another"))
+        with other.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_unlock(%s, %s)",
+                [locks.NAMESPACE, locks.key("alive")],
+            )
+        self.assertFalse(locks.is_held("alive"))
+
     def test_a_locked_tick_skips_its_turn_while_another_holds_the_lock(self):
         other = connections.create_connection("default")
         self.addCleanup(other.close)
