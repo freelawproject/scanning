@@ -167,6 +167,13 @@ MAX_SUBMITS_PER_TICK = 1
 #: vanished. A clock cannot tell a slow render from a dead one.
 SUBMIT_LOCK = "mistral_submit"
 
+#: For the release that ships #534 alone: a wave of a pod still on the
+#: code before it takes no :data:`SUBMIT_LOCK`, so during a rolling
+#: deploy a claim younger than this with no lock held is read as alive,
+#: the clock the sweep used before. Delete it, and its branch in
+#: :func:`_claim_alive`, once that release has fully rolled out.
+LEGACY_CLAIM_GRACE = timedelta(minutes=30)
+
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
 #: uploads the shard's pages again.
@@ -737,7 +744,7 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     :return: None.
     """
     if not job.external_id:
-        if _claim_alive(job):
+        if _claim_alive(job, now):
             # A wave is rendering this shard now; the id lands when
             # the batch is created.
             summary.pending += 1
@@ -785,20 +792,25 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     )
 
 
-def _claim_alive(job: ExternalJob) -> bool:
+def _claim_alive(job: ExternalJob, now) -> bool:
     """Return whether a wave is still submitting this claimed row.
 
     Alive while a session holds :data:`SUBMIT_LOCK` and the row is the
     newest claim with no batch id: one wave runs at a time and claims
     its rows at one instant, so an older row with no id is a claim a
-    killed worker left behind, whoever holds the lock now.
+    killed worker left behind, whoever holds the lock now. With no lock
+    held, a claim inside :data:`LEGACY_CLAIM_GRACE` is alive too, for a
+    pod on the code before the lock.
 
     :param job: A SUBMITTED row with no ``external_id``.
+    :param now: Comparison time.
     :returns: Whether to keep waiting for its batch id.
     :rtype: bool
     """
-    if job.submitted_at is None or not locks.is_held(SUBMIT_LOCK):
+    if job.submitted_at is None:
         return False
+    if not locks.is_held(SUBMIT_LOCK):
+        return (now - job.submitted_at) < LEGACY_CLAIM_GRACE
     newest = ExternalJob.objects.filter(
         provider=JobProvider.MISTRAL,
         stage=JobStage.EXTRACT,

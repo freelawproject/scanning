@@ -1044,11 +1044,14 @@ class TestSweep(ScanningTestCase):
         mocks["find"].assert_not_called()
 
     def test_a_claim_with_no_lock_held_is_lost_and_its_files_deleted(self):
-        # No session holds the lock: the worker died with the claim,
-        # at once and not after a clock. The files it uploaded are
-        # found by their names and deleted before the retry.
+        # No session holds the lock: the worker died with the claim.
+        # The files it uploaded are found by their names and deleted
+        # before the retry.
         self._lose_the_id()
-        summary, mocks = self._sweep_lost(found=["f0", "f1"])
+        summary, mocks = self._sweep_lost(
+            found=["f0", "f1"],
+            now=self.job.submitted_at + mistral_ocr.LEGACY_CLAIM_GRACE,
+        )
         self.assertEqual(summary.retried, 1)
         self.assertEqual(self.job.status, JobStatus.PENDING)
         self.assertEqual(self.job.attempt, 2)
@@ -1059,6 +1062,20 @@ class TestSweep(ScanningTestCase):
         )
         deleted = [c.args[0] for c in mocks["delete"].call_args_list]
         self.assertEqual(deleted, ["f0", "f1"])
+
+    def test_a_young_claim_with_no_lock_held_waits_for_one_release(self):
+        # A pod on the code before the lock submits without it, so
+        # during the rollout a young claim with no lock is alive.
+        self._lose_the_id()
+        summary, mocks = self._sweep_lost(
+            now=self.job.submitted_at
+            + mistral_ocr.LEGACY_CLAIM_GRACE
+            - timedelta(seconds=1)
+        )
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        mocks["find"].assert_not_called()
 
     def test_an_older_claim_under_a_held_lock_is_lost(self):
         # The lock is held by a wave rendering a newer claim: this one
@@ -1082,7 +1099,7 @@ class TestSweep(ScanningTestCase):
         # read the row: the row is read again, and its paid batch kept.
         self._lose_the_id()
 
-        def written_meanwhile(job):
+        def written_meanwhile(job, now):
             ExternalJob.objects.filter(pk=job.pk).update(external_id="batch-2")
             return False
 
