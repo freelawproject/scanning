@@ -127,3 +127,27 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
                 cursor.execute(
                     "SELECT pg_advisory_unlock(%s, %s)", [NAMESPACE, key(name)]
                 )
+
+
+def is_held(name: str) -> bool:
+    """Return whether any session holds the named lock now (#534).
+
+    Read from ``pg_locks`` and never by taking the lock, so the reader
+    never makes a holder's next tick skip. A holder whose client died
+    stops holding once the server reaps its session (:data:`KEEPALIVE`),
+    which is what lets a caller read this as "the holder is alive".
+
+    :param name: The lock's name.
+    :returns: Whether a session of this database holds it.
+    :rtype: bool
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks"
+            " WHERE locktype = 'advisory' AND granted"
+            " AND database = (SELECT oid FROM pg_database"
+            " WHERE datname = current_database())"
+            " AND classid = %s AND objid = %s AND objsubid = 2)",
+            [NAMESPACE, key(name)],
+        )
+        return bool(cursor.fetchone()[0])

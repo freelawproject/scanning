@@ -393,3 +393,45 @@ def delete_file(file_id: str) -> None:
         _call(client().files.delete, file_id=file_id)
     except MistralError as exc:
         logger.warning("could not delete Mistral file %s: %s", file_id, exc)
+
+
+#: Files asked for per page of a listing, and the most pages read. A
+#: shard is about a hundred pages plus its manifest, so two pages hold
+#: one attempt's files; the ceiling only bounds a search that matched
+#: more than it should.
+LIST_PAGE_SIZE = 100
+LIST_MAX_PAGES = 10
+
+
+def find_files(prefix: str) -> list[str]:
+    """Return the ids of the files whose name starts with ``prefix``.
+
+    For the files a killed submit uploaded and never named on its row
+    (#534). Mistral's ``search`` narrows the listing, and the prefix is
+    checked here again, so a looser match at Mistral deletes nothing it
+    should not. Best effort, never raises.
+
+    :param prefix: The start of the file names.
+    :returns: The ids found, possibly none.
+    :rtype: list[str]
+    """
+    found: list[str] = []
+    try:
+        for page in range(LIST_MAX_PAGES):
+            listing = _call(
+                client().files.list,
+                page=page,
+                page_size=LIST_PAGE_SIZE,
+                search=prefix,
+            )
+            data = list(listing.data or [])
+            found.extend(
+                str(item.id)
+                for item in data
+                if str(item.filename or "").startswith(prefix)
+            )
+            if len(data) < LIST_PAGE_SIZE:
+                break
+    except MistralError as exc:
+        logger.warning("could not list Mistral files %s*: %s", prefix, exc)
+    return found

@@ -95,10 +95,19 @@ from pathlib import Path
 import fitz
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
+from django.db.models import Max
 from django.utils import timezone
 from PIL import Image
 
-from scanning import dots_mocr, jobs, mistral_client, perpendiculars, s3_sync
+from scanning import (
+    dots_mocr,
+    jobs,
+    locks,
+    mistral_client,
+    perpendiculars,
+    s3_sync,
+    stopping,
+)
 from scanning.models import (
     ExternalJob,
     JobEngine,
@@ -151,11 +160,19 @@ MAX_CONCURRENCY = 16
 #: its geometry), waits for a measurement on a real volume.
 MAX_SUBMITS_PER_TICK = 1
 
-#: How long a claimed row may go without a batch id before the sweep
-#: calls the claim lost (#503): the render and the uploads of the
-#: largest shard, with room. Under the serial daemon the sweep never
-#: ran during a wave, so the answer used to be "at once".
-LOST_CLAIM_AFTER = timedelta(minutes=30)
+#: The lock the wave holds from its claim to the write of the batch id
+#: (#534), in both modes. A claimed row with no batch id is alive while
+#: a session holds it, and lost once none does: a killed holder's
+#: session ends with it, or within ``locks.KEEPALIVE`` when its node
+#: vanished. A clock cannot tell a slow render from a dead one.
+SUBMIT_LOCK = "mistral_submit"
+
+#: For the release that ships #534 alone: a wave of a pod still on the
+#: code before it takes no :data:`SUBMIT_LOCK`, so during a rolling
+#: deploy a claim younger than this with no lock held is read as alive,
+#: the clock the sweep used before. Delete it, and its branch in
+#: :func:`_claim_alive`, once that release has fully rolled out.
+LEGACY_CLAIM_GRACE = timedelta(minutes=30)
 
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
@@ -194,6 +211,13 @@ MANIFEST_FILE_PURPOSE = "batch"
 #: orphans it, and ``cleanup_processing_tmp`` reclaims it by this prefix
 #: (#215), as it does the other stages' scratch dirs.
 RENDER_TMP_PREFIX = "mistralocr-"
+
+#: Why a row went back to PENDING when its worker was told to stop.
+STOPPED_ERROR_CODE = "SHUTDOWN"
+
+
+class SubmitStopped(Exception):
+    """The worker was told to stop while it uploaded a shard (#534)."""
 
 
 # ── switches and rows ───────────────────────────────────────────────
@@ -285,6 +309,21 @@ def custom_id(page_no: int) -> str:
     :rtype: str
     """
     return f"p{page_no}"
+
+
+def file_prefix(job: ExternalJob) -> str:
+    """Return the start of the name of every file one attempt uploads.
+
+    The scan, the row and the attempt, so the files a killed submit
+    left at Mistral can be found by name and deleted (#534): its row
+    never named them. A page is ``{prefix}p{n}.png`` and the manifest
+    ``{prefix}manifest.jsonl``.
+
+    :param job: The claimed row.
+    :returns: ``"scan{scan}-job{pk}-a{attempt}-"``.
+    :rtype: str
+    """
+    return f"scan{job.scan_id}-job{job.pk}-a{job.attempt}-"
 
 
 def page_no_of(line_id) -> int | None:
@@ -449,6 +488,12 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     them: a failed create left no job, and a lost create left a job
     nothing we hold names.
 
+    A stop request (``stopping.requested``) is read before every upload
+    and before the create (#534): a whole shard is minutes of uploads,
+    longer than a pod's grace period, and a kill in the middle leaves
+    unredacted pages at Mistral. The files go and :class:`SubmitStopped`
+    hands the row back.
+
     :param job: The claimed row.
     :returns: The submission.
     :raises Exception: Whatever the download, the render or the API
@@ -456,6 +501,7 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     """
     started = time.monotonic()
     model = model_for(job)
+    prefix = file_prefix(job)
     files: list[str] = []
     try:
         # Named after the scan and the shard, as the other stages name
@@ -471,21 +517,20 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
             for page_no, png in render_shard_pages(
                 pdf_path, whiteout=bool(settings.PERPENDICULARS_WHITEOUT)
             ):
+                _stop_if_asked()
                 file_id = mistral_client.upload_file(
-                    f"{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
+                    f"{prefix}{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
                 )
                 files.append(file_id)
                 lines.append(_manifest_line(page_no, file_id, model))
-        manifest_name = (
-            f"scan{job.scan_id}-r{job.run}-s{job.shard_index}"
-            f"-a{job.attempt}.jsonl"
-        )
+        _stop_if_asked()
         manifest_id = mistral_client.upload_file(
-            manifest_name,
+            f"{prefix}manifest.jsonl",
             "\n".join(lines).encode("utf-8"),
             MANIFEST_FILE_PURPOSE,
         )
         files.append(manifest_id)
+        _stop_if_asked()
         job_id = mistral_client.create_batch(
             manifest_id,
             metadata={
@@ -504,6 +549,16 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
         page_count=len(lines),
         duration_ms=int((time.monotonic() - started) * 1000),
     )
+
+
+def _stop_if_asked() -> None:
+    """Raise :class:`SubmitStopped` when the worker is shutting down.
+
+    :return: None.
+    :raises SubmitStopped: If a stop was asked for.
+    """
+    if stopping.requested():
+        raise SubmitStopped("the worker is shutting down")
 
 
 def _apply_outcome(
@@ -526,6 +581,9 @@ def _apply_outcome(
       find, so waiting on it would wait on nothing.
     - **Refused for good.** A 4xx from Mistral, or a shard that will
       not render: the row is failed.
+    - **Stopped** (#534). The worker is shutting down and deleted what
+      it uploaded: the row goes back to PENDING with its attempt intact,
+      because nothing was wrong with it.
 
     :param job: The SUBMITTED row.
     :param exc: The exception raised by the thread, if any.
@@ -570,6 +628,8 @@ def _apply_outcome(
         )
         return "submitted"
 
+    if isinstance(exc, SubmitStopped):
+        return jobs._defer(job, STOPPED_ERROR_CODE, str(exc), now)
     if isinstance(exc, mistral_client.MistralBusy):
         return jobs._defer(job, exc.error_code, str(exc), now)
     if isinstance(exc, mistral_client.MistralTransientError):
@@ -606,9 +666,26 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     wait for hours; the second keeps every other daemon task waiting
     for one shard at most.
 
+    The wave holds :data:`SUBMIT_LOCK` from before its claim until the
+    batch id is written (#534), so the sweep can tell a shard still
+    rendering from one whose worker died; a second wave that finds it
+    held claims nothing.
+
     :param summary: Counts to update.
     :param limit: In-flight override; defaults to
         :data:`MAX_CONCURRENCY`. The per-tick cap is not overridden.
+    :return: None.
+    """
+    with locks.held(SUBMIT_LOCK) as got:
+        if got:
+            _submit_locked(summary, limit)
+
+
+def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
+    """The body of :func:`submit_wave`, under :data:`SUBMIT_LOCK`.
+
+    :param summary: Counts to update.
+    :param limit: In-flight override.
     :return: None.
     """
     claimed = jobs.claim_for_wave(
@@ -652,12 +729,11 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     """Poll one batch and apply what it said.
 
     The provider table's ``sweep_job`` for Mistral. A row with no
-    ``external_id`` is a claim the wave lost mid-submission, or a shard
-    the wave is still rendering on another worker (#503): the two are
-    told apart by the clock alone, :data:`LOST_CLAIM_AFTER` since the
-    claim, because the sweep and the wave no longer share one serial
-    scheduler. Past it, the row is retried rather than waited on for a
-    day.
+    ``external_id`` is a shard a wave is still rendering, or a claim
+    whose worker died (#503, #534). :func:`_claim_alive` tells the two
+    apart by the wave's lock and never by a clock; a lost claim's files
+    are found by name and deleted (:func:`discard_lost_files`), and the
+    row is retried rather than waited on for a day.
 
     A row polled inside :data:`POLL_INTERVAL` is left alone, and its
     deadline is judged all the same.
@@ -668,12 +744,25 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     :return: None.
     """
     if not job.external_id:
-        if job.submitted_at and (now - job.submitted_at) < LOST_CLAIM_AFTER:
-            # The wave may still be rendering this shard on another
-            # worker (#503): the sweep and the wave are no longer one
-            # serial scheduler. The id lands when the batch is created.
+        if _claim_alive(job, now):
+            # A wave is rendering this shard now; the id lands when
+            # the batch is created.
             summary.pending += 1
             return
+        # The holder writes the id before it lets the lock go, so a
+        # row read before that write is read again once the lock is
+        # free: a retry of it would orphan a paid batch.
+        fresh = (
+            ExternalJob.objects.filter(pk=job.pk)
+            .values_list("status", "external_id")
+            .first()
+        )
+        if fresh is None or fresh[0] != job.status:
+            return
+        if fresh[1]:
+            summary.pending += 1
+            return
+        discard_lost_files(job)
         jobs.count_sweep_outcome(
             summary,
             jobs._retry_or_fail(
@@ -701,6 +790,60 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
         on_complete=_harvest_outcome,
         on_progress=_record_progress,
     )
+
+
+def _claim_alive(job: ExternalJob, now) -> bool:
+    """Return whether a wave is still submitting this claimed row.
+
+    Alive while a session holds :data:`SUBMIT_LOCK` and the row is the
+    newest claim with no batch id: one wave runs at a time and claims
+    its rows at one instant, so an older row with no id is a claim a
+    killed worker left behind, whoever holds the lock now. With no lock
+    held, a claim inside :data:`LEGACY_CLAIM_GRACE` is alive too, for a
+    pod on the code before the lock.
+
+    :param job: A SUBMITTED row with no ``external_id``.
+    :param now: Comparison time.
+    :returns: Whether to keep waiting for its batch id.
+    :rtype: bool
+    """
+    if job.submitted_at is None:
+        return False
+    if not locks.is_held(SUBMIT_LOCK):
+        return (now - job.submitted_at) < LEGACY_CLAIM_GRACE
+    newest = ExternalJob.objects.filter(
+        provider=JobProvider.MISTRAL,
+        stage=JobStage.EXTRACT,
+        engine=JobEngine.MISTRAL_OCR,
+        status=job.status,
+        external_id="",
+    ).aggregate(newest=Max("submitted_at"))["newest"]
+    return newest is None or job.submitted_at >= newest
+
+
+def discard_lost_files(job: ExternalJob) -> int:
+    """Delete the files a lost claim uploaded, found by their names.
+
+    A worker killed mid-shard never wrote its file ids anywhere, and
+    the pages are unredacted, so they are found at Mistral by
+    :func:`file_prefix` (#534). Best effort, never raises.
+
+    :param job: The lost claim, before its attempt is raised.
+    :returns: How many files were found.
+    :rtype: int
+    """
+    found = mistral_client.find_files(file_prefix(job))
+    if found:
+        logger.warning(
+            "job %s (scan %s shard %s): deleting %d file(s) a lost claim "
+            "left at Mistral",
+            job.pk,
+            job.scan_id,
+            job.shard_index,
+            len(found),
+        )
+    _delete_files(found)
+    return len(found)
 
 
 def _poll_due(job: ExternalJob, now) -> bool:
