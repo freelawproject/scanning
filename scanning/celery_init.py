@@ -14,11 +14,14 @@ stay, and the workers are the only new deployments.
 
 The queues (``scanning.tasks``):
 
-- ``fast``: polls, glues, promotions, the RunPod waves. Seconds.
+- ``fast``: polls, the RunPod waves, the sweeps. Seconds, and never
+  a whole volume in memory.
 - ``io``: the doctor wave, which holds a socket per conversion.
 - ``heavy``: the scan actions (shard, apply, compute, create opinions),
-  the Mistral render and the bad-page score. Minutes, and the only
-  queue that scales by replica count.
+  the volume glues and the promotions (``glue_runs``, which holds a
+  volume's shard results in memory), the Mistral render and the
+  bad-page score. Minutes, and the only queue that scales by replica
+  count.
 - ``opinions``: the opinion OCR glue, the ensemble, the PDFs and the
   figure cuts, which share the local mirror of a volume and so run on
   one pod.

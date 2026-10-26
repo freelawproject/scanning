@@ -382,7 +382,7 @@ def merge_conversions() -> int:
     return finished
 
 
-@app.task(name="scanning.tasks.glue_runs", queue=QUEUE_FAST)
+@app.task(name="scanning.tasks.glue_runs", queue=QUEUE_HEAVY)
 @locked("glue_runs")
 def glue_runs() -> int:
     """Glue the volume runs and move the review states.
@@ -390,6 +390,14 @@ def glue_runs() -> int:
     Locked, because the apply trigger counts the applies in flight
     against ``apply.MAX_SCANS_IN_FLIGHT`` before it queues, and the
     ledgers of the glues are read and written here.
+
+    On the heavy queue, not the fast one, although every pass here is
+    seconds of JSON: a volume glue holds every shard result of a
+    volume as Python objects while it writes the document, gigabytes
+    for a long volume, and the fast pod is sized for ticks that send
+    HTTP calls. Its first day on that pod it was killed at the memory
+    limit on the same glue at every restart, and the RunPod waves and
+    the sweep died with it. The heavy pods are sized for an apply.
 
     :returns: The sum of what the passes did.
     :rtype: int
@@ -549,7 +557,7 @@ TICKS: tuple[Tick, ...] = (
         "DAEMON_COLLECT_INTERVAL",
         QUEUE_HEAVY,
     ),
-    Tick("glue_runs", glue_runs, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("glue_runs", glue_runs, "DAEMON_COLLECT_INTERVAL", QUEUE_HEAVY),
     Tick(
         "prepare_opinions",
         prepare_opinions,
