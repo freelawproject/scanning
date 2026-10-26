@@ -31,7 +31,7 @@ class TestSubmitCommand(TestCase):
 
     def test_the_sweeps_run_before_the_wave(self):
         """So the rows the sweeps create go out on the same tick (#250,
-        #327)."""
+        #327, #341)."""
         order = []
         with (
             patch(
@@ -43,6 +43,10 @@ class TestSubmitCommand(TestCase):
                 side_effect=lambda: order.append("ocr") or 1,
             ),
             patch(
+                "scanning.mistral_ocr.enqueue_missing_runs",
+                side_effect=lambda: order.append("mistral") or 1,
+            ),
+            patch(
                 "scanning.jobs.submit_pending",
                 side_effect=lambda limit=None: (
                     order.append("wave") or SubmitSummary(submitted=2)
@@ -52,7 +56,7 @@ class TestSubmitCommand(TestCase):
         ):
             call_command("submit_external_jobs")
 
-        self.assertEqual(order, ["sweep", "ocr", "wave"])
+        self.assertEqual(order, ["sweep", "ocr", "mistral", "wave"])
 
     def test_the_limit_is_passed_through(self):
         with patch(

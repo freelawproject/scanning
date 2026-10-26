@@ -481,6 +481,35 @@ class TestNudges(TestCase):
         self.assertEqual(merge.call_args.kwargs["queue"], tasks.QUEUE_HEAVY)
 
     @override_settings(CELERY_ENABLED=True)
+    def test_the_sweeps_send_the_wave_each_one_fed(self):
+        """The RunPod sweeps nudge the RunPod wave and the Mistral sweep
+        the Mistral wave (#341): the two run on different queues."""
+        with (
+            patch("scanning.yolo.enqueue_missing_runs", return_value=1),
+            patch("scanning.dots_mocr.enqueue_missing_runs", return_value=0),
+            patch("scanning.mistral_ocr.enqueue_missing_runs", return_value=2),
+            patch.object(tasks.submit_runpod, "apply_async") as runpod,
+            patch.object(tasks.submit_mistral, "apply_async") as mistral,
+        ):
+            self.assertEqual(tasks.enqueue_runs(), 3)
+        runpod.assert_called_once()
+        mistral.assert_called_once()
+        self.assertEqual(mistral.call_args.kwargs["queue"], tasks.QUEUE_HEAVY)
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_sweep_that_started_nothing_sends_no_wave(self):
+        with (
+            patch("scanning.yolo.enqueue_missing_runs", return_value=0),
+            patch("scanning.dots_mocr.enqueue_missing_runs", return_value=0),
+            patch("scanning.mistral_ocr.enqueue_missing_runs", return_value=0),
+            patch.object(tasks.submit_runpod, "apply_async") as runpod,
+            patch.object(tasks.submit_mistral, "apply_async") as mistral,
+        ):
+            self.assertEqual(tasks.enqueue_runs(), 0)
+        runpod.assert_not_called()
+        mistral.assert_not_called()
+
+    @override_settings(CELERY_ENABLED=True)
     def test_a_nudge_sends_every_entry_of_the_task(self):
         """``cleanup_tmp`` has one entry per queue."""
         with (

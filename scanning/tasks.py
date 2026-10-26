@@ -275,19 +275,24 @@ def claim_scans() -> int:
 @app.task(name="scanning.tasks.enqueue_runs", queue=QUEUE_FAST)
 @locked("enqueue_runs")
 def enqueue_runs() -> int:
-    """Start the detection and OCR runs of every new shard set.
+    """Start the detection, OCR and Mistral runs of every new shard set
+    (#250, #327, #341).
 
     :returns: How many runs started.
     :rtype: int
     """
-    from scanning import dots_mocr, yolo
+    from scanning import dots_mocr, mistral_ocr, yolo
 
-    # The same sweeps as ``submit_external_jobs``; a third engine's
-    # sweep (#500) is one more line here and there.
+    # The same sweeps as ``submit_external_jobs``; another engine's
+    # sweep is one more line here and there. Each wave is nudged by
+    # the sweep that fed it, because the two run on different queues.
     started = yolo.enqueue_missing_runs() + dots_mocr.enqueue_missing_runs()
     if started:
         nudge(submit_runpod)
-    return started
+    mistral_started = mistral_ocr.enqueue_missing_runs()
+    if mistral_started:
+        nudge(submit_mistral)
+    return started + mistral_started
 
 
 def _submit(provider: str) -> int:
@@ -750,8 +755,8 @@ _SUBMITTERS = {
 def submit_soon(provider: str) -> bool:
     """Send the wave of a provider now, after a button created its rows.
 
-    The read buttons (``start_dots_mocr``, ``start_mistral_ocr``,
-    ``start_surya_ocr``, ``start_caselaw_tagger``) create PENDING rows
+    The read buttons (``start_dots_mocr``, ``start_surya_ocr``,
+    ``start_caselaw_tagger``) create PENDING rows
     the next submit tick would send; this sends that tick now. Same
     rules as :func:`dispatch_scan`.
 
