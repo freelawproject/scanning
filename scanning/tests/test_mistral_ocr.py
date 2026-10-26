@@ -22,12 +22,13 @@ from unittest.mock import patch
 
 import fitz
 from botocore.exceptions import ClientError
+from django.db import connections
 from django.test import override_settings
 from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 
-from scanning import jobs, mistral_client, mistral_ocr, yolo
+from scanning import jobs, locks, mistral_client, mistral_ocr, stopping, yolo
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
@@ -373,12 +374,16 @@ class TestSubmitWave(ScanningTestCase):
         self.assertTrue(job.result_key.endswith("r1-s0-a1.json"))
         self.assertIn("jobs/extract/mistral_ocr/", job.result_key)
 
-        # Two page images as ``ocr`` files, one manifest as ``batch``.
+        # Two page images as ``ocr`` files, one manifest as ``batch``,
+        # every name under the attempt's prefix (#534).
         calls = mocks["upload"].call_args_list
         self.assertEqual(len(calls), 3)
-        self.assertEqual(calls[0].args[0], "p0.png")
+        prefix = f"scan{self.scan.pk}-job{job.pk}-a1-"
+        self.assertEqual(mistral_ocr.file_prefix(job), prefix)
+        self.assertEqual(calls[0].args[0], f"{prefix}p0.png")
         self.assertEqual(calls[0].args[2], "ocr")
-        self.assertEqual(calls[1].args[0], "p1.png")
+        self.assertEqual(calls[1].args[0], f"{prefix}p1.png")
+        self.assertEqual(calls[2].args[0], f"{prefix}manifest.jsonl")
         self.assertEqual(calls[2].args[2], "batch")
         # The pages are the canonical render.
         self.assertEqual(png_image(calls[0].args[1]).size, (1700, 2200))
@@ -402,6 +407,46 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(kwargs["metadata"]["scan"], str(self.scan.pk))
         self.assertEqual(kwargs["metadata"]["job"], str(job.pk))
         mocks["delete"].assert_not_called()
+
+    def test_a_stop_mid_shard_hands_the_row_back_and_deletes_the_pages(self):
+        # A shutdown between two uploads (#534): the page already at
+        # Mistral is deleted, no batch is created, and the row goes
+        # back with its attempt intact.
+        self.addCleanup(stopping.reset)
+        uploaded = []
+
+        def upload(name, content, purpose):
+            uploaded.append(name)
+            stopping.request()
+            return f"f{len(uploaded) - 1}"
+
+        summary, mocks = self._tick(upload_error=upload)
+
+        self.assertEqual(summary.deferred, 1)
+        self.assertEqual(len(uploaded), 1)
+        mocks["create"].assert_not_called()
+        mocks["delete"].assert_called_once_with("f0")
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, mistral_ocr.STOPPED_ERROR_CODE)
+        self.assertIsNone(job.submitted_at)
+
+    def test_a_held_submit_lock_claims_nothing(self):
+        # Another worker's wave holds the lock: this one claims no row.
+        other = connections.create_connection("default")
+        self.addCleanup(other.close)
+        key = [locks.NAMESPACE, locks.key(mistral_ocr.SUBMIT_LOCK)]
+        with other.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_lock(%s, %s)", key)
+        try:
+            summary, mocks = self._tick()
+        finally:
+            with other.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s, %s)", key)
+        self.assertEqual(summary.submitted, 0)
+        mocks["upload"].assert_not_called()
+        self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.PENDING)
 
     def test_the_scratch_dir_names_the_scan_and_is_removed(self):
         # The shard PDF is rendered in a system temp dir the #215 sweep
@@ -966,30 +1011,108 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(summary.retried, 1)
         self.assertEqual(self.job.error_code, "DEADLINE_EXCEEDED")
 
-    def test_a_fresh_claim_with_no_batch_id_is_still_rendering(self):
-        # The sweep and the wave no longer share one serial scheduler
-        # (#503): a SUBMITTED row with no id inside LOST_CLAIM_AFTER is
-        # a shard another worker is rendering now.
-        ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
-        summary, mocks = self._sweep(mistral_client.BatchOutcome(status=None))
+    def _lose_the_id(self):
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            external_id="", provider_meta={}
+        )
+        self.job.refresh_from_db()
+
+    def _sweep_lost(self, found=(), **kwargs):
+        finder = patch(
+            "scanning.mistral_client.find_files", return_value=list(found)
+        )
+        find = finder.start()
+        self.addCleanup(finder.stop)
+        summary, mocks = self._sweep(
+            mistral_client.BatchOutcome(status=None), **kwargs
+        )
+        mocks["find"] = find
+        return summary, mocks
+
+    def test_a_claim_under_a_held_submit_lock_is_still_rendering(self):
+        # A wave holds the lock (#534): the newest claim with no id is
+        # the shard it renders now, however long that takes.
+        self._lose_the_id()
+        with locks.held(mistral_ocr.SUBMIT_LOCK):
+            summary, mocks = self._sweep_lost(
+                now=timezone.now() + timedelta(hours=2)
+            )
         self.assertEqual(summary.pending, 1)
         self.assertEqual(summary.retried, 0)
-        self.job.refresh_from_db()
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         mocks["poll"].assert_not_called()
+        mocks["find"].assert_not_called()
 
-    def test_an_old_claim_with_no_batch_id_is_a_lost_claim(self):
-        # Past the clock, a claim with no id is one a worker died holding.
-        ExternalJob.objects.filter(pk=self.job.pk).update(external_id="")
-        summary, mocks = self._sweep(
-            mistral_client.BatchOutcome(status=None),
-            now=timezone.now() + mistral_ocr.LOST_CLAIM_AFTER,
+    def test_a_claim_with_no_lock_held_is_lost_and_its_files_deleted(self):
+        # No session holds the lock: the worker died with the claim.
+        # The files it uploaded are found by their names and deleted
+        # before the retry.
+        self._lose_the_id()
+        summary, mocks = self._sweep_lost(
+            found=["f0", "f1"],
+            now=self.job.submitted_at + mistral_ocr.LEGACY_CLAIM_GRACE,
         )
         self.assertEqual(summary.retried, 1)
-        self.job.refresh_from_db()
         self.assertEqual(self.job.status, JobStatus.PENDING)
+        self.assertEqual(self.job.attempt, 2)
         self.assertEqual(self.job.error_code, "LOST_CLAIM")
         mocks["poll"].assert_not_called()
+        mocks["find"].assert_called_once_with(
+            f"scan{self.scan.pk}-job{self.job.pk}-a1-"
+        )
+        deleted = [c.args[0] for c in mocks["delete"].call_args_list]
+        self.assertEqual(deleted, ["f0", "f1"])
+
+    def test_a_young_claim_with_no_lock_held_waits_for_one_release(self):
+        # A pod on the code before the lock submits without it, so
+        # during the rollout a young claim with no lock is alive.
+        self._lose_the_id()
+        summary, mocks = self._sweep_lost(
+            now=self.job.submitted_at
+            + mistral_ocr.LEGACY_CLAIM_GRACE
+            - timedelta(seconds=1)
+        )
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        mocks["find"].assert_not_called()
+
+    def test_an_older_claim_under_a_held_lock_is_lost(self):
+        # The lock is held by a wave rendering a newer claim: this one
+        # was left by a worker that died before it.
+        self._lose_the_id()
+        newer = ExternalJob.objects.get(pk=self.job.pk)
+        newer.pk = None
+        newer.run = self.job.run + 1
+        newer.submitted_at = self.job.submitted_at + timedelta(minutes=1)
+        newer.save()
+        with locks.held(mistral_ocr.SUBMIT_LOCK):
+            summary, _ = self._sweep_lost()
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(self.job.error_code, "LOST_CLAIM")
+        newer.refresh_from_db()
+        self.assertEqual(newer.status, JobStatus.SUBMITTED)
+
+    def test_an_id_written_before_the_lock_went_is_not_retried(self):
+        # The wave wrote the id and let the lock go after the sweep
+        # read the row: the row is read again, and its paid batch kept.
+        self._lose_the_id()
+
+        def written_meanwhile(job, now):
+            ExternalJob.objects.filter(pk=job.pk).update(external_id="batch-2")
+            return False
+
+        with patch.object(
+            mistral_ocr, "_claim_alive", side_effect=written_meanwhile
+        ):
+            summary, mocks = self._sweep_lost()
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        self.assertEqual(self.job.external_id, "batch-2")
+        mocks["find"].assert_not_called()
+        mocks["cancel"].assert_not_called()
 
 
 # ── the sweep that starts the read (#341) ──────────────────────────
@@ -1218,3 +1341,27 @@ class TestProcessBar(ScanningTestCase):
 
         with self.assertRaises(NoReverseMatch):
             reverse("start_mistral_ocr", kwargs={"pk": self.scan.pk})
+
+    def test_a_failed_part_of_an_open_run_says_the_run_goes_on(self):
+        # One part failed while the other is still running (#534): the
+        # line says both, and "failed" alone read as a run that had
+        # ended. The read has no button (#341), so no re-run hint.
+        failed, running = mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=10)
+        )
+        ExternalJob.objects.filter(pk=failed.pk).update(
+            status=JobStatus.FAILED, error_code="LOST_CLAIM"
+        )
+        html = " ".join(self._bar().split())
+        self.assertIn(
+            "Mistral OCR: 1 of 2 part(s) failed (LOST_CLAIM), 1 still running",
+            html,
+        )
+        self.assertNotIn("re-run once they end", html)
+
+        ExternalJob.objects.filter(pk=running.pk).update(
+            status=JobStatus.CONSUMED
+        )
+        html = self._bar()
+        self.assertIn("Mistral OCR failed on 1 of 2 part(s)", html)
+        self.assertNotIn("Re-run Mistral OCR", html)

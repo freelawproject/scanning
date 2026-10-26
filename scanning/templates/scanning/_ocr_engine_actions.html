@@ -25,6 +25,11 @@ Neither stage moves a scan status, so its state comes from the run
 summary and never from `is_processing`. That summary still renders
 after the run ends, so a historical run stays readable.
 
+A run with a failed part and parts still running says both (#534):
+"failed" alone read as a run that had ended. The hint to re-run once
+the parts end shows only beside a button, so an engine the daemon
+starts by itself (Mistral, #341) gets none.
+
 A button has no review-state gate, because both reads are over the
 original shards: what they need exists from the moment the pipeline
 cut them, and nothing later in the pipeline moves a page they name.
@@ -35,7 +40,9 @@ message.
 {% endcomment %}
 {% if run %}
 <span class="text-sm text-gray-600 mr-2" title="{{ label }} run {{ run.run }}: {{ run.label }}">
-  {% if run.failed %}
+  {% if run.failed and run.open %}
+  {{ label }}: {{ run.failed }} of {{ run.total }} part(s) failed ({{ run.error_code }}), {{ run.open }} still running{% if start_url and user.is_staff %}; re-run once they end{% endif %}
+  {% elif run.failed %}
   {{ label }} failed on {{ run.failed }} of {{ run.total }} part(s): {{ run.error_code }}
   {% elif run.open %}
   {{ label }} running: {{ run.done }} of {{ run.total }} part(s) done

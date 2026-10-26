@@ -622,6 +622,66 @@ class TestTheVerdict(OpinionOcrTestCase):
             opinion_ocr.RUNNING_HEAD,
         )
 
+    def test_a_unit_that_holds_the_head_line_with_air_above_is_on_it(self):
+        """An engine draws the page number's box taller than the line,
+        with air above and below: it holds the line and is no taller
+        than twice it, so it is the line's. Four times the line is a
+        merged block, and the other rules judge it."""
+        line = (HEADER[1] * 0.36, HEADER[3] * 0.36)
+        height = line[1] - line[0]
+        self.assertTrue(
+            opinion_ocr.on_head_line(
+                [0, line[0] - 0.4 * height, 300, line[1] + 0.4 * height],
+                [line],
+            )
+        )
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, line[0] - height, 300, line[1] + 2 * height], [line]
+            )
+        )
+        # Holding half the line is not holding it: a body unit that
+        # clips the bottom of the head line and runs a line and a half
+        # below is the opinion's, and so is one under a two-line head
+        # that holds the second head line and two body lines.
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, line[0] + 0.5 * height, 300, line[1] + 1.5 * height],
+                [line],
+            )
+        )
+        two_lines = (line[0], line[1] + height)
+        self.assertFalse(
+            opinion_ocr.on_head_line(
+                [0, line[1], 300, line[1] + 3 * height], [two_lines]
+            )
+        )
+
+    def test_a_cover_that_is_partial_on_the_page_number_is_the_page_number(
+        self,
+    ):
+        """The running head's whiteout stops at the page number on
+        purpose, and an engine that read the abbreviation and the number
+        as one unit has half of it under the box. That is the page
+        number's verdict, whole, and never a partial cover: the card
+        that counts a partial cover asks whether a word shows past the
+        box, and nothing on the running head is a word the text keeps."""
+        page = self.redact(
+            2,
+            to_pt((HEADER[0], HEADER[1], 500, HEADER[3])),
+            rect_type="page_header",
+            fill="white",
+        )
+        document = self.write()
+        header = self.unit(document, 1, "878 N. C.")
+        self.assertEqual(
+            header["exclusion"],
+            {"reason": opinion_ocr.PAGE_NUMBER, "printed": PRINTED},
+        )
+        self.assertEqual(header["share"], 1.0)
+        self.assertEqual(document["counts"]["partial"], 0)
+        self.assertNotEqual(header["exclusion"].get("redaction_id"), page.pk)
+
     def test_a_head_box_in_the_body_takes_nothing(self):
         """A ``PAGE_HEADER`` box the model drew in the body is no head
         line: the units at its height are the opinion's."""
