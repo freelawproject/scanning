@@ -339,12 +339,20 @@ class TestSubmitWave(ScanningTestCase):
         create_error=None,
         workers=1,
         backoff=0.0,
+        per_tick=None,
+        cap=None,
     ):
         # One upload thread unless a test asks for more: the
         # side-effect lists above answer the calls in the order they
         # are made, which only a serial pool keeps in page order. No
         # wait between two tries of a throttled page unless a test
-        # asks for one.
+        # asks for one. The settings override is scoped to the call,
+        # so it nests inside a test's own override.
+        overrides = {"MISTRAL_UPLOAD_WORKERS": workers}
+        if per_tick is not None:
+            overrides["MISTRAL_SUBMITS_PER_TICK"] = per_tick
+        if cap is not None:
+            overrides["MISTRAL_MAX_CONCURRENCY"] = cap
         patches = [
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch(
@@ -362,15 +370,14 @@ class TestSubmitWave(ScanningTestCase):
             ),
             patch("scanning.mistral_client.delete_file"),
             patch("scanning.mistral_client.cancel_batch"),
-            patch.object(mistral_ocr, "UPLOAD_WORKERS", workers),
-            patch.object(mistral_ocr, "UPLOAD_BACKLOG", 2 * workers),
             patch.object(mistral_ocr, "UPLOAD_BACKOFF_SECONDS", backoff),
         ]
         mocks = []
         for patcher in patches:
             mocks.append(patcher.start())
             self.addCleanup(patcher.stop)
-        summary = jobs.submit_pending()
+        with override_settings(**overrides):
+            summary = jobs.submit_pending()
         return summary, {
             "download": mocks[1],
             "upload": mocks[2],
@@ -725,7 +732,9 @@ class TestSubmitWave(ScanningTestCase):
             ),
         ):
             self.assertEqual(
-                mistral_ocr._upload_page("x-", 0, b"", threading.Event()),
+                mistral_ocr._upload_page(
+                    "x-", 0, b"", threading.Event(), threading.Semaphore(1)
+                ),
                 "f0",
             )
         self.assertEqual(len(waits), 3)
@@ -907,18 +916,114 @@ class TestSubmitWave(ScanningTestCase):
         ]
         self.assertEqual(statuses.count(JobStatus.SUBMITTED), 2)
 
+    def test_the_per_tick_cap_follows_the_mode(self):
+        # One shard per tick under the daemon, whose serial scheduler
+        # waits behind the wave; a volume's worth under Celery, where
+        # the wave is its own locked task; the setting overrides both.
+        with override_settings(
+            CELERY_ENABLED=False, MISTRAL_SUBMITS_PER_TICK=0
+        ):
+            self.assertEqual(mistral_ocr.submits_per_tick(), 1)
+        with override_settings(
+            CELERY_ENABLED=True, MISTRAL_SUBMITS_PER_TICK=0
+        ):
+            self.assertEqual(
+                mistral_ocr.submits_per_tick(), mistral_ocr.VOLUME_SHARDS
+            )
+        with override_settings(
+            CELERY_ENABLED=False, MISTRAL_SUBMITS_PER_TICK=3
+        ):
+            self.assertEqual(mistral_ocr.submits_per_tick(), 3)
+
+    def test_a_volume_s_shards_go_in_one_wave(self):
+        # With the cap at a volume's worth, one tick renders, uploads
+        # and submits every shard of the volume, each as its own batch.
+        scan = ScanFactory()
+        mistral_ocr.ensure_extract_jobs(
+            scan, make_manifest(shard_count=3, pages_per_shard=2)
+        )
+        summary, mocks = self._tick(
+            upload_error=lambda name, content, purpose: name,
+            workers=2,
+            per_tick=10,
+        )
+        # The three, plus the fixture's own shard.
+        self.assertEqual(summary.submitted, 4)
+        self.assertEqual(mocks["create"].call_count, 4)
+        self.assertEqual(
+            [
+                job.status
+                for job in ExternalJob.objects.filter(scan=scan).order_by(
+                    "shard_index"
+                )
+            ],
+            [JobStatus.SUBMITTED] * 3,
+        )
+
+    def test_the_backlog_is_the_wave_s_and_not_the_shard_s(self):
+        # Two shards in one wave, one upload thread and a backlog of
+        # two, the first upload held: the wave has two pages out (one
+        # uploading, one waiting on the slot) and each shard one in
+        # hand, four in all, and neither shard renders further until
+        # the upload lets go. A backlog per shard would have six.
+        ExternalJob.objects.filter(scan=self.scan).delete()
+        pdf = self.tmp / "six.pdf"
+        write_pdf(pdf, pages=6)
+        mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=6)
+        )
+        rendered = []
+        lock = threading.Lock()
+        four_out = threading.Event()
+        real = mistral_ocr.render_shard_pages
+
+        def spy(pdf_path, whiteout=False):
+            for page in real(pdf_path, whiteout=whiteout):
+                with lock:
+                    rendered.append(page[0])
+                    if len(rendered) == 4:
+                        four_out.set()
+                yield page
+
+        ahead = []
+        held = [False]
+
+        def upload(name, content, purpose):
+            if name.endswith("manifest.jsonl"):
+                return name
+            with lock:
+                first, held[0] = not held[0], True
+            if first:
+                four_out.wait(timeout=10)
+                time.sleep(0.3)
+                with lock:
+                    ahead.append(len(rendered))
+            return name
+
+        with patch("scanning.mistral_ocr.render_shard_pages", spy):
+            summary, _ = self._tick(
+                download=lambda key, dest: shutil.copy(pdf, dest),
+                upload_error=upload,
+                workers=1,
+                per_tick=10,
+            )
+
+        self.assertEqual(summary.submitted, 2)
+        self.assertEqual(ahead, [4])
+        self.assertEqual(len(rendered), 12)
+
     def test_the_in_flight_cap_holds_a_tick_back(self):
         scan = ScanFactory()
         mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=3, pages_per_shard=2)
         )
-        with (
-            patch.object(mistral_ocr, "MAX_CONCURRENCY", 2),
-            patch.object(mistral_ocr, "MAX_SUBMITS_PER_TICK", 10),
-        ):
-            summary, _ = self._tick(upload=["f"] * 12, create="batch-1")
-            self.assertEqual(summary.submitted, 2)
-            summary, _ = self._tick(upload=["f"] * 12, create="batch-2")
+        summary, _ = self._tick(
+            upload=["f"] * 12, create="batch-1", per_tick=10, cap=2
+        )
+        self.assertEqual(summary.submitted, 2)
+        summary, _ = self._tick(
+            upload=["f"] * 12, create="batch-2", per_tick=10, cap=2
+        )
         # Two in flight at a cap of two: nothing more this tick.
         self.assertEqual(summary.submitted, 0)
 

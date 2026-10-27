@@ -58,12 +58,17 @@ Mistral, and must not be broken:
 - **The deadline is Mistral's own timeout**, stamped once at the first
   claim and never restamped on ``RUNNING``: a batch is queued and run
   inside one budget Mistral enforces.
-- **The wave blocks the serial scheduler, so it takes one shard per
-  tick** (``MAX_SUBMITS_PER_TICK``). A full shard is a minute or more
-  of render and upload, the pages uploaded ``UPLOAD_WORKERS`` at a
-  time, a throttled page tried again on its own thread
-  (``UPLOAD_RETRIES``); the in-flight cap (``MAX_CONCURRENCY``) is a
-  separate number, so a volume keeps draining while its batches wait.
+- **The wave takes one shard per tick under the daemon and a volume's
+  worth under Celery** (:func:`submits_per_tick`): the daemon's serial
+  scheduler waits behind the wave, and a Celery wave is its own locked
+  task that nothing waits behind. The shards of a wave share one
+  upload pool (``MISTRAL_UPLOAD_WORKERS``) and one backlog of rendered
+  pages, so the uploads in flight and the PNGs in memory are bounded
+  by the wave and never by the shard count; a throttled page waits
+  and is tried again on its own thread (``UPLOAD_RETRIES``), thinning
+  the pool while the limit holds. The in-flight cap
+  (``MISTRAL_MAX_CONCURRENCY``) is batches at Mistral, a separate
+  number, so a volume keeps draining while its batches wait.
 - **A job nothing will read is cancelled, and its files deleted.**
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
@@ -91,12 +96,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    Future,
-    ThreadPoolExecutor,
-    wait,
-)
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -148,43 +148,25 @@ SOURCE = "original"
 INCLUDE_BLOCKS = True
 TABLE_FORMAT = "html"
 
-#: Batch jobs in flight at once, not pages. A debug guard on blast
-#: radius, not a cost control: Mistral bills per page whatever the
-#: parallelism, and the batch API is built for a deep queue. A batch
-#: waits at Mistral for hours, so this is the throughput limit of a
-#: volume: with one submit per tick and N in flight, a volume of more
-#: than N shards needs a second round of that latency. Sixteen covers
-#: a normal volume (1100 pages at 100 a shard is 11-14 shards) in one
-#: round. It must stay well above ``MAX_SUBMITS_PER_TICK``.
-MAX_CONCURRENCY = 16
+#: Shards one Celery wave takes when ``MISTRAL_SUBMITS_PER_TICK`` is
+#: unset: a normal volume (1100 pages at 100 a shard is 11-14 shards),
+#: so a volume is rendered and uploaded in one wave. The wave is its
+#: own locked task on the heavy queue (#503), so nothing waits behind
+#: it; under the daemon the wave blocks the serial scheduler (#156)
+#: for as long as its slowest shard takes, and every poll, the glue
+#: and both applies wait behind it, so there the default stays one.
+VOLUME_SHARDS = 16
 
-#: Shards rendered, uploaded and submitted on one submit tick. **One,
-#: because the wave blocks the daemon's serial scheduler** (#156) for
-#: as long as the slowest shard takes: a 100-page shard is 100 renders
-#: (about 160 ms each for a synthetic page, more for a 200 dpi scan)
-#: and 100 uploads of 2-4 MB in sequence -- minutes, not seconds --
-#: and every poll, the glue and both applies wait behind it. One shard
-#: per tick caps that wait at one shard. Raising it, or parallel
-#: uploads inside a shard, or a render off the tick (as #196 did for
-#: its geometry), waits for a measurement on a real volume.
-MAX_SUBMITS_PER_TICK = 1
-
-#: How many page uploads of one shard run at once. The uploads wait on
-#: the network and not on the CPU: a shard of 99 pages uploaded one
-#: after another took five minutes, three seconds a page, and a batch
-#: needs only that its files exist before it is created. The render
-#: stays serial and in page order, feeding the pool, and the stop
-#: check (#534) stays between the pages, before each is handed over.
-UPLOAD_WORKERS = 8
-
-#: How many rendered pages may wait for an upload before the render
-#: pauses, read at call time like the worker count: a stalled network
-#: must not leave a whole shard of PNGs in memory, megabytes each.
-UPLOAD_BACKLOG = 2 * UPLOAD_WORKERS
+#: Rendered pages the wave may hold ahead of the uploads, per upload
+#: thread: one in flight and one waiting on each. A stalled network
+#: must not leave a volume of PNGs in memory, megabytes each, so the
+#: backlog is the wave's and not the shard's, and a shard's render
+#: pauses whenever the wave is at it.
+BACKLOG_PER_WORKER = 2
 
 #: How many times a throttled page upload (a 429) is tried again before
 #: the refusal reaches the wave, and the first wait between two tries,
-#: doubled at each. Eight uploads at once reach a workspace's request
+#: doubled at each. A wave of uploads reaches a workspace's request
 #: rate sooner than one did, and a 429 that reaches the wave deletes
 #: every page of the shard that landed and uploads them all again on
 #: the next tick. A page waits on its own thread, so the pool thins
@@ -255,6 +237,53 @@ STOPPED_ERROR_CODE = "SHUTDOWN"
 
 class SubmitStopped(Exception):
     """The worker was told to stop while it uploaded a shard (#534)."""
+
+
+# ── the throughput knobs ────────────────────────────────────────────
+def submits_per_tick() -> int:
+    """Return how many shards one wave renders and uploads.
+
+    ``MISTRAL_SUBMITS_PER_TICK`` when set; else one under the daemon,
+    whose serial scheduler waits behind the wave, and
+    :data:`VOLUME_SHARDS` under Celery, where the wave is its own
+    locked task (#503).
+
+    :returns: The per-tick cap, at least one.
+    :rtype: int
+    """
+    configured = int(getattr(settings, "MISTRAL_SUBMITS_PER_TICK", 0) or 0)
+    if configured > 0:
+        return configured
+    return VOLUME_SHARDS if getattr(settings, "CELERY_ENABLED", False) else 1
+
+
+def max_concurrency() -> int:
+    """Return how many batches may be in flight at Mistral at once.
+
+    :returns: ``MISTRAL_MAX_CONCURRENCY``, at least one.
+    :rtype: int
+    """
+    return max(1, int(getattr(settings, "MISTRAL_MAX_CONCURRENCY", 64)))
+
+
+def upload_workers() -> int:
+    """Return how many page uploads one wave runs at once, over every
+    shard it took.
+
+    :returns: ``MISTRAL_UPLOAD_WORKERS``, at least one.
+    :rtype: int
+    """
+    return max(1, int(getattr(settings, "MISTRAL_UPLOAD_WORKERS", 16)))
+
+
+def upload_backlog() -> int:
+    """Return how many rendered pages one wave may hold ahead of the
+    uploads: :data:`BACKLOG_PER_WORKER` per upload thread.
+
+    :returns: The backlog, at least one.
+    :rtype: int
+    """
+    return BACKLOG_PER_WORKER * upload_workers()
 
 
 class _ShardAbandoned(Exception):
@@ -521,8 +550,27 @@ def _manifest_line(page_no: int, file_id: str, model: str) -> str:
     )
 
 
+@dataclass
+class _Uploads:
+    """The upload pool one wave's shards share.
+
+    :ivar pool: The threads, :func:`upload_workers` of them.
+    :ivar slots: One slot per rendered page the wave may hold ahead of
+        the uploads (:func:`upload_backlog`): a shard's render takes
+        one before it hands a page over, and the upload gives it back
+        when it is done, so the PNGs in memory are bounded by the wave.
+    """
+
+    pool: ThreadPoolExecutor
+    slots: threading.Semaphore
+
+
 def _upload_page(
-    prefix: str, page_no: int, png: bytes, abandoned: threading.Event
+    prefix: str,
+    page_no: int,
+    png: bytes,
+    abandoned: threading.Event,
+    slots: threading.Semaphore,
 ) -> str:
     """Upload one rendered page. Runs on an upload thread.
 
@@ -540,6 +588,8 @@ def _upload_page(
     :param page_no: Shard-local page.
     :param png: The canonical render.
     :param abandoned: Set by the wave once the shard failed.
+    :param slots: The wave's backlog; the page's slot is given back
+        however the upload ends.
     :returns: The file id.
     :rtype: str
     :raises MistralError: The classified failure; a 429 only once the
@@ -547,6 +597,16 @@ def _upload_page(
     :raises SubmitStopped: If a stop was asked for.
     :raises _ShardAbandoned: If the shard failed on another page.
     """
+    try:
+        return _upload_page_tries(prefix, page_no, png, abandoned)
+    finally:
+        slots.release()
+
+
+def _upload_page_tries(
+    prefix: str, page_no: int, png: bytes, abandoned: threading.Event
+) -> str:
+    """The tries of :func:`_upload_page`, apart from its slot."""
     name = f"{prefix}{custom_id(page_no)}.png"
     tried = 0
     while True:
@@ -637,20 +697,29 @@ def _first_failure(pages: list[tuple[int, Future]]) -> Exception | None:
     return None
 
 
-def _hold_back(pages: list[tuple[int, Future]]) -> None:
-    """Wait until fewer than ``UPLOAD_BACKLOG`` uploads are unfinished.
+def _take_slot(uploads: _Uploads, pages: list[tuple[int, Future]]) -> None:
+    """Wait for a slot of the wave's backlog, and take it.
 
-    :param pages: Each page handed to the pool, with its future.
+    Read in short waits, so a stop and a failed page of this shard are
+    both seen while the wave is at its backlog.
+
+    :param uploads: The wave's pool and backlog.
+    :param pages: This shard's pages handed over so far.
     :return: None.
+    :raises SubmitStopped: If a stop was asked for.
+    :raises Exception: The failure of the first page whose upload
+        failed.
     """
     while True:
-        unfinished = [future for _, future in pages if not future.done()]
-        if len(unfinished) < UPLOAD_BACKLOG:
+        _stop_if_asked()
+        failed = _first_failure(pages)
+        if failed is not None:
+            raise failed
+        if uploads.slots.acquire(timeout=STOP_POLL_SECONDS):
             return
-        wait(unfinished, return_when=FIRST_COMPLETED)
 
 
-def _prepare_and_submit(job: ExternalJob) -> _Submission:
+def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
 
     No database access here: the row's fields were read on the main
@@ -660,10 +729,11 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     nothing we hold names.
 
     The pages are rendered one after another, in page order, and each
-    is handed to a pool of ``UPLOAD_WORKERS`` threads that upload it,
-    because the uploads wait on the network: one at a time, a shard of
-    99 pages took five minutes. The render pauses while
-    ``UPLOAD_BACKLOG`` pages wait for an upload, and an upload that
+    is handed to the wave's upload pool (:class:`_Uploads`, shared with
+    the other shards of the wave), because the uploads wait on the
+    network: one at a time, a shard of 99 pages took five minutes. The
+    render takes a slot of the wave's backlog before it hands a page
+    over, so it pauses while the wave is at it, and an upload that
     failed stops the render at the next page. The manifest is built
     from the futures in page order once every upload is in, so the
     order the uploads finished in changes nothing Mistral sees.
@@ -681,6 +751,7 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     event, so a throttled page never holds the wave for its tries.
 
     :param job: The claimed row.
+    :param uploads: The wave's upload pool and backlog.
     :returns: The submission.
     :raises Exception: Whatever the download, the render or the API
         raised; classified by :func:`_apply_outcome`.
@@ -701,41 +772,42 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
         ) as tmp:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
-            with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as uploads:
-                try:
-                    for page_no, png in render_shard_pages(
-                        pdf_path,
-                        whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
-                    ):
-                        _stop_if_asked()
-                        _hold_back(pages)
-                        # The backlog may have held the render for as
-                        # long as an upload takes, so read it again.
-                        _stop_if_asked()
-                        failed = _first_failure(pages)
-                        if failed is not None:
-                            raise failed
-                        pages.append(
-                            (
+            try:
+                for page_no, png in render_shard_pages(
+                    pdf_path,
+                    whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
+                ):
+                    # The slot is taken here and given back by the
+                    # upload, or below for a page cancelled unstarted.
+                    _take_slot(uploads, pages)
+                    pages.append(
+                        (
+                            page_no,
+                            uploads.pool.submit(
+                                _upload_page,
+                                prefix,
                                 page_no,
-                                uploads.submit(
-                                    _upload_page,
-                                    prefix,
-                                    page_no,
-                                    png,
-                                    abandoned,
-                                ),
-                            )
+                                png,
+                                abandoned,
+                                uploads.slots,
+                            ),
                         )
-                except BaseException:
-                    # The pages not started are dropped and the ones
-                    # waiting out a 429 let go; the pool's exit waits
-                    # for the ones mid-upload, so every id that will
-                    # exist is known when the files go.
-                    abandoned.set()
-                    for _, future in pages:
-                        future.cancel()
-                    raise
+                    )
+            except BaseException:
+                # The pages not started are dropped and the ones
+                # waiting out a 429 let go; then the ones mid-upload
+                # are waited for, so every id that will exist is
+                # known when the files go.
+                abandoned.set()
+                for _, future in pages:
+                    if future.cancel():
+                        uploads.slots.release()
+                wait([future for _, future in pages])
+                raise
+        # Every upload has ended before the manifest is read off them,
+        # so a page that failed late deletes no file an upload still
+        # in flight would land after the delete.
+        wait([future for _, future in pages])
         files = []
         lines = []
         for page_no, future in pages:
@@ -878,12 +950,15 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     pool can start them at once, so a SUBMITTED row is genuinely in
     flight.
 
-    Two caps, on purpose. :data:`MAX_CONCURRENCY` bounds the batches in
-    flight at Mistral; :data:`MAX_SUBMITS_PER_TICK` bounds how many
-    shards this tick renders and uploads, which is what blocks the
-    serial scheduler. The first keeps a volume draining while batches
-    wait for hours; the second keeps every other daemon task waiting
-    for one shard at most.
+    Two caps, on purpose. :func:`max_concurrency` bounds the batches in
+    flight at Mistral; :func:`submits_per_tick` bounds how many shards
+    this tick renders and uploads: one under the daemon, which is what
+    blocks the serial scheduler, a volume's worth under Celery. The
+    first keeps a volume draining while batches wait for hours; the
+    second keeps every other daemon task waiting for one shard at most.
+    The shards of a wave share one upload pool and one backlog
+    (:class:`_Uploads`), so the uploads in flight and the pages in
+    memory are the wave's whatever the shard count.
 
     The wave holds :data:`SUBMIT_LOCK` from before its claim until the
     batch id is written (#534), so the sweep can tell a shard still
@@ -892,7 +967,7 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
 
     :param summary: Counts to update.
     :param limit: In-flight override; defaults to
-        :data:`MAX_CONCURRENCY`. The per-tick cap is not overridden.
+        :func:`max_concurrency`. The per-tick cap is not overridden.
     :return: None.
     """
     with locks.held(SUBMIT_LOCK) as got:
@@ -913,10 +988,10 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
             stage=JobStage.EXTRACT,
             engine=JobEngine.MISTRAL_OCR,
         ),
-        int(limit or MAX_CONCURRENCY),
+        int(limit or max_concurrency()),
         "Mistral OCR",
         summary,
-        per_tick=MAX_SUBMITS_PER_TICK,
+        per_tick=submits_per_tick(),
         # DEBUG for the "cap reached" line: a batch waits at Mistral
         # for hours, so at INFO a full cap would write one line per
         # tick (every 5 s) for the whole wait.
@@ -928,10 +1003,13 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
     logger.info(
         "rendering and submitting %d shard(s) to Mistral", len(claimed)
     )
-    with ThreadPoolExecutor(max_workers=len(claimed)) as pool:
-        futures = [
-            (job, pool.submit(_prepare_and_submit, job)) for job, _ in claimed
-        ]
+    with ThreadPoolExecutor(max_workers=upload_workers()) as pool:
+        uploads = _Uploads(pool, threading.Semaphore(upload_backlog()))
+        with ThreadPoolExecutor(max_workers=len(claimed)) as shards:
+            futures = [
+                (job, shards.submit(_prepare_and_submit, job, uploads))
+                for job, _ in claimed
+            ]
     for job, future in futures:
         exc: Exception | None = None
         submission = None
