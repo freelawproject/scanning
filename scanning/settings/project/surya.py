@@ -52,8 +52,11 @@ RUNPOD_SURYA_ENDPOINT_ID = env.str("RUNPOD_SURYA_ENDPOINT_ID", default="")
 # one submit tick claims. Bounded by this endpoint's own scaling, since
 # each endpoint has its own worker pool. The worker README asks for a
 # ``max_workers`` of at least this value, or the extra rows wait in the
-# provider's queue with the ceiling clock running on them.
-SURYA_MAX_CONCURRENCY = env.int("SURYA_MAX_CONCURRENCY", default=8)
+# provider's queue with the ceiling clock running on them (the corpus
+# read of October 2026 raised it from 8 to 16, with the endpoint's
+# ``max_workers`` at 16 first, because the portal does nothing with a
+# shard while RunPod reads it).
+SURYA_MAX_CONCURRENCY = env.int("SURYA_MAX_CONCURRENCY", default=16)
 
 # Attempts per shard before its job is failed. Serverless workers are
 # preempted, scheduled without a GPU, or land with a dead inference
