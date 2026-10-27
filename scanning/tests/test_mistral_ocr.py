@@ -1230,19 +1230,33 @@ class TestSubmitWave(ScanningTestCase):
             provider_meta={"files": ["e0"], "files_left": ["f0", "f1"]}
         )
         job.refresh_from_db()
+        named = []
+
+        def delete(file_id):
+            named.append(
+                ExternalJob.objects.values_list("provider_meta", flat=True)
+                .get(pk=job.pk)
+                .get("files_left")
+            )
+            return True
+
         with (
-            patch("scanning.mistral_client.delete_file") as delete,
+            patch(
+                "scanning.mistral_client.delete_file", side_effect=delete
+            ) as deleted,
             patch("scanning.mistral_client.cancel_batch") as cancel,
         ):
             jobs._fail(job, "REFUSED", "no")
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.FAILED)
         self.assertEqual(
-            [c.args[0] for c in delete.call_args_list], ["e0", "f0", "f1"]
+            [c.args[0] for c in deleted.call_args_list], ["e0", "f0", "f1"]
         )
         cancel.assert_not_called()
-        # Both keys go: the next write-off of a retried row would
-        # delete the files again otherwise.
+        # The row named every file before the first delete, so a kill
+        # mid-delete leaves them to the sweep; both keys go after, or
+        # the next write-off of a retried row would delete them again.
+        self.assertEqual(named[0], ["f0", "f1", "e0"])
         self.assertNotIn("files_left", job.provider_meta)
         self.assertNotIn("files", job.provider_meta)
 
@@ -1261,36 +1275,67 @@ class TestSubmitWave(ScanningTestCase):
             mistral_ocr._carry_files_left(job, ["c", "d"], ["c"])
         self.assertEqual(job.provider_meta["files_left"], ["b", "c"])
         self.assertEqual(job.provider_meta["files"], ["e0"])
-        mistral_ocr._carry_files_left(
-            job, ["e0", "b", "c"], [], drop_files=True
-        )
+        mistral_ocr._name_before_delete(job, ["e0", "c"])
+        self.assertEqual(job.provider_meta["files_left"], ["b", "c", "e0"])
+        self.assertNotIn("files", job.provider_meta)
+        mistral_ocr._carry_files_left(job, ["e0", "b", "c"], [])
         job.refresh_from_db()
         self.assertNotIn("files_left", job.provider_meta)
-        self.assertNotIn("files", job.provider_meta)
 
-    def test_the_admin_delete_tries_the_carried_files_once_more(self):
-        # The rows go with the scan, and their files_left with them:
-        # one last delete, and the ids it misses are logged.
-        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+    def test_the_admin_delete_logs_the_carried_files_it_loses(self):
+        # The rows go with the scan, and their files_left with them: the
+        # abandon just tried them, so the ids are logged and no call is
+        # made in the request.
         job = extract_jobs(self.scan)[0]
         ExternalJob.objects.filter(pk=job.pk).update(
             status=JobStatus.CANCELLED,
             provider_meta={"files_left": ["f0", "f1"]},
         )
         with (
-            patch(
-                "scanning.mistral_client.delete_file",
-                side_effect=lambda file_id: _answer(
-                    {"f1": [busy]}.get(file_id, [True])
-                ),
-            ) as delete,
+            patch("scanning.mistral_client.delete_file") as delete,
             self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
         ):
-            self.assertEqual(mistral_ocr.release_scan_files(self.scan), ["f1"])
-        self.assertEqual(
-            [c.args[0] for c in delete.call_args_list], ["f0", "f1"]
+            self.assertEqual(
+                mistral_ocr.note_lost_scan_files(self.scan), ["f0", "f1"]
+            )
+        delete.assert_not_called()
+        self.assertIn("f0, f1", logs.output[0])
+
+    def test_an_abandon_cancels_the_batch_written_after_its_snapshot(self):
+        # The wave's thread writes the batch id and its files between
+        # the abandon's read of the open rows and its status swap: the
+        # cancel reads the row again after the swap and finds them.
+        from django.db.models.query import QuerySet
+
+        job = extract_jobs(self.scan)[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.SUBMITTED, external_id=""
         )
-        self.assertIn("f1", logs.output[0])
+        real_update = QuerySet.update
+
+        def update(queryset, **kwargs):
+            if kwargs.get("status") == JobStatus.CANCELLED:
+                real_update(
+                    ExternalJob.objects.filter(pk=job.pk),
+                    external_id="batch-9",
+                    provider_meta={"files": ["f0", "m1"]},
+                )
+            return real_update(queryset, **kwargs)
+
+        with (
+            patch.object(QuerySet, "update", update),
+            patch("scanning.mistral_client.delete_file") as delete,
+            patch("scanning.mistral_client.cancel_batch") as cancel,
+        ):
+            jobs.abandon_open(self.scan, "gone")
+        cancel.assert_called_once_with("batch-9")
+        self.assertEqual(
+            [c.args[0] for c in delete.call_args_list], ["f0", "m1"]
+        )
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.CANCELLED)
+        self.assertNotIn("files", job.provider_meta)
+        self.assertNotIn("files_left", job.provider_meta)
 
     def test_the_in_flight_cap_holds_a_tick_back(self):
         scan = ScanFactory()
@@ -1486,7 +1531,7 @@ class TestSweep(ScanningTestCase):
             job={},
         )
         with (
-            patch.object(mistral_ocr, "LEFTOVER_ROWS_PER_TICK", 0),
+            patch.object(mistral_ocr, "LEFTOVER_CALLS_PER_TICK", 0),
             self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
         ):
             summary, mocks = self._sweep(
@@ -1501,6 +1546,57 @@ class TestSweep(ScanningTestCase):
         self.assertNotIn("files", self.job.provider_meta)
         self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
         self.assertTrue(any("carries them" in line for line in logs.output))
+
+    def test_a_harvest_names_every_file_until_the_last_is_gone(self):
+        # The completion writes the pages, the manifest and the two
+        # output files as files_left, so a kill before the deletes
+        # leaves them to the sweep; the key goes once they are gone.
+        named = []
+
+        def delete(file_id):
+            meta = ExternalJob.objects.values_list(
+                "provider_meta", flat=True
+            ).get(pk=self.job.pk)
+            named.append(meta.get("files_left"))
+            return True
+
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            output_file="out-1",
+            error_file="err-1",
+            job={},
+        )
+        with patch.object(mistral_ocr, "LEFTOVER_CALLS_PER_TICK", 0):
+            summary, mocks = self._sweep(
+                outcome, output=self.OUTPUT, errors=self.ERRORS, delete=delete
+            )
+        self.assertEqual(summary.completed, 1)
+        self.assertEqual(self.job.status, JobStatus.COMPLETED)
+        self.assertEqual(named[0], ["f0", "f1", "m1", "out-1", "err-1"])
+        self.assertNotIn("files_left", self.job.provider_meta)
+        self.assertNotIn("files", self.job.provider_meta)
+
+    def test_the_sweep_spends_a_budget_of_calls_a_tick(self):
+        # The budget is calls, not rows: a row carrying three files on a
+        # budget of two gets two deletes this tick and the third next.
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.FAILED,
+            provider_meta={"files_left": ["f0", "f1", "f2"]},
+        )
+        with (
+            patch.object(mistral_ocr, "LEFTOVER_CALLS_PER_TICK", 2),
+            patch("scanning.mistral_client.delete_file") as delete,
+        ):
+            self.assertEqual(mistral_ocr.delete_leftover_files(), 2)
+            self.job.refresh_from_db()
+            self.assertEqual(self.job.provider_meta["files_left"], ["f2"])
+            self.assertEqual(mistral_ocr.delete_leftover_files(), 1)
+        self.job.refresh_from_db()
+        self.assertNotIn("files_left", self.job.provider_meta)
+        self.assertEqual(
+            [c.args[0] for c in delete.call_args_list], ["f0", "f1", "f2"]
+        )
 
     def test_the_sweep_deletes_what_a_finished_row_carries(self):
         # A COMPLETED row no later write reaches still names a file: the
@@ -1860,7 +1956,7 @@ class TestSweep(ScanningTestCase):
             provider_meta={"files_left": ["old"]}
         )
         self.job.refresh_from_db()
-        with patch.object(mistral_ocr, "LEFTOVER_ROWS_PER_TICK", 0):
+        with patch.object(mistral_ocr, "LEFTOVER_CALLS_PER_TICK", 0):
             summary, mocks = self._sweep_lost(
                 found=["f0", "f1"],
                 now=self.job.submitted_at + mistral_ocr.LEGACY_CLAIM_GRACE,

@@ -84,7 +84,7 @@ def _release_scan_external_work(scan):
         # away, so no stage of it is worth keeping alive.
         jobs.abandon_open(scan, "Scan deleted from the admin")
         # The files a Mistral row still carries go with the row (#540).
-        mistral_ocr.release_scan_files(scan)
+        mistral_ocr.note_lost_scan_files(scan)
     except Exception:
         logger.warning(
             "Could not cancel the external jobs of scan %s before "

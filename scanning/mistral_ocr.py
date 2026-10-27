@@ -184,12 +184,15 @@ BACKLOG_PER_WORKER = 2
 UPLOAD_RETRIES = 5
 UPLOAD_BACKOFF_SECONDS = 2.0
 
-#: How many rows carrying ``files_left`` one sweep tick tries again.
-#: A delete never sleeps: a throttled or refused one is carried on the
-#: row, and the sweep tries the carried files once more every tick,
-#: whatever the row's status, so a cleanup holds nothing and a file
-#: outlives its row's last write by a tick or two, never for good.
-LEFTOVER_ROWS_PER_TICK = 50
+#: How many delete calls the sweep's pass over the rows carrying
+#: ``files_left`` makes a tick. A delete never sleeps: a throttled or
+#: refused one is carried on the row, and the sweep tries the carried
+#: files once more every tick, whatever the row's status, so a cleanup
+#: holds nothing and a file outlives its row's last write by a tick or
+#: two, never for good. The budget is calls and not rows, because one
+#: row can carry a shard's hundred files, and the tick is the serial
+#: loop's under the daemon and the locked sweep's under Celery.
+LEFTOVER_CALLS_PER_TICK = 200
 
 #: How often a waiting upload thread reads the stop flag (#534), so a
 #: shutdown never waits out a backoff.
@@ -1330,25 +1333,19 @@ def discard_lost_files(job: ExternalJob) -> int:
 
 
 def _carry_files_left(
-    job: ExternalJob,
-    tried: list[str],
-    left: list[str],
-    *,
-    drop_files: bool = False,
+    job: ExternalJob, tried: list[str], left: list[str]
 ) -> None:
     """Stamp the files a delete could not reach on the row, as
     ``files_left``: the ids this caller tried come off the list the
     row carries and the ones it could not reach go on, so two callers
     at once (the wave's thread and an admin's abandon, the lost-claim
     sweep and a thread that outlived its session) each keep the
-    other's. A list left empty drops the key.
+    other's. A list left empty drops the key. Never raises: a row
+    deleted meanwhile is logged, and the caller's sweep goes on.
 
     :param job: The row.
     :param tried: Every id this caller tried.
     :param left: The ids among them no delete reached.
-    :param drop_files: Whether the row's ``files`` were among the
-        tried, so the key goes with them: a write-off, after which the
-        next write-off would delete them again.
     :return: None.
     """
     if left:
@@ -1360,12 +1357,7 @@ def _carry_files_left(
             job.shard_index,
             len(left),
         )
-    meta = job.provider_meta or {}
-    if (
-        not left
-        and "files_left" not in meta
-        and not (drop_files and "files" in meta)
-    ):
+    elif "files_left" not in (job.provider_meta or {}):
         return
     gone = set(tried) - set(left)
 
@@ -1378,10 +1370,49 @@ def _carry_files_left(
             meta["files_left"] = kept
         else:
             meta.pop("files_left", None)
-        if drop_files:
-            meta.pop("files", None)
 
-    jobs.swap_provider_meta(job, carry)
+    _swap_quietly(job, carry)
+
+
+def _name_before_delete(job: ExternalJob, files: list[str]) -> None:
+    """Stamp the files about to be deleted on the row as ``files_left``
+    and drop its ``files`` key, before the first delete call: a kill
+    between the status write of a write-off or a harvest and the last
+    of its hundred deletes leaves the ids where the sweep reads them,
+    and a row retried keeps no ``files`` to delete twice.
+
+    :param job: The row.
+    :param files: The ids about to be deleted.
+    :return: None.
+    """
+
+    def name(meta: dict) -> None:
+        kept = [str(f) for f in meta.get("files_left") or []]
+        kept += [f for f in files if f not in kept]
+        if kept:
+            meta["files_left"] = kept
+        meta.pop("files", None)
+
+    _swap_quietly(job, name)
+
+
+def _swap_quietly(job: ExternalJob, mutate) -> None:
+    """Swap the row's ``provider_meta``, logging instead of raising when
+    the row is gone or the database is: the files are deleted either
+    way, and the pass that called must judge its other rows.
+
+    :param job: The row.
+    :param mutate: See :func:`jobs.swap_provider_meta`.
+    :return: None.
+    """
+    try:
+        jobs.swap_provider_meta(job, mutate)
+    except Exception:  # noqa: BLE001 - a row deleted meanwhile
+        logger.warning(
+            "job %s: could not stamp its Mistral files; the row may be gone",
+            job.pk,
+            exc_info=True,
+        )
 
 
 def delete_leftover_files() -> int:
@@ -1389,15 +1420,17 @@ def delete_leftover_files() -> int:
     ``files_left``, one call per file, on every sweep tick.
 
     The one deleter of a file on a row no later write reaches: a
-    harvest or a write-off that was throttled stamps the ids on a
-    COMPLETED, FAILED or CANCELLED row, and nothing else runs for
-    those again. A row in flight is left to its harvest, and a PENDING
-    row is tried here and by its next submission alike; a double
-    delete is a 404, which counts as gone. At most
-    :data:`LEFTOVER_ROWS_PER_TICK` rows a tick, oldest first, and a
-    stop ends the pass between two rows.
+    harvest or a write-off that was throttled, or killed between its
+    status write and its last delete, leaves the ids on a COMPLETED,
+    FAILED or CANCELLED row, and nothing else runs for those again. A
+    row in flight is left to its harvest, and a PENDING row is tried
+    here and by its next submission alike; a double delete is a 404,
+    which counts as gone. The tick spends :data:`LEFTOVER_CALLS_PER_TICK`
+    calls and reads the stop flag before each, and the rows come in no
+    order, so a row whose deletes Mistral refuses for good holds no
+    other row back.
 
-    :returns: How many rows were tried.
+    :returns: How many delete calls were made.
     :rtype: int
     """
     rows = (
@@ -1405,49 +1438,49 @@ def delete_leftover_files() -> int:
             provider=JobProvider.MISTRAL, provider_meta__has_key="files_left"
         )
         .exclude(status__in=jobs.IN_FLIGHT_JOB_STATUSES)
-        .order_by("pk")[:LEFTOVER_ROWS_PER_TICK]
+        .order_by("?")
     )
-    tried = 0
+    calls = 0
     for job in rows:
-        if stopping.requested():
+        if calls >= LEFTOVER_CALLS_PER_TICK or stopping.requested():
             break
         carried = [
             str(f) for f in (job.provider_meta or {}).get("files_left") or []
         ]
-        left = _delete_files(carried)
-        if not left:
+        tried: list[str] = []
+        left: list[str] = []
+        for file_id in carried:
+            if calls >= LEFTOVER_CALLS_PER_TICK or stopping.requested():
+                break
+            tried.append(file_id)
+            calls += 1
+            left += _delete_files([file_id])
+        if tried and not left:
             logger.info(
                 "job %s (scan %s shard %s): deleted %d file(s) the row "
                 "carried at Mistral",
                 job.pk,
                 job.scan_id,
                 job.shard_index,
-                len(carried),
+                len(tried),
             )
-        try:
-            _carry_files_left(job, carried, left)
-        except Exception:  # noqa: BLE001 - a row deleted meanwhile
-            logger.warning(
-                "job %s: could not stamp its carried Mistral files; the "
-                "row may be gone",
-                job.pk,
-                exc_info=True,
-            )
-        tried += 1
-    return tried
+        if tried:
+            _carry_files_left(job, tried, left)
+    return calls
 
 
-def release_scan_files(scan) -> list[str]:
-    """Try once more to delete the files a scan's rows still carry,
-    before the rows go with the scan (the admin deletion).
+def note_lost_scan_files(scan) -> list[str]:
+    """Log the files a scan's rows still carry, before the rows go with
+    the scan (the admin deletion).
 
     A row deleted takes its ``files_left`` with it, and nothing would
-    name the pages at Mistral again, so this is their last delete: one
-    call each, in the request like the abandon before it, and the ids
-    it could not reach are logged, the one record that survives.
+    name the pages at Mistral again. The abandon before this made one
+    delete call per file already, in the request, so another round
+    here would land nowhere a throttle just refused; the log line is
+    the one record that survives, for a person to finish.
 
     :param scan: The scan about to be deleted.
-    :returns: The ids no delete reached.
+    :returns: The ids the rows carry.
     :rtype: list[str]
     """
     lost = []
@@ -1457,10 +1490,9 @@ def release_scan_files(scan) -> list[str]:
         provider_meta__has_key="files_left",
     )
     for job in rows:
-        carried = [
+        lost += [
             str(f) for f in (job.provider_meta or {}).get("files_left") or []
         ]
-        lost += _delete_files(carried)
     if lost:
         logger.warning(
             "scan %s: %d Mistral file(s) could not be deleted before the "
@@ -1680,12 +1712,17 @@ def harvest(
         str(f) for f in meta.get("files_left") or []
     ]
     outputs = [f for f in (outcome.output_file, outcome.error_file) if f]
-    # The files are about to be deleted, so the row stops naming them.
+    # The files are about to be deleted, the two output files with the
+    # pages and the manifest, and the row names them all as
+    # ``files_left`` until the last is gone: a kill between the
+    # completion and that delete leaves them to the sweep.
     job.provider_meta = {
         key: value
         for key, value in meta.items()
         if key not in ("files", "files_left")
     }
+    if files + outputs:
+        job.provider_meta["files_left"] = files + outputs
     if not jobs._complete(job, summary, now):
         # Another writer took the row. Its cancel deletes the files the
         # row names -- the pages and the manifest -- but nothing names
@@ -1717,9 +1754,10 @@ def cancel_job(
     :param job_id: The batch job id, or none.
     :param files: The file ids to delete; defaults to the row's own
         ``provider_meta["files"]`` plus the ``files_left`` an earlier
-        delete could not reach. Either way the row's ``files`` key goes:
-        every id of it was tried, and a row retried keeps its meta, so
-        the key would send the next write-off deleting them again.
+        delete could not reach. Either way the ids are named as
+        ``files_left`` and the ``files`` key dropped before the first
+        delete call (:func:`_name_before_delete`), so a kill mid-delete
+        leaves them to the sweep and a retried row deletes none twice.
     :return: None.
     """
     if job_id:
@@ -1730,7 +1768,9 @@ def cancel_job(
             str(f) for f in meta.get("files_left") or []
         ]
     files = [str(f) for f in files]
-    _carry_files_left(job, files, _delete_files(files), drop_files=True)
+    if files or "files" in meta:
+        _name_before_delete(job, files)
+    _carry_files_left(job, files, _delete_files(files))
 
 
 # ── the glue ────────────────────────────────────────────────────────

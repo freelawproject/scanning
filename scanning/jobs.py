@@ -3350,9 +3350,15 @@ def abandon_open(
         # the pipeline, which owns no part of an apply run (#224).
         rows = rows.filter(apply_run__isnull=True)
 
-    # Read the handles before the update: it is the only thing that says
-    # what to cancel, and afterwards the rows no longer read as open.
-    doomed = list(rows.filter(status__in=IN_FLIGHT_JOB_STATUSES))
+    # Read the ids before the update, because afterwards the rows no
+    # longer read as open, and the handles after it: a wave's thread
+    # writes a batch id and its files right up to the swap, and a
+    # cancel from the snapshot would miss what landed in between.
+    doomed = list(
+        rows.filter(status__in=IN_FLIGHT_JOB_STATUSES).values_list(
+            "pk", flat=True
+        )
+    )
     cancelled = rows.update(
         status=JobStatus.CANCELLED,
         error_code="ABANDONED",
@@ -3365,6 +3371,8 @@ def abandon_open(
             getattr(scan, "pk", scan),
             reason,
         )
-    for job in doomed:
+    for job in ExternalJob.objects.filter(pk__in=doomed).select_related(
+        "scan"
+    ):
         _cancel_provider_job(job)
     return cancelled
