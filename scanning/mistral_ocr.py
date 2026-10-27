@@ -1261,6 +1261,10 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     outcome = mistral_client.poll_batch(
         job.external_id, label=f"scan {job.scan_id} shard {job.shard_index}"
     )
+    if outcome.status in jobs.DEAD_JOB_STATUSES:
+        # The cancel deletes what the row names, and only the batch
+        # object names its two output files: name them first.
+        _name_outputs(job, outcome)
     jobs.apply_poll_outcome(
         job,
         outcome,
@@ -1374,6 +1378,34 @@ def _carry_files_left(
     _swap_quietly(job, carry)
 
 
+def _name_outputs(job: ExternalJob, outcome) -> None:
+    """Name a batch's two output files on the row as ``files_left``
+    before a write-off, whose cancel deletes what the row names and
+    nothing else: the output files are named by the batch object
+    alone, so a retried batch left them at Mistral before.
+
+    :param job: The row.
+    :param outcome: The poll's outcome, with the output file ids.
+    :return: None.
+    """
+    outputs = [
+        str(f)
+        for f in (
+            getattr(outcome, "output_file", None),
+            getattr(outcome, "error_file", None),
+        )
+        if f
+    ]
+    if not outputs:
+        return
+
+    def name(meta: dict) -> None:
+        kept = [str(f) for f in meta.get("files_left") or []]
+        meta["files_left"] = kept + [f for f in outputs if f not in kept]
+
+    _swap_quietly(job, name)
+
+
 def _name_before_delete(job: ExternalJob, files: list[str]) -> None:
     """Stamp the files about to be deleted on the row as ``files_left``
     and drop its ``files`` key, before the first delete call: a kill
@@ -1469,18 +1501,22 @@ def delete_leftover_files() -> int:
     return calls
 
 
-def note_lost_scan_files(scan) -> list[str]:
-    """Log the files a scan's rows still carry, before the rows go with
-    the scan (the admin deletion).
+def release_scan_files(scan) -> list[str]:
+    """Try once more to delete the files a scan's rows still carry,
+    before the rows go with the scan (the admin deletion), and log
+    what is left.
 
     A row deleted takes its ``files_left`` with it, and nothing would
-    name the pages at Mistral again. The abandon before this made one
-    delete call per file already, in the request, so another round
-    here would land nowhere a throttle just refused; the log line is
-    the one record that survives, for a person to finish.
+    name the pages at Mistral again. The abandon before this tried the
+    files of the rows that were in flight; a PENDING row a throttle
+    deferred and a COMPLETED row whose harvest was throttled carry
+    theirs for the sweep, which the deletion will not wait for. One
+    call per file, in the request like the abandon, and the ids no
+    delete reached are logged, the one record that survives, for a
+    person to finish.
 
     :param scan: The scan about to be deleted.
-    :returns: The ids the rows carry.
+    :returns: The ids no delete reached.
     :rtype: list[str]
     """
     lost = []
@@ -1490,9 +1526,10 @@ def note_lost_scan_files(scan) -> list[str]:
         provider_meta__has_key="files_left",
     )
     for job in rows:
-        lost += [
+        carried = [
             str(f) for f in (job.provider_meta or {}).get("files_left") or []
         ]
+        lost += _delete_files(carried)
     if lost:
         logger.warning(
             "scan %s: %d Mistral file(s) could not be deleted before the "
@@ -1563,6 +1600,7 @@ def _harvest_outcome(job: ExternalJob, outcome, now) -> str:
             exc.error_code,
             exc,
         )
+        _name_outputs(job, outcome)
         return jobs._retry_or_fail(job, exc.error_code, str(exc), now)
     if stored:
         return "completed"

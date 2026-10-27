@@ -1282,24 +1282,51 @@ class TestSubmitWave(ScanningTestCase):
         job.refresh_from_db()
         self.assertNotIn("files_left", job.provider_meta)
 
-    def test_the_admin_delete_logs_the_carried_files_it_loses(self):
-        # The rows go with the scan, and their files_left with them: the
-        # abandon just tried them, so the ids are logged and no call is
-        # made in the request.
+    def test_the_admin_delete_tries_the_carried_files_once_more(self):
+        # The rows go with the scan, and their files_left with them: a
+        # PENDING row a throttle deferred gets one last delete, and the
+        # ids it misses are logged.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
         job = extract_jobs(self.scan)[0]
         ExternalJob.objects.filter(pk=job.pk).update(
-            status=JobStatus.CANCELLED,
+            status=JobStatus.PENDING,
             provider_meta={"files_left": ["f0", "f1"]},
         )
         with (
-            patch("scanning.mistral_client.delete_file") as delete,
+            patch(
+                "scanning.mistral_client.delete_file",
+                side_effect=lambda file_id: _answer(
+                    {"f1": [busy]}.get(file_id, [True])
+                ),
+            ) as delete,
             self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
         ):
+            self.assertEqual(mistral_ocr.release_scan_files(self.scan), ["f1"])
+        self.assertEqual(
+            [c.args[0] for c in delete.call_args_list], ["f0", "f1"]
+        )
+        self.assertIn("f1", logs.output[-1])
+
+    def test_a_lost_claim_retry_loses_to_a_batch_id_written_meanwhile(self):
+        # The sweep judged the claim dead and the wave's thread wrote
+        # the batch id between that judgement and the retry: the retry
+        # matches on the id it read, none, and lands nowhere, so the
+        # batch is polled next tick instead of orphaned.
+        job = extract_jobs(self.scan)[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.SUBMITTED, external_id=""
+        )
+        job.refresh_from_db()
+        ExternalJob.objects.filter(pk=job.pk).update(external_id="batch-9")
+        with patch("scanning.mistral_client.cancel_batch") as cancel:
             self.assertEqual(
-                mistral_ocr.note_lost_scan_files(self.scan), ["f0", "f1"]
+                jobs._retry_or_fail(job, "LOST_CLAIM", "gone", timezone.now()),
+                "skipped",
             )
-        delete.assert_not_called()
-        self.assertIn("f0, f1", logs.output[0])
+        cancel.assert_not_called()
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.external_id, "batch-9")
 
     def test_an_abandon_cancels_the_batch_written_after_its_snapshot(self):
         # The wave's thread writes the batch id and its files between
@@ -1547,7 +1574,7 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
         self.assertTrue(any("carries them" in line for line in logs.output))
 
-    def test_a_harvest_names_every_file_until_the_last_is_gone(self):
+    def test_a_harvest_names_every_file_before_the_first_delete(self):
         # The completion writes the pages, the manifest and the two
         # output files as files_left, so a kill before the deletes
         # leaves them to the sweep; the key goes once they are gone.
@@ -1671,6 +1698,27 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.COMPLETED)
         self.assertEqual(self.job.provider_meta["output"]["failed_pages"], [1])
 
+    def test_a_dead_batch_names_its_output_files_before_the_cancel(self):
+        # Only the batch object names the two output files, and the
+        # cancel deletes what the row names: a failed batch's outputs
+        # go with its pages instead of staying at Mistral.
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.FAILED,
+            provider_status="FAILED",
+            output_file="out-1",
+            error_file="err-1",
+            error_code="BATCH_FAILED",
+            error_message="x",
+            retriable=False,
+            job={},
+        )
+        summary, mocks = self._sweep(outcome)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(self.job.status, JobStatus.FAILED)
+        deleted = [c.args[0] for c in mocks["delete"].call_args_list]
+        self.assertEqual(deleted, ["f0", "f1", "m1", "out-1", "err-1"])
+        self.assertNotIn("files_left", self.job.provider_meta)
+
     def test_a_lost_completion_still_deletes_the_output_files(self):
         # Another writer took the row between the poll and the
         # completion. Its cancel deletes the files the row names; the
@@ -1760,10 +1808,12 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.external_id, "")
         self.assertEqual(self.job.error_code, "NOT_FOUND")
         put.assert_not_called()
-        # The retry deletes what the dead attempt uploaded.
+        # The retry deletes what the dead attempt uploaded, and the
+        # output file the batch object named with it: a delete of a
+        # file already gone counts as gone.
         self.assertEqual(
             [call.args[0] for call in delete.call_args_list],
-            ["f0", "f1", "m1"],
+            ["f0", "f1", "m1", "out-1"],
         )
 
     def test_a_put_that_keeps_failing_ends_at_the_deadline(self):

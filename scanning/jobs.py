@@ -709,17 +709,25 @@ def _write(job: ExternalJob, **fields) -> bool:
     daemon-against-daemon is not the case being handled -- but this is
     also what makes a second replica safe if one is ever deployed.
 
+    The provider id is the second guard (#540): a Mistral wave's thread
+    writes the batch id of a claim up to the moment it ends, and the
+    lost-claim sweep, having judged that claim dead, retries the row
+    with the id it read, none. Matched on the id too, the retry lands
+    only while the row still has none, and a batch written meanwhile
+    is polled on the next tick instead of orphaned and paid for twice.
+
     On success the in-memory instance is updated too, so a caller can
     chain another :func:`_write` against the new status.
 
-    :param job: The row to update; its current ``status`` is the guard.
+    :param job: The row to update; its current ``status`` and
+        ``external_id`` are the guard.
     :param fields: Field values to write.
     :returns: True if this writer won the row.
     :rtype: bool
     """
-    updated = ExternalJob.objects.filter(pk=job.pk, status=job.status).update(
-        **fields
-    )
+    updated = ExternalJob.objects.filter(
+        pk=job.pk, status=job.status, external_id=job.external_id
+    ).update(**fields)
     if not updated:
         logger.info(
             "job %s (%s/%s shard %s) moved out of %s under us; skipping",
