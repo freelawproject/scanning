@@ -714,13 +714,20 @@ class TestSubmitWave(ScanningTestCase):
         with (
             patch.object(mistral_ocr, "UPLOAD_RETRIES", 3),
             patch.object(mistral_ocr, "UPLOAD_BACKOFF_SECONDS", 1.0),
-            patch.object(mistral_ocr, "_wait_out", side_effect=waits.append),
+            patch.object(
+                mistral_ocr,
+                "_wait_out",
+                side_effect=lambda seconds, abandoned: waits.append(seconds),
+            ),
             patch(
                 "scanning.mistral_client.upload_file",
                 side_effect=[busy, busy, busy, "f0"],
             ),
         ):
-            self.assertEqual(mistral_ocr._upload_page("x-", 0, b""), "f0")
+            self.assertEqual(
+                mistral_ocr._upload_page("x-", 0, b"", threading.Event()),
+                "f0",
+            )
         self.assertEqual(len(waits), 3)
         for tried, wait in enumerate(waits):
             self.assertGreaterEqual(wait, 2**tried)
@@ -748,6 +755,49 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(job.status, JobStatus.PENDING)
         self.assertEqual(job.attempt, 1)
         self.assertEqual(job.error_code, mistral_ocr.STOPPED_ERROR_CODE)
+
+    def test_a_refused_page_ends_a_throttled_one_s_tries_at_once(self):
+        # Three upload threads over six pages: page 1 is throttled on
+        # every try and would wait out a long backoff, page 2 is
+        # refused for good. The shard is abandoned, the throttled page
+        # lets go of its wait at once, the row fails, and the wave does
+        # not sit behind the tries.
+        download = self._six_page_shard()
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        landed = []
+        lock = threading.Lock()
+
+        def upload(name, content, purpose):
+            page = _page_of(name)
+            if page == 1:
+                raise busy
+            if page == 2:
+                time.sleep(0.05)
+                raise mistral_client.MistralError("bad", "HTTP_400", 400)
+            with lock:
+                landed.append(f"id-p{page}")
+            return f"id-p{page}"
+
+        started = time.monotonic()
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, workers=3, backoff=30.0
+        )
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.FAILED)
+        mocks["create"].assert_not_called()
+        self.assertEqual(
+            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            sorted(landed),
+        )
+        # The throttled page was tried once and let go, not retried.
+        tries = [
+            c
+            for c in mocks["upload"].call_args_list
+            if _page_of(c.args[0]) == 1
+        ]
+        self.assertEqual(len(tries), 1)
 
     def test_a_page_queued_behind_a_stop_never_uploads(self):
         # One upload thread and a backlog of two, so a page is queued

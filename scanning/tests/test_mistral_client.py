@@ -51,7 +51,6 @@ class TestEnabled(SimpleTestCase):
     def test_no_key_means_off(self):
         self.assertFalse(mistral_client.enabled())
 
-    @override_settings(**{**MISTRAL, "MISTRAL_API_KEY": ""})
     @override_settings(**MISTRAL)
     def test_the_client_is_built_once_per_thread_and_key(self):
         # Two calls on one thread share the client; another thread and
@@ -78,6 +77,7 @@ class TestEnabled(SimpleTestCase):
             [b["api_key"] for b in built], ["key-1", "key-1", "key-2"]
         )
 
+    @override_settings(**{**MISTRAL, "MISTRAL_API_KEY": ""})
     def test_the_client_refuses_to_build_without_a_key(self):
         with self.assertRaises(mistral_client.MistralError) as ctx:
             mistral_client.client()

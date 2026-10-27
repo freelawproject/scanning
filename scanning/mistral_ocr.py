@@ -88,6 +88,7 @@ import logging
 import random
 import re
 import tempfile
+import threading
 import time
 from collections.abc import Iterator
 from concurrent.futures import (
@@ -254,6 +255,11 @@ STOPPED_ERROR_CODE = "SHUTDOWN"
 
 class SubmitStopped(Exception):
     """The worker was told to stop while it uploaded a shard (#534)."""
+
+
+class _ShardAbandoned(Exception):
+    """The shard this page belongs to failed on another page, so the
+    upload thread lets go of it rather than finishing its tries."""
 
 
 # ── switches and rows ───────────────────────────────────────────────
@@ -515,30 +521,36 @@ def _manifest_line(page_no: int, file_id: str, model: str) -> str:
     )
 
 
-def _upload_page(prefix: str, page_no: int, png: bytes) -> str:
+def _upload_page(
+    prefix: str, page_no: int, png: bytes, abandoned: threading.Event
+) -> str:
     """Upload one rendered page. Runs on an upload thread.
 
     A throttled upload (:class:`mistral_client.MistralBusy`) is tried
     again up to :data:`UPLOAD_RETRIES` times, after
     :data:`UPLOAD_BACKOFF_SECONDS` doubled at each try plus a little
     jitter, so eight threads throttled at once do not knock again as
-    one. The stop flag (#534) is read before every try and while the
-    page waits: a page queued behind a stop never uploads, and a
-    shutdown never waits out a backoff.
+    one. The stop flag (#534) and the shard's ``abandoned`` event are
+    read before every try and while the page waits: a page queued
+    behind a stop never uploads, a shutdown never waits out a backoff,
+    and a shard another page failed is let go of rather than tried
+    again for a minute while the wave waits on the pool.
 
     :param prefix: The attempt's file prefix (:func:`file_prefix`).
     :param page_no: Shard-local page.
     :param png: The canonical render.
+    :param abandoned: Set by the wave once the shard failed.
     :returns: The file id.
     :rtype: str
     :raises MistralError: The classified failure; a 429 only once the
         tries are spent.
     :raises SubmitStopped: If a stop was asked for.
+    :raises _ShardAbandoned: If the shard failed on another page.
     """
     name = f"{prefix}{custom_id(page_no)}.png"
     tried = 0
     while True:
-        _stop_if_asked()
+        _bail_if_asked(abandoned)
         try:
             return mistral_client.upload_file(name, png, PAGE_FILE_PURPOSE)
         except mistral_client.MistralBusy as exc:
@@ -553,20 +565,36 @@ def _upload_page(prefix: str, page_no: int, png: bytes) -> str:
                 exc,
                 delay,
             )
-            _wait_out(delay)
+            _wait_out(delay, abandoned)
             tried += 1
 
 
-def _wait_out(seconds: float) -> None:
-    """Sleep for ``seconds``, reading the stop flag as it goes.
+def _bail_if_asked(abandoned: threading.Event) -> None:
+    """Raise when the worker is stopping or the shard was let go.
+
+    :param abandoned: The shard's event.
+    :return: None.
+    :raises SubmitStopped: If a stop was asked for.
+    :raises _ShardAbandoned: If the shard failed on another page.
+    """
+    _stop_if_asked()
+    if abandoned.is_set():
+        raise _ShardAbandoned("the shard failed on another page")
+
+
+def _wait_out(seconds: float, abandoned: threading.Event) -> None:
+    """Sleep for ``seconds``, reading the stop flag and the shard's
+    event as it goes.
 
     :param seconds: How long to wait.
+    :param abandoned: The shard's event.
     :return: None.
     :raises SubmitStopped: If a stop was asked for meanwhile.
+    :raises _ShardAbandoned: If the shard failed meanwhile.
     """
     until = time.monotonic() + seconds
     while True:
-        _stop_if_asked()
+        _bail_if_asked(abandoned)
         left = until - time.monotonic()
         if left <= 0:
             return
@@ -646,8 +674,11 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     manifest and before the create (#534): a whole shard is a minute or
     more of uploads, and a kill in the middle leaves unredacted pages
     at Mistral. The pages not started are dropped, a queued one starts
-    and stops at once, the ones running finish, every file that landed
-    goes, and :class:`SubmitStopped` hands the row back.
+    and stops at once, one waiting out a 429 lets go, the ones
+    mid-upload finish, every file that landed goes, and
+    :class:`SubmitStopped` hands the row back. A page refused for good
+    ends the shard the same way, through the shard's ``abandoned``
+    event, so a throttled page never holds the wave for its tries.
 
     :param job: The claimed row.
     :returns: The submission.
@@ -659,6 +690,7 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     prefix = file_prefix(job)
     pages: list[tuple[int, Future]] = []
     tail: list[str] = []
+    abandoned = threading.Event()
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -687,14 +719,20 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
                             (
                                 page_no,
                                 uploads.submit(
-                                    _upload_page, prefix, page_no, png
+                                    _upload_page,
+                                    prefix,
+                                    page_no,
+                                    png,
+                                    abandoned,
                                 ),
                             )
                         )
                 except BaseException:
-                    # The pages not started are dropped; the pool's
-                    # exit waits for the ones running, so every id
-                    # that will exist is known when the files go.
+                    # The pages not started are dropped and the ones
+                    # waiting out a 429 let go; the pool's exit waits
+                    # for the ones mid-upload, so every id that will
+                    # exist is known when the files go.
+                    abandoned.set()
                     for _, future in pages:
                         future.cancel()
                     raise
