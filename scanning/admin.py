@@ -77,12 +77,14 @@ def _release_scan_external_work(scan):
 
     :param scan: The scan about to be deleted.
     """
-    from scanning import jobs, s3_sync
+    from scanning import jobs, mistral_ocr, s3_sync
 
     try:
         # Unscoped deliberately, unlike the re-queue: the scan is going
         # away, so no stage of it is worth keeping alive.
         jobs.abandon_open(scan, "Scan deleted from the admin")
+        # The files a Mistral row still carries go with the row (#540).
+        mistral_ocr.release_scan_files(scan)
     except Exception:
         logger.warning(
             "Could not cancel the external jobs of scan %s before "

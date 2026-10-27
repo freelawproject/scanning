@@ -5014,6 +5014,14 @@ class ExternalJob(AbstractDateTimeModel):
             ),
         ]
         indexes = [
+            # The rows that still name a file at Mistral (#540): the
+            # sweep asks every tick, and a row names one rarely, so the
+            # index holds a handful of rows and the ask reads no other.
+            models.Index(
+                fields=["id"],
+                name="idx_externaljob_files_left",
+                condition=models.Q(provider_meta__has_key="files_left"),
+            ),
             # The daemon's hot query: everything still open, and which
             # of those is past its deadline.
             models.Index(

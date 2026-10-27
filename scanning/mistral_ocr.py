@@ -607,11 +607,14 @@ class _Uploads:
         when it is done, so the PNGs in memory are bounded by the wave.
     :ivar left: Per row, the file ids a submission could not delete,
         for the main thread to stamp on the row as ``files_left``.
+    :ivar tried: Per row, every file id the submission tried to
+        delete, so the stamp takes only those off the row.
     """
 
     pool: ThreadPoolExecutor
     slots: threading.Semaphore
     left: dict[int, list[str]] = field(default_factory=dict)
+    tried: dict[int, list[str]] = field(default_factory=dict)
 
 
 def _upload_page(
@@ -845,9 +848,10 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     pages: list[tuple[int, Future]] = []
     tail: list[str] = []
     abandoned = threading.Event()
-    left = _delete_files(
-        [str(f) for f in (job.provider_meta or {}).get("files_left") or []]
-    )
+    carried = [
+        str(f) for f in (job.provider_meta or {}).get("files_left") or []
+    ]
+    left = _delete_files(carried)
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -916,8 +920,11 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             timeout_hours=BATCH_TIMEOUT_HOURS,
         )
     except Exception:
-        uploads.left[job.pk] = left + _delete_files(_uploaded(pages) + tail)
+        landed = _uploaded(pages) + tail
+        uploads.tried[job.pk] = carried + landed
+        uploads.left[job.pk] = left + _delete_files(landed)
         raise
+    uploads.tried[job.pk] = carried
     uploads.left[job.pk] = left
     return _Submission(
         job_id=job_id,
@@ -943,6 +950,7 @@ def _apply_outcome(
     submission: _Submission | None,
     now,
     left: list[str] | None = None,
+    tried: list[str] | None = None,
 ) -> str:
     """Record what one shard's submission came to.
 
@@ -973,13 +981,15 @@ def _apply_outcome(
     :param submission: The submission on success.
     :param now: Current time.
     :param left: The file ids the thread could not delete.
+    :param tried: Every file id the thread tried to delete.
     :returns: One of ``"submitted"``, ``"deferred"``, ``"retried"``,
         ``"failed"``, ``"skipped"``.
     :rtype: str
     """
     left = [str(f) for f in left or []]
+    tried = [str(f) for f in tried or []] or left
     if left and (exc is not None or submission is None):
-        _carry_files_left(job, left)
+        _carry_files_left(job, tried, left)
     elif left:
         logger.warning(
             "job %s (scan %s shard %s): %d file(s) could not be deleted at "
@@ -1142,6 +1152,7 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
                         submission,
                         timezone.now(),
                         left=uploads.left.get(job.pk),
+                        tried=uploads.tried.get(job.pk),
                     )
                 except Exception:  # noqa: BLE001 - the wave goes on
                     # A database fault: the row keeps its claim and the
@@ -1313,17 +1324,31 @@ def discard_lost_files(job: ExternalJob) -> int:
     carried = [
         str(f) for f in (job.provider_meta or {}).get("files_left") or []
     ]
-    _carry_files_left(job, _delete_files(found + carried))
+    tried = found + carried
+    _carry_files_left(job, tried, _delete_files(tried))
     return len(found)
 
 
-def _carry_files_left(job: ExternalJob, left: list[str]) -> None:
+def _carry_files_left(
+    job: ExternalJob,
+    tried: list[str],
+    left: list[str],
+    *,
+    drop_files: bool = False,
+) -> None:
     """Stamp the files a delete could not reach on the row, as
-    ``files_left``, in place of the ids it carried before: every caller
-    tried those too, so what is left is the whole of it.
+    ``files_left``: the ids this caller tried come off the list the
+    row carries and the ones it could not reach go on, so two callers
+    at once (the wave's thread and an admin's abandon, the lost-claim
+    sweep and a thread that outlived its session) each keep the
+    other's. A list left empty drops the key.
 
     :param job: The row.
-    :param left: The ids no delete reached; none drops the key.
+    :param tried: Every id this caller tried.
+    :param left: The ids among them no delete reached.
+    :param drop_files: Whether the row's ``files`` were among the
+        tried, so the key goes with them: a write-off, after which the
+        next write-off would delete them again.
     :return: None.
     """
     if left:
@@ -1335,14 +1360,26 @@ def _carry_files_left(job: ExternalJob, left: list[str]) -> None:
             job.shard_index,
             len(left),
         )
-    elif "files_left" not in (job.provider_meta or {}):
+    meta = job.provider_meta or {}
+    if (
+        not left
+        and "files_left" not in meta
+        and not (drop_files and "files" in meta)
+    ):
         return
+    gone = set(tried) - set(left)
 
     def carry(meta: dict) -> None:
-        if left:
-            meta["files_left"] = list(left)
+        kept = [
+            str(f) for f in meta.get("files_left") or [] if str(f) not in gone
+        ]
+        kept += [f for f in left if f not in kept]
+        if kept:
+            meta["files_left"] = kept
         else:
             meta.pop("files_left", None)
+        if drop_files:
+            meta.pop("files", None)
 
     jobs.swap_provider_meta(job, carry)
 
@@ -1387,9 +1424,52 @@ def delete_leftover_files() -> int:
                 job.shard_index,
                 len(carried),
             )
-        _carry_files_left(job, left)
+        try:
+            _carry_files_left(job, carried, left)
+        except Exception:  # noqa: BLE001 - a row deleted meanwhile
+            logger.warning(
+                "job %s: could not stamp its carried Mistral files; the "
+                "row may be gone",
+                job.pk,
+                exc_info=True,
+            )
         tried += 1
     return tried
+
+
+def release_scan_files(scan) -> list[str]:
+    """Try once more to delete the files a scan's rows still carry,
+    before the rows go with the scan (the admin deletion).
+
+    A row deleted takes its ``files_left`` with it, and nothing would
+    name the pages at Mistral again, so this is their last delete: one
+    call each, in the request like the abandon before it, and the ids
+    it could not reach are logged, the one record that survives.
+
+    :param scan: The scan about to be deleted.
+    :returns: The ids no delete reached.
+    :rtype: list[str]
+    """
+    lost = []
+    rows = ExternalJob.objects.filter(
+        scan=scan,
+        provider=JobProvider.MISTRAL,
+        provider_meta__has_key="files_left",
+    )
+    for job in rows:
+        carried = [
+            str(f) for f in (job.provider_meta or {}).get("files_left") or []
+        ]
+        lost += _delete_files(carried)
+    if lost:
+        logger.warning(
+            "scan %s: %d Mistral file(s) could not be deleted before the "
+            "scan's rows go, and no row will name them again: %s",
+            getattr(scan, "pk", scan),
+            len(lost),
+            ", ".join(lost),
+        )
+    return lost
 
 
 def _poll_due(job: ExternalJob, now) -> bool:
@@ -1619,7 +1699,7 @@ def harvest(
                 len(left),
             )
         return False
-    _carry_files_left(job, _delete_files(files + outputs))
+    _carry_files_left(job, files + outputs, _delete_files(files + outputs))
     return True
 
 
@@ -1637,18 +1717,20 @@ def cancel_job(
     :param job_id: The batch job id, or none.
     :param files: The file ids to delete; defaults to the row's own
         ``provider_meta["files"]`` plus the ``files_left`` an earlier
-        delete could not reach, because a write-off is the last delete
-        the row gets.
+        delete could not reach. Either way the row's ``files`` key goes:
+        every id of it was tried, and a row retried keeps its meta, so
+        the key would send the next write-off deleting them again.
     :return: None.
     """
     if job_id:
         mistral_client.cancel_batch(job_id)
+    meta = job.provider_meta or {}
     if files is None:
-        meta = job.provider_meta or {}
         files = [str(f) for f in meta.get("files") or []] + [
             str(f) for f in meta.get("files_left") or []
         ]
-    _carry_files_left(job, _delete_files(files))
+    files = [str(f) for f in files]
+    _carry_files_left(job, files, _delete_files(files), drop_files=True)
 
 
 # ── the glue ────────────────────────────────────────────────────────

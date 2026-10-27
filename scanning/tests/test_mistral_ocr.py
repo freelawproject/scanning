@@ -1051,8 +1051,8 @@ class TestSubmitWave(ScanningTestCase):
         seen = []
         real = mistral_ocr._apply_outcome
 
-        def spy(job, exc, submission, now, left=None):
-            result = real(job, exc, submission, now, left=left)
+        def spy(job, exc, submission, now, **kwargs):
+            result = real(job, exc, submission, now, **kwargs)
             if job.pk == rows[0].pk:
                 first_applied.set()
             return result
@@ -1227,7 +1227,7 @@ class TestSubmitWave(ScanningTestCase):
         # key once they are gone.
         job = extract_jobs(self.scan)[0]
         ExternalJob.objects.filter(pk=job.pk).update(
-            provider_meta={"files_left": ["f0", "f1"]}
+            provider_meta={"files": ["e0"], "files_left": ["f0", "f1"]}
         )
         job.refresh_from_db()
         with (
@@ -1238,10 +1238,59 @@ class TestSubmitWave(ScanningTestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.FAILED)
         self.assertEqual(
-            [c.args[0] for c in delete.call_args_list], ["f0", "f1"]
+            [c.args[0] for c in delete.call_args_list], ["e0", "f0", "f1"]
         )
         cancel.assert_not_called()
+        # Both keys go: the next write-off of a retried row would
+        # delete the files again otherwise.
         self.assertNotIn("files_left", job.provider_meta)
+        self.assertNotIn("files", job.provider_meta)
+
+    def test_two_carriers_keep_each_others_files(self):
+        # Each carry takes off only what its caller tried and adds what
+        # it could not reach, so the wave's thread and an abandon that
+        # carry at once drop neither's ids.
+        job = extract_jobs(self.scan)[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            provider_meta={"files": ["e0"], "files_left": ["a", "b"]}
+        )
+        job.refresh_from_db()
+        mistral_ocr._carry_files_left(job, ["a"], [])
+        self.assertEqual(job.provider_meta["files_left"], ["b"])
+        with self.assertLogs("scanning.mistral_ocr", "WARNING"):
+            mistral_ocr._carry_files_left(job, ["c", "d"], ["c"])
+        self.assertEqual(job.provider_meta["files_left"], ["b", "c"])
+        self.assertEqual(job.provider_meta["files"], ["e0"])
+        mistral_ocr._carry_files_left(
+            job, ["e0", "b", "c"], [], drop_files=True
+        )
+        job.refresh_from_db()
+        self.assertNotIn("files_left", job.provider_meta)
+        self.assertNotIn("files", job.provider_meta)
+
+    def test_the_admin_delete_tries_the_carried_files_once_more(self):
+        # The rows go with the scan, and their files_left with them:
+        # one last delete, and the ids it misses are logged.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        job = extract_jobs(self.scan)[0]
+        ExternalJob.objects.filter(pk=job.pk).update(
+            status=JobStatus.CANCELLED,
+            provider_meta={"files_left": ["f0", "f1"]},
+        )
+        with (
+            patch(
+                "scanning.mistral_client.delete_file",
+                side_effect=lambda file_id: _answer(
+                    {"f1": [busy]}.get(file_id, [True])
+                ),
+            ) as delete,
+            self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
+        ):
+            self.assertEqual(mistral_ocr.release_scan_files(self.scan), ["f1"])
+        self.assertEqual(
+            [c.args[0] for c in delete.call_args_list], ["f0", "f1"]
+        )
+        self.assertIn("f1", logs.output[0])
 
     def test_the_in_flight_cap_holds_a_tick_back(self):
         scan = ScanFactory()
@@ -1496,6 +1545,24 @@ class TestSweep(ScanningTestCase):
         )
         in_flight.refresh_from_db()
         self.assertEqual(in_flight.provider_meta["files_left"], ["g0"])
+
+    def test_the_sweep_survives_a_row_deleted_under_it(self):
+        # The row goes between the pass's select and its stamp: the
+        # stamp fails, the tick logs it and ends as it should.
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.COMPLETED, provider_meta={"files_left": ["f1"]}
+        )
+
+        def delete(file_id):
+            ExternalJob.objects.filter(pk=self.job.pk).delete()
+            return True
+
+        with (
+            patch("scanning.mistral_client.delete_file", side_effect=delete),
+            self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
+        ):
+            jobs.sweep_jobs()
+        self.assertIn("may be gone", logs.output[-1])
 
     def test_a_page_no_line_names_is_a_hole(self):
         outcome = mistral_client.BatchOutcome(
