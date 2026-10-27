@@ -61,8 +61,9 @@ Mistral, and must not be broken:
 - **The wave blocks the serial scheduler, so it takes one shard per
   tick** (``MAX_SUBMITS_PER_TICK``). A full shard is a minute or more
   of render and upload, the pages uploaded ``UPLOAD_WORKERS`` at a
-  time; the in-flight cap (``MAX_CONCURRENCY``) is a separate number,
-  so a volume keeps draining while its batches wait.
+  time, a throttled page tried again on its own thread
+  (``UPLOAD_RETRIES``); the in-flight cap (``MAX_CONCURRENCY``) is a
+  separate number, so a volume keeps draining while its batches wait.
 - **A job nothing will read is cancelled, and its files deleted.**
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
@@ -84,6 +85,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import random
 import re
 import tempfile
 import time
@@ -178,6 +180,21 @@ UPLOAD_WORKERS = 8
 #: pauses, read at call time like the worker count: a stalled network
 #: must not leave a whole shard of PNGs in memory, megabytes each.
 UPLOAD_BACKLOG = 2 * UPLOAD_WORKERS
+
+#: How many times a throttled page upload (a 429) is tried again before
+#: the refusal reaches the wave, and the first wait between two tries,
+#: doubled at each. Eight uploads at once reach a workspace's request
+#: rate sooner than one did, and a 429 that reaches the wave deletes
+#: every page of the shard that landed and uploads them all again on
+#: the next tick. A page waits on its own thread, so the pool thins
+#: itself while the limit holds; past the last try the 429 defers the
+#: row as before.
+UPLOAD_RETRIES = 5
+UPLOAD_BACKOFF_SECONDS = 2.0
+
+#: How often a waiting upload thread reads the stop flag (#534), so a
+#: shutdown never waits out a backoff.
+STOP_POLL_SECONDS = 0.5
 
 #: The lock the wave holds from its claim to the write of the batch id
 #: (#534), in both modes. A claimed row with no batch id is alive while
@@ -501,16 +518,59 @@ def _manifest_line(page_no: int, file_id: str, model: str) -> str:
 def _upload_page(prefix: str, page_no: int, png: bytes) -> str:
     """Upload one rendered page. Runs on an upload thread.
 
+    A throttled upload (:class:`mistral_client.MistralBusy`) is tried
+    again up to :data:`UPLOAD_RETRIES` times, after
+    :data:`UPLOAD_BACKOFF_SECONDS` doubled at each try plus a little
+    jitter, so eight threads throttled at once do not knock again as
+    one. The stop flag (#534) is read before every try and while the
+    page waits: a page queued behind a stop never uploads, and a
+    shutdown never waits out a backoff.
+
     :param prefix: The attempt's file prefix (:func:`file_prefix`).
     :param page_no: Shard-local page.
     :param png: The canonical render.
     :returns: The file id.
     :rtype: str
-    :raises MistralError: The classified failure.
+    :raises MistralError: The classified failure; a 429 only once the
+        tries are spent.
+    :raises SubmitStopped: If a stop was asked for.
     """
-    return mistral_client.upload_file(
-        f"{prefix}{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
-    )
+    name = f"{prefix}{custom_id(page_no)}.png"
+    tried = 0
+    while True:
+        _stop_if_asked()
+        try:
+            return mistral_client.upload_file(name, png, PAGE_FILE_PURPOSE)
+        except mistral_client.MistralBusy as exc:
+            if tried >= UPLOAD_RETRIES:
+                raise
+            delay = UPLOAD_BACKOFF_SECONDS * 2**tried + random.uniform(
+                0, UPLOAD_BACKOFF_SECONDS
+            )
+            logger.info(
+                "%s was throttled (%s); trying again in %.1f s",
+                name,
+                exc,
+                delay,
+            )
+            _wait_out(delay)
+            tried += 1
+
+
+def _wait_out(seconds: float) -> None:
+    """Sleep for ``seconds``, reading the stop flag as it goes.
+
+    :param seconds: How long to wait.
+    :return: None.
+    :raises SubmitStopped: If a stop was asked for meanwhile.
+    """
+    until = time.monotonic() + seconds
+    while True:
+        _stop_if_asked()
+        left = until - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(left, STOP_POLL_SECONDS))
 
 
 def _uploaded(pages: list[tuple[int, Future]]) -> list[str]:
@@ -581,11 +641,13 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     order the uploads finished in changes nothing Mistral sees.
 
     A stop request (``stopping.requested``) is read before every page
-    is handed over, before the manifest and before the create (#534):
-    a whole shard is a minute or more of uploads, and a kill in the
-    middle leaves unredacted pages at Mistral. The pages not started
-    are dropped, the ones running finish, every file that landed goes,
-    and :class:`SubmitStopped` hands the row back.
+    is handed over, again once the backlog let it through, at the start
+    of every upload and while a throttled one waits, before the
+    manifest and before the create (#534): a whole shard is a minute or
+    more of uploads, and a kill in the middle leaves unredacted pages
+    at Mistral. The pages not started are dropped, a queued one starts
+    and stops at once, the ones running finish, every file that landed
+    goes, and :class:`SubmitStopped` hands the row back.
 
     :param job: The claimed row.
     :returns: The submission.
@@ -615,6 +677,9 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
                     ):
                         _stop_if_asked()
                         _hold_back(pages)
+                        # The backlog may have held the render for as
+                        # long as an upload takes, so read it again.
+                        _stop_if_asked()
                         failed = _first_failure(pages)
                         if failed is not None:
                             raise failed

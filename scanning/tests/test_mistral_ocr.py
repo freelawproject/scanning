@@ -338,10 +338,13 @@ class TestSubmitWave(ScanningTestCase):
         upload_error=None,
         create_error=None,
         workers=1,
+        backoff=0.0,
     ):
         # One upload thread unless a test asks for more: the
         # side-effect lists above answer the calls in the order they
-        # are made, which only a serial pool keeps in page order.
+        # are made, which only a serial pool keeps in page order. No
+        # wait between two tries of a throttled page unless a test
+        # asks for one.
         patches = [
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch(
@@ -361,6 +364,7 @@ class TestSubmitWave(ScanningTestCase):
             patch("scanning.mistral_client.cancel_batch"),
             patch.object(mistral_ocr, "UPLOAD_WORKERS", workers),
             patch.object(mistral_ocr, "UPLOAD_BACKLOG", 2 * workers),
+            patch.object(mistral_ocr, "UPLOAD_BACKOFF_SECONDS", backoff),
         ]
         mocks = []
         for patcher in patches:
@@ -439,8 +443,10 @@ class TestSubmitWave(ScanningTestCase):
 
         summary, mocks = self._tick(upload_error=upload)
 
+        # The page rendered meanwhile is either never handed over or
+        # starts in the pool and stops at once: one upload, no more.
         self.assertEqual(summary.deferred, 1)
-        self.assertLessEqual(len(uploaded), 2)
+        self.assertEqual(len(uploaded), 1)
         self.assertTrue(all(name.endswith(".png") for name in uploaded))
         mocks["create"].assert_not_called()
         self.assertEqual(
@@ -659,14 +665,12 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.PENDING)
 
     def test_a_rate_limit_defers_and_deletes_the_uploads(self):
-        # The first page uploaded, the second was declined: nothing is
-        # wrong with the job, so the attempt is intact and the orphan
-        # file is deleted.
+        # The first page uploaded, the second was declined on every
+        # try: nothing is wrong with the job, so the attempt is intact
+        # and the orphan file is deleted.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
         summary, mocks = self._tick(
-            upload_error=[
-                "f0",
-                mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429),
-            ]
+            upload_error=["f0"] + [busy] * (mistral_ocr.UPLOAD_RETRIES + 1)
         )
         self.assertEqual(summary.deferred, 1)
         job = extract_jobs(self.scan)[0]
@@ -675,6 +679,101 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(job.error_code, "RATE_LIMITED")
         mocks["delete"].assert_called_once_with("f0")
         mocks["create"].assert_not_called()
+        self.assertEqual(
+            mocks["upload"].call_count, 2 + mistral_ocr.UPLOAD_RETRIES
+        )
+
+    def test_a_throttled_page_is_tried_again_and_the_shard_goes_on(self):
+        # The second page is declined twice and then taken: the page
+        # waited on its own thread, the shard was not thrown away, and
+        # the batch names both pages.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        summary, mocks = self._tick(
+            upload_error=["f0", busy, busy, "f1", "m1"]
+        )
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(mocks["upload"].call_count, 5)
+        mocks["delete"].assert_not_called()
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.external_id, "batch-1")
+        self.assertEqual(job.provider_meta["files"], ["f0", "f1", "m1"])
+        manifest = mocks["upload"].call_args_list[-1].args[1].decode()
+        self.assertEqual(
+            [
+                json.loads(line)["body"]["document"]["file_id"]
+                for line in manifest.splitlines()
+            ],
+            ["f0", "f1"],
+        )
+
+    def test_the_backoff_doubles_between_tries(self):
+        # Each wait is the base doubled per try, plus a jitter under one
+        # base, and the stop flag is read as it goes.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        waits = []
+        with (
+            patch.object(mistral_ocr, "UPLOAD_RETRIES", 3),
+            patch.object(mistral_ocr, "UPLOAD_BACKOFF_SECONDS", 1.0),
+            patch.object(mistral_ocr, "_wait_out", side_effect=waits.append),
+            patch(
+                "scanning.mistral_client.upload_file",
+                side_effect=[busy, busy, busy, "f0"],
+            ),
+        ):
+            self.assertEqual(mistral_ocr._upload_page("x-", 0, b""), "f0")
+        self.assertEqual(len(waits), 3)
+        for tried, wait in enumerate(waits):
+            self.assertGreaterEqual(wait, 2**tried)
+            self.assertLess(wait, 2**tried + 1)
+
+    def test_a_stop_during_a_backoff_hands_the_row_back_at_once(self):
+        # The first page is throttled and the worker is told to stop
+        # while it waits: the wait ends at once, nothing more uploads,
+        # and the row goes back with its attempt intact.
+        self.addCleanup(stopping.reset)
+
+        def upload(name, content, purpose):
+            stopping.request()
+            raise mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+
+        started = time.monotonic()
+        summary, mocks = self._tick(upload_error=upload, backoff=30.0)
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(summary.deferred, 1)
+        self.assertEqual(mocks["upload"].call_count, 1)
+        mocks["create"].assert_not_called()
+        mocks["delete"].assert_not_called()
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, mistral_ocr.STOPPED_ERROR_CODE)
+
+    def test_a_page_queued_behind_a_stop_never_uploads(self):
+        # One upload thread and a backlog of two, so a page is queued
+        # behind the one uploading; the upload of the first page asks
+        # for the stop, and the queued page starts and stops at once
+        # rather than uploading after the stop.
+        self.addCleanup(stopping.reset)
+        download = self._six_page_shard()
+        uploaded = []
+
+        def upload(name, content, purpose):
+            uploaded.append(name)
+            time.sleep(0.05)
+            stopping.request()
+            return name
+
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, workers=1
+        )
+
+        self.assertEqual(summary.deferred, 1)
+        self.assertEqual(uploaded, [uploaded[0]])
+        mocks["create"].assert_not_called()
+        self.assertEqual(
+            [c.args[0] for c in mocks["delete"].call_args_list], uploaded
+        )
 
     def test_a_transient_create_failure_retries_and_deletes(self):
         summary, mocks = self._tick(

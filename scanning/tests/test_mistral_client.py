@@ -8,6 +8,7 @@ line is handed back whole.
 """
 
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, override_settings
@@ -51,6 +52,32 @@ class TestEnabled(SimpleTestCase):
         self.assertFalse(mistral_client.enabled())
 
     @override_settings(**{**MISTRAL, "MISTRAL_API_KEY": ""})
+    @override_settings(**MISTRAL)
+    def test_the_client_is_built_once_per_thread_and_key(self):
+        # Two calls on one thread share the client; another thread and
+        # another key each build their own.
+        built = []
+
+        def sdk(**kwargs):
+            built.append(kwargs)
+            return MagicMock()
+
+        with patch("mistralai.client.Mistral", side_effect=sdk):
+            first = mistral_client.client()
+            self.assertIs(mistral_client.client(), first)
+            seen = []
+            thread = threading.Thread(
+                target=lambda: seen.append(mistral_client.client())
+            )
+            thread.start()
+            thread.join()
+            self.assertIsNot(seen[0], first)
+            with override_settings(MISTRAL_API_KEY="key-2"):
+                self.assertIsNot(mistral_client.client(), first)
+        self.assertEqual(
+            [b["api_key"] for b in built], ["key-1", "key-1", "key-2"]
+        )
+
     def test_the_client_refuses_to_build_without_a_key(self):
         with self.assertRaises(mistral_client.MistralError) as ctx:
             mistral_client.client()

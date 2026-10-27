@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -162,8 +163,18 @@ def model() -> str:
     return settings.MISTRAL_MODEL
 
 
+#: One SDK client per thread, built on the thread's first call and
+#: kept for its life, keyed by the API key it was built with. The SDK's
+#: client holds an HTTP connection pool, so a client per call pays a
+#: TLS handshake per page: an upload thread of the wave now pays one
+#: per shard. Thread-local rather than process-wide, because the SDK
+#: promises nothing about a client shared across threads, and a
+#: forked worker never inherits one from its parent's other threads.
+_local = threading.local()
+
+
 def client():
-    """Return an SDK client bound to the configured key.
+    """Return the SDK client of this thread, bound to the configured key.
 
     Imported here, not at module level: the daemon and the web pod load
     this module through the provider table whether or not the stage is
@@ -173,17 +184,20 @@ def client():
     :returns: A ``mistralai`` client.
     :raises MistralError: If the key is unset.
     """
-    if not settings.MISTRAL_API_KEY:
+    key = settings.MISTRAL_API_KEY
+    if not key:
         raise MistralError(
             "MISTRAL_API_KEY is not set", error_code="NOT_CONFIGURED"
         )
+    if getattr(_local, "key", None) == key:
+        return _local.client
     try:
         from mistralai import Mistral
     except ImportError:  # 2.x namespace layout
         from mistralai.client import Mistral
-    return Mistral(
-        api_key=settings.MISTRAL_API_KEY, timeout_ms=REQUEST_TIMEOUT * 1000
-    )
+    _local.client = Mistral(api_key=key, timeout_ms=REQUEST_TIMEOUT * 1000)
+    _local.key = key
+    return _local.client
 
 
 def classify(exc: Exception) -> MistralError:
