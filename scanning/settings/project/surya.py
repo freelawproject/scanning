@@ -52,10 +52,7 @@ RUNPOD_SURYA_ENDPOINT_ID = env.str("RUNPOD_SURYA_ENDPOINT_ID", default="")
 # one submit tick claims. Bounded by this endpoint's own scaling, since
 # each endpoint has its own worker pool. The worker README asks for a
 # ``max_workers`` of at least this value, or the extra rows wait in the
-# provider's queue with the ceiling clock running on them (the corpus
-# read of October 2026 raised it from 8 to 16, with the endpoint's
-# ``max_workers`` at 16 first, because the portal does nothing with a
-# shard while RunPod reads it).
+# provider's queue with the ceiling clock running on them.
 SURYA_MAX_CONCURRENCY = env.int("SURYA_MAX_CONCURRENCY", default=16)
 
 # Attempts per shard before its job is failed. Serverless workers are
@@ -72,4 +69,4 @@ SURYA_MAX_ATTEMPTS = env.int("SURYA_MAX_ATTEMPTS", default=3)
 # (2.9 s a page) on one 24 GB card, and the kit measured about 3 s a
 # page on an A40; a page whose answer loops pays surya's 12288-token
 # ladder on top. Measure a shard of 100 pages and change this then.
-SURYA_SECONDS_PER_PAGE = env.float("SURYA_SECONDS_PER_PAGE", default=4.0)
+SURYA_SECONDS_PER_PAGE = env.float("SURYA_SECONDS_PER_PAGE", default=5.0)
