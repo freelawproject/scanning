@@ -437,29 +437,29 @@ def find_files(prefix: str) -> list[str]:
     For the files a killed submit uploaded and never named on its row
     (#534). Mistral's ``search`` narrows the listing, and the prefix is
     checked here again, so a looser match at Mistral deletes nothing it
-    should not. Best effort, never raises.
+    should not. A listing that fails raises, because a partial list
+    read as the whole would hand the row on with its other files
+    unnamed for good: the caller leaves the row for the next tick.
 
     :param prefix: The start of the file names.
     :returns: The ids found, possibly none.
     :rtype: list[str]
+    :raises MistralError: If a page of the listing could not be read.
     """
     found: list[str] = []
-    try:
-        for page in range(LIST_MAX_PAGES):
-            listing = _call(
-                client().files.list,
-                page=page,
-                page_size=LIST_PAGE_SIZE,
-                search=prefix,
-            )
-            data = list(listing.data or [])
-            found.extend(
-                str(item.id)
-                for item in data
-                if str(item.filename or "").startswith(prefix)
-            )
-            if len(data) < LIST_PAGE_SIZE:
-                break
-    except MistralError as exc:
-        logger.warning("could not list Mistral files %s*: %s", prefix, exc)
+    for page in range(LIST_MAX_PAGES):
+        listing = _call(
+            client().files.list,
+            page=page,
+            page_size=LIST_PAGE_SIZE,
+            search=prefix,
+        )
+        data = list(listing.data or [])
+        found.extend(
+            str(item.id)
+            for item in data
+            if str(item.filename or "").startswith(prefix)
+        )
+        if len(data) < LIST_PAGE_SIZE:
+            break
     return found

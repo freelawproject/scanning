@@ -379,8 +379,10 @@ class TestFindFiles(SimpleTestCase):
         self.assertEqual(len(found), mistral_client.LIST_PAGE_SIZE + 1)
         self.assertEqual(sdk.files.list.call_args.kwargs["page"], 1)
 
-    def test_a_failure_finds_nothing_and_never_raises(self):
+    def test_a_failed_listing_raises_for_the_claim_to_wait(self):
+        # A partial list read as the whole would hand the row on with
+        # its other files unnamed for good.
         patcher, sdk = _client()
         sdk.files.list.side_effect = _StatusError(500)
-        with patcher, self.assertLogs("scanning.mistral_client", "WARNING"):
-            self.assertEqual(mistral_client.find_files("scan7-"), [])
+        with patcher, self.assertRaises(mistral_client.MistralError):
+            mistral_client.find_files("scan7-")

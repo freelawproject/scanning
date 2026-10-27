@@ -1655,16 +1655,20 @@ class TestSweep(ScanningTestCase):
             ),
             self.assertLogs("scanning.mistral_ocr", "WARNING"),
         ):
+            # The first tick ends at the throttled f1, before f2; the
+            # next deletes both.
             jobs.sweep_jobs()
             self.job.refresh_from_db()
-            self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
+            self.assertEqual(
+                self.job.provider_meta["files_left"], ["f1", "f2"]
+            )
             self.assertEqual(self.job.status, JobStatus.COMPLETED)
             jobs.sweep_jobs()
         self.job.refresh_from_db()
         self.assertNotIn("files_left", self.job.provider_meta)
         self.assertEqual(self.job.provider_meta["output"], {})
         self.assertEqual(
-            [c.args[0] for c in delete.call_args_list], ["f1", "f2", "f1"]
+            [c.args[0] for c in delete.call_args_list], ["f1", "f1", "f2"]
         )
         in_flight.refresh_from_db()
         self.assertEqual(in_flight.provider_meta["files_left"], ["g0"])
@@ -1762,6 +1766,52 @@ class TestSweep(ScanningTestCase):
             )
         self.assertEqual(summary.errors, 1)
         self.assertEqual(self.job.provider_meta["files_left"], ["err-1"])
+
+    def test_the_leftover_pass_ends_at_the_first_miss(self):
+        # A throttle is a fact about the workspace: the pass stops at
+        # the first delete that did not land, on this row and the next,
+        # instead of spending its budget at the limit.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.FAILED,
+            provider_meta={"files_left": ["f0", "f1", "f2"]},
+        )
+        other = ScanFactory()
+        (second,) = mistral_ocr.ensure_extract_jobs(
+            other, make_manifest(shard_count=1, pages_per_shard=2)
+        )
+        ExternalJob.objects.filter(pk=second.pk).update(
+            status=JobStatus.FAILED, provider_meta={"files_left": ["g0"]}
+        )
+        answers = {"f0": [True], "f1": [busy], "f2": [True], "g0": [True]}
+        with (
+            patch(
+                "scanning.mistral_client.delete_file",
+                side_effect=lambda file_id: _answer(answers[file_id]),
+            ) as delete,
+            patch.object(mistral_ocr, "LEFTOVER_SECONDS_PER_TICK", 60.0),
+            self.assertLogs("scanning.mistral_ocr", "WARNING"),
+        ):
+            # Two rows in no order: the pass ends at f1 whichever comes
+            # first, so at most the other row's one file joins the two.
+            calls = mistral_ocr.delete_leftover_files()
+        self.assertLessEqual(calls, 3)
+        self.assertIn("f1", [c.args[0] for c in delete.call_args_list])
+        self.assertNotIn("f2", [c.args[0] for c in delete.call_args_list])
+        self.job.refresh_from_db()
+        self.assertEqual(self.job.provider_meta["files_left"], ["f1", "f2"])
+
+    def test_the_leftover_pass_ends_when_its_time_is_spent(self):
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.FAILED,
+            provider_meta={"files_left": ["f0", "f1"]},
+        )
+        with (
+            patch.object(mistral_ocr, "LEFTOVER_SECONDS_PER_TICK", 0.0),
+            patch("scanning.mistral_client.delete_file") as delete,
+        ):
+            self.assertEqual(mistral_ocr.delete_leftover_files(), 0)
+        delete.assert_not_called()
 
     def test_the_leftover_pass_waits_for_a_key(self):
         # No key, no calls: a row carrying files from an environment
@@ -1989,7 +2039,10 @@ class TestSweep(ScanningTestCase):
 
     def _sweep_lost(self, found=(), **kwargs):
         finder = patch(
-            "scanning.mistral_client.find_files", return_value=list(found)
+            "scanning.mistral_client.find_files",
+            side_effect=found
+            if isinstance(found, BaseException)
+            else lambda prefix: list(found),
         )
         find = finder.start()
         self.addCleanup(finder.stop)
@@ -2059,6 +2112,22 @@ class TestSweep(ScanningTestCase):
         deleted = [c.args[0] for c in mocks["delete"].call_args_list]
         self.assertEqual(deleted, ["f0", "f1", "old", "f1"])
         self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
+
+    def test_a_lost_claim_whose_listing_failed_waits_for_the_next_tick(self):
+        # The listing was throttled: handed on, the row's next attempt
+        # would name another prefix and this one's files would never be
+        # searched for again. The claim stays as it is, still lost.
+        self._lose_the_id()
+        with self.assertLogs("scanning.mistral_ocr", "WARNING"):
+            summary, mocks = self._sweep_lost(
+                found=mistral_client.MistralBusy("slow", "RATE_LIMITED", 429),
+                now=self.job.submitted_at + mistral_ocr.LEGACY_CLAIM_GRACE,
+            )
+        self.assertEqual(summary.pending, 1)
+        self.assertEqual(summary.retried, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        self.assertEqual(self.job.attempt, 1)
+        mocks["delete"].assert_not_called()
 
     def test_a_young_claim_with_no_lock_held_waits_for_one_release(self):
         # A pod on the code before the lock submits without it, so

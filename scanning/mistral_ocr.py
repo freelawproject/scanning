@@ -194,6 +194,10 @@ UPLOAD_BACKOFF_SECONDS = 2.0
 #: loop's under the daemon and the locked sweep's under Celery.
 LEFTOVER_CALLS_PER_TICK = 200
 
+#: How long the pass may run a tick, because a slow answer is bounded
+#: by the request timeout alone and the tick waits behind the pass.
+LEFTOVER_SECONDS_PER_TICK = 20.0
+
 #: How often a waiting upload thread reads the stop flag (#534), so a
 #: shutdown never waits out a backoff.
 STOP_POLL_SECONDS = 0.5
@@ -1241,7 +1245,12 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
         if fresh[1]:
             summary.pending += 1
             return
-        discard_lost_files(job)
+        if discard_lost_files(job) is None:
+            # The listing failed: handed on now, the row's next attempt
+            # names another prefix and the files of this one are never
+            # searched for again. The claim is still lost next tick.
+            summary.pending += 1
+            return
         jobs.count_sweep_outcome(
             summary,
             jobs._retry_or_fail(
@@ -1304,7 +1313,7 @@ def _claim_alive(job: ExternalJob, now) -> bool:
     return newest is None or job.submitted_at >= newest
 
 
-def discard_lost_files(job: ExternalJob) -> int:
+def discard_lost_files(job: ExternalJob) -> int | None:
     """Delete the files a lost claim uploaded, found by their names.
 
     A worker killed mid-shard never wrote its file ids anywhere, and
@@ -1315,10 +1324,22 @@ def discard_lost_files(job: ExternalJob) -> int:
     for the sweep (:func:`delete_leftover_files`).
 
     :param job: The lost claim, before its attempt is raised.
-    :returns: How many files were found.
-    :rtype: int
+    :returns: How many files were found, or ``None`` when the listing
+        failed and the caller must not hand the row on.
+    :rtype: int | None
     """
-    found = mistral_client.find_files(file_prefix(job))
+    try:
+        found = mistral_client.find_files(file_prefix(job))
+    except mistral_client.MistralError as exc:
+        logger.warning(
+            "job %s (scan %s shard %s): could not list the files a lost "
+            "claim left at Mistral; the claim waits for the next tick: %s",
+            job.pk,
+            job.scan_id,
+            job.shard_index,
+            exc,
+        )
+        return None
     if found:
         logger.warning(
             "job %s (scan %s shard %s): deleting %d file(s) a lost claim "
@@ -1458,9 +1479,13 @@ def delete_leftover_files() -> int:
     row in flight is left to its harvest, and a PENDING row is tried
     here and by its next submission alike; a double delete is a 404,
     which counts as gone. The tick spends :data:`LEFTOVER_CALLS_PER_TICK`
-    calls and reads the stop flag before each, and the rows come in no
+    calls inside :data:`LEFTOVER_SECONDS_PER_TICK`, reads the stop flag
+    before each, and ends at the first delete that did not land: a
+    throttle or a refusal is a fact about the workspace or the key, not
+    the file, and a pass that went on would spend its budget feeding
+    the limit the wave's uploads are already at. The rows come in no
     order, so a row whose deletes Mistral refuses for good holds no
-    other row back.
+    other row back on the ticks that do reach them.
 
     :returns: How many delete calls were made.
     :rtype: int
@@ -1477,8 +1502,17 @@ def delete_leftover_files() -> int:
         .order_by("?")
     )
     calls = 0
+    until = time.monotonic() + LEFTOVER_SECONDS_PER_TICK
+
+    def budget_spent() -> bool:
+        return (
+            calls >= LEFTOVER_CALLS_PER_TICK
+            or time.monotonic() >= until
+            or stopping.requested()
+        )
+
     for job in rows:
-        if calls >= LEFTOVER_CALLS_PER_TICK or stopping.requested():
+        if budget_spent():
             break
         carried = [
             str(f) for f in (job.provider_meta or {}).get("files_left") or []
@@ -1486,7 +1520,7 @@ def delete_leftover_files() -> int:
         tried: list[str] = []
         left: list[str] = []
         for file_id in carried:
-            if calls >= LEFTOVER_CALLS_PER_TICK or stopping.requested():
+            if budget_spent() or left:
                 break
             tried.append(file_id)
             calls += 1
@@ -1502,6 +1536,8 @@ def delete_leftover_files() -> int:
             )
         if tried:
             _carry_files_left(job, tried, left)
+        if left:
+            break
     return calls
 
 
