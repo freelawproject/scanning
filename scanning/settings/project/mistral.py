@@ -39,6 +39,12 @@ MISTRAL_SUBMITS_PER_TICK = env.int("MISTRAL_SUBMITS_PER_TICK", default=0)
 # or the next volume waits on this one's batches.
 MISTRAL_MAX_CONCURRENCY = env.int("MISTRAL_MAX_CONCURRENCY", default=64)
 
+# Shards downloaded and rendered at once inside a wave. Each holds its
+# shard PDF on disk (up to SHARD_TARGET_BYTES), an open document and a
+# page in hand, so this bounds the wave's disk and memory where the
+# upload backlog bounds its PNGs; the shards past it wait their turn.
+MISTRAL_RENDER_WORKERS = env.int("MISTRAL_RENDER_WORKERS", default=4)
+
 # Page uploads in flight at once, over every shard of the wave: the
 # one number to lower when the throttled-page log line gets busy, and
 # to raise when the workspace's limit allows. The wave holds at most

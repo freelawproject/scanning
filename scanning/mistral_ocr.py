@@ -96,7 +96,13 @@ import tempfile
 import threading
 import time
 from collections.abc import Iterator
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_EXCEPTION,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -264,6 +270,19 @@ def max_concurrency() -> int:
     :rtype: int
     """
     return max(1, int(getattr(settings, "MISTRAL_MAX_CONCURRENCY", 64)))
+
+
+def render_workers() -> int:
+    """Return how many shards one wave downloads and renders at once.
+
+    Each holds its shard PDF on disk, an open document and a page in
+    hand, so this bounds the wave's disk and memory where the backlog
+    bounds its PNGs; the shards past it wait their turn in the pool.
+
+    :returns: ``MISTRAL_RENDER_WORKERS``, at least one.
+    :rtype: int
+    """
+    return max(1, int(getattr(settings, "MISTRAL_RENDER_WORKERS", 4)))
 
 
 def upload_workers() -> int:
@@ -514,15 +533,21 @@ class _Submission:
     duration_ms: int = 0
 
 
-def _delete_files(file_ids: list[str]) -> None:
+def _delete_files(file_ids: list[str]) -> list[str]:
     """Delete some files at Mistral, best effort.
 
     :param file_ids: The ids.
-    :return: None.
+    :returns: The ids that could not be deleted, for the row to carry
+        as ``files_left`` so the next submission of the row deletes
+        them: the pages are unredacted, and a delete throttled by the
+        wave's own uploads must not be the last word.
+    :rtype: list[str]
     """
-    for file_id in file_ids:
-        if file_id:
-            mistral_client.delete_file(str(file_id))
+    return [
+        str(file_id)
+        for file_id in file_ids
+        if file_id and not mistral_client.delete_file(str(file_id))
+    ]
 
 
 def _manifest_line(page_no: int, file_id: str, model: str) -> str:
@@ -559,10 +584,13 @@ class _Uploads:
         the uploads (:func:`upload_backlog`): a shard's render takes
         one before it hands a page over, and the upload gives it back
         when it is done, so the PNGs in memory are bounded by the wave.
+    :ivar left: Per row, the file ids a submission could not delete,
+        for the main thread to stamp on the row as ``files_left``.
     """
 
     pool: ThreadPoolExecutor
     slots: threading.Semaphore
+    left: dict[int, list[str]] = field(default_factory=dict)
 
 
 def _upload_page(
@@ -719,6 +747,30 @@ def _take_slot(uploads: _Uploads, pages: list[tuple[int, Future]]) -> None:
             return
 
 
+def _let_go(
+    uploads: _Uploads,
+    pages: list[tuple[int, Future]],
+    abandoned: threading.Event,
+) -> None:
+    """End a shard's uploads after a failure, and wait for the rest.
+
+    The pages not started are dropped, with their slots given back,
+    the ones waiting out a 429 let go through ``abandoned``, and the
+    ones mid-upload are waited for, so every id that will exist is
+    known when the files go.
+
+    :param uploads: The wave's pool and backlog.
+    :param pages: The shard's pages handed over.
+    :param abandoned: The shard's event.
+    :return: None.
+    """
+    abandoned.set()
+    for _, future in pages:
+        if future.cancel():
+            uploads.slots.release()
+    wait([future for _, future in pages])
+
+
 def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
 
@@ -748,7 +800,13 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     mid-upload finish, every file that landed goes, and
     :class:`SubmitStopped` hands the row back. A page refused for good
     ends the shard the same way, through the shard's ``abandoned``
-    event, so a throttled page never holds the wave for its tries.
+    event, so a throttled page never holds the wave for its tries,
+    whether the refusal comes while the render runs or after its last
+    page is handed over.
+
+    A file an earlier try of this row could not delete (``files_left``
+    on the row) is deleted first, and whatever still cannot be is
+    handed back through ``uploads.left`` for the row to carry again.
 
     :param job: The claimed row.
     :param uploads: The wave's upload pool and backlog.
@@ -762,6 +820,9 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     pages: list[tuple[int, Future]] = []
     tail: list[str] = []
     abandoned = threading.Event()
+    left = _delete_files(
+        [str(f) for f in (job.provider_meta or {}).get("files_left") or []]
+    )
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -794,20 +855,18 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
                         )
                     )
             except BaseException:
-                # The pages not started are dropped and the ones
-                # waiting out a 429 let go; then the ones mid-upload
-                # are waited for, so every id that will exist is
-                # known when the files go.
-                abandoned.set()
-                for _, future in pages:
-                    if future.cancel():
-                        uploads.slots.release()
-                wait([future for _, future in pages])
+                _let_go(uploads, pages, abandoned)
                 raise
         # Every upload has ended before the manifest is read off them,
         # so a page that failed late deletes no file an upload still
-        # in flight would land after the delete.
-        wait([future for _, future in pages])
+        # in flight would land after the delete; and a page that
+        # failed after the last was handed over ends the shard as one
+        # that failed during the render does.
+        wait([future for _, future in pages], return_when=FIRST_EXCEPTION)
+        failed = _first_failure(pages)
+        if failed is not None:
+            _let_go(uploads, pages, abandoned)
+            raise failed
         files = []
         lines = []
         for page_no, future in pages:
@@ -832,8 +891,9 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             timeout_hours=BATCH_TIMEOUT_HOURS,
         )
     except Exception:
-        _delete_files(_uploaded(pages) + tail)
+        uploads.left[job.pk] = left + _delete_files(_uploaded(pages) + tail)
         raise
+    uploads.left[job.pk] = left
     return _Submission(
         job_id=job_id,
         files=files + tail,
@@ -857,6 +917,7 @@ def _apply_outcome(
     exc: Exception | None,
     submission: _Submission | None,
     now,
+    left: list[str] | None = None,
 ) -> str:
     """Record what one shard's submission came to.
 
@@ -876,17 +937,35 @@ def _apply_outcome(
       it uploaded: the row goes back to PENDING with its attempt intact,
       because nothing was wrong with it.
 
+    Whatever the outcome, the files the thread could not delete
+    (``left``) are stamped on the row as ``files_left``, so the next
+    submission of the row deletes them, or the harvest does.
+
     :param job: The SUBMITTED row.
     :param exc: The exception raised by the thread, if any.
     :param submission: The submission on success.
     :param now: Current time.
+    :param left: The file ids the thread could not delete.
     :returns: One of ``"submitted"``, ``"deferred"``, ``"retried"``,
         ``"failed"``, ``"skipped"``.
     :rtype: str
     """
+    left = [str(f) for f in left or []]
+    if left:
+        logger.warning(
+            "job %s (scan %s shard %s): %d file(s) could not be deleted at "
+            "Mistral; the row carries them for the next try",
+            job.pk,
+            job.scan_id,
+            job.shard_index,
+            len(left),
+        )
     if exc is None and submission is not None:
         meta = dict(job.provider_meta or {})
         meta["files"] = list(submission.files)
+        meta.pop("files_left", None)
+        if left:
+            meta["files_left"] = left
         meta["submission"] = {
             "page_count": submission.page_count,
             "duration_ms": submission.duration_ms,
@@ -919,6 +998,12 @@ def _apply_outcome(
         )
         return "submitted"
 
+    if left:
+
+        def carry(meta: dict) -> None:
+            meta["files_left"] = left
+
+        jobs.swap_provider_meta(job, carry)
     if isinstance(exc, SubmitStopped):
         return jobs._defer(job, STOPPED_ERROR_CODE, str(exc), now)
     if isinstance(exc, mistral_client.MistralBusy):
@@ -1003,22 +1088,36 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
     logger.info(
         "rendering and submitting %d shard(s) to Mistral", len(claimed)
     )
+    # Each shard's outcome is written the moment its thread is done,
+    # inside the pools: a batch id that waited on the slowest shard of
+    # the wave would be lost with the worker, and its batch paid for
+    # twice. The renders are capped apart from the shards per wave,
+    # because each holds a shard PDF and an open document.
     with ThreadPoolExecutor(max_workers=upload_workers()) as pool:
         uploads = _Uploads(pool, threading.Semaphore(upload_backlog()))
-        with ThreadPoolExecutor(max_workers=len(claimed)) as shards:
-            futures = [
-                (job, shards.submit(_prepare_and_submit, job, uploads))
+        with ThreadPoolExecutor(
+            max_workers=min(len(claimed), render_workers())
+        ) as shards:
+            futures = {
+                shards.submit(_prepare_and_submit, job, uploads): job
                 for job, _ in claimed
-            ]
-    for job, future in futures:
-        exc: Exception | None = None
-        submission = None
-        try:
-            submission = future.result()
-        except Exception as caught:  # noqa: BLE001 - classified above
-            exc = caught
-        result = _apply_outcome(job, exc, submission, timezone.now())
-        setattr(summary, result, getattr(summary, result) + 1)
+            }
+            for future in as_completed(futures):
+                job = futures[future]
+                exc: Exception | None = None
+                submission = None
+                try:
+                    submission = future.result()
+                except Exception as caught:  # noqa: BLE001 - classified above
+                    exc = caught
+                result = _apply_outcome(
+                    job,
+                    exc,
+                    submission,
+                    timezone.now(),
+                    left=uploads.left.get(job.pk),
+                )
+                setattr(summary, result, getattr(summary, result) + 1)
 
 
 # ── the sweep ───────────────────────────────────────────────────────
@@ -1346,13 +1445,16 @@ def harvest(
         if job.submitted_at
         else None,
     }
-    files = [str(f) for f in (job.provider_meta or {}).get("files") or []]
+    meta = job.provider_meta or {}
+    files = [str(f) for f in meta.get("files") or []] + [
+        str(f) for f in meta.get("files_left") or []
+    ]
     outputs = [f for f in (outcome.output_file, outcome.error_file) if f]
     # The files are about to be deleted, so the row stops naming them.
     job.provider_meta = {
         key: value
-        for key, value in (job.provider_meta or {}).items()
-        if key != "files"
+        for key, value in meta.items()
+        if key not in ("files", "files_left")
     }
     if not jobs._complete(job, summary, now):
         # Another writer took the row. Its cancel deletes the files the

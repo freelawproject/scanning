@@ -315,10 +315,35 @@ class TestBestEffort(SimpleTestCase):
 
     def test_delete_file_swallows_a_failure(self):
         patcher, sdk = _client()
-        sdk.files.delete.side_effect = _StatusError(404)
+        sdk.files.delete.side_effect = _StatusError(400)
         with patcher, self.assertLogs("scanning.mistral_client", "WARNING"):
-            mistral_client.delete_file("file-1")
+            self.assertFalse(mistral_client.delete_file("file-1"))
         sdk.files.delete.assert_called_once_with(file_id="file-1")
+
+    def test_a_file_already_gone_counts_as_deleted(self):
+        patcher, sdk = _client()
+        sdk.files.delete.side_effect = _StatusError(404)
+        with patcher:
+            self.assertTrue(mistral_client.delete_file("file-1"))
+
+    def test_a_throttled_delete_is_tried_again(self):
+        # Two 429s and then the delete: gone, with no warning. Past the
+        # tries, the id is handed back for the row to carry.
+        patcher, sdk = _client()
+        sdk.files.delete.side_effect = [
+            _StatusError(429),
+            _StatusError(429),
+            None,
+        ]
+        with (
+            patcher,
+            patch.object(mistral_client, "DELETE_BACKOFF_SECONDS", 0),
+        ):
+            self.assertTrue(mistral_client.delete_file("file-1"))
+            self.assertEqual(sdk.files.delete.call_count, 3)
+            sdk.files.delete.side_effect = _StatusError(429)
+            with self.assertLogs("scanning.mistral_client", "WARNING"):
+                self.assertFalse(mistral_client.delete_file("file-2"))
 
 
 @override_settings(**MISTRAL)

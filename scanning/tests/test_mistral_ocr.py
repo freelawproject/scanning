@@ -341,6 +341,8 @@ class TestSubmitWave(ScanningTestCase):
         backoff=0.0,
         per_tick=None,
         cap=None,
+        renders=None,
+        delete_ok=True,
     ):
         # One upload thread unless a test asks for more: the
         # side-effect lists above answer the calls in the order they
@@ -353,6 +355,8 @@ class TestSubmitWave(ScanningTestCase):
             overrides["MISTRAL_SUBMITS_PER_TICK"] = per_tick
         if cap is not None:
             overrides["MISTRAL_MAX_CONCURRENCY"] = cap
+        if renders is not None:
+            overrides["MISTRAL_RENDER_WORKERS"] = renders
         patches = [
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch(
@@ -368,7 +372,9 @@ class TestSubmitWave(ScanningTestCase):
                 side_effect=create_error,
                 return_value=create,
             ),
-            patch("scanning.mistral_client.delete_file"),
+            patch(
+                "scanning.mistral_client.delete_file", return_value=delete_ok
+            ),
             patch("scanning.mistral_client.cancel_batch"),
             patch.object(mistral_ocr, "UPLOAD_BACKOFF_SECONDS", backoff),
         ]
@@ -1011,6 +1017,142 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(summary.submitted, 2)
         self.assertEqual(ahead, [4])
         self.assertEqual(len(rendered), 12)
+
+    def _two_shards(self):
+        """Replace the fixture's shard with two six-page shards of one
+        volume, and return the rows in shard order and the download
+        stub."""
+        ExternalJob.objects.filter(scan=self.scan).delete()
+        pdf = self.tmp / "six.pdf"
+        write_pdf(pdf, pages=6)
+        mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=6)
+        )
+        rows = list(extract_jobs(self.scan))
+        return rows, (lambda key, dest: shutil.copy(pdf, dest))
+
+    def test_a_batch_id_is_written_the_moment_its_shard_is_done(self):
+        # Two shards in one wave, the second held on its first upload:
+        # the first shard's outcome is written while the second still
+        # uploads, so a worker lost mid-wave loses no batch it paid
+        # for. The held upload sees the first row's outcome applied.
+        rows, download = self._two_shards()
+        first_applied = threading.Event()
+        seen = []
+        real = mistral_ocr._apply_outcome
+
+        def spy(job, exc, submission, now, left=None):
+            result = real(job, exc, submission, now, left=left)
+            if job.pk == rows[0].pk:
+                first_applied.set()
+            return result
+
+        def upload(name, content, purpose):
+            if f"-job{rows[1].pk}-" in name and name.endswith("p0.png"):
+                seen.append(first_applied.wait(timeout=5))
+            return name
+
+        with patch("scanning.mistral_ocr._apply_outcome", spy):
+            summary, _ = self._tick(
+                download=download, upload_error=upload, workers=2, per_tick=10
+            )
+
+        self.assertEqual(summary.submitted, 2)
+        self.assertEqual(seen, [True])
+
+    def test_the_renders_are_capped_apart_from_the_shards_per_wave(self):
+        # Three shards in one wave and one render worker: the shard
+        # PDFs come down one at a time, so a wave of a whole volume
+        # never holds every shard on disk at once.
+        scan = ScanFactory()
+        mistral_ocr.ensure_extract_jobs(
+            scan, make_manifest(shard_count=3, pages_per_shard=2)
+        )
+        lock = threading.Lock()
+        running = [0]
+        most = [0]
+
+        def download(key, dest):
+            with lock:
+                running[0] += 1
+                most[0] = max(most[0], running[0])
+            time.sleep(0.05)
+            shutil.copy(self.pdf, dest)
+            with lock:
+                running[0] -= 1
+
+        summary, _ = self._tick(
+            download=download,
+            upload_error=lambda name, content, purpose: name,
+            workers=4,
+            per_tick=10,
+            renders=1,
+        )
+        self.assertEqual(summary.submitted, 4)
+        self.assertEqual(most[0], 1)
+
+    def test_a_page_refused_after_the_last_is_handed_over_ends_the_shard(
+        self,
+    ):
+        # Three upload threads and a backlog of six, so every page of
+        # the six-page shard is handed over before any answers; then
+        # the last page is refused for good while another is throttled
+        # and would wait out a long backoff. The shard is abandoned all
+        # the same: the throttled page lets go at once and is not tried
+        # again, and the row fails within seconds.
+        download = self._six_page_shard()
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+
+        def upload(name, content, purpose):
+            page = _page_of(name)
+            if page == 4:
+                time.sleep(0.05)
+                raise busy
+            if page == 5:
+                time.sleep(0.1)
+                raise mistral_client.MistralError("bad", "HTTP_400", 400)
+            return name
+
+        started = time.monotonic()
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, workers=3, backoff=30.0
+        )
+
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.FAILED)
+        tries = [
+            c
+            for c in mocks["upload"].call_args_list
+            if _page_of(c.args[0]) == 4
+        ]
+        self.assertEqual(len(tries), 1)
+
+    def test_a_file_no_delete_reached_is_carried_and_deleted_next_time(self):
+        # The first page landed, the second failed for now, and the
+        # delete of the first was throttled past its tries: the row
+        # carries the id, and its next submission deletes it first and
+        # drops it from the row once the batch is submitted.
+        transient = mistral_client.MistralTransientError(
+            "down", "HTTP_503", 503
+        )
+        summary, mocks = self._tick(
+            upload_error=["f0", transient], delete_ok=False
+        )
+        self.assertEqual(summary.retried, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.provider_meta["files_left"], ["f0"])
+
+        summary, mocks = self._tick(
+            upload=["g0", "g1", "m2"], create="batch-2"
+        )
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(mocks["delete"].call_args_list[0].args, ("f0",))
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.external_id, "batch-2")
+        self.assertNotIn("files_left", job.provider_meta)
+        self.assertEqual(job.provider_meta["files"], ["g0", "g1", "m2"])
 
     def test_the_in_flight_cap_holds_a_tick_back(self):
         scan = ScanFactory()
