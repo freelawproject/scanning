@@ -1737,6 +1737,45 @@ class TestSweep(ScanningTestCase):
         deleted = [c.args[0] for c in mocks["delete"].call_args_list]
         self.assertEqual(deleted, ["out-1", "err-1"])
 
+    def test_a_lost_completion_carries_the_output_files_it_misses(self):
+        # The row another writer took is still there: an output file a
+        # throttle refused is named on it for the sweep, not dropped.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            output_file="out-1",
+            error_file="err-1",
+            job={},
+        )
+        with (
+            patch("scanning.jobs._complete", return_value=False),
+            patch.object(mistral_ocr, "LEFTOVER_CALLS_PER_TICK", 0),
+            self.assertLogs("scanning.mistral_ocr", "WARNING"),
+        ):
+            summary, mocks = self._sweep(
+                outcome,
+                output=self.OUTPUT,
+                delete=lambda file_id: _answer(
+                    {"err-1": [busy]}.get(file_id, [True])
+                ),
+            )
+        self.assertEqual(summary.errors, 1)
+        self.assertEqual(self.job.provider_meta["files_left"], ["err-1"])
+
+    def test_the_leftover_pass_waits_for_a_key(self):
+        # No key, no calls: a row carrying files from an environment
+        # that had one would otherwise log a refusal every tick.
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.FAILED, provider_meta={"files_left": ["f0"]}
+        )
+        with (
+            override_settings(MISTRAL_API_KEY=""),
+            patch("scanning.mistral_client.delete_file") as delete,
+        ):
+            self.assertEqual(mistral_ocr.delete_leftover_files(), 0)
+        delete.assert_not_called()
+
     def test_a_failed_put_leaves_the_row_in_flight(self):
         outcome = mistral_client.BatchOutcome(
             status=JobStatus.COMPLETED,

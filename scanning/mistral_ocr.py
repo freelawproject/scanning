@@ -1465,6 +1465,10 @@ def delete_leftover_files() -> int:
     :returns: How many delete calls were made.
     :rtype: int
     """
+    if not enabled():
+        # No key: every call would refuse, and a row carrying files from
+        # an environment that had one would log that refusal every tick.
+        return 0
     rows = (
         ExternalJob.objects.filter(
             provider=JobProvider.MISTRAL, provider_meta__has_key="files_left"
@@ -1765,14 +1769,9 @@ def harvest(
         # Another writer took the row. Its cancel deletes the files the
         # row names -- the pages and the manifest -- but nothing names
         # the two output files except this call, so delete them here.
-        left = _delete_files(outputs)
-        if left:
-            logger.warning(
-                "job %s: %d output file(s) of a lost completion could not "
-                "be deleted at Mistral",
-                job.pk,
-                len(left),
-            )
+        # The row is still there, whatever took it, so the two the
+        # delete does not reach are carried for the sweep like any.
+        _carry_files_left(job, outputs, _delete_files(outputs))
         return False
     _carry_files_left(job, files + outputs, _delete_files(files + outputs))
     return True
