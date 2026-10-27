@@ -59,9 +59,10 @@ Mistral, and must not be broken:
   claim and never restamped on ``RUNNING``: a batch is queued and run
   inside one budget Mistral enforces.
 - **The wave blocks the serial scheduler, so it takes one shard per
-  tick** (``MAX_SUBMITS_PER_TICK``). A full shard is minutes of render
-  and sequential upload; the in-flight cap (``MAX_CONCURRENCY``) is a
-  separate number, so a volume keeps draining while its batches wait.
+  tick** (``MAX_SUBMITS_PER_TICK``). A full shard is a minute or more
+  of render and upload, the pages uploaded ``UPLOAD_WORKERS`` at a
+  time; the in-flight cap (``MAX_CONCURRENCY``) is a separate number,
+  so a volume keeps draining while its batches wait.
 - **A job nothing will read is cancelled, and its files deleted.**
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
@@ -87,7 +88,12 @@ import re
 import tempfile
 import time
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    wait,
+)
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -159,6 +165,19 @@ MAX_CONCURRENCY = 16
 #: uploads inside a shard, or a render off the tick (as #196 did for
 #: its geometry), waits for a measurement on a real volume.
 MAX_SUBMITS_PER_TICK = 1
+
+#: How many page uploads of one shard run at once. The uploads wait on
+#: the network and not on the CPU: a shard of 99 pages uploaded one
+#: after another took five minutes, three seconds a page, and a batch
+#: needs only that its files exist before it is created. The render
+#: stays serial and in page order, feeding the pool, and the stop
+#: check (#534) stays between the pages, before each is handed over.
+UPLOAD_WORKERS = 8
+
+#: How many rendered pages may wait for an upload before the render
+#: pauses, read at call time like the worker count: a stalled network
+#: must not leave a whole shard of PNGs in memory, megabytes each.
+UPLOAD_BACKLOG = 2 * UPLOAD_WORKERS
 
 #: The lock the wave holds from its claim to the write of the batch id
 #: (#534), in both modes. A claimed row with no batch id is alive while
@@ -479,6 +498,70 @@ def _manifest_line(page_no: int, file_id: str, model: str) -> str:
     )
 
 
+def _upload_page(prefix: str, page_no: int, png: bytes) -> str:
+    """Upload one rendered page. Runs on an upload thread.
+
+    :param prefix: The attempt's file prefix (:func:`file_prefix`).
+    :param page_no: Shard-local page.
+    :param png: The canonical render.
+    :returns: The file id.
+    :rtype: str
+    :raises MistralError: The classified failure.
+    """
+    return mistral_client.upload_file(
+        f"{prefix}{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
+    )
+
+
+def _uploaded(pages: list[tuple[int, Future]]) -> list[str]:
+    """Return the ids of the page uploads that finished, in page order.
+
+    Every id that exists at Mistral, whatever became of the other
+    pages: the list a failure deletes, and the head of the list a
+    success records.
+
+    :param pages: Each page handed to the pool, with its future.
+    :returns: The ids.
+    :rtype: list[str]
+    """
+    return [
+        future.result()
+        for _, future in pages
+        if future.done()
+        and not future.cancelled()
+        and future.exception() is None
+    ]
+
+
+def _first_failure(pages: list[tuple[int, Future]]) -> Exception | None:
+    """Return the failure of the first page whose upload failed, if any.
+
+    :param pages: Each page handed to the pool, with its future.
+    :returns: The exception, or None while every finished upload
+        succeeded.
+    :rtype: Exception | None
+    """
+    for _, future in pages:
+        if future.done() and not future.cancelled():
+            exc = future.exception()
+            if exc is not None:
+                return exc
+    return None
+
+
+def _hold_back(pages: list[tuple[int, Future]]) -> None:
+    """Wait until fewer than ``UPLOAD_BACKLOG`` uploads are unfinished.
+
+    :param pages: Each page handed to the pool, with its future.
+    :return: None.
+    """
+    while True:
+        unfinished = [future for _, future in pages if not future.done()]
+        if len(unfinished) < UPLOAD_BACKLOG:
+            return
+        wait(unfinished, return_when=FIRST_COMPLETED)
+
+
 def _prepare_and_submit(job: ExternalJob) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
 
@@ -488,11 +571,21 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     them: a failed create left no job, and a lost create left a job
     nothing we hold names.
 
-    A stop request (``stopping.requested``) is read before every upload
-    and before the create (#534): a whole shard is minutes of uploads,
-    longer than a pod's grace period, and a kill in the middle leaves
-    unredacted pages at Mistral. The files go and :class:`SubmitStopped`
-    hands the row back.
+    The pages are rendered one after another, in page order, and each
+    is handed to a pool of ``UPLOAD_WORKERS`` threads that upload it,
+    because the uploads wait on the network: one at a time, a shard of
+    99 pages took five minutes. The render pauses while
+    ``UPLOAD_BACKLOG`` pages wait for an upload, and an upload that
+    failed stops the render at the next page. The manifest is built
+    from the futures in page order once every upload is in, so the
+    order the uploads finished in changes nothing Mistral sees.
+
+    A stop request (``stopping.requested``) is read before every page
+    is handed over, before the manifest and before the create (#534):
+    a whole shard is a minute or more of uploads, and a kill in the
+    middle leaves unredacted pages at Mistral. The pages not started
+    are dropped, the ones running finish, every file that landed goes,
+    and :class:`SubmitStopped` hands the row back.
 
     :param job: The claimed row.
     :returns: The submission.
@@ -502,7 +595,8 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
     started = time.monotonic()
     model = model_for(job)
     prefix = file_prefix(job)
-    files: list[str] = []
+    pages: list[tuple[int, Future]] = []
+    tail: list[str] = []
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -513,23 +607,45 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
         ) as tmp:
             pdf_path = Path(tmp) / "shard.pdf"
             s3_sync.download_object(job.input_key, pdf_path)
-            lines = []
-            for page_no, png in render_shard_pages(
-                pdf_path, whiteout=bool(settings.PERPENDICULARS_WHITEOUT)
-            ):
-                _stop_if_asked()
-                file_id = mistral_client.upload_file(
-                    f"{prefix}{custom_id(page_no)}.png", png, PAGE_FILE_PURPOSE
-                )
-                files.append(file_id)
-                lines.append(_manifest_line(page_no, file_id, model))
+            with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as uploads:
+                try:
+                    for page_no, png in render_shard_pages(
+                        pdf_path,
+                        whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
+                    ):
+                        _stop_if_asked()
+                        _hold_back(pages)
+                        failed = _first_failure(pages)
+                        if failed is not None:
+                            raise failed
+                        pages.append(
+                            (
+                                page_no,
+                                uploads.submit(
+                                    _upload_page, prefix, page_no, png
+                                ),
+                            )
+                        )
+                except BaseException:
+                    # The pages not started are dropped; the pool's
+                    # exit waits for the ones running, so every id
+                    # that will exist is known when the files go.
+                    for _, future in pages:
+                        future.cancel()
+                    raise
+        files = []
+        lines = []
+        for page_no, future in pages:
+            file_id = future.result()
+            files.append(file_id)
+            lines.append(_manifest_line(page_no, file_id, model))
         _stop_if_asked()
         manifest_id = mistral_client.upload_file(
             f"{prefix}manifest.jsonl",
             "\n".join(lines).encode("utf-8"),
             MANIFEST_FILE_PURPOSE,
         )
-        files.append(manifest_id)
+        tail.append(manifest_id)
         _stop_if_asked()
         job_id = mistral_client.create_batch(
             manifest_id,
@@ -541,12 +657,12 @@ def _prepare_and_submit(job: ExternalJob) -> _Submission:
             timeout_hours=BATCH_TIMEOUT_HOURS,
         )
     except Exception:
-        _delete_files(files)
+        _delete_files(_uploaded(pages) + tail)
         raise
     return _Submission(
         job_id=job_id,
-        files=files,
-        page_count=len(lines),
+        files=files + tail,
+        page_count=len(files),
         duration_ms=int((time.monotonic() - started) * 1000),
     )
 

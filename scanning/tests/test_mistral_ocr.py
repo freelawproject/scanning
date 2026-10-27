@@ -14,8 +14,11 @@ The render is real, over a synthetic PDF.
 
 import io
 import json
+import re
 import shutil
 import tempfile
+import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -89,6 +92,11 @@ def write_pdf(path: Path, pages: int = 2, size=(612, 792)) -> None:
                 width=0,
             )
         doc.save(str(path))
+
+
+def _page_of(name: str) -> int:
+    """Return the shard-local page an uploaded page file is named for."""
+    return int(re.search(r"-p(\d+)\.png$", name).group(1))
 
 
 def png_image(data: bytes) -> Image.Image:
@@ -329,7 +337,11 @@ class TestSubmitWave(ScanningTestCase):
         download=None,
         upload_error=None,
         create_error=None,
+        workers=1,
     ):
+        # One upload thread unless a test asks for more: the
+        # side-effect lists above answer the calls in the order they
+        # are made, which only a serial pool keeps in page order.
         patches = [
             patch("scanning.s3_sync.s3_active", return_value=True),
             patch(
@@ -347,6 +359,8 @@ class TestSubmitWave(ScanningTestCase):
             ),
             patch("scanning.mistral_client.delete_file"),
             patch("scanning.mistral_client.cancel_batch"),
+            patch.object(mistral_ocr, "UPLOAD_WORKERS", workers),
+            patch.object(mistral_ocr, "UPLOAD_BACKLOG", 2 * workers),
         ]
         mocks = []
         for patcher in patches:
@@ -409,9 +423,12 @@ class TestSubmitWave(ScanningTestCase):
         mocks["delete"].assert_not_called()
 
     def test_a_stop_mid_shard_hands_the_row_back_and_deletes_the_pages(self):
-        # A shutdown between two uploads (#534): the page already at
-        # Mistral is deleted, no batch is created, and the row goes
-        # back with its attempt intact.
+        # A shutdown while the pages upload (#534): the stop is read
+        # before each page is handed to the pool, so the page that
+        # asked for it may be joined by the one rendered meanwhile and
+        # never by the manifest; every page that reached Mistral is
+        # deleted, no batch is created, and the row goes back with its
+        # attempt intact.
         self.addCleanup(stopping.reset)
         uploaded = []
 
@@ -423,14 +440,149 @@ class TestSubmitWave(ScanningTestCase):
         summary, mocks = self._tick(upload_error=upload)
 
         self.assertEqual(summary.deferred, 1)
-        self.assertEqual(len(uploaded), 1)
+        self.assertLessEqual(len(uploaded), 2)
+        self.assertTrue(all(name.endswith(".png") for name in uploaded))
         mocks["create"].assert_not_called()
-        mocks["delete"].assert_called_once_with("f0")
+        self.assertEqual(
+            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            [f"f{i}" for i in range(len(uploaded))],
+        )
         job = extract_jobs(self.scan)[0]
         self.assertEqual(job.status, JobStatus.PENDING)
         self.assertEqual(job.attempt, 1)
         self.assertEqual(job.error_code, mistral_ocr.STOPPED_ERROR_CODE)
         self.assertIsNone(job.submitted_at)
+
+    def _six_page_shard(self):
+        """Replace the two-page shard with a six-page one, so a pool of
+        three has pages to overlap, and return its download stub."""
+        ExternalJob.objects.filter(scan=self.scan).delete()
+        pdf = self.tmp / "six.pdf"
+        write_pdf(pdf, pages=6)
+        mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=1, pages_per_shard=6)
+        )
+        return lambda key, dest: shutil.copy(pdf, dest)
+
+    def test_the_pages_upload_in_parallel_and_the_manifest_names_each(self):
+        # Six pages through three upload threads, each answering later
+        # than the next, so they finish out of page order: the pool
+        # overlapped them, the recorded ids are in page order, and the
+        # manifest names each page's own file.
+        download = self._six_page_shard()
+        running = []
+        most = [0]
+        lock = threading.Lock()
+
+        def upload(name, content, purpose):
+            if name.endswith("manifest.jsonl"):
+                return "m"
+            page = _page_of(name)
+            with lock:
+                running.append(name)
+                most[0] = max(most[0], len(running))
+            time.sleep(0.05 * (6 - page))
+            with lock:
+                running.remove(name)
+            return f"id-p{page}"
+
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, workers=3
+        )
+
+        self.assertEqual(summary.submitted, 1)
+        self.assertGreaterEqual(most[0], 2)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(
+            job.provider_meta["files"], [f"id-p{i}" for i in range(6)] + ["m"]
+        )
+        self.assertEqual(job.provider_meta["submission"]["page_count"], 6)
+        manifest = mocks["upload"].call_args_list[-1]
+        self.assertTrue(manifest.args[0].endswith("manifest.jsonl"))
+        lines = [
+            json.loads(line) for line in manifest.args[1].decode().splitlines()
+        ]
+        self.assertEqual(
+            [
+                (line["custom_id"], line["body"]["document"]["file_id"])
+                for line in lines
+            ],
+            [(f"p{i}", f"id-p{i}") for i in range(6)],
+        )
+        mocks["delete"].assert_not_called()
+
+    def test_a_failed_upload_deletes_every_page_that_landed(self):
+        # One page of six is refused for good while the others are in
+        # flight: the render stops at the next page, every page that
+        # landed is deleted, none is orphaned, and the row is failed.
+        download = self._six_page_shard()
+        landed = []
+        lock = threading.Lock()
+
+        def upload(name, content, purpose):
+            page = _page_of(name)
+            if page == 2:
+                raise mistral_client.MistralError("bad", "HTTP_400", 400)
+            time.sleep(0.02)
+            with lock:
+                landed.append(f"id-p{page}")
+            return f"id-p{page}"
+
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, workers=3
+        )
+
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.FAILED)
+        mocks["create"].assert_not_called()
+        self.assertEqual(
+            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            sorted(landed),
+        )
+        # The render stopped: the pages after the failure were not all
+        # handed over.
+        self.assertLess(len(mocks["upload"].call_args_list), 6)
+
+    def test_the_render_waits_behind_a_stalled_upload(self):
+        # One upload thread, a backlog of two, and the first upload held
+        # until the render has three pages out (one uploading, one
+        # queued, one in hand): the render gets no further while the
+        # upload stalls, so a stalled network never holds a shard of
+        # PNGs in memory. The pool and the backlog are read at call
+        # time, so the tick helper's patch of both is what this reads.
+        download = self._six_page_shard()
+        rendered = []
+        three_out = threading.Event()
+        real = mistral_ocr.render_shard_pages
+
+        def spy(pdf_path, whiteout=False):
+            for page in real(pdf_path, whiteout=whiteout):
+                rendered.append(page[0])
+                if len(rendered) == 3:
+                    three_out.set()
+                yield page
+
+        ahead = []
+
+        def upload(name, content, purpose):
+            if name.endswith("manifest.jsonl"):
+                return "m"
+            if name.endswith("p0.png"):
+                three_out.wait(timeout=10)
+                # The feed is parked in ``_hold_back`` now; a moment
+                # more proves it renders nothing further.
+                time.sleep(0.2)
+                ahead.append(len(rendered))
+            return name
+
+        with patch("scanning.mistral_ocr.render_shard_pages", spy):
+            summary, _ = self._tick(
+                download=download, upload_error=upload, workers=1
+            )
+
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(ahead, [3])
+        self.assertEqual(len(rendered), 6)
 
     def test_a_held_submit_lock_claims_nothing(self):
         # Another worker's wave holds the lock: this one claims no row.
