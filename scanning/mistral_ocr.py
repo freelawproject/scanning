@@ -73,8 +73,11 @@ Mistral, and must not be broken:
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
   deletes what it uploaded, and :func:`harvest` deletes all four once
-  the result is in S3. The pages are unredacted, so this delete is
-  the only thing that limits how long a third party holds them.
+  the result is in S3. A delete never sleeps: a file it could not
+  reach is carried on the row as ``files_left``, and the sweep tries
+  it again every tick (:func:`delete_leftover_files`). The pages are
+  unredacted, so this delete is the only thing that limits how long a
+  third party holds them.
 - **A result with a hole is never carried.** The stable-hole rule of
   #238 trusts a deterministic worker; a Mistral batch line can fail
   from a transient fault, so the carry re-reads the shard instead.
@@ -181,16 +184,12 @@ BACKLOG_PER_WORKER = 2
 UPLOAD_RETRIES = 5
 UPLOAD_BACKOFF_SECONDS = 2.0
 
-#: How many rounds a cleanup gives its throttled deletes, and the first
-#: wait between two rounds, doubled at each. A round tries every file
-#: once; the files a 429 refused wait together and are tried again, so
-#: a shard's cleanup waits out the ladder once, never once per file: a
-#: failed shard's deletes run while the wave's other uploads hold the
-#: workspace's limit, under the wave's lock, and a hundred files each
-#: waiting their own minute would hold it for hours. A file the last
-#: round could not delete is carried on the row.
-DELETE_RETRIES = 5
-DELETE_BACKOFF_SECONDS = 2.0
+#: How many rows carrying ``files_left`` one sweep tick tries again.
+#: A delete never sleeps: a throttled or refused one is carried on the
+#: row, and the sweep tries the carried files once more every tick,
+#: whatever the row's status, so a cleanup holds nothing and a file
+#: outlives its row's last write by a tick or two, never for good.
+LEFTOVER_ROWS_PER_TICK = 50
 
 #: How often a waiting upload thread reads the stop flag (#534), so a
 #: shutdown never waits out a backoff.
@@ -545,62 +544,31 @@ class _Submission:
 
 
 def _delete_files(file_ids: list[str]) -> list[str]:
-    """Delete some files at Mistral, best effort.
+    """Delete some files at Mistral, once each, best effort.
 
-    Every id is tried once; the ids a 429 throttled wait out one
-    backoff together and are tried again, up to :data:`DELETE_RETRIES`
-    rounds after :data:`DELETE_BACKOFF_SECONDS` doubled at each. The
-    wait reads the stop flag (#534): a shutdown ends the cleanup at
-    once, and whatever is left is carried, so a pod leaves nothing
-    behind that no row names. An id refused for another reason is
-    carried too, and tried once more at each later delete of the row.
+    No delete waits: a throttled one (a 429, while the wave's own
+    uploads hold the workspace's limit) or a refused one is handed
+    back for the row to carry as ``files_left``, and
+    :func:`delete_leftover_files` tries the carried files again on
+    every sweep tick. The pages are unredacted, so a delete that did
+    not land must not be the last word, and a cleanup that slept would
+    hold the wave's lock, the outcome writes of the other shards, or a
+    web request.
 
     :param file_ids: The ids.
-    :returns: The ids that could not be deleted, for the row to carry
-        as ``files_left`` so a later delete of the row reaches them:
-        the pages are unredacted, and a delete throttled by the wave's
-        own uploads must not be the last word.
+    :returns: The ids that are not gone, in the caller's order.
     :rtype: list[str]
     """
-    ids = [str(file_id) for file_id in file_ids if file_id]
-    refused: set[str] = set()
-    busy = list(ids)
-    tried = 0
-    while busy:
-        throttled = []
-        for file_id in busy:
-            try:
-                if not mistral_client.delete_file(file_id):
-                    refused.add(file_id)
-            except mistral_client.MistralBusy:
-                throttled.append(file_id)
-        busy = throttled
-        if not busy or tried >= DELETE_RETRIES:
-            break
-        if not _wait_unless_stopped(DELETE_BACKOFF_SECONDS * 2**tried):
-            break
-        tried += 1
-    return [
-        file_id for file_id in ids if file_id in refused or file_id in busy
-    ]
-
-
-def _wait_unless_stopped(seconds: float) -> bool:
-    """Sleep for ``seconds`` unless a stop is asked for meanwhile.
-
-    :param seconds: How long to wait.
-    :returns: Whether the wait ran out; ``False`` the moment a stop was
-        asked for (#534).
-    :rtype: bool
-    """
-    until = time.monotonic() + seconds
-    while True:
-        if stopping.requested():
-            return False
-        left = until - time.monotonic()
-        if left <= 0:
-            return True
-        time.sleep(min(left, STOP_POLL_SECONDS))
+    left = []
+    for file_id in file_ids:
+        if not file_id:
+            continue
+        try:
+            if not mistral_client.delete_file(str(file_id)):
+                left.append(str(file_id))
+        except mistral_client.MistralBusy:
+            left.append(str(file_id))
+    return left
 
 
 def _manifest_line(page_no: int, file_id: str, model: str) -> str:
@@ -843,10 +811,11 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     from the futures in page order once every upload is in, so the
     order the uploads finished in changes nothing Mistral sees.
 
-    A stop request (``stopping.requested``) is read before every page
-    is handed over, again once the backlog let it through, at the start
-    of every upload and while a throttled one waits, before the
-    manifest and before the create (#534): a whole shard is a minute or
+    A stop request (``stopping.requested``) is read before the shard
+    PDF is pulled, before every page is handed over, again once the
+    backlog let it through, at the start of every upload and while a
+    throttled one waits, before the manifest and before the create
+    (#534): a whole shard is a minute or
     more of uploads, and a kill in the middle leaves unredacted pages
     at Mistral. The pages not started are dropped, a queued one starts
     and stops at once, one waiting out a 429 lets go, the ones
@@ -858,8 +827,8 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     page is handed over.
 
     A file an earlier try of this row could not delete (``files_left``
-    on the row) is deleted first, and whatever still cannot be is
-    handed back through ``uploads.left`` for the row to carry again.
+    on the row) is tried first, and whatever still cannot be is handed
+    back through ``uploads.left`` for the row to carry again.
 
     :param job: The claimed row.
     :param uploads: The wave's upload pool and backlog.
@@ -867,6 +836,9 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     :raises Exception: Whatever the download, the render or the API
         raised; classified by :func:`_apply_outcome`.
     """
+    # A shard queued behind the render cap starts here after a stop
+    # was asked for: it must not pull a shard PDF first.
+    _stop_if_asked()
     started = time.monotonic()
     model = model_for(job)
     prefix = file_prefix(job)
@@ -993,7 +965,8 @@ def _apply_outcome(
     Whatever the outcome, the files the thread could not delete
     (``left``) are stamped on the row as ``files_left``, so the next
     submission of the row deletes them, or the harvest does, or the
-    write-off (:func:`cancel_job`).
+    write-off (:func:`cancel_job`), or the sweep
+    (:func:`delete_leftover_files`).
 
     :param job: The SUBMITTED row.
     :param exc: The exception raised by the thread, if any.
@@ -1162,14 +1135,58 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
                     submission = future.result()
                 except Exception as caught:  # noqa: BLE001 - classified above
                     exc = caught
-                result = _apply_outcome(
-                    job,
-                    exc,
-                    submission,
-                    timezone.now(),
-                    left=uploads.left.get(job.pk),
-                )
+                try:
+                    result = _apply_outcome(
+                        job,
+                        exc,
+                        submission,
+                        timezone.now(),
+                        left=uploads.left.get(job.pk),
+                    )
+                except Exception:  # noqa: BLE001 - the wave goes on
+                    # A database fault: the row keeps its claim and the
+                    # lost-claim sweep judges it, so a batch it minted
+                    # is cancelled here, or it is paid for twice.
+                    logger.exception(
+                        "job %s (scan %s shard %s): could not write its "
+                        "Mistral outcome",
+                        job.pk,
+                        job.scan_id,
+                        job.shard_index,
+                    )
+                    if submission is not None:
+                        _cancel_quietly(job, submission, uploads)
+                    result = "unanswered"
                 setattr(summary, result, getattr(summary, result) + 1)
+
+
+def _cancel_quietly(
+    job: ExternalJob, submission: _Submission, uploads: _Uploads
+) -> None:
+    """Cancel a submission whose outcome could not be written, and
+    delete its files, raising nothing: the fault that stopped the
+    write may stop the carry too, and the wave must go on.
+
+    :param job: The row.
+    :param submission: The batch it minted.
+    :param uploads: The wave's pools, for the files the shard could
+        not delete.
+    :return: None.
+    """
+    try:
+        cancel_job(
+            job,
+            submission.job_id,
+            files=list(submission.files)
+            + list(uploads.left.get(job.pk) or []),
+        )
+    except Exception:  # noqa: BLE001 - best effort
+        logger.exception(
+            "job %s: could not cancel Mistral batch %s after a failed "
+            "outcome write",
+            job.pk,
+            submission.job_id,
+        )
 
 
 # ── the sweep ───────────────────────────────────────────────────────
@@ -1277,7 +1294,7 @@ def discard_lost_files(job: ExternalJob) -> int:
     :func:`file_prefix` (#534). Best effort, never raises.
 
     A file no delete reached is carried on the row as ``files_left``,
-    so the next submission deletes it or a write-off does.
+    for the sweep (:func:`delete_leftover_files`).
 
     :param job: The lost claim, before its attempt is raised.
     :returns: How many files were found.
@@ -1312,7 +1329,7 @@ def _carry_files_left(job: ExternalJob, left: list[str]) -> None:
     if left:
         logger.warning(
             "job %s (scan %s shard %s): %d file(s) could not be deleted "
-            "at Mistral; the row carries them for a later delete",
+            "at Mistral; the row carries them for the sweep",
             job.pk,
             job.scan_id,
             job.shard_index,
@@ -1328,6 +1345,51 @@ def _carry_files_left(job: ExternalJob, left: list[str]) -> None:
             meta.pop("files_left", None)
 
     jobs.swap_provider_meta(job, carry)
+
+
+def delete_leftover_files() -> int:
+    """Try once more to delete the files the rows carry as
+    ``files_left``, one call per file, on every sweep tick.
+
+    The one deleter of a file on a row no later write reaches: a
+    harvest or a write-off that was throttled stamps the ids on a
+    COMPLETED, FAILED or CANCELLED row, and nothing else runs for
+    those again. A row in flight is left to its harvest, and a PENDING
+    row is tried here and by its next submission alike; a double
+    delete is a 404, which counts as gone. At most
+    :data:`LEFTOVER_ROWS_PER_TICK` rows a tick, oldest first, and a
+    stop ends the pass between two rows.
+
+    :returns: How many rows were tried.
+    :rtype: int
+    """
+    rows = (
+        ExternalJob.objects.filter(
+            provider=JobProvider.MISTRAL, provider_meta__has_key="files_left"
+        )
+        .exclude(status__in=jobs.IN_FLIGHT_JOB_STATUSES)
+        .order_by("pk")[:LEFTOVER_ROWS_PER_TICK]
+    )
+    tried = 0
+    for job in rows:
+        if stopping.requested():
+            break
+        carried = [
+            str(f) for f in (job.provider_meta or {}).get("files_left") or []
+        ]
+        left = _delete_files(carried)
+        if not left:
+            logger.info(
+                "job %s (scan %s shard %s): deleted %d file(s) the row "
+                "carried at Mistral",
+                job.pk,
+                job.scan_id,
+                job.shard_index,
+                len(carried),
+            )
+        _carry_files_left(job, left)
+        tried += 1
+    return tried
 
 
 def _poll_due(job: ExternalJob, now) -> bool:

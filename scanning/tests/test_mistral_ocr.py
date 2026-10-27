@@ -598,7 +598,7 @@ class TestSubmitWave(ScanningTestCase):
                 return "m"
             if name.endswith("p0.png"):
                 three_out.wait(timeout=10)
-                # The feed is parked in ``_hold_back`` now; a moment
+                # The feed is parked in ``_take_slot`` now; a moment
                 # more proves it renders nothing further.
                 time.sleep(0.2)
                 ahead.append(len(rendered))
@@ -1164,65 +1164,62 @@ class TestSubmitWave(ScanningTestCase):
         self.assertNotIn("files_left", job.provider_meta)
         self.assertEqual(job.provider_meta["files"], ["g0", "g1", "m2"])
 
-    def test_a_cleanup_waits_out_one_ladder_for_every_throttled_file(self):
-        # A round tries every id once; the ids a 429 refused wait
-        # together and are tried again. Two files throttled twice cost
-        # two waits, not four, and the ladder doubles between rounds.
+    def test_a_delete_is_one_call_and_what_it_misses_is_carried(self):
+        # No delete waits: a throttled id and a refused one are handed
+        # back in the caller's order, each after one call, for the row
+        # to carry and the sweep to try again.
         busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
-        answers = {"f0": [busy, busy, True], "f1": [busy, busy, True]}
-        waits = []
-        with (
-            patch.object(mistral_ocr, "DELETE_BACKOFF_SECONDS", 1.0),
-            patch.object(
-                mistral_ocr,
-                "_wait_unless_stopped",
-                side_effect=lambda seconds: waits.append(seconds) or True,
+        with patch(
+            "scanning.mistral_client.delete_file",
+            side_effect=lambda file_id: _answer(
+                {"f0": [busy], "f1": [True], "f2": [False]}[file_id]
             ),
-            patch(
-                "scanning.mistral_client.delete_file",
-                side_effect=lambda file_id: _answer(answers[file_id]),
-            ) as delete,
-        ):
-            self.assertEqual(mistral_ocr._delete_files(["f0", "f1", ""]), [])
-        self.assertEqual(waits, [1.0, 2.0])
-        self.assertEqual(
-            [c.args[0] for c in delete.call_args_list],
-            ["f0", "f1", "f0", "f1", "f0", "f1"],
-        )
-
-    def test_a_file_throttled_past_the_rounds_is_handed_back(self):
-        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
-        # A file refused for another reason is carried too, untried
-        # after its first refusal, and the order is the caller's.
-        with (
-            patch.object(mistral_ocr, "DELETE_RETRIES", 2),
-            patch.object(mistral_ocr, "DELETE_BACKOFF_SECONDS", 0.0),
-            patch(
-                "scanning.mistral_client.delete_file",
-                side_effect=lambda file_id: _answer(
-                    {"f0": [False], "f1": [True], "f2": [busy]}[file_id]
-                ),
-            ) as delete,
-        ):
+        ) as delete:
             self.assertEqual(
-                mistral_ocr._delete_files(["f0", "f1", "f2"]), ["f0", "f2"]
+                mistral_ocr._delete_files(["f0", "f1", "", "f2"]),
+                ["f0", "f2"],
             )
-        self.assertEqual(delete.call_count, 5)
+        self.assertEqual(delete.call_count, 3)
 
-    def test_a_stop_ends_a_cleanup_at_once(self):
-        # The wait between two rounds reads the stop flag: the files a
-        # 429 refused are handed back for the row to carry, and the
-        # shutdown waits out no ladder.
-        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
-        with (
-            patch.object(mistral_ocr, "DELETE_BACKOFF_SECONDS", 30.0),
-            patch("scanning.mistral_client.delete_file", side_effect=busy),
-        ):
+    def test_a_stop_keeps_a_queued_shard_from_pulling_its_pdf(self):
+        # Two shards and one render worker: the first shard's upload
+        # asks for the stop, and the second, queued behind the cap,
+        # reads it before it downloads anything.
+        self.addCleanup(stopping.reset)
+        rows, download = self._two_shards()
+
+        def upload(name, content, purpose):
             stopping.request()
-            self.addCleanup(stopping.reset)
-            started = time.monotonic()
-            self.assertEqual(mistral_ocr._delete_files(["f0"]), ["f0"])
-        self.assertLess(time.monotonic() - started, 5)
+            return name
+
+        summary, mocks = self._tick(
+            download=download, upload_error=upload, per_tick=2, renders=1
+        )
+        self.assertEqual(summary.deferred, 2)
+        self.assertEqual(mocks["download"].call_count, 1)
+        mocks["create"].assert_not_called()
+
+    def test_an_outcome_write_that_raises_cancels_the_batch(self):
+        # The database fault that stops the write would leave the batch
+        # to the lost-claim sweep and pay for the shard twice: the wave
+        # cancels it, deletes its files and goes on.
+        with (
+            patch.object(
+                mistral_ocr, "_apply_outcome", side_effect=RuntimeError("db")
+            ),
+            self.assertLogs("scanning.mistral_ocr", "ERROR"),
+        ):
+            summary, mocks = self._tick()
+        self.assertEqual(summary.unanswered, 1)
+        self.assertEqual(summary.submitted, 0)
+        mocks["cancel"].assert_called_once_with("batch-1")
+        self.assertEqual(
+            [c.args[0] for c in mocks["delete"].call_args_list],
+            ["f0", "f1", "m1"],
+        )
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.external_id, "")
 
     def test_a_write_off_deletes_the_files_the_row_carries(self):
         # A row failed with no batch id still reaches the cancel, which
@@ -1429,8 +1426,9 @@ class TestSweep(ScanningTestCase):
 
     def test_a_harvest_carries_the_files_it_could_not_delete(self):
         # The result is in S3 and the row complete; a file a throttled
-        # delete did not reach stays named on the row, so an operator
-        # can find it, instead of being dropped with the key.
+        # delete did not reach stays named on the row for the sweep's
+        # own pass, held off here, instead of being dropped with the
+        # key.
         busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
         outcome = mistral_client.BatchOutcome(
             status=JobStatus.COMPLETED,
@@ -1439,7 +1437,7 @@ class TestSweep(ScanningTestCase):
             job={},
         )
         with (
-            patch.object(mistral_ocr, "DELETE_RETRIES", 0),
+            patch.object(mistral_ocr, "LEFTOVER_ROWS_PER_TICK", 0),
             self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
         ):
             summary, mocks = self._sweep(
@@ -1454,6 +1452,50 @@ class TestSweep(ScanningTestCase):
         self.assertNotIn("files", self.job.provider_meta)
         self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
         self.assertTrue(any("carries them" in line for line in logs.output))
+
+    def test_the_sweep_deletes_what_a_finished_row_carries(self):
+        # A COMPLETED row no later write reaches still names a file: the
+        # sweep tries it every tick and drops the key once it is gone.
+        # A row in flight is left to its harvest.
+        busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
+        ExternalJob.objects.filter(pk=self.job.pk).update(
+            status=JobStatus.COMPLETED,
+            provider_meta={"files_left": ["f1", "f2"], "output": {}},
+        )
+        other = ScanFactory()
+        (in_flight,) = mistral_ocr.ensure_extract_jobs(
+            other, make_manifest(shard_count=1, pages_per_shard=2)
+        )
+        ExternalJob.objects.filter(pk=in_flight.pk).update(
+            status=JobStatus.IN_PROGRESS,
+            external_id="batch-2",
+            provider_meta={"files_left": ["g0"]},
+        )
+        answers = {"f1": [busy, True], "f2": [True], "g0": [True]}
+        with (
+            patch(
+                "scanning.mistral_client.delete_file",
+                side_effect=lambda file_id: _answer(answers[file_id]),
+            ) as delete,
+            patch(
+                "scanning.mistral_client.poll_batch",
+                return_value=mistral_client.BatchOutcome(status=None),
+            ),
+            self.assertLogs("scanning.mistral_ocr", "WARNING"),
+        ):
+            jobs.sweep_jobs()
+            self.job.refresh_from_db()
+            self.assertEqual(self.job.provider_meta["files_left"], ["f1"])
+            self.assertEqual(self.job.status, JobStatus.COMPLETED)
+            jobs.sweep_jobs()
+        self.job.refresh_from_db()
+        self.assertNotIn("files_left", self.job.provider_meta)
+        self.assertEqual(self.job.provider_meta["output"], {})
+        self.assertEqual(
+            [c.args[0] for c in delete.call_args_list], ["f1", "f2", "f1"]
+        )
+        in_flight.refresh_from_db()
+        self.assertEqual(in_flight.provider_meta["files_left"], ["g0"])
 
     def test_a_page_no_line_names_is_a_hole(self):
         outcome = mistral_client.BatchOutcome(
@@ -1743,14 +1785,15 @@ class TestSweep(ScanningTestCase):
         # The files found by name and the ones the row carried from
         # before are deleted together. What a throttle refused is tried
         # once more by the retry's cancel and then carried into the next
-        # attempt, whose submission deletes it first.
+        # attempt, whose submission deletes it first (the sweep's own
+        # pass is held off here).
         busy = mistral_client.MistralBusy("slow down", "RATE_LIMITED", 429)
         self._lose_the_id()
         ExternalJob.objects.filter(pk=self.job.pk).update(
             provider_meta={"files_left": ["old"]}
         )
         self.job.refresh_from_db()
-        with patch.object(mistral_ocr, "DELETE_RETRIES", 0):
+        with patch.object(mistral_ocr, "LEFTOVER_ROWS_PER_TICK", 0):
             summary, mocks = self._sweep_lost(
                 found=["f0", "f1"],
                 now=self.job.submitted_at + mistral_ocr.LEGACY_CLAIM_GRACE,

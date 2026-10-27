@@ -401,10 +401,9 @@ def delete_file(file_id: str) -> bool:
     """Delete one file at Mistral, once. Never sleeps.
 
     A file already gone counts as deleted. A throttled delete (a 429)
-    is raised, because the wait is the caller's: it reads the stop
-    flag and bounds the cleanup of a whole shard, never one file
-    (:func:`scanning.mistral_ocr._delete_files`). Any other refusal
-    is logged and swallowed, as a sweep needs.
+    is raised, so the caller carries the id for a later try instead of
+    sleeping here (:func:`scanning.mistral_ocr._delete_files`). Any
+    other refusal is logged and swallowed, as a sweep needs.
 
     :param file_id: The file id.
     :returns: Whether the file is gone. The caller carries an id that

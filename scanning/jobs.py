@@ -3279,6 +3279,12 @@ def sweep_jobs(now=None) -> SweepSummary:
         ):
             summary.failed += 1
 
+    # The files a Mistral row still names after its last write (#540):
+    # a provider's own pass, not a row's, so it is called and not in
+    # the table. Imported here like the table does, for the cycle.
+    from scanning import mistral_ocr
+
+    mistral_ocr.delete_leftover_files()
     return summary
 
 
