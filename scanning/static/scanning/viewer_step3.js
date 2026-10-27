@@ -2887,8 +2887,12 @@
      *
      * The approval sends the revisions of the text this page drew
      * (``postEdit``), so the curator approves the text they saw, and a
-     * page older than the stamped text is refused. A warning card asks
-     * for a confirm; a blocking card holds the button, which the
+     * page older than the stamped text is refused. Every approval asks
+     * for a confirm, which counts the open warning cards and names the
+     * cost of the tagger (#499): the approval sends the approved text
+     * to a paid RunPod job where the stage is on, a fact the template
+     * writes (``data-tagger-on-approval``), so the script promises no
+     * run of its own. A blocking card holds the button, which the
      * template writes disabled, and the server refuses it too. Both
      * answers are Django messages, so the page reloads to show them.
      */
@@ -2918,10 +2922,15 @@
                     return;
                 }
                 var warnings = Number(approve.dataset.openWarnings || 0);
+                var tagged = approve.dataset.taggerOnApproval === '1';
                 var asked = warnings
                     ? warnings + ' warning(s) of this opinion are open. '
-                        + 'Approve the text anyway?'
-                    : 'Approve the text of this opinion?';
+                        + 'Approve the text anyway'
+                    : 'Approve the text of this opinion';
+                asked += tagged
+                    ? ' and send it to the case-law block tagger on RunPod? '
+                        + 'This will incur costs $$$.'
+                    : '?';
                 if (!window.confirm(asked)) { return; }
                 postEdit(endpoint('approveUrl'), {}, approve);
             });
@@ -2946,12 +2955,19 @@
                     });
             });
         }
-        // The tagger of the approved text (#272). The server answers a
-        // Django message either way, so the page reloads to show it.
+        // The tagger of the approved text (#272), the retry since the
+        // approval starts it (#499). A press is a paid RunPod job, so
+        // it asks first, the rule of the paid buttons of step 1. The
+        // server answers a Django message either way, so the page
+        // reloads to show it.
         var tag = document.getElementById('start-tagger');
         if (tag) {
             tag.addEventListener('click', function () {
                 if (tag.disabled) { return; }
+                if (!window.confirm('Send the approved text to the case-law '
+                    + 'block tagger on RunPod? This will incur costs $$$.')) {
+                    return;
+                }
                 tag.disabled = true;
                 fetch(endpoint('tagUrl'), {
                     method: 'POST',
