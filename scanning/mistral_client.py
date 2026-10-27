@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -398,46 +397,31 @@ def cancel_batch(job_id: str) -> None:
         logger.warning("could not cancel Mistral batch %s: %s", job_id, exc)
 
 
-#: How many times a throttled delete (a 429) is tried again, and the
-#: first wait between two tries, doubled at each. The deletes of a
-#: failed shard run while the wave's other uploads hold the workspace's
-#: limit, and a page no delete reaches stays at a third party.
-DELETE_RETRIES = 5
-DELETE_BACKOFF_SECONDS = 2.0
-
-
 def delete_file(file_id: str) -> bool:
-    """Delete one file at Mistral. Best effort, never raises.
+    """Delete one file at Mistral, once. Never sleeps.
 
-    A throttled delete is tried again up to :data:`DELETE_RETRIES`
-    times, after :data:`DELETE_BACKOFF_SECONDS` doubled at each try. A
-    file already gone counts as deleted.
+    A file already gone counts as deleted. A throttled delete (a 429)
+    is raised, because the wait is the caller's: it reads the stop
+    flag and bounds the cleanup of a whole shard, never one file
+    (:func:`scanning.mistral_ocr._delete_files`). Any other refusal
+    is logged and swallowed, as a sweep needs.
 
     :param file_id: The file id.
     :returns: Whether the file is gone. The caller carries an id that
         is not, so a later try deletes it.
     :rtype: bool
+    :raises MistralBusy: If the delete was throttled.
     """
-    tried = 0
-    while True:
-        try:
-            _call(client().files.delete, file_id=file_id)
-            return True
-        except MistralMissing:
-            return True
-        except MistralBusy as exc:
-            if tried >= DELETE_RETRIES:
-                logger.warning(
-                    "could not delete Mistral file %s: %s", file_id, exc
-                )
-                return False
-            time.sleep(DELETE_BACKOFF_SECONDS * 2**tried)
-            tried += 1
-        except MistralError as exc:
-            logger.warning(
-                "could not delete Mistral file %s: %s", file_id, exc
-            )
-            return False
+    try:
+        _call(client().files.delete, file_id=file_id)
+        return True
+    except MistralMissing:
+        return True
+    except MistralBusy:
+        raise
+    except MistralError as exc:
+        logger.warning("could not delete Mistral file %s: %s", file_id, exc)
+        return False
 
 
 #: Files asked for per page of a listing, and the most pages read. A

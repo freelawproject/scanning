@@ -527,11 +527,20 @@ def _cancel_provider_job(job: ExternalJob) -> None:
     Best effort and never raises: this runs inside a sweep that must
     still judge every other row on the tick.
 
+    A row with no provider id goes to its provider's cancel too, with
+    an empty id: RunPod has nothing to cancel then, and Mistral deletes
+    the files a row names before its batch exists, the pages a
+    throttled cleanup left (``files_left``, #540).
+
     :param job: The row being written off.
     :return: None.
     """
-    if job.external_id:
-        _cancel_job_id(job, job.external_id)
+    try:
+        spec = _provider(job)
+    except UnknownProvider as exc:
+        logger.warning("cannot cancel job %s: %s", job.pk, exc)
+        return
+    spec.cancel(job, job.external_id or "")
 
 
 def _cancel_job_id(job: ExternalJob, job_id: str) -> None:
@@ -559,9 +568,11 @@ def _cancel_runpod_job_id(job: ExternalJob, job_id: str) -> None:
     """Cancel one RunPod job on ``job``'s engine endpoint.
 
     :param job: A RunPod row; names the endpoint through its engine.
-    :param job_id: RunPod's job id.
+    :param job_id: RunPod's job id; none means nothing to cancel.
     :return: None.
     """
+    if not job_id:
+        return
     try:
         base_url, headers = runpod_client.endpoint_config(
             _runpod_endpoint(job)
