@@ -41,17 +41,21 @@ SCRIPT = (
 class TestTheScriptKeysAKeptCardByItsPlace(SimpleTestCase):
     """A kept card is browser state until the page's dismissal is
     sent, and an answer elsewhere rebuilds the opinion in between:
-    the finding rows are written again with new pks and an edit before
-    the word moves its offset. The key reads the position the server
-    writes for that, and never the finding pk."""
+    the finding rows are written again with new pks, an edit before
+    the word moves its offset, and a "Not text" drop moves every
+    later block's id down by one. The key reads the block's box and
+    the position the server writes for that, never the finding pk or
+    the group id."""
 
-    def test_the_key_reads_the_position_and_never_the_finding(self):
+    def test_the_key_reads_the_box_and_the_position_alone(self):
         source = SCRIPT.read_text()
         body = re.search(
             r"function keyOf\(card\) \{(.*?)\n    \}", source, re.S
         ).group(1)
         self.assertIn("card.position", body)
+        self.assertIn("card.box_pt", body)
         self.assertNotIn("finding_pk", body)
+        self.assertNotIn("group_id", body)
         self.assertNotIn("card.start", body.split("else")[0])
 
     def test_a_reload_settles_the_findings_whose_cards_are_all_kept(self):

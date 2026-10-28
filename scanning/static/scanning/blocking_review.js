@@ -84,15 +84,21 @@
     }
 
     /** The key a card keeps across reloads: its kind, page, block and
-     *  place. The place is the base position the card answers for
-     *  (a gap's, marked, since it starts where the word after it
-     *  starts; a word of a run with its place in the run), because
-     *  every rebuild renews the finding rows and an edit before the
-     *  word moves its offset, and a kept word must still be kept
-     *  after an answer elsewhere rebuilt the opinion. A card with no
-     *  position (a block, a single block, a link) is one per block or
-     *  per check. */
+     *  place. The block is its box in points, never its id: the ids
+     *  number the kept blocks of the page, so a "Not text" drop moves
+     *  every later block's id down by one, and a kept mark keyed by
+     *  id would land on another block's word. The place is the base
+     *  position the card answers for (a gap's, marked, since it
+     *  starts where the word after it starts; a word of a run with
+     *  its place in the run), because every rebuild renews the
+     *  finding rows and an edit before the word moves its offset, and
+     *  a kept word must still be kept after an answer elsewhere
+     *  rebuilt the opinion. A card with no position (a block, a
+     *  single block, a link) is one per block or per check. */
     function keyOf(card) {
+        var block = card.box_pt
+            ? card.box_pt.map(function (v) { return Math.round(v * 10) / 10; }).join(',')
+            : '';
         var place;
         if (card.position !== undefined && card.position !== null) {
             place = (card.gap ? 'gap@' : 'p') + card.position
@@ -100,7 +106,7 @@
         } else {
             place = card.check || ('s' + (card.start || 0) + ':' + (card.length || 0));
         }
-        return [card.kind, card.page_in_opinion, card.group_id, place].join(':');
+        return [card.kind, card.page_in_opinion, block, place].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────

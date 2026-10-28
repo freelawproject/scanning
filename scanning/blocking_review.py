@@ -230,9 +230,11 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
         text there and ``position`` the base position the card answers
         for: a span's first, a gap's the word after it, and a word of a
         run its position with ``run_index`` beside it. The browser keys
-        a card kept as shown by the position, never by the finding pk
-        or the offset: every rebuild renews the finding rows, and an
-        edit before the word moves its offset.
+        a card kept as shown by its block's ``box_pt`` and the
+        position, never by the finding pk, the group id or the offset:
+        every rebuild renews the finding rows, a drop renumbers the
+        later groups of the page, and an edit before the word moves
+        its offset.
     :rtype: list[dict]
     """
     agreements = (
