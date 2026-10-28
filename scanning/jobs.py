@@ -527,11 +527,20 @@ def _cancel_provider_job(job: ExternalJob) -> None:
     Best effort and never raises: this runs inside a sweep that must
     still judge every other row on the tick.
 
+    A row with no provider id goes to its provider's cancel too, with
+    an empty id: RunPod has nothing to cancel then, and Mistral deletes
+    the files a row names before its batch exists, the pages a
+    throttled cleanup left (``files_left``, #540).
+
     :param job: The row being written off.
     :return: None.
     """
-    if job.external_id:
-        _cancel_job_id(job, job.external_id)
+    try:
+        spec = _provider(job)
+    except UnknownProvider as exc:
+        logger.warning("cannot cancel job %s: %s", job.pk, exc)
+        return
+    spec.cancel(job, job.external_id or "")
 
 
 def _cancel_job_id(job: ExternalJob, job_id: str) -> None:
@@ -559,9 +568,11 @@ def _cancel_runpod_job_id(job: ExternalJob, job_id: str) -> None:
     """Cancel one RunPod job on ``job``'s engine endpoint.
 
     :param job: A RunPod row; names the endpoint through its engine.
-    :param job_id: RunPod's job id.
+    :param job_id: RunPod's job id; none means nothing to cancel.
     :return: None.
     """
+    if not job_id:
+        return
     try:
         base_url, headers = runpod_client.endpoint_config(
             _runpod_endpoint(job)
@@ -698,17 +709,25 @@ def _write(job: ExternalJob, **fields) -> bool:
     daemon-against-daemon is not the case being handled -- but this is
     also what makes a second replica safe if one is ever deployed.
 
+    The provider id is the second guard (#540): a Mistral wave's thread
+    writes the batch id of a claim up to the moment it ends, and the
+    lost-claim sweep, having judged that claim dead, retries the row
+    with the id it read, none. Matched on the id too, the retry lands
+    only while the row still has none, and a batch written meanwhile
+    is polled on the next tick instead of orphaned and paid for twice.
+
     On success the in-memory instance is updated too, so a caller can
     chain another :func:`_write` against the new status.
 
-    :param job: The row to update; its current ``status`` is the guard.
+    :param job: The row to update; its current ``status`` and
+        ``external_id`` are the guard.
     :param fields: Field values to write.
     :returns: True if this writer won the row.
     :rtype: bool
     """
-    updated = ExternalJob.objects.filter(pk=job.pk, status=job.status).update(
-        **fields
-    )
+    updated = ExternalJob.objects.filter(
+        pk=job.pk, status=job.status, external_id=job.external_id
+    ).update(**fields)
     if not updated:
         logger.info(
             "job %s (%s/%s shard %s) moved out of %s under us; skipping",
@@ -3268,6 +3287,12 @@ def sweep_jobs(now=None) -> SweepSummary:
         ):
             summary.failed += 1
 
+    # The files a Mistral row still names after its last write (#540):
+    # a provider's own pass, not a row's, so it is called and not in
+    # the table. Imported here like the table does, for the cycle.
+    from scanning import mistral_ocr
+
+    mistral_ocr.delete_leftover_files()
     return summary
 
 
@@ -3333,9 +3358,15 @@ def abandon_open(
         # the pipeline, which owns no part of an apply run (#224).
         rows = rows.filter(apply_run__isnull=True)
 
-    # Read the handles before the update: it is the only thing that says
-    # what to cancel, and afterwards the rows no longer read as open.
-    doomed = list(rows.filter(status__in=IN_FLIGHT_JOB_STATUSES))
+    # Read the ids before the update, because afterwards the rows no
+    # longer read as open, and the handles after it: a wave's thread
+    # writes a batch id and its files right up to the swap, and a
+    # cancel from the snapshot would miss what landed in between.
+    doomed = list(
+        rows.filter(status__in=IN_FLIGHT_JOB_STATUSES).values_list(
+            "pk", flat=True
+        )
+    )
     cancelled = rows.update(
         status=JobStatus.CANCELLED,
         error_code="ABANDONED",
@@ -3348,6 +3379,8 @@ def abandon_open(
             getattr(scan, "pk", scan),
             reason,
         )
-    for job in doomed:
+    for job in ExternalJob.objects.filter(pk__in=doomed).select_related(
+        "scan"
+    ):
         _cancel_provider_job(job)
     return cancelled
