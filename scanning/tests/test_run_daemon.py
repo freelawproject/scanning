@@ -338,6 +338,11 @@ class TestDaemonHeartbeat(TestCase):
     def test_the_loop_beats_after_every_pass_once_the_interval_passed(self):
         """A serial round runs every due pass back to back, and one of
         them can hold the loop for minutes."""
-        with patch("scanning.daemon_heartbeat.INTERVAL_SECONDS", 0):
+        with (
+            patch("scanning.daemon_heartbeat.INTERVAL_SECONDS", 0),
+            # Monotonic time counts from boot, so on a host up for less
+            # than a pass's interval (CI's) that pass is not due yet.
+            patch.object(ScheduledTask, "due", return_value=True),
+        ):
             beats = self._run_once()
         self.assertEqual(len(beats), 1 + len(Command()._build_schedule()))
