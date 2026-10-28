@@ -334,12 +334,15 @@ def submit_doctor() -> int:
 @app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
 @locked("submit_mistral")
 def submit_mistral() -> int:
-    """Render and submit one shard to Mistral: minutes, on the heavy queue.
+    """Render and submit a wave of shards to Mistral: minutes, on the
+    heavy queue.
 
-    Locked like the other waves: one render at a time keeps the batch
-    cap (``mistral_ocr.MAX_CONCURRENCY``, counted before the claim)
+    The wave takes a volume's worth of shards here
+    (``mistral_ocr.submits_per_tick``), because nothing waits behind
+    it. Locked like the other waves: one wave at a time keeps the batch
+    cap (``mistral_ocr.max_concurrency``, counted before the claim)
     exact, and two workers never pay for two renders when one was
-    wanted. Lifting it is a measured decision, not a default.
+    wanted.
 
     :returns: The submitted count.
     :rtype: int

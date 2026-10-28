@@ -6,7 +6,7 @@ carries its own status. So the PDF is one pass over the rows and not a
 schedule (``build_opinion_pdfs``, last in ``run_daemon``), the tick
 finds one row that owes its PDF, writes it, and stamps the row. One PDF
 per tick (:data:`PDFS_PER_TICK`), the rule of the Mistral wave
-(``mistral_ocr.MAX_SUBMITS_PER_TICK``), because the tick blocks the
+(``mistral_ocr.submits_per_tick``), because the tick blocks the
 serial scheduler for the whole write, and every other task
 (``process_next_scan``, the two job waves) waits for it. After the
 pulls that is a second or two of re-encoding. The first tick of a
