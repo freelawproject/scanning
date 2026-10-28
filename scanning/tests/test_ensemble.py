@@ -1444,6 +1444,55 @@ class TestTheVote(TestCase):
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
 
+    def test_a_hyphen_with_a_space_after_it_is_the_hyphen(self):
+        """Mistral wrote ``CP-23-CR-0001065- 2021`` for the docket
+        number dots.mocr wrote as ``CP-23-CR-0001065-2021``: one
+        reading with a space in it, not two readings. The key folds
+        the space, the pairing reads the two words as one, and the
+        two engines are the majority over Surya's comma; the card is
+        a warning, not a block nobody agrees on. A dash between
+        spaces is a mark of its own and stays."""
+        self.assertEqual(
+            ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
+            "No(s): CP-23-CR-0001065-2021",
+        )
+        self.assertEqual(ensemble.compare_text("a - b"), "a - b")
+        self.assertEqual(
+            ensemble.compare_text("677 -- 679 and - so"), "677 -- 679 and - so"
+        )
+        self.assertEqual(
+            ensemble.compare_text("677- 679", hyphen_gaps=False), "677- 679"
+        )
+        self.assertEqual(
+            ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+            [
+                ("No(s):", "No(s):"),
+                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
+        )
+        self.assertEqual(
+            ensemble._pairs("677 -- 679"),
+            [("677", "677"), ("--", "--"), ("679", "679")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("No(s): CP-23-CR-0001065-2021"),
+            [
+                ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+                ensemble._pairs("No(s): CP-23-CR-0001065, 2021"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["No(s):", "CP-23-CR-0001065-2021"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
         a word the base does have is marked. So the word goes in,

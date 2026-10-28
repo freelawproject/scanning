@@ -652,6 +652,15 @@ class TestCarriesNumber(SimpleTestCase):
         text = "STATE v. SMITH\nCite as 218 A.3d 677 -- 679"
         self.assertTrue(page_numbers.carries_number(text, "679"))
 
+    def test_a_hyphen_with_a_space_after_it_keeps_the_number_at_the_end(
+        self,
+    ):
+        """The vote folds ``677- 679`` to one word; this reader must
+        not, or the line ends in a range and the page loses its
+        number."""
+        text = "STATE v. SMITH\nCite as 218 A.3d 677- 679"
+        self.assertTrue(page_numbers.carries_number(text, "679"))
+
     def test_a_number_buried_in_the_line_is_no_reading(self):
         text = "STATE v. SMITH\nCite as 218 A.3d 677 -- 679"
         self.assertFalse(page_numbers.carries_number(text, "218"))

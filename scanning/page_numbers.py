@@ -500,7 +500,10 @@ def carries_number(text: str, value: str | None) -> bool:
         return False
     wanted = str(value)
     for line in _clean(text).splitlines():
-        folded = compare_text(line).lstrip(_BULLETS).strip()
+        # The vote's fold less its hyphen rule: ``677- 679`` at the end
+        # of a ``Cite as`` line ends in the page number as the engine
+        # wrote it, and folded to ``677-679`` it would end in a range.
+        folded = compare_text(line, hyphen_gaps=False).lstrip(_BULLETS).strip()
         for detected, _type, _side in _line_readings(folded):
             if detected == wanted:
                 return True

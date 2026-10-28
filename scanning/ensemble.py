@@ -397,6 +397,18 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
 
+#: A hyphen between a word character and whitespace, with a word after:
+#: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
+#: ``CP-23-CR-0001065-2021``, the same docket number, and the two are
+#: no two engines agreeing on a word. A dash between spaces, or the
+#: second of a double dash (``677 -- 679``), is a mark of its own and
+#: stays.
+_HYPHEN_GAP = re.compile(r"(?<=\w)-\s+(?=\w)")
+
+#: A word that ends in a hyphen after a word character, the head of a
+#: ``_HYPHEN_GAP`` split; ``--`` is not one.
+_HYPHEN_END = re.compile(r"\w-$")
+
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
 #: Mistral writes an image placeholder as a block's whole text where
@@ -493,7 +505,7 @@ def _strip_markup(fragment: str) -> str:
     return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
-def compare_text(text: str) -> str:
+def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """Return the text as the vote compares it, never as it is shown.
 
     **The comparison is not the text.** The engines agree about the
@@ -505,11 +517,18 @@ def compare_text(text: str) -> str:
     text is what a reader sees.
 
     :param text: One engine's read.
+    :param hyphen_gaps: Fold a hyphen with whitespace after it inside a
+        word (``_HYPHEN_GAP``). The page-number reader turns it off
+        (``page_numbers.carries_number``): a ``Cite as`` line that
+        ends ``677- 679`` ends in the page number as the engine wrote
+        it, and folded it would end in a range.
     :returns: The key.
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    if hyphen_gaps:
+        folded = _HYPHEN_GAP.sub("-", folded)
     return _WS.sub(" ", folded).strip()
 
 
@@ -525,7 +544,8 @@ def compare_word(word: str) -> str:
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
-    return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
+    folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    return _HYPHEN_GAP.sub("-", folded).strip()
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -540,7 +560,10 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     writes ``...``, and :func:`compare_text` reads them alike already
     (``_DOT_RUN``). Split on whitespace first, they are three words
     against one, and a block that agrees to the letter goes to a vote.
-    The shown word keeps the engine's own spacing.
+    A word that ends in a hyphen and the word after it are one word
+    the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
+    spacing of ``0001065-2021``, and split it is two words against
+    one. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
@@ -552,6 +575,15 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     while index < len(words):
         end = index
         while end < len(words) and _LONE_DOTS.match(words[end]):
+            end += 1
+        if end - index < 2:
+            end = index
+            while (
+                end + 1 < len(words)
+                and _HYPHEN_END.search(words[end])
+                and words[end + 1][:1].isalnum()
+            ):
+                end += 1
             end += 1
         if end - index >= 2:
             shown = " ".join(words[index:end])
