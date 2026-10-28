@@ -74,9 +74,9 @@ Mistral, and must not be broken:
   Mistral until we delete them, so every path that writes a row off
   deletes what it uploaded, and :func:`harvest` deletes all four once
   the result is in S3, on a pool as wide as the uploads (#548). A
-  delete never sleeps: a file it could not
-  reach is carried on the row as ``files_left``, and the sweep tries
-  it again every tick (:func:`delete_leftover_files`). The pages are
+  delete never sleeps: a file it could not reach is carried on the
+  row as ``files_left``, and the sweep tries it again every tick
+  (:func:`delete_leftover_files`). The pages are
   unredacted, so this delete is the only thing that limits how long a
   third party holds them.
 - **A result with a hole is never carried.** The stable-hole rule of
