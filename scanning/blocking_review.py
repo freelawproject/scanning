@@ -225,8 +225,16 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     :param group: One group of a stamped ensemble document.
     :param flag: The flag of the tokens to open.
     :returns: One entry per open place: ``{start, length, token,
-        before, after, readings: [{engine, word}]}``, with ``start`` an
-        offset into the group's ``text`` and ``token`` the text there.
+        before, after, readings: [{engine, word}], position}``, with
+        ``start`` an offset into the group's ``text``, ``token`` the
+        text there and ``position`` the base position the card answers
+        for: a span's first, a gap's the word after it, and a word of a
+        run its position with ``run_index`` beside it. The browser keys
+        a card kept as shown by its block's ``box_pt`` and the
+        position, never by the finding pk, the group id or the offset:
+        every rebuild renews the finding rows, a drop renumbers the
+        later groups of the page, and an edit before the word moves
+        its offset.
     :rtype: list[dict]
     """
     agreements = (
@@ -380,6 +388,7 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 "before": before,
                 "after": after,
                 "readings": readings,
+                "position": first,
             }
         )
     # The words of a run the base did not read, one card each.
@@ -411,6 +420,8 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                 "before": before,
                 "after": after,
                 "readings": readings,
+                "position": position,
+                "run_index": entry["run_index"],
             }
         )
     # The gaps, one card each, on the gap itself.
@@ -478,6 +489,7 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
                     "before": before,
                     "after": after,
                     "readings": readings,
+                    "position": position,
                     # The crop is cut at the word beside the gap.
                     "crop_span": [
                         entry["start"],
