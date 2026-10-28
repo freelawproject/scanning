@@ -868,6 +868,31 @@ class TestSubmitWave(ScanningTestCase):
             ["f0", "f1", "m1"],
         )
 
+    def test_a_waves_deletes_run_on_its_upload_pool(self):
+        # A failed shard deletes its landed pages, and the carried files
+        # of an earlier try go first: both on the wave's upload pool,
+        # never a pool of their own, so a wave has at most
+        # upload_workers() calls in flight however many shards fail.
+        ExternalJob.objects.filter(scan=self.scan).update(
+            provider_meta={"files_left": ["old"]}
+        )
+        with patch.object(
+            mistral_ocr, "_delete_files", wraps=mistral_ocr._delete_files
+        ) as deletes:
+            summary, mocks = self._tick(
+                create_error=mistral_client.MistralTransientError(
+                    "no answer", mistral_client.UNANSWERED_ERROR_CODE
+                )
+            )
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(len(deletes.call_args_list), 2)
+        for call in deletes.call_args_list:
+            self.assertIsNotNone(call.kwargs.get("pool"))
+        self.assertEqual(
+            [c.args[0] for c in mocks["delete"].call_args_list],
+            ["old", "f0", "f1", "m1"],
+        )
+
     def test_a_refusal_fails_the_row(self):
         summary, mocks = self._tick(
             create_error=mistral_client.MistralError("bad", "HTTP_400", 400)

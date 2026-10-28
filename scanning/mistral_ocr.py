@@ -551,7 +551,9 @@ class _Submission:
     duration_ms: int = 0
 
 
-def _delete_files(file_ids: list[str]) -> list[str]:
+def _delete_files(
+    file_ids: list[str], pool: ThreadPoolExecutor | None = None
+) -> list[str]:
     """Delete some files at Mistral, once each, best effort, side by
     side.
 
@@ -576,10 +578,17 @@ def _delete_files(file_ids: list[str]) -> list[str]:
     a wave's uploads on another worker the two pools share the limit,
     and a throttled delete is carried, a throttled upload backs off
     (:data:`UPLOAD_RETRIES`), so the width is the first thing to lower
-    if the uploads start to see 429s. One id, the leftover pass's
-    case, opens no pool.
+    if the uploads start to see 429s. Inside a wave the deletes go on
+    the wave's own upload pool (``pool``), so a wave never has more
+    than :func:`upload_workers` calls in flight: a shard that fails
+    deletes its hundred landed pages beside the other shards' uploads,
+    and four failing at once on pools of their own would put sixty-four
+    deletes beside sixteen uploads, on a workspace a 429 has just
+    throttled. One id, the leftover pass's case, opens no pool.
 
     :param file_ids: The ids.
+    :param pool: The wave's upload pool, to run the deletes on instead
+        of a pool of their own.
     :returns: The ids that are not gone, in the caller's order.
     :rtype: list[str]
     """
@@ -589,9 +598,11 @@ def _delete_files(file_ids: list[str]) -> list[str]:
     workers = min(len(ids), upload_workers())
     if workers == 1:
         gone = [_delete_one(file_id) for file_id in ids]
+    elif pool is not None:
+        gone = list(pool.map(_delete_one, ids))
     else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            gone = list(pool.map(_delete_one, ids))
+        with ThreadPoolExecutor(max_workers=workers) as own:
+            gone = list(own.map(_delete_one, ids))
     return [file_id for file_id, is_gone in zip(ids, gone) if not is_gone]
 
 
@@ -889,7 +900,7 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     carried = [
         str(f) for f in (job.provider_meta or {}).get("files_left") or []
     ]
-    left = _delete_files(carried)
+    left = _delete_files(carried, pool=uploads.pool)
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -960,7 +971,7 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     except Exception:
         landed = _uploaded(pages) + tail
         uploads.tried[job.pk] = carried + landed
-        uploads.left[job.pk] = left + _delete_files(landed)
+        uploads.left[job.pk] = left + _delete_files(landed, pool=uploads.pool)
         raise
     uploads.tried[job.pk] = carried
     uploads.left[job.pk] = left
