@@ -571,9 +571,13 @@ def _delete_files(file_ids: list[str]) -> list[str]:
     sweep that harvests one shard at a time; and a batch holds its
     slot under :func:`max_concurrency` until its row is harvested, so
     a volume of finished batches kept the cap full for the length of
-    its deletes. Sixteen wide, measured, the same hundred take three
-    seconds and Mistral does not push back. One id, the leftover
-    pass's case, opens no pool.
+    its deletes. Sixteen wide, measured with no wave running, the same
+    hundred take three seconds and Mistral does not push back; beside
+    a wave's uploads on another worker the two pools share the limit,
+    and a throttled delete is carried, a throttled upload backs off
+    (:data:`UPLOAD_RETRIES`), so the width is the first thing to lower
+    if the uploads start to see 429s. One id, the leftover pass's
+    case, opens no pool.
 
     :param file_ids: The ids.
     :returns: The ids that are not gone, in the caller's order.

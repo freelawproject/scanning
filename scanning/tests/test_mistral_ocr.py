@@ -356,7 +356,9 @@ class TestSubmitWave(ScanningTestCase):
     ):
         # One upload thread unless a test asks for more: the
         # side-effect lists above answer the calls in the order they
-        # are made, which only a serial pool keeps in page order. No
+        # are made, which only a serial pool keeps in page order; the
+        # wave's deletes share the width (#548), so they are serial and
+        # in order here too. No
         # wait between two tries of a throttled page unless a test
         # asks for one. The settings override is scoped to the call,
         # so it nests inside a test's own override.
@@ -847,8 +849,7 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(uploaded, [uploaded[0]])
         mocks["create"].assert_not_called()
         self.assertEqual(
-            sorted(c.args[0] for c in mocks["delete"].call_args_list),
-            sorted(uploaded),
+            [c.args[0] for c in mocks["delete"].call_args_list], uploaded
         )
 
     def test_a_transient_create_failure_retries_and_deletes(self):
@@ -863,7 +864,7 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(job.attempt, 2)
         self.assertEqual(job.external_id, "")
         self.assertEqual(
-            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            [c.args[0] for c in mocks["delete"].call_args_list],
             ["f0", "f1", "m1"],
         )
 
@@ -1197,7 +1198,10 @@ class TestSubmitWave(ScanningTestCase):
             return file_id != "f3"
 
         ids = [f"f{i}" for i in range(8)]
-        with patch("scanning.mistral_client.delete_file", side_effect=delete):
+        with (
+            override_settings(MISTRAL_UPLOAD_WORKERS=16),
+            patch("scanning.mistral_client.delete_file", side_effect=delete),
+        ):
             self.assertEqual(
                 mistral_ocr._delete_files(ids), ["f1", "f3", "f6"]
             )
@@ -1246,7 +1250,7 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(summary.submitted, 0)
         mocks["cancel"].assert_called_once_with("batch-1")
         self.assertEqual(
-            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            [c.args[0] for c in mocks["delete"].call_args_list],
             ["f0", "f1", "m1"],
         )
         job = extract_jobs(self.scan)[0]
@@ -1285,8 +1289,7 @@ class TestSubmitWave(ScanningTestCase):
         job.refresh_from_db()
         self.assertEqual(job.status, JobStatus.FAILED)
         self.assertEqual(
-            sorted(c.args[0] for c in deleted.call_args_list),
-            ["e0", "f0", "f1"],
+            [c.args[0] for c in deleted.call_args_list], ["e0", "f0", "f1"]
         )
         cancel.assert_not_called()
         # The row named every file before the first delete, so a kill
@@ -1721,11 +1724,14 @@ class TestSweep(ScanningTestCase):
             status=JobStatus.COMPLETED, provider_meta={"files_left": ["f1"]}
         )
 
+        # The fake writes the row, so the delete runs on this thread: a
+        # pool thread has no view of the test's transaction.
         def delete(file_id):
             ExternalJob.objects.filter(pk=self.job.pk).delete()
             return True
 
         with (
+            override_settings(MISTRAL_UPLOAD_WORKERS=1),
             patch("scanning.mistral_client.delete_file", side_effect=delete),
             self.assertLogs("scanning.mistral_ocr", "WARNING") as logs,
         ):
@@ -2124,7 +2130,7 @@ class TestSweep(ScanningTestCase):
         mocks["find"].assert_called_once_with(
             f"scan{self.scan.pk}-job{self.job.pk}-a1-"
         )
-        deleted = [c.args[0] for c in mocks["delete"].call_args_list]
+        deleted = sorted(c.args[0] for c in mocks["delete"].call_args_list)
         self.assertEqual(deleted, ["f0", "f1"])
 
     def test_a_lost_claim_carries_the_files_it_could_not_delete(self):
