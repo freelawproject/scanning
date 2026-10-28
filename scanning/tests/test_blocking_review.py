@@ -60,8 +60,37 @@ class TestTheScriptKeysAKeptCardByItsPlace(SimpleTestCase):
 
     def test_a_reload_settles_the_findings_whose_cards_are_all_kept(self):
         source = SCRIPT.read_text()
-        self.assertIn("return self.settle();", source)
-        self.assertIn("Section.prototype.settle = function", source)
+        self.assertIn("return self.settle(cause);", source)
+        self.assertIn("Section.prototype.settle = function (cause)", source)
+
+    def test_a_sent_dismissal_leaves_kept_and_is_undone_with_its_cause(
+        self,
+    ):
+        """Once sent, a dismissal's marks leave ``kept``, or a card a
+        curator restores elsewhere is dismissed again with no click;
+        and a dismissal settle sent on an edit's reload is listed
+        under that edit, whose Undo restores it first."""
+        source = SCRIPT.read_text()
+        dismiss = re.search(
+            r"Section\.prototype\.dismiss = function(.*?)\n    \};",
+            source,
+            re.S,
+        ).group(1)
+        self.assertIn("delete self.kept[key]", dismiss)
+        self.assertIn("cause.settled = cause.settled || []", dismiss)
+        self.assertIn("return self.reload(cause);", dismiss)
+        undo = re.search(
+            r"Section\.prototype\.undo = function(.*?)\n    \};", source, re.S
+        ).group(1)
+        self.assertIn("entry.settled", undo)
+        self.assertIn("self.undoOne(d)", undo)
+        for write in ("write", "drop"):
+            body = re.search(
+                rf"Section\.prototype\.{write} = function(.*?)\n    \}};",
+                source,
+                re.S,
+            ).group(1)
+            self.assertIn("return self.reload(entry);", body)
 
 
 # ── the open words ───────────────────────────────────────────────────
