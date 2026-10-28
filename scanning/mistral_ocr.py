@@ -73,7 +73,8 @@ Mistral, and must not be broken:
   Every page image, the manifest and the two output files live at
   Mistral until we delete them, so every path that writes a row off
   deletes what it uploaded, and :func:`harvest` deletes all four once
-  the result is in S3. A delete never sleeps: a file it could not
+  the result is in S3, on a pool as wide as the uploads (#548). A
+  delete never sleeps: a file it could not
   reach is carried on the row as ``files_left``, and the sweep tries
   it again every tick (:func:`delete_leftover_files`). The pages are
   unredacted, so this delete is the only thing that limits how long a
@@ -551,7 +552,8 @@ class _Submission:
 
 
 def _delete_files(file_ids: list[str]) -> list[str]:
-    """Delete some files at Mistral, once each, best effort.
+    """Delete some files at Mistral, once each, best effort, side by
+    side.
 
     No delete waits: a throttled one (a 429, while the wave's own
     uploads hold the workspace's limit) or a refused one is handed
@@ -562,20 +564,45 @@ def _delete_files(file_ids: list[str]) -> list[str]:
     hold the wave's lock, the outcome writes of the other shards, or a
     web request.
 
+    The calls run on a pool as wide as the uploads (#548,
+    :func:`upload_workers`), so both share one assumption about the
+    workspace's request limit. One at a time, a shard's hundred files
+    took forty seconds and a volume's a quarter of an hour, inside the
+    sweep that harvests one shard at a time; and a batch holds its
+    slot under :func:`max_concurrency` until its row is harvested, so
+    a volume of finished batches kept the cap full for the length of
+    its deletes. Sixteen wide, measured, the same hundred take three
+    seconds and Mistral does not push back. One id, the leftover
+    pass's case, opens no pool.
+
     :param file_ids: The ids.
     :returns: The ids that are not gone, in the caller's order.
     :rtype: list[str]
     """
-    left = []
-    for file_id in file_ids:
-        if not file_id:
-            continue
-        try:
-            if not mistral_client.delete_file(str(file_id)):
-                left.append(str(file_id))
-        except mistral_client.MistralBusy:
-            left.append(str(file_id))
-    return left
+    ids = [str(file_id) for file_id in file_ids if file_id]
+    if not ids:
+        return []
+    workers = min(len(ids), upload_workers())
+    if workers == 1:
+        gone = [_delete_one(file_id) for file_id in ids]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            gone = list(pool.map(_delete_one, ids))
+    return [file_id for file_id, is_gone in zip(ids, gone) if not is_gone]
+
+
+def _delete_one(file_id: str) -> bool:
+    """Delete one file at Mistral, and say whether it is gone.
+
+    :param file_id: The id.
+    :returns: ``False`` for a throttled or a refused delete, which the
+        caller carries.
+    :rtype: bool
+    """
+    try:
+        return bool(mistral_client.delete_file(file_id))
+    except mistral_client.MistralBusy:
+        return False
 
 
 def _manifest_line(page_no: int, file_id: str, model: str) -> str:
