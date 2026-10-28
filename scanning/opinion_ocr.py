@@ -369,18 +369,6 @@ MESSAGE_PREFIX = "OCR glue: "
 POINTS_PER_INCH = 72.0
 
 
-#: The C0 controls a unit's text loses before the parse (#538): XML
-#: 1.0 refuses them and Postgres refuses a NUL in ``text`` and
-#: ``jsonb``. Python reads ``\x0b``, ``\x0c`` and ``\x1c``-``\x1f`` as
-#: whitespace and they may part two words, so they become a space; the
-#: rest are deleted. Tab, LF and CR stay.
-_CONTROLS = {
-    code: (" " if chr(code).isspace() else None)
-    for code in range(0x20)
-    if chr(code) not in "\t\n\r"
-}
-
-
 class OpinionGlueError(Exception):
     """A fact about one row: the glue of this opinion cannot be written.
 
@@ -489,7 +477,7 @@ class EngineSpec:
             source = unit.get(self.text_key)
         label = unit.get(self.type_key) or ""
         return self.dialect(
-            source.translate(_CONTROLS) if isinstance(source, str) else "",
+            markup.strip_controls(source) if isinstance(source, str) else "",
             kind=self.kind_types.get(label),
         )
 

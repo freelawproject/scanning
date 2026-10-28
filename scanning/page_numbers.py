@@ -105,6 +105,8 @@ from __future__ import annotations
 import logging
 import re
 
+from scanning import markup
+
 logger = logging.getLogger(__name__)
 
 #: Band fractions of the page render height, from ai-research
@@ -620,7 +622,8 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
         zone = labelled or band
         if zone is None:
             continue
-        text = unit.get(spec.text_key) or ""
+        # The whole line is stored on ``Scan.ocr_results`` (#538).
+        text = markup.strip_controls(unit.get(spec.text_key) or "")
         for index, line in enumerate(_clean(text).splitlines()):
             line = compare_text(line).lstrip(_BULLETS).strip()
             for detected, number_type, side in _line_readings(line):
