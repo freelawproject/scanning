@@ -3240,14 +3240,28 @@ def _record_progress(job: ExternalJob, outcome, now) -> bool:
     return _write(job, **fields)
 
 
-def sweep_jobs(now=None) -> SweepSummary:
+def sweep_jobs(
+    now=None, providers: tuple[str, ...] | None = None
+) -> SweepSummary:
     """Confirm in-flight jobs and write off stranded rows.
 
     The recovery half of the loop. For doctor it is the *only* thing
     that can finish a job whose response we never saw. For RunPod it is
     the normal path: submitting only queues the work.
 
+    ``providers`` names whose rows this pass judges; ``None`` judges
+    every provider's, the daemon's serial tick. A Celery tick task
+    names one, the twin of :func:`submit_pending`: a sweep is as slow
+    as its slowest provider, and Mistral's harvest deletes a finished
+    shard's hundred page files one call at a time, so a volume of
+    batches finishing together held one shared pass for a quarter of
+    an hour while RunPod's finished shards sat uncollected, their caps
+    full and their GPUs idle. One sweep per provider, each its own
+    task on its own queue, and a slow one holds up nothing but itself.
+
     :param now: Comparison time; defaults to ``timezone.now()``.
+    :param providers: The ``JobProvider`` values whose rows are swept,
+        or ``None`` for every one.
     :returns: Counts of what the tick did.
     :rtype: SweepSummary
     """
@@ -3257,6 +3271,8 @@ def sweep_jobs(now=None) -> SweepSummary:
     in_flight = ExternalJob.objects.filter(
         status__in=IN_FLIGHT_JOB_STATUSES
     ).select_related("scan", "scan__reporter")
+    if providers is not None:
+        in_flight = in_flight.filter(provider__in=providers)
     for job in in_flight:
         try:
             spec = _provider(job)
@@ -3279,6 +3295,8 @@ def sweep_jobs(now=None) -> SweepSummary:
         deadline__isnull=False,
         deadline__lt=now,
     ).select_related("scan", "scan__reporter")
+    if providers is not None:
+        stranded = stranded.filter(provider__in=providers)
     for job in stranded:
         if _fail(
             job,
@@ -3289,10 +3307,12 @@ def sweep_jobs(now=None) -> SweepSummary:
 
     # The files a Mistral row still names after its last write (#540):
     # a provider's own pass, not a row's, so it is called and not in
-    # the table. Imported here like the table does, for the cycle.
-    from scanning import mistral_ocr
+    # the table, and only by the sweep that owns Mistral. Imported
+    # here like the table does, for the cycle.
+    if providers is None or JobProvider.MISTRAL in providers:
+        from scanning import mistral_ocr
 
-    mistral_ocr.delete_leftover_files()
+        mistral_ocr.delete_leftover_files()
     return summary
 
 

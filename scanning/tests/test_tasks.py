@@ -22,7 +22,9 @@ TICK_TASKS = (
     tasks.submit_runpod,
     tasks.submit_doctor,
     tasks.submit_mistral,
-    tasks.sweep_jobs,
+    tasks.sweep_runpod,
+    tasks.sweep_doctor,
+    tasks.sweep_mistral,
     tasks.merge_conversions,
     tasks.glue_runs,
     tasks.prepare_opinions,
@@ -71,19 +73,19 @@ class TestTicks(TestCase):
 
     @override_settings(DAEMON_COLLECT_INTERVAL=42)
     def test_the_interval_comes_from_the_settings_at_send_time(self):
-        tick = next(t for t in tasks.TICKS if t.name == "sweep_jobs")
+        tick = next(t for t in tasks.TICKS if t.name == "sweep_runpod")
         self.assertEqual(tick.interval(), 42.0)
-        with patch.object(tasks.sweep_jobs, "apply_async") as send:
+        with patch.object(tasks.sweep_runpod, "apply_async") as send:
             self.assertTrue(tick.send())
         # Its interval is its expiry: a stale tick is dropped, never
         # replayed behind a busy worker.
         send.assert_called_once_with(queue=tasks.QUEUE_FAST, expires=42.0)
 
     def test_a_broker_fault_on_a_send_is_a_warning(self):
-        tick = next(t for t in tasks.TICKS if t.name == "sweep_jobs")
+        tick = next(t for t in tasks.TICKS if t.name == "sweep_runpod")
         with (
             patch.object(
-                tasks.sweep_jobs, "apply_async", side_effect=OSError("down")
+                tasks.sweep_runpod, "apply_async", side_effect=OSError("down")
             ),
             self.assertLogs("scanning.tasks", level="WARNING"),
         ):
@@ -501,8 +503,55 @@ class TestNudges(TestCase):
             patch("scanning.ticks.sweep", return_value=SweepSummary()),
             patch.object(tasks.merge_conversions, "apply_async") as merge,
         ):
-            self.assertEqual(tasks.sweep_jobs(), 0)
+            self.assertEqual(tasks.sweep_runpod(), 0)
         merge.assert_not_called()
+
+    def test_each_sweep_names_its_provider_on_its_own_queue(self):
+        """One sweep per provider, the twin of the waves: a slow
+        Mistral harvest never holds RunPod's polls. RunPod's stays on
+        the fast queue; doctor's and Mistral's go where doctor's
+        blocking wave already lives."""
+        from scanning.jobs import SweepSummary
+
+        expected = {
+            tasks.sweep_runpod: (JobProvider.RUNPOD, tasks.QUEUE_FAST),
+            tasks.sweep_doctor: (JobProvider.DOCTOR, tasks.QUEUE_IO),
+            tasks.sweep_mistral: (JobProvider.MISTRAL, tasks.QUEUE_IO),
+        }
+        for task, (provider, queue) in expected.items():
+            with self.subTest(task=task.name):
+                self.assertEqual(task.queue, queue)
+                self.assertEqual(
+                    next(t.queue for t in tasks.TICKS if t.task is task), queue
+                )
+                with patch(
+                    "scanning.ticks.sweep", return_value=SweepSummary()
+                ) as sweep:
+                    task()
+                sweep.assert_called_once_with(providers=(provider,))
+        # The old name sweeps everyone, for a clock of the release
+        # before; it is no tick.
+        self.assertNotIn(tasks.sweep_jobs, {t.task for t in tasks.TICKS})
+        with patch(
+            "scanning.ticks.sweep", return_value=SweepSummary()
+        ) as sweep:
+            tasks.sweep_jobs()
+        sweep.assert_called_once_with(providers=None)
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_completion_in_any_sweep_sends_the_merge_and_the_glue(self):
+        from scanning.jobs import SweepSummary
+
+        done = SweepSummary()
+        done.completed = 1
+        with (
+            patch("scanning.ticks.sweep", return_value=done),
+            patch.object(tasks.merge_conversions, "apply_async") as merge,
+            patch.object(tasks.glue_runs, "apply_async") as glue,
+        ):
+            self.assertEqual(tasks.sweep_mistral(), 1)
+        merge.assert_called_once()
+        glue.assert_called_once()
 
     @override_settings(CELERY_ENABLED=True)
     def test_the_opinion_creation_sends_the_opinion_passes(self):
