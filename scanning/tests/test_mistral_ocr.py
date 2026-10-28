@@ -885,12 +885,19 @@ class TestSubmitWave(ScanningTestCase):
                 )
             )
         self.assertEqual(summary.retried, 1)
-        self.assertEqual(len(deletes.call_args_list), 2)
-        for call in deletes.call_args_list:
+        calls = deletes.call_args_list
+        self.assertEqual(
+            [list(c.args[0]) for c in calls[:2]], [["old"], ["f0", "f1", "m1"]]
+        )
+        for call in calls[:2]:
             self.assertIsNotNone(call.kwargs.get("pool"))
+        # The retry's cancel tries the refused file once more, on the
+        # main thread after the shard: one id, inline, no pool.
+        self.assertEqual([list(c.args[0]) for c in calls[2:]], [["old"]])
+        self.assertIsNone(calls[2].kwargs.get("pool"))
         self.assertEqual(
             [c.args[0] for c in mocks["delete"].call_args_list],
-            ["old", "f0", "f1", "m1"],
+            ["old", "f0", "f1", "m1", "old"],
         )
 
     def test_a_refusal_fails_the_row(self):
