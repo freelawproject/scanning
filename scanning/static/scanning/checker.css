@@ -1328,6 +1328,12 @@ a.doc-name:hover { text-decoration: underline; }
     border-left: 2px dashed rgba(146, 64, 14, 0.8);
     background: rgba(146, 64, 14, 0.06);
 }
+/* The syllabus zone (#518): the box over the heading that opens a */
+/* syllabus, in the colour the detection drawer gives SYLLABUS. */
+.ensemble-zone.ensemble-syllabus-zone {
+    border-top: 2px dashed rgba(234, 179, 8, 0.9);
+    background: rgba(234, 179, 8, 0.12);
+}
 .ensemble-box[data-blockquote="true"] {
     border-left-width: 4px;
 }

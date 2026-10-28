@@ -2668,6 +2668,10 @@ class OpinionCheck(models.TextChoices):
         "An engine read a footnote no detection covers",
     )
     BLOCKQUOTE_LIST = "blockquote_list", "A blockquote may be a list"
+    SYLLABUS_UNSURE = (
+        "syllabus_unsure",
+        "The syllabus box and the syllabus heading disagree",
+    )
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"

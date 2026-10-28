@@ -176,8 +176,9 @@ logger = logging.getLogger(__name__)
 #: out of the verdict of the unit whose bracket token it deleted
 #: (#419); 7 takes the bullet of a list item off its text and marks
 #: every item with an ``li`` mark (#428); 8 gives a picture unit the
-#: ``figure`` kind (#463).
-SCHEMA_VERSION = 8
+#: ``figure`` kind (#463); 9 puts the syllabus zone beside the footnote
+#: and blockquote zones (#518).
+SCHEMA_VERSION = 9
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -221,6 +222,9 @@ FOOTNOTE_LABEL = Label.FOOTNOTES.name
 #: The detection label of a blockquote (#411).
 BLOCKQUOTE_LABEL = Label.BLOCKQUOTE.name
 
+#: The detection label of the heading that opens a syllabus (#518).
+SYLLABUS_LABEL = Label.SYLLABUS.name
+
 
 @dataclass(frozen=True)
 class Zone:
@@ -230,11 +234,16 @@ class Zone:
     :param count_key: The key of the manifest counts.
     :param floor_setting: The name of the setting that holds the least
         confidence of a row that counts, or empty for every row.
+    :param own: Whether a box the neighbour's outside mask covers
+        :data:`EXCLUDE_SHARE` of is left out. A zone of the whole page
+        (a footnote band) is a fact of the page; a zone that opens the
+        next case's syllabus on a shared page is the neighbour's.
     """
 
     label: str
     count_key: str
     floor_setting: str = ""
+    own: bool = False
 
     def counts(self, row) -> bool:
         """Return whether one live row of the label is part of the zone."""
@@ -244,14 +253,17 @@ class Zone:
 
 
 #: The zones of a page, by the name they take under ``zones`` (#399,
-#: #411). The ensemble reads them by these names. A hand-drawn row
-#: counts like a model row: a curator who drew the box said where the
-#: zone is.
+#: #411, #518). The ensemble reads them by these names. A hand-drawn
+#: row counts like a model row: a curator who drew the box said where
+#: the zone is. The syllabus zone is the model's box over the heading
+#: line that opens a syllabus, one line high: it marks the start and
+#: never the extent, which the final XML reads off the tagger's spans.
 ZONES: dict[str, Zone] = {
     "footnotes": Zone(FOOTNOTE_LABEL, "footnote_zones"),
     "blockquotes": Zone(
         BLOCKQUOTE_LABEL, "blockquote_zones", "BLOCKQUOTE_MIN_CONFIDENCE"
     ),
+    "syllabus": Zone(SYLLABUS_LABEL, "syllabus_zones", own=True),
 }
 
 #: The verdict of a unit on the running head's line: the height of a
@@ -1776,10 +1788,10 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
-            # The zones of the page, in points (#399, #411). The same
-            # value on every engine's page, because they are a fact of
-            # the page and not of the engine. Empty when no detection
-            # drew one, or when no size puts it in points.
+            # The zones of the page, in points (#399, #411, #518). The
+            # same value on every engine's page, because they are a
+            # fact of the page and not of the engine. Empty when no
+            # detection drew one, or when no size puts it in points.
             "zones": {name: [] for name in ZONES},
             "units": [],
         }
@@ -1790,12 +1802,23 @@ def build_document(
                 "render_width": frame[0],
                 "render_height": frame[1],
             }
+        page_masks = masks.get(page_index, [])
         if size:
             for name, zone in ZONES.items():
-                entry["zones"][name] = zones_pt(
+                boxes = zones_pt(
                     inputs.zones.get(name, {}).get(page_index, []), size
                 )
-                counts[zone.count_key] += len(entry["zones"][name])
+                if zone.own:
+                    # The next case's syllabus box on a shared last
+                    # page is the neighbour's (#518), the rule a unit
+                    # under the mask follows.
+                    boxes = [
+                        box
+                        for box in boxes
+                        if covered_share(box, page_masks)[0] < EXCLUDE_SHARE
+                    ]
+                entry["zones"][name] = boxes
+                counts[zone.count_key] += len(boxes)
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
@@ -1809,7 +1832,6 @@ def build_document(
         rects = [
             r for r in rects if r.get("rect_type") != brackets.BRACKET_LABEL
         ]
-        page_masks = masks.get(page_index, [])
         printed = inputs.printed.get(page_index)
         frame_rects = (
             page_frame(inputs.detected.get(page_index, []), size)
