@@ -29,6 +29,15 @@ class TestScheduledTask(TestCase):
 class TestRunDaemonSchedule(TestCase):
     """run_daemon builds the expected schedule from settings."""
 
+    def setUp(self):
+        # The loop beats for real, and a beat closes its session, which
+        # the test transaction cannot survive.
+        patcher = patch(
+            "scanning.management.commands.run_daemon.daemon_heartbeat.beat"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @override_settings(
         DAEMON_POLL_INTERVAL=5,
         DAEMON_SUBMIT_INTERVAL=5,
@@ -234,6 +243,15 @@ class TestHandleSignal(TestCase):
 class TestCeleryMode(TestCase):
     """With the switch on, the daemon is the clock and runs no pass."""
 
+    def setUp(self):
+        # The loop beats for real, and a beat closes its session, which
+        # the test transaction cannot survive.
+        patcher = patch(
+            "scanning.management.commands.run_daemon.daemon_heartbeat.beat"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @override_settings(CELERY_ENABLED=True)
     def test_the_schedule_is_the_tick_table(self):
         from scanning import tasks
@@ -316,3 +334,10 @@ class TestDaemonHeartbeat(TestCase):
     @override_settings(CELERY_ENABLED=True)
     def test_the_clock_beats(self):
         self.assertEqual(self._run_once(), ["celery"])
+
+    def test_the_loop_beats_after_every_pass_once_the_interval_passed(self):
+        """A serial round runs every due pass back to back, and one of
+        them can hold the loop for minutes."""
+        with patch("scanning.daemon_heartbeat.INTERVAL_SECONDS", 0):
+            beats = self._run_once()
+        self.assertEqual(len(beats), 1 + len(Command()._build_schedule()))

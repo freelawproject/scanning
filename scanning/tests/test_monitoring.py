@@ -1,13 +1,15 @@
 """Tests for the Celery monitoring views and the workers' heartbeat
 (#503). No broker runs: the pool's connection is a fake whose Redis
-client is a dict."""
+client is a dict, answering ``bytes`` as the real client does."""
 
 import json
 import time
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+from celery.worker.consumer import Consumer
 from django.core.cache import cache
+from django.db import DatabaseError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
@@ -27,14 +29,17 @@ class FakeRedis:
         self.ttls[key] = ex
 
     def get(self, key):
-        return self.data.get(key)
+        if isinstance(key, bytes):
+            key = key.decode()
+        value = self.data.get(key)
+        return None if value is None else value.encode()
 
     def delete(self, key):
         self.data.pop(key, None)
 
     def scan_iter(self, match, count=None):
         prefix = match.rstrip("*")
-        return [k for k in list(self.data) if k.startswith(prefix)]
+        return [k.encode() for k in list(self.data) if k.startswith(prefix)]
 
 
 def _fake_pool(client):
@@ -81,11 +86,26 @@ class TestHeartbeat(TestCase):
         step.start(consumer)
         key = worker_heartbeat.KEY_PREFIX + "celery@a"
         self.assertIn(key, self.redis.data)
-        interval, _beat = consumer.timer.call_repeatedly.call_args.args
+        interval, scheduled = consumer.timer.call_repeatedly.call_args.args
         self.assertEqual(interval, worker_heartbeat.INTERVAL_SECONDS)
+        # The timer's own call writes the key again.
+        self.redis.delete(key)
+        scheduled()
+        self.assertEqual(
+            json.loads(self.redis.data[key])["queues"], ["opinions"]
+        )
         step.shutdown(consumer)
         consumer.timer.call_repeatedly.return_value.cancel.assert_called_once()
         self.assertNotIn(key, self.redis.data)
+
+    def test_the_step_is_in_the_consumer_blueprint_after_the_tasks(self):
+        """A ``requires`` that does not resolve fails only at worker
+        boot, so the real blueprint is built here."""
+        blueprint = Consumer.Blueprint(steps=app.steps["consumer"])
+        blueprint.apply(MagicMock(app=app, steps=[], hostname="celery@a"))
+        order = [type(step).__name__ for step in blueprint.order]
+        self.assertIn("Heartbeat", order)
+        self.assertLess(order.index("Tasks"), order.index("Heartbeat"))
 
     def test_a_stop_keeps_the_key_for_a_reconnect(self):
         consumer = MagicMock()
@@ -199,6 +219,11 @@ class TestCeleryQueuesView(TestCase):
 
 class TestDaemonHeartbeatView(TestCase):
     def setUp(self):
+        # A beat closes its session, which a test transaction cannot
+        # survive.
+        patcher = patch("scanning.daemon_heartbeat.connections.close_all")
+        self.close_all = patcher.start()
+        self.addCleanup(patcher.stop)
         cache.delete(daemon_heartbeat.KEY)
         self.addCleanup(cache.delete, daemon_heartbeat.KEY)
 
@@ -211,7 +236,9 @@ class TestDaemonHeartbeatView(TestCase):
         )
 
     def test_a_daemon_that_never_beat_is_a_500(self):
-        self.assertEqual(self._get().status_code, 500)
+        response = self._get()
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("never beat", response.json()["error"])
 
     def test_a_fresh_clock_is_a_200(self):
         daemon_heartbeat.beat(daemon_heartbeat.MODE_CELERY)
@@ -222,6 +249,12 @@ class TestDaemonHeartbeatView(TestCase):
         self.assertEqual(
             body["stale_after"], daemon_heartbeat.CELERY_STALE_SECONDS
         )
+        self.assertLess(body["age_seconds"], 5)
+
+    def test_a_beat_writes_the_one_entry_again(self):
+        daemon_heartbeat.beat(daemon_heartbeat.MODE_CELERY)
+        daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
+        self.assertEqual(daemon_heartbeat.read()["mode"], "serial")
 
     def test_a_clock_past_its_limit_is_a_500(self):
         self._stamp(
@@ -237,17 +270,31 @@ class TestDaemonHeartbeatView(TestCase):
         self._stamp(daemon_heartbeat.MODE_SERIAL, 601)
         self.assertEqual(self._get().status_code, 500)
 
-    def test_a_cache_fault_never_raises_from_the_beat(self):
+    def test_a_database_fault_never_raises_from_the_beat(self):
         with (
             patch("scanning.daemon_heartbeat.cache.set", side_effect=OSError),
-            patch("scanning.daemon_heartbeat.connections.close_all") as close,
             self.assertLogs("scanning.daemon_heartbeat", level="WARNING"),
         ):
             daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
-        # A dropped session would fail every later beat the same way.
-        close.assert_called_once_with()
+        self.close_all.assert_called_once_with()
 
-    def test_a_good_beat_keeps_its_connection(self):
-        with patch("scanning.daemon_heartbeat.connections.close_all") as close:
-            daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
-        close.assert_not_called()
+    def test_every_beat_closes_its_session(self):
+        """A session held idle between beats is the one a failover
+        drops, and with Celery on nothing else in the loop opens one."""
+        daemon_heartbeat.beat(daemon_heartbeat.MODE_CELERY)
+        self.close_all.assert_called_once_with()
+
+    def test_a_database_fault_is_a_json_500(self):
+        """A cache table ``createcachetable`` has not made, or a dead
+        database, must not raise an HTML 500 and a Sentry event per
+        probe."""
+        with (
+            patch(
+                "scanning.daemon_heartbeat.cache.get",
+                side_effect=DatabaseError("no table"),
+            ),
+            self.assertLogs("scanning.monitoring", level="WARNING"),
+        ):
+            response = self._get()
+        self.assertEqual(response.status_code, 500)
+        self.assertIn("database", response.json()["error"])

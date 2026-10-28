@@ -35,8 +35,9 @@ and the deployment stay; the shutdown re-queues nothing, because the
 workers hold the scans, and the mirror release at start is the
 ``opinions`` worker's. The daemon's own passes never block the clock.
 
-The loop stamps ``scanning.daemon_heartbeat`` at most every 15 seconds,
-in both modes, and ``/monitoring/daemon/`` reads the stamp.
+The loop stamps ``scanning.daemon_heartbeat`` at most every 15 seconds
+and after every pass it runs, in both modes, and ``/monitoring/daemon/``
+reads the stamp.
 
 Known limitation of the serial mode: a long task delays the others
 by however long it runs -- a submit wave blocks scan claiming for the
@@ -233,15 +234,10 @@ class Command(BaseCommand):
             if self.celery
             else daemon_heartbeat.MODE_SERIAL
         )
-        last_beat = None
+        self._last_beat = None
         while not self.shutdown:
             now = time.monotonic()
-            if (
-                last_beat is None
-                or now - last_beat >= daemon_heartbeat.INTERVAL_SECONDS
-            ):
-                daemon_heartbeat.beat(beat_mode)
-                last_beat = now
+            self._beat_if_due(beat_mode)
             for task in schedule:
                 if self.shutdown:
                     # The rest of the round would be killed half done.
@@ -263,9 +259,27 @@ class Command(BaseCommand):
                 except Exception:
                     logger.exception("Scheduled task %s failed", task.name)
                 task.mark_ran(time.monotonic())
+                # After every pass and not once a round: a serial round
+                # runs every due pass back to back, and one of them can
+                # hold the loop for minutes.
+                self._beat_if_due(beat_mode)
             time.sleep(1)
 
         self.stdout.write("Daemon shutting down.")
+
+    def _beat_if_due(self, mode: str) -> None:
+        """Stamp the heartbeat when ``INTERVAL_SECONDS`` have passed.
+
+        :param mode: The mode the stamp names.
+        :return: None.
+        """
+        now = time.monotonic()
+        if (
+            self._last_beat is None
+            or now - self._last_beat >= daemon_heartbeat.INTERVAL_SECONDS
+        ):
+            daemon_heartbeat.beat(mode)
+            self._last_beat = now
 
     def _handle_signal(self, signum, frame):
         """Set the shutdown flag on receipt of a termination signal.

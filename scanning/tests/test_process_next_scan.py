@@ -457,6 +457,36 @@ class TestHeartbeat(TestCase):
         scan's own stamp goes on."""
         self._daemon_beats_under_an_action().assert_not_called()
 
+    def _scan_leaves_the_claim(self):
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        with (
+            patch.object(
+                process_next_scan, "stamp_heartbeat", return_value=0
+            ) as stamp,
+            patch.object(process_next_scan, "close_thread_connection"),
+            patch("scanning.daemon_heartbeat.beat") as beat,
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.05)
+        return stamp, beat
+
+    @override_settings(CELERY_ENABLED=False)
+    def test_a_serial_action_beats_for_the_daemon_after_its_scan_left(self):
+        """A re-queue for the next action or a park comes before the
+        action returns, and its tail still holds the loop."""
+        stamp, beat = self._scan_leaves_the_claim()
+        stamp.assert_called_once()
+        self.assertGreater(beat.call_count, 1)
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_worker_thread_ends_when_its_scan_left_the_claim(self):
+        stamp, beat = self._scan_leaves_the_claim()
+        stamp.assert_called_once()
+        beat.assert_not_called()
+
     @override_settings(CELERY_ENABLED=True)
     def test_a_worker_action_never_beats_for_the_clock(self):
         """A live worker must not hide a dead clock."""

@@ -270,13 +270,19 @@ def heartbeat(
     clock_until = time.monotonic() + settings.DAEMON_MAX_ACTION_SECONDS
 
     def beat() -> None:
+        stamps_scan = True
         try:
             while not stop.wait(period):
                 try:
-                    if not stamp_heartbeat(scan_pk, action):
-                        return
+                    if stamps_scan and not stamp_heartbeat(scan_pk, action):
+                        # The scan left the claim (a park, a re-queue
+                        # for the next action), but the action's tail
+                        # still holds the serial loop.
+                        stamps_scan = False
                     if beats_clock and time.monotonic() < clock_until:
                         daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
+                    elif not stamps_scan:
+                        return
                 except Exception:
                     logger.warning(
                         "heartbeat of scan %s failed; next beat in %ss",
