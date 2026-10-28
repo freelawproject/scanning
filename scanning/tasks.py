@@ -352,21 +352,90 @@ def submit_mistral() -> int:
     return _submit(JobProvider.MISTRAL)
 
 
-@app.task(name="scanning.tasks.sweep_jobs", queue=QUEUE_FAST)
-@locked("sweep_jobs")
-def sweep_jobs() -> int:
-    """Poll every in-flight external job, and send the passes that
-    read a completion.
+def _sweep(provider: str | None) -> int:
+    """Run one provider's sweep, and send the passes that read a
+    completion.
 
+    :param provider: A ``JobProvider`` value, or ``None`` for every one.
     :returns: How many completed.
     :rtype: int
     """
     from scanning import ticks
 
-    completed = ticks.sweep().completed
+    completed = ticks.sweep(
+        providers=None if provider is None else (provider,)
+    ).completed
     if completed:
         nudge(merge_conversions, glue_runs)
     return completed
+
+
+@app.task(name="scanning.tasks.sweep_runpod", queue=QUEUE_FAST)
+@locked("sweep_runpod")
+def sweep_runpod() -> int:
+    """Poll the in-flight RunPod jobs of every engine: a status call
+    each, seconds for a wave.
+
+    One sweep per provider, the twin of the waves: a sweep is as slow
+    as its slowest provider, and one shared pass that met a volume of
+    finished Mistral batches ran for a quarter of an hour while the
+    finished Surya shards behind it sat uncollected, their cap full
+    and their GPUs idle. Here nothing waits behind a RunPod poll but
+    RunPod polls.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.RUNPOD)
+
+
+@app.task(name="scanning.tasks.sweep_doctor", queue=QUEUE_IO)
+@locked("sweep_doctor")
+def sweep_doctor() -> int:
+    """Confirm the in-flight doctor jobs by an S3 HEAD each, on the
+    queue that already holds doctor's blocking wave.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.DOCTOR)
+
+
+@app.task(name="scanning.tasks.sweep_mistral", queue=QUEUE_IO)
+@locked("sweep_mistral")
+def sweep_mistral() -> int:
+    """Poll the Mistral batches, harvest the finished ones and delete
+    their files, then the leftover files: minutes when a volume's
+    batches finish together, on the io queue, where a long call holds
+    up nothing but its own kind.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.MISTRAL)
+
+
+@app.task(name="scanning.tasks.sweep_jobs", queue=QUEUE_FAST)
+@locked("sweep_jobs")
+def sweep_jobs() -> int:
+    """Poll every provider's in-flight jobs in one pass: the sweep as
+    it was before it was split by provider.
+
+    Registered for the rollout alone, not in ``TICKS``: a clock from
+    the release before sends this name until its pod restarts, and a
+    worker that did not know it would log an unregistered task every
+    collect interval. Delete once that release has rolled out.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    return _sweep(None)
 
 
 @app.task(name="scanning.tasks.merge_conversions", queue=QUEUE_HEAVY)
@@ -553,7 +622,9 @@ TICKS: tuple[Tick, ...] = (
     Tick(
         "submit_mistral", submit_mistral, "DAEMON_SUBMIT_INTERVAL", QUEUE_HEAVY
     ),
-    Tick("sweep_jobs", sweep_jobs, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("sweep_runpod", sweep_runpod, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("sweep_doctor", sweep_doctor, "DAEMON_COLLECT_INTERVAL", QUEUE_IO),
+    Tick("sweep_mistral", sweep_mistral, "DAEMON_COLLECT_INTERVAL", QUEUE_IO),
     Tick(
         "merge_conversions",
         merge_conversions,
