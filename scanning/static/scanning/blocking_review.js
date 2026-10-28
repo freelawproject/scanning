@@ -83,13 +83,24 @@
         return field ? field.value : '';
     }
 
-    /** The key a card keeps across reloads: its kind, page, block,
-     *  offset and span. A gap card starts where the word after it
-     *  starts, so the span tells the two apart; the finding stays
-     *  last, the Undo of a dismissal reads it there. */
+    /** The key a card keeps across reloads: its kind, page, block and
+     *  place. The place is the base position the card answers for
+     *  (a gap's, marked, since it starts where the word after it
+     *  starts; a word of a run with its place in the run), because
+     *  every rebuild renews the finding rows and an edit before the
+     *  word moves its offset, and a kept word must still be kept
+     *  after an answer elsewhere rebuilt the opinion. A card with no
+     *  position (a block, a single block, a link) is one per block or
+     *  per check. */
     function keyOf(card) {
-        return [card.kind, card.page_in_opinion, card.group_id, card.start,
-            card.gap ? 'gap' : (card.length || 0), card.finding_pk].join(':');
+        var place;
+        if (card.position !== undefined && card.position !== null) {
+            place = (card.gap ? 'gap@' : 'p') + card.position
+                + (card.run_index !== undefined && card.run_index !== null ? 'r' + card.run_index : '');
+        } else {
+            place = card.check || ('s' + (card.start || 0) + ':' + (card.length || 0));
+        }
+        return [card.kind, card.page_in_opinion, card.group_id, place].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────
@@ -114,6 +125,8 @@
         this.cards = [];
         this.kept = {};
         this.skipped = {};
+        /** The findings a settle is dismissing, by pk. */
+        this.settling = {};
         this.answered = 0;
         this.pdf = null;
         this.pages = {};
@@ -136,6 +149,7 @@
             // approval stays behind the gate.
             self.blockingOpen = answer.data.blocking_open || 0;
             self.render();
+            return self.settle();
         }).catch(function (error) {
             self.cardsNode.replaceChildren(note('The cards did not load: ' + error.message, 'error'));
         });
@@ -247,18 +261,22 @@
     };
 
     /** Dismiss the page's card: what is shown is right. */
-    Section.prototype.dismiss = function (card, node) {
+    /** Dismiss the finding of a card. ``keys`` names the kept cards
+     *  the dismissal closes, so its Undo can open them again. */
+    Section.prototype.dismiss = function (card, node, keys) {
         var self = this;
-        var state = node.querySelector('.bk-state');
+        var state = node ? node.querySelector('.bk-state') : null;
         if (!card.dismiss_url) {
-            state.textContent = 'This card has no dismissal here; open the document.';
+            if (state) { state.textContent = 'This card has no dismissal here; open the document.'; }
             return Promise.resolve();
         }
-        state.textContent = 'dismissing the card…';
+        if (state) { state.textContent = 'dismissing the card…'; }
         return postJson(card.dismiss_url, {}).then(function (answer) {
             if (!answer.ok) {
-                state.textContent = answer.data.message || 'The dismissal was refused.';
-                state.classList.add('bk-error');
+                if (state) {
+                    state.textContent = answer.data.message || 'The dismissal was refused.';
+                    state.classList.add('bk-error');
+                }
                 return;
             }
             self.answered += 1;
@@ -267,10 +285,36 @@
                     card: card,
                     label: 'kept as shown, the page\'s card closed',
                     undo: { url: card.restore_url, body: {} },
-                    finding_pk: card.finding_pk
+                    keys: keys || [keyOf(card)]
                 });
             }
             return self.reload();
+        });
+    };
+
+    /** Send the dismissal of every finding whose cards are all kept.
+     *  A keep sends it at the click when it is the last of its
+     *  finding; after an answer elsewhere rebuilt the opinion, the
+     *  cards come back with new findings and the kept ones among
+     *  them are matched by their place, so a finding that is now all
+     *  kept is closed here, once. */
+    Section.prototype.settle = function () {
+        var self = this;
+        var byFinding = {};
+        this.cards.forEach(function (card) {
+            if (!card.finding_pk) { return; }
+            (byFinding[card.finding_pk] = byFinding[card.finding_pk] || []).push(card);
+        });
+        var due = Object.keys(byFinding).filter(function (pk) {
+            return !self.settling[pk] && byFinding[pk].every(function (card) { return self.kept[keyOf(card)]; });
+        });
+        if (!due.length) { return Promise.resolve(); }
+        var pk = due[0];
+        var cards = byFinding[pk];
+        this.settling[pk] = true;
+        var node = this.cardsNode.querySelector('[data-key="' + keyOf(cards[0]) + '"]');
+        return this.dismiss(cards[0], node, cards.map(keyOf)).then(function () {
+            delete self.settling[pk];
         });
     };
 
@@ -280,12 +324,8 @@
         var self = this;
         var index = this.answers.indexOf(entry);
         if (index >= 0) { this.answers.splice(index, 1); }
-        if (entry.finding_pk) {
-            // The card reopens with every word of its page: none is kept.
-            Object.keys(this.kept).forEach(function (key) {
-                if (key.split(':').pop() === String(entry.finding_pk)) { delete self.kept[key]; }
-            });
-        }
+        // A dismissal undone reopens the cards it closed: none is kept.
+        (entry.keys || []).forEach(function (key) { delete self.kept[key]; });
         return postJson(entry.undo.url, entry.undo.body).then(function (answer) {
             if (!answer.ok) {
                 self.answers.push(entry);
@@ -323,7 +363,7 @@
             return other.finding_pk === card.finding_pk;
         });
         var allKept = siblings.every(function (other) { return self.kept[keyOf(other)]; });
-        if (allKept) { return this.dismiss(card, node); }
+        if (allKept) { return this.dismiss(card, node, siblings.map(keyOf)); }
         node.querySelector('.bk-state').textContent = 'kept as shown; the page\'s card closes once its other cards are answered';
         this.render();
         countAll();
