@@ -116,6 +116,57 @@ class TestOpenWords(TestCase):
             ["", "[c]ontract", "I contract"],
         )
 
+    def test_a_persons_block_of_an_older_document_opens_no_word_card(self):
+        """A document from before the join rules (schema 12) counted a
+        kept token's position over the text split on whitespace; the
+        cards align the engines with the join, so the positions may
+        name other words. Those tokens open no card until the document
+        is written again; one of this schema opens them as before."""
+        from scanning.tests.test_ensemble import engine_page
+
+        texts = {
+            "dots_mocr": "a sat x",
+            "mistral_ocr": "a dog sat y",
+            "surya": "a dog sat y",
+        }
+        pages = {
+            name: engine_page([unit(name, 0, BODY_A_PT, text)])
+            for name, text in texts.items()
+        }
+        edit = {
+            "id": 1,
+            "kind": "text",
+            "source_edit_id": None,
+            "source_page": 2,
+            "page_in_opinion": 0,
+            "box_pt": BODY_A_PT,
+            "section": ensemble.BODY,
+            "base_text": "a dog sat y",
+            "text": "a dog sat z",
+            "order": [],
+            "quoted": None,
+            "span": [10, 11],
+            "by": "curator",
+            "at": "",
+        }
+        group = ensemble.build_page(pages, 0, edits=[edit])["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.HUMAN)
+
+        fresh = blocking_review.open_words(
+            group, blocking_review.MAJORITY, schema=ensemble.SCHEMA_VERSION
+        )
+        stale = blocking_review.open_words(
+            group,
+            blocking_review.MAJORITY,
+            schema=blocking_review.POSITIONS_SCHEMA - 1,
+        )
+
+        self.assertEqual([c["token"] for c in fresh], ["dog"])
+        self.assertEqual(stale, [])
+        self.assertGreaterEqual(
+            ensemble.SCHEMA_VERSION, blocking_review.POSITIONS_SCHEMA
+        )
+
     def test_the_stored_block_of_a_person_names_the_engine_of_its_positions(
         self,
     ):

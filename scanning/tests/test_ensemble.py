@@ -975,6 +975,33 @@ class TestTheVote(TestCase):
         # ``alpha`` alone is the no-majority place.
         self.assertEqual(answer["n_low_confidence"], 1)
 
+    def test_a_word_the_vote_joined_keeps_its_flag_beside_an_answer(self):
+        """``0001065- 2021`` is one word to the vote (``_pairs``), shown
+        with its space. The person answered the card of ``x`` and left
+        it as it was. Aligned on the text split on whitespace it was
+        two words against one token, read as changed, and its card
+        closed unjudged; the carry splits the person's text as the
+        vote does, so the flag and the position stay."""
+        group = self.read(
+            "No. 0001065- 2021 x", "No. 0001065-2O21 y", "No. 0001065, 2021 z"
+        )
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["text"], "No. 0001065- 2021 x")
+        self.assertEqual(answer["n_low_confidence"], 2)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "No. 0001065- 2021 w", "span": [18, 19]},
+            group["engines"],
+        )
+
+        joined = next(
+            t for t in kept["tokens"] if t["text"] == "0001065- 2021"
+        )
+        self.assertTrue(joined.get("low_confidence"))
+        self.assertEqual(joined.get("position"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
     def test_a_changed_neighbour_leaves_the_gap_open(self):
         """The person answered the word before the gap, ``b`` to ``z``,
         and never looked at the gap: it stays, on the same word, with

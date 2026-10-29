@@ -625,7 +625,9 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
             continue
         text = unit.get(spec.text_key) or ""
         for index, line in enumerate(_clean(text).splitlines()):
-            line = compare_text(line).lstrip(_BULLETS).strip()
+            line = (
+                compare_text(line, hyphen_gaps=False).lstrip(_BULLETS).strip()
+            )
             for detected, number_type, side in _line_readings(line):
                 distance = _corner_distance(bbox, width, side)
                 corner = distance <= CORNER_BAND
