@@ -412,12 +412,30 @@ _HYPHEN_GAP = re.compile(r"(?<=\w)-\s+(?=\w)")
 #: ``_HYPHEN_GAP`` split; ``--`` is not one.
 _HYPHEN_END = re.compile(r"\w-$")
 
+#: Whitespace between two quotation marks: a quote inside a quote.
+#: Mistral writes ``“ ‘finally`` and ``justice’ ”`` where dots.mocr
+#: writes ``"'finally`` and ``justice'"``, the same marks at the same
+#: ends. The fold table has made the curly and the straight marks
+#: alike already; this takes the space out, so the two read as one.
+#: Surya, which drops the inner mark (``“finally``), is then one
+#: engine against two, a warning and not a block.
+_QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
+
 #: The gaps the key folds out. Readings that agree by key and differ
 #: by one of these are one reading spelled two ways, and the shown one
 #: is the spelling with the fewest (:func:`_tidiest`): the rank's
 #: engine wrote ``CP-1- 2021`` once where two others wrote
 #: ``CP-1-2021``, and the approved text took the stray space.
-_GAPS = (_HYPHEN_GAP,)
+_GAPS = (_HYPHEN_GAP, _QUOTE_GAP)
+
+#: A word that is quotation marks alone, the half of a nested quote
+#: Mistral sets apart with a space; :func:`_join_lone_quotes` puts it
+#: back onto the neighbour that holds the other mark.
+_LONE_QUOTES = re.compile(
+    r"^[\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e]+$"
+)
+_CLOSING = frozenset("\u2019\u201d\u201b")
+_QUOTE_CHARS = frozenset("\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e")
 
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
@@ -490,10 +508,14 @@ def _tidiest(spellings: list[str]) -> str:
     :returns: The one to show.
     :rtype: str
     """
-    return min(
-        spellings,
-        key=lambda text: sum(len(gap.findall(text)) for gap in _GAPS),
-    )
+
+    def gaps(text: str) -> int:
+        # Counted on the text as the key sees it: a curly mark or an
+        # en dash is folded before a gap pattern can match beside it.
+        folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+        return sum(len(gap.findall(folded)) for gap in _GAPS)
+
+    return min(spellings, key=gaps)
 
 
 def plain(fragment: str | None) -> str:
@@ -553,6 +575,7 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
     if hyphen_gaps:
         folded = _HYPHEN_GAP.sub("-", folded)
+    folded = _QUOTE_GAP.sub("", folded)
     return _WS.sub(" ", folded).strip()
 
 
@@ -569,7 +592,7 @@ def compare_word(word: str) -> str:
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
-    return _HYPHEN_GAP.sub("-", folded).strip()
+    return _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded)).strip()
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -587,13 +610,16 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     A word that ends in a hyphen and the word after it are one word
     the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
     spacing of ``0001065-2021``, and split it is two words against
-    one. The shown word keeps the engine's own spacing.
+    one. So is a word of quotation marks alone and its neighbour
+    (``_LONE_QUOTES``, :func:`_join_lone_quotes`): ``“ ‘finally`` and
+    ``justice’ ”`` are one engine's spacing of ``"'finally`` and
+    ``justice'"``. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = text.split()
+    words = _join_lone_quotes(text.split())
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
@@ -617,6 +643,51 @@ def _pairs(text: str) -> list[tuple[str, str]]:
         pairs.append((compare_word(words[index]), words[index]))
         index += 1
     return pairs
+
+
+def _join_lone_quotes(words: list[str]) -> list[str]:
+    """Join each word of quotation marks alone onto the neighbour that
+    holds the other mark of the pair.
+
+    The word after it when that word starts with a mark, the word
+    before when that one ends with a mark; with both, an opening mark
+    (``“``, ``‘``) goes after and a closing one (``”``, ``’``) before,
+    and a straight mark, which is either, goes after. A lone mark with
+    no marked neighbour is a word of its own, as it was. The joined
+    word keeps the space, which the key folds out (``_QUOTE_GAP``).
+
+    :param words: One read, split on whitespace.
+    :returns: The words, with the lone marks joined on.
+    :rtype: list[str]
+    """
+    if not any(_LONE_QUOTES.match(word) for word in words):
+        return words
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if not _LONE_QUOTES.match(word):
+            out.append(word)
+            index += 1
+            continue
+        before = out[-1] if out else None
+        after = words[index + 1] if index + 1 < len(words) else None
+        can_go_after = (
+            after is not None
+            and after[:1] in _QUOTE_CHARS
+            and not _LONE_QUOTES.match(after)
+        )
+        can_go_before = before is not None and before[-1:] in _QUOTE_CHARS
+        if can_go_after and can_go_before:
+            can_go_after = not any(c in _CLOSING for c in word)
+        if can_go_after:
+            words[index + 1] = f"{word} {after}"
+        elif can_go_before:
+            out[-1] = f"{before} {word}"
+        else:
+            out.append(word)
+        index += 1
+    return out
 
 
 # ---------------------------------------------------------------------------

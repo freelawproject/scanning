@@ -1496,6 +1496,79 @@ class TestTheVote(TestCase):
         # Alike to the letter, the rank's own spelling stays.
         answer = ensemble.resolve(self.read("a - b", "a - b", "a - b"))
         self.assertEqual(answer["source"], "dots_mocr")
+        # A nested quote the same way: the spelling without the space.
+        answer = ensemble.resolve(
+            self.read(
+                "father \u201c \u2018finally",
+                "father \"'finally",
+                "father \"'finally",
+            )
+        )
+        self.assertEqual(answer["text"], "father \"'finally")
+        self.assertEqual(answer["source"], "mistral_ocr")
+
+    def test_a_quote_inside_a_quote_reads_alike_however_it_is_spaced(self):
+        """Mistral wrote ``father “ ‘finally`` and ``justice’ ” so``
+        where dots.mocr wrote ``father "'finally`` and ``justice'" so``:
+        the same marks at the same ends, with a space between them.
+        The key folds the space, and the pairing joins a lone mark onto
+        its neighbour, an opening one forward and a closing one back,
+        so the two engines read one word alike and are the majority
+        over Surya, which drops the inner mark; the card is a warning,
+        not a block nobody agrees on."""
+        self.assertEqual(
+            ensemble.compare_text("father \u201c \u2018finally have"),
+            ensemble.compare_text("father \"'finally have"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("his justice\u2019 \u201d so"),
+            ensemble.compare_text("his justice'\" so"),
+        )
+        self.assertEqual(
+            ensemble._pairs("father \u201c \u2018finally have"),
+            [
+                ("father", "father"),
+                ("\"'finally", "\u201c \u2018finally"),
+                ("have", "have"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("his justice\u2019 \u201d so"),
+            [
+                ("his", "his"),
+                ("justice'\"", "justice\u2019 \u201d"),
+                ("so", "so"),
+            ],
+        )
+        # A straight mark goes to the neighbour that holds a mark. A
+        # lone mark with no marked neighbour stays a word of its own.
+        self.assertEqual(
+            ensemble._pairs("said ' \"go"),
+            [("said", "said"), ("'\"go", "' \"go")],
+        )
+        self.assertEqual(
+            ensemble._pairs("go' \" now"),
+            [("go'\"", "go' \""), ("now", "now")],
+        )
+        self.assertEqual(
+            ensemble._pairs('a " b'), [("a", "a"), ('"', '"'), ("b", "b")]
+        )
+        self.assertEqual(ensemble._pairs("\u201d"), [('"', "\u201d")])
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("father \"'finally have"),
+            [
+                ensemble._pairs("father \u201c \u2018finally have"),
+                ensemble._pairs("father \u201cfinally have"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["father", "\"'finally", "have"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
 
     def test_a_hyphen_with_a_space_after_it_is_the_hyphen(self):
         """Mistral wrote ``CP-23-CR-0001065- 2021`` for the docket
