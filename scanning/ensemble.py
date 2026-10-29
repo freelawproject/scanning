@@ -421,6 +421,13 @@ _HYPHEN_END = re.compile(r"\w-$")
 #: engine against two, a warning and not a block.
 _QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
 
+#: The gaps the key folds out. Readings that agree by key and differ
+#: by one of these are one reading spelled two ways, and the shown one
+#: is the spelling with the fewest (:func:`_tidiest`): the rank's
+#: engine wrote ``CP-1- 2021`` once where two others wrote
+#: ``CP-1-2021``, and the approved text took the stray space.
+_GAPS = (_HYPHEN_GAP, _QUOTE_GAP)
+
 #: A word that is quotation marks alone, the half of a nested quote
 #: Mistral sets apart with a space; :func:`_join_lone_quotes` puts it
 #: back onto the neighbour that holds the other mark.
@@ -491,6 +498,24 @@ class RevisionMoved(TransientFault):
 # ---------------------------------------------------------------------------
 # The text of one unit
 # ---------------------------------------------------------------------------
+
+
+def _tidiest(spellings: list[str]) -> str:
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, the
+    first of them when they tie.
+
+    :param spellings: Readings that agree by key, in rank order.
+    :returns: The one to show.
+    :rtype: str
+    """
+
+    def gaps(text: str) -> int:
+        # Counted on the text as the key sees it: a curly mark or an
+        # en dash is folded before a gap pattern can match beside it.
+        folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+        return sum(len(gap.findall(folded)) for gap in _GAPS)
+
+    return min(spellings, key=gaps)
 
 
 def plain(fragment: str | None) -> str:
@@ -2660,8 +2685,11 @@ def _candidates(
     matcher = SequenceMatcher(None, base_keys, other_keys, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for index in range(i1, i2):
-                at.setdefault(index, []).append(base[index])
+            # The engine's own spelling of the word it read as the
+            # base's: one key, and the shown word may differ by a gap
+            # the key folds (``_tidiest`` picks between them).
+            for offset in range(i2 - i1):
+                at.setdefault(i1 + offset, []).append(other[j1 + offset])
         elif tag == "replace":
             if i2 - i1 == j2 - j1:
                 for offset in range(i2 - i1):
@@ -2871,8 +2899,8 @@ def vote_words(
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
                 token = {
-                    "text": next(
-                        word for key, word in readings if key == winner
+                    "text": _tidiest(
+                        [word for key, word in readings if key == winner]
                     ),
                     "position": position,
                 }
@@ -2988,12 +3016,19 @@ def resolve(group: dict) -> dict:
         quorum = (len(present) + 2) // 2
         if votes >= quorum:
             agreeing = [name for name in present if keys[name] == winner]
+            # The spelling shown is the tidiest of the agreeing ones,
+            # and ``source`` names its engine, the side the cards vote
+            # from (``blocking_review.open_words``).
+            shown = _tidiest([engines[name]["text"] for name in agreeing])
+            source = next(
+                name for name in agreeing if engines[name]["text"] == shown
+            )
             answer = {
                 "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
-                "source": agreeing[0],
+                "source": source,
                 "agreeing": agreeing,
                 "silent": silent,
-                "text": engines[agreeing[0]]["text"],
+                "text": shown,
                 "tokens": [],
                 "n_low_confidence": 0,
             }

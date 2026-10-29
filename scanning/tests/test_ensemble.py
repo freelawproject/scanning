@@ -1471,6 +1471,42 @@ class TestTheVote(TestCase):
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
 
+    def test_the_shown_spelling_of_an_agreed_word_has_no_gap(self):
+        """The rank's engine wrote ``CP-1- 2021`` where two others wrote
+        ``CP-1-2021``: one reading by key, and the text shows the
+        spelling without the stray space, at the word (``vote_words``)
+        and for a block read alike (``resolve``), whose ``source``
+        names the engine it took it from."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("No. CP-1- 2021 x"),
+            [
+                ensemble._pairs("No. CP-1-2021 y"),
+                ensemble._pairs("No. CP-1-2021 z"),
+            ],
+        )
+        self.assertEqual(tokens[1]["text"], "CP-1-2021")
+        self.assertFalse(tokens[1].get("low_confidence"))
+
+        answer = ensemble.resolve(
+            self.read("No. CP-1- 2021 x", "No. CP-1-2021 x", "No. CP-1-2021 x")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "No. CP-1-2021 x")
+        self.assertEqual(answer["source"], "mistral_ocr")
+        # Alike to the letter, the rank's own spelling stays.
+        answer = ensemble.resolve(self.read("a - b", "a - b", "a - b"))
+        self.assertEqual(answer["source"], "dots_mocr")
+        # A nested quote the same way: the spelling without the space.
+        answer = ensemble.resolve(
+            self.read(
+                "father \u201c \u2018finally",
+                "father \"'finally",
+                "father \"'finally",
+            )
+        )
+        self.assertEqual(answer["text"], "father \"'finally")
+        self.assertEqual(answer["source"], "mistral_ocr")
+
     def test_a_quote_inside_a_quote_reads_alike_however_it_is_spaced(self):
         """Mistral wrote ``father “ ‘finally`` and ``justice’ ” so``
         where dots.mocr wrote ``father "'finally`` and ``justice'" so``:
