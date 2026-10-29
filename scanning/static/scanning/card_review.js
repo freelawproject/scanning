@@ -1,10 +1,11 @@
 /* The card review of review 2 (card_review.py): the missed headnote
- * brackets, the missed captions and the image boxes of one volume,
- * one after the next. Each card is a crop of the page, cut from the
- * PDF step 2 draws, with the box on it, movable at its edges, and two
- * or three buttons. The page writes nothing of its own: every answer
- * is one of step 2's own writes (the add, the approval, the resize,
- * the dismissal), and every answer has the Undo of the write it made.
+ * brackets, the missed captions, the image boxes and the editor's
+ * note boxes of one volume, one after the next. Each card is a crop
+ * of the page, cut from the PDF step 2 draws, with the box on it,
+ * movable at its edges, and two or three buttons. The page writes
+ * nothing of its own: every answer is one of step 2's own writes (the
+ * add, the approval, the resize, the dismissal), and every answer has
+ * the Undo of the write it made.
  *
  * Keys: Return presses the first button of the card in view, x the
  * second ("No bracket", "Take out"), s skips it, u undoes, f opens
@@ -46,7 +47,7 @@
     var DPR = Math.min(2, window.devicePixelRatio || 1);
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
-    var GROUPS = ['caption', 'bracket', 'text', 'image'];
+    var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
     var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
@@ -54,7 +55,8 @@
         bracket: 'bracket the model missed',
         faint: 'bracket box under the gate',
         text: 'text in no box',
-        image: 'image box'
+        image: 'image box',
+        editorial: "editor's note box"
     };
     /** What a card is, in words: a link card reads by its group, since
      *  a bracket finding with no guess is a link too. */
@@ -85,6 +87,7 @@
      *  second takes it out. */
     var MODEL_VERBS = {
         image: { keep: 'Keep', kept: 'kept', move: 'Save size', out: 'Take out', gone: 'taken out' },
+        editorial: { keep: 'Keep', kept: 'kept', move: 'Save size', out: 'Take out', gone: 'taken out' },
         faint: { keep: 'Approve', kept: 'approved', move: 'Save size', out: 'Not a bracket', gone: 'not a bracket' }
     };
 

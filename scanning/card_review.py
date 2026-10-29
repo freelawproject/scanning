@@ -7,19 +7,21 @@ saw and the model did not (``brackets.missing``, 88 on one volume of
 (``findings``'s ``missing_caption``), and the ``IMAGE`` boxes, which
 the model draws from the top of a column over the picture and on down
 the page (``image_fit``), each of which the opinion PDF pastes onto the
-bitonal page as a grey photograph of whatever it covers. In the viewer
-each costs a click on the card, a scroll, a look and a click on the
-box. This module turns them into cards a curator answers in a row,
-the shape of the blocking review of review 3 (``blocking_review``):
-the scan around the box, the box itself, drawn and movable, and two
-or three buttons.
+bitonal page as a grey photograph of whatever it covers, and the
+``EDITORIAL`` boxes, the publisher's notes and Words and Phrases lines
+the redaction blacks out, which the model also draws over a court's
+own line now and then. In the viewer each costs a click on the card,
+a scroll, a look and a click on the box. This module turns them into
+cards a curator answers in a row, the shape of the blocking review of
+review 3 (``blocking_review``): the scan around the box, the box
+itself, drawn and movable, and two or three buttons.
 
 **The page writes nothing of its own.** An answer is one of the
 viewer's own writes: a bracket or a caption is added through
 ``add_single_detection`` at the box as the card holds it, an image box
-is kept through ``approve_detection``, resized through
-``update_detection`` or taken out through ``delete_detection``, and a
-card that says there is nothing there is dismissed through
+or an editor's note box is kept through ``approve_detection``, resized
+through ``update_detection`` or taken out through ``delete_detection``,
+and a card that says there is nothing there is dismissed through
 ``dismiss_finding``. So the viewer and this page hold one set of
 rules, and every answer has the Undo of the write it made.
 
@@ -45,24 +47,29 @@ from scanning.models import CheckName, Detection, Issue, Scan
 #: saw and the model did not box, answered the same way; a ``faint``
 #: card a bracket box the model drew under blackletter's redaction
 #: gate (#410), approved, resized or taken out; an ``image`` card a
-#: live model ``IMAGE`` box, kept, resized or taken out; a ``link``
-#: card one with no box to act on here (the first key icon of a volume
-#: with no caption before it), which points at the viewer; a ``text``
-#: card a block of print no box covers (``undetected``), answered by
-#: adding the column box the card holds over it.
+#: live model ``IMAGE`` box, kept, resized or taken out; an
+#: ``editorial`` card a live model ``EDITORIAL`` box, the same three
+#: answers; a ``link`` card one with no box to act on here (the first
+#: key icon of a volume with no caption before it), which points at
+#: the viewer; a ``text`` card a block of print no box covers
+#: (``undetected``), answered by adding the column box the card holds
+#: over it.
 CAPTION = "caption"
 BRACKET = "bracket"
 FAINT = "faint"
 TEXT = "text"
 IMAGE = "image"
+EDITORIAL = "editorial"
 LINK = "link"
 
 #: The sections of the page, in order (``group``). The captions first,
 #: because each one splits an opinion and the volume's pairing waits
 #: on them; then the brackets, the bulk, one key press each; then the
 #: blocks of text in no box, which the opinion text would drop; then
-#: the images.
-GROUPS = (CAPTION, BRACKET, TEXT, IMAGE)
+#: the images; then the editor's notes, a look each. The template has
+#: a section per group and the script a list of them, both pinned to
+#: this table.
+GROUPS = (CAPTION, BRACKET, TEXT, IMAGE, EDITORIAL)
 
 #: The checks whose open cards this review walks, and the kind of card
 #: each one makes.
@@ -80,6 +87,11 @@ CROP_PAD_PX = 40.0
 #: The crop around an image box: wider, so a box drawn short of the
 #: picture's edge can be pulled out to it.
 IMAGE_PAD_PX = 90.0
+
+#: The crop around an editor's note box: a few lines above and below,
+#: so the line reads as the publisher's or the court's by what is
+#: printed around it.
+EDITORIAL_PAD_PX = 60.0
 
 #: A bracket's crop reaches this many bracket heights below the guess:
 #: the first lines of the paragraph, enough to see the bracket and the
@@ -374,10 +386,17 @@ def text_card(issue: Issue) -> dict | None:
     return card
 
 
-def image_card(row: Detection) -> dict | None:
-    """Return the card of a live model ``IMAGE`` row.
+def _model_box_card(
+    row: Detection, kind: str, label: Label, pad: float, message: str
+) -> dict | None:
+    """Return the card of a live model row the curator keeps, resizes
+    or takes out: the row's own box in a group of its own kind.
 
     :param row: The row.
+    :param kind: The card's kind, which is its group too.
+    :param label: The row's label.
+    :param pad: The crop's pad around the box, in render pixels.
+    :param message: What the card says.
     :returns: The card, or None when the row has no render size.
     :rtype: dict | None
     """
@@ -386,24 +405,66 @@ def image_card(row: Detection) -> dict | None:
     if width <= 0 or height <= 0 or box is None:
         return None
     return _card(
-        kind=IMAGE,
-        group=IMAGE,
+        kind=kind,
+        group=kind,
         key=f"d{row.pk}",
         page_index=row.page_index,
         width=width,
         height=height,
-        crop=_pad(box, IMAGE_PAD_PX, width, height),
+        crop=_pad(box, pad, width, height),
         box=box,
-        label=Label.IMAGE.name,
-        message=(
-            f"The model drew an image box here at {row.confidence:.2f}. "
-            "Keep it over a picture, pull it in to the picture's edges, "
-            "or take it out: the opinion PDF pastes the original scan "
-            "of the box over the page."
-        ),
+        label=label.name,
+        message=message,
         detection_id=row.pk,
         confidence=row.confidence,
     )
+
+
+def image_card(row: Detection) -> dict | None:
+    """Return the card of a live model ``IMAGE`` row.
+
+    :param row: The row.
+    :returns: The card, or None when the row has no render size.
+    :rtype: dict | None
+    """
+    return _model_box_card(
+        row,
+        IMAGE,
+        Label.IMAGE,
+        IMAGE_PAD_PX,
+        f"The model drew an image box here at {row.confidence:.2f}. "
+        "Keep it over a picture, pull it in to the picture's edges, "
+        "or take it out: the opinion PDF pastes the original scan "
+        "of the box over the page.",
+    )
+
+
+def editorial_card(row: Detection) -> dict | None:
+    """Return the card of a live model ``EDITORIAL`` row.
+
+    :param row: The row.
+    :returns: The card, or None when the row has no render size.
+    :rtype: dict | None
+    """
+    return _model_box_card(
+        row,
+        EDITORIAL,
+        Label.EDITORIAL,
+        EDITORIAL_PAD_PX,
+        f"The model drew an editor's note box here at {row.confidence:.2f}. "
+        "Keep it over the publisher's text (an editor's note, a Words "
+        "and Phrases line), pull it in to that text, or take it out "
+        "when it holds the court's own words: the redaction blacks out "
+        "whatever the box holds.",
+    )
+
+
+#: The live model rows this review walks, by label, and the card each
+#: one makes: a box the curator keeps, resizes or takes out.
+MODEL_BOXES = {
+    Label.IMAGE.name: image_card,
+    Label.EDITORIAL.name: editorial_card,
+}
 
 
 def _column_of(box: Box, columns: list[Box]) -> Box | None:
@@ -497,10 +558,10 @@ def attach_others(built: list[dict], scan: Scan) -> None:
 def cards(scan: Scan) -> list[dict]:
     """Return the cards of a scan, in the order of the page.
 
-    The open findings of ``CHECKS`` and the live model ``IMAGE`` rows,
-    each group by page, every crop widened to its text column. A
-    dismissed finding and a row a curator drew or approved are
-    answered already and make no card.
+    The open findings of ``CHECKS`` and the live model rows of
+    ``MODEL_BOXES``, each group by page, every crop widened to its text
+    column. A dismissed finding and a row a curator drew or approved
+    are answered already and make no card.
 
     :param scan: The scan.
     :returns: The cards.
@@ -535,12 +596,12 @@ def cards(scan: Scan) -> list[dict]:
     # was judged, and makes no card.
     rows = (
         Detection.objects.live()
-        .filter(scan=scan, label=Label.IMAGE.name, decision__isnull=True)
+        .filter(scan=scan, label__in=list(MODEL_BOXES), decision__isnull=True)
         .exclude(model_name=Detection.ModelName.MANUAL)
         .order_by("page_index", "y0", "pk")
     )
     for row in rows:
-        card = image_card(row)
+        card = MODEL_BOXES[row.label](row)
         if card is not None:
             built.append(card)
     widen_to_columns(built, scan)
