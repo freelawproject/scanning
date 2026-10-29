@@ -606,7 +606,7 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
     The family picks blackletter's confidence gates, so every reader of
     a gate asks this and never copies the number: the bracket card, the
     key icons of the pairing's rule (``blackletter.scanner.key_icons``)
-    and the editor's note cards (``card_review.redacting_notes``).
+    and the editor's note cards (``card_review.cards``).
 
     :param scan: The scan.
     :returns: ``rows_are_bl_warm`` over the live model rows' ``found_by``.
