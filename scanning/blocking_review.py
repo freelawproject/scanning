@@ -645,6 +645,31 @@ def _cover_card(page: dict, finding) -> dict | None:
     }
 
 
+def _stale_open(group: dict, schema: int | None) -> int:
+    """Return how many open places a person's block of an older
+    document holds, which the word cards cannot show.
+
+    The stale gate of :func:`open_words` strips the positions of such
+    a block's tokens, so it opens no word card; with none, the block
+    would make no card at all, and an answer elsewhere on the page
+    would settle the page's finding with this block unseen. The count
+    is the block's own (``n_low_confidence``): a flagged word or a
+    blocking gap each.
+
+    :param group: One group of the document.
+    :param schema: The document's ``schema_version``.
+    :returns: The count, zero for any other block.
+    :rtype: int
+    """
+    if (
+        group.get("agreement") != ensemble.HUMAN
+        or schema is None
+        or schema >= POSITIONS_SCHEMA
+    ):
+        return 0
+    return int(group.get("n_low_confidence") or 0)
+
+
 def _place(page: dict, group: dict) -> str:
     """Return where on the page a block sits, for the card's header."""
     section = (
@@ -690,15 +715,12 @@ def cards(
     for finding in findings:
         by_page.setdefault(finding.page_in_opinion, []).append(finding)
     out: list[dict] = []
+    schema = document.get("schema_version")
     for page in document.get("pages") or []:
         number = page["page_in_opinion"]
         page_findings = by_page.pop(number, [])
         if level == ensemble.WARNING:
-            out.extend(
-                _warning_cards(
-                    page, number, page_findings, document.get("schema_version")
-                )
-            )
+            out.extend(_warning_cards(page, number, page_findings, schema))
             continue
         single_card = next(
             (
@@ -749,17 +771,22 @@ def cards(
                 continue
             if word_card is None:
                 continue
-            words = open_words(group, schema=document.get("schema_version"))
+            words = open_words(group, schema=schema)
+            # A person's block of an older document: its open words
+            # cannot be placed, so the whole block is the card, and
+            # the page's finding waits on it.
+            stale = _stale_open(group, schema) if not words else 0
             if (
                 group.get("kind") == markup.TABLE
                 or len(words) > MANY_OPEN_WORDS
+                or stale
             ):
                 out.append(
                     {
                         **common,
                         "kind": BLOCK,
                         "table": group.get("kind") == markup.TABLE,
-                        "open": len(words),
+                        "open": len(words) or stale,
                         "readings": [
                             {
                                 "engine": name,
