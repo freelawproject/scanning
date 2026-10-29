@@ -8,6 +8,8 @@ the list, plus ``restore_detection``, the Undo of a dismissed model box.
 """
 
 import json
+import pathlib
+import re
 
 from blackletter.models import Label
 from django.urls import reverse
@@ -16,6 +18,10 @@ from scanning import card_review
 from scanning.models import CheckName, Detection, DetectionDecision, Issue
 from scanning.tests.test_findings import make_detection, make_scan
 from scanning.tests.test_views import ScanningTestCase
+
+APP = pathlib.Path(__file__).resolve().parent.parent
+SCRIPT = APP / "static" / "scanning" / "card_review.js"
+TEMPLATE = APP / "templates" / "scanning" / "scan_card_review.html"
 
 
 def finding(
@@ -198,6 +204,60 @@ class TestTheBuilders(ScanningTestCase):
         self.assertEqual(card["key"], f"d{row.pk}")
         self.assertEqual(card["page_number"], 3)
 
+    def test_an_editorial_card_is_the_live_model_row(self):
+        row = make_detection(
+            self.scan,
+            "EDITORIAL",
+            1,
+            label_id=int(Label.EDITORIAL),
+            x0=300.0,
+            y0=400.0,
+            x1=800.0,
+            y1=460.0,
+            confidence=0.7,
+        )
+        card = card_review.editorial_card(row)
+        self.assertEqual(card["kind"], card_review.EDITORIAL)
+        self.assertEqual(card["group"], card_review.EDITORIAL)
+        self.assertEqual(card["label"], "EDITORIAL")
+        self.assertEqual(card["label_id"], int(Label.EDITORIAL))
+        self.assertEqual(card["detection_id"], row.pk)
+        self.assertEqual(card["key"], f"d{row.pk}")
+        self.assertEqual(card["page_number"], 2)
+        self.assertEqual(card["box"], [300.0, 400.0, 800.0, 460.0])
+        # A few lines around the note, so it reads as whose it is.
+        self.assertEqual(card["crop"], [240.0, 340.0, 860.0, 520.0])
+        self.assertEqual(card["confidence"], 0.7)
+        self.assertIn("editor's note box", card["message"])
+
+    def test_the_editorial_cards_come_after_the_images(self):
+        # The note is on an earlier page than the image: the group
+        # orders before the page.
+        make_detection(
+            self.scan,
+            "EDITORIAL",
+            0,
+            label_id=int(Label.EDITORIAL),
+            x0=300.0,
+            y0=100.0,
+            x1=800.0,
+            y1=160.0,
+        )
+        make_detection(
+            self.scan,
+            "IMAGE",
+            1,
+            label_id=int(Label.IMAGE),
+            x0=300.0,
+            y0=400.0,
+            x1=800.0,
+            y1=900.0,
+        )
+        self.assertEqual(
+            [c["group"] for c in card_review.cards(self.scan)],
+            ["image", "editorial"],
+        )
+
 
 class TestTheCards(ScanningTestCase):
     def setUp(self):
@@ -292,6 +352,49 @@ class TestTheCards(ScanningTestCase):
             confidence=1.0,
         )
         self.assertEqual(card_review.cards(self.scan), [])
+
+    def test_a_hand_drawn_editorial_row_makes_no_card(self):
+        """A kept box is a hand-drawn row (#414): judged, so no card."""
+        make_detection(
+            self.scan,
+            "EDITORIAL",
+            0,
+            label_id=int(Label.EDITORIAL),
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+            confidence=1.0,
+        )
+        self.assertEqual(card_review.cards(self.scan), [])
+
+
+class TestThePageFollowsTheGroups(ScanningTestCase):
+    """The template's sections and the script's list are the groups of
+    ``card_review.GROUPS``, in order, so a group added to the table is
+    never a card the page has no section for."""
+
+    def test_the_template_has_a_section_per_group(self):
+        sections = re.findall(r'data-group="([a-z]+)"', TEMPLATE.read_text())
+        self.assertEqual(sections, list(card_review.GROUPS))
+
+    def test_the_script_lists_the_groups(self):
+        source = SCRIPT.read_text()
+        match = re.search(r"var GROUPS = \[([^\]]*)\];", source)
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            re.findall(r"'([a-z]+)'", match.group(1)), list(card_review.GROUPS)
+        )
+
+    def test_every_model_box_kind_has_its_verbs(self):
+        """A card that holds a model box gets Keep and Take out from
+        ``MODEL_VERBS``; a kind missing there would get the add
+        buttons instead."""
+        source = SCRIPT.read_text()
+        for kind in (
+            card_review.IMAGE,
+            card_review.EDITORIAL,
+            card_review.FAINT,
+        ):
+            self.assertRegex(source, rf"\n\s+{kind}: \{{ keep: ")
 
 
 class TestTheEndpoints(ScanningTestCase):
