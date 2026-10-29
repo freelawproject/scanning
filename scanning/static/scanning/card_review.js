@@ -985,20 +985,26 @@
         return !node.classList.contains('bk-done') && !node.classList.contains('cr-skipped');
     }
 
-    /** Whether any of the card is on the screen. */
-    function onScreen(node) {
-        var rect = node.getBoundingClientRect();
-        return rect.bottom > 0 && rect.top < window.innerHeight;
+    /** Whether the reader can see the card: at least half of its crop
+     *  is inside the window. A card whose top edge has just come up at
+     *  the foot of the window is not seen, whatever the cursor says,
+     *  so Return never answers a card before its picture is shown; a
+     *  crop taller than the window is seen when it fills half of it. */
+    function seen(node) {
+        var rect = (node.querySelector('.bk-cropwrap') || node).getBoundingClientRect();
+        if (!(rect.height > 0)) { return false; }
+        var shown = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+        return shown >= Math.min(rect.height, window.innerHeight) / 2;
     }
 
-    /** The card the keys act on: the active one while it is on the
-     *  screen, else the one in view. The page never scrolls on its
-     *  own after an answer, so the cursor can be left behind by a
-     *  hand scroll, and a key then acts on what is in front of the
-     *  reader, never on a card out of sight. */
+    /** The card the keys act on: the active one while the reader can
+     *  see it, else the one in view. The page never scrolls on its
+     *  own after an answer, so the cursor moves on to a card that may
+     *  sit below the fold, and a key then acts on what is in front of
+     *  the reader, never on a card out of sight. */
     function keyCard() {
         var active = activeCard();
-        return active && onScreen(active) ? active : cardInView();
+        return active && seen(active) ? active : cardInView();
     }
 
     /** The card whose middle is nearest the middle of the window. */
