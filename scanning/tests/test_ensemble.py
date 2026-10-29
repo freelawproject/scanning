@@ -975,6 +975,33 @@ class TestTheVote(TestCase):
         # ``alpha`` alone is the no-majority place.
         self.assertEqual(answer["n_low_confidence"], 1)
 
+    def test_a_word_the_vote_joined_keeps_its_flag_beside_an_answer(self):
+        """``0001065- 2021`` is one word to the vote (``_pairs``), shown
+        with its space. The person answered the card of ``x`` and left
+        it as it was. Aligned on the text split on whitespace it was
+        two words against one token, read as changed, and its card
+        closed unjudged; the carry splits the person's text as the
+        vote does, so the flag and the position stay."""
+        group = self.read(
+            "No. 0001065- 2021 x", "No. 0001065-2O21 y", "No. 0001065, 2021 z"
+        )
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["text"], "No. 0001065- 2021 x")
+        self.assertEqual(answer["n_low_confidence"], 2)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "No. 0001065- 2021 w", "span": [18, 19]},
+            group["engines"],
+        )
+
+        joined = next(
+            t for t in kept["tokens"] if t["text"] == "0001065- 2021"
+        )
+        self.assertTrue(joined.get("low_confidence"))
+        self.assertEqual(joined.get("position"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
     def test_a_changed_neighbour_leaves_the_gap_open(self):
         """The person answered the word before the gap, ``b`` to ``z``,
         and never looked at the gap: it stays, on the same word, with
@@ -1443,6 +1470,81 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
+
+    def test_the_shown_spelling_of_an_agreed_word_has_no_gap(self):
+        """The rank's engine wrote ``CP-1- 2021`` where two others wrote
+        ``CP-1-2021``: one reading by key, and the text shows the
+        spelling without the stray space, at the word (``vote_words``)
+        and for a block read alike (``resolve``), whose ``source``
+        names the engine it took it from."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("No. CP-1- 2021 x"),
+            [
+                ensemble._pairs("No. CP-1-2021 y"),
+                ensemble._pairs("No. CP-1-2021 z"),
+            ],
+        )
+        self.assertEqual(tokens[1]["text"], "CP-1-2021")
+        self.assertFalse(tokens[1].get("low_confidence"))
+
+        answer = ensemble.resolve(
+            self.read("No. CP-1- 2021 x", "No. CP-1-2021 x", "No. CP-1-2021 x")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "No. CP-1-2021 x")
+        self.assertEqual(answer["source"], "mistral_ocr")
+        # Alike to the letter, the rank's own spelling stays.
+        answer = ensemble.resolve(self.read("a - b", "a - b", "a - b"))
+        self.assertEqual(answer["source"], "dots_mocr")
+
+    def test_a_hyphen_with_a_space_after_it_is_the_hyphen(self):
+        """Mistral wrote ``CP-23-CR-0001065- 2021`` for the docket
+        number dots.mocr wrote as ``CP-23-CR-0001065-2021``: one
+        reading with a space in it, not two readings. The key folds
+        the space, the pairing reads the two words as one, and the
+        two engines are the majority over Surya's comma; the card is
+        a warning, not a block nobody agrees on. A dash between
+        spaces is a mark of its own and stays."""
+        self.assertEqual(
+            ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
+            "No(s): CP-23-CR-0001065-2021",
+        )
+        self.assertEqual(ensemble.compare_text("a - b"), "a - b")
+        self.assertEqual(
+            ensemble.compare_text("677 -- 679 and - so"), "677 -- 679 and - so"
+        )
+        self.assertEqual(
+            ensemble.compare_text("677- 679", hyphen_gaps=False), "677- 679"
+        )
+        self.assertEqual(
+            ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+            [
+                ("No(s):", "No(s):"),
+                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
+        )
+        self.assertEqual(
+            ensemble._pairs("677 -- 679"),
+            [("677", "677"), ("--", "--"), ("679", "679")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("No(s): CP-23-CR-0001065-2021"),
+            [
+                ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+                ensemble._pairs("No(s): CP-23-CR-0001065, 2021"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["No(s):", "CP-23-CR-0001065-2021"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
 
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on

@@ -184,7 +184,19 @@ def _span_reading(at: dict, first: int, last: int) -> str:
     return " ".join(words)
 
 
-def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
+#: The first document schema whose kept tokens of a person's block
+#: carry positions counted over the words as ``ensemble._pairs`` joins
+#: them. An older document counted them over the text split on
+#: whitespace, and the cards align the engines with the join, so a
+#: word joined earlier in the block would shift every later card onto
+#: the readings of the wrong word: those tokens open no word card
+#: until the document is written again (``rerun_opinion_ensemble``).
+POSITIONS_SCHEMA = 13
+
+
+def open_words(
+    group: dict, flag: str = LOW_CONFIDENCE, schema: int | None = None
+) -> list[dict]:
     """Return the places of one voted group no two engines agree on.
 
     With ``flag`` :data:`MAJORITY`, the places a majority settled over
@@ -224,6 +236,9 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
 
     :param group: One group of a stamped ensemble document.
     :param flag: The flag of the tokens to open.
+    :param schema: The document's ``schema_version``, or None for a
+        group built now: a person's block of a document under
+        :data:`POSITIONS_SCHEMA` opens no word card.
     :returns: One entry per open place: ``{start, length, token,
         before, after, readings: [{engine, word}], position}``, with
         ``start`` an offset into the group's ``text``, ``token`` the
@@ -268,8 +283,18 @@ def open_words(group: dict, flag: str = LOW_CONFIDENCE) -> list[dict]:
     if group.get("agreement") == ensemble.HUMAN:
         # A person wrote the text; the open words they left as they
         # were are the document's own tokens, each at its base
-        # position (``ensemble._kept_open``), placed in that text.
+        # position (``ensemble._kept_open``), placed in that text. A
+        # position of an older document counts other words.
         tokens = group.get("tokens") or []
+        if schema is not None and schema < POSITIONS_SCHEMA:
+            tokens = [
+                {
+                    k: v
+                    for k, v in token.items()
+                    if k not in ("position", "run_index", "gap_at")
+                }
+                for token in tokens
+            ]
     else:
         tokens = voted
     # The base positions the vote kept a word for: a base word with no
@@ -620,6 +645,31 @@ def _cover_card(page: dict, finding) -> dict | None:
     }
 
 
+def _stale_open(group: dict, schema: int | None) -> int:
+    """Return how many open places a person's block of an older
+    document holds, which the word cards cannot show.
+
+    The stale gate of :func:`open_words` strips the positions of such
+    a block's tokens, so it opens no word card; with none, the block
+    would make no card at all, and an answer elsewhere on the page
+    would settle the page's finding with this block unseen. The count
+    is the block's own (``n_low_confidence``): a flagged word or a
+    blocking gap each.
+
+    :param group: One group of the document.
+    :param schema: The document's ``schema_version``.
+    :returns: The count, zero for any other block.
+    :rtype: int
+    """
+    if (
+        group.get("agreement") != ensemble.HUMAN
+        or schema is None
+        or schema >= POSITIONS_SCHEMA
+    ):
+        return 0
+    return int(group.get("n_low_confidence") or 0)
+
+
 def _place(page: dict, group: dict) -> str:
     """Return where on the page a block sits, for the card's header."""
     section = (
@@ -665,11 +715,12 @@ def cards(
     for finding in findings:
         by_page.setdefault(finding.page_in_opinion, []).append(finding)
     out: list[dict] = []
+    schema = document.get("schema_version")
     for page in document.get("pages") or []:
         number = page["page_in_opinion"]
         page_findings = by_page.pop(number, [])
         if level == ensemble.WARNING:
-            out.extend(_warning_cards(page, number, page_findings))
+            out.extend(_warning_cards(page, number, page_findings, schema))
             continue
         single_card = next(
             (
@@ -720,17 +771,22 @@ def cards(
                 continue
             if word_card is None:
                 continue
-            words = open_words(group)
+            words = open_words(group, schema=schema)
+            # A person's block of an older document: its open words
+            # cannot be placed, so the whole block is the card, and
+            # the page's finding waits on it.
+            stale = _stale_open(group, schema) if not words else 0
             if (
                 group.get("kind") == markup.TABLE
                 or len(words) > MANY_OPEN_WORDS
+                or stale
             ):
                 out.append(
                     {
                         **common,
                         "kind": BLOCK,
                         "table": group.get("kind") == markup.TABLE,
-                        "open": len(words),
+                        "open": len(words) or stale,
                         "readings": [
                             {
                                 "engine": name,
@@ -783,7 +839,9 @@ def cards(
     return out
 
 
-def _warning_cards(page: dict, number: int, page_findings: list) -> list:
+def _warning_cards(
+    page: dict, number: int, page_findings: list, schema: int | None
+) -> list:
     """Return the warning cards of one page.
 
     One ``word`` card per place a majority settled over one engine in
@@ -826,7 +884,7 @@ def _warning_cards(page: dict, number: int, page_findings: list) -> list:
         }
         answered.add(disagree.pk)
         table = group.get("kind") == markup.TABLE
-        words = [] if table else open_words(group, MAJORITY)
+        words = [] if table else open_words(group, MAJORITY, schema=schema)
         if words and len(words) <= MANY_OPEN_WORDS:
             for word in words:
                 out.append(

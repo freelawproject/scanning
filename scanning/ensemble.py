@@ -202,7 +202,10 @@ logger = logging.getLogger(__name__)
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
 #: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
-SCHEMA_VERSION = 12
+#: 13 counts the positions of a person's kept tokens over the words as
+#: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
+#: split the cards align the engines with (``blocking_review.open_words``).
+SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -397,6 +400,25 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
 
+#: A hyphen between a word character and whitespace, with a word after:
+#: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
+#: ``CP-23-CR-0001065-2021``, the same docket number, and the two are
+#: no two engines agreeing on a word. A dash between spaces, or the
+#: second of a double dash (``677 -- 679``), is a mark of its own and
+#: stays.
+_HYPHEN_GAP = re.compile(r"(?<=\w)-\s+(?=\w)")
+
+#: A word that ends in a hyphen after a word character, the head of a
+#: ``_HYPHEN_GAP`` split; ``--`` is not one.
+_HYPHEN_END = re.compile(r"\w-$")
+
+#: The gaps the key folds out. Readings that agree by key and differ
+#: by one of these are one reading spelled two ways, and the shown one
+#: is the spelling with the fewest (:func:`_tidiest`): the rank's
+#: engine wrote ``CP-1- 2021`` once where two others wrote
+#: ``CP-1-2021``, and the approved text took the stray space.
+_GAPS = (_HYPHEN_GAP,)
+
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
 #: Mistral writes an image placeholder as a block's whole text where
@@ -460,6 +482,20 @@ class RevisionMoved(TransientFault):
 # ---------------------------------------------------------------------------
 
 
+def _tidiest(spellings: list[str]) -> str:
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, the
+    first of them when they tie.
+
+    :param spellings: Readings that agree by key, in rank order.
+    :returns: The one to show.
+    :rtype: str
+    """
+    return min(
+        spellings,
+        key=lambda text: sum(len(gap.findall(text)) for gap in _GAPS),
+    )
+
+
 def plain(fragment: str | None) -> str:
     """Return one unit's content, its whitespace folded.
 
@@ -493,7 +529,7 @@ def _strip_markup(fragment: str) -> str:
     return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
-def compare_text(text: str) -> str:
+def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """Return the text as the vote compares it, never as it is shown.
 
     **The comparison is not the text.** The engines agree about the
@@ -505,11 +541,18 @@ def compare_text(text: str) -> str:
     text is what a reader sees.
 
     :param text: One engine's read.
+    :param hyphen_gaps: Fold a hyphen with whitespace after it inside a
+        word (``_HYPHEN_GAP``). The page-number reader turns it off
+        (``page_numbers.carries_number``): a ``Cite as`` line that
+        ends ``677- 679`` ends in the page number as the engine wrote
+        it, and folded it would end in a range.
     :returns: The key.
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    if hyphen_gaps:
+        folded = _HYPHEN_GAP.sub("-", folded)
     return _WS.sub(" ", folded).strip()
 
 
@@ -525,7 +568,8 @@ def compare_word(word: str) -> str:
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
-    return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
+    folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    return _HYPHEN_GAP.sub("-", folded).strip()
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -540,7 +584,10 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     writes ``...``, and :func:`compare_text` reads them alike already
     (``_DOT_RUN``). Split on whitespace first, they are three words
     against one, and a block that agrees to the letter goes to a vote.
-    The shown word keeps the engine's own spacing.
+    A word that ends in a hyphen and the word after it are one word
+    the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
+    spacing of ``0001065-2021``, and split it is two words against
+    one. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
@@ -552,6 +599,15 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     while index < len(words):
         end = index
         while end < len(words) and _LONE_DOTS.match(words[end]):
+            end += 1
+        if end - index < 2:
+            end = index
+            while (
+                end + 1 < len(words)
+                and _HYPHEN_END.search(words[end])
+                and words[end + 1][:1].isalnum()
+            ):
+                end += 1
             end += 1
         if end - index >= 2:
             shown = " ".join(words[index:end])
@@ -2558,8 +2614,11 @@ def _candidates(
     matcher = SequenceMatcher(None, base_keys, other_keys, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for index in range(i1, i2):
-                at.setdefault(index, []).append(base[index])
+            # The engine's own spelling of the word it read as the
+            # base's: one key, and the shown word may differ by a gap
+            # the key folds (``_tidiest`` picks between them).
+            for offset in range(i2 - i1):
+                at.setdefault(i1 + offset, []).append(other[j1 + offset])
         elif tag == "replace":
             if i2 - i1 == j2 - j1:
                 for offset in range(i2 - i1):
@@ -2769,8 +2828,8 @@ def vote_words(
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
                 token = {
-                    "text": next(
-                        word for key, word in readings if key == winner
+                    "text": _tidiest(
+                        [word for key, word in readings if key == winner]
                     ),
                     "position": position,
                 }
@@ -2886,12 +2945,19 @@ def resolve(group: dict) -> dict:
         quorum = (len(present) + 2) // 2
         if votes >= quorum:
             agreeing = [name for name in present if keys[name] == winner]
+            # The spelling shown is the tidiest of the agreeing ones,
+            # and ``source`` names its engine, the side the cards vote
+            # from (``blocking_review.open_words``).
+            shown = _tidiest([engines[name]["text"] for name in agreeing])
+            source = next(
+                name for name in agreeing if engines[name]["text"] == shown
+            )
             answer = {
                 "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
-                "source": agreeing[0],
+                "source": source,
                 "agreeing": agreeing,
                 "silent": silent,
-                "text": engines[agreeing[0]]["text"],
+                "text": shown,
                 "tokens": [],
                 "n_low_confidence": 0,
             }
@@ -3256,11 +3322,17 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             token["run_index"] = run_index
         else:
             run_index = None
-    words = text.split()
+    # The person's words, split as the vote splits a read: a run of
+    # dots or a hyphen gap the vote joined is one token with a space
+    # in it, and split on whitespace it is two words that never match
+    # it, so a word the person left as it was read as changed and its
+    # card closed unjudged.
+    person = _pairs(text)
+    words = [shown for _, shown in person]
     matcher = SequenceMatcher(
         None,
         [compare_word(t["text"]) for t in voted],
-        [compare_word(w) for w in words],
+        [key for key, _ in person],
         autojunk=False,
     )
     # What the engines read in each gap, by the base position the gap
@@ -3314,7 +3386,7 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         elif tag == "replace":
             for offset in range(i2 - i1):
                 landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
-            human_keys = [compare_word(w) for w in words[j1:j2]]
+            human_keys = [key for key, _ in person[j1:j2]]
             voted_keys = [compare_word(t["text"]) for t in voted[i1:i2]]
             extra = set(human_keys) - set(voted_keys)
             # More words than were replaced, and not the same words
