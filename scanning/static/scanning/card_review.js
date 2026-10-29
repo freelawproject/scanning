@@ -840,13 +840,12 @@
     }
 
     /** Read the cards again and come back to one, or to the next open
-     *  one when it is gone. */
+     *  one when it is gone. The page stays where it is. */
     function reloadAt(key) {
         return load().then(function () {
             var again = key ? root.querySelector('.bk-card[data-key="' + key + '"]') : null;
             if (again) {
                 setActive(again);
-                again.scrollIntoView({ behavior: 'smooth', block: 'center' });
             } else {
                 focusNextCard();
             }
@@ -879,9 +878,7 @@
             // another pk: read the cards again, and come back to this
             // one.
             return load().then(function () {
-                var again = root.querySelector('.bk-card[data-key="' + card.key + '"]');
-                setActive(again);
-                if (again) { again.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+                setActive(root.querySelector('.bk-card[data-key="' + card.key + '"]'));
             });
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
@@ -988,6 +985,22 @@
         return !node.classList.contains('bk-done') && !node.classList.contains('cr-skipped');
     }
 
+    /** Whether any of the card is on the screen. */
+    function onScreen(node) {
+        var rect = node.getBoundingClientRect();
+        return rect.bottom > 0 && rect.top < window.innerHeight;
+    }
+
+    /** The card the keys act on: the active one while it is on the
+     *  screen, else the one in view. The page never scrolls on its
+     *  own after an answer, so the cursor can be left behind by a
+     *  hand scroll, and a key then acts on what is in front of the
+     *  reader, never on a card out of sight. */
+    function keyCard() {
+        var active = activeCard();
+        return active && onScreen(active) ? active : cardInView();
+    }
+
     /** The card whose middle is nearest the middle of the window. */
     function cardInView() {
         var mid = window.innerHeight / 2;
@@ -1001,6 +1014,10 @@
         return best;
     }
 
+    /** The next open card takes the cursor, and the page stays where
+     *  it is: a scroll after every answer moved the cards under the
+     *  pointer, and the reader's next click landed on the wrong one.
+     *  The reader scrolls, by hand or with the arrow keys. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
@@ -1012,9 +1029,6 @@
             if (isOpen(list[i])) { next = list[i]; }
         }
         setActive(next);
-        if (next) {
-            window.setTimeout(function () { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 80);
-        }
     }
 
     function step(delta) {
@@ -1050,13 +1064,13 @@
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             event.preventDefault();
-            if (!activeCard()) { setActive(cardInView()); }
+            setActive(keyCard());
             step(event.key === 'ArrowDown' ? 1 : -1);
             return;
         }
         var key = event.key === 'Enter' ? 'enter' : String(event.key).toLowerCase();
         if (!KEY_NAMES[key]) { return; }
-        var card = activeCard() || cardInView();
+        var card = keyCard();
         if (key === 'u' && lastEdit()) {
             // A box edit was the last thing done: u takes it back.
             event.preventDefault();
