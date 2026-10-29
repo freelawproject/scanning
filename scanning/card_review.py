@@ -10,7 +10,8 @@ the page (``image_fit``), each of which the opinion PDF pastes onto the
 bitonal page as a grey photograph of whatever it covers, and the
 ``EDITORIAL`` boxes, the publisher's notes and Words and Phrases lines
 the redaction blacks out, which the model also draws over a court's
-own line now and then. In the viewer each costs a click on the card,
+own line now and then (only the boxes doing the redaction are asked
+about, ``redacting_notes``). In the viewer each costs a click on the card,
 a scroll, a look and a click on the box. This module turns them into
 cards a curator answers in a row, the shape of the blocking review of
 review 3 (``blocking_review``): the scan around the box, the box
@@ -38,8 +39,10 @@ the wrong column.
 from __future__ import annotations
 
 from blackletter.models import Label
+from blackletter.scanner import label_confidence
 
-from scanning.models import CheckName, Detection, Issue, Scan
+from scanning import boundaries, findings, opinion_ocr, redactions
+from scanning.models import CheckName, Detection, Issue, Redaction, Scan
 
 #: What a card offers (``kind``). A ``caption`` card is a caption the
 #: model did not box after a key icon, answered by adding the box where
@@ -48,8 +51,9 @@ from scanning.models import CheckName, Detection, Issue, Scan
 #: card a bracket box the model drew under blackletter's redaction
 #: gate (#410), approved, resized or taken out; an ``image`` card a
 #: live model ``IMAGE`` box, kept, resized or taken out; an
-#: ``editorial`` card a live model ``EDITORIAL`` box, the same three
-#: answers; a ``link`` card one with no box to act on here (the first
+#: ``editorial`` card a live model ``EDITORIAL`` box that is doing the
+#: redaction (``redacting_notes``), the same three answers; a ``link``
+#: card one with no box to act on here (the first
 #: key icon of a volume with no caption before it), which points at
 #: the viewer; a ``text`` card a block of print no box covers
 #: (``undetected``), answered by adding the column box the card holds
@@ -459,6 +463,60 @@ def editorial_card(row: Detection) -> dict | None:
     )
 
 
+def redacting_notes(scan: Scan, rows: list[Detection]) -> list[Detection]:
+    """Return the editor's note boxes that are doing the redaction.
+
+    A model box blacks out its note only at or above blackletter's
+    gate for the family the compute reads (``label_confidence`` over
+    ``findings.model_rows_are_bl_warm``, the rule the faint bracket
+    card reads, never a copy of the number): under it the box sits on
+    the page and redacts nothing, so keeping or taking it out changes
+    nothing. And a box inside the page's other black redactions, the
+    headnote blackout from the synopsis to the start of the opinion,
+    is black whichever way it is answered. Neither asks anything, and
+    on thirty volumes they were 93 of every 100 boxes. The cover is
+    the glue's own measure of "covered whole"
+    (``opinion_ocr.covered_share`` at ``FULL_SHARE``) over the visible
+    black boxes of other types: a white strip hides nothing, and
+    another editor's note box is itself in question.
+
+    :param scan: The scan.
+    :param rows: The live model ``EDITORIAL`` rows.
+    :returns: The rows that make a card, in the order given.
+    :rtype: list[Detection]
+    """
+    if not rows:
+        return []
+    gate = label_confidence(
+        Label.EDITORIAL, findings.model_rows_are_bl_warm(scan)
+    )
+    strong = [row for row in rows if (row.confidence or 0.0) >= gate]
+    if not strong:
+        return []
+    by_page = {
+        entry["page_index"]: entry["rects"]
+        for entry in redactions.visible_by_page(scan)
+    }
+    out = []
+    for row in strong:
+        others = [
+            rect
+            for rect in by_page.get(row.page_index, ())
+            if rect["fill"] == Redaction.Fill.BLACK
+            and rect["rect_type"] != Label.EDITORIAL.name
+        ]
+        x0, y0 = boundaries.to_points(
+            row.x0, row.y0, row.img_width, row.img_height
+        )
+        x1, y1 = boundaries.to_points(
+            row.x1, row.y1, row.img_width, row.img_height
+        )
+        share, _ = opinion_ocr.covered_share([x0, y0, x1, y1], others)
+        if share < opinion_ocr.FULL_SHARE:
+            out.append(row)
+    return out
+
+
 #: The live model rows this review walks, by label, and the card each
 #: one makes: a box the curator keeps, resizes or takes out.
 MODEL_BOXES = {
@@ -561,7 +619,8 @@ def cards(scan: Scan) -> list[dict]:
     The open findings of ``CHECKS`` and the live model rows of
     ``MODEL_BOXES``, each group by page, every crop widened to its text
     column. A dismissed finding and a row a curator drew or approved
-    are answered already and make no card.
+    are answered already and make no card, and an editor's note box
+    that is not doing the redaction asks nothing (``redacting_notes``).
 
     :param scan: The scan.
     :returns: The cards.
@@ -594,13 +653,17 @@ def cards(scan: Scan) -> list[dict]:
     # A live model row with a standing decision carries an approval
     # written before #414, which left the model row live at 1.0: it
     # was judged, and makes no card.
-    rows = (
+    rows = list(
         Detection.objects.live()
         .filter(scan=scan, label__in=list(MODEL_BOXES), decision__isnull=True)
         .exclude(model_name=Detection.ModelName.MANUAL)
         .order_by("page_index", "y0", "pk")
     )
+    notes = [row for row in rows if row.label == Label.EDITORIAL.name]
+    asked = {row.pk for row in redacting_notes(scan, notes)}
     for row in rows:
+        if row.label == Label.EDITORIAL.name and row.pk not in asked:
+            continue
         card = MODEL_BOXES[row.label](row)
         if card is not None:
             built.append(card)

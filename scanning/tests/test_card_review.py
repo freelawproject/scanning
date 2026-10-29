@@ -12,11 +12,16 @@ import pathlib
 import re
 
 from blackletter.models import Label
+from blackletter.scanner import label_confidence
 from django.urls import reverse
 
 from scanning import card_review
 from scanning.models import CheckName, Detection, DetectionDecision, Issue
-from scanning.tests.test_findings import make_detection, make_scan
+from scanning.tests.test_findings import (
+    make_detection,
+    make_redaction,
+    make_scan,
+)
 from scanning.tests.test_views import ScanningTestCase
 
 APP = pathlib.Path(__file__).resolve().parent.parent
@@ -365,6 +370,73 @@ class TestTheCards(ScanningTestCase):
             confidence=1.0,
         )
         self.assertEqual(card_review.cards(self.scan), [])
+
+    def note(self, **fields):
+        """A model editor's note box, 500 by 60 pixels on page 1."""
+        values = dict(
+            label_id=int(Label.EDITORIAL),
+            x0=300.0,
+            y0=400.0,
+            x1=800.0,
+            y1=460.0,
+        )
+        values.update(fields)
+        return make_detection(self.scan, "EDITORIAL", 0, **values)
+
+    def test_an_editorial_box_inside_the_headnote_blackout_makes_no_card(
+        self,
+    ):
+        """The headnote blackout runs from the synopsis to the start of
+        the opinion, and a note box inside it is black whichever way it
+        is answered: 84 in 100 of the boxes on thirty volumes."""
+        self.note()
+        # The note in points: [108, 144, 288, 166]. The blackout holds it.
+        make_redaction(self.scan, 0, x0=100.0, y0=130.0, x1=300.0, y1=180.0)
+        self.assertEqual(card_review.cards(self.scan), [])
+
+    def test_a_white_box_or_another_note_box_is_no_cover(self):
+        """A white strip hides nothing, and another editor's note box
+        is itself in question; a blackout over half the box leaves the
+        other half to this box."""
+        row = self.note()
+        make_redaction(
+            self.scan,
+            0,
+            rect_type="margin",
+            fill="white",
+            x0=100.0,
+            y0=130.0,
+            x1=300.0,
+            y1=180.0,
+        )
+        make_redaction(
+            self.scan,
+            0,
+            rect_type="EDITORIAL",
+            x0=100.0,
+            y0=130.0,
+            x1=300.0,
+            y1=180.0,
+        )
+        make_redaction(self.scan, 0, x0=100.0, y0=130.0, x1=200.0, y1=180.0)
+        self.assertEqual(
+            [c["detection_id"] for c in card_review.cards(self.scan)],
+            [row.pk],
+        )
+
+    def test_an_editorial_box_under_blackletters_gate_makes_no_card(self):
+        """blackletter draws a black box from a model detection only at
+        or above its gate for the label and the model family; under it
+        the box redacts nothing, so there is nothing to keep or take
+        out. The gate is read, never copied."""
+        gate = label_confidence(Label.EDITORIAL, bl_warm=True)
+        self.note(confidence=round(gate - 0.01, 2))
+        self.assertEqual(card_review.cards(self.scan), [])
+        row = self.note(confidence=gate)
+        self.assertEqual(
+            [c["detection_id"] for c in card_review.cards(self.scan)],
+            [row.pk],
+        )
 
 
 class TestThePageFollowsTheGroups(ScanningTestCase):
