@@ -631,6 +631,29 @@ class TestOcrResultsFromVolume(SimpleTestCase):
 
         self.assertIsNone(results[1]["detected"])
 
+    def test_a_hyphen_with_a_space_in_the_cite_as_line_is_no_range(self):
+        """The vote folds ``677- 679`` to one word; this reader folds
+        by the rule of ``carries_number`` and must not, or the line
+        reads as the range 677-679 and the page loses its number."""
+        document = {
+            "pages": [
+                make_page(
+                    1,
+                    [
+                        cell(
+                            "Cite as 218 A.3d 677- 679",
+                            bbox=[1285, 107, 1427, 144],
+                        )
+                    ],
+                )
+            ]
+        }
+
+        results = page_numbers.ocr_results_from_volume(document)
+
+        self.assertEqual(results[0]["detected"], "679")
+        self.assertEqual(results[0]["type"], "single")
+
     def test_the_output_is_the_run_and_nothing_else(self):
         # Pure machine output since #214: a curator's own number is a
         # PageEdit row, overlaid on top of this by page_edits.

@@ -202,7 +202,10 @@ logger = logging.getLogger(__name__)
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
 #: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
-SCHEMA_VERSION = 12
+#: 13 counts the positions of a person's kept tokens over the words as
+#: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
+#: split the cards align the engines with (``blocking_review.open_words``).
+SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -3355,11 +3358,17 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             token["run_index"] = run_index
         else:
             run_index = None
-    words = text.split()
+    # The person's words, split as the vote splits a read: a run of
+    # dots or a hyphen gap the vote joined is one token with a space
+    # in it, and split on whitespace it is two words that never match
+    # it, so a word the person left as it was read as changed and its
+    # card closed unjudged.
+    person = _pairs(text)
+    words = [shown for _, shown in person]
     matcher = SequenceMatcher(
         None,
         [compare_word(t["text"]) for t in voted],
-        [compare_word(w) for w in words],
+        [key for key, _ in person],
         autojunk=False,
     )
     # What the engines read in each gap, by the base position the gap
@@ -3413,7 +3422,7 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         elif tag == "replace":
             for offset in range(i2 - i1):
                 landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
-            human_keys = [compare_word(w) for w in words[j1:j2]]
+            human_keys = [key for key, _ in person[j1:j2]]
             voted_keys = [compare_word(t["text"]) for t in voted[i1:i2]]
             extra = set(human_keys) - set(voted_keys)
             # More words than were replaced, and not the same words
