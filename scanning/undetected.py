@@ -485,8 +485,13 @@ def _finding(
 # ---------------------------------------------------------------------------
 
 #: The black boxes that cover a glyph and not words: a bracket, the key
-#: icon, the divider rule. One of them over part of a line is its job.
-GLYPH_RECT_TYPES = frozenset({"HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER"})
+#: icon, the divider rule, and the case number West prints over each
+#: caption (``CASE_SEQUENCE``, a box blackletter clamps to the digit).
+#: One of them over part of a line is its job: the reader merged the
+#: glyph into the line beside it, and the line stays.
+GLYPH_RECT_TYPES = frozenset(
+    {"HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER", "CASE_SEQUENCE"}
+)
 
 #: A cell with fewer letters and digits than this is a speck the reader
 #: read as a character, and no card asks about it.
@@ -497,7 +502,6 @@ MIN_CUT_LETTERS = 3
 _BOX_WORDS = {
     "headnote": "A headnote box",
     "EDITORIAL": "An editor's note box",
-    "CASE_SEQUENCE": "A case sequence box",
     "manual": "A hand-drawn box",
 }
 

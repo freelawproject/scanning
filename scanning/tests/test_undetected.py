@@ -709,9 +709,9 @@ class TestTheCutLine(ScanningTestCase):
         self.assertEqual(self.found(), [])
 
     def test_a_glyphs_box_and_a_white_box_make_no_card(self):
-        """A bracket, a key and a divider cover a symbol; a white box is
-        a margin or the running head."""
-        for rect_type in ("HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER"):
+        """A bracket, a key, a divider and a case number cover a symbol;
+        a white box is a margin or the running head."""
+        for rect_type in undetected.GLYPH_RECT_TYPES:
             make_redaction(
                 self.scan,
                 rect_type=rect_type,
@@ -732,6 +732,26 @@ class TestTheCutLine(ScanningTestCase):
         self.write(cell("the words of the line", LINE))
 
         self.assertEqual(self.found(), [])
+
+    def test_a_case_number_merged_into_its_caption_is_no_card(self):
+        """West prints a small number over each caption, and the reader
+        often reads it into the caption's first line. blackletter's
+        box holds the digit alone, so the line beside it stays: no
+        card asks to cover it."""
+        make_redaction(
+            self.scan,
+            rect_type="CASE_SEQUENCE",
+            x0=106.0,
+            y0=358.0,
+            x1=122.0,
+            y1=380.0,
+        )
+        self.write(
+            cell("4 Joseph R. BIDEN, Jr.", [300.0, 1000.0, 500.0, 1050.0])
+        )
+
+        self.assertEqual(self.found(), [])
+        self.assertIn("CASE_SEQUENCE", undetected.GLYPH_RECT_TYPES)
 
     def test_a_white_box_over_the_rest_of_the_line_makes_it_covered(self):
         """Review 3 measures every visible box: a headnote box over the
