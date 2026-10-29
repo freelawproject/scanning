@@ -800,6 +800,55 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         self.assertEqual(self.job.attempt, 1)
 
+    def test_a_sweep_named_for_a_provider_judges_its_rows_alone(self):
+        """One sweep per provider: RunPod's pass leaves the doctor row
+        untouched and runs no Mistral leftover pass; doctor's pass
+        takes it. The daemon's own pass, with no name, judges all."""
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        self.assertIsNone(self.job.last_polled_at)
+        leftover.assert_not_called()
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 1)
+        self.assertEqual(self.job.status, JobStatus.COMPLETED)
+        leftover.assert_not_called()
+
+        with patch("scanning.mistral_ocr.delete_leftover_files") as leftover:
+            jobs.sweep_jobs(providers=(JobProvider.MISTRAL,))
+        leftover.assert_called_once()
+
+    def test_a_stranded_row_is_written_off_by_its_own_provider_alone(self):
+        stranded = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=stranded.pk).update(
+            deadline=timezone.now() - timedelta(seconds=1)
+        )
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        stranded.refresh_from_db()
+        self.assertEqual(stranded.status, JobStatus.PENDING)
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            with self.assertLogs("scanning.jobs", level="ERROR"):
+                summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        stranded.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(stranded.status, JobStatus.FAILED)
+
     def test_a_pending_row_past_its_stamped_ceiling_is_written_off(self):
         """A row an endpoint kept declining must still end.
 

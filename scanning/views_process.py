@@ -5360,8 +5360,8 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Review the boxes of a volume one after the next (``card_review``).
 
     The brackets the reader saw, the captions the model missed and the
-    image boxes it drew, each a crop of the page with the box on it
-    and two or three buttons. **The page writes nothing of its own**:
+    image and editor's note boxes it drew, each a crop of the page with
+    the box on it and two or three buttons. **The page writes nothing of its own**:
     the browser asks :func:`scan_review_cards` for the cards and
     answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
     so the viewer and this page hold one set of rules. The crops are
@@ -5408,7 +5408,7 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
     """Return the cards of the card review of one volume.
 
     ``card_review.cards`` over the open findings and the live model
-    image rows: rows alone, no S3 read and no render.
+    image and editor's note rows: rows alone, no S3 read and no render.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
