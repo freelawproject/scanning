@@ -1,8 +1,10 @@
 """The blocking review: the cards, the crop estimate, the two views."""
 
+import pathlib
+import re
 from types import SimpleNamespace
 
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.urls import reverse
 
 from scanning import blocking_review, ensemble
@@ -26,6 +28,69 @@ def read(*texts) -> dict:
     )
     group.update(ensemble.resolve(group))
     return group
+
+
+SCRIPT = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "static"
+    / "scanning"
+    / "blocking_review.js"
+)
+
+
+class TestTheScriptKeysAKeptCardByItsPlace(SimpleTestCase):
+    """A kept card is browser state until the page's dismissal is
+    sent, and an answer elsewhere rebuilds the opinion in between:
+    the finding rows are written again with new pks, an edit before
+    the word moves its offset, and a "Not text" drop moves every
+    later block's id down by one. The key reads the block's box and
+    the position the server writes for that, never the finding pk or
+    the group id."""
+
+    def test_the_key_reads_the_box_and_the_position_alone(self):
+        source = SCRIPT.read_text()
+        body = re.search(
+            r"function keyOf\(card\) \{(.*?)\n    \}", source, re.S
+        ).group(1)
+        self.assertIn("card.position", body)
+        self.assertIn("card.box_pt", body)
+        self.assertNotIn("finding_pk", body)
+        self.assertNotIn("group_id", body)
+        self.assertNotIn("card.start", body.split("else")[0])
+
+    def test_a_reload_settles_the_findings_whose_cards_are_all_kept(self):
+        source = SCRIPT.read_text()
+        self.assertIn("return self.settle(cause);", source)
+        self.assertIn("Section.prototype.settle = function (cause)", source)
+
+    def test_a_sent_dismissal_leaves_kept_and_is_undone_with_its_cause(
+        self,
+    ):
+        """Once sent, a dismissal's marks leave ``kept``, or a card a
+        curator restores elsewhere is dismissed again with no click;
+        and a dismissal settle sent on an edit's reload is listed
+        under that edit, whose Undo restores it first."""
+        source = SCRIPT.read_text()
+        dismiss = re.search(
+            r"Section\.prototype\.dismiss = function(.*?)\n    \};",
+            source,
+            re.S,
+        ).group(1)
+        self.assertIn("delete self.kept[key]", dismiss)
+        self.assertIn("cause.settled = cause.settled || []", dismiss)
+        self.assertIn("return self.reload(cause);", dismiss)
+        undo = re.search(
+            r"Section\.prototype\.undo = function(.*?)\n    \};", source, re.S
+        ).group(1)
+        self.assertIn("entry.settled", undo)
+        self.assertIn("self.undoOne(d)", undo)
+        for write in ("write", "drop"):
+            body = re.search(
+                rf"Section\.prototype\.{write} = function(.*?)\n    \}};",
+                source,
+                re.S,
+            ).group(1)
+            self.assertIn("return self.reload(entry);", body)
 
 
 # ── the open words ───────────────────────────────────────────────────
@@ -52,6 +117,47 @@ class TestOpenWords(TestCase):
         # The word a majority settled over one engine is its own card.
         self.assertEqual([c["token"] for c in cards[1:]], ["b"])
         self.assertEqual(blocking_review.open_words(voted), [])
+
+    def test_a_card_keeps_its_position_when_a_word_before_it_is_rewritten(
+        self,
+    ):
+        """The browser keys a kept card by ``position``: the finding pk
+        is new on every rebuild and the offset moves with an edit
+        before the word, so a word kept as shown must still match its
+        card after an answer elsewhere in the block rebuilt the
+        opinion."""
+        voted = read(
+            "one two three four", "uno two tres four", "ein two drei four"
+        )
+
+        before = blocking_review.open_words(voted)
+        kept = ensemble._human_read(
+            voted,
+            {"text": "unoxx two three four", "span": [0, 3]},
+            voted["engines"],
+        )
+        after = blocking_review.open_words(kept)
+
+        self.assertEqual(
+            [(c["token"], c["start"], c["position"]) for c in before],
+            [("one", 0, 0), ("three", 8, 2)],
+        )
+        # The rewritten word is judged; the kept one moved by two
+        # characters and kept its position.
+        self.assertEqual(
+            [(c["token"], c["start"], c["position"]) for c in after],
+            [("three", 10, 2)],
+        )
+
+    def test_a_gap_card_carries_the_position_of_the_word_after_it(self):
+        voted = read("a included b", "a included c", "a 1490 included b")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(
+            [(c.get("gap"), c["position"]) for c in cards],
+            [(True, 1), (None, 2)],
+        )
 
     def test_a_gap_no_two_engines_read_alike_is_a_blocking_card(self):
         voted = read(

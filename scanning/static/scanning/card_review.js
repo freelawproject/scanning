@@ -1,10 +1,11 @@
 /* The card review of review 2 (card_review.py): the missed headnote
- * brackets, the missed captions and the image boxes of one volume,
- * one after the next. Each card is a crop of the page, cut from the
- * PDF step 2 draws, with the box on it, movable at its edges, and two
- * or three buttons. The page writes nothing of its own: every answer
- * is one of step 2's own writes (the add, the approval, the resize,
- * the dismissal), and every answer has the Undo of the write it made.
+ * brackets, the missed captions, the image boxes and the editor's
+ * note boxes of one volume, one after the next. Each card is a crop
+ * of the page, cut from the PDF step 2 draws, with the box on it,
+ * movable at its edges, and two or three buttons. The page writes
+ * nothing of its own: every answer is one of step 2's own writes (the
+ * add, the approval, the resize, the dismissal), and every answer has
+ * the Undo of the write it made.
  *
  * Keys: Return presses the first button of the card in view, x the
  * second ("No bracket", "Take out"), s skips it, u undoes, f opens
@@ -46,7 +47,7 @@
     var DPR = Math.min(2, window.devicePixelRatio || 1);
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
-    var GROUPS = ['caption', 'bracket', 'text', 'image'];
+    var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
     var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
@@ -54,7 +55,8 @@
         bracket: 'bracket the model missed',
         faint: 'bracket box under the gate',
         text: 'text in no box',
-        image: 'image box'
+        image: 'image box',
+        editorial: "editor's note box"
     };
     /** What a card is, in words: a link card reads by its group, since
      *  a bracket finding with no guess is a link too. */
@@ -85,6 +87,7 @@
      *  second takes it out. */
     var MODEL_VERBS = {
         image: { keep: 'Keep', kept: 'kept', move: 'Save size', out: 'Take out', gone: 'taken out' },
+        editorial: { keep: 'Keep', kept: 'kept', move: 'Save size', out: 'Take out', gone: 'taken out' },
         faint: { keep: 'Approve', kept: 'approved', move: 'Save size', out: 'Not a bracket', gone: 'not a bracket' }
     };
 
@@ -840,13 +843,12 @@
     }
 
     /** Read the cards again and come back to one, or to the next open
-     *  one when it is gone. */
+     *  one when it is gone. The page stays where it is. */
     function reloadAt(key) {
         return load().then(function () {
             var again = key ? root.querySelector('.bk-card[data-key="' + key + '"]') : null;
             if (again) {
                 setActive(again);
-                again.scrollIntoView({ behavior: 'smooth', block: 'center' });
             } else {
                 focusNextCard();
             }
@@ -879,9 +881,7 @@
             // another pk: read the cards again, and come back to this
             // one.
             return load().then(function () {
-                var again = root.querySelector('.bk-card[data-key="' + card.key + '"]');
-                setActive(again);
-                if (again) { again.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+                setActive(root.querySelector('.bk-card[data-key="' + card.key + '"]'));
             });
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
@@ -988,6 +988,28 @@
         return !node.classList.contains('bk-done') && !node.classList.contains('cr-skipped');
     }
 
+    /** Whether the reader can see the card: at least half of its crop
+     *  is inside the window. A card whose top edge has just come up at
+     *  the foot of the window is not seen, whatever the cursor says,
+     *  so Return never answers a card before its picture is shown; a
+     *  crop taller than the window is seen when it fills half of it. */
+    function seen(node) {
+        var rect = (node.querySelector('.bk-cropwrap') || node).getBoundingClientRect();
+        if (!(rect.height > 0)) { return false; }
+        var shown = Math.min(rect.bottom, window.innerHeight) - Math.max(rect.top, 0);
+        return shown >= Math.min(rect.height, window.innerHeight) / 2;
+    }
+
+    /** The card the keys act on: the active one while the reader can
+     *  see it, else the one in view. The page never scrolls on its
+     *  own after an answer, so the cursor moves on to a card that may
+     *  sit below the fold, and a key then acts on what is in front of
+     *  the reader, never on a card out of sight. */
+    function keyCard() {
+        var active = activeCard();
+        return active && seen(active) ? active : cardInView();
+    }
+
     /** The card whose middle is nearest the middle of the window. */
     function cardInView() {
         var mid = window.innerHeight / 2;
@@ -1001,6 +1023,10 @@
         return best;
     }
 
+    /** The next open card takes the cursor, and the page stays where
+     *  it is: a scroll after every answer moved the cards under the
+     *  pointer, and the reader's next click landed on the wrong one.
+     *  The reader scrolls, by hand or with the arrow keys. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
@@ -1012,9 +1038,6 @@
             if (isOpen(list[i])) { next = list[i]; }
         }
         setActive(next);
-        if (next) {
-            window.setTimeout(function () { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 80);
-        }
     }
 
     function step(delta) {
@@ -1050,13 +1073,13 @@
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             event.preventDefault();
-            if (!activeCard()) { setActive(cardInView()); }
+            setActive(keyCard());
             step(event.key === 'ArrowDown' ? 1 : -1);
             return;
         }
         var key = event.key === 'Enter' ? 'enter' : String(event.key).toLowerCase();
         if (!KEY_NAMES[key]) { return; }
-        var card = activeCard() || cardInView();
+        var card = keyCard();
         if (key === 'u' && lastEdit()) {
             // A box edit was the last thing done: u takes it back.
             event.preventDefault();

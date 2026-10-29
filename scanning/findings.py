@@ -95,9 +95,10 @@ HEAD_MATTER_NAMES = frozenset(label.name for label in HEAD_MATTER_LABELS)
 logger = logging.getLogger(__name__)
 
 #: A headnote box the model is at least this sure of must be covered by
-#: a redaction. The value the step-2 view used before the finding was a
-#: row.
-HEADNOTE_CONFIDENCE = 0.8
+#: a redaction. The step-2 view asked at 0.8 before the finding was a
+#: row; 0.7 since 2026-10-29, because a box the compute dropped between
+#: the two printed its headnote with no card.
+HEADNOTE_CONFIDENCE = 0.7
 
 #: The order the groups of the step-2 section are shown in, with their
 #: headings. Redactions first: "everything that has to be redacted is
@@ -479,7 +480,7 @@ def _unmatched_findings(
         .order_by("page_index", "y0")
     )
     read_keys = boundaries.key_icon_rows(
-        candidates, _model_rows_are_bl_warm(scan)
+        candidates, model_rows_are_bl_warm(scan)
     )
     keys = [det for det in read_keys if det.pk not in paired_keys]
     paired_rows = {
@@ -600,12 +601,13 @@ def _over_a_paired_key(det: Detection, paired_rows: dict) -> bool:
     )
 
 
-def _model_rows_are_bl_warm(scan: Scan) -> bool:
+def model_rows_are_bl_warm(scan: Scan) -> bool:
     """Return whether bl-warm alone drew the scan's live model rows.
 
     The family picks blackletter's confidence gates, so every reader of
-    a gate asks this and never copies the number: the bracket card and
-    the key icons of the pairing's rule (``blackletter.scanner.key_icons``).
+    a gate asks this and never copies the number: the bracket card, the
+    key icons of the pairing's rule (``blackletter.scanner.key_icons``)
+    and the editor's note cards (``card_review.cards``).
 
     :param scan: The scan.
     :returns: ``rows_are_bl_warm`` over the live model rows' ``found_by``.
@@ -1045,7 +1047,7 @@ def _low_confidence_bracket_findings(scan: Scan):
     )
     if not weak:
         return
-    gate = gates[_model_rows_are_bl_warm(scan)]
+    gate = gates[model_rows_are_bl_warm(scan)]
     for det in weak:
         if det.confidence >= gate:
             continue

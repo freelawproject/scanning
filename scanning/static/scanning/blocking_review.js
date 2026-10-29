@@ -83,13 +83,30 @@
         return field ? field.value : '';
     }
 
-    /** The key a card keeps across reloads: its kind, page, block,
-     *  offset and span. A gap card starts where the word after it
-     *  starts, so the span tells the two apart; the finding stays
-     *  last, the Undo of a dismissal reads it there. */
+    /** The key a card keeps across reloads: its kind, page, block and
+     *  place. The block is its box in points, never its id: the ids
+     *  number the kept blocks of the page, so a "Not text" drop moves
+     *  every later block's id down by one, and a kept mark keyed by
+     *  id would land on another block's word. The place is the base
+     *  position the card answers for (a gap's, marked, since it
+     *  starts where the word after it starts; a word of a run with
+     *  its place in the run), because every rebuild renews the
+     *  finding rows and an edit before the word moves its offset, and
+     *  a kept word must still be kept after an answer elsewhere
+     *  rebuilt the opinion. A card with no position (a block, a
+     *  single block, a link) is one per block or per check. */
     function keyOf(card) {
-        return [card.kind, card.page_in_opinion, card.group_id, card.start,
-            card.gap ? 'gap' : (card.length || 0), card.finding_pk].join(':');
+        var block = card.box_pt
+            ? card.box_pt.map(function (v) { return Math.round(v * 10) / 10; }).join(',')
+            : '';
+        var place;
+        if (card.position !== undefined && card.position !== null) {
+            place = (card.gap ? 'gap@' : 'p') + card.position
+                + (card.run_index !== undefined && card.run_index !== null ? 'r' + card.run_index : '');
+        } else {
+            place = card.check || ('s' + (card.start || 0) + ':' + (card.length || 0));
+        }
+        return [card.kind, card.page_in_opinion, block, place].join(':');
     }
 
     // ── one opinion ──────────────────────────────────────────────────
@@ -114,6 +131,8 @@
         this.cards = [];
         this.kept = {};
         this.skipped = {};
+        /** The findings a settle is dismissing, by pk. */
+        this.settling = {};
         this.answered = 0;
         this.pdf = null;
         this.pages = {};
@@ -122,7 +141,10 @@
         this.approveButton.addEventListener('click', function () { self.approve(); });
     }
 
-    Section.prototype.load = function () {
+    /** Ask for the cards again. ``cause`` is the answer whose write
+     *  brought the reload about, when one did: a dismissal settle sends
+     *  on the way is that answer's doing, and its Undo takes it back. */
+    Section.prototype.load = function (cause) {
         var self = this;
         return getJson(this.cardsUrl).then(function (answer) {
             if (!answer.ok) {
@@ -136,6 +158,7 @@
             // approval stays behind the gate.
             self.blockingOpen = answer.data.blocking_open || 0;
             self.render();
+            return self.settle(cause);
         }).catch(function (error) {
             self.cardsNode.replaceChildren(note('The cards did not load: ' + error.message, 'error'));
         });
@@ -178,8 +201,8 @@
         countAll();
     };
 
-    Section.prototype.reload = function () {
-        return this.load().then(function () { focusNextCard(); });
+    Section.prototype.reload = function (cause) {
+        return this.load(cause).then(function () { focusNextCard(); });
     };
 
     /** Write the text of a block, the edit "Edit text" writes. */
@@ -205,14 +228,16 @@
                 return;
             }
             self.answered += 1;
+            var entry = null;
             if (answer.data.edit_id) {
-                self.answers.push({
+                entry = {
                     card: card,
                     label: 'written as "' + shorten(text) + '"',
                     undo: { url: self.withdrawUrl, body: { edit_id: answer.data.edit_id } }
-                });
+                };
+                self.answers.push(entry);
             }
-            return self.reload();
+            return self.reload(entry);
         });
     };
 
@@ -235,65 +260,129 @@
                 return;
             }
             self.answered += 1;
+            var entry = null;
             if (answer.data.edit_id) {
-                self.answers.push({
+                entry = {
                     card: card,
                     label: 'taken out of the text as not text',
                     undo: { url: self.withdrawUrl, body: { edit_id: answer.data.edit_id } }
-                });
+                };
+                self.answers.push(entry);
             }
-            return self.reload();
+            return self.reload(entry);
         });
     };
 
-    /** Dismiss the page's card: what is shown is right. */
-    Section.prototype.dismiss = function (card, node) {
+    /** Dismiss the finding of a card: what is shown is right.
+     *  ``keys`` names the kept cards the dismissal closes, so its Undo
+     *  can open them again; they leave ``kept`` once it is sent, or a
+     *  card a curator restores elsewhere would be matched by them on
+     *  the next reload and dismissed again with no click. ``cause`` is
+     *  the answer whose reload settled this finding, when one did: the
+     *  dismissal is listed under that answer, and that answer's Undo
+     *  restores it too, or the word the edit put back would come back
+     *  with its page's card closed and the approval open. */
+    Section.prototype.dismiss = function (card, node, keys, cause) {
         var self = this;
-        var state = node.querySelector('.bk-state');
+        var state = node ? node.querySelector('.bk-state') : null;
         if (!card.dismiss_url) {
-            state.textContent = 'This card has no dismissal here; open the document.';
+            if (state) { state.textContent = 'This card has no dismissal here; open the document.'; }
             return Promise.resolve();
         }
-        state.textContent = 'dismissing the card…';
+        if (state) { state.textContent = 'dismissing the card…'; }
         return postJson(card.dismiss_url, {}).then(function (answer) {
             if (!answer.ok) {
-                state.textContent = answer.data.message || 'The dismissal was refused.';
-                state.classList.add('bk-error');
+                if (state) {
+                    state.textContent = answer.data.message || 'The dismissal was refused.';
+                    state.classList.add('bk-error');
+                }
                 return;
             }
             self.answered += 1;
+            var closed = keys || [keyOf(card)];
+            closed.forEach(function (key) { delete self.kept[key]; });
             if (card.restore_url) {
-                self.answers.push({
+                var entry = {
                     card: card,
                     label: 'kept as shown, the page\'s card closed',
                     undo: { url: card.restore_url, body: {} },
-                    finding_pk: card.finding_pk
-                });
+                    keys: closed,
+                    cause: cause || null
+                };
+                self.answers.push(entry);
+                if (cause) { (cause.settled = cause.settled || []).push(entry); }
             }
-            return self.reload();
+            return self.reload(cause);
+        });
+    };
+
+    /** Send the dismissal of every finding whose cards are all kept.
+     *  A keep sends it at the click when it is the last of its
+     *  finding; after an answer elsewhere rebuilt the opinion, the
+     *  cards come back with new findings and the kept ones among
+     *  them are matched by their place, so a finding that is now all
+     *  kept is closed here, once. */
+    Section.prototype.settle = function (cause) {
+        var self = this;
+        var byFinding = {};
+        this.cards.forEach(function (card) {
+            if (!card.finding_pk) { return; }
+            (byFinding[card.finding_pk] = byFinding[card.finding_pk] || []).push(card);
+        });
+        var due = Object.keys(byFinding).filter(function (pk) {
+            return !self.settling[pk] && byFinding[pk].every(function (card) { return self.kept[keyOf(card)]; });
+        });
+        if (!due.length) { return Promise.resolve(); }
+        var pk = due[0];
+        var cards = byFinding[pk];
+        this.settling[pk] = true;
+        var node = this.cardsNode.querySelector('[data-key="' + keyOf(cards[0]) + '"]');
+        return this.dismiss(cards[0], node, cards.map(keyOf), cause).then(function () {
+            delete self.settling[pk];
         });
     };
 
     /** Take one answer back: the review page's own undo. The cards are
-     *  asked for again afterwards, the rule of every write here. */
+     *  asked for again afterwards, the rule of every write here. An
+     *  edit whose reload settled a page's card takes that dismissal
+     *  back first (``settled``), because the dismissal is stored by
+     *  page and check and outlives every rebuild: left standing, the
+     *  word the Undo puts back would get no card. */
     Section.prototype.undo = function (entry) {
         var self = this;
         var index = this.answers.indexOf(entry);
         if (index >= 0) { this.answers.splice(index, 1); }
-        if (entry.finding_pk) {
-            // The card reopens with every word of its page: none is kept.
-            Object.keys(this.kept).forEach(function (key) {
-                if (key.split(':').pop() === String(entry.finding_pk)) { delete self.kept[key]; }
-            });
+        if (entry.cause && entry.cause.settled) {
+            // Taken back on its own: its cause no longer owns it.
+            entry.cause.settled = entry.cause.settled.filter(function (d) { return d !== entry; });
         }
+        // A dismissal undone reopens the cards it closed: none is kept.
+        (entry.keys || []).forEach(function (key) { delete self.kept[key]; });
+        var settled = (entry.settled || []).filter(function (d) { return self.answers.indexOf(d) >= 0; });
+        entry.settled = [];
+        return settled.reduce(function (chain, d) {
+            return chain.then(function () { return self.undoOne(d); });
+        }, Promise.resolve()).then(function () {
+            return self.undoOne(entry);
+        }).then(function (ok) {
+            if (ok) { return self.reload(); }
+        });
+    };
+
+    /** Send one answer's undo and count it; the error, if any, goes on
+     *  the page and the entry stays listed. */
+    Section.prototype.undoOne = function (entry) {
+        var self = this;
+        var index = this.answers.indexOf(entry);
+        if (index >= 0) { this.answers.splice(index, 1); }
         return postJson(entry.undo.url, entry.undo.body).then(function (answer) {
             if (!answer.ok) {
                 self.answers.push(entry);
                 self.cardsNode.insertBefore(note(answer.data.message || 'The undo was refused.', 'error'), self.cardsNode.firstChild);
-                return;
+                return false;
             }
             self.answered = Math.max(0, self.answered - 1);
-            return self.reload();
+            return true;
         });
     };
 
@@ -323,7 +412,7 @@
             return other.finding_pk === card.finding_pk;
         });
         var allKept = siblings.every(function (other) { return self.kept[keyOf(other)]; });
-        if (allKept) { return this.dismiss(card, node); }
+        if (allKept) { return this.dismiss(card, node, siblings.map(keyOf)); }
         node.querySelector('.bk-state').textContent = 'kept as shown; the page\'s card closes once its other cards are answered';
         this.render();
         countAll();
