@@ -424,19 +424,22 @@ class TestTheCards(ScanningTestCase):
             [row.pk],
         )
 
-    def test_an_editorial_box_under_blackletters_gate_makes_no_card(self):
+    def test_a_box_under_blackletters_gate_says_it_is_not_redacted(self):
         """blackletter draws a black box from a model detection only at
         or above its gate for the label and the model family; under it
-        the box redacts nothing, so there is nothing to keep or take
-        out. The gate is read, never copied."""
+        the note prints until the box is kept, so the card asks, and
+        says so. The gate is read, never copied."""
         gate = label_confidence(Label.EDITORIAL, bl_warm=True)
-        self.note(confidence=round(gate - 0.01, 2))
-        self.assertEqual(card_review.cards(self.scan), [])
-        row = self.note(confidence=gate)
-        self.assertEqual(
-            [c["detection_id"] for c in card_review.cards(self.scan)],
-            [row.pk],
+        weak = self.note(confidence=round(gate - 0.01, 2))
+        strong = self.note(confidence=gate, y0=600.0, y1=660.0)
+        cards = {c["detection_id"]: c for c in card_review.cards(self.scan)}
+        self.assertEqual(set(cards), {weak.pk, strong.pk})
+        self.assertIn(
+            f"under blackletter's gate of {gate:.2f}",
+            cards[weak.pk]["message"],
         )
+        self.assertIn("nothing is redacted yet", cards[weak.pk]["message"])
+        self.assertNotIn("gate", cards[strong.pk]["message"])
 
 
 class TestThePageFollowsTheGroups(ScanningTestCase):
