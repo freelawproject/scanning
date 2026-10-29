@@ -43,10 +43,10 @@ MISTRAL_MAX_CONCURRENCY = env.int("MISTRAL_MAX_CONCURRENCY", default=64)
 # shard PDF on disk (up to SHARD_TARGET_BYTES), an open document and a
 # page in hand, so this bounds the wave's disk and memory where the
 # upload backlog bounds its PNGs; the shards past it wait their turn.
-MISTRAL_RENDER_WORKERS = env.int("MISTRAL_RENDER_WORKERS", default=4)
+MISTRAL_RENDER_WORKERS = env.int("MISTRAL_RENDER_WORKERS", default=8)
 
 # Page uploads in flight at once, over every shard of the wave: the
 # one number to lower when the throttled-page log line gets busy, and
 # to raise when the workspace's limit allows. The wave holds at most
 # twice this many rendered pages in memory, whatever the shard count.
-MISTRAL_UPLOAD_WORKERS = env.int("MISTRAL_UPLOAD_WORKERS", default=16)
+MISTRAL_UPLOAD_WORKERS = env.int("MISTRAL_UPLOAD_WORKERS", default=32)
