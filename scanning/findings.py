@@ -95,9 +95,10 @@ HEAD_MATTER_NAMES = frozenset(label.name for label in HEAD_MATTER_LABELS)
 logger = logging.getLogger(__name__)
 
 #: A headnote box the model is at least this sure of must be covered by
-#: a redaction. The value the step-2 view used before the finding was a
-#: row.
-HEADNOTE_CONFIDENCE = 0.8
+#: a redaction. The step-2 view asked at 0.8 before the finding was a
+#: row; 0.7 since 2026-10-29, because a box the compute dropped between
+#: the two printed its headnote with no card.
+HEADNOTE_CONFIDENCE = 0.7
 
 #: The order the groups of the step-2 section are shown in, with their
 #: headings. Redactions first: "everything that has to be redacted is
