@@ -443,6 +443,29 @@ class TestGlues(GlueTestCase):
         self.assertEqual(by_final[3]["type"], "single")
         self.assertEqual(by_final[5]["type"], "suffixed")
 
+    def test_an_insert_filed_under_a_range_keeps_each_pages_own_number(
+        self,
+    ):
+        """A 260-page file inserted under ``1125-1381`` is filed under
+        the span it fills, not a page's number: stamped on every page
+        as a range, it keyed every opinion of 698 F. Supp. 3d on those
+        pages at 1381. The pages keep the model's reading of each."""
+        self.volume_ocr_run()
+        run, (turn, swap, leaf) = self.built_run()
+        PageEdit.objects.filter(pk=leaf.pk).update(logical_page="1125-1381")
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        printed = self.objects[run.printed_pages_key]
+        by_final = {p["final_page"]: p for p in printed["pages"]}
+        for final in (5, 6):
+            self.assertEqual(
+                (by_final[final]["printed"], by_final[final]["by"]),
+                (str(900 + leaf.pk), "model"),
+            )
+            self.assertEqual(by_final[final]["type"], "single")
+
     def test_the_detections_glue_drops_changed_pages_and_adds_new_ones(self):
         self.volume_detect_run()
         run, (turn, swap, leaf) = self.built_run()

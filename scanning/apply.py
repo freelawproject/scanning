@@ -2280,7 +2280,11 @@ def printed_pages(
     documents filling the blanks, #351), overlaid with the curator's
     decisions: a ``SET_NUMBER`` row lands on the slot its original
     page holds (a replaced or rotated page included), and an inserted
-    page carries the label its row was uploaded under. The curator
+    page carries the label its row was uploaded under, unless that
+    label is a range: a file filed under the span it fills (a 260-page
+    insert under ``1125-1381``) names no page's number, and a range
+    stamped on every page keys every opinion on them at the range's
+    end, so those pages keep the model's reading of each. The curator
     outranks the model. Citations use printed pages, so this map is a
     product of the apply, not review scaffolding.
 
@@ -2334,7 +2338,7 @@ def printed_pages(
                 .values_list("logical_page", flat=True)
                 .first()
             )
-            if label:
+            if label and page_numbers.number_type(label) != page_numbers.RANGE:
                 curator(page, label)
     return {
         "schema_version": MAP_SCHEMA_VERSION,
