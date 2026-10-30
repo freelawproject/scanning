@@ -615,14 +615,29 @@
             }));
         } else {
             var verbsToAdd = addVerbs(card);
-            if (card.kind !== 'link' && verbsToAdd.add) {
+            var grow = card.grow || {};
+            if (card.kind === 'text' && grow.column) {
+                // A column box right above, below or beside the block:
+                // it grows over the block, one box, no seam.
+                foot.appendChild(button('Grow column box', 'enter', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    growBox(card, node, grow.column, 'column box grown');
+                }));
+            } else if (card.kind !== 'link' && verbsToAdd.add) {
                 foot.appendChild(button(verbsToAdd.add, 'enter', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
                     add(card, node);
                 }));
             }
             var footnoteLabel = labelNamed('FOOTNOTES');
-            if (card.kind === 'text' && footnoteLabel) {
+            if (card.kind === 'text' && grow.footnote) {
+                // The page's footnote box stopped short of this line:
+                // it grows down (or across) to take it.
+                foot.appendChild(button('Grow footnote box', 'n', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    growBox(card, node, grow.footnote, 'footnote box grown');
+                }));
+            } else if (card.kind === 'text' && footnoteLabel) {
                 // The text card's second answer: a footnote box, for the
                 // footnote line the page's footnote box stopped short
                 // of. It takes the box as the curator shaped it, else
@@ -771,6 +786,32 @@
     function keep(card, node) {
         write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
+        });
+    }
+
+    /** Grow the box beside a text card's block over the block, through
+     *  the resize endpoint: one box where two would leave a seam. The
+     *  box becomes the union with the block, or with the box as the
+     *  curator shaped it. A model box becomes a hand-drawn one, as any
+     *  resize does, so the Undo puts the box back when it is still its
+     *  own row and withdraws the hand-drawn row otherwise. */
+    function growBox(card, node, target, label) {
+        var take = moved(card) ? card.box : (card.block || card.box);
+        var grown = [
+            Math.min(target.box[0], take[0]), Math.min(target.box[1], take[1]),
+            Math.max(target.box[2], take[2]), Math.max(target.box[3], take[3])
+        ];
+        write(card, node, cfg.urls.update_detection, {
+            detection_id: target.id, new_bbox: grown
+        }, label, function (data) {
+            var holder = data.detection_id;
+            card.others = (card.others || []).map(function (o) {
+                if (o.id !== target.id) { return o; }
+                return { id: holder, label: o.label, box: grown, own: true, mine: true };
+            });
+            return holder === target.id
+                ? { url: cfg.urls.update_detection, body: { detection_id: target.id, new_bbox: target.box } }
+                : { url: cfg.urls.delete_detection, body: { detection_id: holder } };
         });
     }
 
