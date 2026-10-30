@@ -234,6 +234,21 @@ def _range_value(match: re.Match | None) -> str | None:
     return f"{first}-{last}"
 
 
+def fold_dashes(value: str) -> str:
+    """Return ``value`` with an en dash or an em dash made a hyphen.
+
+    A reporter prints a range with an en dash (``913–925``) and a
+    curator types what the page shows, so a typed number and an
+    insert's label both come in either way; a stored number holds one
+    hyphen, and ``number_type`` reads the hyphen alone.
+
+    :param value: What the curator typed.
+    :returns: The same text with every dash a hyphen.
+    :rtype: str
+    """
+    return value.replace("\u2013", "-").replace("\u2014", "-")
+
+
 def number_type(value: str | None) -> str | None:
     """Name the shape of one stored printed page number.
 
