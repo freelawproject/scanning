@@ -99,14 +99,14 @@ IMAGE_PAD_PX = 90.0
 #: printed around it.
 EDITORIAL_PAD_PX = 60.0
 
-#: How near a live footnote or editor's note box must be to a text
-#: card's block, in render pixels, for the card to grow that box over
-#: the block instead of adding a second one: a footnote line the
-#: footnote box stopped short of sits right under it. Two boxes of one
-#: kind with a seam between them are a partial cover in review 3 and a
-#: hairline the glue has to bridge; one box is what the page means.
-#: The reach is ``undetected``'s own gap between the cells of one
-#: block.
+#: How near the page's footnote box must be to a text card's block, in
+#: render pixels, for the card to grow that box over the block instead
+#: of adding a second one: a footnote line the box stopped short of
+#: sits right under it, or beside it. Two footnote boxes with a seam
+#: between them are a partial cover in review 3 and a hairline the glue
+#: has to bridge; the footnotes of a page are one block, across both
+#: columns, so the growth crosses the gutter on purpose. The reach is
+#: ``undetected``'s own gap between the cells of one block.
 GROW_GAP_PX = 150.0
 
 #: A bracket's crop reaches this many bracket heights below the guess:
@@ -363,11 +363,11 @@ def text_card(issue: Issue) -> dict | None:
     block (``block``), and Add editor's note an ``EDITORIAL`` box over
     it, for the publisher's text the boxes missed (a Words and Phrases
     line), which the redaction then blacks out; the labels come from
-    the page's own table. The footnote and the editor's note answers
-    grow the box of their kind beside the block instead, when there is
-    one (``neighbour_box``); the column answer always adds, because a
+    the page's own table. The footnote answer grows the footnote box
+    beside the block instead, when there is one (``neighbour_box``);
+    the column and the editor's note answers always add, because a
     page has two column boxes by design and a second box in a column
-    joins it.
+    joins it, and a grown note box blacks out whatever it reaches.
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -417,8 +417,10 @@ def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
     two, the one rule of "same column") that ends within
     :data:`GROW_GAP_PX` above the block or starts within it below, or
     one beside the block (sharing half the block's height) within that
-    gap sideways. The nearest when several. ``grown`` is the union, the
-    box the resize writes; ``box`` is the box as it stands, the Undo.
+    gap sideways, gutter or no gutter: the caller grows a footnote box
+    with this, and a page's footnotes run across its columns. The
+    nearest when several. ``grown`` is the union, the box the resize
+    writes; ``box`` is the box as it stands, the Undo.
 
     :param block: The block of print, in render pixels.
     :param others: The page's other live boxes (``attach_others``).
@@ -771,15 +773,15 @@ def cards(scan: Scan) -> list[dict]:
     for card in built:
         if card["kind"] == TEXT:
             block = card["block"]
-            # Not the column box: a page has two by design, and a
-            # second box in a column joins it (``columns.column_groups``),
-            # so the column answer stays an add.
+            # The footnote box alone grows. Not the column box: a page
+            # has two by design, and a second box in a column joins it
+            # (``columns.column_groups``), so that answer stays an add.
+            # Not the editor's note box: that answer is a quick add
+            # where the curator sees a note, and a grown note box
+            # blacks out whatever it reaches.
             card["grow"] = {
                 "footnote": neighbour_box(
                     block, card["others"], Label.FOOTNOTES.name
-                ),
-                "editorial": neighbour_box(
-                    block, card["others"], Label.EDITORIAL.name
                 ),
             }
     order = {group: i for i, group in enumerate(GROUPS)}

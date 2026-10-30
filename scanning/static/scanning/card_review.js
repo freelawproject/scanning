@@ -647,16 +647,12 @@
                 }));
             }
             var editorialLabel = labelNamed('EDITORIAL');
-            if (card.kind === 'text' && grow.editorial) {
-                foot.appendChild(button("Grow editor's note box", 'e', 'btn-primary text-xs', function (btn) {
-                    btn.disabled = true;
-                    growBox(card, node, grow.editorial, "editor's note box grown");
-                }));
-            } else if (card.kind === 'text' && editorialLabel) {
+            if (card.kind === 'text' && editorialLabel) {
                 // The text card's third answer: the block is the
                 // publisher's text (a Words and Phrases line, an
                 // editor's note), so an editor's note box over it,
-                // which the redaction blacks out.
+                // which the redaction blacks out. A quick add, never a
+                // grow: a grown note box blacks out whatever it reaches.
                 foot.appendChild(button("Add editor's note", 'e', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
                     add(card, node, {

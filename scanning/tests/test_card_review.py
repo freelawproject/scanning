@@ -402,9 +402,10 @@ class TestTheCards(ScanningTestCase):
         self.assertEqual(
             card["grow"]["footnote"]["grown"], [100.0, 1500.0, 800.0, 2000.0]
         )
-        self.assertIsNone(card["grow"]["editorial"])
-        # The column answer always adds: a page has two column boxes.
-        self.assertEqual(set(card["grow"]), {"footnote", "editorial"})
+        # The column and the editor's note answers always add: a page
+        # has two column boxes, and a grown note box blacks out whatever
+        # it reaches.
+        self.assertEqual(set(card["grow"]), {"footnote"})
 
     def test_a_hand_drawn_editorial_row_makes_no_card(self):
         """A kept box is a hand-drawn row (#414): judged, so no card."""
@@ -530,8 +531,9 @@ class TestNeighbourBox(ScanningTestCase):
         )
 
     def test_a_box_beside_the_block_grows_across(self):
-        """The footnote box covers the left of the line and the block
-        is its right half: side by side, sharing the line's height."""
+        """The footnote box covers the left column's notes and the block
+        is the right column's, across the gutter: a page's footnotes
+        are one block, so the box grows across."""
         found = card_review.neighbour_box(
             [420.0, 1800.0, 800.0, 2000.0],
             [self.other([100.0, 1800.0, 400.0, 2000.0])],
