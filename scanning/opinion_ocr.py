@@ -465,6 +465,9 @@ class EngineSpec:
     def parse(self, unit: dict) -> markup.Parsed:
         """Parse one unit's markup into the one shape (#404).
 
+        The source loses its XML-invalid controls first (#538), so the
+        marks are offsets into the cleaned text, for every engine.
+
         :param unit: The unit as the engine's volume document holds it.
         :returns: The plain text, its marks and its kind.
         :rtype: markup.Parsed
@@ -474,7 +477,7 @@ class EngineSpec:
             source = unit.get(self.text_key)
         label = unit.get(self.type_key) or ""
         return self.dialect(
-            source if isinstance(source, str) else "",
+            markup.strip_controls(source) if isinstance(source, str) else "",
             kind=self.kind_types.get(label),
         )
 
