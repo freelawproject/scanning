@@ -31,7 +31,14 @@ from django.urls import reverse
 from django.utils import timezone
 from PIL import Image
 
-from scanning import jobs, locks, mistral_client, mistral_ocr, stopping
+from scanning import (
+    jobs,
+    locks,
+    mistral_client,
+    mistral_ocr,
+    runpod_client,
+    stopping,
+)
 from scanning.factories import ScanFactory
 from scanning.models import (
     ExternalJob,
@@ -2452,3 +2459,355 @@ class TestStartButton(ScanningTestCase):
             "Run Mistral OCR",
             self.client.get(f"{url}?step=1").json()["html"],
         )
+
+
+# ── the remote render ───────────────────────────────────────────────
+REMOTE = {
+    **MISTRAL,
+    "RUNPOD_ENABLED": True,
+    "RUNPOD_API_KEY": "rp-key",
+    "RUNPOD_MISTRAL_RENDER_ENDPOINT_ID": "ep-render",
+    "RUNPOD_PRESIGNED_TTL": 3600,
+    "MISTRAL_UPLOAD_WORKERS": 1,
+}
+
+
+def _outcome(status, **fields):
+    """A :class:`runpod_client.PollOutcome` of ``status``."""
+    return runpod_client.PollOutcome(status=status, **fields)
+
+
+def _done(file_ids, **output):
+    """A COMPLETED outcome whose worker answered ``file_ids``."""
+    return _outcome(
+        JobStatus.COMPLETED,
+        provider_status="COMPLETED",
+        output={
+            "file_ids": list(file_ids),
+            "page_count": len(file_ids),
+            "processes": 2,
+            "render_ms": 400,
+            "upload_ms": 900,
+            "duration_ms": 1500,
+            **output,
+        },
+    )
+
+
+def _failed(error_code, retriable=False, message="worker said no"):
+    """A FAILED outcome the worker answered ``error_code`` for."""
+    return _outcome(
+        JobStatus.FAILED,
+        provider_status="FAILED",
+        error_code=error_code,
+        error_message=message,
+        retriable=retriable,
+    )
+
+
+def _poll(script: list):
+    """Answer one poll from a script: the next entry, called when it
+    is a function (a test's hook), the last one repeating."""
+    answer = _answer(script)
+    return answer() if callable(answer) else answer
+
+
+RUNNING = _outcome(JobStatus.IN_PROGRESS, provider_status="IN_PROGRESS")
+QUEUED = _outcome(JobStatus.IN_QUEUE, provider_status="IN_QUEUE")
+CANCELLED = _outcome(
+    JobStatus.FAILED, provider_status="CANCELLED", error_code="CANCELLED"
+)
+
+
+@override_settings(**REMOTE)
+class TestRemoteRender(ScanningTestCase):
+    """With the render endpoint set, the wave renders nothing itself:
+    one RunPod job per shard, the manifest and the batch from its
+    answer, and the local render's failure rules over the worker's
+    codes."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.rows = mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=1, pages_per_shard=2)
+        )
+        self.job = self.rows[0]
+        self.prefix = mistral_ocr.file_prefix(self.job)
+
+    def _tick(
+        self,
+        polls=(QUEUED, RUNNING, _done(["f0", "f1"])),
+        submit="rp-1",
+        submit_error=None,
+        upload=("m1",),
+        create="batch-1",
+        create_error=None,
+        found=(),
+        delete_ok=True,
+    ):
+        patches = [
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get",
+                return_value="https://signed/shard.pdf",
+            ),
+            patch(
+                "scanning.s3_sync.download_object",
+                side_effect=AssertionError("the pod downloaded the shard"),
+            ),
+            patch(
+                "scanning.mistral_ocr.render_shard_pages",
+                side_effect=AssertionError("the pod rendered a page"),
+            ),
+            patch(
+                "scanning.runpod_client.submit_job",
+                side_effect=submit_error,
+                return_value=submit,
+            ),
+            patch(
+                "scanning.runpod_client.poll_once",
+                side_effect=lambda *a, **k: _poll(script),
+            ),
+            patch("scanning.runpod_client.cancel_job"),
+            patch(
+                "scanning.mistral_client.upload_file", side_effect=list(upload)
+            ),
+            patch(
+                "scanning.mistral_client.create_batch",
+                side_effect=create_error,
+                return_value=create,
+            ),
+            patch(
+                "scanning.mistral_client.delete_file", return_value=delete_ok
+            ),
+            patch("scanning.mistral_client.cancel_batch"),
+            patch(
+                "scanning.mistral_client.find_files", return_value=list(found)
+            ),
+            patch.object(mistral_ocr, "RENDER_POLL_SECONDS", 0.0),
+            patch.object(mistral_ocr, "RENDER_CANCEL_POLLS", 1),
+        ]
+        script = list(polls)
+        mocks = []
+        for patcher in patches:
+            mocks.append(patcher.start())
+            self.addCleanup(patcher.stop)
+        summary = jobs.submit_pending(providers=(JobProvider.MISTRAL,))
+        return summary, {
+            "presign": mocks[1],
+            "submit": mocks[4],
+            "poll": mocks[5],
+            "cancel": mocks[6],
+            "upload": mocks[7],
+            "create": mocks[8],
+            "delete": mocks[9],
+            "find": mocks[11],
+        }
+
+    def test_the_shard_is_rendered_on_the_worker_and_submitted(self):
+        summary, mocks = self._tick()
+
+        self.assertEqual(summary.submitted, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.SUBMITTED)
+        self.assertEqual(job.external_id, "batch-1")
+        self.assertEqual(job.provider_meta["files"], ["f0", "f1", "m1"])
+        submission = job.provider_meta["submission"]
+        self.assertEqual(submission["page_count"], 2)
+        render = submission["render"]
+        self.assertEqual(render["mode"], "runpod")
+        self.assertEqual(render["runpod_job"], "rp-1")
+        self.assertEqual(render["processes"], 2)
+        self.assertEqual(render["upload_ms"], 900)
+        # The ids are the files list's, not a second copy in the ledger.
+        self.assertNotIn("file_ids", render)
+
+        # One job, with the shard presigned and the attempt's prefix,
+        # the worker refusing another page count, the whiteout flag
+        # and the PNG level.
+        mocks["presign"].assert_called_once_with(job.input_key, 3600)
+        mocks["submit"].assert_called_once()
+        base_url, headers, payload = mocks["submit"].call_args.args[:3]
+        self.assertEqual(base_url, "https://api.runpod.ai/v2/ep-render")
+        self.assertEqual(headers, {"Authorization": "Bearer rp-key"})
+        self.assertEqual(
+            payload,
+            {
+                "action": "render",
+                "scan_pk": self.scan.pk,
+                "shard_index": 0,
+                "pdf_url": "https://signed/shard.pdf",
+                "file_prefix": self.prefix,
+                "page_count": 2,
+                "whiteout_perpendiculars": True,
+                "png_level": mistral_ocr.RENDER_PNG_LEVEL,
+            },
+        )
+        self.assertEqual(mocks["poll"].call_count, 3)
+        mocks["cancel"].assert_not_called()
+
+        # The manifest alone was uploaded from here, naming the
+        # worker's files in page order; the batch was created from it.
+        mocks["upload"].assert_called_once()
+        name, content, purpose = mocks["upload"].call_args.args
+        self.assertEqual(name, f"{self.prefix}manifest.jsonl")
+        self.assertEqual(purpose, mistral_ocr.MANIFEST_FILE_PURPOSE)
+        lines = [json.loads(line) for line in content.decode().splitlines()]
+        self.assertEqual([line["custom_id"] for line in lines], ["p0", "p1"])
+        self.assertEqual(
+            [line["body"]["document"]["file_id"] for line in lines],
+            ["f0", "f1"],
+        )
+        mocks["create"].assert_called_once_with(
+            "m1",
+            metadata={
+                "scan": str(self.scan.pk),
+                "job": str(job.pk),
+                "shard": "0",
+            },
+            timeout_hours=mistral_ocr.BATCH_TIMEOUT_HOURS,
+        )
+        mocks["delete"].assert_not_called()
+        mocks["find"].assert_not_called()
+
+    def test_every_shard_of_the_wave_runs_at_once(self):
+        self.assertEqual(mistral_ocr.shard_threads(14), 14)
+        with override_settings(
+            RUNPOD_MISTRAL_RENDER_ENDPOINT_ID="", MISTRAL_RENDER_WORKERS=4
+        ):
+            self.assertEqual(mistral_ocr.shard_threads(14), 4)
+            self.assertEqual(mistral_ocr.shard_threads(2), 2)
+
+    def test_a_throttled_worker_defers_the_row_and_sweeps_its_prefix(self):
+        summary, mocks = self._tick(
+            polls=(RUNNING, _failed("RATE_LIMITED")), found=["f0"]
+        )
+
+        self.assertEqual(summary.deferred, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, "RATE_LIMITED")
+        # The job ended on its own: nothing to cancel. What it left at
+        # Mistral under the prefix is deleted from here.
+        mocks["cancel"].assert_not_called()
+        mocks["find"].assert_called_once_with(self.prefix)
+        mocks["delete"].assert_called_once_with("f0")
+        mocks["upload"].assert_not_called()
+        mocks["create"].assert_not_called()
+
+    def test_a_transient_worker_fault_spends_an_attempt(self):
+        summary, mocks = self._tick(polls=(_failed("MISTRAL_UNREACHABLE"),))
+
+        self.assertEqual(summary.retried, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 2)
+        self.assertEqual(job.error_code, "MISTRAL_UNREACHABLE")
+        mocks["find"].assert_called_once_with(self.prefix)
+
+    def test_a_platform_failure_with_no_code_spends_an_attempt(self):
+        summary, _ = self._tick(polls=(_failed("FAILED", retriable=True),))
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(extract_jobs(self.scan)[0].attempt, 2)
+
+    def test_a_mistral_5xx_at_the_worker_spends_an_attempt(self):
+        summary, _ = self._tick(polls=(_failed("MISTRAL_HTTP_503"),))
+        self.assertEqual(summary.retried, 1)
+
+    def test_a_refused_render_fails_the_row(self):
+        summary, mocks = self._tick(polls=(_failed("BAD_INPUT"),))
+
+        self.assertEqual(summary.failed, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "BAD_INPUT")
+        mocks["create"].assert_not_called()
+
+    def test_a_busy_endpoint_defers_the_row(self):
+        summary, mocks = self._tick(
+            submit_error=runpod_client.RunpodEndpointBusy(
+                "paused", error_code="ENDPOINT_PAUSED"
+            )
+        )
+
+        self.assertEqual(summary.deferred, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, "ENDPOINT_PAUSED")
+        mocks["poll"].assert_not_called()
+        mocks["cancel"].assert_not_called()
+
+    def test_a_render_that_outruns_its_budget_is_cancelled_and_retried(
+        self,
+    ):
+        with (
+            patch.object(mistral_ocr, "RENDER_BASE_SECONDS", 0.0),
+            patch.object(mistral_ocr, "RENDER_SECONDS_PER_PAGE", 0.0),
+        ):
+            summary, mocks = self._tick(polls=(RUNNING, CANCELLED))
+
+        self.assertEqual(summary.retried, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 2)
+        self.assertEqual(job.error_code, mistral_ocr.RENDER_TIMED_OUT_CODE)
+        mocks["cancel"].assert_called_once()
+        self.assertEqual(mocks["cancel"].call_args.args[2], "rp-1")
+        mocks["find"].assert_called_once_with(self.prefix)
+
+    def test_a_stop_while_the_worker_renders_cancels_the_job(self):
+        self.addCleanup(stopping.reset)
+
+        def ask_to_stop():
+            stopping.request()
+            return RUNNING
+
+        summary, mocks = self._tick(
+            polls=(ask_to_stop, CANCELLED), found=["f0", "f1"]
+        )
+
+        self.assertEqual(summary.deferred, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, mistral_ocr.STOPPED_ERROR_CODE)
+        mocks["cancel"].assert_called_once()
+        self.assertEqual(
+            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            ["f0", "f1"],
+        )
+        mocks["create"].assert_not_called()
+
+    def test_an_answer_short_of_the_shard_fails_the_row_and_deletes(self):
+        summary, mocks = self._tick(polls=(_done(["f0"]),))
+
+        self.assertEqual(summary.failed, 1)
+        job = extract_jobs(self.scan)[0]
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "BAD_OUTPUT")
+        mocks["delete"].assert_called_once_with("f0")
+        mocks["upload"].assert_not_called()
+        mocks["create"].assert_not_called()
+
+    def test_a_failed_create_deletes_the_worker_files_and_the_manifest(
+        self,
+    ):
+        summary, mocks = self._tick(
+            create_error=mistral_client.MistralError("no", "HTTP_400", 400)
+        )
+
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(
+            sorted(c.args[0] for c in mocks["delete"].call_args_list),
+            ["f0", "f1", "m1"],
+        )
+
+    def test_a_poll_that_learned_nothing_asks_again(self):
+        summary, mocks = self._tick(
+            polls=(_outcome(None), _outcome(None), _done(["f0", "f1"]))
+        )
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(mocks["poll"].call_count, 3)

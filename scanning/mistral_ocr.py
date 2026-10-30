@@ -124,6 +124,7 @@ from scanning import (
     locks,
     mistral_client,
     perpendiculars,
+    runpod_client,
     s3_sync,
     stopping,
 )
@@ -132,6 +133,7 @@ from scanning.models import (
     JobEngine,
     JobProvider,
     JobStage,
+    JobStatus,
 )
 
 logger = logging.getLogger(__name__)
@@ -258,6 +260,42 @@ RENDER_TMP_PREFIX = "mistralocr-"
 #: Why a row went back to PENDING when its worker was told to stop.
 STOPPED_ERROR_CODE = "SHUTDOWN"
 
+# ── the remote render ───────────────────────────────────────────────
+# With ``RUNPOD_MISTRAL_RENDER_ENDPOINT_ID`` set, the wave renders and
+# uploads nothing itself: each claimed shard is one job on a RunPod CPU
+# endpoint (``scanning/runpod-mistral-render/``), which answers the
+# file ids of the pages it uploaded, and the wave writes the manifest
+# and creates the batch from them. The thread of the shard waits on
+# the job, so the submit lock, the stop flag and the lost-claim rule
+# hold as they do for a local render.
+#: The worker action.
+RENDER_ACTION = "render"
+#: PNG compression level the worker encodes a page at. Lossless at
+#: every level; 1 is about three percent bigger than Pillow's default
+#: 6 and a third of its encode time (#562).
+RENDER_PNG_LEVEL = 1
+#: How often a shard's thread asks after its render job.
+RENDER_POLL_SECONDS = 3.0
+#: The wait a render job gets before it is cancelled and the row
+#: spends an attempt: a base for the queue, the cold start and the
+#: shard download, plus an allowance per page.
+RENDER_BASE_SECONDS = 900.0
+RENDER_SECONDS_PER_PAGE = 3.0
+#: The worker's code for a Mistral 429 past its retries: nothing is
+#: wrong with the shard, so the row is deferred with its attempt.
+RENDER_BUSY_CODE = "RATE_LIMITED"
+#: Worker codes another attempt may survive, beside the ones
+#: ``runpod_client`` already reads as transient.
+RENDER_TRANSIENT_CODES = frozenset(
+    {"MISTRAL_UNREACHABLE", "NOT_CONFIGURED", "MISTRAL_BAD_RESPONSE"}
+)
+#: The daemon's own code for a render job that outran its budget.
+RENDER_TIMED_OUT_CODE = "RENDER_TIMED_OUT"
+#: How long the wave waits for a cancelled render job to stop before
+#: it lists the files the job left at Mistral, in polls of
+#: :data:`RENDER_POLL_SECONDS`.
+RENDER_CANCEL_POLLS = 3
+
 
 class SubmitStopped(Exception):
     """The worker was told to stop while it uploaded a shard (#534)."""
@@ -336,6 +374,34 @@ def enabled() -> bool:
     :rtype: bool
     """
     return mistral_client.enabled()
+
+
+def remote_render_enabled() -> bool:
+    """Return whether the wave renders its shards on the RunPod worker.
+
+    :returns: Whether ``RUNPOD_MISTRAL_RENDER_ENDPOINT_ID`` is set and
+        RunPod dispatch is on (:func:`runpod_client.enabled`).
+    :rtype: bool
+    """
+    return runpod_client.enabled(
+        getattr(settings, "RUNPOD_MISTRAL_RENDER_ENDPOINT_ID", "")
+    )
+
+
+def shard_threads(claimed: int) -> int:
+    """Return how many shards of a wave run at once.
+
+    Every shard when the render is remote, because a thread then only
+    waits on its job and holds no PDF and no page; else
+    :func:`render_workers`.
+
+    :param claimed: The shards the wave claimed.
+    :returns: The pool width, at least one.
+    :rtype: int
+    """
+    if remote_render_enabled():
+        return max(1, claimed)
+    return max(1, min(claimed, render_workers()))
 
 
 def model_for(job: ExternalJob) -> str:
@@ -543,12 +609,16 @@ class _Submission:
     :ivar files: Every file id uploaded: the pages, then the manifest.
     :ivar page_count: Pages rendered and uploaded.
     :ivar duration_ms: Wall clock of download, render, upload, create.
+    :ivar render: Where the pages were rendered and what it cost: the
+        worker's answer for a remote render, ``{"mode": "local"}`` for
+        the pod's own.
     """
 
     job_id: str
     files: list[str] = field(default_factory=list)
     page_count: int = 0
     duration_ms: int = 0
+    render: dict = field(default_factory=dict)
 
 
 def _delete_files(
@@ -844,8 +914,234 @@ def _let_go(
     wait([future for _, future in pages])
 
 
+def render_payload(job: ExternalJob, pdf_url: str, prefix: str) -> dict:
+    """Return the RunPod ``input`` of one shard's render job.
+
+    :param job: The claimed row.
+    :param pdf_url: Presigned GET of the shard PDF.
+    :param prefix: The attempt's file prefix (:func:`file_prefix`),
+        which the worker names every page with, so a job that dies
+        leaves files :func:`discard_lost_files` can find.
+    :returns: The ``input`` dict to POST.
+    :rtype: dict
+    """
+    return {
+        "action": RENDER_ACTION,
+        # The worker tags its Sentry events with this.
+        "scan_pk": job.scan_id,
+        "shard_index": job.shard_index,
+        "pdf_url": pdf_url,
+        "file_prefix": prefix,
+        # The worker refuses a PDF of another count, so the manifest
+        # never names a page that does not exist.
+        "page_count": int((job.input_manifest or {}).get("page_count") or 0)
+        or None,
+        "whiteout_perpendiculars": bool(settings.PERPENDICULARS_WHITEOUT),
+        "png_level": RENDER_PNG_LEVEL,
+    }
+
+
+def _sleep_reading_stop(seconds: float) -> None:
+    """Sleep for ``seconds``, reading the stop flag as it goes.
+
+    :param seconds: How long to wait.
+    :return: None.
+    :raises SubmitStopped: If a stop was asked for meanwhile.
+    """
+    until = time.monotonic() + seconds
+    while True:
+        _stop_if_asked()
+        left = until - time.monotonic()
+        if left <= 0:
+            return
+        time.sleep(min(left, STOP_POLL_SECONDS))
+
+
+def _render_failure(outcome: runpod_client.PollOutcome) -> Exception:
+    """Return the exception one failed render job amounts to.
+
+    The worker's code decides what the row pays, as the Mistral
+    client's classes do for a local upload: a Mistral 429 past the
+    worker's retries costs nothing, a transient fault an attempt, the
+    rest the row.
+
+    :param outcome: The terminal poll outcome.
+    :returns: :class:`runpod_client.RunpodEndpointBusy`,
+        :class:`runpod_client.RunpodTransientError` or
+        :class:`runpod_client.RunpodError`.
+    :rtype: Exception
+    """
+    code = outcome.error_code or "RENDER_FAILED"
+    message = outcome.error_message or f"render job ended {outcome.status}"
+    if code == RENDER_BUSY_CODE:
+        return runpod_client.RunpodEndpointBusy(message, error_code=code)
+    if (
+        outcome.retriable
+        or code in RENDER_TRANSIENT_CODES
+        or code.startswith("MISTRAL_HTTP_5")
+    ):
+        return runpod_client.RunpodTransientError(message, error_code=code)
+    return runpod_client.RunpodError(message, error_code=code)
+
+
+def _settle_cancel(base_url: str, headers: dict, runpod_id: str) -> None:
+    """Cancel a render job and wait a little for it to stop.
+
+    The worker uploads pages until RunPod stops it, and the caller
+    lists what it left by name once this returns, so a few polls here
+    keep most of a cancelled job's pages out of that race. Bounded,
+    because a stop request is waiting on this thread.
+
+    :param base_url: From :func:`runpod_client.endpoint_config`.
+    :param headers: From :func:`runpod_client.endpoint_config`.
+    :param runpod_id: The render job.
+    :return: None.
+    """
+    runpod_client.cancel_job(base_url, headers, runpod_id)
+    for _ in range(RENDER_CANCEL_POLLS):
+        outcome = runpod_client.poll_once(base_url, headers, runpod_id)
+        if outcome.status not in (
+            None,
+            JobStatus.IN_QUEUE,
+            JobStatus.IN_PROGRESS,
+        ):
+            return
+        time.sleep(RENDER_POLL_SECONDS)
+
+
+def _leftovers_by_name(prefix: str) -> list[str]:
+    """Return the ids of the files a render job left at Mistral.
+
+    For a job that failed or was cancelled: the worker deletes what it
+    uploaded before it answers, and a job RunPod stopped answers
+    nothing, so the daemon asks Mistral by name as it does for a lost
+    claim (#534). Never raises: a listing that failed leaves the files
+    to the next listing of this prefix.
+
+    :param prefix: The attempt's file prefix.
+    :returns: The ids found, possibly none.
+    :rtype: list[str]
+    """
+    try:
+        return mistral_client.find_files(prefix)
+    except mistral_client.MistralError as exc:
+        logger.warning(
+            "could not list the files a render job left at Mistral "
+            "under %s: %s",
+            prefix,
+            exc,
+        )
+        return []
+
+
+def _render_remotely(job: ExternalJob, prefix: str, landed: list[str]) -> dict:
+    """Render and upload one shard on the RunPod worker.
+
+    Submits one render job, waits for it reading the stop flag, and
+    hands back the worker's answer. The file ids it names are appended
+    to ``landed`` as soon as they are known, before any check, so the
+    caller's failure path deletes them.
+
+    A stop request, a poll that outran :data:`RENDER_BASE_SECONDS` plus
+    :data:`RENDER_SECONDS_PER_PAGE` per page, and a database fault on
+    the caller's side all cancel the job: a worker nobody will read the
+    answer of is money and unredacted pages at Mistral.
+
+    :param job: The claimed row.
+    :param prefix: The attempt's file prefix.
+    :param landed: The caller's list of the ids that exist at Mistral.
+    :returns: The worker's answer, with ``runpod_job`` added.
+    :rtype: dict
+    :raises runpod_client.RunpodError: The classified failure of the
+        submit or the job (:func:`_render_failure`); a busy endpoint
+        and a throttled worker cost the row no attempt.
+    :raises SubmitStopped: If a stop was asked for.
+    """
+    endpoint = getattr(settings, "RUNPOD_MISTRAL_RENDER_ENDPOINT_ID", "")
+    base_url, headers = runpod_client.endpoint_config(endpoint)
+    label = f"mistral render scan {job.scan_id} shard {job.shard_index}"
+    pdf_url = s3_sync.presign_get(
+        job.input_key, int(settings.RUNPOD_PRESIGNED_TTL)
+    )
+    _stop_if_asked()
+    runpod_id = runpod_client.submit_job(
+        base_url, headers, render_payload(job, pdf_url, prefix), label=label
+    )
+    budget = RENDER_BASE_SECONDS + RENDER_SECONDS_PER_PAGE * int(
+        (job.input_manifest or {}).get("page_count") or 0
+    )
+    started = time.monotonic()
+    try:
+        while True:
+            _sleep_reading_stop(RENDER_POLL_SECONDS)
+            outcome = runpod_client.poll_once(
+                base_url, headers, runpod_id, label=label
+            )
+            if outcome.status not in (
+                None,
+                JobStatus.IN_QUEUE,
+                JobStatus.IN_PROGRESS,
+            ):
+                # Done, or ended: either way nothing is left to cancel.
+                break
+            if time.monotonic() - started > budget:
+                raise runpod_client.RunpodTransientError(
+                    f"render job {runpod_id} did not finish in "
+                    f"{int(budget)} s",
+                    error_code=RENDER_TIMED_OUT_CODE,
+                )
+    except BaseException:
+        _settle_cancel(base_url, headers, runpod_id)
+        raise
+    if outcome.status != JobStatus.COMPLETED:
+        raise _render_failure(outcome)
+    answer = dict(outcome.output or {})
+    answer["runpod_job"] = runpod_id
+    ids = answer.get("file_ids")
+    if isinstance(ids, list):
+        landed.extend(str(f) for f in ids if f)
+    return answer
+
+
+def _remote_files(answer: dict, job: ExternalJob) -> list[str]:
+    """Return the page file ids of one worker answer, checked.
+
+    :param answer: The worker's answer.
+    :param job: The row, for the page count the manifest needs.
+    :returns: One id per page, in page order.
+    :rtype: list[str]
+    :raises runpod_client.RunpodError: ``BAD_OUTPUT`` when the answer
+        names no id, a blank one, or another count than the shard
+        has: a manifest over it would read pages that do not exist or
+        miss pages that do, so the row fails rather than the batch.
+    """
+    ids = answer.get("file_ids")
+    expected = int((job.input_manifest or {}).get("page_count") or 0)
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or any(not isinstance(f, str) or not f for f in ids)
+        or (expected and len(ids) != expected)
+    ):
+        raise runpod_client.RunpodError(
+            f"render job {answer.get('runpod_job')} answered "
+            f"{len(ids) if isinstance(ids, list) else 'no'} file id(s) "
+            f"for a shard of {expected or '?'} page(s)",
+            error_code="BAD_OUTPUT",
+        )
+    return [str(f) for f in ids]
+
+
 def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     """Render, upload and submit one shard. Runs on a worker thread.
+
+    With the remote render on (:func:`remote_render_enabled`), the
+    shard is one job on the RunPod worker (:func:`_render_remotely`)
+    and this thread renders and uploads no page: it waits on the job,
+    reads the file ids off its answer and goes on at the manifest. The
+    failure path is the same, over the ids the worker named plus
+    whatever a failed or cancelled job left under the prefix
+    (:func:`_leftovers_by_name`).
 
     No database access here: the row's fields were read on the main
     thread, and every write happens there afterwards. On any failure
@@ -853,15 +1149,16 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     them: a failed create left no job, and a lost create left a job
     nothing we hold names.
 
-    The pages are rendered one after another, in page order, and each
-    is handed to the wave's upload pool (:class:`_Uploads`, shared with
-    the other shards of the wave), because the uploads wait on the
-    network: one at a time, a shard of 99 pages took five minutes. The
-    render takes a slot of the wave's backlog before it hands a page
-    over, so it pauses while the wave is at it, and an upload that
-    failed stops the render at the next page. The manifest is built
-    from the futures in page order once every upload is in, so the
-    order the uploads finished in changes nothing Mistral sees.
+    On the pod (:func:`_render_and_upload`) the pages are rendered one
+    after another, in page order, and each is handed to the wave's
+    upload pool (:class:`_Uploads`, shared with the other shards of the
+    wave), because the uploads wait on the network: one at a time, a
+    shard of 99 pages took five minutes. The render takes a slot of the
+    wave's backlog before it hands a page over, so it pauses while the
+    wave is at it, and an upload that failed stops the render at the
+    next page. The manifest is built from the futures in page order
+    once every upload is in, so the order the uploads finished in
+    changes nothing Mistral sees.
 
     A stop request (``stopping.requested``) is read before the shard
     PDF is pulled, before every page is handed over, again once the
@@ -894,7 +1191,10 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     started = time.monotonic()
     model = model_for(job)
     prefix = file_prefix(job)
+    remote = remote_render_enabled()
     pages: list[tuple[int, Future]] = []
+    remote_files: list[str] = []
+    render: dict = {"mode": "runpod" if remote else "local"}
     tail: list[str] = []
     abandoned = threading.Event()
     carried = [
@@ -902,55 +1202,19 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
     ]
     left = _delete_files(carried, pool=uploads.pool)
     try:
-        # Named after the scan and the shard, as the other stages name
-        # theirs: an orphan of a SIGKILL holds a shard PDF of up to
-        # SHARD_TARGET_BYTES, and the #215 sweep reclaims it by prefix,
-        # so whoever finds one first can tell whose it is.
-        with tempfile.TemporaryDirectory(
-            prefix=f"{RENDER_TMP_PREFIX}{job.scan_id}-s{job.shard_index}-"
-        ) as tmp:
-            pdf_path = Path(tmp) / "shard.pdf"
-            s3_sync.download_object(job.input_key, pdf_path)
-            try:
-                for page_no, png in render_shard_pages(
-                    pdf_path,
-                    whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
-                ):
-                    # The slot is taken here and given back by the
-                    # upload, or below for a page cancelled unstarted.
-                    _take_slot(uploads, pages)
-                    pages.append(
-                        (
-                            page_no,
-                            uploads.pool.submit(
-                                _upload_page,
-                                prefix,
-                                page_no,
-                                png,
-                                abandoned,
-                                uploads.slots,
-                            ),
-                        )
-                    )
-            except BaseException:
-                _let_go(uploads, pages, abandoned)
-                raise
-        # Every upload has ended before the manifest is read off them,
-        # so a page that failed late deletes no file an upload still
-        # in flight would land after the delete; and a page that
-        # failed after the last was handed over ends the shard as one
-        # that failed during the render does.
-        wait([future for _, future in pages], return_when=FIRST_EXCEPTION)
-        failed = _first_failure(pages)
-        if failed is not None:
-            _let_go(uploads, pages, abandoned)
-            raise failed
-        files = []
-        lines = []
-        for page_no, future in pages:
-            file_id = future.result()
-            files.append(file_id)
-            lines.append(_manifest_line(page_no, file_id, model))
+        if remote:
+            answer = _render_remotely(job, prefix, remote_files)
+            files = _remote_files(answer, job)
+            render.update(answer)
+            render.pop("file_ids", None)
+            lines = [
+                _manifest_line(page_no, file_id, model)
+                for page_no, file_id in enumerate(files)
+            ]
+        else:
+            files, lines = _render_and_upload(
+                job, uploads, prefix, model, pages, abandoned
+            )
         _stop_if_asked()
         manifest_id = mistral_client.upload_file(
             f"{prefix}manifest.jsonl",
@@ -969,7 +1233,14 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             timeout_hours=BATCH_TIMEOUT_HOURS,
         )
     except Exception:
-        landed = _uploaded(pages) + tail
+        landed = _uploaded(pages) + remote_files + tail
+        if remote:
+            # A failed job deleted its own pages, best effort, and a
+            # cancelled one answered nothing: what is left under the
+            # prefix goes with the ids this thread knows.
+            landed += [
+                f for f in _leftovers_by_name(prefix) if f not in landed
+            ]
         uploads.tried[job.pk] = carried + landed
         uploads.left[job.pk] = left + _delete_files(landed, pool=uploads.pool)
         raise
@@ -980,7 +1251,83 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
         files=files + tail,
         page_count=len(files),
         duration_ms=int((time.monotonic() - started) * 1000),
+        render=render,
     )
+
+
+def _render_and_upload(
+    job: ExternalJob,
+    uploads: _Uploads,
+    prefix: str,
+    model: str,
+    pages: list[tuple[int, Future]],
+    abandoned: threading.Event,
+) -> tuple[list[str], list[str]]:
+    """Render one shard on this pod and upload its pages through the
+    wave's pool: the local half of :func:`_prepare_and_submit`.
+
+    :param job: The claimed row.
+    :param uploads: The wave's upload pool and backlog.
+    :param prefix: The attempt's file prefix.
+    :param model: The model the manifest names.
+    :param pages: The caller's list of the pages handed to the pool,
+        filled here so its failure path reads every future.
+    :param abandoned: The shard's event.
+    :returns: The page file ids in page order, and the manifest lines.
+    :rtype: tuple[list[str], list[str]]
+    :raises Exception: Whatever the download, the render or an upload
+        raised.
+    """
+    # Named after the scan and the shard, as the other stages name
+    # theirs: an orphan of a SIGKILL holds a shard PDF of up to
+    # SHARD_TARGET_BYTES, and the #215 sweep reclaims it by prefix,
+    # so whoever finds one first can tell whose it is.
+    with tempfile.TemporaryDirectory(
+        prefix=f"{RENDER_TMP_PREFIX}{job.scan_id}-s{job.shard_index}-"
+    ) as tmp:
+        pdf_path = Path(tmp) / "shard.pdf"
+        s3_sync.download_object(job.input_key, pdf_path)
+        try:
+            for page_no, png in render_shard_pages(
+                pdf_path,
+                whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
+            ):
+                # The slot is taken here and given back by the
+                # upload, or below for a page cancelled unstarted.
+                _take_slot(uploads, pages)
+                pages.append(
+                    (
+                        page_no,
+                        uploads.pool.submit(
+                            _upload_page,
+                            prefix,
+                            page_no,
+                            png,
+                            abandoned,
+                            uploads.slots,
+                        ),
+                    )
+                )
+        except BaseException:
+            _let_go(uploads, pages, abandoned)
+            raise
+    # Every upload has ended before the manifest is read off them,
+    # so a page that failed late deletes no file an upload still
+    # in flight would land after the delete; and a page that
+    # failed after the last was handed over ends the shard as one
+    # that failed during the render does.
+    wait([future for _, future in pages], return_when=FIRST_EXCEPTION)
+    failed = _first_failure(pages)
+    if failed is not None:
+        _let_go(uploads, pages, abandoned)
+        raise failed
+    files = []
+    lines = []
+    for page_no, future in pages:
+        file_id = future.result()
+        files.append(file_id)
+        lines.append(_manifest_line(page_no, file_id, model))
+    return files, lines
 
 
 def _stop_if_asked() -> None:
@@ -1058,6 +1405,7 @@ def _apply_outcome(
             "page_count": submission.page_count,
             "duration_ms": submission.duration_ms,
             "model": model_for(job),
+            "render": dict(submission.render),
         }
         written = jobs._write(
             job, external_id=submission.job_id, provider_meta=meta
@@ -1092,6 +1440,17 @@ def _apply_outcome(
         return jobs._defer(job, STOPPED_ERROR_CODE, str(exc), now)
     if isinstance(exc, mistral_client.MistralBusy):
         return jobs._defer(job, exc.error_code, str(exc), now)
+    # The remote render's failures, classified by ``_render_failure``
+    # and ``runpod_client.submit_job``: a busy endpoint or a throttled
+    # worker costs nothing, a transient fault an attempt, the rest the
+    # row.
+    if isinstance(exc, runpod_client.RunpodEndpointBusy):
+        return jobs._defer(job, exc.error_code, str(exc), now)
+    if isinstance(exc, runpod_client.RunpodTransientError):
+        return jobs._retry_or_fail(job, exc.error_code, str(exc), now)
+    if isinstance(exc, runpod_client.RunpodError):
+        failed = jobs._fail(job, exc.error_code, str(exc))
+        return "failed" if failed else "skipped"
     if isinstance(exc, mistral_client.MistralTransientError):
         return jobs._retry_or_fail(job, exc.error_code, str(exc), now)
     if isinstance(exc, mistral_client.MistralError):
@@ -1180,7 +1539,7 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
     with ThreadPoolExecutor(max_workers=upload_workers()) as pool:
         uploads = _Uploads(pool, threading.Semaphore(upload_backlog()))
         with ThreadPoolExecutor(
-            max_workers=min(len(claimed), render_workers())
+            max_workers=shard_threads(len(claimed))
         ) as shards:
             futures = {
                 shards.submit(_prepare_and_submit, job, uploads): job

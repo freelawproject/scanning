@@ -50,3 +50,14 @@ MISTRAL_RENDER_WORKERS = env.int("MISTRAL_RENDER_WORKERS", default=8)
 # to raise when the workspace's limit allows. The wave holds at most
 # twice this many rendered pages in memory, whatever the shard count.
 MISTRAL_UPLOAD_WORKERS = env.int("MISTRAL_UPLOAD_WORKERS", default=32)
+
+# The RunPod CPU endpoint that renders and uploads the pages of a shard
+# (``scanning/runpod-mistral-render/``). Set, beside ``RUNPOD_ENABLED``
+# and ``RUNPOD_API_KEY``, the wave sends every shard it claims to that
+# endpoint as its own job and only writes the manifest and creates the
+# batch itself; blank, the wave renders on the pod as before, and the
+# two render knobs above apply. Per engine like the other endpoint ids,
+# because it is a separate endpoint with its own image and worker pool.
+RUNPOD_MISTRAL_RENDER_ENDPOINT_ID = env.str(
+    "RUNPOD_MISTRAL_RENDER_ENDPOINT_ID", default=""
+)

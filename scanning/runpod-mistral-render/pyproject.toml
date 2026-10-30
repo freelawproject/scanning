@@ -1,0 +1,34 @@
+[project]
+name = "mistral-render-worker"
+version = "0.0.1"
+description = "RunPod Serverless CPU handler that renders the pages of one shard and uploads them to Mistral."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # Page rendering: the same PyMuPDF render and Pillow PNG encode the
+    # daemon does in ``scanning/mistral_ocr.py``, so a worker page is
+    # the pod page byte for byte at the same compression level. Below
+    # 2: the app pins the 1.x line, and 2.0 pulls onnxruntime into the
+    # image for layout features this worker never calls.
+    "pillow>=10",
+    "pymupdf>=1.25,<2",
+
+    # The perpendiculars whiteout (``perpendiculars.py``, copied next
+    # to the handler) finds the marks with OpenCV. Headless: no display
+    # libraries in a server image.
+    "numpy>=1.26",
+    "opencv-python-headless>=4.8",
+
+    # Mistral's files API is two plain HTTP calls (a multipart POST and
+    # a DELETE), made with requests rather than the SDK: no pydantic
+    # stack in the image, and no SDK pin to keep in step with the app.
+    "requests>=2.33,<3",
+
+    # RunPod plumbing
+    "runpod>=1.9,<2",
+    "sentry-sdk>=2,<3",
+]
+
+# This project is an application (handler.py), not a library. Tell uv
+# not to try to build it as an installable package.
+[tool.uv]
+package = false

@@ -10,11 +10,12 @@ repos:
     rev: v6.0.0
     hooks:
      - id: check-added-large-files
-       # The GPU workers' uv.lock files are intentionally large (locked
+       # The workers' uv.lock files are intentionally large (locked
        # deps: the vLLM client stack plus dots_mocr for one, surya-ocr
-       # and a CPU torch for the other, and their transitives).
-       # Reproducible builds require tracking them.
-       exclude: ^scanning/runpod-(dotsmocr|surya)/uv\.lock$
+       # and a CPU torch for another, the runpod SDK's own tree for the
+       # Mistral render worker, and their transitives). Reproducible
+       # builds require tracking them.
+       exclude: ^scanning/runpod-(dotsmocr|surya|mistral-render)/uv\.lock$
      - id: check-ast
      - id: check-json
      - id: check-merge-conflict
