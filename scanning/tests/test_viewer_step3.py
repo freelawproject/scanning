@@ -15,6 +15,17 @@ the viewer would take that away, and nothing on the page would say so.
 **A class with no rule draws nothing.** The viewer writes the marks as
 spans. A class the stylesheet does not name leaves the words plain,
 and the panel looks like a panel with no difference in it.
+
+**The section is the group's own (#399).** The ensemble writes the body
+groups of a page before its footnote groups, so a viewer that split
+the page by position would look right on every page of today's
+documents and go wrong in silence the day the order changes. The page
+column draws the footnote zones beside the boxes, and a zone left
+over from an older scale is a band in the wrong place.
+
+**The risk is the document's (#419).** ``ensemble.disagreement_level``
+is the one rule of the cards, the colours and the badge. A copy of it
+in the browser would drift from the cards in silence.
 """
 
 import pathlib
@@ -22,7 +33,7 @@ import re
 
 from django.test import SimpleTestCase
 
-from scanning import opinion_ocr
+from scanning import ensemble, opinion_ocr
 
 STATIC = pathlib.Path(__file__).resolve().parent.parent / "static" / "scanning"
 VIEWER = STATIC / "viewer_step3.js"
@@ -87,9 +98,345 @@ class TestEveryPanelClassHasARule(SimpleTestCase):
         }
         self.assertIn("ensemble-diff", written, "the mark is gone")
         self.assertIn("ensemble-why", written, "the reason line is gone")
+        self.assertIn("ensemble-footnotes", written, "the block is gone")
+        self.assertIn("ensemble-zone", written, "the zone is gone")
+        self.assertIn("ensemble-blockquote", written, "the quote is gone")
+        self.assertIn("ensemble-quote-zone", written, "the band is gone")
         for name in sorted(written):
             self.assertIn(
                 f".{name}",
                 styles,
                 f"{name} has no rule in checker.css",
             )
+
+
+class TestTheSectionIsTheGroupsOwn(SimpleTestCase):
+    """The viewer splits a page by ``group.section`` (#399)."""
+
+    def test_the_viewer_spells_the_sections_of_the_ensemble(self):
+        """A renamed section would put every footnote in the body."""
+        source = VIEWER.read_text()
+        for name, value in (
+            ("BODY", ensemble.BODY),
+            ("FOOTNOTES", ensemble.FOOTNOTES),
+        ):
+            self.assertRegex(source, rf"var {name} = '{re.escape(value)}';")
+
+    def test_the_split_reads_the_group_and_not_the_page_text(self):
+        """The page's ``footnotes`` string is text, not a list of groups."""
+        source = VIEWER.read_text()
+        self.assertIn("group.section === FOOTNOTES", source)
+        self.assertNotRegex(source, r"\bpage\.footnotes\b")
+
+    def test_a_footnote_box_has_a_rule(self):
+        """The colour is the agreement, so the section needs its own rule."""
+        self.assertIn(
+            '.ensemble-box[data-section="footnotes"]', STYLES.read_text()
+        )
+
+
+class TestTheZonesGoWithTheBoxes(SimpleTestCase):
+    """Every removal of the boxes of a page removes its zones too."""
+
+    def test_no_removal_takes_the_boxes_alone(self):
+        """A zone of an older scale would stay on the page."""
+        source = VIEWER.read_text()
+        self.assertNotRegex(
+            source,
+            r"querySelectorAll\(\s*'\.ensemble-box'\s*\)\s*"
+            r"\.forEach\(function \(el\) \{\s*el\.remove",
+        )
+        self.assertIn("'.ensemble-box, .ensemble-zone'", source)
+
+
+class TestTheMarksAreNodes(SimpleTestCase):
+    """The formatting is standoff marks, and the viewer builds nodes
+    from them (#404); no string of the document becomes HTML."""
+
+    def test_the_viewer_builds_the_marks_and_never_sets_html(self):
+        source = VIEWER.read_text()
+        self.assertIn("function markedNodes(", source)
+        block = source[
+            source.index("var KIND_ELEMENTS") : source.index(
+                "function hasLevels("
+            )
+        ]
+        self.assertIn("createTextNode", block)
+        self.assertIn("textContent", block)
+        for name in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(name, block, f"{name} builds a group node")
+
+    def test_every_kind_of_the_ensemble_has_an_element(self):
+        source = VIEWER.read_text()
+        block = source[source.index("var KIND_ELEMENTS") :]
+        block = block[: block.index("};")]
+        from scanning import markup
+
+        for kind in markup.BLOCK_KINDS:
+            self.assertIn(f"{kind}:", block, f"{kind} has no element")
+
+    def test_a_table_with_no_rows_draws_its_text(self):
+        source = VIEWER.read_text()
+        self.assertIn("kind === 'table' && (group.table || []).length", source)
+
+
+class TestTheBlockquoteIsTheDocumentsOwn(SimpleTestCase):
+    """The viewer draws the runs the ensemble wrote (#411)."""
+
+    def test_the_viewer_reads_the_runs_of_the_page(self):
+        """A run the browser found by itself could differ from the one
+        the tagger reads."""
+        source = VIEWER.read_text()
+        self.assertIn("page.blockquotes", source)
+        self.assertIn("run.list_groups", source)
+        self.assertIn("document.createElement('blockquote')", source)
+
+    def test_the_quote_is_built_with_the_group_nodes(self):
+        """The blockquote holds the group nodes and sets no HTML."""
+        source = VIEWER.read_text()
+        block = source[
+            source.index("function blockquoteNode(") : source.index(
+                "function hasLevels("
+            )
+        ]
+        for name in ("innerHTML", "outerHTML", "insertAdjacentHTML"):
+            self.assertNotIn(name, block)
+
+
+class TestTheRiskIsTheDocuments(SimpleTestCase):
+    """The viewer reads ``level`` and derives no risk (#419)."""
+
+    def test_the_viewer_reads_the_level_of_the_group(self):
+        source = VIEWER.read_text()
+        self.assertIn("group.level", source)
+        self.assertIn("dataset.level", source)
+
+    def test_the_viewer_holds_no_copy_of_the_rule(self):
+        """``differs`` was the browser's copy of ``ensemble._differs``;
+        the document says it now."""
+        source = VIEWER.read_text()
+        self.assertNotIn("function differs(", source)
+        self.assertNotIn("_differs", source)
+
+    def test_the_viewer_knows_the_schema_that_writes_the_level(self):
+        source = VIEWER.read_text()
+        match = re.search(r"var LEVEL_SCHEMA = (\d+);", source)
+        self.assertIsNotNone(match)
+        self.assertLessEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_the_stylesheet_draws_both_levels(self):
+        styles = STYLES.read_text()
+        for level in (ensemble.WARNING, ensemble.BLOCKING):
+            self.assertIn(f'[data-level="{level}"]', styles)
+
+    def test_the_stylesheet_draws_the_quiet_boxes_and_the_lock(self):
+        styles = STYLES.read_text()
+        self.assertIn(".ensemble-quiet", styles)
+        self.assertIn(".show-quiet", styles)
+        self.assertIn(".ensemble-locked", styles)
+
+
+class TestTheLockIsReleased(SimpleTestCase):
+    """Every single click outside releases the lock (#419)."""
+
+    def listener(self) -> str:
+        source = VIEWER.read_text()
+        start = source.index("document.addEventListener('click'")
+        return source[start : source.index("true);", start) + 6]
+
+    def test_a_keyboard_click_releases_it(self):
+        """A click of the keyboard has a detail of 0."""
+        self.assertIn("event.detail > 1", self.listener())
+        self.assertNotIn("event.detail !== 1", self.listener())
+
+    def test_a_button_that_stops_the_click_releases_it(self):
+        """The listener runs in the capture phase, before a badge
+        stops the click."""
+        self.assertIn("}, true);", self.listener())
+
+
+class TestTheStorageIsAConvenience(SimpleTestCase):
+    """The page works when the browser refuses the storage (#419)."""
+
+    def test_every_storage_call_is_inside_a_try(self):
+        source = VIEWER.read_text()
+        calls = [
+            m.start()
+            for m in re.finditer(r"(?:local|session)Storage\.", source)
+        ]
+        self.assertTrue(calls, "the choice of the quiet boxes is gone")
+        self.assertIn("sessionStorage", source, "the place of an edit is gone")
+        for at in calls:
+            before = source[max(0, at - 80) : at]
+            self.assertIn("try {", before, "a storage call outside a try")
+
+
+class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
+    """A write control exists on the locked block alone (#376)."""
+
+    def test_the_toolbar_is_built_by_the_lock_alone(self):
+        source = VIEWER.read_text()
+        calls = re.findall(r"editBar\(", source)
+        # The definition and the one call, in ``lock``.
+        self.assertEqual(len(calls), 2)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("editBar(", lock)
+        self.assertIn("canEdit()", lock)
+
+    def test_the_viewer_reads_the_routes_of_the_page(self):
+        source = VIEWER.read_text()
+        for name in (
+            "editTextUrl",
+            "editSectionUrl",
+            "editBlockquoteUrl",
+            "editDropUrl",
+            "editMoveUrl",
+            "editWithdrawUrl",
+        ):
+            self.assertIn(f"endpoint('{name}')", source)
+        self.assertNotIn("/edits/", source)
+
+    def test_the_viewer_knows_the_schema_that_holds_the_edits(self):
+        source = VIEWER.read_text()
+        match = re.search(r"var EDIT_SCHEMA = (\d+);", source)
+        self.assertIsNotNone(match)
+        # A floor, the pin of ``LEVEL_SCHEMA``: a later schema still
+        # holds the edits, and its document keeps the toolbar.
+        self.assertLessEqual(int(match.group(1)), ensemble.SCHEMA_VERSION)
+
+    def test_an_unresolved_edit_has_its_undo(self):
+        """An edit with no block to lock is undone from its line (#376)."""
+        source = VIEWER.read_text()
+        lines = source[source.index("function unresolvedList(") :]
+        lines = lines[: lines.index("\n    }\n")]
+        self.assertIn("withdrawEdit(entry.edit_id", lines)
+        self.assertIn("entry.said", lines)
+        for reader in (
+            "page.unresolved_edits",
+            "doc.unresolved_edits",
+            'data-check="unresolved_edit"',
+        ):
+            self.assertIn(reader, source)
+
+    def test_a_block_taken_out_has_its_undo(self):
+        """A block a person took out of the text has no node to lock,
+        so its Undo is on the list under the page's label, and its box
+        is drawn apart from the groups, where the hit test never finds
+        it."""
+        source = VIEWER.read_text()
+        lines = source[source.index("function droppedList(") :]
+        lines = lines[: lines.index("\n    }\n")]
+        self.assertIn("withdrawEdit(drop.edit.id", lines)
+        self.assertIn("block.appendChild(droppedList(", source)
+        boxes = source[source.index("function drawBoxes(") :]
+        boxes = boxes[: boxes.index("\n    }\n")]
+        self.assertIn("handDropped(page)", boxes)
+        self.assertIn("junk.className = 'ensemble-junk'", boxes)
+
+    def test_the_edit_reads_the_level_and_derives_none(self):
+        source = VIEWER.read_text()
+        bar = source[source.index("function fillBar(") :]
+        bar = bar[: bar.index("\n    }\n")]
+        self.assertIn("group.level", bar)
+        self.assertNotIn("agreement", bar)
+
+    def test_the_release_asks_before_it_drops_typed_text(self):
+        """A stray click must not throw a curator's text away (#376)."""
+        source = VIEWER.read_text()
+        release = source[source.index("function release(") :]
+        release = release[: release.index("\n    }\n")]
+        self.assertIn("hasUnsavedText()", release)
+        self.assertIn("window.confirm(", release)
+        lock = source[source.index("function lock(") :]
+        lock = lock[: lock.index("\n    }\n")]
+        self.assertIn("!release()", lock)
+        editor = source[source.index("function openEditor(") :]
+        editor = editor[: editor.index("\n    }\n")]
+        self.assertIn("locked.editor = { area: area", editor)
+
+
+class TestTheHandFootnoteBandIsNoZone(SimpleTestCase):
+    """A footnote a person set gets a band of its own (#419)."""
+
+    def test_the_band_reads_the_section_edits(self):
+        source = VIEWER.read_text()
+        bands = source[source.index("function handFootnoteBands(") :]
+        bands = bands[: bands.index("\n    }\n")]
+        self.assertIn("group.section_edit", bands)
+        self.assertIn("sectionOf(group) !== FOOTNOTES", bands)
+        # One band per column: a union over both columns would cover
+        # the body text between them.
+        self.assertIn("group.column", bands)
+        self.assertNotIn("zones", bands)
+
+    def test_the_band_is_removed_with_the_zones_and_has_a_rule(self):
+        self.assertIn("'ensemble-zone ensemble-hand-zone'", VIEWER.read_text())
+        self.assertIn(".ensemble-zone.ensemble-hand-zone", STYLES.read_text())
+
+
+class TestTheGuideOpensOnAPressAlone(SimpleTestCase):
+    """The "?" of the text review opens the guide, and nothing else
+    does (#419): the guide of review 2 opens once per session."""
+
+    def test_the_guide_keeps_no_key_and_opens_on_the_click(self):
+        source = VIEWER.read_text()
+        guide = source[source.index("function bindHelp(") :]
+        guide = guide[: guide.index("\n    }\n")]
+        self.assertNotIn("Storage", guide)
+        self.assertEqual(guide.count("setOpen(panel.hidden)"), 1)
+        self.assertIn("setOpen(false)", guide)
+
+
+class TestTheQuoteEditsAreTheDocuments(SimpleTestCase):
+    """The blockquote edits (#419): the toolbar offers what the
+    endpoint takes, and a part quote is drawn from the document's
+    ``quote_span``."""
+
+    def test_the_buttons_are_in_the_toolbar_of_the_lock(self):
+        source = VIEWER.read_text()
+        bar = source[source.index("function fillBar(") :]
+        bar = bar[: bar.index("\n    }\n")]
+        self.assertIn("quoteButtons(bar, page, group)", bar)
+        buttons = source[source.index("function quoteButtons(") :]
+        buttons = buttons[: buttons.index("\n    }\n")]
+        # The refusals of the endpoint: no quote in a footnote or a table.
+        self.assertIn("sectionOf(group) !== BODY", buttons)
+        self.assertIn("group.kind === 'table'", buttons)
+
+    def test_a_part_quote_is_drawn_from_the_span_in_a_div(self):
+        source = VIEWER.read_text()
+        node = source[source.index("function groupNode(") :]
+        node = node[: node.index("\n    }\n")]
+        self.assertIn("group.quote_span", node)
+        self.assertIn("span ? 'div'", node)
+        # A voted group draws its tokens through the same helper.
+        self.assertIn("fillText(", node)
+        self.assertNotIn("tokens.forEach", node)
+
+    def test_a_part_quoted_group_is_drawn_outside_the_runs(self):
+        source = VIEWER.read_text()
+        text = source[source.index("function drawText(") :]
+        text = text[: text.index("\n    }\n")]
+        self.assertIn("run === undefined || group.quote_span", text)
+        self.assertIn('[data-blockquote="part"]', STYLES.read_text())
+
+
+class TestTheItemsAreTheDocumentsOwn(SimpleTestCase):
+    """The viewer draws the ``li`` marks the ensemble voted (#428)."""
+
+    def test_the_viewer_reads_the_item_marks(self):
+        from scanning import markup
+
+        source = VIEWER.read_text()
+        self.assertIn(f"mark.kind === '{markup.ITEM}'", source)
+        self.assertIn("group.list", source)
+        self.assertIn("function itemParents(", source)
+
+    def test_the_stylesheet_draws_the_bullet_of_a_bullet_list(self):
+        from scanning import markup
+
+        self.assertIn(
+            f'.ensemble-group[data-list="{markup.BULLET_LIST}"] .ensemble-item',
+            STYLES.read_text(),
+        )

@@ -5,8 +5,14 @@ env = environ.FileAwareEnv()
 # How often (in seconds) the daemon checks for queued scans.
 DAEMON_POLL_INTERVAL = env.int("DAEMON_POLL_INTERVAL", default=5)
 
-# How long (in seconds) before a PROCESSING scan is considered stale.
-DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=3600)
+# How long (in seconds) a PROCESSING scan may go without a heartbeat
+# before it is considered stale and re-queued. A running action stamps
+# ``processed_at`` every ``process_next_scan.HEARTBEAT_SECONDS`` (60),
+# so this covers a few missed beats and not the longest action (#503):
+# a scan whose worker was killed (a deploy past the grace period, an
+# OOM) comes back in ten minutes instead of an hour. It is also the
+# expiry of the scan task's message.
+DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=600)
 
 # How many times the daemon may re-queue a single scan after being killed or
 # timing out mid-pipeline before giving up and flagging it ERROR_INTERRUPTED.
@@ -43,6 +49,23 @@ DAEMON_JOB_MAX_QUEUE_SECONDS = env.int(
 # 5 seconds is 25 minutes, in the background.
 DAEMON_OPINION_PDF_INTERVAL = env.int("DAEMON_OPINION_PDF_INTERVAL", default=5)
 
+# How often (in seconds) the daemon cuts the pictures of one opinion's
+# text from the original scan (#463). Few opinions print a picture, so
+# most ticks read one query and stop; the first cut of a volume pulls a
+# shard, inside the serial loop, the hazard of the PDF pass.
+DAEMON_OPINION_FIGURE_INTERVAL = env.int(
+    "DAEMON_OPINION_FIGURE_INTERVAL", default=10
+)
+
+# How often (in seconds) the daemon scores one volume with the bad-page
+# model (#436), and with how many worker processes. The tick blocks the
+# serial scheduler for the whole score, about 0.2 CPU-seconds a page,
+# so a 1300-page volume is a minute or two at two workers; the interval
+# and the pool size, not the count per tick, are the knobs. Two workers
+# leave the daemon's cores to the job waves; the web pods never run it.
+DAEMON_BADPAGE_INTERVAL = env.int("DAEMON_BADPAGE_INTERVAL", default=30)
+BADPAGE_JOBS = env.int("BADPAGE_JOBS", default=2)
+
 # How long (in seconds) a failed opinion PDF row waits before the pass
 # takes it again (#336). A counted fault will fail again, so retrying it
 # every tick would spend its three attempts in fifteen seconds; a
@@ -64,3 +87,11 @@ OPINION_PDF_RETRY_AFTER_SECONDS = env.int(
 OPINION_ENSEMBLE_MIN_ENGINES = env.int(
     "OPINION_ENSEMBLE_MIN_ENGINES", default=3
 )
+
+# The least confidence of a model BLOCKQUOTE box that the OCR glue of an
+# opinion reads as a blockquote (#411). The model also boxes bullet and
+# numbered lists as blockquotes (#211), and a wrong <blockquote> is a
+# wrong input of the tagger, so the floor is high. A box a person drew
+# or approved has confidence 1.0 and always counts. A change is a
+# re-glue (reglue_opinion_ocr).
+BLOCKQUOTE_MIN_CONFIDENCE = env.float("BLOCKQUOTE_MIN_CONFIDENCE", default=0.8)

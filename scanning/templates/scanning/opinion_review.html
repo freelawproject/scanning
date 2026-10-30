@@ -15,10 +15,14 @@
   the address of the two routes that mint a presigned GET, and
   `viewer_step3.js` spells no path of its own (#334).
 
-  The one write control is the re-run of the ensemble. The approval,
-  the dismissal and the typing of a page come with the review that
-  closes an opinion. A button the endpoint would refuse is the one
-  thing a viewer must never offer (the rule of the step-1 bar, #151).
+  The write controls are the re-run of the ensemble, the dismissal
+  of a finding (#419), the human edits of the text (#376), which
+  show on a locked block alone, and the approval of the text with its
+  staff reopen (#375), and the tagger of an approved text (#272). The
+  final XML (#432) is a link, where the spans exist. A
+  button the endpoint would refuse
+  is the one thing a viewer must never offer (the rule of the step-1
+  bar, #151).
 {% endcomment %}
 
 {% block title %}{{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }} - FLP Scanning Portal{% endblock %}
@@ -56,6 +60,72 @@
       <i class="fa-solid fa-up-right-from-square"></i> Open the PDF
     </a>
     {% endif %}
+    {% comment %}
+      The approval (#375). Held while a blocking card is open, and
+      while the last edit is not in the text: the endpoint refuses it
+      then, and a button the endpoint would refuse is the one thing a
+      viewer must never offer. The script holds it on a document older
+      than data-min-schema, a fact of the bucket this render never reads. A warning card asks
+      for a confirm. The script sends the revisions of the text it
+      drew, so the curator approves the text they saw.
+    {% endcomment %}
+    {% comment %}
+      The two card walks of this opinion alone: the blocking review
+      and the warnings review, offered while a card of their kind is
+      open and the opinion is in the text review (blocking_walk_url).
+    {% endcomment %}
+    {% if open_to_check and blocking_walk_url %}
+    <a href="{{ blocking_walk_url }}" class="btn-outline text-sm" title="Walk the blocking cards of this opinion, one word at a time"
+       data-card-count-url="{{ cards_url }}" data-card-level="blocking">
+      <i class="fa-solid fa-layer-group"></i> Blocking cards (<span data-card-count>{{ open_to_check }}</span>)
+    </a>
+    {% endif %}
+    {% if open_warnings and warning_walk_url %}
+    <a href="{{ warning_walk_url }}" class="btn-outline text-sm" title="Walk the warning cards of this opinion, one word at a time"
+       data-card-count-url="{{ cards_url }}" data-card-level="warning">
+      <i class="fa-solid fa-layer-group"></i> Warning cards (<span data-card-count>{{ open_warnings }}</span>)
+    </a>
+    {% endif %}
+    {% if can_approve %}
+    <button type="button" id="approve-text" class="btn-primary text-sm"
+            data-open-warnings="{{ open_warnings }}"
+            data-min-schema="{{ min_document_schema }}"
+            {% if approve_not_built %}disabled title="The last edit is not in the text yet: press Read the OCR documents again"{% elif blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
+      <i class="fa-solid fa-check"></i>
+      {% if approve_not_built %}The last edit is not in the text yet{% elif blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
+    </button>
+    {% endif %}
+    {% if review2_open and opinion.status == "ready_for_text_review" %}
+    <span class="text-sm text-amber-800 dark:text-amber-200 self-center" id="review2-open-note" title="The approval of the redaction review builds this opinion again">The redaction review of this volume is open again: the text takes no approval until it is approved.</span>
+    {% endif %}
+    {% if can_reopen %}
+    <button type="button" id="reopen-text" class="btn-outline text-sm"
+            title="Take this opinion back to the text review">
+      <i class="fa-solid fa-lock-open"></i> Reopen the text review
+    </button>
+    {% endif %}
+    {% comment %}
+      The tagger (#272): on an approved text, where a press can move
+      its state. A run in progress or a text already tagged shows the
+      state and offers no button, because the endpoint refuses both.
+    {% endcomment %}
+    {% if can_tag %}
+    <button type="button" id="start-tagger" class="btn-outline text-sm"
+            title="Send the approved text to the case-law block tagger">
+      <i class="fa-solid fa-tags"></i>
+      {% if tag_state == "none" %}Tag the text{% else %}Tag the text again{% endif %}
+    </button>
+    {% elif tag_state == "running" %}
+    <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-spinner fa-spin"></i> Tagging the text</span>
+    {% elif tag_state == "done" %}
+    <span class="text-sm text-gray-600 self-center"><i class="fa-solid fa-tags"></i> Text tagged</span>
+    {% endif %}
+    {% if final_xml_url %}
+    <a href="{{ final_xml_url }}" target="_blank" rel="noopener" class="btn-outline text-sm"
+       title="The approved text with the tagger's tags, in the CAP casebody shape">
+      <i class="fa-solid fa-code"></i> Display final XML
+    </a>
+    {% endif %}
     {% if can_rerun %}
     <button type="button" id="rerun-ensemble" class="btn-outline text-sm"
             title="Read the OCR documents of this opinion again and write its text">
@@ -83,7 +153,7 @@
     {% if user.is_staff %}
     <a href="{{ files_url }}"
        class="text-xs font-normal text-gray-500 dark:text-gray-400 underline hover:text-blue-600 dark:hover:text-blue-400 ml-2"
-       title="The glued objects of this opinion: the redacted PDF, the OCR documents and the ensemble">files</a>
+       title="The objects of this opinion: the redacted PDF, the OCR documents, the ensemble, the approved text and the tagger's spans">files</a>
     {% endif %}
   </summary>
   <table class="min-w-full text-sm mt-3">
@@ -143,7 +213,18 @@
      class="opinion-review grid grid-cols-1 lg:grid-cols-2 gap-2 px-2 pb-4"
      data-pdf-url-endpoint="{{ pdf_url_endpoint }}"
      data-ensemble-url-endpoint="{{ ensemble_url_endpoint }}"
+     data-figure-url-endpoint="{{ figure_url_endpoint }}"
      data-rerun-url="{{ rerun_url }}"
+     data-can-edit="{% if can_edit %}1{% endif %}"
+     data-edit-text-url="{{ edit_text_url }}"
+     data-edit-section-url="{{ edit_section_url }}"
+     data-edit-blockquote-url="{{ edit_blockquote_url }}"
+     data-edit-drop-url="{{ edit_drop_url }}"
+     data-edit-move-url="{{ edit_move_url }}"
+     data-edit-withdraw-url="{{ edit_withdraw_url }}"
+     data-approve-url="{{ approve_url }}"
+     data-reopen-url="{{ reopen_url }}"
+     data-tag-url="{{ tag_url }}"
      data-page-count="{{ opinion.page_count }}">
 
   <div class="card p-2">
@@ -155,7 +236,17 @@
         column to start with, and these change it; the label is the
         scale of the render.
       {% endcomment %}
-      <div class="ml-auto flex items-center gap-1">
+      {% comment %}
+        The boxes every engine read alike are quiet by default (#419):
+        nothing there asks for the reviewer's eye. The script keeps the
+        choice in this browser.
+      {% endcomment %}
+      <label class="ml-auto flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 cursor-pointer"
+             title="Draw the boxes of the blocks every engine read alike. A box shows anyway while its block is selected.">
+        <input type="checkbox" id="show-quiet" class="h-3 w-3">
+        Show the blocks all engines agree on
+      </label>
+      <div class="flex items-center gap-1">
         <button type="button" class="btn-ghost text-xs px-2 py-0.5"
                 data-zoom="out" title="Smaller pages">&minus;</button>
         <span id="zoom-level"
@@ -178,10 +269,24 @@
   </div>
 
   <div class="card p-2">
-    <h2 class="text-xs font-bold mb-1">
-      The text
-      <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
-    </h2>
+    <div class="flex items-start gap-2 mb-1">
+      <h2 class="text-xs font-bold">
+        The text
+        <span id="ensemble-summary" class="font-normal text-gray-500 dark:text-gray-400"></span>
+      </h2>
+      {% if ensemble_written %}
+      {% comment %}
+        The guide of the page (#419). It opens only on a press of "?".
+      {% endcomment %}
+      <div class="relative ml-auto">
+        <button type="button" id="text-review-help-btn"
+                class="btn-ghost text-xs px-2 py-0.5 font-bold"
+                aria-expanded="false" aria-controls="text-review-help-panel"
+                title="What a click, a double click and the colours do">?</button>
+        {% include "scanning/_text_review_help.html" %}
+      </div>
+      {% endif %}
+    </div>
     {% if ensemble_written %}
     <div id="opinion-text" class="opinion-text"></div>
     {% elif ocr_written %}

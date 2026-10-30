@@ -1,0 +1,29 @@
+{% comment %}
+  One card of `_opinion_findings.html` (#419). `tone` is `red` for a
+  card the approval waits on and `yellow` for a warning; a dismissed
+  card is grey whatever its tone. The class names are spelled whole,
+  so Tailwind finds them.
+{% endcomment %}
+<div class="finding-card rounded border px-3 py-2 text-sm
+     {% if finding.dismissal %}border-gray-300 dark:border-gray-700 bg-gray-100 dark:bg-gray-800 opacity-60{% elif tone == 'red' %}border-red-300 bg-red-50 dark:border-red-700 dark:bg-red-900/20{% else %}border-yellow-300 bg-yellow-50 dark:border-yellow-700 dark:bg-yellow-900/20{% endif %}"
+     data-check="{{ finding.check_name }}"
+     {% if finding.page_in_opinion is not None %}data-page="{{ finding.page_in_opinion }}"{% endif %}>
+  <div class="flex items-center gap-2 flex-wrap">
+    <span class="font-semibold">{{ finding.get_check_name_display }}</span>
+    <span class="text-xs text-gray-500 dark:text-gray-400">{{ finding.page_label }}</span>
+    {% if finding.is_stale %}<span class="text-[10px] font-bold uppercase text-red-700 dark:text-red-300">not applied</span>{% endif %}
+    {% if finding.dismissal %}<span class="text-[10px] font-bold uppercase text-gray-500">dismissed</span>{% endif %}
+    {% if finding.dismiss_url %}
+    {% if finding.dismissal %}
+    <button type="button" class="finding-restore btn-ghost text-xs px-2 py-0.5 ml-auto"
+            data-restore-url="{{ finding.restore_url }}"
+            title="Take the dismissal back: the card is open again">Undo</button>
+    {% else %}
+    <button type="button" class="finding-dismiss btn-ghost text-xs px-2 py-0.5 ml-auto"
+            data-dismiss-url="{{ finding.dismiss_url }}"
+            title="You read this against the PDF, and the text is right">Dismiss</button>
+    {% endif %}
+    {% endif %}
+  </div>
+  {% if finding.message %}<p class="mt-1 text-xs text-gray-700 dark:text-gray-300">{{ finding.message }}</p>{% endif %}
+</div>

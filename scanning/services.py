@@ -41,8 +41,10 @@ from blackletter.validate import (
 )
 from django.conf import settings
 from django.db.models import Case, F, Value, When
+from django.utils import timezone
 
-from scanning import boundaries
+from scanning import boundaries, tasks, undetected
+from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
     DEAD_JOB_STATUSES,
@@ -251,6 +253,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     scan.save()
     flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
+    tasks.dispatch_scan(scan.pk, QueuedAction.FULL_PIPELINE)
 
 
 def recover_pending_upload(pending) -> bool:
@@ -306,7 +309,14 @@ def _update_progress(
     :param total: Total step count, if applicable.
     :param kwargs: Additional Scan fields to update.
     """
-    updates = {"progress_message": message[:255]}
+    # The heartbeat (#503): ``processed_at`` is the claim stamp the
+    # stale sweep reads (``process_next_scan.recover_stale``), and a
+    # progress write refreshes it, so a long action on one of several
+    # workers is never swept for being old while it reports progress.
+    updates = {
+        "progress_message": message[:255],
+        "processed_at": timezone.now(),
+    }
     if current is not None:
         updates["progress_current"] = current
     if total is not None:
@@ -691,6 +701,110 @@ def _pull_processing_files_from_s3(scan_pk: int) -> None:
         )
 
 
+def _label_of(entry: dict):
+    """Return the blackletter ``Label`` of a detection dict, or None.
+
+    The id first, the name when there is no id; None for either value
+    blackletter's enum does not carry, which a row written under an
+    older taxonomy can hold. A caller leaves such an entry out of what
+    it hands blackletter rather than raise on a page a person is
+    looking at.
+
+    :param entry: A detection dict with ``label_id`` and/or ``label``.
+    :returns: The label, or None.
+    """
+    from blackletter.models import Label
+
+    try:
+        if entry.get("label_id") is not None:
+            return Label(entry["label_id"])
+        return Label[entry["label"]]
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def drop_junk_entries(entries: list) -> tuple[set[int], int]:
+    """Take the junk boxes out of a list of detection dicts, in place.
+
+    **blackletter's rule, over the portal's dicts.** The three rules of
+    ``blackletter.junk`` (the blot in an edge band, the image box that
+    is a text box's twin, the key that is the show-through of the
+    leaf's other side) and its cut of a box that runs onto the blot are
+    run by ``blackletter.junk.drop_junk`` over a document lifted from
+    the dicts, and the answer is written back: a dropped entry leaves
+    the list and a cut entry's foot moves. Three readers call it, the
+    compute (:func:`detection_entries`), the viewer
+    (``views_api.serve_detections``) and the image chips
+    (``views_process``), so all three see the boxes blackletter's own
+    geometry would.
+
+    A hand-added entry (no ``found_by``) is lifted at confidence 1.0,
+    which is a person's box to blackletter, so it is never judged.
+
+    :param entries: Dicts with ``id``, ``label_id`` (or ``label``),
+        ``bbox``, ``confidence``, ``page_index``, ``img_width``,
+        ``img_height`` and ``found_by``, the page's boxes together.
+    :returns: The ids dropped, and how many boxes were cut.
+    :rtype: tuple[set[int], int]
+    """
+    from blackletter.junk import drop_junk
+    from blackletter.models import BBox, Document, Page
+    from blackletter.models import Detection as BLDetection
+
+    by_page: dict[int, list[dict]] = {}
+    for entry in entries:
+        by_page.setdefault(entry["page_index"], []).append(entry)
+    pages = []
+    lifted: dict[int, dict] = {}
+    unknown = 0
+    for index in sorted(by_page):
+        group = by_page[index]
+        page = Page(
+            index=index,
+            pdf_width=612.0,
+            pdf_height=792.0,
+            img_width=int(group[0].get("img_width") or 0),
+            img_height=int(group[0].get("img_height") or 0),
+        )
+        for entry in group:
+            bbox = entry.get("bbox")
+            if not isinstance(bbox, list | tuple) or len(bbox) != 4:
+                continue
+            label = _label_of(entry)
+            if label is None:
+                # A label blackletter does not know is not lifted: the
+                # entry is never judged and never dropped, and the
+                # page it is on is served and computed as before.
+                unknown += 1
+                continue
+            det = BLDetection(
+                bbox=BBox(*(float(v) for v in bbox)),
+                label=label,
+                confidence=(
+                    1.0
+                    if not entry.get("found_by")
+                    else float(entry.get("confidence") or 0.0)
+                ),
+                page_index=index,
+            )
+            page.detections.append(det)
+            lifted[id(det)] = entry
+        pages.append(page)
+    if unknown:
+        logger.warning(
+            "%d detection(s) carry a label blackletter does not know and "
+            "were left out of the junk pass",
+            unknown,
+        )
+    report = drop_junk(Document(pdf_path="", pages=pages))
+    dropped = {lifted[id(d)].get("id") for d in report.dropped}
+    for before, after in report.cut:
+        lifted[id(before)]["bbox"][3] = after.bbox.y2
+    if dropped:
+        entries[:] = [e for e in entries if e.get("id") not in dropped]
+    return dropped, len(report.cut)
+
+
 def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     """The live detections of a scan, in the shape blackletter reads.
 
@@ -753,6 +867,29 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
             if pn[1] is not None:
                 entry["page_number_end"] = pn[1]
         det_data.append(entry)
+    # The blot along the top or the bottom edge that the model boxes as
+    # a key icon or a headnote, the image box that is a text box's twin
+    # and the key that is the show-through of the leaf's other side are
+    # left out here, and a box that runs from the text down onto the
+    # blot is cut at the band top (blackletter's ``drop_junk``, through
+    # :func:`drop_junk_entries`), so that every reader of this list (the
+    # pairing, the key stamps, the margin strips) stops seeing them at
+    # once. The rows stay; only the list the compute reads changes.
+    dropped, cut = drop_junk_entries(det_data)
+    if dropped:
+        logger.info(
+            "Scan %s: %d model box(es) left out of the document "
+            "(an edge band, an image twin or a show-through)",
+            scan_pk,
+            len(dropped),
+        )
+    if cut:
+        logger.info(
+            "Scan %s: %d model box(es) running into the bottom band cut at "
+            "the band top",
+            scan_pk,
+            cut,
+        )
     return det_data
 
 
@@ -801,9 +938,19 @@ def _build_document_with_ids(
             )
             for d in pd["detections"]:
                 b = d.get("bbox", [0, 0, 1, 1])
+                label = _label_of(d)
+                if label is None:
+                    logger.warning(
+                        "Scan %s: a detection on page %s carries a label "
+                        "blackletter does not know and is left out of the "
+                        "document",
+                        scan.pk if isinstance(scan, Scan) else scan,
+                        pi + 1,
+                    )
+                    continue
                 detection = BLDetection(
                     bbox=BBox(x1=b[0], y1=b[1], x2=b[2], y2=b[3]),
-                    label=Label(d["label_id"]),
+                    label=label,
                     confidence=d["confidence"],
                     page_index=pi,
                 )
@@ -975,13 +1122,6 @@ def _expected_range(scan: "Scan") -> tuple[int | None, int | None]:
     return scan.start_page or 1, scan.end_page
 
 
-#: Prefix :mod:`scanning.page_numbers` stamps on the ``zone`` of every
-#: entry it reads off a dots.mocr run (``dots-header``,
-#: ``dots-footer``). It is what tells a new-pipeline page number from a
-#: legacy PaddleOCR one.
-DOTS_ZONE_PREFIX = "dots-"
-
-
 def has_legacy_ocr(scan: "Scan") -> bool:
     """Return whether a scan's page numbers came from the retired OCR.
 
@@ -990,9 +1130,11 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     only reproduce them. Review 1 says so instead of pretending to redo
     the work (#151).
 
-    Two signals answer it, because neither alone is enough. A ``dots-``
-    zone proves the new stage wrote the entry, but a volume dots read
-    with no number on any page carries none. An ``ANALYZE`` job row
+    Two signals answer it, because neither alone is enough. An engine's
+    zone prefix (``dots-``, ``mistral-``, ``surya-``;
+    ``page_numbers.is_model_zone``) proves the new stage wrote the
+    entry, but a volume dots read with no number on any page carries
+    none. An ``ANALYZE`` job row
     proves the new stage ran at all, and it outlives a recompute. A
     scan with no readings at all is not legacy: it has nothing to
     recompute either way, and the caller handles that first.
@@ -1005,10 +1147,12 @@ def has_legacy_ocr(scan: "Scan") -> bool:
     :returns: ``True`` when the readings are the retired stage's.
     :rtype: bool
     """
+    from scanning import page_numbers
+
     if not scan.ocr_results:
         return False
     if any(
-        (entry.get("zone") or "").startswith(DOTS_ZONE_PREFIX)
+        page_numbers.is_model_zone(entry.get("zone"))
         for entry in scan.ocr_results
     ):
         return False
@@ -1200,8 +1344,9 @@ def _project_trailing_gap(
     The collapse is right **inside** a volume, where the pages are
     almost always in the book with a number nobody read. It is wrong at
     the end, where the expected last page says the pages should be
-    there and the volume stops before them. So this appends one
-    placeholder for the trailing run, and only for that one.
+    there and the volume stops before them. So this adds one
+    placeholder for the trailing run, and only for that one, after the
+    last page that prints a number below the run.
 
     **One placeholder per gap, because the gap is the address.** An
     insert and an INSERT repair request are both addressed by
@@ -1241,12 +1386,34 @@ def _project_trailing_gap(
         # Not collapsed: blackletter drew one placeholder per page.
         return
 
-    result["page_map"].append(
+    # After the last copy of the greatest number printed below the run,
+    # the rule blackletter follows for a short gap past the last number
+    # (blackletter#83): an unnumbered tail after the last printed page
+    # stays after the placeholder, and an insert there follows that
+    # page. A page's own PDF page is its ``logical_number`` when it
+    # prints none, so only the pages of ``seen_nums`` can anchor.
+    seen_nums = analysis.get("seen_nums") or {}
+    below = [number for number in seen_nums if number < first]
+    page_map = result["page_map"]
+    at = len(page_map)
+    if below:
+        anchors = {pdf_page - 1 for pdf_page in seen_nums[max(below)]}
+        at = 1 + max(
+            (
+                position
+                for position, entry in enumerate(page_map)
+                if entry.get("type") == "pdf_page"
+                and entry.get("pdf_index") in anchors
+            ),
+            default=len(page_map) - 1,
+        )
+    page_map.insert(
+        at,
         {
             "type": "missing",
             "logical_number": f"{first}-{exp_end}",
             "missing_range": [first, exp_end],
-        }
+        },
     )
 
     # The card of that run, reworded: it reads "likely an OCR misread
@@ -1264,7 +1431,7 @@ def _project_trailing_gap(
                 f"({exp_end - first + 1} pages) are not in this volume. "
                 f"The last page number read is {max(all_nums)}. If the "
                 f"book has these pages, ask a scanner for them at the "
-                f"placeholder at the end of the volume. If the pages "
+                f"placeholder after the last numbered page. If the pages "
                 f"are there with a number nobody read, correct a page "
                 f"number and recompute."
             )
@@ -1421,6 +1588,11 @@ def recalculate_issues(scan: "Scan") -> None:
     _ask_about_front_matter(
         result["issues"], ocr_results, page_edits.deleted_pages(scan)
     )
+    # The pages the bad-page model suspects, one card each (#436).
+    # Derived from the stamp on the scan, before the deletion and
+    # dismissal filters below, so a deleted page answers its card and
+    # a dismissal matches it by check and page like every other.
+    result["issues"].extend(badpage_scoring.issues(scan))
 
     # Every open edit this volume cannot take, not only the page
     # numbers: a delete or an insert made against another original is
@@ -1535,6 +1707,29 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Apply the page numbers under the lock the bad-page score shares.
+
+    See :func:`_run_compute_issues`. The score (``badpage.scoring
+    .score_scan``) stamps and rebuilds under the same lock (#503), so
+    this apply never reads the scores before the stamp and opens the
+    review after the score's status check.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed.
+    :rtype: bool
+    """
+    from scanning import locks
+
+    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True) as held:
+        if not held:
+            # A holder's dead session, until the server reaps it: the
+            # next tick applies the numbers.
+            return False
+        return _run_compute_issues(scan, result_key)
+
+
+def _run_compute_issues(scan: "Scan", result_key: str) -> bool:
     """Read page numbers off a glued dots.mocr run and rebuild Issues.
 
     The apply step of issues #149/#204, called by
@@ -1559,6 +1754,13 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
     conditional DB update, so it can neither revive a cancelled scan
     nor write a stale READY over a concurrent approval (#151).
 
+    The other engines' glued volume documents, when a person started
+    them, fill the pages dots.mocr left blank (#351,
+    ``page_numbers.fallback_documents``). They are read after the
+    dots.mocr document, so a volume nobody read with them costs one
+    download as before, and a fallback that does not load is logged
+    and left out rather than holding the volume out of review 1.
+
     :param scan: The scan whose live run is fully glued.
     :param result_key: S3 key of the run's glued volume JSON.
     :returns: Whether the apply completed. False means the scan left
@@ -1569,7 +1771,8 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 
     started = time.monotonic()
     document = s3_sync.download_json_object(result_key)
-    results = page_numbers.ocr_results_from_volume(document)
+    fallbacks = page_numbers.fallback_documents(scan)
+    results = page_numbers.ocr_results_from_volume(document, fallbacks)
     # Overlay before the save, not only inside recalculate_issues: a
     # scan that fails the edge below keeps this blob until its next
     # recompute, and the viewer would show the model's reading over a
@@ -1602,11 +1805,16 @@ def run_compute_issues(scan: "Scan", result_key: str) -> bool:
 
     logger.info(
         "compute_issues: scan %s: %d page(s), %d without a number, "
-        "%d issue(s), in %.1fs",
+        "%d issue(s), %s, in %.1fs",
         scan.pk,
         len(results),
         sum(1 for entry in results if not entry["detected"]),
         scan.issues.count(),
+        (
+            "filled from " + ", ".join(sorted(fallbacks))
+            if fallbacks
+            else "no other engine read"
+        ),
         time.monotonic() - started,
     )
     return True
@@ -1622,6 +1830,7 @@ def _import_detections(
     detections: list,
     run: "ApplyRun | None" = None,
     detect_run: int | None = None,
+    cells: dict | None = None,
 ) -> int:
     """Replace a scan's model detections with the ones just merged.
 
@@ -1652,8 +1861,18 @@ def _import_detections(
     :param run: The apply run whose final space the list is in; None
         for the original's space.
     :param detect_run: The ``ExternalJob.run`` of the detection run.
+    :param cells: The cells of each page (``text_fit.page_cells``), or
+        None for a caller with no OCR read. The new model rows are
+        shaped by them before the decisions land: the gutter
+        (``columns.separate_rows``) and the foot trim
+        (``columns.trim_feet``) write the rows a curator decides on,
+        so a decision's copy of the box is of the shaped row, and a
+        decision landed on the unshaped row by IoU would miss a column
+        the trim had cut by more than half, and the model's box would
+        come back.
     :return: How many rows were created.
     """
+    from scanning import columns
     from scanning import detections as decisions
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1699,6 +1918,10 @@ def _import_detections(
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
+    if cells:
+        # The rows the decisions were made on are the shaped rows.
+        columns.separate_rows(scan, cells)
+        columns.trim_feet(scan, cells)
     landed, stale = decisions.resolve(scan)
     moved = 0
     if run is not None and kept:
@@ -1750,7 +1973,9 @@ def geometry_pdf_path(scan: "Scan", run=_UNSET_RUN) -> str:
     return str(apply.local_copy(scan, run.bitonal_key))
 
 
-def run_compute_redactions(scan_pk: int) -> None:
+def run_compute_redactions(
+    scan_pk: int, then_create_opinions: bool = False
+) -> None:
     """Turn a merged detection run into the geometry review 2 reads.
 
     The apply step of issue #196, dispatched by ``process_next_scan``
@@ -1794,13 +2019,21 @@ def run_compute_redactions(scan_pk: int) -> None:
     runs the whole pipeline again. A failure is counted on the run
     instead (``yolo.record_apply_failure``), which bounds the retries.
 
+    **A review-2 approval can ask for the opinions next** (#240,
+    ``then_create_opinions``): a success then queues
+    ``CREATE_OPINIONS`` in place of the park, and every other exit
+    parks as usual, with a message that asks for the approval again.
+
     :param scan_pk: Primary key of the scan to compute redactions for.
+    :param then_create_opinions: Whether a review-2 approval queued
+        this compute (``QueuedAction.COMPUTE_THEN_CREATE_OPINIONS``).
     :return: None.
     """
     from scanning import (
         apply,
         brackets,
         columns,
+        editorial,
         findings,
         redactions,
         review_states,
@@ -1848,6 +2081,18 @@ def run_compute_redactions(scan_pk: int) -> None:
             return Status.READY_FOR_REDACTION_REVIEW
         return Status.PAGE_COMPLETENESS_REVIEW_DONE
 
+    def unapproved(message: str) -> str:
+        """Add to a park message that the approval did not go through.
+
+        :param message: The message of the park.
+        :returns: The message, and the sentence when an approval
+            queued this compute.
+        :rtype: str
+        """
+        if not then_create_opinions:
+            return message
+        return f"{message} {APPROVAL_NOT_DONE_NOTE}"
+
     if not merged and not has_rows:
         # Nothing to measure: no merged run, and no detections from an
         # earlier one. Park the scan back rather than fail it -- the
@@ -1859,8 +2104,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "No detections to work from. The detection run has not "
-            "reached this volume yet.",
+            unapproved(
+                "No detections to work from. The detection run has not "
+                "reached this volume yet."
+            ),
             park(),
         )
         return
@@ -1883,8 +2130,10 @@ def run_compute_redactions(scan_pk: int) -> None:
         )
         _park_after_redactions(
             scan_pk,
-            "The corrected volume is not built yet. The redactions are "
-            "computed when it is.",
+            unapproved(
+                "The corrected volume is not built yet. The redactions "
+                "are computed when it is."
+            ),
             park(),
         )
         return
@@ -1895,6 +2144,11 @@ def run_compute_redactions(scan_pk: int) -> None:
     # a legacy volume whose rows the old pipeline wrote.
     importing = merged and not yolo.redactions_current(rows, run)
     started = time.monotonic()
+    # Before the first read of the rows (#240): a curator's write after
+    # this moment may be missing from the geometry, and one before it is
+    # in it. A time too early costs one more compute; a time too late
+    # would miss a box.
+    read_at = timezone.now()
     try:
         detections = []
         page_numbers = None
@@ -1927,29 +2181,45 @@ def run_compute_redactions(scan_pk: int) -> None:
             ensure_output_dir(scan)
             pdf_path = geometry_pdf_path(scan, None)
 
+        # One read of the cells serves the import, the gutter, the
+        # trim, the readings and the text fit further down (#279).
+        ocr_document = text_fit.load_document(scan, run)
+        cells = text_fit.page_cells(ocr_document)
+
         if importing:
             with _log_stage("Import detections"):
                 _import_detections(
-                    scan_pk, detections, run=run, detect_run=rows[0].run
+                    scan_pk,
+                    detections,
+                    run=run,
+                    detect_run=rows[0].run,
+                    cells=cells,
                 )
 
         # The two column boxes of a page share an edge, because the
         # model cuts one text block in half, and a headnote box then
         # grows across the gutter onto the facing column's text (#308).
         # This runs before the ink snap below, which reads the pair and
-        # has no gutter to stop its own walk at either. One read of the
-        # cells serves it and the text fit further down (#279).
+        # has no gutter to stop its own walk at either.
         _update_progress(scan_pk, "Measuring the column gutter...")
         with _log_stage("Column gutter"):
-            ocr_document = text_fit.load_document(scan, run)
-            cells = text_fit.page_cells(ocr_document)
             columns.separate_rows(scan, cells)
+            # A column box the model ran to the foot of the facing
+            # column ends at its own last line of print.
+            columns.trim_feet(scan, cells)
 
         # The brackets the reader saw, stored as rows so that the
         # findings can be rebuilt from the rows alone (#328). It reads
         # the document already in memory and renders nothing.
         with _log_stage("Bracket readings"):
             brackets.write_rows(scan, ocr_document, run)
+        # The editor's notes, the same way (#450).
+        with _log_stage("Editor's note readings"):
+            editorial.write_rows(scan, ocr_document, run)
+        # The text cells of every page, the same way, for the card of a
+        # block no box covers (``undetected``).
+        with _log_stage("Text readings"):
+            undetected.write_rows(scan, ocr_document, run)
 
         if importing:
             # Only after an import: the correction converges, so it is
@@ -1962,6 +2232,7 @@ def run_compute_redactions(scan_pk: int) -> None:
             # gutter goes back in after it (#308).
             with _log_stage("Column gutter"):
                 columns.separate_rows(scan, cells)
+                columns.trim_feet(scan, cells)
 
         # One corrected document for the pairing and the geometry, and
         # one pairing (#240 PR C): the boundaries are rows written from
@@ -1991,6 +2262,20 @@ def run_compute_redactions(scan_pk: int) -> None:
         _update_progress(scan_pk, "Fitting the text redactions...")
         with _log_stage("Text redaction fit"):
             text_fit.fit_rects(rects, cells, document.pages)
+        # A running head's whiteout the model drew short grows across the
+        # text width at its own height, so no letter of it is left on the
+        # page; the page number stays.
+        with _log_stage("Running head fit"):
+            text_fit.widen_running_heads(
+                rects,
+                document.pages,
+                redactions.dismissed_boxes(
+                    scan,
+                    text_fit.HEAD_RECT_TYPE,
+                    run,
+                    [entry["page_index"] for entry in rects],
+                ),
+            )
 
         _update_progress(scan_pk, "Measuring the page margins...")
         margins = _measure_margin_rects(pdf_path, document)
@@ -2069,7 +2354,7 @@ def run_compute_redactions(scan_pk: int) -> None:
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
-        _park_after_redactions(scan_pk, message, park())
+        _park_after_redactions(scan_pk, unapproved(message), park())
         return
 
     if merged:
@@ -2083,10 +2368,18 @@ def run_compute_redactions(scan_pk: int) -> None:
         # page the moment the scan parks, and a park in the approved
         # status would show the curator a step 2 whose approve button
         # appears a tick later, from nothing they did.
-        yolo.record_apply_success(rows, run)
-    _park_after_redactions(
-        scan_pk, "Detection review is ready: check the redactions.", park()
-    )
+        yolo.record_apply_success(rows, run, read_at=read_at)
+    destination = park()
+    if then_create_opinions and destination == (
+        Status.READY_FOR_REDACTION_REVIEW
+    ):
+        _queue_opinions_after_compute(scan_pk, open_findings)
+    else:
+        _park_after_redactions(
+            scan_pk,
+            unapproved("Detection review is ready: check the redactions."),
+            destination,
+        )
     logger.info(
         "compute_redactions: scan %s: %d detection(s), %d opinion(s), "
         "%d page(s) with rects, %d page(s) with margins, in %.1fs",
@@ -2108,7 +2401,7 @@ def run_compute_redactions(scan_pk: int) -> None:
 #: before the #154 statuses existed. A busy scan is refused: it holds a
 #: claim already. ``REDACTION_REVIEW_DONE`` is deliberately absent: a
 #: closed review is not recomputed under the person who closed it, and
-#: the way back is the admin re-queue.
+#: the way back is the staff reopen (#240).
 REDACTION_COMPUTE_STATUSES = (
     Status.PAGE_COMPLETENESS_REVIEW_DONE,
     Status.READY_FOR_REDACTION_REVIEW,
@@ -2143,6 +2436,7 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         progress_total=0,
     )
     if queued:
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         return True, (
             "Queued. The redactions are computed on the server, and this "
             "page reloads when they are ready."
@@ -2152,6 +2446,65 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
     return False, (
         "This volume is not in a state that can compute redactions."
     )
+
+
+#: The sentence a compute queued by a review-2 approval adds to a park
+#: that is not the opinions (#240): the approval was not recorded, and
+#: the next press is the retry, the rule of a failed creation (#336).
+APPROVAL_NOT_DONE_NOTE = (
+    "The approval of the redactions did not go through: approve again."
+)
+
+
+def run_compute_then_create_opinions(scan_pk: int) -> None:
+    """Compute the redactions, then create the opinions (#240).
+
+    The worker behind ``QueuedAction.COMPUTE_THEN_CREATE_OPINIONS``,
+    which the review-2 approval writes when a curator changed the
+    detections after the last compute
+    (``detections.changed_since_compute``). The opinions are cut from
+    the redaction rows, and only the compute turns a detection into
+    those rows.
+
+    :param scan_pk: Primary key of the claimed scan.
+    :return: None.
+    """
+    run_compute_redactions(scan_pk, then_create_opinions=True)
+
+
+def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
+    """Hand a computed scan to the opinion creation, in place of the park.
+
+    A compare-and-swap over the busy statuses, the guard of
+    :func:`_park_after_redactions`, so an admin who moved the scan
+    during the compute keeps their decision. The person who approved is
+    in the log line of the approval.
+
+    :param scan_pk: Primary key of the scan.
+    :param open_findings: The open review-2 findings the compute wrote,
+        for the message: the compute can write a card the curator did
+        not see before the approval.
+    :return: None.
+    """
+    message = (
+        "The redactions are computed. The opinions are queued for creation."
+    )
+    if open_findings:
+        message = (
+            f"The redactions are computed, with {open_findings} open "
+            "finding(s). The opinions are queued for creation."
+        )
+    moved = Scan.objects.filter(
+        pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
+    ).update(
+        status=Status.QUEUED,
+        queued_action=QueuedAction.CREATE_OPINIONS,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
+    )
+    if moved:
+        tasks.dispatch_scan(scan_pk, QueuedAction.CREATE_OPINIONS)
 
 
 def _park_after_redactions(
@@ -2480,7 +2833,9 @@ def _can_analyze(scan_pk: int, manifest: dict | None) -> bool:
     created where it cannot be submitted sits PENDING until its queue
     deadline expires hours later, and its failure is noise about a
     volume that did nothing wrong. An environment that fails a check
-    parks as before, and the staff button stays as the manual way in.
+    parks as before, and the daemon's sweep
+    (``dots_mocr.enqueue_missing_runs``, #327) starts the read once the
+    stage is configured.
 
     - a committed shard set, or there is nothing for a job to read;
     - ``dots_mocr.enabled()``, the operator switch plus the account

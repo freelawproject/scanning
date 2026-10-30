@@ -36,6 +36,20 @@ The vertical test is what removes the running head: one cell holds the
 whole head and it spans the gutter. It finds a band on 1290 of the 1291
 two-column pages of that volume, 10.1 pt wide at the median.
 
+**The foot** is the other edge the model gets wrong, and for the same
+reason: it measures one block and cuts it at the centre, so a column
+whose print ends halfway down (the column's last opinion closed at its
+key icon, and the next opinion starts at the top of the facing column,
+two pages in forty of one real volume) is boxed to the foot of the
+other column. :func:`trim_feet` moves a model column box's foot up to
+the lowest cell inside it, smaller only, by at least
+:data:`MIN_FOOT_TRIM_PX`, so a reader of the rows (the caption guess of
+``findings._caption_guess``, which may read no cell) can tell a blank
+half-column from one that holds the next caption. A page with no
+cells keeps its boxes, and a cell that runs out of the box (the blot
+along the bottom edge, where dots.mocr boxes it) holds the foot where
+it is, for ``blackletter.junk.cut_band_boxes`` to cut.
+
 Two callers share the rule, because they hold the boxes in different
 places: :func:`separate_rows` for the ``Detection`` rows, so the viewer
 overlay and ``detection_entries`` show what the geometry used, and
@@ -196,6 +210,43 @@ def inner_edges(
     return edge - nudge, edge + nudge
 
 
+#: A box is in a column when the column holds more than this of its
+#: width. The model's two boxes of a page overlap by a sliver at the
+#: gutter before the import separates them, and that sliver is the
+#: gutter, never one column.
+COLUMN_SHARE = 0.5
+
+
+def column_groups(spans: list[tuple[float, float]]) -> list[list[int]]:
+    """Group the boxes of a page into its columns, left to right.
+
+    A page's columns are groups of boxes, not boxes: a picture cuts
+    each column into a box above it and a box below it, and a curator
+    draws a box over a block at a column's foot. A box joins the column
+    to its left when that column holds more than :data:`COLUMN_SHARE`
+    of its width, so a sliver of overlap at the gutter opens the next
+    column. The gutter is read between the two groups, never between a
+    box and another box of its own column, and two boxes in one column
+    are no pair.
+
+    :param spans: ``(x0, x1)`` per box, in one space.
+    :returns: The positions of each group's boxes, left to right.
+    :rtype: list[list[int]]
+    """
+    groups: list[list[int]] = []
+    reach = None
+    for at in sorted(range(len(spans)), key=lambda i: spans[i][0]):
+        x0, x1 = spans[at]
+        inside = min(x1, reach) - x0 if reach is not None else 0.0
+        if groups and inside > (x1 - x0) * COLUMN_SHARE:
+            groups[-1].append(at)
+            reach = max(reach, x1)
+        else:
+            groups.append([at])
+            reach = x1
+    return groups
+
+
 def separate_rows(scan, cells: dict[int, PageCells]) -> int:
     """Separate the ``TEXT_COLUMN`` rows of a scan, in place.
 
@@ -226,33 +277,41 @@ def separate_rows(scan, cells: dict[int, PageCells]) -> int:
 
     changed, pairs = [], 0
     for page_index, rows in sorted(pages.items()):
-        if len(rows) != 2 or any(
+        groups = column_groups([(row.x0, row.x1) for row in rows])
+        if len(groups) != 2 or any(
             row.model_name == Detection.ModelName.MANUAL for row in rows
         ):
             continue
         pairs += 1
-        left, right = rows
-        width, height = float(left.img_width), float(left.img_height)
+        lefts = [rows[at] for at in groups[0]]
+        rights = [rows[at] for at in groups[1]]
+        width, height = float(lefts[0].img_width), float(lefts[0].img_height)
         if width <= 0 or height <= 0:
             continue
         edges = _edges_for(
-            (left.x0, left.x1),
-            (right.x0, right.x1),
+            (min(r.x0 for r in lefts), max(r.x1 for r in lefts)),
+            (min(r.x0 for r in rights), max(r.x1 for r in rights)),
             cells.get(page_index),
             width,
             height,
-            min(left.y0, right.y0),
-            max(left.y1, right.y1),
+            min(r.y0 for r in rows),
+            max(r.y1 for r in rows),
         )
         if edges is None:
             continue
         new_left, new_right = edges
-        if abs(new_left - left.x1) >= MIN_MOVE_PX:
-            left.x1 = round(new_left, 1)
-            changed.append(left)
-        if abs(new_right - right.x0) >= MIN_MOVE_PX:
-            right.x0 = round(new_right, 1)
-            changed.append(right)
+        # Inwards only, box by box: a box short of its column's edge
+        # keeps its own.
+        for left in lefts:
+            target = min(left.x1, new_left)
+            if abs(target - left.x1) >= MIN_MOVE_PX:
+                left.x1 = round(target, 1)
+                changed.append(left)
+        for right in rights:
+            target = max(right.x0, new_right)
+            if abs(target - right.x0) >= MIN_MOVE_PX:
+                right.x0 = round(target, 1)
+                changed.append(right)
     if changed:
         Detection.objects.bulk_update(changed, ["x0", "x1"], batch_size=500)
     _log(pairs, len(changed), "the rows")
@@ -279,45 +338,150 @@ def separate_document(document, cells: dict[int, PageCells]) -> int:
     moved = 0
     pages = 0
     for page in getattr(document, "pages", []):
-        indexed = sorted(
-            (
-                (position, det)
-                for position, det in enumerate(page.detections)
-                if det.label == Label.TEXT_COLUMN
-            ),
-            key=lambda pair: pair[1].bbox.x1,
-        )
-        if len(indexed) != 2:
+        indexed = [
+            (position, det)
+            for position, det in enumerate(page.detections)
+            if det.label == Label.TEXT_COLUMN
+        ]
+        groups = column_groups([(d.bbox.x1, d.bbox.x2) for _, d in indexed])
+        if len(groups) != 2:
             continue
         pages += 1
-        (left_at, left), (right_at, right) = indexed
+        lefts = [indexed[at] for at in groups[0]]
+        rights = [indexed[at] for at in groups[1]]
         width, height = float(page.img_width), float(page.img_height)
         if width <= 0 or height <= 0:
             continue
+        boxes = [d.bbox for _, d in indexed]
         edges = _edges_for(
-            (left.bbox.x1, left.bbox.x2),
-            (right.bbox.x1, right.bbox.x2),
+            (
+                min(d.bbox.x1 for _, d in lefts),
+                max(d.bbox.x2 for _, d in lefts),
+            ),
+            (
+                min(d.bbox.x1 for _, d in rights),
+                max(d.bbox.x2 for _, d in rights),
+            ),
             cells.get(page.index),
             width,
             height,
-            min(left.bbox.y1, right.bbox.y1),
-            max(left.bbox.y2, right.bbox.y2),
+            min(b.y1 for b in boxes),
+            max(b.y2 for b in boxes),
         )
         if edges is None:
             continue
         new_left, new_right = edges
-        if abs(new_left - left.bbox.x2) >= MIN_MOVE_PX:
-            page.detections[left_at] = replace(
-                left, bbox=replace(left.bbox, x2=round(new_left, 1))
-            )
-            moved += 1
-        if abs(new_right - right.bbox.x1) >= MIN_MOVE_PX:
-            page.detections[right_at] = replace(
-                right, bbox=replace(right.bbox, x1=round(new_right, 1))
-            )
-            moved += 1
+        # Inwards only, box by box, the rule of ``separate_rows``.
+        for left_at, left in lefts:
+            target = min(left.bbox.x2, new_left)
+            if abs(target - left.bbox.x2) >= MIN_MOVE_PX:
+                page.detections[left_at] = replace(
+                    left, bbox=replace(left.bbox, x2=round(target, 1))
+                )
+                moved += 1
+        for right_at, right in rights:
+            target = max(right.bbox.x1, new_right)
+            if abs(target - right.bbox.x1) >= MIN_MOVE_PX:
+                page.detections[right_at] = replace(
+                    right, bbox=replace(right.bbox, x1=round(target, 1))
+                )
+                moved += 1
     _log(pages, moved, "the document")
     return moved
+
+
+#: The least a column foot moves up for, in pixels of the render the
+#: boxes are in. A line of print and its gap is about 45 px at 200 dpi,
+#: and the model boxes a column's last line a little long; under this
+#: the box is right, above it the column is boxed past its print.
+MIN_FOOT_TRIM_PX = 60.0
+
+
+def text_foot(
+    box: tuple[float, float, float, float],
+    cells: PageCells | None,
+    width: float,
+    height: float,
+) -> float | None:
+    """Return where the print inside a column box ends.
+
+    The foot of the lowest cell whose centre is inside the box's width
+    and that overlaps the box's height, held inside the box, in pixels
+    of the render the box is in.
+
+    :param box: The box's ``(x0, y0, x1, y1)``, in render pixels.
+    :param cells: The page's cells, or None.
+    :param width: The render width, in pixels.
+    :param height: The render height, in pixels.
+    :returns: The foot, or None when the page has no cells or the box
+        holds none.
+    :rtype: float | None
+    """
+    if (
+        cells is None
+        or not cells.boxes
+        or cells.width <= 0
+        or cells.height <= 0
+    ):
+        return None
+    x0, y0, x1, y1 = box
+    sx, sy = width / cells.width, height / cells.height
+    foot = None
+    for cx0, cy0, cx1, cy1 in cells.boxes:
+        centre = (cx0 + cx1) / 2 * sx
+        if not x0 <= centre <= x1:
+            continue
+        top, bottom = cy0 * sy, cy1 * sy
+        if bottom <= y0 or top >= y1:
+            continue
+        bottom = min(bottom, y1)
+        if foot is None or bottom > foot:
+            foot = bottom
+    return foot
+
+
+def trim_feet(scan, cells: dict[int, PageCells]) -> int:
+    """Trim the ``TEXT_COLUMN`` rows of a scan to their print, in place.
+
+    Model rows only, smaller only, and a page with no cells keeps its
+    boxes. The rows are what ``services.detection_entries`` hands every
+    reader of the geometry and what the viewer draws, like the gutter.
+
+    :param scan: The scan.
+    :param cells: The cells of each page, ``text_fit.page_cells``.
+    :returns: How many rows were written.
+    :rtype: int
+    """
+    from scanning.models import Detection
+
+    changed, read = [], 0
+    for row in (
+        Detection.objects.live()
+        .filter(scan=scan, label="TEXT_COLUMN")
+        .exclude(model_name=Detection.ModelName.MANUAL)
+    ):
+        page = cells.get(row.page_index)
+        if page is None:
+            continue
+        width, height = float(row.img_width), float(row.img_height)
+        if width <= 0 or height <= 0:
+            continue
+        read += 1
+        foot = text_foot((row.x0, row.y0, row.x1, row.y1), page, width, height)
+        if foot is None or row.y1 - foot < MIN_FOOT_TRIM_PX:
+            continue
+        row.y1 = round(foot, 1)
+        changed.append(row)
+    if changed:
+        Detection.objects.bulk_update(changed, ["y1"], batch_size=500)
+    if read:
+        logger.info(
+            "column foot: %d column box(es) read against the cells, %d "
+            "trimmed to the print",
+            read,
+            len(changed),
+        )
+    return len(changed)
 
 
 def _edges_for(

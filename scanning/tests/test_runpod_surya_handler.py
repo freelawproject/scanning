@@ -46,7 +46,7 @@ from unittest import mock
 from django.test import SimpleTestCase
 from PIL import Image
 
-from scanning import runpod_common
+from scanning import perpendiculars, runpod_common
 
 _HANDLER_PATH = (
     Path(__file__).resolve().parent.parent / "runpod-surya" / "handler.py"
@@ -64,6 +64,8 @@ def _load_handler():
         # The real shared module, under the top-level name the worker
         # image gives it: the Dockerfile copies it next to handler.py.
         "runpod_common": runpod_common,
+        # The perpendiculars whiteout, copied next to the handler too.
+        "perpendiculars": perpendiculars,
     }
     # ``shutil.which("nvidia-smi")`` -> None makes ``_preload()`` take
     # the no-GPU path regardless of the machine running the tests.
@@ -424,7 +426,9 @@ class TestSuryaConfiguration(SimpleTestCase):
 
     def test_serve_command_carries_the_kit_flags(self):
         cmd = handler._vllm_command()
-        self.assertEqual(cmd[:3], ["vllm", "serve", "datalab-to/surya-ocr-2"])
+        self.assertEqual(
+            cmd[:3], ["vllm", "serve", "freelawproject/surya-ocr-2"]
+        )
         flags = {}
         rest = cmd[3:]
         for i, token in enumerate(rest):

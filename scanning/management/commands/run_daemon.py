@@ -14,6 +14,10 @@ Current schedule:
   (default 15s)
 - ``cleanup_processing_tmp`` every ``PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS``
   seconds (default 900s)
+- ``score_bad_pages`` every ``DAEMON_BADPAGE_INTERVAL`` seconds
+  (default 30s): the bad-page score of one volume (#436)
+- ``cut_opinion_figures`` every ``DAEMON_OPINION_FIGURE_INTERVAL``
+  seconds (default 10s): the pictures of one opinion's text (#463)
 - ``build_opinion_pdfs`` every ``DAEMON_OPINION_PDF_INTERVAL`` seconds
   (default 5s), last in the tick: one redacted opinion PDF per run
   (#336)
@@ -23,7 +27,15 @@ the local mirror of every scan in ``REDACTION_REVIEW_DONE``. The PDF
 pass keeps its inputs between ticks on purpose, and a crash leaves them
 behind; no worker runs at start, so nothing is in use.
 
-Known limitation: the loop is serial, so a long task delays the others
+With ``CELERY_ENABLED`` on (#503) the loop is the clock and runs no
+pass itself: on each entry's interval it sends the tick task of
+``scanning.tasks.TICKS`` to the workers, which run the passes on the
+queues of ``scanning.celery_init``. The schedule, the signal handling
+and the deployment stay; the shutdown re-queues nothing, because the
+workers hold the scans, and the mirror release at start is the
+``opinions`` worker's. The daemon's own passes never block the clock.
+
+Known limitation of the serial mode: a long task delays the others
 by however long it runs -- a submit wave blocks scan claiming for the
 length of its slowest request, and a multi-minute pipeline run blocks
 job confirmation. Splitting the loop is issue #156; it needs
@@ -44,12 +56,15 @@ Examples:
 import logging
 import signal
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from django.conf import settings
 from django.core.management import call_command
 from django.core.management.base import BaseCommand
 from django.db import OperationalError
+
+from scanning import stopping
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +82,19 @@ class ScheduledTask:
     name: str
     interval_seconds: float
     last_ran: float = field(default=0.0)
+    #: What firing does: ``call_command(name)`` by default, or a tick
+    #: send under Celery (#503).
+    fire: Callable[[], object] | None = field(default=None, compare=False)
+
+    def run(self) -> None:
+        """Fire the task: the command, or the tick send.
+
+        :return: None.
+        """
+        if self.fire is not None:
+            self.fire()
+        else:
+            call_command(self.name)
 
     def due(self, now: float) -> bool:
         """Return True if the task should fire at ``now``.
@@ -122,12 +150,41 @@ class Command(BaseCommand):
                     settings.PROCESSING_TMP_CLEANUP_INTERVAL_SECONDS
                 ),
             ),
-            # Last, on purpose: the loop walks the list in order, and
-            # this one blocks it for one opinion's write (#336).
+            # Last three, on purpose: the loop walks the list in order,
+            # and these block it, one for a volume's bad-page score
+            # (#436), one for the pictures of an opinion's text (#463)
+            # and one for an opinion's write (#336).
+            ScheduledTask(
+                name="score_bad_pages",
+                interval_seconds=float(settings.DAEMON_BADPAGE_INTERVAL),
+            ),
+            ScheduledTask(
+                name="cut_opinion_figures",
+                interval_seconds=float(
+                    settings.DAEMON_OPINION_FIGURE_INTERVAL
+                ),
+            ),
             ScheduledTask(
                 name="build_opinion_pdfs",
                 interval_seconds=float(settings.DAEMON_OPINION_PDF_INTERVAL),
             ),
+        ]
+
+    def _build_celery_schedule(self) -> list[ScheduledTask]:
+        """Return the schedule of tick sends (#503).
+
+        :return: One entry per ``tasks.TICKS`` row, firing its send.
+        :rtype: list[ScheduledTask]
+        """
+        from scanning import tasks
+
+        return [
+            ScheduledTask(
+                name=tick.name,
+                interval_seconds=tick.interval(),
+                fire=tick.send,
+            )
+            for tick in tasks.TICKS
         ]
 
     def _release_at_start(self) -> None:
@@ -154,20 +211,30 @@ class Command(BaseCommand):
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
-        schedule = self._build_schedule()
+        self.celery = bool(settings.CELERY_ENABLED)
+        schedule = (
+            self._build_celery_schedule()
+            if self.celery
+            else self._build_schedule()
+        )
         intervals = ", ".join(
             f"{t.name}={t.interval_seconds:g}s" for t in schedule
         )
-        self.stdout.write(f"Daemon started. Schedule: {intervals}")
-        self._release_at_start()
+        mode = "sending ticks to Celery" if self.celery else "running passes"
+        self.stdout.write(f"Daemon started, {mode}. Schedule: {intervals}")
+        if not self.celery:
+            self._release_at_start()
 
         while not self.shutdown:
             now = time.monotonic()
             for task in schedule:
+                if self.shutdown:
+                    # The rest of the round would be killed half done.
+                    break
                 if not task.due(now):
                     continue
                 try:
-                    call_command(task.name)
+                    task.run()
                 except OperationalError as exc:
                     # Transient DB blip (e.g. a lost TLS handshake on a
                     # fresh connection). Self-recovering; log at WARNING so
@@ -188,10 +255,13 @@ class Command(BaseCommand):
     def _handle_signal(self, signum, frame):
         """Set the shutdown flag on receipt of a termination signal.
 
-        Also re-queues any PROCESSING scans so they retry on the next
-        daemon tick instead of waiting out ``DAEMON_PROCESSING_TIMEOUT``,
-        and reports the shutdown to Sentry to help diagnose unexpected
-        kills (deploys, OOM, container restarts).
+        Also asks the running pass to stop (``stopping.request``, #534):
+        the Mistral wave reads it between its uploads and hands its row
+        back before the grace period ends. Re-queues any PROCESSING
+        scans so they retry on the next daemon tick instead of waiting
+        out ``DAEMON_PROCESSING_TIMEOUT``, and reports the shutdown to
+        Sentry to help diagnose unexpected kills (deploys, OOM,
+        container restarts).
 
         :param signum: The signal number received.
         :param frame: The interrupted stack frame.
@@ -199,6 +269,12 @@ class Command(BaseCommand):
         """
         self.stdout.write(f"Received signal {signum}, shutting down...")
         self.shutdown = True
+        stopping.request()
+
+        if getattr(self, "celery", False):
+            # The workers hold the scans, and a worker's own shutdown
+            # finishes its task (acks late) or hands it back (#503).
+            return
 
         try:
             from scanning.models import Scan, Status

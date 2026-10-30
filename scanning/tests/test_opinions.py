@@ -8,15 +8,19 @@ Four groups:
   and the two stale cards;
 - the worker (``opinions.run``): where it parks the scan;
 - the approval and the daemon: the queue and the dispatch;
-- the promotion to the text review (#365).
+- the promotion to the text review (#365);
+- the deletion of the glues of the old revisions (#452).
 """
 
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 
-from scanning import apply, opinions, review_states
+from scanning import apply, opinions, review_states, s3_sync
 from scanning.factories import (
     OpinionBoundaryFactory,
     OpinionFactory,
@@ -26,6 +30,7 @@ from scanning.factories import (
 from scanning.management.commands.process_next_scan import Command
 from scanning.models import (
     ApplyRun,
+    Issue,
     Opinion,
     OpinionBoundary,
     OpinionCheck,
@@ -35,6 +40,7 @@ from scanning.models import (
     Scan,
     Status,
 )
+from scanning.tests.test_findings import make_detection, make_redaction
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -392,6 +398,9 @@ class TestCreateRows(TestCase):
         summary = self._create()
 
         self.assertEqual((summary.created, summary.updated), (0, 1))
+        # Another run is another page map and another set of documents:
+        # the inputs moved, so the revision does.
+        self.assertEqual(summary.rebuilt, 1)
         one.refresh_from_db()
         self.assertEqual((one.start_page_index, one.end_page_index), (3, 4))
         self.assertEqual(one.apply_run_id, later.pk)
@@ -537,11 +546,317 @@ class TestCreateRows(TestCase):
 
         self.assertEqual(
             summary.message,
-            "3 opinion(s): 2 new, 1 updated, 1 without a boundary.",
+            "3 opinion(s): 2 new, 1 updated, 0 rebuilt, 1 without a boundary.",
         )
         self.assertEqual(
             opinions.Summary(created=1).message,
-            "1 opinion(s): 1 new, 0 updated.",
+            "1 opinion(s): 1 new, 0 updated, 0 rebuilt.",
+        )
+
+
+class TestTheInputDigest(TestCase):
+    """A matched row keeps its revision while its inputs stand still.
+
+    Two opinions on a six-page volume: A over pages 0-2, B over 3-5. A
+    change on one page of B moves B's digest and no other, so the
+    creation rebuilds B alone; the same rows twice rebuild nothing.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=6, source_fingerprint="fp1")
+        self.apply_run = make_run(self.scan)
+        self.printed = printed_document(
+            *[(str(500 + i), "single") for i in range(6)]
+        )
+        make_boundary(self.scan, self.apply_run, 0, 2)
+        make_boundary(self.scan, self.apply_run, 3, 5)
+        self._create()
+        self.a, self.b = Opinion.objects.filter(scan=self.scan).order_by(
+            "first_printed_page"
+        )
+        # The daemon wrote both rows' glues at the first revision.
+        for row in (self.a, self.b):
+            Opinion.objects.filter(pk=row.pk).update(
+                ocr_glue_revision=row.glue_revision,
+                ensemble_revision=row.glue_revision,
+                redacted_pdf_revision=row.glue_revision,
+                status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+            )
+
+    def _create(self):
+        rows = opinions.live_boundaries(self.scan)
+        return opinions.create_rows(
+            self.scan, self.apply_run, rows, self.printed
+        )
+
+    def revisions(self) -> tuple[int, int]:
+        self.a.refresh_from_db()
+        self.b.refresh_from_db()
+        return self.a.glue_revision, self.b.glue_revision
+
+    def test_the_first_creation_stamps_the_digest(self):
+        self.assertTrue(self.a.input_digest)
+        self.assertTrue(self.b.input_digest)
+        self.assertNotEqual(self.a.input_digest, self.b.input_digest)
+
+    def test_the_same_rows_rebuild_nothing(self):
+        before = self.revisions()
+
+        summary = self._create()
+
+        self.assertEqual((summary.updated, summary.rebuilt), (2, 0))
+        self.assertEqual(self.revisions(), before)
+        self.a.refresh_from_db()
+        self.assertEqual(
+            self.a.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+        self.assertEqual(self.a.redacted_pdf_revision, self.a.glue_revision)
+
+    def test_an_unbuilt_row_stays_due_through_an_unchanged_creation(self):
+        """A volume sent back before its opinions were built, and
+        approved again with nothing changed: the rows keep their
+        revision, and the ones whose stamps were behind are still owed,
+        because what is owed is read off the stamps, never off the
+        creation."""
+        from scanning import opinion_ocr, opinion_pdf
+
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.PROCESSING,
+            ocr_glue_revision=None,
+            ensemble_revision=None,
+            redacted_pdf_revision=None,
+        )
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        before = self.revisions()
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 0)
+        self.assertEqual(self.revisions(), before)
+        self.b.refresh_from_db()
+        self.assertEqual(self.b.status, OpinionReviewStatus.PROCESSING)
+        self.assertIn(self.b, opinion_ocr.due())
+        self.assertIn(self.b, opinion_pdf.owed())
+        self.assertNotIn(self.a, opinion_ocr.due())
+        self.assertNotIn(self.a, opinion_pdf.owed())
+
+    def test_a_redaction_on_one_page_rebuilds_that_opinion_alone(self):
+        a_before, b_before = self.revisions()
+        make_redaction(self.scan, page_index=4)
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before, b_before + 1))
+        self.a.refresh_from_db()
+        self.assertEqual(
+            self.a.status, OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+    def test_a_moved_margin_strip_rebuilds_its_page_alone(self):
+        strip = make_redaction(
+            self.scan, page_index=1, rect_type="margin", fill="white", x1=40.0
+        )
+        self._create()
+        a_before, b_before = self.revisions()
+        strip.x1 = 60.0
+        strip.save(update_fields=["x1"])
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+
+    def test_a_detection_on_one_page_rebuilds_that_opinion_alone(self):
+        a_before, b_before = self.revisions()
+        make_detection(
+            self.scan, "HEADNOTE", page_index=5, apply_run=self.apply_run
+        )
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before, b_before + 1))
+
+    def test_a_moved_anchor_rebuilds(self):
+        a_before, b_before = self.revisions()
+        boundary = OpinionBoundary.objects.get(
+            scan=self.scan, start_page_index=0
+        )
+        boundary.start_y = boundary.start_y + 50
+        boundary.save(update_fields=["start_y"])
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+
+    def test_a_row_from_before_the_rule_is_rebuilt_once(self):
+        a_before, b_before = self.revisions()
+        Opinion.objects.filter(pk=self.a.pk).update(input_digest="")
+
+        first = self._create()
+        second = self._create()
+
+        self.assertEqual((first.rebuilt, second.rebuilt), (1, 0))
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+
+    def test_an_error_row_is_rebuilt_whatever_its_digest(self):
+        a_before, b_before = self.revisions()
+        Opinion.objects.filter(pk=self.a.pk).update(
+            status=OpinionReviewStatus.ERROR
+        )
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+        self.a.refresh_from_db()
+        self.assertEqual(self.a.status, OpinionReviewStatus.PROCESSING)
+
+    def test_an_approved_row_keeps_its_digest_until_a_text_reopen(self):
+        """Boxes move under an approved opinion: it keeps its glues and
+        the digest they were built from, so the first creation after
+        the text reopen sees the move and rebuilds it then."""
+        a_before, b_before = self.revisions()
+        built_from = self.b.input_digest
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        make_redaction(self.scan, page_index=4)
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 0)
+        self.assertEqual(self.revisions(), (a_before, b_before))
+        self.b.refresh_from_db()
+        self.assertEqual(self.b.input_digest, built_from)
+
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before, b_before + 1))
+
+    def test_a_live_detection_of_another_run_counts(self):
+        """The PDF's masks and picture rects read every live detection
+        of the page, whatever its run: one withdrawn moves the PDF."""
+        row = make_detection(self.scan, "IMAGE", page_index=1)
+        self._create()
+        a_before, b_before = self.revisions()
+        # The withdrawal's own write: ``active`` is what ``live`` reads.
+        row.active = False
+        row.withdrawn_at = timezone.now()
+        row.save(update_fields=["active", "withdrawn_at"])
+
+        summary = self._create()
+
+        self.assertEqual(summary.rebuilt, 1)
+        self.assertEqual(self.revisions(), (a_before + 1, b_before))
+
+    def test_the_backfill_stamps_step_three_alone(self):
+        """``stamp_opinion_digests``: a blank digest is written on a
+        step-3 volume and no revision moves; a volume sent back to step
+        2 is refused, named or not."""
+        Opinion.objects.filter(scan=self.scan).update(input_digest="")
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        before = self.revisions()
+        out, err = StringIO(), StringIO()
+
+        with (
+            patch.object(
+                apply, "load_printed_pages", return_value=self.printed
+            ),
+            patch.object(
+                review_states, "final_run", return_value=self.apply_run
+            ),
+        ):
+            call_command("stamp_opinion_digests", "--dry-run", stdout=out)
+            self.a.refresh_from_db()
+            self.assertEqual(self.a.input_digest, "")
+            self.assertIn("would stamp 2", out.getvalue())
+
+            call_command("stamp_opinion_digests", stdout=out)
+            self.a.refresh_from_db()
+            self.assertTrue(self.a.input_digest)
+            self.assertEqual(self.revisions(), before)
+            self.assertEqual(self._create().rebuilt, 0)
+
+            Opinion.objects.filter(scan=self.scan).update(input_digest="")
+            self.scan.status = Status.READY_FOR_REDACTION_REVIEW
+            self.scan.save(update_fields=["status"])
+            call_command("stamp_opinion_digests", stdout=out, stderr=err)
+            call_command(
+                "stamp_opinion_digests",
+                str(self.scan.pk),
+                stdout=out,
+                stderr=err,
+            )
+            self.a.refresh_from_db()
+            self.assertEqual(self.a.input_digest, "")
+            self.assertIn("not in step 3", err.getvalue())
+
+    def test_the_digest_does_not_read_the_order_of_the_rows(self):
+        boundary = OpinionBoundary.objects.get(
+            scan=self.scan, start_page_index=0
+        )
+        lookup = opinions.printed_lookup(self.printed)
+        rows = opinions.ScanRows(
+            redactions={
+                0: [
+                    ("headnote", "black", 1.0, 2.0, 3.0, 4.0),
+                    ("margin", "white", 0.0, 0.0, 9.0, 9.0),
+                ]
+            },
+            detections={
+                1: [
+                    ("HEADNOTE", 1.0, 1.0, 2.0, 2.0, 0.9, 1700, 2200),
+                    ("TEXT_COLUMN", 0.0, 0.0, 9.0, 9.0, 0.95, 1700, 2200),
+                ]
+            },
+        )
+        shuffled = opinions.ScanRows(
+            redactions={0: list(reversed(rows.redactions[0]))},
+            detections={1: list(reversed(rows.detections[1]))},
+        )
+        elsewhere = opinions.ScanRows(
+            redactions={5: rows.redactions[0]}, detections={}
+        )
+
+        same = opinions.input_digest(boundary, self.apply_run, rows, lookup)
+
+        self.assertEqual(
+            same,
+            opinions.input_digest(boundary, self.apply_run, shuffled, lookup),
+        )
+        self.assertNotEqual(
+            same,
+            opinions.input_digest(boundary, self.apply_run, elsewhere, lookup),
+        )
+
+    def test_a_late_engine_moves_no_digest(self):
+        """A run that gains a Mistral and a Surya key gives the same
+        digest: an engine moves the text and never the PDF, which the
+        creation never carries, so it reaches the opinions through
+        ``reglue_opinion_ocr`` alone."""
+        boundary = OpinionBoundary.objects.get(
+            scan=self.scan, start_page_index=0
+        )
+        rows = opinions.read_rows(self.scan, self.apply_run)
+        lookup = opinions.printed_lookup(self.printed)
+        before = opinions.input_digest(boundary, self.apply_run, rows, lookup)
+
+        self.apply_run.extract_key = "jobs/apply/a1/extract-volume.json"
+        self.apply_run.surya_key = "jobs/apply/a1/surya-volume.json"
+
+        self.assertEqual(
+            opinions.input_digest(boundary, self.apply_run, rows, lookup),
+            before,
         )
 
 
@@ -817,9 +1132,10 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (2, 0)})
+        self.assertEqual(counts, {self.opinion.pk: (2, 0, 0)})
 
-    def test_a_stale_finding_counts_twice(self):
+    def test_a_stale_finding_counts_three_times(self):
+        """Open, stale, and blocking: no dismissal answers it (#375)."""
         OpinionFindingFactory(
             opinion=self.opinion,
             page_in_opinion=None,
@@ -828,7 +1144,7 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (1, 1)})
+        self.assertEqual(counts, {self.opinion.pk: (1, 1, 1)})
 
     def test_a_dismissed_finding_does_not_count(self):
         dismissal = OpinionFindingDismissal.objects.create(
@@ -845,7 +1161,7 @@ class TestFindingCounts(TestCase):
 
         counts = opinions.finding_counts([self.opinion.pk])
 
-        self.assertEqual(counts, {self.opinion.pk: (1, 0)})
+        self.assertEqual(counts, {self.opinion.pk: (1, 0, 0)})
 
     def test_two_opinions_take_one_query(self):
         other = OpinionFactory(scan=self.scan)
@@ -855,8 +1171,33 @@ class TestFindingCounts(TestCase):
         with self.assertNumQueries(1):
             counts = opinions.finding_counts([self.opinion.pk, other.pk])
 
-        self.assertEqual(counts[self.opinion.pk], (1, 0))
-        self.assertEqual(counts[other.pk], (1, 0))
+        self.assertEqual(counts[self.opinion.pk], (1, 0, 0))
+        self.assertEqual(counts[other.pk], (1, 0, 0))
+
+    def test_an_open_error_card_blocks_and_a_dismissed_one_does_not(self):
+        """The badge counts the gate of the approval (#375)."""
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.NO_MAJORITY,
+            severity=Issue.Severity.ERROR,
+        )
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+        )
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+            severity=Issue.Severity.ERROR,
+            dismissal=dismissal,
+        )
+
+        counts = opinions.finding_counts([self.opinion.pk])
+
+        self.assertEqual(counts, {self.opinion.pk: (1, 0, 1)})
 
 
 class TestTheTextReviewPromotion(TestCase):
@@ -991,8 +1332,12 @@ class TestTheTextReviewPromotion(TestCase):
         """The collect tick is serial, the rule of the other passes."""
         self.ready()
         for index in range(3):
+            # The page of ``self.opinion`` at another index: a fixed
+            # page number can meet the factory's sequence.
             other = OpinionFactory(
-                scan=self.scan, first_printed_page=700 + index
+                scan=self.scan,
+                first_printed_page=self.opinion.first_printed_page,
+                index_in_page=self.opinion.index_in_page + 1 + index,
             )
             Opinion.objects.filter(pk=other.pk).update(
                 redacted_pdf_revision=other.glue_revision,
@@ -1052,3 +1397,129 @@ class TestTheTextReviewPromotion(TestCase):
 
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.status, OpinionReviewStatus.PROCESSING)
+
+
+class TestThePruneOfOldGlues(TestCase):
+    """The glues of a revision below the live one are deleted (#452).
+
+    The bucket is a list of keys; ``list_keys`` and ``delete_objects``
+    are the two calls the prune makes.
+    """
+
+    def setUp(self):
+        self.scan = ScanFactory(status=Status.REDACTION_REVIEW_DONE)
+        self.opinion = OpinionFactory(scan=self.scan)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            glue_revision=2,
+            redacted_pdf_revision=2,
+            ocr_glue_revision=2,
+            ensemble_revision=2,
+        )
+        self.opinion.refresh_from_db()
+        self.root = (
+            f"{s3_sync.s3_processing_prefix(self.scan)}"
+            f"{self.opinion.object_prefix}"
+        )
+        self.old = [
+            f"{self.root}r0/redacted.pdf",
+            f"{self.root}r0/dots_mocr.json",
+            f"{self.root}r1/manifest.json",
+            f"{self.root}r1/ensemble.e3.json",
+        ]
+        self.kept = [
+            f"{self.root}r2/redacted.pdf",
+            f"{self.root}r2/ensemble.json",
+            f"{self.root}r10/redacted.pdf",
+            f"{self.root}approved/r0.e0.j1.t20261001T000000000000Z.json",
+            f"{self.root}tag/input-abc.json",
+        ]
+        self.listing: list[str] | None = self.old + self.kept
+        self.deleted: list[str] = []
+        for target, side in (
+            ("scanning.s3_sync.list_keys", lambda prefix: self.listing),
+            ("scanning.s3_sync.delete_objects", self.delete_objects),
+        ):
+            patcher = patch(target, side_effect=side)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def delete_objects(self, keys):
+        self.deleted.extend(keys)
+        return len(keys)
+
+    def test_the_older_revisions_go_and_nothing_else(self):
+        keys = opinions.prune_glues(self.opinion)
+
+        self.assertEqual(sorted(keys), sorted(self.old))
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_a_dry_run_deletes_nothing(self):
+        keys = opinions.prune_glues(self.opinion, dry_run=True)
+
+        self.assertEqual(sorted(keys), sorted(self.old))
+        self.assertEqual(self.deleted, [])
+
+    def test_a_failed_listing_deletes_nothing(self):
+        self.listing = None
+
+        self.assertIsNone(opinions.prune_glues(self.opinion))
+        self.assertEqual(self.deleted, [])
+
+    def test_the_promotion_prunes(self):
+        self.assertTrue(opinions.promote_ready(self.opinion))
+
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_a_first_revision_is_promoted_with_no_listing(self):
+        """Nothing is older than revision 0, so the tick lists nothing."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            glue_revision=0,
+            redacted_pdf_revision=0,
+            ocr_glue_revision=0,
+            ensemble_revision=0,
+        )
+        self.opinion.refresh_from_db()
+
+        with patch("scanning.s3_sync.list_keys") as list_keys:
+            self.assertTrue(opinions.promote_ready(self.opinion))
+
+        list_keys.assert_not_called()
+
+    def test_a_row_that_is_not_promoted_prunes_nothing(self):
+        """A live revision that is not complete keeps the last one."""
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            redacted_pdf_revision=1
+        )
+        self.opinion.refresh_from_db()
+
+        self.assertFalse(opinions.promote_ready(self.opinion))
+        self.assertEqual(self.deleted, [])
+
+    def run_command(self, *args):
+        out = StringIO()
+        call_command("prune_opinion_glues", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def test_the_command_prunes_a_complete_row_and_an_approved_one(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        output = self.run_command(str(self.scan.pk))
+
+        self.assertIn("deleted 4 object(s)", output)
+        self.assertEqual(sorted(self.deleted), sorted(self.old))
+
+    def test_the_command_skips_a_row_whose_revision_is_not_complete(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(ensemble_revision=1)
+
+        output = self.run_command("--all")
+
+        self.assertIn("Deleted 0 object(s)", output)
+        self.assertEqual(self.deleted, [])
+
+    def test_the_command_dry_run_counts(self):
+        output = self.run_command(str(self.scan.pk), "--dry-run")
+
+        self.assertIn("would delete 4 object(s)", output)
+        self.assertEqual(self.deleted, [])

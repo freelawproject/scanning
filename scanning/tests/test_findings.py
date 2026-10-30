@@ -12,11 +12,12 @@ import json
 from io import StringIO
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.core.management import call_command
 from django.urls import reverse
 from django.utils import timezone
 
-from scanning import findings
+from scanning import detections, findings
 from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
     BUSY_STATUSES,
@@ -41,12 +42,19 @@ FINGERPRINT = "10:4"
 def make_detection(scan, label, page_index=0, **fields):
     """Create one live model detection.
 
+    A key icon is drawn with a key's shape (240 by 90 pixels, the icon
+    of a reporter page at 200 dpi), because ``blackletter.scanner.key_icons``
+    reads a box as a key only inside blackletter's ratio window and
+    near the volume's median size; a square is no key to the pairing
+    or to the cards. An override that moves a key keeps its shape.
+
     :param scan: The scan.
     :param label: The class label.
     :param page_index: The 0-based page.
     :param fields: Overrides.
     :returns: The row.
     """
+    key = label == "KEY_ICON"
     values = {
         "scan": scan,
         "page_index": page_index,
@@ -57,8 +65,8 @@ def make_detection(scan, label, page_index=0, **fields):
         "confidence": 0.9,
         "x0": 100.0,
         "y0": 100.0,
-        "x1": 200.0,
-        "y1": 200.0,
+        "x1": 340.0 if key else 200.0,
+        "y1": 190.0 if key else 200.0,
         "img_width": 1700,
         "img_height": 2200,
         "model_name": Detection.ModelName.BL_WARM,
@@ -166,7 +174,7 @@ class TestRebuild(ScanningTestCase):
         scan = make_scan()
         caption = make_detection(scan, "CASE_CAPTION", 0)
         key = make_detection(scan, "KEY_ICON", 1)
-        loose = make_detection(scan, "KEY_ICON", 2, x0=300.0, x1=400.0)
+        loose = make_detection(scan, "KEY_ICON", 2, x0=300.0, x1=540.0)
         make_boundary(scan, caption, key)
 
         findings.rebuild(scan)
@@ -177,9 +185,187 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(row.target, Issue.Target.DETECTION)
         self.assertEqual(row.page_number, 3)
         self.assertEqual(row.metadata["detection_id"], loose.pk)
-        self.assertEqual(row.metadata["bbox"], [300.0, 100.0, 400.0, 200.0])
+        self.assertEqual(row.metadata["bbox"], [300.0, 100.0, 540.0, 190.0])
         self.assertEqual(row.metadata["source_page"], 3)
         self.assertEqual(row.severity, Issue.Severity.WARNING)
+
+    def test_a_key_inside_an_opinion_with_no_caption_after_it_is_a_missing_caption(
+        self,
+    ):
+        """The pairing let the opinion before run on to the next key
+        (blackletter 0.4.4), so the key inside the span is the error
+        card, placed under the key in its column, naming the opinion
+        that runs on."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        span = make_boundary(scan, caption, key)
+        inside = make_detection(scan, "KEY_ICON", 1, y0=300.0, y1=390.0)
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            1,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=2000.0,
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(checks_of(scan), [CheckName.MISSING_CAPTION])
+        row = scan.issues.get(check_name=CheckName.MISSING_CAPTION)
+        self.assertEqual(row.severity, Issue.Severity.ERROR)
+        self.assertEqual(row.target, Issue.Target.BOUNDARY)
+        self.assertEqual(row.page_number, 2)
+        self.assertEqual(row.metadata["runs_on"], span.pk)
+        self.assertEqual(row.metadata["key_page_index"], 1)
+        self.assertEqual(
+            row.metadata["key_bbox"], [100.0, 300.0, 340.0, 390.0]
+        )
+        self.assertNotIn("detection_id", row.metadata)
+        # Under the key, half a key height down, the column's width,
+        # to the column's foot.
+        self.assertEqual(row.metadata["bbox"], [90.0, 435.0, 800.0, 2000.0])
+        self.assertEqual(row.metadata["source_page"], 2)
+        self.assertIn(f"page {inside.page_index + 1}", row.message)
+
+    def test_the_guess_keeps_off_the_case_number_and_the_next_key(self):
+        """A column of orders: the case number sits at the top of the
+        caption and the next key icon ends it. The box starts a little
+        under the number and ends a little above the key, so the
+        curator who adds it trims nothing."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        span = make_boundary(scan, caption, key)
+        inside = make_detection(scan, "KEY_ICON", 1, y0=300.0, y1=390.0)
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            1,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=2000.0,
+        )
+        # The number of the next case, under the key, 440 to 470.
+        make_detection(
+            scan,
+            "CASE_SEQUENCE",
+            1,
+            label_id=int(Label.CASE_SEQUENCE),
+            x0=400.0,
+            y0=440.0,
+            x1=430.0,
+            y1=470.0,
+        )
+        # The key that closes that case, 1200 to 1290.
+        make_detection(
+            scan, "KEY_ICON", 1, x0=100.0, y0=1200.0, x1=340.0, y1=1290.0
+        )
+
+        findings.rebuild(scan)
+
+        rows = scan.issues.filter(check_name=CheckName.MISSING_CAPTION)
+        card = next(r for r in rows if r.metadata["key_bbox"][1] == inside.y0)
+        self.assertEqual(card.metadata["runs_on"], span.pk)
+        # Half a key height under the key is 435; the number ends at
+        # 470, and the box starts 0.05 key heights (4.5) under it; the
+        # next key starts at 1200, and the box ends 0.3 key heights
+        # (27) above it.
+        self.assertEqual(card.metadata["bbox"], [90.0, 474.5, 800.0, 1173.0])
+
+    def test_a_second_box_over_a_paired_key_is_an_unmatched_key(self):
+        """Two boxes over one icon: the pairing skipped the second, and
+        it is the warning, not a missed caption inside the opinion the
+        first one closes."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(
+            scan, "KEY_ICON", 3, x0=110.0, y0=95.0, x1=350.0, y1=185.0
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(checks_of(scan), [CheckName.UNMATCHED_KEY_ICON])
+
+    def test_a_caption_drawn_in_the_place_answers_the_card(self):
+        """A live caption box after the key, inside its column, is the
+        box the next compute starts the opinion on, so the card goes at
+        the rebuild; one below the column is a footnote the model called
+        a caption and answers nothing. The drawn box sits between two
+        paired keys, as on a real page, so it is no unmatched caption."""
+        scan = make_scan()
+        first_caption = make_detection(scan, "CASE_CAPTION", 0)
+        first_key = make_detection(
+            scan, "KEY_ICON", 0, x0=1000.0, x1=1240.0, y0=1000.0, y1=1090.0
+        )
+        make_boundary(scan, first_caption, first_key)
+        caption = make_detection(scan, "CASE_CAPTION", 1)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(scan, "KEY_ICON", 2, y0=300.0, y1=390.0)
+        # A sliver the size filter rejects, between the key and the
+        # caption: it is no key to the pairing, so it ends nothing.
+        make_detection(
+            scan, "KEY_ICON", 2, confidence=0.5, y0=420.0, y1=450.0, x1=250.0
+        )
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            2,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=90.0,
+            y0=50.0,
+            x1=800.0,
+            y1=1500.0,
+        )
+        drawn = make_detection(
+            scan,
+            "CASE_CAPTION",
+            2,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+            confidence=1.0,
+            x0=120.0,
+            y0=1700.0,
+            x1=500.0,
+            y1=1800.0,
+        )
+
+        findings.rebuild(scan)
+        self.assertEqual(checks_of(scan), [CheckName.MISSING_CAPTION])
+
+        Detection.objects.filter(pk=drawn.pk).update(y0=500.0, y1=700.0)
+        findings.rebuild(scan)
+        self.assertEqual(checks_of(scan), [])
+
+    def test_the_first_key_of_a_volume_with_no_caption_before_it(self):
+        """Before the first computed opinion the card sits on the key
+        itself: the pages before it belong to no opinion."""
+        scan = make_scan()
+        first = make_detection(scan, "KEY_ICON", 0)
+        caption = make_detection(scan, "CASE_CAPTION", 1)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+
+        findings.rebuild(scan)
+
+        # The page before the opinion is an uncovered run as well.
+        self.assertIn(CheckName.MISSING_CAPTION, checks_of(scan))
+        self.assertNotIn(CheckName.UNMATCHED_KEY_ICON, checks_of(scan))
+        row = scan.issues.get(check_name=CheckName.MISSING_CAPTION)
+        self.assertEqual(row.severity, Issue.Severity.ERROR)
+        self.assertEqual(row.page_number, 1)
+        self.assertEqual(row.metadata["bbox"], [100.0, 100.0, 340.0, 190.0])
+        self.assertNotIn("detection_id", row.metadata)
+        self.assertNotIn("runs_on", row.metadata)
+        self.assertEqual(row.metadata["source_page"], first.source_page)
 
     def test_a_dismissed_boundary_frees_its_key(self):
         scan = make_scan()
@@ -331,6 +517,127 @@ class TestRebuild(ScanningTestCase):
         findings.rebuild(scan)
 
         self.assertNotIn(CheckName.UNCOVERED_HEADNOTE, checks_of(scan))
+
+    def _bracket_scan(self):
+        """A scan with one computed boundary, so the measured checks run."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        return scan
+
+    def _low_brackets(self, scan):
+        return scan.issues.filter(
+            check_name=CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET
+        )
+
+    def test_a_bracket_under_the_gate_is_a_finding(self):
+        """#410: bl-warm redacts a bracket at 0.30 and above, and YOLO
+        keeps a box down to 0.20, so a box at 0.25 is drawn and not
+        redacted."""
+        scan = self._bracket_scan()
+        low = make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.30)
+
+        findings.rebuild(scan)
+
+        rows = self._low_brackets(scan)
+        self.assertEqual([r.metadata["detection_id"] for r in rows], [low.pk])
+        self.assertEqual(rows[0].target, Issue.Target.REDACTION)
+        self.assertEqual(rows[0].page_number, 2)
+        self.assertIn("0.25", rows[0].message)
+        self.assertIn("0.30", rows[0].message)
+
+    def test_a_volume_with_no_bl_warm_provenance_reads_the_legacy_gate(self):
+        """The compute reads the family off ``found_by`` (``rows_are_bl_warm``),
+        and a set with no provenance keeps the 0.50 gate."""
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0, found_by=[])
+        key = make_detection(scan, "KEY_ICON", 3, found_by=[])
+        make_boundary(scan, caption, key)
+        legacy = make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            1,
+            confidence=0.40,
+            model_name="",
+            found_by=[],
+        )
+        make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            2,
+            confidence=0.50,
+            model_name="",
+            found_by=[],
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(
+            [r.metadata["detection_id"] for r in self._low_brackets(scan)],
+            [legacy.pk],
+        )
+
+    def test_the_family_is_the_flag_the_compute_reads(self):
+        """A row with no ``model_name`` in a bl-warm volume is redacted
+        at 0.30, because the compute reads one flag off ``found_by``."""
+        scan = self._bracket_scan()
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.40, model_name=""
+        )
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_an_approval_or_a_deletion_answers_the_card(self):
+        """An approval writes 1.0 on the row, over the gate; a deletion
+        takes the box out."""
+        scan = self._bracket_scan()
+        approved = make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        deleted = make_detection(scan, "HEADNOTE_BRACKET", 2, confidence=0.25)
+        findings.rebuild(scan)
+        self.assertEqual(self._low_brackets(scan).count(), 2)
+        user = self.make_user()
+
+        detections.decide(scan, approved, DetectionDecision.Kind.APPROVE, user)
+        detections.decide(
+            scan, deleted, DetectionDecision.Kind.DEACTIVATE, user
+        )
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_hand_drawn_or_hidden_bracket_is_no_finding(self):
+        scan = self._bracket_scan()
+        make_detection(
+            scan,
+            "HEADNOTE_BRACKET",
+            1,
+            confidence=0.0,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+        )
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 2, confidence=0.25, active=False
+        )
+        make_detection(scan, "HEADNOTE", 2, confidence=0.25)
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_low_confidence_bracket_can_be_dismissed(self):
+        scan = self._bracket_scan()
+        make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
+        findings.rebuild(scan)
+        finding = self._low_brackets(scan).get()
+
+        findings.dismiss(scan, finding, self.make_user())
+        findings.rebuild(scan)
+
+        self.assertTrue(self._low_brackets(scan).get().is_dismissed)
 
     def test_the_rebuild_is_idempotent_and_leaves_review_1_alone(self):
         scan = make_scan()
@@ -521,7 +828,17 @@ class TestDismissals(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        self.loose = make_detection(self.scan, "KEY_ICON", 1)
+        # Past the span's end in reading order (the span ends in the
+        # right column of its last page): a key no opinion holds.
+        self.loose = make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
         self.finding = self.scan.issues.get(
             check_name=CheckName.UNMATCHED_KEY_ICON
@@ -531,9 +848,9 @@ class TestDismissals(ScanningTestCase):
         row = findings.dismiss(self.scan, self.finding, self.user)
 
         self.assertEqual(row.check_name, CheckName.UNMATCHED_KEY_ICON)
-        self.assertEqual(row.source_page, 2)
+        self.assertEqual(row.source_page, 4)
         self.assertEqual(row.label, "KEY_ICON")
-        self.assertEqual(row.target_bbox, [100.0, 100.0, 200.0, 200.0])
+        self.assertEqual(row.target_bbox, [1000.0, 1000.0, 1240.0, 1090.0])
         self.assertEqual(row.source_fingerprint, FINGERPRINT)
         self.assertEqual(row.author, self.user)
         self.finding.refresh_from_db()
@@ -561,7 +878,7 @@ class TestDismissals(ScanningTestCase):
 
     def test_a_box_that_moved_far_is_a_new_finding(self):
         findings.dismiss(self.scan, self.finding, self.user)
-        Detection.objects.filter(pk=self.loose.pk).update(x0=600.0, x1=700.0)
+        Detection.objects.filter(pk=self.loose.pk).update(x0=1300.0, x1=1540.0)
 
         findings.rebuild(self.scan)
 
@@ -695,7 +1012,15 @@ class TestFindingEndpoints(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        make_detection(self.scan, "KEY_ICON", 1)
+        make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
         self.finding = self.scan.issues.get(
             check_name=CheckName.UNMATCHED_KEY_ICON
@@ -805,7 +1130,7 @@ class TestFindingEndpoints(ScanningTestCase):
         data = response.json()
         self.assertEqual(data["open"], 1)
         # The same position label as the page, for the viewer to relabel.
-        self.assertIn('data-finding-page="1">p.2<', data["html"])
+        self.assertIn('data-finding-page="3">p.4<', data["html"])
         self.assertEqual(data["stale"], 0)
         self.assertIn(f'data-issue-id="{self.finding.pk}"', data["html"])
         self.assertIn("dismissFinding(", data["html"])
@@ -869,7 +1194,17 @@ class TestTheRebuildButton(ScanningTestCase):
         caption = make_detection(self.scan, "CASE_CAPTION", 0)
         key = make_detection(self.scan, "KEY_ICON", 3)
         make_boundary(self.scan, caption, key)
-        self.loose = make_detection(self.scan, "KEY_ICON", 1)
+        # Past the span's end in reading order (the span ends in the
+        # right column of its last page): a key no opinion holds.
+        self.loose = make_detection(
+            self.scan,
+            "KEY_ICON",
+            3,
+            x0=1000.0,
+            x1=1240.0,
+            y0=1000.0,
+            y1=1090.0,
+        )
         findings.rebuild(self.scan)
 
     def _rebuild(self):
@@ -1023,6 +1358,16 @@ class TestTheView(ScanningTestCase):
         # number over it from the page map, so both renders agree.
         self.assertIn('data-finding-page="2">p.3<', html)
         self.assertNotIn("Unmatched Key Icons", html)
+
+    def test_a_low_confidence_bracket_card_offers_the_detection_buttons(self):
+        """#410: the approval is the direct answer, so the card shows it."""
+        make_detection(self.scan, "HEADNOTE_BRACKET", 3, confidence=0.25)
+        findings.rebuild(self.scan)
+
+        html = self._page(2).content.decode()
+
+        self.assertIn("the next compute redacts the box", html)
+        self.assertEqual(html.count("deleteUnmatchedDetection(this)"), 2)
 
     def test_the_approve_button_asks_for_a_confirm_with_open_findings(self):
         response = self.client.get(

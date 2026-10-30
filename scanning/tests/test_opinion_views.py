@@ -7,6 +7,7 @@ pages keep their tests in ``test_views.py``, under their new names.
 
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.urls import reverse
 
 from scanning import stats
@@ -20,12 +21,14 @@ from scanning.factories import (
 )
 from scanning.models import (
     ApplyRun,
+    Issue,
     Opinion,
     OpinionCheck,
     OpinionFindingDismissal,
     OpinionReviewStatus,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -191,6 +194,49 @@ class TestOpinionList(ScanningTestCase):
         row = response.context["page_obj"][0]
         self.assertEqual((row.open_findings, row.stale_findings), (0, 0))
 
+    def tag(self, status=OpinionReviewStatus.TEXT_REVIEW_DONE):
+        """Give the opinion an approved text and its spans."""
+        key = "processing/1/jobs/opinions/412.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=status,
+            approved_text_key=key,
+            tagged_text_key=key,
+            tag_key="processing/1/jobs/opinions/412.0/tag/spans.json",
+        )
+
+    def xml_url(self):
+        return reverse(
+            "opinion_final_xml",
+            kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+        )
+
+    def test_a_tagged_opinion_links_its_final_xml(self):
+        self.tag()
+
+        response = self.client.get(
+            reverse("opinion_list"),
+            {"status": OpinionReviewStatus.TEXT_REVIEW_DONE},
+        )
+
+        self.assertContains(response, self.xml_url())
+
+    def test_an_opinion_with_no_spans_links_no_final_xml(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
+    def test_a_reopened_opinion_links_no_final_xml(self):
+        """The rule of the review page's link: the text review is done."""
+        self.tag(status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
     def test_the_badge_costs_no_query_per_row(self):
         """The count is one grouped query, whatever the row count."""
         for index in range(4):
@@ -209,6 +255,95 @@ class TestOpinionList(ScanningTestCase):
                 index_in_page=0,
             )
         with self.assertNumQueries(7):
+            self.client.get(reverse("opinion_list"))
+
+    def pictured(self):
+        """A run, and the opinion over its pages 3 to 5 (indexes 2-4)."""
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            apply_run=run, start_page_index=2, end_page_index=4
+        )
+        return run
+
+    def test_the_pictures_column_counts_review_2s_image_boxes(self):
+        run = self.pictured()
+        for page in (2, 4):
+            model_row(
+                self.scan,
+                apply_run=run,
+                page_index=page,
+                label="IMAGE",
+                label_id=int(Label.IMAGE),
+            )
+        # Outside the span, another label, and a box the curator
+        # dismissed: none of them is a picture of this opinion.
+        model_row(
+            self.scan, apply_run=run, page_index=5, label="IMAGE", label_id=8
+        )
+        model_row(self.scan, apply_run=run, page_index=3)
+        model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            active=False,
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        row = response.context["page_obj"][0]
+        self.assertEqual(row.pictures, 2)
+        self.assertContains(response, ">Pictures</th>")
+
+    def test_a_junk_box_is_no_picture(self):
+        """The column counts the glue's pictures: a box the junk rule
+        drops from every screen is not one."""
+        run = self.pictured()
+        row = model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+        )
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_an_opinion_with_no_picture_shows_a_dash(self):
+        self.pictured()
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_the_pictures_cost_one_query_per_page(self):
+        run = self.pictured()
+        for index in range(4):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=500 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
+            self.client.get(reverse("opinion_list"))
+
+        for index in range(20):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=600 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
 
@@ -289,23 +424,136 @@ class TestOpinionReview(ScanningTestCase):
         self.assertEqual(response.context["open_findings"], 0)
         self.assertContains(response, "dismissed")
 
-    def test_the_page_offers_no_write_control(self):
-        """The re-run of the ensemble is the one control of the page.
+    def dismiss_url(self, finding):
+        return reverse(
+            "dismiss_opinion_finding",
+            kwargs={
+                "pk": self.scan.pk,
+                "opinion_pk": self.opinion.pk,
+                "finding_pk": finding.pk,
+            },
+        )
 
-        The approval, the dismissal and the typing of a page come with
-        the review that closes an opinion. The header's sign-out form
-        is the only form of the page, so the test looks for a form that
-        posts to an opinion instead of for any form at all.
-        """
-        OpinionFindingFactory(opinion=self.opinion)
+    def test_an_open_card_offers_the_dismissal(self):
+        """The template writes the address the script posts (#419)."""
+        finding = OpinionFindingFactory(opinion=self.opinion)
 
         response = self.client.get(self.url)
 
-        body = response.content.decode()
-        self.assertNotIn('action="/opinions/', body)
-        self.assertNotIn("Dismiss", body)
-        self.assertNotIn("Undo", body)
-        self.assertNotIn("The opinion text is correct", body)
+        self.assertContains(
+            response, f'data-dismiss-url="{self.dismiss_url(finding)}"'
+        )
+        self.assertNotContains(response, "data-restore-url=")
+
+    def test_a_dismissed_card_offers_the_undo(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+        )
+        finding = OpinionFindingFactory(
+            opinion=self.opinion, dismissal=dismissal
+        )
+
+        response = self.client.get(self.url)
+
+        restore = reverse(
+            "restore_opinion_finding",
+            kwargs={
+                "pk": self.scan.pk,
+                "opinion_pk": self.opinion.pk,
+                "finding_pk": finding.pk,
+            },
+        )
+        self.assertContains(response, f'data-restore-url="{restore}"')
+        self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_a_stale_card_offers_no_dismissal(self):
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        response = self.client.get(self.url)
+
+        self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_an_opinion_not_ready_offers_no_dismissal(self):
+        """The endpoint refuses it, so the page offers no button (the
+        rule of the step-1 bar, #151)."""
+        for status in (
+            OpinionReviewStatus.PROCESSING,
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+            OpinionReviewStatus.ERROR,
+        ):
+            with self.subTest(status=status):
+                Opinion.objects.filter(pk=self.opinion.pk).update(
+                    status=status
+                )
+                OpinionFindingFactory(opinion=self.opinion)
+
+                response = self.client.get(self.url)
+
+                self.assertNotContains(response, "data-dismiss-url=")
+
+    def test_the_page_offers_no_approval(self):
+        """The approval comes with the review that closes an opinion
+        (#334)."""
+        response = self.client.get(self.url)
+
+        self.assertNotContains(response, "The opinion text is correct")
+
+    def test_the_cards_the_approval_waits_on_come_first(self):
+        """Two lists (#419): the ERROR and stale cards, then the
+        warnings, and a dismissed card at the end of its list."""
+        warning = OpinionFindingFactory(opinion=self.opinion)
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.NO_MAJORITY,
+        )
+        muted = OpinionFindingFactory(
+            opinion=self.opinion,
+            check_name=OpinionCheck.NO_MAJORITY,
+            severity=Issue.Severity.ERROR,
+            dismissal=dismissal,
+        )
+        error = OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=1,
+            check_name=OpinionCheck.SINGLE_ENGINE,
+            severity=Issue.Severity.ERROR,
+        )
+        stale = OpinionFindingFactory(
+            opinion=self.opinion,
+            page_in_opinion=None,
+            check_name=OpinionCheck.ORPHANED_OPINION,
+        )
+
+        response = self.client.get(self.url)
+
+        to_check = [row.pk for row in response.context["to_check"]]
+        self.assertEqual(to_check[-1], muted.pk)
+        self.assertEqual(set(to_check), {muted.pk, error.pk, stale.pk})
+        self.assertEqual(
+            [row.pk for row in response.context["warnings"]], [warning.pk]
+        )
+        self.assertEqual(response.context["open_to_check"], 2)
+        self.assertEqual(response.context["open_warnings"], 1)
+        self.assertContains(response, "Check these before the approval")
+        # The walk buttons count their cards through the cards
+        # endpoint: the numbers above are findings, and a page makes
+        # a card per open word or gap.
+        self.assertEqual(
+            response.context["cards_url"],
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+        self.assertContains(response, 'data-card-level="blocking"')
+        self.assertContains(response, 'data-card-level="warning"')
 
     def test_the_back_link_keeps_the_filters(self):
         response = self.client.get(self.url, {"scan": self.scan.pk})
@@ -611,9 +859,17 @@ class TestOpinionFileIndex(ScanningTestCase):
                 "surya.json",
                 "manifest.json",
                 "ensemble.json",
+                "approved.json",
+                "tags.json",
+                "final.xml",
+                "exported.xml",
             ],
         )
-        for entry in body["files"]:
+        # The approved text and the tagger's spans over it are outside
+        # the glue prefix (#272, #431), and blank before they exist; the
+        # final XML (#432) is built at each request and has no key, and
+        # its export (#408) is at a key of the two ids.
+        for entry in body["files"][:-4]:
             self.assertTrue(
                 entry["key"].endswith(
                     f"{self.opinion.glue_prefix}{entry['name']}"
@@ -696,6 +952,32 @@ class TestOpinionFileIndex(ScanningTestCase):
             ),
         )
 
+    def test_the_approved_text_is_listed_once_approved(self):
+        key = "processing/1/jobs/opinions/11.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=key
+        )
+
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertTrue(files["approved.json"]["written"])
+        self.assertEqual(files["approved.json"]["key"], key)
+        self.assertEqual(
+            files["approved.json"]["url"],
+            reverse(
+                "serve_opinion_approved_text",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+
+    def test_an_opinion_never_approved_lists_no_approved_url(self):
+        response = self.client.get(self.url)
+
+        files = {entry["name"]: entry for entry in response.json()["files"]}
+        self.assertFalse(files["approved.json"]["written"])
+        self.assertNotIn("url", files["approved.json"])
+
     def test_it_makes_no_s3_call(self):
         """Every fact is on the row, so the index answers anywhere."""
         with patch("scanning.s3_sync.object_exists") as exists:
@@ -703,6 +985,98 @@ class TestOpinionFileIndex(ScanningTestCase):
 
         self.assertEqual(response.status_code, 200)
         exists.assert_not_called()
+
+
+class TestServeOpinionApprovedText(ScanningTestCase):
+    """The route of the approved text of one opinion (#431)."""
+
+    KEY = "processing/1/jobs/opinions/11.0/approved/r0.e0.j1.t1.json"
+
+    def setUp(self):
+        self.client.force_login(self.make_user())
+        self.scan = ScanFactory()
+        self.opinion = OpinionFactory(scan=self.scan, first_printed_page=11)
+        self.enterContext(
+            patch("scanning.s3_sync.s3_active", return_value=True)
+        )
+
+    def url(self, scan=None):
+        return reverse(
+            "serve_opinion_approved_text",
+            kwargs={
+                "pk": (scan or self.scan).pk,
+                "opinion_pk": self.opinion.pk,
+            },
+        )
+
+    def approve(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            approved_text_key=self.KEY,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+        )
+
+    def test_an_approved_text_redirects_to_a_presigned_get(self):
+        self.approve()
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch(
+                "scanning.s3_sync.presign_get", return_value="https://s3/a"
+            ) as presign,
+        ):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "https://s3/a")
+        key, _ttl = presign.call_args.args
+        self.assertEqual(key, self.KEY)
+        self.assertIn(
+            f"scan-{self.scan.pk}-opinion-11.0-approved.json",
+            presign.call_args.kwargs["content_disposition"],
+        )
+
+    def test_a_reopened_opinion_serves_the_last_approved_text(self):
+        # A reopen keeps the key until the next approval (#375).
+        self.approve()
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.s3_sync.presign_get", return_value="https://s3/a"),
+        ):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+
+    def test_an_opinion_never_approved_is_a_404(self):
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_a_key_the_bucket_does_not_hold_is_a_404(self):
+        self.approve()
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_an_opinion_of_another_scan_is_a_404(self):
+        self.approve()
+
+        response = self.client.get(self.url(scan=ScanFactory()))
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_login_is_required(self):
+        self.client.logout()
+
+        response = self.client.get(self.url())
+
+        self.assertEqual(response.status_code, 302)
+        self.assertNotIn("s3", response["Location"])
 
 
 class TestTheStepThreeTab(ScanningTestCase):

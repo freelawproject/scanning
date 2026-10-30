@@ -6,7 +6,7 @@ carries its own status. So the PDF is one pass over the rows and not a
 schedule (``build_opinion_pdfs``, last in ``run_daemon``), the tick
 finds one row that owes its PDF, writes it, and stamps the row. One PDF
 per tick (:data:`PDFS_PER_TICK`), the rule of the Mistral wave
-(``mistral_ocr.MAX_SUBMITS_PER_TICK``), because the tick blocks the
+(``mistral_ocr.submits_per_tick``), because the tick blocks the
 serial scheduler for the whole write, and every other task
 (``process_next_scan``, the two job waves) waits for it. After the
 pulls that is a second or two of re-encoding. The first tick of a
@@ -176,8 +176,8 @@ class TransientFault(Exception):
 # ---------------------------------------------------------------------------
 
 
-def key(opinion: Opinion) -> str:
-    """Return the S3 key of the opinion's redacted PDF at the live revision.
+def key(opinion: Opinion, revision: int | None = None) -> str:
+    """Return the S3 key of the opinion's redacted PDF at a revision.
 
     The one rule for the key: the scan's processing prefix, the
     opinion's glue prefix (``jobs/opinions/{first}.{index}/r{n}/``, the
@@ -186,11 +186,15 @@ def key(opinion: Opinion) -> str:
     admin deletion sweeps it.
 
     :param opinion: The opinion.
+    :param revision: The glue revision; None is the live one. The OCR
+        re-glue names the next one, where it carries the PDF (#452).
     :returns: The key.
     :rtype: str
     """
+    if revision is None:
+        revision = opinion.glue_revision
     prefix = s3_sync.s3_processing_prefix(opinion.scan)
-    return f"{prefix}{opinion.glue_prefix}{REDACTED_NAME}"
+    return f"{prefix}{opinion.revision_prefix(revision)}{REDACTED_NAME}"
 
 
 def download_name(opinion: Opinion) -> str:
@@ -721,7 +725,10 @@ def _shard_of(
 
 @contextmanager
 def image_source(
-    opinion: Opinion, run, small: fitz.Document, images: dict
+    opinion: Opinion,
+    run,
+    page_rect: Callable[[int], fitz.Rect],
+    images: dict,
 ) -> Iterator[Callable[[int, fitz.Rect], bytes | None] | None]:
     """Yield the ``image_for`` callable of one ``generate`` call.
 
@@ -733,11 +740,13 @@ def image_source(
     callable then renders the clip and answers JPEG bytes. It is
     called per rect and opens nothing.
 
-    The rect is in the small source's space, cut from the bitonal
-    copy, whose page box may differ from the shard page's. So the
-    callable scales the rect by the ratio of the two page boxes before
-    it clips: a picture from the wrong part of the page is the one
-    thing the output must never show.
+    The rect is in the space of a page whose box ``page_rect`` gives:
+    the small source's page, cut from the bitonal copy, for the PDF;
+    the volume page of the ensemble's boxes, for the cut of a picture
+    of the text (``opinion_figures``, #463). That box may differ from
+    the shard page's, so the callable scales the rect by the ratio of
+    the two page boxes before it clips: a picture from the wrong part
+    of the page is the one thing the output must never show.
 
     Every fault answers ``None``, logged: a shard that does not pull or
     open, a page past the end, a clip that fails. A raise inside the
@@ -747,8 +756,10 @@ def image_source(
 
     :param opinion: The opinion.
     :param run: The apply run whose space the opinion is in.
-    :param small: The small source, open.
-    :param images: The ``images`` of the payload.
+    :param page_rect: The box of the page each rect is drawn on, by the
+        0-based page of the opinion.
+    :param images: ``{page of the opinion: ...}``, the pages that hold a
+        picture: the ``images`` of the payload.
     :yields: The callable, or None.
     """
     if not images:
@@ -832,7 +843,7 @@ def image_source(
             if doc is not None and 0 <= page_in_shard < doc.page_count:
                 try:
                     source_page = doc[page_in_shard]
-                    small_rect = small[page_index].rect
+                    small_rect = page_rect(page_index)
                     sx = source_page.rect.width / (small_rect.width or 1.0)
                     sy = source_page.rect.height / (small_rect.height or 1.0)
                     clip = fitz.Rect(
@@ -935,7 +946,9 @@ def write_one(opinion: Opinion) -> dict:
             try:
                 data = payload(opinion, volume, small)
                 images = data.get("images") or {}
-                with image_source(opinion, run, small, images) as image_for:
+                with image_source(
+                    opinion, run, lambda index: small[index].rect, images
+                ) as image_for:
                     result = generate(
                         pdf_path=source_path,
                         redactions=data,
@@ -994,7 +1007,8 @@ def write_one(opinion: Opinion) -> dict:
 
 
 def _release_if_done(scan: Scan) -> bool:
-    """Release the scan's local mirror when no row of it owes a PDF.
+    """Release the scan's local mirror when no row of it owes a PDF,
+    and no row owes the cut of its pictures (#463).
 
     :func:`owed` and not :func:`due`: a row under its cooldown still
     owes its PDF. Reading the cooldown here would free the tree of a
@@ -1006,7 +1020,12 @@ def _release_if_done(scan: Scan) -> bool:
     :returns: Whether a tree was removed.
     :rtype: bool
     """
+    from scanning import opinion_figures
+
     if owed().filter(scan=scan).exists():
+        return False
+    # The cut of the pictures pulls the shards into the same tree (#463).
+    if opinion_figures.owed().filter(scan=scan).exists():
         return False
     return s3_sync.release_local_processing(scan)
 

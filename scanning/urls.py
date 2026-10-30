@@ -13,6 +13,7 @@ from scanning.views import (
     legacy_opinion_upload,
     login_view,
     logout_view,
+    opinion_blocking_review,
     opinion_list,
     opinion_review,
     password_change,
@@ -33,20 +34,30 @@ from scanning.views_api import (
     add_single_detection,
     apply_rect_to_opinion,
     approve_detection,
+    approve_opinion_text,
     approve_scan,
     bake_redactions,
     compute_redactions_api,
     delete_detection,
     dismiss_boundary,
     dismiss_finding,
+    dismiss_opinion_finding,
     dismiss_redaction,
+    edit_opinion_blockquote,
+    edit_opinion_drop,
+    edit_opinion_section,
+    edit_opinion_text,
     export_pdf,
     generate_files,
+    move_opinion_block,
     move_redaction,
     rebuild_findings,
+    reopen_opinion_text,
     rerun_opinion_ensemble,
     restore_boundary,
+    restore_detection,
     restore_finding,
+    restore_opinion_finding,
     restore_redaction,
     review_findings,
     serve_detections,
@@ -55,7 +66,9 @@ from scanning.views_api import (
     serve_opinionscan_pdf,
     serve_redacted_pdf,
     serve_redactions,
+    start_caselaw_tagger,
     update_detection,
+    withdraw_opinion_edit,
     withdraw_stale_edit,
 )
 from scanning.views_process import (
@@ -69,8 +82,11 @@ from scanning.views_process import (
     dismiss_page_repair,
     glued_output_index,
     move_page,
+    opinion_blocking_cards,
     opinion_ensemble_url,
+    opinion_figure_url,
     opinion_file_index,
+    opinion_final_xml,
     opinion_pdf_url,
     page_edit_file,
     process_actions,
@@ -78,20 +94,27 @@ from scanning.views_process import (
     recalculate,
     remove_page_insert,
     reopen_page_review,
+    reopen_redaction_review,
     replace_page,
     reprocess,
     request_page_repair,
     rotate_page,
+    scan_card_review,
     scan_ocr_text_url,
     scan_original_url,
     scan_process_view,
+    scan_review_cards,
     serve_apply_output,
     serve_apply_shard,
     serve_final_pdf,
     serve_glued_shard,
     serve_glued_volume,
+    serve_opinion_approved_text,
+    serve_opinion_exported_xml,
+    serve_opinion_final_xml,
     serve_opinion_ocr,
     serve_opinion_pdf,
+    serve_opinion_tags,
     serve_original_crop,
     serve_scan_original,
     serve_scan_pdf,
@@ -112,6 +135,17 @@ urlpatterns = [
     path("", scan_list, name="scan_list"),
     path("scans/<int:pk>/", scan_detail, name="scan_detail"),
     path("opinions/", opinion_list, name="opinion_list"),
+    path(
+        "opinions/blocking/",
+        opinion_blocking_review,
+        name="opinion_blocking_review",
+    ),
+    path(
+        "opinions/warnings/",
+        opinion_blocking_review,
+        {"level": "warning"},
+        name="opinion_warning_review",
+    ),
     path(
         "opinions/<int:pk>/review/",
         opinion_review,
@@ -237,6 +271,68 @@ urlpatterns = [
         rerun_opinion_ensemble,
         name="rerun_opinion_ensemble",
     ),
+    # The curator's answer to a finding of review 3 (#419).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/findings/"
+        "<int:finding_pk>/dismiss/",
+        dismiss_opinion_finding,
+        name="dismiss_opinion_finding",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/findings/"
+        "<int:finding_pk>/restore/",
+        restore_opinion_finding,
+        name="restore_opinion_finding",
+    ),
+    # The human edits of an opinion's text (#376).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/text/",
+        edit_opinion_text,
+        name="edit_opinion_text",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/section/",
+        edit_opinion_section,
+        name="edit_opinion_section",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/blockquote/",
+        edit_opinion_blockquote,
+        name="edit_opinion_blockquote",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/drop/",
+        edit_opinion_drop,
+        name="edit_opinion_drop",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/move/",
+        move_opinion_block,
+        name="move_opinion_block",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/edits/withdraw/",
+        withdraw_opinion_edit,
+        name="withdraw_opinion_edit",
+    ),
+    # The approval of the text, and the staff reopen (#375).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/approve-text/",
+        approve_opinion_text,
+        name="approve_opinion_text",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/reopen-text/",
+        reopen_opinion_text,
+        name="reopen_opinion_text",
+    ),
+    # The tagger of an approved text (#272): the one creator of its
+    # jobs, and nothing enqueues them on a tick.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/tag/",
+        start_caselaw_tagger,
+        name="start_caselaw_tagger",
+    ),
     # The redacted PDF of one opinion (#336): a redirect to a presigned
     # GET, named by the printed range for the download alone (#165).
     path(
@@ -253,9 +349,20 @@ urlpatterns = [
         name="opinion_pdf_url",
     ),
     path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/blocking-cards/",
+        opinion_blocking_cards,
+        name="opinion_blocking_cards",
+    ),
+    path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/ensemble-url/",
         opinion_ensemble_url,
         name="opinion_ensemble_url",
+    ),
+    # One picture of the text (#463), cut from the original.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/figure-url/",
+        opinion_figure_url,
+        name="opinion_figure_url",
     ),
     # The glued objects of one opinion (#334), the twin of the volume's
     # own index: which object exists, and where it is.
@@ -263,6 +370,34 @@ urlpatterns = [
         "scans/<int:pk>/opinions/<int:opinion_pk>/files/",
         opinion_file_index,
         name="opinion_file_index",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/approved-text/",
+        serve_opinion_approved_text,
+        name="serve_opinion_approved_text",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/tags/",
+        serve_opinion_tags,
+        name="serve_opinion_tags",
+    ),
+    # The final XML of an opinion (#432), built at each request from the
+    # approved text and the tagger's spans: the page, and the file.
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/",
+        opinion_final_xml,
+        name="opinion_final_xml",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final.xml",
+        serve_opinion_final_xml,
+        name="serve_opinion_final_xml",
+    ),
+    # The same document as stored for CourtListener (#408).
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/final-xml/exported/",
+        serve_opinion_exported_xml,
+        name="serve_opinion_exported_xml",
     ),
     # The glued outputs of the GPU stages (#243): an index of the runs
     # and their shards, then one redirect per file.
@@ -315,6 +450,11 @@ urlpatterns = [
         "scans/<int:pk>/reopen-pages/",
         reopen_page_review,
         name="reopen_page_review",
+    ),
+    path(
+        "scans/<int:pk>/reopen-redactions/",
+        reopen_redaction_review,
+        name="reopen_redaction_review",
     ),
     path("scans/<int:pk>/reprocess/", reprocess, name="reprocess"),
     path("scans/<int:pk>/assign-page/", assign_page, name="assign_page"),
@@ -463,6 +603,24 @@ urlpatterns = [
         "scans/<int:pk>/ocr-results/",
         serve_ocr_results,
         name="serve_ocr_results",
+    ),
+    # The card review of review 2 (``card_review``): the page, its
+    # cards, and the Undo of a dismissed model box. Every other answer
+    # of the page goes to the step-2 writes below.
+    path(
+        "scans/<int:pk>/cards/",
+        scan_card_review,
+        name="scan_card_review",
+    ),
+    path(
+        "scans/<int:pk>/cards/list/",
+        scan_review_cards,
+        name="scan_review_cards",
+    ),
+    path(
+        "scans/<int:pk>/restore-detection/",
+        restore_detection,
+        name="restore_detection",
     ),
     path(
         "scans/<int:pk>/add-single-detection/",

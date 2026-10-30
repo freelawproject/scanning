@@ -26,6 +26,7 @@ from scanning import (
     redactions,
     services,
     text_fit,
+    undetected,
     yolo,
 )
 from scanning.factories import ScanFactory
@@ -34,12 +35,14 @@ from scanning.models import (
     BracketReading,
     Detection,
     DetectionDecision,
+    EditorialReading,
     ExternalJob,
     JobStatus,
     QueuedAction,
     Redaction,
     Scan,
     Status,
+    TextReading,
 )
 from scanning.tests.test_jobs import make_manifest
 
@@ -210,6 +213,24 @@ class TestQueueReadyRuns(TestCase):
         self.assertTrue(
             yolo.apply_state(yolo.live_detect_jobs(scan)).get("queued_at")
         )
+
+    def test_the_task_is_sent_after_the_ledger_is_written(self):
+        """The worker writes the ledger as soon as it claims (#503), so
+        the sender's write must land first or it erases the worker's."""
+        merged_scan()
+        order = []
+        with (
+            patch(
+                "scanning.yolo.write_apply_state",
+                side_effect=lambda rows, state: order.append("ledger"),
+            ),
+            patch(
+                "scanning.tasks.dispatch_scan",
+                side_effect=lambda pk, action: order.append("dispatch"),
+            ),
+        ):
+            yolo.queue_ready_runs()
+        self.assertEqual(order, ["ledger", "dispatch"])
 
     def test_the_apply_itself_does_not_run_here(self):
         """It renders every page; the tick's scheduler is serial."""
@@ -689,6 +710,61 @@ class TestRunComputeRedactions(ComputeMixin, TestCase):
         self.assertEqual(row.numbers, [7])
         self.assertEqual(row.raw, "[7]")
         self.assertEqual(row.page_index, 0)
+
+    def test_the_compute_stores_the_editors_note_readings(self):
+        """#450: the editor's notes the reader found become rows, from
+        the same read of the OCR volume as the brackets."""
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        self._measured(stubs, [])
+        stubs["_snapped_document"].return_value = (
+            SimpleNamespace(
+                pages=[
+                    SimpleNamespace(
+                        index=0,
+                        scale_x=0.5,
+                        scale_y=0.5,
+                        img_width=1000,
+                        img_height=1000,
+                        pdf_width=500.0,
+                        pdf_height=500.0,
+                    )
+                ]
+            ),
+            {},
+            [{"page_index": 0}],
+        )
+        note = "[Editor's Note: The preceding image contains footnote 3]"
+        stubs["load_document"].return_value = {
+            "pages": [
+                {
+                    "page_index": 0,
+                    "origin_width": 1000,
+                    "origin_height": 1000,
+                    "cells": [
+                        {"bbox": [150, 210, 450, 390], "text": note},
+                        {"bbox": [150, 400, 450, 500], "text": "Body text"},
+                    ],
+                }
+            ]
+        }
+
+        services.run_compute_redactions(scan.pk)
+
+        row = EditorialReading.objects.get(scan=scan)
+        self.assertEqual(row.text, note)
+        self.assertEqual(row.bbox, [150.0, 210.0, 450.0, 390.0])
+        self.assertEqual(row.page_index, 0)
+        # The text readings are written from the same document, in the
+        # same pass: one row per page, both cells on it.
+        reading = TextReading.objects.get(scan=scan)
+        self.assertEqual(reading.page_index, 0)
+        self.assertEqual((reading.img_width, reading.img_height), (1000, 1000))
+        # The reading keeps the first characters of a cell's text.
+        self.assertEqual(
+            [c["text"] for c in reading.cells],
+            [note[: undetected.MAX_TEXT_CHARS], "Body text"],
+        )
 
     def test_a_recompute_rewrites_the_computed_rows_and_keeps_the_human_ones(
         self,

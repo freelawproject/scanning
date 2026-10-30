@@ -66,6 +66,13 @@ reach step 2.
     &middot; <a href="{% url 'glued_output_index' scan.pk 'dots-mocr' %}" class="underline" title="The runs, the shards and the result files of the dots.mocr read">files</a>
     {% endif %}
   </span>
+  {% elif ocr_missing %}
+  {% comment %}
+    A parked new-pipeline volume with no OCR run at all (#327), in the
+    spot the run's state takes once it exists. A bar with no word about
+    OCR was how such a volume sat for good unnoticed.
+  {% endcomment %}
+  <span class="text-sm text-orange-800 dark:text-orange-200" title="The OCR read is what the page review is built on.">{{ ocr_missing }}</span>
   {% endif %}
   {% include "scanning/_ocr_engine_actions.html" with run=mistral_run label="Mistral OCR" start_url="start_mistral_ocr" files_slug="mistral" title="Read every page of this volume with Mistral OCR on Mistral's batch API (incurs costs $$$)" confirm="This sends every page of this volume to the Mistral OCR batch API. This will incur costs $$$. Continue?" part="status" %}
   {% include "scanning/_ocr_engine_actions.html" with run=surya_run label="Surya OCR" start_url="start_surya_ocr" files_slug="surya" title="Read every page of this volume with Surya OCR on RunPod (incurs costs $$$)" confirm="This sends every page of this volume to the Surya OCR worker on RunPod. This will incur costs $$$. Continue?" part="status" %}
@@ -298,6 +305,23 @@ reach step 2.
     it approves the model's answer in its place.
   {% endcomment %}
   {% if redaction_review_ready %}
+  {% comment %}
+    Two notes before the approval (#240). The approval computes first
+    when a curator changed the detections after the last compute, and
+    says so here before the press. An opinion whose text is approved is
+    never built again, so a redaction changed now does not reach it:
+    the note links each one, and a staff member reopens its text before
+    this approval.
+  {% endcomment %}
+  {% if review2_compute_owed %}
+  <span class="inline-flex items-center rounded px-2 py-1 text-xs text-slate-700 bg-slate-100 dark:bg-slate-800 dark:text-slate-200" id="review2-compute-owed" title="A detection was added, moved, dismissed or restored after the last computation">The detections changed: the approval computes the redactions first.</span>
+  {% endif %}
+  {% if approved_opinions %}
+  <span class="inline-flex flex-wrap items-center gap-1 rounded px-2 py-1 text-xs bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200" id="review2-approved-opinions" title="The approval does not build an opinion whose text is approved again. Reopen its text first if a redaction you changed is on its pages.">
+    {{ approved_opinions|length }} approved opinion{{ approved_opinions|pluralize }} keep{{ approved_opinions|pluralize:"s," }} the old redactions:
+    {% for opinion in approved_opinions %}<a href="{% url 'opinion_review' opinion.pk %}" class="underline">{{ opinion.first_printed_page }}.{{ opinion.index_in_page }}</a>{% if not forloop.last %},{% endif %}{% endfor %}
+  </span>
+  {% endif %}
   {% if review2_open %}
   <span class="inline-flex items-center rounded px-2 py-1 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200" title="Open findings of the redaction review, listed in the sidebar">{{ review2_open }} finding{{ review2_open|pluralize }} open{% if review2_stale %}, {{ review2_stale }} decision{{ review2_stale|pluralize }} not applied{% endif %}</span>
   {% endif %}
@@ -313,7 +337,7 @@ reach step 2.
   <span class="inline-flex items-center rounded px-2 py-1 text-xs text-slate-700 bg-slate-100 dark:bg-slate-800 dark:text-slate-200" id="review2-note" title="The last message of the server about this volume">{{ redaction_review_note }}</span>
   {% endif %}
   {% elif redaction_review_done %}
-  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume">&#10003; Redaction review done</span>
+  <span class="inline-flex items-center gap-1.5 rounded px-2 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200" title="A reviewer confirmed the redactions of this volume{% if redaction_review_reopenable %}; a staff member can reopen the review{% endif %}">&#10003; Redaction review done</span>
   {% endif %}
 </div>{% endspaceless %}
 {% spaceless %}<div class="flex flex-wrap items-center gap-2 empty:hidden" data-row="buttons">
@@ -342,7 +366,8 @@ reach step 2.
     It is not offered after the approval. ``REDACTION_COMPUTE_STATUSES``
     refuses ``REDACTION_REVIEW_DONE`` -- a closed review is not
     recomputed under the person who closed it -- and a button must
-    never send a curator to an action that refuses.
+    never send a curator to an action that refuses. The way back is the
+    staff reopen below (#240).
   {% endcomment %}
   {% if redaction_review_ready or legacy_review %}
   <button type="button" class="btn-outline text-sm" id="recompute-btn" title="Pair the opinions again and measure every redaction from the detection boxes as they are now. It runs on the server and takes this volume out of the review for a minute or more. Your boxes and your decisions are kept, but a text box you dismissed can come back when the new reading makes it much narrower." onclick="return recomputeRedactions();">Recompute redactions</button>
@@ -352,6 +377,18 @@ reach step 2.
     {% csrf_token %}
     <button type="submit" class="btn-primary text-sm" title="Confirm the redactions of this volume are correct: every headnote and key number is covered, and no opinion text is."{% if review2_open %} onclick="return confirm('This volume still lists {{ review2_open }} open finding{{ review2_open|pluralize }}.{% if review2_stale %} {{ review2_stale }} of your decision{{ review2_stale|pluralize }} {{ review2_stale|pluralize:'is,are' }} not applied, so the volume shows the model\'s answer there.{% endif %} Approve the redactions anyway?');"{% endif %}>I reviewed the redactions and they are correct</button>
   </form>
+  {% elif redaction_review_done %}
+  {% comment %}
+    The staff reopen of review 2 (#240), the twin of the review-1
+    reopen. The confirm names the approved opinions, because the next
+    approval does not build them again.
+  {% endcomment %}
+  {% if user.is_staff and redaction_review_reopenable %}
+  <form method="post" action="{% url 'reopen_redaction_review' scan.pk %}" class="inline">
+    {% csrf_token %}
+    <button type="submit" class="btn-outline text-sm" id="reopen-redactions" title="Open the redaction review again to change a redaction. The next approval builds each opinion whose text is not approved again." onclick="return confirm('Reopen the redaction review?{% if approved_opinions %} {{ approved_opinions|length }} opinion{{ approved_opinions|pluralize }} of this volume {{ approved_opinions|pluralize:'has,have' }} an approved text, and the next approval does not build {{ approved_opinions|pluralize:'it,them' }} again. Reopen the text of each one the change touches before you approve the redactions.{% endif %}');">Reopen redaction review</button>
+  </form>
+  {% endif %}
   {% endif %}
   {% comment %}
     The button follows the step-3 tab (#334). A volume whose opinions

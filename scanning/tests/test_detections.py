@@ -393,6 +393,79 @@ class TestMoveAndManual(TestCase):
         self.assertEqual(row.found_by, [])
         self.assertTrue(row.active)
 
+    def test_an_approval_is_a_move_by_zero(self):
+        """The two writes of a move, at the row's own box (#414)."""
+        row = model_row(self.scan)
+
+        holder = detections.approve_model_row(self.scan, row, self.user)
+
+        row.refresh_from_db()
+        self.assertFalse(row.active)
+        self.assertEqual(row.decision.kind, DetectionDecision.Kind.DEACTIVATE)
+        self.assertEqual(holder.model_name, Detection.ModelName.MANUAL)
+        self.assertEqual(holder.replaces, row.decision)
+        self.assertEqual(
+            [holder.x0, holder.y0, holder.x1, holder.y1],
+            [row.x0, row.y0, row.x1, row.y1],
+        )
+        self.assertEqual(holder.page_index, row.page_index)
+        self.assertEqual(holder.label_id, row.label_id)
+        self.assertEqual(holder.confidence, 1.0)
+        self.assertEqual(holder.found_by, [])
+        self.assertFalse(
+            DetectionDecision.objects.filter(
+                kind=DetectionDecision.Kind.APPROVE
+            ).exists()
+        )
+
+    def test_an_approved_box_survives_the_next_import(self):
+        """The import deletes the model row and draws it again; the
+        hand-drawn row stands and the dismissal lands on the new model
+        row, so the page shows one box, the curator's (#414)."""
+        row = model_row(self.scan)
+        holder = detections.approve_model_row(self.scan, row, self.user)
+        row.delete()
+        again = model_row(self.scan, x0=95.0, x1=205.0)
+
+        landed, stale = detections.resolve(self.scan)
+
+        self.assertEqual((landed, stale), (1, []))
+        again.refresh_from_db()
+        holder.refresh_from_db()
+        self.assertFalse(again.active)
+        self.assertEqual(again.decision, holder.replaces)
+        self.assertTrue(holder.active)
+        self.assertEqual(
+            list(Detection.objects.live().filter(scan=self.scan)), [holder]
+        )
+
+    def test_a_second_approval_of_the_model_row_answers_the_same_row(self):
+        """A second tab or a stale card sends the model row's id again:
+        the standing dismiss names the hand-drawn row, so nothing is
+        written and no second row shares the dismissal (#414)."""
+        row = model_row(self.scan)
+        holder = detections.approve_model_row(self.scan, row, self.user)
+
+        again = detections.approve_model_row(self.scan, row, self.user)
+
+        self.assertEqual(again, holder)
+        self.assertEqual(Detection.objects.live().count(), 1)
+        self.assertEqual(DetectionDecision.objects.count(), 1)
+
+    def test_a_dismissed_box_can_be_approved(self):
+        """A plain dismiss leaves no hand-drawn row, so an approval of
+        that box draws one that names the standing dismiss."""
+        row = model_row(self.scan)
+        dismissal = detections.decide(
+            self.scan, row, DetectionDecision.Kind.DEACTIVATE, self.user
+        )
+
+        holder = detections.approve_model_row(self.scan, row, self.user)
+
+        self.assertEqual(holder.replaces, dismissal)
+        self.assertEqual(holder.model_name, Detection.ModelName.MANUAL)
+        self.assertEqual(DetectionDecision.objects.count(), 1)
+
 
 class TestResolve(TestCase):
     """The import deletes the model rows; the resolution lands the

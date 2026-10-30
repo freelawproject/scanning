@@ -31,7 +31,7 @@ serverless, result retention) is documented once in
 │  - poll /status     │◀───────│  - fans pages out to local vLLM ──┐│
 │  - persist result   │  JSON  │  - rescales bboxes, builds md     ││
 └─────────────────────┘        │                                   ││
-                               │ vllm serve rednote-hilab/dots.mocr◀┘
+                               │vllm serve freelawproject/dots.mocr◀┘
                                │ (subprocess, localhost:8000)       │
                                └────────────────────────────────────┘
 ```
@@ -50,7 +50,8 @@ batching turns the concurrent requests into efficient GPU batches.
   recommends (dots.mocr is officially integrated in vLLM ≥ 0.11.0).
   The plain (non `-cu130`) tag keeps the image compatible with RunPod
   hosts whose drivers predate CUDA 13.
-- The full `rednote-hilab/dots.mocr` HF snapshot baked into `/opt/hf`
+- The full `freelawproject/dots.mocr` HF snapshot (our fork of
+  `rednote-hilab/dots.mocr`, pinned by `DOTSMOCR_REVISION`) baked into `/opt/hf`
   (`HF_HUB_OFFLINE=1` at runtime — cold start never touches the
   network for weights).
 - A separate uv-managed venv (`/opt/venv`) for the handler and its
@@ -98,6 +99,7 @@ by scanning today):
 
 ```bash
 docker build --build-arg DOTSMOCR_MODEL=rednote-hilab/dots.mocr-svg \
+  --build-arg DOTSMOCR_REVISION=<commit of that repo> \
   -t dotsmocr-svg-gpu-worker:local scanning/runpod-dotsmocr/
 ```
 

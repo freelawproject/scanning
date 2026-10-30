@@ -800,6 +800,55 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         self.assertEqual(self.job.attempt, 1)
 
+    def test_a_sweep_named_for_a_provider_judges_its_rows_alone(self):
+        """One sweep per provider: RunPod's pass leaves the doctor row
+        untouched and runs no Mistral leftover pass; doctor's pass
+        takes it. The daemon's own pass, with no name, judges all."""
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        self.assertIsNone(self.job.last_polled_at)
+        leftover.assert_not_called()
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 1)
+        self.assertEqual(self.job.status, JobStatus.COMPLETED)
+        leftover.assert_not_called()
+
+        with patch("scanning.mistral_ocr.delete_leftover_files") as leftover:
+            jobs.sweep_jobs(providers=(JobProvider.MISTRAL,))
+        leftover.assert_called_once()
+
+    def test_a_stranded_row_is_written_off_by_its_own_provider_alone(self):
+        stranded = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=stranded.pk).update(
+            deadline=timezone.now() - timedelta(seconds=1)
+        )
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        stranded.refresh_from_db()
+        self.assertEqual(stranded.status, JobStatus.PENDING)
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            with self.assertLogs("scanning.jobs", level="ERROR"):
+                summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        stranded.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(stranded.status, JobStatus.FAILED)
+
     def test_a_pending_row_past_its_stamped_ceiling_is_written_off(self):
         """A row an endpoint kept declining must still end.
 
@@ -1443,3 +1492,50 @@ class TestDurationLogging(ScanningTestCase):
             self.assertFalse(jobs._complete(job, None, timezone.now()))
 
         self.assertNotIn("completed in", "\n".join(logs.output))
+
+
+class TestSwapProviderMeta(ScanningTestCase):
+    """A ledger write never erases what another pass wrote beside it
+    (#503)."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.row = ExternalJobFactory(
+            scan=self.scan, provider_meta={"glue": {"attempts": 1}}
+        )
+
+    def test_a_key_is_changed_and_the_others_kept(self):
+        jobs.swap_provider_meta(self.row, lambda m: m.update(apply={"a": 1}))
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "apply": {"a": 1}},
+        )
+
+    def test_a_write_that_lands_between_the_read_and_the_swap_survives(self):
+        """The first swap loses, the second reads the other's write."""
+        rival_written = []
+
+        def rival_then_mine(meta):
+            if not rival_written:
+                ExternalJob.objects.filter(pk=self.row.pk).update(
+                    provider_meta={"glue": {"attempts": 1}, "rival": True}
+                )
+                rival_written.append(True)
+            meta["mine"] = True
+
+        jobs.swap_provider_meta(self.row, rival_then_mine)
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "rival": True, "mine": True},
+        )
+
+    def test_the_run_ledger_counts_through_the_swap(self):
+        attempts, head = jobs.bump_run_ledger(
+            [self.row], "glue", RuntimeError("boom")
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(head.provider_meta["glue"]["attempts"], 2)
+        self.assertEqual(head.provider_meta["glue"]["last_error"], "boom")

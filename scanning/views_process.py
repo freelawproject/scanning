@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import fitz
+from blackletter.models import Label
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -25,12 +26,17 @@ from django.http import (
 from django.shortcuts import get_object_or_404, redirect, render
 from django.template.loader import render_to_string
 from django.urls import reverse
+from django.utils.safestring import mark_safe
 from django.views.decorators.clickjacking import xframe_options_sameorigin
 from django.views.decorators.http import require_POST
 
 from scanning import (
     boundaries,
+    card_review,
+    casebody,
+    detections,
     dots_mocr,
+    final_xml,
     findings,
     jobs,
     mistral_ocr,
@@ -41,8 +47,11 @@ from scanning import (
     s3_sync,
     stats,
     surya,
+    tagger,
+    tasks,
     yolo,
 )
+from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
     PAGE_EDIT_ROTATIONS,
@@ -55,10 +64,12 @@ from scanning.models import (
     ExternalJob,
     Issue,
     JobEngine,
+    JobProvider,
     JobStage,
     JobStatus,
     Opinion,
     OpinionBoundary,
+    OpinionReviewStatus,
     OpinionScan,
     PageEdit,
     PageRepairRequest,
@@ -127,6 +138,22 @@ REDACTION_REVIEW_NOT_READY_MESSAGE = (
     "This scan is not ready for the redaction review. The redactions "
     "are computed after the page completeness approval, and this page "
     "shows them when they are there."
+)
+#: The approval of a volume whose detections changed after the last
+#: compute (#240): the compute runs first, then the opinions.
+REDACTION_REVIEW_COMPUTE_FIRST_MESSAGE = (
+    "Thank you. The detections changed after the last computation, so "
+    "the redactions are computed again on the server first, then the "
+    "opinions are created. This page reloads when they are ready."
+)
+REDACTION_REVIEW_REOPENED_MESSAGE = (
+    "The redaction review is open again. Make the corrections, then "
+    "approve the redactions once more. Each opinion whose text is not "
+    "approved is built again from them."
+)
+REDACTION_REVIEW_NOT_REOPENABLE_MESSAGE = (
+    "Only an approved redaction review can be reopened, and this "
+    "volume's is not approved."
 )
 LEGACY_OCR_RECOMPUTE_MESSAGE = (
     "The old OCR engine that read this scan no longer runs here. Run "
@@ -247,6 +274,33 @@ NO_DETECTIONS_MESSAGE = (
     "finishes. If nothing shows after a few minutes, ask a staff "
     "member."
 )
+# What the step-1 bar says about a parked new-pipeline volume with no
+# OCR run at all (#327), in the spot the run's state takes once it
+# exists. Three texts, because the daemon's sweep starts the run when
+# the stage is configured and the shard set still describes the
+# original, and never otherwise, so the bar must not promise a run
+# that is not coming.
+OCR_NOT_STARTED_MESSAGE = (
+    "OCR missing: this volume has no OCR run yet. The server starts one "
+    "by itself within a few seconds."
+)
+OCR_UNAVAILABLE_MESSAGE = (
+    "OCR missing: OCR is not configured on this server, so the page "
+    "review cannot start. Ask a staff member."
+)
+OCR_REFUSED_MESSAGE = (
+    "OCR missing: the server cannot start the read of this volume. "
+    "{reason} Ask a staff member."
+)
+#: The reason of a volume with no ``source_fingerprint``: the sweep
+#: names a shard set by it, so a blank one is skipped for good, and
+#: only the pipeline (through an admin re-queue) stamps one.
+OCR_NO_FINGERPRINT_REASON = (
+    "This volume was sharded before the pipeline stamped fingerprints, "
+    "so the server cannot tell which shard set to read. Re-queue it so "
+    "the pipeline stamps one."
+)
+
 
 #: The step-2 warning when the run's printed pages could not be read
 #: (#269). The page renders with positional labels instead.
@@ -314,6 +368,44 @@ def run_is_glued(summary: dict | None) -> bool:
     if not summary:
         return False
     return summary["statuses"].get(JobStatus.CONSUMED) == summary["total"]
+
+
+def ocr_missing(scan, summary: dict | None) -> str | None:
+    """Return the step-1 bar's line about a missing OCR run, if any (#327).
+
+    ``summary`` is ``dots_mocr.run_summary(scan)``: ``None`` when the
+    stage has never run for this scan. Only a volume the sweep would
+    look at (``yolo.SWEEP_STATUSES``) gets a line: a legacy volume holds
+    PENDING_REVIEW, a queued one is the pipeline's, and an errored one
+    has its own banner. Which line depends on whether this environment
+    can start the read (``services.analyze_stage_open``) and, when it
+    can, on whether the sweep would take this volume. The sweep names a
+    shard set by ``Scan.source_fingerprint`` and skips a blank one for
+    good, so that volume is told to ask for the admin re-queue, the
+    one path that stamps it. Otherwise it asks
+    ``sharding.committed_manifest`` before it creates a run, and a
+    refused set (a re-uploaded or missing original) is left alone until
+    an admin re-queue re-cuts it. The sweep's memo of that refusal lives
+    in the daemon process, so the bar asks the same question itself, one
+    HEAD and one manifest read, for the rare parked volume with no run.
+
+    :param scan: The scan the bar is for.
+    :param summary: The run summary, or ``None``.
+    :returns: The message, or ``None`` when nothing is missing.
+    :rtype: str | None
+    """
+    from scanning import services, sharding
+
+    if summary is not None or scan.status not in yolo.SWEEP_STATUSES:
+        return None
+    if not services.analyze_stage_open():
+        return OCR_UNAVAILABLE_MESSAGE
+    if not scan.source_fingerprint:
+        return OCR_REFUSED_MESSAGE.format(reason=OCR_NO_FINGERPRINT_REASON)
+    manifest, reason = sharding.committed_manifest(scan)
+    if manifest is None:
+        return OCR_REFUSED_MESSAGE.format(reason=reason)
+    return OCR_NOT_STARTED_MESSAGE
 
 
 def engine_label(name: str) -> str:
@@ -438,6 +530,27 @@ def detection_message(summary: dict | None) -> str:
     )
 
 
+def _prints(reading: str | None, entry: dict) -> bool:
+    """Return whether a page map entry's number is the one its page prints.
+
+    ``build_issues`` gives a page the number it reads, and a page that
+    reads none, a range or a number outside the volume its PDF page, a
+    display value (#403). The two agree only on a page that prints its
+    ``logical_number``.
+
+    :param reading: The page's ``detected`` value, for a single number.
+    :param entry: A ``pdf_page`` entry of the page map.
+    :returns: Whether the entry's ``logical_number`` is a printed number.
+    :rtype: bool
+    """
+    if reading is None or "range_label" in entry:
+        return False
+    try:
+        return int(reading) == entry["logical_number"]
+    except (TypeError, ValueError):
+        return False
+
+
 @login_required
 def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     """Unified scan processing page with 3-step workflow.
@@ -533,6 +646,11 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     pages_needing_repair = {
         r["pdf_page"] for r in waiting_repairs if r["pdf_page"] is not None
     }
+    # The pages the bad-page model suspects (#436), for the score at
+    # the end of each page row. The ranked section reads the ``Issue``
+    # rows instead, so a page a scanner is asked for keeps its score
+    # here and loses its card there.
+    bad_scores = dict(badpage_scoring.flagged(scan))
 
     # One read of the review flags for the bar and the page (#151), and
     # with them the space the page is drawn in (#269). Step 2 shows the
@@ -597,15 +715,27 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # each one, with a link that opens the file the curator uploaded.
         replaced_pages = page_edits.replacements_by_page(scan)
 
-        # Map pdf_index → logical page number for navigation
+        # Map pdf_index → logical page number for navigation. A card
+        # names a printed number, so only a page that prints it resolves
+        # the card: an unnumbered page, a range page and an out-of-range
+        # reading carry their PDF page as ``logical_number``, a display
+        # value (#403), and a card of printed page 12 went to PDF page
+        # 12 of the front matter too. The page map was built from the
+        # stored readings, the curator's numbers included.
+        printed = {
+            r["pdf_page"] - 1: r.get("detected")
+            for r in scan.ocr_results or []
+            if r.get("type") == "single" and r.get("detected")
+        }
         idx_to_logical = {}
         logical_to_indices: dict[int, list[int]] = {}
         for entry in page_map:
             if entry.get("type") == "pdf_page":
                 idx_to_logical[entry["pdf_index"]] = entry["logical_number"]
-                logical_to_indices.setdefault(
-                    entry["logical_number"], []
-                ).append(entry["pdf_index"])
+                if _prints(printed.get(entry["pdf_index"]), entry):
+                    logical_to_indices.setdefault(
+                        entry["logical_number"], []
+                    ).append(entry["pdf_index"])
 
         # PDF page indices the page_map flags as duplicates (a detected page
         # number that already appeared on an earlier page). The PDF viewer marks
@@ -626,6 +756,18 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
         # from the real pages (issue #90), so they must be resolved through the
         # page_map rather than matched directly. The set is shared with the
         # dismissal, which keeps its address in the same two spaces (#214).
+        # A missing page's card goes to the page its placeholder follows,
+        # with the placeholder right below it. That page is not at fault,
+        # so it gets no red border, as with the trailing range below. An
+        # upload into the gap takes the placeholder's entry and keeps
+        # its anchor (``page_edits._inserted_entry``), and the card
+        # stands until a recheck, so the inserted entry answers too.
+        gap_anchors = {
+            e["logical_number"]: e["anchor_pdf_page"]
+            for e in page_map
+            if e.get("type") in ("missing", "inserted")
+            and "anchor_pdf_page" in e
+        }
         flagged_indices: set[int] = set()
         for i in issues:
             # Resolve each issue to PDF page indices (unique physical positions),
@@ -634,6 +776,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             # has no page (or points at a missing page absent from the page_map).
             i.nav_pdf_index = None
             if i.page_number is None:
+                continue
+            if (
+                i.check_name == CheckName.MISSING_PAGE
+                and i.page_number in gap_anchors
+            ):
+                i.nav_pdf_index = max(gap_anchors[i.page_number] - 1, 0)
                 continue
             if i.check_name in PHYSICAL_PAGE_CHECKS:
                 indices = [i.page_number - 1]
@@ -644,8 +792,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 i.nav_pdf_index = indices[0]
 
         # The card of a range missing at the end names the placeholder
-        # ("ask a scanner for them at the placeholder at the end of the
-        # volume", #256), so the card must reach it. Its own address is a
+        # ("ask a scanner for them at the placeholder after the last
+        # numbered page", #256), so the card must reach it. Its own address is a
         # printed number the volume does not show, which resolves to no
         # page above, and the placeholder carries the range as its label,
         # so neither of ``goToPage``'s lookups finds it. The physical
@@ -701,6 +849,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             r["is_replaced"] = r["pdf_page"] in replaced_pages
             r["is_moved"] = r["pdf_page"] in moves
             r["needs_repair"] = r["pdf_page"] in pages_needing_repair
+            r["bad_score"] = bad_scores.get(r["pdf_page"])
             if r.get("type") == page_numbers.SUFFIXED:
                 # The book adds this page between two numbered ones, so
                 # it breaks no sequence: the page before it and the page
@@ -784,6 +933,74 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             if idx in image_page_indices
         ]
 
+    # An opinion the pairing could not start. A key icon inside a
+    # computed span closes an opinion whose caption box the model did
+    # not draw (``missing_caption``, ``findings._unmatched_findings``),
+    # so the opinion before it runs on to the next key and the list
+    # shows one card where there are two opinions. Each such finding
+    # goes under the card that runs on past it, as a row of its own:
+    # the pages the missing opinion holds (from the card's guess of the
+    # caption's page to the next missing key, or the span's end), and
+    # the guess box to flash, so the curator knows where to draw. The
+    # card names that opinion (``runs_on``, the boundary pk the rule
+    # found by reading order); a match by page would list it under
+    # every opinion of a page that holds several.
+    missing_count = 0
+    if opinions and not preview:
+        open_missing = [
+            row
+            for row in Issue.objects.filter(
+                scan=scan, check_name=CheckName.MISSING_CAPTION
+            ).order_by("page_number", "pk")
+            if not row.is_dismissed and row.metadata.get("bbox")
+        ]
+        for op in opinions:
+            op["missing"] = []
+            if op["dismissed"]:
+                continue
+            ep = op.get(
+                "end_page", op.get("key_page", op.get("caption_page", 0))
+            )
+            inside = [
+                row
+                for row in open_missing
+                if row.metadata.get("runs_on") == op["id"]
+            ]
+            for pos, row in enumerate(inside):
+                md = row.metadata
+                idx = md["page_index"]
+                end = (
+                    inside[pos + 1].metadata.get(
+                        "key_page_index",
+                        inside[pos + 1].metadata["page_index"],
+                    )
+                    if pos + 1 < len(inside)
+                    else ep
+                )
+                op["missing"].append(
+                    {
+                        "issue_pk": row.pk,
+                        "idx": idx,
+                        "num": idx_to_logical.get(idx, idx + 1),
+                        "end_num": idx_to_logical.get(end, end + 1),
+                        "key_num": idx_to_logical.get(
+                            md.get("key_page_index", idx),
+                            md.get("key_page_index", idx) + 1,
+                        ),
+                        "boxes": ",".join(f"{v:.1f}" for v in md["bbox"]),
+                        "img_w": md["img_width"],
+                        "img_h": md["img_height"],
+                        # The row's + adds the guess as a caption box
+                        # (``addMissingCaption``), with the label the
+                        # finding names and never one the script spells.
+                        "label": md.get("label", Label.CASE_CAPTION.name),
+                        "label_id": md.get(
+                            "label_id", Label.CASE_CAPTION.value
+                        ),
+                    }
+                )
+            missing_count += len(op["missing"])
+
     opinion_scans = []
     if step == 3:
         for s in OpinionScan.objects.filter(scan=scan).order_by(
@@ -814,6 +1031,16 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     if printed_warning:
         detect_warnings.insert(0, printed_warning)
 
+    # The bad-page cards have their own section, ranked by score and
+    # not by page (#436): a reviewer works the worst page first. They
+    # stayed in ``issues`` until here so the walk above gave them a
+    # jump target and a red border like every other physical card.
+    bad_pages = sorted(
+        (i for i in issues if i.check_name == CheckName.BAD_PAGE),
+        key=lambda i: (-(i.metadata or {}).get("score", 0), i.page_number),
+    )
+    issues = [i for i in issues if i.check_name != CheckName.BAD_PAGE]
+
     return render(
         request,
         "scanning/scan_process.html",
@@ -821,6 +1048,8 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "scan": scan,
             "step": step,
             "issues": issues,
+            "bad_pages": bad_pages,
+            "bad_page_state": badpage_scoring.state(scan),
             "page_map_json": json.dumps(page_map),
             "missing_pages": missing_pages,
             "flagged_indices_json": json.dumps(sorted(flagged_indices)),
@@ -829,6 +1058,7 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
             "has_detections": has_detections,
             "is_processing": is_processing,
             "dots_run": dots_run,
+            "ocr_missing": ocr_missing(scan, dots_run),
             "yolo_run": yolo_run,
             "mistral_run": mistral_run,
             "surya_run": surya_run,
@@ -851,7 +1081,12 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
                 engine["available"] for engine in ocr_engines
             ),
             "opinions": opinions,
+            # The text card's footnote answer writes this label (the
+            # server's table, never a script's copy of it).
+            "footnote_label": Label.FOOTNOTES.name,
+            "footnote_label_id": Label.FOOTNOTES.value,
             "opinion_count": opinion_count,
+            "missing_count": missing_count,
             "opinions_json": json.dumps(opinions),
             "opinion_scans": opinion_scans,
             "detect_warnings": detect_warnings,
@@ -1687,6 +1922,19 @@ OPINION_PDF_NOT_WRITTEN_MESSAGE = (
     "writes one per tick after the redaction review is approved."
 )
 
+#: The blocking review asks for the cards of an opinion whose text is
+#: not written yet.
+OPINION_TEXT_NOT_WRITTEN_MESSAGE = (
+    'The text of this opinion is not written yet. Press "Read the OCR '
+    'documents again" on its review page, or wait for the daemon.'
+)
+
+#: The blocking review asks for the cards with no bucket to read.
+OPINION_BUCKET_OFF_MESSAGE = (
+    "The text of this opinion is in the bucket, and this server has no "
+    "bucket to read it from."
+)
+
 #: The 404 of ``opinion_ensemble_url`` before the pass has written the
 #: ensemble document at the live revision (#365).
 OPINION_ENSEMBLE_NOT_WRITTEN_MESSAGE = (
@@ -1777,6 +2025,127 @@ def opinion_pdf_url(
 
 
 @login_required
+def opinion_blocking_cards(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return the cards of the blocking review of one opinion.
+
+    ``blocking_review.cards`` over the stamped ensemble document and
+    the open blocking findings (``opinion_review.blocking_findings``,
+    the rule of the gate). The answer carries the two revisions the
+    document was drawn at, which every write of the review page asks
+    for, and the dismissal URL of each card that has one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, opinion, cards}``; 404 for an opinion of
+        another scan, 409 while the text is not written or the bucket
+        is off.
+    """
+    from scanning import blocking_review, ensemble, opinion_review, s3_sync
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan", "apply_run"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    if not ensemble.is_written(opinion):
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    if not s3_sync.s3_active():
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    try:
+        document = ensemble.read_document(opinion)
+    except ensemble.TransientFault:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_BUCKET_OFF_MESSAGE},
+            status=409,
+        )
+    except ensemble.EnsembleError:
+        return JsonResponse(
+            {"status": "error", "message": OPINION_TEXT_NOT_WRITTEN_MESSAGE},
+            status=409,
+        )
+    if request.GET.get("counts") == "1":
+        # The review page's walk buttons: both counts from one read of
+        # the document, and no card goes over the wire.
+        return JsonResponse(
+            {
+                "status": "ok",
+                "counts": {
+                    ensemble.BLOCKING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.blocking_findings(opinion)),
+                            ensemble.BLOCKING,
+                        )
+                    ),
+                    ensemble.WARNING: len(
+                        blocking_review.cards(
+                            document,
+                            list(opinion_review.warning_findings(opinion)),
+                            ensemble.WARNING,
+                        )
+                    ),
+                },
+            }
+        )
+    # The warnings review asks for its own cards (``?level=warning``),
+    # over the open warning findings; the blocking review is the
+    # default. ``blocking_open`` goes with either, so the page keeps
+    # the approval to the gate whatever it walks.
+    level = (
+        ensemble.WARNING
+        if request.GET.get("level") == ensemble.WARNING
+        else ensemble.BLOCKING
+    )
+    open_findings = (
+        opinion_review.warning_findings
+        if level == ensemble.WARNING
+        else opinion_review.blocking_findings
+    )
+    findings = list(open_findings(opinion).order_by("page_in_opinion", "pk"))
+    cards = blocking_review.cards(document, findings, level)
+    for card in cards:
+        if card.get("finding_pk"):
+            kwargs = {
+                "pk": pk,
+                "opinion_pk": opinion.pk,
+                "finding_pk": card["finding_pk"],
+            }
+            card["dismiss_url"] = reverse(
+                "dismiss_opinion_finding", kwargs=kwargs
+            )
+            # The way back from a dismissal, the review page's Undo.
+            card["restore_url"] = reverse(
+                "restore_opinion_finding", kwargs=kwargs
+            )
+    return JsonResponse(
+        {
+            "status": "ok",
+            "level": level,
+            "blocking_open": opinion_review.blocking_findings(opinion).count(),
+            "opinion": {
+                "pk": opinion.pk,
+                "label": str(opinion),
+                "status": opinion.status,
+                "page_count": opinion.page_count,
+                "glue_revision": opinion.glue_revision,
+                "edit_revision": opinion.ensemble_edit_revision,
+            },
+            "cards": cards,
+        }
+    )
+
+
+@login_required
 def opinion_ensemble_url(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> JsonResponse:
@@ -1808,6 +2177,67 @@ def opinion_ensemble_url(
         )
     return _presigned_opinion_object(
         ensemble.document_key(opinion), opinion.glue_revision, opinion.pk
+    )
+
+
+#: The 404 of ``opinion_figure_url`` before the daemon cut the pictures
+#: of the text (#463), and its 400 for an address the page did not send.
+OPINION_FIGURE_NOT_CUT_MESSAGE = (
+    "The pictures of this opinion are not cut yet. The daemon cuts them "
+    "from the original after the text is written."
+)
+OPINION_FIGURE_BAD_REQUEST_MESSAGE = "Name the picture by its page and box."
+
+
+@login_required
+def opinion_figure_url(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Return a URL the browser can read one picture of the text from (#463).
+
+    The review page draws each picture of the text in its place. It
+    names the picture as the ensemble document does, by its volume page
+    (``page``) and its box (``box``, four numbers), and the key is
+    built here by ``opinion_figures.key``, the one rule for it, so the
+    browser spells no path. ``opinion_figures.is_written`` is the one
+    rule for "the pictures exist".
+
+    :param request: The HTTP request, with ``page`` and ``box``.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
+    :return: JSON with ``url`` and ``revision``, a 400 for an address
+        the page did not send, or a 404.
+    """
+    from scanning import opinion_figures
+
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("apply_run"), pk=opinion_pk, scan=scan
+    )
+    try:
+        page_index = int(request.GET.get("page", ""))
+        box = [float(value) for value in request.GET.get("box", "").split(",")]
+    except ValueError:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if page_index < 0 or len(box) != 4:
+        return JsonResponse(
+            {"error": OPINION_FIGURE_BAD_REQUEST_MESSAGE}, status=400
+        )
+    if not opinion.figure_digest or not opinion_figures.is_written(opinion):
+        return _json_404(
+            OPINION_FIGURE_NOT_CUT_MESSAGE,
+            opinion=opinion.pk,
+            revision=opinion.glue_revision,
+        )
+    run_label = opinion.apply_run.label if opinion.apply_run else ""
+    return _presigned_opinion_object(
+        opinion_figures.key(
+            opinion, run_label, {"page_index": page_index, "box_pt": box}
+        ),
+        opinion.glue_revision,
+        opinion.pk,
     )
 
 
@@ -1987,6 +2417,273 @@ def serve_opinion_ocr(
 
 
 @login_required
+def serve_opinion_approved_text(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the approved text of one opinion (#431).
+
+    The output of the text review (#375), the object the tagger reads.
+    A developer's route, so it redirects (#243/#262). A 404 before the
+    first approval, and for an opinion of another scan. A reopen keeps
+    ``approved_text_key`` until the next approval, so after a reopen
+    this is the text of the last approval.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not opinion.approved_text_key:
+        return _json_404(
+            f"The text of {opinion} is not approved.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-approved",
+        opinion.approved_text_key,
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-approved.json"
+        ),
+        missing_message=(
+            f"The text of {opinion} is approved, but "
+            f"{opinion.approved_text_key} is not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
+def serve_opinion_tags(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the tagger's spans of one opinion (#272).
+
+    A developer's route, so it redirects (#243/#262). A 404 while the
+    spans of the approved text do not exist (``tagger.is_written``),
+    and for an opinion of another scan.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not tagger.is_written(opinion):
+        return _json_404(
+            f"The approved text of {opinion} is not tagged.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    return _redirect_to_object(
+        scan,
+        "opinion-tags",
+        opinion.tag_key,
+        filename=(
+            f"scan-{scan.pk}-opinion-{opinion.first_printed_page}."
+            f"{opinion.index_in_page}-tags.json"
+        ),
+        missing_message=(
+            f"The spans of {opinion} are stamped, but {opinion.tag_key} "
+            "is not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+FINAL_XML_REFUSED_MESSAGE = (
+    "The final XML of {opinion} was not built: the approved text or the "
+    "spans could not be read, or the spans do not fit the text. The log "
+    "of the web pod has the reason."
+)
+#: The refusal of a writing whose type is not read (#442). The words
+#: go to the error log, where a developer reads them; no answer repeats
+#: an exception's text.
+FINAL_XML_TYPE_MESSAGE = (
+    "The final XML of {opinion} was not built: a concurrence or a dissent "
+    "names a type the builder does not read yet. A developer was told."
+)
+
+
+class _FinalXmlRefused(Exception):
+    """The final XML of an opinion cannot be built now."""
+
+    def __init__(self, response: JsonResponse) -> None:
+        super().__init__(response)
+        self.response = response
+
+
+def _final_xml(opinion: Opinion) -> tuple[str, dict]:
+    """Build the final XML of an opinion from its two objects (#432).
+
+    The spans must be over the approved text the row names now
+    (``tagger.is_written``), the one rule of the tagger's ledger. The
+    build is ``final_xml.render``, the one the export stores (#408).
+
+    :param opinion: The opinion, with ``scan__reporter``.
+    :returns: The XML, and the spans object for the legend.
+    :rtype: tuple[str, dict]
+    :raises _FinalXmlRefused: 404 before the spans exist, 409 when an
+        object cannot be read or the spans do not fit the text.
+    """
+    if not tagger.is_written(opinion):
+        raise _FinalXmlRefused(
+            _json_404(
+                f"The approved text of {opinion} is not tagged.",
+                opinion=opinion.pk,
+                label=opinion.status,
+            )
+        )
+    try:
+        return final_xml.render(opinion)
+    except (final_xml.FinalXmlError, final_xml.TransientFault) as exc:
+        # The reason goes to the log alone: an S3 fault's text is the
+        # client library's, and no answer of this route repeats it. A
+        # writing whose type is not read is an error, so Sentry tells a
+        # developer to add its words to ``casebody.OPINION_TYPES`` (#442).
+        # ``final_xml.render`` wraps it, so the cause names it.
+        unread_type = isinstance(exc.__cause__, casebody.OpinionTypeError)
+        log = logger.error if unread_type else logger.warning
+        log("%s: the final XML was not built: %s", opinion, exc)
+        message = (
+            FINAL_XML_TYPE_MESSAGE.format(opinion=opinion)
+            if unread_type
+            else FINAL_XML_REFUSED_MESSAGE.format(opinion=opinion)
+        )
+        raise _FinalXmlRefused(
+            JsonResponse(
+                {"status": "error", "message": message},
+                status=409,
+            )
+        ) from exc
+
+
+def _final_xml_name(opinion: Opinion) -> str:
+    return (
+        f"scan-{opinion.scan_id}-opinion-{opinion.first_printed_page}."
+        f"{opinion.index_in_page}-final.xml"
+    )
+
+
+@login_required
+def serve_opinion_final_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Answer the final XML of one opinion, computed now (#432).
+
+    :param request: The HTTP request. ``?download=1`` answers it as a
+        file; any other value does not.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: The XML, or a JSON 404 or 409.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan__reporter"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    try:
+        xml, _tags = _final_xml(opinion)
+    except _FinalXmlRefused as refused:
+        return refused.response
+    response = HttpResponse(xml, content_type="application/xml; charset=utf-8")
+    if request.GET.get("download") == "1":
+        response["Content-Disposition"] = (
+            f'attachment; filename="{_final_xml_name(opinion)}"'
+        )
+    return response
+
+
+@login_required
+def serve_opinion_exported_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Send the browser to the stored final XML of one opinion (#408).
+
+    The object CourtListener reads, at ``final_xml.key``. A developer's
+    route, so it redirects (#243/#262). A 404 while no object is stored
+    (``final_xml.is_stored``). The object may be older than the row:
+    after a rewrite of the approved text it holds the text approved
+    before, until a tagger run of the new one.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: A 302 to a presigned GET, or a 404 JSON response.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if not final_xml.is_stored(opinion):
+        return _json_404(
+            f"The final XML of {opinion} is not exported.",
+            opinion=opinion.pk,
+            label=opinion.status,
+        )
+    object_key = final_xml.key(opinion)
+    return _redirect_to_object(
+        scan,
+        "opinion-exported-xml",
+        object_key,
+        filename=_final_xml_name(opinion),
+        missing_message=(
+            f"The final XML of {opinion} is stamped, but {object_key} is "
+            "not in the bucket."
+        ),
+        opinion=opinion.pk,
+    )
+
+
+@login_required
+def opinion_final_xml(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> HttpResponse:
+    """Show the final XML of one opinion, for display and debugging (#432).
+
+    Two views of one document: every element drawn as a box with its
+    name, and the XML text. Built at this request; the export for
+    CourtListener stores the same build (``final_xml``, #408).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: The page, or a JSON 404 or 409.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    opinion = get_object_or_404(
+        Opinion.objects.select_related("scan__reporter"),
+        pk=opinion_pk,
+        scan=scan,
+    )
+    try:
+        xml, tags = _final_xml(opinion)
+    except _FinalXmlRefused as refused:
+        return refused.response
+    kwargs = {"pk": scan.pk, "opinion_pk": opinion.pk}
+    return render(
+        request,
+        "scanning/opinion_final_xml.html",
+        {
+            "opinion": opinion,
+            "display": mark_safe(casebody.display_html(xml)),  # noqa: S308
+            "source": mark_safe(casebody.source_html(xml)),  # noqa: S308
+            "labels": casebody.label_counts(tags),
+            "span_count": len(tags.get("spans") or []),
+            "model": tags.get("model"),
+            "run": tags.get("run"),
+            "review_url": reverse("opinion_review", kwargs={"pk": opinion.pk}),
+            "xml_url": reverse("serve_opinion_final_xml", kwargs=kwargs),
+            "tags_url": reverse("serve_opinion_tags", kwargs=kwargs),
+        },
+    )
+
+
+@login_required
 def opinion_file_index(
     request: HttpRequest, pk: int, opinion_pk: int
 ) -> JsonResponse:
@@ -2022,6 +2719,11 @@ def opinion_file_index(
     The keys are of the live revision (``Opinion.glue_prefix``). A
     re-glue raises the revision, so this index never names an object of
     an older prefix, although that object stays in the bucket.
+
+    **Two entries are not glues**: the approved text (#375, #431),
+    written once by the approval, and the tagger's spans over it
+    (#272). They are outside the glue prefix, and their ledgers are
+    ``approved_text_key`` and ``tagger.is_written``.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
@@ -2077,6 +2779,66 @@ def opinion_file_index(
                 ),
             }
         )
+    # The approved text (#375, #431) and the tagger's spans over it
+    # (#272), outside the glue prefix: the approval writes the text
+    # once, and no re-glue moves it. A reopen keeps the key until the
+    # next approval, and ``status`` below says the review is open again.
+    files.append(
+        {
+            "name": "approved.json",
+            "output": "opinion-approved",
+            "written": bool(opinion.approved_text_key),
+            "key": opinion.approved_text_key,
+            "url": reverse(
+                "serve_opinion_approved_text",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    files.append(
+        {
+            "name": "tags.json",
+            "output": "opinion-tags",
+            "written": tagger.is_written(opinion),
+            "key": opinion.tag_key,
+            "url": reverse(
+                "serve_opinion_tags",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    # The final XML (#432) is no object: it is built at each request
+    # from the approved text and the spans, so it exists with them.
+    files.append(
+        {
+            "name": "final.xml",
+            "output": "opinion-final-xml",
+            "written": tagger.is_written(opinion),
+            "computed": True,
+            "key": None,
+            "url": reverse(
+                "serve_opinion_final_xml",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
+    # The same build, stored for CourtListener (#408) at a key of the
+    # two ids, outside the glue prefix.
+    files.append(
+        {
+            "name": "exported.xml",
+            "output": "opinion-exported-xml",
+            "written": final_xml.is_stored(opinion),
+            # False while the object holds older inputs than the row:
+            # the pass writes it again, or a tagger run is owed.
+            "current": final_xml.is_written(opinion),
+            "key": final_xml.key(opinion),
+            "url": reverse(
+                "serve_opinion_exported_xml",
+                kwargs={"pk": scan.pk, "opinion_pk": opinion.pk},
+            ),
+        }
+    )
     for entry in files:
         if not entry["written"]:
             entry.pop("url")
@@ -2617,6 +3379,33 @@ def _review_flags(
         # ``opinion_count``, which the step-2 sidebar already uses for
         # the boundaries of the volume.
         "review3_opinions": Opinion.objects.filter(scan=scan).count(),
+        # The reopen of review 2 (#240): a staff button in the approved
+        # status alone, the compare-and-swap it writes.
+        "redaction_review_reopenable": (
+            scan.status == Status.REDACTION_REVIEW_DONE
+        ),
+        # The opinions a new approval of review 2 does not build again
+        # (#240): an approved text keeps its PDF and its text, so the
+        # bar names them, around the reopen and before the approval.
+        "approved_opinions": (
+            list(
+                Opinion.objects.filter(
+                    scan=scan, status=OpinionReviewStatus.TEXT_REVIEW_DONE
+                ).order_by("first_printed_page", "index_in_page")
+            )
+            if scan.status
+            in (
+                Status.REDACTION_REVIEW_DONE,
+                Status.READY_FOR_REDACTION_REVIEW,
+            )
+            else []
+        ),
+        # Whether the approval computes first (#240), so the bar says so
+        # before the press. Read where the button is offered alone.
+        "review2_compute_owed": (
+            scan.status == Status.READY_FOR_REDACTION_REVIEW
+            and detections.changed_since_compute(scan, detect_rows)
+        ),
         **page_edits.pending_edit_flags(scan, run),
     }
 
@@ -2734,6 +3523,7 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
     if step < 1 or step > 3:
         step = 1
 
+    dots_run = dots_mocr.run_summary(scan)
     yolo_run = yolo.run_summary(scan)
     flags = _review_flags(scan)
     context = {
@@ -2743,7 +3533,8 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         "issues": scan.issues.exclude(check_name__in=REVIEW2_CHECKS),
         "missing_pages": scan.missing_pages,
         "has_detections": Detection.objects.filter(scan=scan).exists(),
-        "dots_run": dots_mocr.run_summary(scan),
+        "dots_run": dots_run,
+        "ocr_missing": ocr_missing(scan, dots_run),
         "yolo_run": yolo_run,
         "mistral_run": mistral_ocr.run_summary(scan),
         "surya_run": surya.run_summary(scan),
@@ -2870,6 +3661,8 @@ class ShardRead:
     :ivar create: The row creator. **This is what costs money**, which
         is why the AST test of ``TestKnownEnqueuePaths`` pins the
         modules that name one.
+    :ivar provider: The ``JobProvider`` whose wave sends the rows, so
+        the button can send that wave now (``tasks.submit_soon``, #503).
     """
 
     name: str
@@ -2881,6 +3674,7 @@ class ShardRead:
     is_enabled: Callable[[], bool]
     run_summary: Callable[[Scan], dict | None]
     create: Callable[[Scan, dict], list[ExternalJob]]
+    provider: str
 
 
 def _shard_reads() -> dict[str, ShardRead]:
@@ -2905,6 +3699,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=dots_mocr.enabled,
             run_summary=dots_mocr.run_summary,
             create=dots_mocr.ensure_analyze_jobs,
+            provider=JobProvider.RUNPOD,
         ),
         JobEngine.MISTRAL_OCR: ShardRead(
             name="start_mistral_ocr",
@@ -2918,6 +3713,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=mistral_ocr.enabled,
             run_summary=mistral_ocr.run_summary,
             create=mistral_ocr.ensure_extract_jobs,
+            provider=JobProvider.MISTRAL,
         ),
         JobEngine.SURYA: ShardRead(
             name="start_surya_ocr",
@@ -2929,6 +3725,7 @@ def _shard_reads() -> dict[str, ShardRead]:
             is_enabled=surya.enabled,
             run_summary=surya.run_summary,
             create=surya.ensure_extract_jobs,
+            provider=JobProvider.RUNPOD,
         ),
     }
 
@@ -3013,6 +3810,7 @@ def _start_shard_read(
         queued,
     )
     if queued:
+        tasks.submit_soon(spec.provider)
         messages.success(
             request,
             f"Queued {spec.label} for {queued} part(s) of this volume. "
@@ -3302,6 +4100,55 @@ def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
 
 @login_required
 @require_POST
+def reopen_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Open the redaction review again, after its approval (#240).
+
+    The way back for a redaction found after the approval. A staff
+    button, the rule of :func:`reopen_page_review`: one
+    compare-and-swap from ``REDACTION_REVIEW_DONE`` to
+    ``READY_FOR_REDACTION_REVIEW``, and no other write. A scan whose
+    opinions are being created is not in that status, so the worker of
+    the approval is never cut off.
+
+    The status is all that must move. The opinion passes read
+    ``REDACTION_REVIEW_DONE`` alone, so they stop for this volume, and
+    a tick in flight cannot write over the next approval: each stamp is
+    a compare-and-swap on ``glue_revision``. The ``Opinion`` rows stay;
+    the next approval matches them by key, keeps every human field and
+    builds each one whose text is not approved again. An approved text
+    is never built again (``opinions.create_rows``), so the bar lists
+    those opinions, and a staff member reopens the ones the change
+    touches before the next approval.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: Redirect to step 2 of the scan processing page.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    step_two = reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
+    if not request.user.is_staff:
+        messages.warning(request, "Only a staff member can reopen a review.")
+        return redirect(step_two)
+    reopened = Scan.objects.filter(
+        pk=scan.pk, status=Status.REDACTION_REVIEW_DONE
+    ).update(
+        status=Status.READY_FOR_REDACTION_REVIEW,
+        progress_message="The redaction review was reopened.",
+    )
+    if reopened:
+        logger.info(
+            "reopen_redaction_review: scan=%s reopened by user=%s",
+            scan.pk,
+            request.user.pk,
+        )
+        messages.success(request, REDACTION_REVIEW_REOPENED_MESSAGE)
+    else:
+        messages.warning(request, REDACTION_REVIEW_NOT_REOPENABLE_MESSAGE)
+    return redirect(step_two)
+
+
+@login_required
+@require_POST
 def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Record that a person reviewed the redactions of this scan.
 
@@ -3326,6 +4173,11 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     is the judge of the geometry, exactly as they are the judge of a
     page-completeness suspicion (#151).
 
+    A volume whose detections a curator changed after the last compute
+    is queued with ``COMPUTE_THEN_CREATE_OPINIONS`` instead (#240): the
+    compute turns the boxes into redaction rows, then queues the
+    opinions itself.
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: Redirect to step 2 of the scan processing page.
@@ -3333,22 +4185,32 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     from scanning import opinions
 
     scan = get_object_or_404(Scan, pk=pk)
-    if opinions.queue_create_opinions(scan):
+    action = opinions.queue_create_opinions(scan)
+    if action:
         logger.info(
-            "approve_redaction_review: scan=%s approved by user=%s",
+            "approve_redaction_review: scan=%s approved by user=%s (%s)",
             scan.pk,
             request.user.pk,
+            action,
         )
-        messages.success(request, REDACTION_REVIEW_APPROVED_MESSAGE)
+        messages.success(
+            request,
+            REDACTION_REVIEW_COMPUTE_FIRST_MESSAGE
+            if action == QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+            else REDACTION_REVIEW_APPROVED_MESSAGE,
+        )
     else:
         # The write lost, so the fetch above is stale. Re-read the row
         # so the message describes it as it is.
         scan.refresh_from_db()
         if scan.status == Status.REDACTION_REVIEW_DONE:
             messages.info(request, REDACTION_REVIEW_ALREADY_DONE_MESSAGE)
-        elif (
-            scan.status in (Status.QUEUED, Status.PROCESSING)
-            and scan.queued_action == QueuedAction.CREATE_OPINIONS
+        elif scan.status in (
+            Status.QUEUED,
+            Status.PROCESSING,
+        ) and scan.queued_action in (
+            QueuedAction.CREATE_OPINIONS,
+            QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
         ):
             messages.info(request, REDACTION_REVIEW_QUEUED_MESSAGE)
         else:
@@ -4412,6 +5274,8 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
             "source_fingerprint": scan.source_fingerprint,
         },
     )
+    if created:
+        _rebuild_bad_page_card(scan, address.get("pdf_page"))
     row = repairs.open_requests(scan).get(pk=row.pk)
     answer = {
         "status": "ok",
@@ -4450,5 +5314,105 @@ def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     rows = scan.repair_requests.filter(pk=request_id)
     if not rows.exists():
         return JsonResponse({"error": "Unknown request."}, status=404)
+    row = rows.first()
     repairs.dismiss(rows, request.user)
+    if row.action == PageRepairRequest.Action.REPLACE:
+        _rebuild_bad_page_card(scan, row.pdf_page)
     return JsonResponse({"status": "ok"})
+
+
+def _rebuild_bad_page_card(scan: Scan, pdf_page: int | None) -> None:
+    """Rebuild the review-1 issues when a request moves a bad-page card.
+
+    A rescan request answers the card of its page and a dismissed one
+    gives it back (``badpage.scoring.issues``), so the ``Issue`` rows
+    must follow the write. Only for a page the model flagged, so the
+    rebuild is not paid on every request, and only in a review state,
+    which the rebuild keeps.
+
+    :param scan: The scan.
+    :param pdf_page: The page the request names, or None for a gap.
+    """
+    from scanning import services
+
+    if pdf_page is None or scan.status not in REVIEW_STATUSES:
+        return
+    if any(page == pdf_page for page, _ in badpage_scoring.flagged(scan)):
+        services.recalculate_issues(scan)
+
+
+#: The writes the card review answers through (``card_review``), by URL
+#: name: step 2's own, so the two pages hold one set of rules.
+CARD_REVIEW_WRITES = (
+    "add_single_detection",
+    "approve_detection",
+    "update_detection",
+    "delete_detection",
+    "restore_detection",
+    "dismiss_finding",
+    "restore_finding",
+    "compute_redactions_api",
+)
+
+
+@login_required
+def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
+    """Review the boxes of a volume one after the next (``card_review``).
+
+    The brackets the reader saw, the captions the model missed and the
+    image and editor's note boxes it drew, each a crop of the page with
+    the box on it and two or three buttons. **The page writes nothing of its own**:
+    the browser asks :func:`scan_review_cards` for the cards and
+    answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
+    so the viewer and this page hold one set of rules. The crops are
+    cut from the PDF step 2 draws, chosen by the rule step 2 reads
+    (``final_space``).
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: The rendered page.
+    """
+
+    scan = get_object_or_404(Scan, pk=pk)
+    flags = _review_flags(scan)
+    kwargs = {"pk": scan.pk}
+    pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
+    review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
+    config = {
+        "scan": scan.pk,
+        # The labels a drawn box may take: the server's own table, so
+        # the page keeps no copy of ``LABEL_IDS`` (#343).
+        "labels": [{"name": label.name, "id": label.value} for label in Label],
+        "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        "cards_url": reverse("scan_review_cards", kwargs=kwargs),
+        "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
+        "review_open": review_open,
+        "urls": {
+            name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
+        },
+    }
+    return render(
+        request,
+        "scanning/scan_card_review.html",
+        {
+            "scan": scan,
+            "config": config,
+            "review_open": review_open,
+            "step2_url": config["step2_url"],
+        },
+    )
+
+
+@login_required
+def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
+    """Return the cards of the card review of one volume.
+
+    ``card_review.cards`` over the open findings and the live model
+    image and editor's note rows: rows alone, no S3 read and no render.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :return: ``{status, cards}``.
+    """
+    scan = get_object_or_404(Scan, pk=pk)
+    return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})

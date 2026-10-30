@@ -4,23 +4,25 @@ from blackletter.models import Label
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
 from django.core.paginator import Paginator
-from django.db import connection
+from django.db import connection, transaction
 from django.urls import NoReverseMatch, reverse
 from django.utils.functional import cached_property
 from django.utils.html import format_html
 from django.utils.text import capfirst
 
-from scanning import apply, jobs
+from scanning import apply, jobs, tasks
 from scanning.models import (
     ApplyRun,
     BracketReading,
     Detection,
     DetectionDecision,
+    EditorialReading,
     ExternalJob,
     Issue,
     JobStage,
     Opinion,
     OpinionBoundary,
+    OpinionEdit,
     OpinionFinding,
     OpinionFindingDismissal,
     OpinionScan,
@@ -34,6 +36,7 @@ from scanning.models import (
     ReviewDismissal,
     Scan,
     Status,
+    TextReading,
     Volume,
     WithdrawnOpinion,
 )
@@ -74,12 +77,14 @@ def _release_scan_external_work(scan):
 
     :param scan: The scan about to be deleted.
     """
-    from scanning import jobs, s3_sync
+    from scanning import jobs, mistral_ocr, s3_sync
 
     try:
         # Unscoped deliberately, unlike the re-queue: the scan is going
         # away, so no stage of it is worth keeping alive.
         jobs.abandon_open(scan, "Scan deleted from the admin")
+        # The files a Mistral row still carries go with the row (#540).
+        mistral_ocr.release_scan_files(scan)
     except Exception:
         logger.warning(
             "Could not cancel the external jobs of scan %s before "
@@ -103,6 +108,35 @@ def _release_scan_external_work(scan):
                 scan.pk,
                 exc_info=True,
             )
+
+
+def _sweep_final_xml_after_commit(scan_pk: int) -> None:
+    """Delete a deleted scan's exported final XML once the delete commits.
+
+    After the row delete, and not before it like the other sweeps
+    (#408): ``export/`` is the list CourtListener imports, so an
+    orphan there is an import of a deleted scan, not storage. Once the
+    rows are gone no export can stamp, and an export whose PUT lands
+    later finds no row and deletes its own object. A failure is an
+    error, for Sentry: ``export_final_xml --all`` deletes what it left.
+
+    :param scan_pk: The pk of the scan being deleted.
+    """
+    from scanning import s3_sync
+
+    def sweep():
+        try:
+            s3_sync.delete_export_objects(scan_pk)
+        except Exception:
+            logger.error(
+                "Could not delete the exported final XML of deleted scan "
+                "%s; CourtListener can still list it. Run "
+                "export_final_xml --all to delete it",
+                scan_pk,
+                exc_info=True,
+            )
+
+    transaction.on_commit(sweep)
 
 
 class RetryCapFilter(admin.SimpleListFilter):
@@ -357,11 +391,14 @@ class ScanAdmin(admin.ModelAdmin):
             (PageEdit, "scan_id"),
             (OpinionBoundary, "scan_id"),
             (BracketReading, "scan_id"),
+            (EditorialReading, "scan_id"),
+            (TextReading, "scan_id"),
             (Opinion, "scan_id"),
             (WithdrawnOpinion, "scan_id"),
             (OpinionText, "opinion__scan_id"),
             (OpinionFinding, "opinion__scan_id"),
             (OpinionFindingDismissal, "opinion__scan_id"),
+            (OpinionEdit, "opinion__scan_id"),
             (PendingUpload, "scan_id"),
             (ExternalJob, "scan_id"),
         ):
@@ -416,8 +453,12 @@ class ScanAdmin(admin.ModelAdmin):
         :param obj: The Scan to delete.
         """
         volume = obj.volume_obj
+        scan_pk = obj.pk
         _release_scan_external_work(obj)
         super().delete_model(request, obj)
+        # Registered after the delete: outside a transaction, on_commit
+        # runs at once.
+        _sweep_final_xml_after_commit(scan_pk)
         if volume is not None:
             refresh_volume_queue_status(volume)
 
@@ -435,9 +476,13 @@ class ScanAdmin(admin.ModelAdmin):
             .values_list("volume_obj_id", flat=True)
             .distinct()
         )
+        scan_pks = []
         for scan in queryset:
             _release_scan_external_work(scan)
+            scan_pks.append(scan.pk)
         super().delete_queryset(request, queryset)
+        for scan_pk in scan_pks:
+            _sweep_final_xml_after_commit(scan_pk)
         for volume in Volume.objects.filter(pk__in=volume_ids):
             refresh_volume_queue_status(volume)
 
@@ -506,7 +551,10 @@ class ScanAdmin(admin.ModelAdmin):
         # stale ``queued_action`` left over from before the cutover would
         # make the daemon park the scan with the pipeline-paused message
         # instead of recovering it.
-        updated = queryset.filter(status__in=statuses).update(
+        pks = list(
+            queryset.filter(status__in=statuses).values_list("pk", flat=True)
+        )
+        updated = queryset.filter(pk__in=pks, status__in=statuses).update(
             status=Status.QUEUED,
             queued_action=QueuedAction.FULL_PIPELINE,
             progress_message=progress_message,
@@ -514,6 +562,8 @@ class ScanAdmin(admin.ModelAdmin):
             progress_total=0,
             **counter_resets,
         )
+        for pk in pks:
+            tasks.dispatch_scan(pk, QueuedAction.FULL_PIPELINE)
         if not updated:
             self.message_user(
                 request, no_match_message, level=messages.WARNING
@@ -873,6 +923,62 @@ class BracketReadingAdmin(admin.ModelAdmin):
     search_fields = ["raw"]
     raw_id_fields = ["scan", "source_edit", "apply_run"]
     readonly_fields = [f.name for f in BracketReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(EditorialReading)
+class EditorialReadingAdmin(admin.ModelAdmin):
+    """One editor's note the OCR read (issue #450).
+
+    Read-only, the rule of ``BracketReadingAdmin``: the compute writes
+    every row and replaces the set at each compute.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "text",
+        "apply_run",
+        "date_created",
+    ]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in EditorialReading._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(TextReading)
+class TextReadingAdmin(admin.ModelAdmin):
+    """The text cells of one page, as the OCR read them.
+
+    Read-only, the rule of ``BracketReadingAdmin``: the compute writes
+    every row and replaces the set at each compute.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "cell_count",
+        "apply_run",
+        "date_created",
+    ]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in TextReading._meta.fields]
+
+    @admin.display(description="cells")
+    def cell_count(self, obj):
+        return len(obj.cells or [])
 
     def has_add_permission(self, request):
         return False

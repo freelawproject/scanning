@@ -1,6 +1,6 @@
 """RunPod Serverless handler for Surya OCR 2 full-page reads.
 
-Runs ``datalab-to/surya-ocr-2`` behind a local vLLM server (spawned as
+Runs ``freelawproject/surya-ocr-2`` behind a local vLLM server (spawned as
 a subprocess at worker boot) and dispatches on ``job["input"]["action"]``:
 
 - ``ocr``: fetch a PDF via presigned GET URL, render each page, read
@@ -40,6 +40,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import perpendiculars
 import requests
 import runpod
 import runpod_common
@@ -89,7 +90,7 @@ MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
 # served name must equal this id: surya's client asks the server for
 # its model list and refuses a name other than its own checkpoint
 # setting (``surya.inference.backends.spawn.attach_or_spawn``).
-SURYA_MODEL = os.environ.get("SURYA_MODEL", "datalab-to/surya-ocr-2")
+SURYA_MODEL = os.environ.get("SURYA_MODEL", "freelawproject/surya-ocr-2")
 VLLM_HOST = "127.0.0.1"
 # HANDLER_-prefixed on purpose: ``VLLM_PORT`` itself is a *reserved*
 # vLLM env var (the base port for internal distributed services), and
@@ -1028,6 +1029,11 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     dpi = coerce_input("dpi", inputs.get("dpi", DEFAULT_DPI), int)
     if dpi < 36 or dpi > 600:
         raise BadInputError(f"dpi must be between 36 and 600, got {dpi}")
+    # Paint the perpendiculars out of every render before the
+    # model reads it (``perpendiculars.py``), when the daemon asks.
+    whiteout_perpendiculars = bool(
+        inputs.get("whiteout_perpendiculars", False)
+    )
     num_threads = coerce_input(
         "num_threads", inputs.get("num_threads", DEFAULT_NUM_THREADS), int
     )
@@ -1074,6 +1080,10 @@ def _action_ocr(job: dict, inputs: dict, tmp_dir: Path) -> dict:
         records: list[dict] = []
         try:
             image = _render_page(_doc()[page_idx], dpi)
+            # The perpendiculars, painted out of the render
+            # (``perpendiculars.py``).
+            if whiteout_perpendiculars:
+                image = perpendiculars.paint(image, dpi)
             page: dict | None = None
             for attempt in range(1, EMPTY_READS + 1):
                 _LOG.open()

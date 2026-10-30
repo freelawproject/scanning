@@ -22,11 +22,14 @@ printed page and the boundary link. ``status``, the approval and the
 notes are not touched, except that an ``ERROR`` row goes back to
 ``PROCESSING``, because the work that failed runs again. The
 ``glue_revision`` of a matched row that is not approved is raised
-(#350, #336): the glue prefix belongs to one row at a time, and the
-boxes and the boundary under the key may have moved, so every derived
-artifact of the row -- its OCR documents and its redacted PDF -- is due
-again and the old revision is never written over. An approved row keeps
-its revision and its glues. A row no
+(#350, #336) when the digest of its inputs moved (:func:`input_digest`:
+the boxes on its pages, its anchors, its printed numbers, the run): the
+glue prefix belongs to one row at a time, and every derived artifact of
+the row -- its OCR documents and its redacted PDF -- is due again and
+the old revision is never written over. A row whose digest did not
+move keeps its revision, its glues and its status, so a fix on one page
+of the volume rebuilds the opinions of that page alone. An approved
+row keeps its revision and its glues whatever moved. A row no
 boundary matched keeps its data and gets one of the two
 ``STALE_OPINION_CHECKS`` cards: ``STALE_PAGE_NUMBER`` when a live
 boundary shares its start address under another number, and
@@ -43,15 +46,20 @@ and this pass writes no chain, no stamp and no queue for it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
-from dataclasses import dataclass
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
 
 from django.db import transaction
 from django.db.models import Case, Count, F, Q, Value, When
 
-from scanning import apply, boundaries, review_states
+from scanning import apply, boundaries, review_states, s3_sync
 from scanning.models import (
     STALE_OPINION_CHECKS,
+    Detection,
     Issue,
     Opinion,
     OpinionBoundary,
@@ -59,6 +67,7 @@ from scanning.models import (
     OpinionFinding,
     OpinionReviewStatus,
     QueuedAction,
+    Redaction,
     Scan,
     Status,
 )
@@ -93,6 +102,9 @@ class Summary:
 
     created: int = 0
     updated: int = 0
+    #: Of the updated rows, those whose inputs moved and whose revision
+    #: rose; the rest keep their text and their PDF.
+    rebuilt: int = 0
     stale: int = 0
     orphaned: int = 0
 
@@ -101,7 +113,8 @@ class Summary:
         """The park message a curator reads under the progress bar."""
         total = self.created + self.updated
         parts = [
-            f"{total} opinion(s): {self.created} new, {self.updated} updated"
+            f"{total} opinion(s): {self.created} new, {self.updated} updated, "
+            f"{self.rebuilt} rebuilt"
         ]
         without = self.stale + self.orphaned
         if without:
@@ -251,6 +264,182 @@ def keyed(
     return out
 
 
+# ---------------------------------------------------------------------------
+# The digest of an opinion's inputs
+# ---------------------------------------------------------------------------
+
+#: The version of :func:`input_digest`. Raise it when a code change alters
+#: what the OCR glue or the redacted PDF reads off the rows, and every
+#: opinion is rebuilt at its volume's next approval, as every approval
+#: did before the digest.
+DIGEST_RULES = 1
+
+
+@dataclass
+class ScanRows:
+    """The rows of one scan the digests read, grouped by page.
+
+    Read once per creation (:func:`read_rows`), the shape
+    ``opinion_figures.ledger_digest`` keeps: a creation over a volume of
+    five hundred opinions runs two queries and not a thousand.
+
+    :param redactions: ``{page_index: [(rect_type, fill, x0, y0, x1,
+        y1)]}``, the boxes a reader paints, rounded to a tenth of a
+        point.
+    :param detections: ``{page_index: [(label, x0, y0, x1, y1,
+        confidence, img_width, img_height)]}``, every live detection of
+        the page, whatever its run.
+    """
+
+    redactions: dict[int, list[tuple]] = field(default_factory=dict)
+    detections: dict[int, list[tuple]] = field(default_factory=dict)
+
+
+def read_rows(scan: Scan, run) -> ScanRows:
+    """Read the rows every opinion of one scan is built from.
+
+    The same selections the glue and the PDF make: the visible
+    redactions of the scan (``redactions.visible_by_page``,
+    ``opinion_pdf._redaction_pages``) and every live detection of the
+    scan, whatever its run: the glue reads the run's
+    (``opinion_ocr.load_inputs``), but the masks and the picture rects
+    of the PDF read them all (``boundaries.outside_rects``,
+    ``opinion_pdf._image_rects``), so the union is what a digest must
+    cover. A digest over anything else, or anything less, would miss a
+    move a reader sees. The run's engine documents are no input
+    (:func:`input_digest`): they are the re-glue's to apply.
+
+    :param scan: The scan.
+    :param run: The final apply run the rows are measured in.
+    :returns: The rows, by page.
+    :rtype: ScanRows
+    """
+    rows = ScanRows()
+    redactions: dict[int, list[tuple]] = defaultdict(list)
+    for page, kind, fill, x0, y0, x1, y1 in (
+        Redaction.objects.visible()
+        .filter(scan=scan)
+        .values_list("page_index", "rect_type", "fill", "x0", "y0", "x1", "y1")
+    ):
+        redactions[page].append(
+            (
+                kind or "",
+                fill or "",
+                *(round(float(v), 1) for v in (x0, y0, x1, y1)),
+            )
+        )
+    detections: dict[int, list[tuple]] = defaultdict(list)
+    for page, label, x0, y0, x1, y1, confidence, width, height in (
+        Detection.objects.live()
+        .filter(scan=scan)
+        .values_list(
+            "page_index",
+            "label",
+            "x0",
+            "y0",
+            "x1",
+            "y1",
+            "confidence",
+            "img_width",
+            "img_height",
+        )
+    ):
+        detections[page].append(
+            (
+                label or "",
+                *(round(float(v), 1) for v in (x0, y0, x1, y1)),
+                round(float(confidence or 0), 2),
+                int(width or 0),
+                int(height or 0),
+            )
+        )
+    rows.redactions = dict(redactions)
+    rows.detections = dict(detections)
+    return rows
+
+
+def input_digest(
+    row: OpinionBoundary,
+    run,
+    rows: ScanRows,
+    lookup: dict[int, tuple[int, int | None]],
+) -> str:
+    """Return the digest of everything one opinion is built from.
+
+    **The one rule** of ``Opinion.input_digest``. The OCR glue and the
+    redacted PDF read, and read only: the visible redactions and the
+    live detections of the opinion's pages; its own boundary, the two
+    page indexes and the two anchor points (``boundaries.outside_rects``
+    builds the neighbour masks from the opinion's own anchors and the
+    page's detections, never from a neighbour's); the printed numbers
+    of its pages; and the run, whose bitonal copy and page map are
+    fixed for its lifetime. Human text edits have their own
+    ``edit_revision`` and the pictures their own ``figure_digest``.
+
+    The run's engine documents are **no input**, by choice. They move
+    the text and never the PDF, and the approval never carries a PDF,
+    so a digest that read them would cut every PDF of the volume again
+    for a late engine or a document a re-glue rewrote in place.
+    ``reglue_opinion_ocr`` is the one way an engine reaches the
+    opinions: it writes the text again and carries the PDF (#452). So
+    a late engine moves no digest, and the first approval after one
+    rebuilds only what the boxes moved.
+
+    The rows are sorted, so the order a query returns them in is no
+    input. :data:`DIGEST_RULES` is, so a change of what the glue reads
+    moves every digest at once.
+
+    :param row: The opinion's boundary.
+    :param run: The final apply run.
+    :param rows: :func:`read_rows` of the scan.
+    :param lookup: :func:`printed_lookup` of the run's printed pages.
+    :returns: A hex digest.
+    :rtype: str
+    """
+    pages = range(row.start_page_index, row.end_page_index + 1)
+    raw = json.dumps(
+        {
+            "rules": DIGEST_RULES,
+            "run": run.pk,
+            "anchors": [
+                row.start_page_index,
+                row.end_page_index,
+                *(
+                    round(float(v or 0), 1)
+                    for v in (row.start_x, row.start_y, row.end_x, row.end_y)
+                ),
+            ],
+            "printed": [
+                list(lookup[page]) if page in lookup else None
+                for page in pages
+            ],
+            "redactions": [
+                [page, sorted(rows.redactions.get(page, []))] for page in pages
+            ],
+            "detections": [
+                [page, sorted(rows.detections.get(page, []))] for page in pages
+            ],
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _unchanged(opinion: Opinion, digest: str) -> bool:
+    """Return whether a matched row may keep its revision.
+
+    Its digest is the one just computed, and it is not in ``ERROR``: the
+    way back from ``ERROR`` is the work running again, which takes a
+    new revision. A blank digest (a row from before the rule) never
+    matches, so such a row is rebuilt once and stamped.
+    """
+    return (
+        bool(digest)
+        and opinion.input_digest == digest
+        and opinion.status != OpinionReviewStatus.ERROR
+    )
+
+
 def _fields(scan: Scan, run, row: OpinionBoundary, last: int) -> dict:
     """The columns the pass owns on an ``Opinion`` row."""
     return {
@@ -338,6 +527,7 @@ def create_rows(
     lookup = printed_lookup(printed)
     plan = keyed(rows, lookup)
     summary = Summary()
+    scan_rows = read_rows(scan, run)
     with transaction.atomic():
         existing = {
             (o.first_printed_page, o.index_in_page): o
@@ -347,6 +537,7 @@ def create_rows(
         new_rows = []
         for row, first, index, last in plan:
             fields = _fields(scan, run, row, last)
+            digest = input_digest(row, run, scan_rows, lookup)
             opinion = existing.get((first, index))
             if opinion is None:
                 new_rows.append(
@@ -354,22 +545,41 @@ def create_rows(
                         scan=scan,
                         first_printed_page=first,
                         index_in_page=index,
+                        input_digest=digest,
                         **fields,
                     )
                 )
                 continue
             matched.add(opinion.pk)
+            if _unchanged(opinion, digest):
+                # Nothing the row is built from moved (the one rule,
+                # :func:`input_digest`): the revision stays, and with it
+                # the OCR documents, the text, the PDF and the status.
+                # A fix on another page of the volume rebuilds nothing
+                # here, which is what a reopen for one box costs.
+                Opinion.objects.filter(pk=opinion.pk).update(
+                    **fields, input_digest=digest
+                )
+                summary.updated += 1
+                continue
             # One statement per matched row, with three rules folded in.
             # The way back from ERROR is this run of the work (#335).
-            # The inputs of every glue may have moved under the key, so
-            # the revision moves too, and with it the attempt count of
-            # each glue (#350, #336): a redaction a curator moved after
-            # a send-back changes the ink of the PDF and no field of
-            # this row, so the revision is what says the set is new. An
-            # approved opinion keeps its revision and its glues.
+            # The inputs of the glue moved under the key, so the
+            # revision moves too, and with it the attempt count of each
+            # glue (#350, #336): a redaction a curator moved after a
+            # send-back changes the ink of the PDF and no field of this
+            # row, so the revision is what says the set is new. An
+            # approved opinion keeps its revision and its glues, and
+            # its digest with them: the digest names the inputs its
+            # glues were built from, so the first creation after a
+            # text reopen sees the move and rebuilds it then.
             approved = Q(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
             Opinion.objects.filter(pk=opinion.pk).update(
                 **fields,
+                input_digest=Case(
+                    When(approved, then=F("input_digest")),
+                    default=Value(digest),
+                ),
                 status=Case(
                     When(
                         status=OpinionReviewStatus.ERROR,
@@ -398,6 +608,8 @@ def create_rows(
                 ),
             )
             summary.updated += 1
+            if opinion.status != OpinionReviewStatus.TEXT_REVIEW_DONE:
+                summary.rebuilt += 1
         Opinion.objects.bulk_create(new_rows, batch_size=500)
         summary.created = len(new_rows)
 
@@ -416,12 +628,13 @@ def create_rows(
             unmatched, by_address
         )
     logger.info(
-        "scan %s: opinions under %s: %d created, %d updated, %d stale, "
-        "%d orphaned",
+        "scan %s: opinions under %s: %d created, %d updated (%d rebuilt), "
+        "%d stale, %d orphaned",
         scan.pk,
         run.label,
         summary.created,
         summary.updated,
+        summary.rebuilt,
         summary.stale,
         summary.orphaned,
     )
@@ -433,7 +646,17 @@ def create_rows(
 # ---------------------------------------------------------------------------
 
 
-def queue_create_opinions(scan: Scan) -> bool:
+#: The queued actions of a review-2 approval in flight (#240). From the
+#: approval's read of the rows to the creation of the opinions, a box a
+#: curator writes reaches no opinion, so the writes of review 2 refuse
+#: while a scan holds one of them (``views_api._refuse_closed_review``).
+APPROVAL_ACTIONS = (
+    QueuedAction.CREATE_OPINIONS,
+    QueuedAction.COMPUTE_THEN_CREATE_OPINIONS,
+)
+
+
+def queue_create_opinions(scan: Scan) -> str:
     """Close review 2 and ask the daemon for the opinions.
 
     The write of the approve button (``views_process
@@ -442,21 +665,41 @@ def queue_create_opinions(scan: Scan) -> bool:
     ``REDACTION_REVIEW_DONE`` when it is done, and parks the scan back
     in the review on a failure, so the next press is the retry.
 
+    The action is ``CREATE_OPINIONS``, or ``COMPUTE_THEN_CREATE_OPINIONS``
+    when a curator changed the detections after the last compute
+    (``detections.changed_since_compute``, #240): the opinions are cut
+    from the redaction rows, and a detection reaches those rows through
+    the compute alone. The compute then queues the creation itself.
+
     :param scan: The scan the curator approved.
-    :returns: Whether the write won.
-    :rtype: bool
+    :returns: The action queued, or an empty string when the write lost.
+    :rtype: str
     """
-    return bool(
-        Scan.objects.filter(
-            pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
-        ).update(
-            status=Status.QUEUED,
-            queued_action=QueuedAction.CREATE_OPINIONS,
-            progress_message="The opinions are queued for creation.",
-            progress_current=0,
-            progress_total=0,
+    from scanning import detections
+
+    action = QueuedAction.CREATE_OPINIONS
+    message = "The opinions are queued for creation."
+    if detections.changed_since_compute(scan):
+        action = QueuedAction.COMPUTE_THEN_CREATE_OPINIONS
+        message = (
+            "The detections changed after the last computation. The "
+            "redactions are queued for computation, then the opinions "
+            "for creation."
         )
+    moved = Scan.objects.filter(
+        pk=scan.pk, status=Status.READY_FOR_REDACTION_REVIEW
+    ).update(
+        status=Status.QUEUED,
+        queued_action=action,
+        progress_message=message,
+        progress_current=0,
+        progress_total=0,
     )
+    if moved:
+        from scanning import tasks
+
+        tasks.dispatch_scan(scan.pk, action)
+    return action if moved else ""
 
 
 def run(scan_pk: int) -> None:
@@ -471,12 +714,24 @@ def run(scan_pk: int) -> None:
     :param scan_pk: Primary key of the claimed scan.
     :return: None.
     """
+    from scanning import detections
+    from scanning.services import APPROVAL_NOT_DONE_NOTE
+
     scan = Scan.objects.get(pk=scan_pk)
     status = Status.READY_FOR_REDACTION_REVIEW
     try:
         run_ = review_states.final_run(scan)
         if run_ is None:
             message = "The corrected volume is not built."
+        elif detections.changed_since_compute(scan):
+            # A box written after the approval read the rows and before
+            # the writes refused (#240): the swap of the approval, or a
+            # tab that posted as it landed. It is in no redaction, so
+            # the opinions wait for the next approval, which computes.
+            message = (
+                "The detections changed after the approval. "
+                f"{APPROVAL_NOT_DONE_NOTE}"
+            )
         else:
             printed = apply.load_printed_pages(scan, run_)
             rows = live_boundaries(scan)
@@ -502,8 +757,40 @@ def run(scan_pk: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
-    """Return the open findings, and the stale ones, per opinion (#334).
+def picture_counts(rows) -> dict[int, int]:
+    """Return how many pictures each opinion's text holds.
+
+    A picture is a curated box of review 2 on a page of the opinion's
+    span, read by ``opinion_ocr.picture_pages``, the glue's own rule:
+    a live ``IMAGE`` detection of the opinion's run less the junk the
+    viewer drops (#463). A page two opinions share counts for both.
+    The caller passes the rows of one page of the list, so two queries
+    answer it whatever its length, one when no page holds a box.
+
+    :param rows: The ``Opinion`` rows, usually one page of the list.
+    :returns: ``{opinion id: count}``; an opinion with none is absent.
+    :rtype: dict[int, int]
+    """
+    from scanning import opinion_ocr
+
+    rows = [row for row in rows if row.apply_run_id]
+    if not rows:
+        return {}
+    pages = opinion_ocr.picture_pages({row.apply_run_id for row in rows})
+    counts = {}
+    for row in rows:
+        count = sum(
+            1
+            for page in pages.get(row.apply_run_id, ())
+            if row.start_page_index <= page <= row.end_page_index
+        )
+        if count:
+            counts[row.pk] = count
+    return counts
+
+
+def finding_counts(opinion_ids) -> dict[int, tuple[int, int, int]]:
+    """Return the open findings, the stale ones and the blocking ones (#334).
 
     The warning badge of the opinions list, the twin of
     ``findings.open_count`` for one scan and of
@@ -518,10 +805,16 @@ def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
 
     :param opinion_ids: The opinions to count, usually one page of the
         list.
-    :returns: ``{opinion id: (open, stale)}``. An opinion with no open
-        finding is absent.
-    :rtype: dict[int, tuple[int, int]]
+    The blocking count is the gate of the approval
+    (``opinion_review.blocking_filter``, #375), so the badge says what
+    the button waits on and holds no copy of the rule.
+
+    :returns: ``{opinion id: (open, stale, blocking)}``. An opinion with
+        no open finding is absent.
+    :rtype: dict[int, tuple[int, int, int]]
     """
+    from scanning.opinion_review import blocking_filter
+
     rows = (
         OpinionFinding.objects.filter(
             opinion_id__in=opinion_ids, dismissal__isnull=True
@@ -531,9 +824,13 @@ def finding_counts(opinion_ids) -> dict[int, tuple[int, int]]:
         .annotate(
             open=Count("pk"),
             stale=Count("pk", filter=Q(check_name__in=STALE_OPINION_CHECKS)),
+            blocking=Count("pk", filter=blocking_filter()),
         )
     )
-    return {row["opinion_id"]: (row["open"], row["stale"]) for row in rows}
+    return {
+        row["opinion_id"]: (row["open"], row["stale"], row["blocking"])
+        for row in rows
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -549,15 +846,21 @@ def text_review_ready(opinion: Opinion) -> bool:
     the text of that revision (``ensemble.is_written``, which holds the
     OCR glue's own stamp inside it). The review page draws those two
     objects and nothing else, so a row that has them is a row a person
-    can work on.
+    can work on. The pictures of the text are cut too
+    (``opinion_figures.is_written``, #463): the page shows them in the
+    text, and the approval embeds them.
 
     :param opinion: The row.
     :returns: Whether the review can start.
     :rtype: bool
     """
-    from scanning import ensemble, opinion_pdf
+    from scanning import ensemble, opinion_figures, opinion_pdf
 
-    return opinion_pdf.is_written(opinion) and ensemble.is_written(opinion)
+    return (
+        opinion_pdf.is_written(opinion)
+        and ensemble.is_written(opinion)
+        and opinion_figures.is_written(opinion)
+    )
 
 
 #: How many rows one tick moves in each direction. The twin of
@@ -583,7 +886,7 @@ def _live_stamps() -> Q:
         redacted_pdf_revision=F("glue_revision"),
         ocr_glue_revision=F("glue_revision"),
         ensemble_revision=F("glue_revision"),
-    )
+    ) & (Q(figure_digest="") | Q(figures_cut_digest=F("figure_digest")))
 
 
 def promote_ready(opinion: Opinion) -> bool:
@@ -613,7 +916,66 @@ def promote_ready(opinion: Opinion) -> bool:
             opinion,
             opinion.scan_id,
         )
+        if opinion.glue_revision:
+            # Revision 0 is the first: no folder can be older, so the
+            # tick spends no listing on it.
+            prune_glues(opinion)
     return bool(moved)
+
+
+#: A glue revision folder under ``Opinion.object_prefix``, and its number.
+#: ``approved/`` and ``tag/`` never match it.
+_REVISION_FOLDER = re.compile(r"r(\d+)/")
+
+
+def prune_glues(opinion: Opinion, dry_run: bool = False) -> list[str] | None:
+    """Delete the glues of every revision below the opinion's live one.
+
+    The glues of a revision (the engine documents, the manifest, the
+    redacted PDF, the ensemble documents) are derived, and a re-glue
+    writes each of them again with no paid read, so nothing reads a
+    revision once the live one is complete (#452). The caller says it
+    is: :func:`promote_ready` after its swap, and the command
+    ``prune_opinion_glues`` over the rows :func:`text_review_ready`
+    accepts. Only ``r{k}/`` with ``k`` below ``glue_revision`` goes:
+    the approved texts (``approved/``), the tagger input (``tag/``) and
+    every paid result outside the opinion's prefix stay. The revision
+    only goes up, so a re-glue during the walk makes no live folder
+    old.
+
+    Best effort, the rule of ``s3_sync.delete_objects``: an orphan
+    costs storage and nothing else, so a failed listing deletes nothing
+    and nothing raises into the tick. The command is the retry.
+
+    :param opinion: The row, with ``scan`` and its reporter.
+    :param dry_run: List the keys and delete nothing.
+    :returns: The keys of the older revisions, or None when the listing
+        failed.
+    :rtype: list[str] | None
+    """
+    root = (
+        f"{s3_sync.s3_processing_prefix(opinion.scan)}{opinion.object_prefix}"
+    )
+    keys = s3_sync.list_keys(root)
+    if keys is None:
+        return None
+    old = []
+    for key in keys:
+        match = _REVISION_FOLDER.match(key[len(root) :])
+        if match and int(match.group(1)) < opinion.glue_revision:
+            old.append(key)
+    if old and not dry_run:
+        deleted = s3_sync.delete_objects(old)
+        logger.info(
+            "%s of scan %s: deleted %d of %d object(s) of the revisions "
+            "below r%d",
+            opinion,
+            opinion.scan_id,
+            deleted,
+            len(old),
+            opinion.glue_revision,
+        )
+    return old
 
 
 def demote_stale(opinion: Opinion) -> bool:
@@ -681,7 +1043,7 @@ def promote_ready_opinions(limit: int = PROMOTIONS_PER_TICK) -> int:
         _live_stamps(),
         scan__status__in=OPINION_PDF_STATUSES,
         status=OpinionReviewStatus.PROCESSING,
-    )[:limit]
+    ).select_related("scan", "scan__reporter")[:limit]
     moved = sum(1 for row in ready if promote_ready(row))
     stale = Opinion.objects.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW

@@ -284,23 +284,34 @@ a.doc-name:hover { text-decoration: underline; }
     position: relative;
 }
 
-/* Zoom toolbar — floats at the top-left of the viewer panel.
-   Sticky on both axes so it stays visible when horizontal overflow
-   appears at zoom > 1. */
+/* Zoom toolbar — a column pinned at the top-left of the viewer panel,
+   over the grey gutter beside the pages. Sticky on both axes so it
+   stays visible when horizontal overflow appears at zoom > 1. The
+   sticky box itself has no size, so the column takes no height in the
+   flow: a row across the top sat over the first page of every volume,
+   and a column in the flow would have pushed that page down by its
+   own height. The stack inside it is what shows. */
 .zoom-toolbar {
     position: sticky;
     top: 0;
     left: 0;
+    width: 0;
+    height: 0;
+    overflow: visible;
+    z-index: 30;
+}
+.zoom-toolbar .zoom-stack {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
     width: max-content;
-    margin-bottom: 12px;
-    padding: 4px 8px;
+    max-width: 150px;
+    padding: 6px;
     background: rgba(40, 42, 45, 0.92);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 6px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    z-index: 30;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     backdrop-filter: blur(4px);
 }
@@ -314,6 +325,7 @@ a.doc-name:hover { text-decoration: underline; }
     line-height: 1.2;
     cursor: pointer;
     min-width: 28px;
+    text-align: center;
 }
 .zoom-toolbar .zoom-btn:hover { background: #4b5056; }
 .zoom-toolbar .zoom-btn:active { background: #2f3337; }
@@ -338,6 +350,7 @@ a.doc-name:hover { text-decoration: underline; }
     font-size: 12px;
     line-height: 1.2;
     cursor: pointer;
+    max-width: 100%;
 }
 .zoom-toolbar .zoom-select:hover { background: #4b5056; }
 .zoom-toolbar .zoom-select:disabled {
@@ -347,6 +360,7 @@ a.doc-name:hover { text-decoration: underline; }
 .zoom-toolbar .zoom-select option:disabled { color: #9ca3af; }
 .zoom-toolbar .zoom-pct {
     color: #f3f4f6;
+    text-align: center;
     font-size: 12px;
     min-width: 44px;
     text-align: center;
@@ -1145,6 +1159,15 @@ a.doc-name:hover { text-decoration: underline; }
     line-height: 1.5;
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
 }
+/* Under the step-2 toolbar column the panel opens beside the stack,
+   not under it: the stack is its positioned ancestor. Scoped here,
+   because the text review's guide shares the rule and must keep
+   hanging under its own "?" (the panel over its toggle could not be
+   closed). */
+.zoom-toolbar .viewer-help-panel {
+    top: 0;
+    left: calc(100% + 6px);
+}
 .viewer-help-panel h3 {
     margin: 8px 0 4px;
     font-size: 11px;
@@ -1203,6 +1226,20 @@ a.doc-name:hover { text-decoration: underline; }
 /* The text review of one opinion (#365)                               */
 /* ------------------------------------------------------------------ */
 
+/* The guide of the text review (#419): the panel of review 2, hung
+   from the right edge of the "?", which is at the right of the card. */
+.text-review-help-panel {
+    left: auto;
+    right: 0;
+    z-index: 50;
+    max-height: calc(100vh - 160px);
+}
+.text-review-help-panel .viewer-help-swatch { margin-right: 4px; }
+.text-review-help-blocking { background: rgba(220, 38, 38, 0.8); }
+.text-review-help-warning { background: rgba(217, 119, 6, 0.75); }
+.text-review-help-zone { background: rgba(8, 145, 178, 0.6); }
+.text-review-help-quote { background: rgba(146, 64, 14, 0.7); }
+
 /* Each column is its own scroll box, so a jump inside one column
    leaves the other one where the reviewer put it. The pages column
    scrolls sideways as well, because a zoomed page is wider than it. */
@@ -1236,13 +1273,87 @@ a.doc-name:hover { text-decoration: underline; }
     border-color: rgba(107, 114, 128, 0.7);
     background: rgba(107, 114, 128, 0.06);
 }
+/* The risk of a group (#419), after the agreement, which it replaces
+   in a document that writes it: yellow where a majority of the engines
+   read alike, red where the approval waits for a person. */
+.ensemble-box[data-level="warning"] {
+    border-color: rgba(217, 119, 6, 0.75);
+    background: rgba(217, 119, 6, 0.08);
+}
+.ensemble-box[data-level="blocking"] {
+    border-color: rgba(220, 38, 38, 0.8);
+    background: rgba(220, 38, 38, 0.08);
+}
+/* A box every engine read alike is quiet (#419): drawn while its
+   group is selected, or while the reviewer asks for every box. It
+   stays in the page, so the hit test still finds it. */
+.ensemble-box.ensemble-quiet:not(.ensemble-selected) {
+    border-color: transparent;
+    background: transparent;
+}
+.opinion-pages.show-quiet .ensemble-box.ensemble-quiet:not(.ensemble-selected) {
+    border-color: rgba(37, 99, 235, 0.45);
+    background: rgba(37, 99, 235, 0.05);
+}
+/* The section of a box (#399). The colour is the agreement, so the */
+/* section takes the border style, and the zone band shows the rule. */
+.ensemble-box[data-section="footnotes"] {
+    border-style: double;
+    border-width: 3px;
+}
+/* After the section rule, which has the same weight: the zone band */
+/* shows the section of a weak box, and nothing else shows the doubt. */
 .ensemble-box.weak {
     border-style: dashed;
+    border-width: 1px;
 }
+.ensemble-zone {
+    position: absolute;
+    pointer-events: none;
+    box-sizing: border-box;
+    border-top: 1px dashed rgba(8, 145, 178, 0.8);
+    background: rgba(8, 145, 178, 0.07);
+}
+/* The band of the footnotes a person set (#419): the colour of the */
+/* footnote zone, and a dotted edge, because no detection drew it. */
+.ensemble-zone.ensemble-hand-zone {
+    border-top: 1px dotted rgba(8, 145, 178, 0.9);
+    border-bottom: 1px dotted rgba(8, 145, 178, 0.9);
+    background: rgba(8, 145, 178, 0.1);
+}
+/* The blockquote zone (#411): a band on the left edge, in the colour */
+/* the detection drawer gives BLOCKQUOTE, and a box in the quote. */
+.ensemble-zone.ensemble-quote-zone {
+    border-top: none;
+    border-left: 2px dashed rgba(146, 64, 14, 0.8);
+    background: rgba(146, 64, 14, 0.06);
+}
+.ensemble-box[data-blockquote="true"] {
+    border-left-width: 4px;
+}
+.ensemble-box[data-blockquote="part"] {
+    border-left-width: 4px;
+    border-left-style: dotted;
+}
+.ensemble-box.ensemble-doubt {
+    outline: 1px dashed #b45309;
+    outline-offset: 2px;
+}
+/* The selection is blue, because red is the colour of a group the
+   approval waits on (#419). */
 .ensemble-box.ensemble-selected {
-    border-color: #dc2626;
+    border-color: #1d4ed8;
     border-width: 2px;
-    background: rgba(220, 38, 38, 0.12);
+    background: rgba(29, 78, 216, 0.12);
+}
+.ensemble-box.ensemble-locked,
+.ensemble-group.ensemble-locked {
+    outline: 2px solid #1d4ed8;
+    outline-offset: 2px;
+}
+/* A double border under 3px draws as one solid line. */
+.ensemble-box[data-section="footnotes"].ensemble-selected {
+    border-width: 3px;
 }
 
 .opinion-text-page {
@@ -1272,6 +1383,58 @@ a.doc-name:hover { text-decoration: underline; }
     white-space: pre-wrap;
     cursor: default;
 }
+/* The kind of a group and the marks of its text (#404). */
+h3.ensemble-group {
+    font-size: 14px;
+    font-weight: 600;
+}
+/* A picture of the text (#463): drawn at its printed width, never
+   wider than the column. */
+figure.ensemble-group[data-kind="figure"] {
+    margin: 0.5rem 0;
+}
+img.ensemble-figure {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+}
+.ensemble-figure-missing {
+    font-size: 0.75rem;
+    font-style: italic;
+    opacity: 0.7;
+}
+div.ensemble-group[data-kind="list_item"] {
+    margin-left: 1.2em;
+}
+/* The items of a list (#428): the ``li`` marks of the group. A bullet
+   list draws its bullet here, a numbered list has its numbers in the
+   text, and the rest of an item above has no bullet. */
+.ensemble-item {
+    display: block;
+}
+.ensemble-group[data-list="ul"] .ensemble-item:not(.ensemble-item-rest)::before {
+    content: "\2022";
+    display: inline-block;
+    width: 1.2em;
+    margin-left: -1.2em;
+}
+.ensemble-item-rest {
+    display: block;
+}
+.ensemble-group sup {
+    line-height: 0;
+    font-size: 0.75em;
+}
+.ensemble-table {
+    border-collapse: collapse;
+    margin: 2px 0;
+}
+.ensemble-table td {
+    border: 1px solid #d1d5db;
+    padding: 1px 6px;
+    vertical-align: top;
+}
 .ensemble-group[data-agreement="majority"],
 .ensemble-group[data-agreement="voted"] {
     border-left-color: rgba(217, 119, 6, 0.75);
@@ -1279,9 +1442,49 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-group[data-agreement="single"] {
     border-left-color: rgba(107, 114, 128, 0.7);
 }
-.ensemble-group.ensemble-selected {
-    background: rgba(220, 38, 38, 0.10);
+.ensemble-group[data-level="warning"] {
+    border-left-color: rgba(217, 119, 6, 0.75);
+}
+.ensemble-group[data-level="blocking"] {
     border-left-color: #dc2626;
+    background: rgba(220, 38, 38, 0.05);
+}
+.ensemble-group.ensemble-selected {
+    background: rgba(29, 78, 216, 0.10);
+    border-left-color: #1d4ed8;
+}
+.ensemble-group.ensemble-doubt:not(.ensemble-selected) {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-blockquote {
+    margin: 0 0 10px 12px;
+    padding-left: 8px;
+    border-left: 3px solid rgba(146, 64, 14, 0.5);
+}
+/* A block a person quoted in part (#419): the parts are the words
+   of the group, so they take no margin of their own, and the quote
+   inside the group keeps the gap of a paragraph. */
+.ensemble-part-quoted .ensemble-part { margin: 0; }
+.ensemble-part-quoted .ensemble-blockquote { margin: 4px 0 4px 12px; }
+.ensemble-blockquote.ensemble-quote-list {
+    border-left-style: dashed;
+    border-left-color: #b45309;
+}
+.ensemble-footnotes {
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px dashed rgba(8, 145, 178, 0.6);
+}
+.ensemble-footnotes .ensemble-group {
+    font-size: 12px;
+}
+.ensemble-footnotes-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #0e7490;
+    margin-bottom: 6px;
 }
 .ensemble-low {
     background: rgba(217, 119, 6, 0.25);
@@ -1296,12 +1499,15 @@ a.doc-name:hover { text-decoration: underline; }
     cursor: pointer;
 }
 
-/* The readings of the engines, under the group that differs (#365). */
-/* Not on a selected group: the two rules have the same weight, and
-   this one comes later, so the red of the selection would go. */
-.ensemble-group.differs:not(.ensemble-selected) {
-    border-left-color: rgba(217, 119, 6, 0.75);
+/* The findings of one opinion scroll inside a fixed height (#419), so
+   the strip never pushes the two columns off the first screen. */
+.opinion-findings {
+    max-height: 16rem;
+    overflow-y: auto;
 }
+
+/* The badge of a group fewer engines read than the page holds, and
+   the readings under a group (#365, #419). */
 .ensemble-compare {
     font-size: 10px;
     padding: 0 5px;
@@ -1408,3 +1614,280 @@ a.doc-name:hover { text-decoration: underline; }
 .ensemble-voted {
     background: rgba(217, 119, 6, 0.12);
 }
+
+/* The human edits of the text (#376). The toolbar sits under the locked
+   block, and it is the one place a curator writes. The colours are
+   rgba over the scheme, so they read in the light and the dark mode. */
+.ensemble-edit-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: -4px 0 10px 6px;
+    padding: 4px 6px;
+    border-left: 2px solid #1d4ed8;
+    background: rgba(29, 78, 216, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-edit-bar.ensemble-editor {
+    flex-direction: column;
+}
+.ensemble-edit-button {
+    font-size: 12px;
+    line-height: 1.3;
+    padding: 2px 8px;
+    border: 1px solid rgba(29, 78, 216, 0.5);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+}
+.ensemble-edit-button:hover:not(:disabled) {
+    background: rgba(29, 78, 216, 0.15);
+}
+.ensemble-edit-button:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+.ensemble-edit-area {
+    width: 100%;
+    font: inherit;
+    font-size: 13px;
+    padding: 4px 6px;
+    border: 1px solid rgba(107, 114, 128, 0.5);
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+}
+.ensemble-edit-hint {
+    margin: 0 0 4px;
+    font-size: 12px;
+    color: #6b7280;
+}
+.ensemble-edit-row {
+    display: flex;
+    gap: 4px;
+    justify-content: flex-end;
+}
+/* A block whose text a person wrote. */
+.ensemble-group.ensemble-human {
+    border-left: 3px solid #16a34a;
+    padding-left: 4px;
+}
+/* The modal of a text edit: the text before and after, side by side. */
+.edit-modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+    background: rgba(17, 24, 39, 0.55);
+}
+.edit-modal-box {
+    width: min(900px, 100%);
+    max-height: 90vh;
+    overflow-y: auto;
+    padding: 16px;
+    border-radius: 8px;
+    background: var(--modal-bg, #fff);
+    color: var(--modal-fg, #111827);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3);
+}
+@media (prefers-color-scheme: dark) {
+    .edit-modal-box {
+        --modal-bg: #1f2937;
+        --modal-fg: #f3f4f6;
+    }
+}
+.edit-modal-title {
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+.edit-modal-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+@media (max-width: 640px) {
+    .edit-modal-columns {
+        grid-template-columns: 1fr;
+    }
+}
+.edit-modal-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    opacity: 0.7;
+    margin-bottom: 4px;
+}
+.edit-modal-text {
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    padding: 6px 8px;
+    border: 1px solid rgba(107, 114, 128, 0.35);
+    border-radius: 4px;
+}
+/* The edits a build did not apply, each with its Undo (#376). */
+.ensemble-unresolved {
+    margin: 4px 0 8px;
+    padding: 4px 6px;
+    border-left: 2px solid #dc2626;
+    background: rgba(220, 38, 38, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-unresolved-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
+/* A block a person took out of the text as not text: its box stays
+   on the page, hatched and grey, so the reader sees what went, and no
+   ``ensemble-box`` class, so the hit test never finds it. The list
+   under the page's label holds its Undo. */
+.ensemble-junk {
+    position: absolute;
+    border: 1px dashed rgba(107, 114, 128, 0.8);
+    background: repeating-linear-gradient(
+        45deg,
+        rgba(107, 114, 128, 0.14) 0 6px,
+        transparent 6px 12px
+    );
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ensemble-dropped {
+    margin: 4px 0 8px;
+    padding: 4px 6px;
+    border-left: 2px solid #6b7280;
+    background: rgba(107, 114, 128, 0.08);
+    border-radius: 0 4px 4px 0;
+}
+.ensemble-dropped-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    padding: 2px 0;
+}
+
+/* ── The blocking review ───────────────────────────────────────────
+   One card per open word (or block), in a row: the crop of the scan,
+   the sentence, one row per engine and a row to type. The classes are
+   the script's (blocking_review.js); the colours follow the review
+   page's red for a block the approval waits on. */
+.bk-card { border: 1px solid #d6d3cd; border-radius: 6px; padding: 12px 14px; margin: 0 0 14px; background: #fff; }
+.bk-card.bk-done { opacity: 0.55; }
+.bk-card.bk-active { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.18); }
+.bk-card > header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12.5px; color: #6b7280; margin-bottom: 8px; }
+.bk-card > header .bk-step { font-weight: 600; color: #b3261e; }
+.bk-cropwrap { position: relative; border: 1px solid #e5e7eb; background: #fff; overflow: hidden; border-radius: 4px; max-width: 760px; margin-bottom: 8px; }
+.bk-cropwrap canvas { width: 100%; height: auto; display: block; }
+.bk-hl { position: absolute; border: 2px solid #b3261e; background: rgba(179, 38, 30, 0.14); border-radius: 3px; box-sizing: border-box; pointer-events: none; }
+.bk-snippet { font-family: Georgia, "Times New Roman", serif; font-size: 15px; line-height: 1.5; margin: 0 0 8px; color: #6b7280; }
+.bk-snippet mark { background: rgba(179, 38, 30, 0.14); color: inherit; border-bottom: 2px solid #b3261e; font-weight: 600; padding: 0 2px; }
+.bk-stack { display: grid; gap: 6px; max-width: 760px; }
+.bk-opt { display: grid; grid-template-columns: 110px 1fr; gap: 12px; align-items: center; text-align: left; font: inherit; padding: 8px 12px 8px 10px; border: 2px solid #d6d3cd; border-left-width: 6px; border-radius: 6px; background: transparent; color: inherit; cursor: pointer; }
+.bk-opt:hover { border-color: #2f5d8a; }
+.bk-opt .bk-who { font-size: 12px; color: #6b7280; font-family: ui-monospace, Menlo, monospace; }
+.bk-opt .bk-val { font-family: Georgia, "Times New Roman", serif; font-size: 18px; line-height: 1.3; word-break: break-word; min-width: 0; }
+.bk-opt .bk-ctx { color: #9ca3af; font-size: 14px; }
+.bk-opt .bk-nothing { color: #9ca3af; font-style: italic; font-size: 14px; }
+.bk-opt.r0 { border-left-color: #2f5d8a; }
+.bk-opt.r1 { border-left-color: #b7791f; }
+.bk-opt.r2 { border-left-color: #7a5c99; }
+.bk-opt.bk-chosen { border-color: #2e7d32; box-shadow: inset 0 0 0 2px #2e7d32; }
+/* The reading that is in the text now: a tint and a check mark, so
+   the reviewer sees what was selected before blessing or correcting
+   it; the words are in the row's tooltip. */
+.bk-opt.bk-shown { background: rgba(46, 125, 50, 0.07); }
+.bk-opt .bk-shown-tag { margin-left: 10px; font-size: 11px; font-family: ui-monospace, Menlo, monospace; color: #2e7d32; white-space: nowrap; }
+/* Dark mode follows the system setting (Tailwind's ``darkMode:
+   'media'``), so these go under the media query and never under a
+   class nothing sets: a white card under light text is unreadable. */
+@media (prefers-color-scheme: dark) {
+    .bk-card { background: #1f2937; border-color: #374151; }
+    .bk-snippet mark { color: #f3f4f6; }
+    .bk-opt { border-color: #4b5563; }
+    .bk-opt.bk-shown { background: rgba(46, 125, 50, 0.18); }
+    .bk-opt .bk-shown-tag { color: #86efac; }
+}
+.bk-opt.bk-focus { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.25); }
+.bk-opt.bk-typed { cursor: text; border-left-color: #d6d3cd; }
+.bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }
+.bk-card > footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.bk-state { font-size: 12.5px; color: #6b7280; }
+.bk-card.bk-done .bk-state { color: #2e7d32; font-weight: 600; }
+.bk-grow { flex: 1; }
+.bk-note { font-size: 13px; color: #6b7280; margin: 4px 0; }
+.bk-note.bk-error { color: #b3261e; }
+.bk-note.bk-ok { color: #2e7d32; font-weight: 600; }
+.bk-single .bk-val { font-size: 15px; line-height: 1.45; max-height: 9em; overflow: auto; }
+.bk-opinion.bk-approved { opacity: 0.6; }
+.bk-card.bk-answered { opacity: 0.7; border-left: 6px solid #2e7d32; }
+.bk-card.bk-answered .bk-state { color: #2e7d32; font-weight: 600; }
+
+/* ── The card review of review 2 (card_review.js) ────────────────────
+   The cards reuse the blocking review's .bk-* rules; these are the box
+   on the crop, movable at its edges, and the key hints. */
+.cr-cropwrap { max-width: 900px; }
+.cr-cropwrap.cr-fullpage { max-width: none; }
+/* The opened card takes the window: the whole page at the window's
+   width, scrolled inside the card, the box still movable. */
+.bk-card.cr-expanded { position: fixed; inset: 0; z-index: 90; margin: 0; overflow: auto; border-radius: 0; background: #fff; padding: 12px 24px 24px; }
+.bk-card.cr-expanded > header { position: sticky; top: 0; background: #fff; padding: 6px 0; z-index: 1; }
+.bk-card.cr-expanded > footer { position: sticky; bottom: 0; background: #fff; padding: 8px 0; }
+@media (prefers-color-scheme: dark) {
+  .bk-card.cr-expanded, .bk-card.cr-expanded > header, .bk-card.cr-expanded > footer { background: #1f2937; }
+}
+.cr-full-btn { font: inherit; font-size: 12px; color: #2f5d8a; background: none; border: 1px solid #d6d3cd; border-radius: 4px; padding: 0 6px; cursor: pointer; }
+.cr-full-btn:hover { border-color: #2f5d8a; }
+.cr-layer { position: absolute; inset: 0; }
+.cr-box { position: absolute; box-sizing: border-box; border: 2px solid #22c55e; background: rgba(34, 197, 94, 0.10); cursor: move; color: #22c55e; }
+.cr-box.cr-image { border-color: #2f5d8a; background: rgba(47, 93, 138, 0.10); color: #2f5d8a; }
+.cr-box.cr-faint { border-color: #b7791f; background: rgba(183, 121, 31, 0.12); color: #b7791f; }
+.cr-box.cr-editorial { border-color: #7c3aed; background: rgba(124, 58, 237, 0.10); color: #7c3aed; }
+.cr-box.cr-frozen { cursor: default; opacity: 0.6; }
+.cr-anchor { position: absolute; box-sizing: border-box; border: 2px dashed #6b7280; pointer-events: none; }
+/* The block a text card's footnote answer takes, inside a wider guess. */
+.cr-block { position: absolute; box-sizing: border-box; border: 2px dotted #2563eb; pointer-events: none; }
+.cr-other { position: absolute; box-sizing: border-box; border: 1px solid rgba(107, 114, 128, 0.55); pointer-events: none; }
+.cr-other.cr-own { border-color: rgba(46, 125, 50, 0.7); }
+.cr-other.cr-mine { border-width: 2px; border-color: #2e7d32; }
+.cr-other-tag { position: absolute; left: 0; top: 0; font: 10px ui-monospace, Menlo, monospace; color: #fff; background: rgba(107, 114, 128, 0.7); padding: 0 3px; line-height: 13px; white-space: nowrap; }
+/* The label of an outline is the handle that opens the box for editing. */
+.cr-other .cr-other-tag { pointer-events: auto; cursor: pointer; }
+.cr-other .cr-other-tag:hover { background: #2563eb; }
+.cr-layer.cr-drawing .cr-other-tag { pointer-events: none; }
+/* A box of the page under edit: the handles of the card's own box, in blue, over a frozen own box. */
+.cr-box.cr-edit { border-color: #2563eb; background: rgba(37, 99, 235, 0.08); color: #2563eb; z-index: 4; }
+.cr-box.cr-edit .cr-other-tag { background: #2563eb; pointer-events: none; }
+.cr-layer.cr-editing .cr-box:not(.cr-edit) { pointer-events: none; }
+.cr-other.cr-own .cr-other-tag { background: rgba(46, 125, 50, 0.75); }
+.cr-other-x { position: absolute; z-index: 3; right: -8px; top: -8px; width: 18px; height: 18px; border-radius: 9px; border: 1px solid #2e7d32; background: #fff; color: #2e7d32; font: 13px/16px sans-serif; cursor: pointer; pointer-events: auto; padding: 0; }
+.cr-layer.cr-drawing { cursor: crosshair; }
+/* While drawing, the card's own box and its handles let the mouse through to the surface. */
+.cr-layer.cr-drawing .cr-box, .cr-layer.cr-drawing .cr-box .cr-handle { pointer-events: none; }
+.cr-new { position: absolute; box-sizing: border-box; border: 2px dashed #2e7d32; background: rgba(46, 125, 50, 0.08); pointer-events: none; }
+.cr-draw-popup { position: absolute; z-index: 5; display: flex; gap: 6px; align-items: center; background: #fff; border: 1px solid #d6d3cd; border-radius: 6px; padding: 6px 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15); }
+.cr-draw-select { font: 13px sans-serif; max-width: 180px; }
+.cr-full-btn.cr-on { color: #fff; background: #2e7d32; border-color: #2e7d32; }
+.cr-box.cr-frozen .cr-handle { display: none; }
+.cr-handle { position: absolute; width: 10px; height: 10px; background: #fff; border: 2px solid currentColor; border-radius: 2px; box-sizing: border-box; }
+.cr-handle.nw { top: -5px; left: -5px; cursor: nw-resize; }
+.cr-handle.n  { top: -5px; left: calc(50% - 5px); cursor: n-resize; }
+.cr-handle.ne { top: -5px; right: -5px; cursor: ne-resize; }
+.cr-handle.w  { top: calc(50% - 5px); left: -5px; cursor: w-resize; }
+.cr-handle.e  { top: calc(50% - 5px); right: -5px; cursor: e-resize; }
+.cr-handle.sw { bottom: -5px; left: -5px; cursor: sw-resize; }
+.cr-handle.s  { bottom: -5px; left: calc(50% - 5px); cursor: s-resize; }
+.cr-handle.se { bottom: -5px; right: -5px; cursor: se-resize; }
+.bk-card.cr-skipped { opacity: 0.7; }
+.bk-card.cr-skipped .bk-state { color: #b7791f; }
+.cr-keys kbd { font: 11px ui-monospace, Menlo, monospace; border: 1px solid #d6d3cd; border-radius: 3px; padding: 0 4px; }

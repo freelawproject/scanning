@@ -52,7 +52,7 @@ import fitz
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import page_edits, s3_sync
+from scanning import page_edits, s3_sync, tasks
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -1773,6 +1773,7 @@ def queue_ready_scans() -> int:
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
             queued += claimed
+            tasks.dispatch_scan(scan.pk, QueuedAction.APPLY_PAGE_EDITS)
     return queued
 
 
@@ -1842,6 +1843,10 @@ def _rows_by_edit(
 ) -> dict[int, ExternalJob]:
     """Return one stage's rows of a run, keyed by the edit they read.
 
+    The newest job run wins an edit: a re-read of the edited pages
+    (``enqueue_yolo_detect --stale-labels``, #338) leaves the first
+    read's rows on the apply run beside the new ones.
+
     :param rows: The run's rows.
     :param stage: A ``JobStage`` value.
     :returns: ``{edit pk: row}``.
@@ -1849,12 +1854,12 @@ def _rows_by_edit(
     """
     return {
         row.input_manifest["edit_id"]: row
-        for row in rows
+        for row in sorted(rows, key=lambda row: (row.run, row.attempt))
         if row.stage == stage and "edit_id" in (row.input_manifest or {})
     }
 
 
-def _volume_bitonal_key(scan: Scan) -> str:
+def volume_bitonal_key(scan: Scan) -> str:
     """Return the key of the review-1 bitonal copy, or of the original.
 
     A volume that skipped the conversion (its source is already 1-bit)
@@ -1915,11 +1920,11 @@ def _glue_bitonal(
         raise ApplyError(f"run {run.label} of scan {scan.pk} has no page map")
     entries = page_map["pages"]
     if is_identity_map(page_map):
-        return _volume_bitonal_key(scan)
+        return volume_bitonal_key(scan)
 
     converted = _rows_by_edit(rows, JobStage.CONVERT)
     volume_path = tmp_dir / "volume-bitonal.pdf"
-    s3_sync.download_object(_volume_bitonal_key(scan), volume_path)
+    s3_sync.download_object(volume_bitonal_key(scan), volume_path)
     shards: dict[int, fitz.Document] = {}
 
     def shard_of(edit_id: int) -> fitz.Document:
@@ -2150,11 +2155,66 @@ def _glue_ocr(
         if not s3_sync.upload_json_object(ocr_key, document):
             raise ApplyError("could not upload the final OCR volume")
 
-    printed = printed_pages(scan, run, document)
+    printed = printed_pages(
+        scan, run, document, _final_fallbacks(scan, page_map)
+    )
     printed_key = f"{prefix}printed_pages.json"
     if not s3_sync.upload_json_object(printed_key, printed):
         raise ApplyError("could not upload the printed pages")
     return ocr_key, printed_key
+
+
+def _final_fallbacks(scan: Scan, page_map: dict) -> dict[str, dict]:
+    """Project the other engines' volume documents into the final space.
+
+    The pages of a corrected volume that the other engines fill in
+    (#351, ``page_numbers.fallback_documents``). Their volume documents
+    are in the original's page space, like dots.mocr's, so the same
+    walk renumbers them (:func:`walk_final_pages`), with no result for
+    an edited page: that page is the curator's own upload, which
+    carries its label, or a page dots.mocr read again on its own.
+
+    The corrected volume's own Mistral and Surya documents
+    (``ApplyRun.extract_key``, ``ApplyRun.surya_key``) are not read
+    here: the tick writes them after this glue, and a printed-page map
+    that waited for them would hold a volume nobody read with them.
+    The review-1 reading was filled from these same volume documents,
+    so the map agrees with what the reviewer approved.
+
+    A document the walk refuses is logged and left out: it fills no
+    page, and the map is still written.
+
+    :param scan: The scan.
+    :param page_map: The run's stored map.
+    :returns: ``{engine name: document}``, pages in the final space.
+    :rtype: dict[str, dict]
+    """
+    from scanning import page_numbers
+
+    projected = {}
+    for name, volume in page_numbers.fallback_documents(scan).items():
+        pages = volume.get("pages") if isinstance(volume, dict) else None
+        if not isinstance(pages, list):
+            continue
+        try:
+            walked = walk_final_pages(
+                page_map,
+                pages,
+                {},
+                missing={},
+                error_cls=ApplyError,
+                what=f"the {name} volume document",
+            )
+        except ApplyError as exc:
+            logger.warning(
+                "apply: scan %s: %s; its page numbers fill no page of "
+                "the printed-page map",
+                scan.pk,
+                exc,
+            )
+            continue
+        projected[name] = {**volume, "pages": walked}
+    return projected
 
 
 def _repair_edit_pages(
@@ -2207,21 +2267,29 @@ def _repair_edit_pages(
         )
 
 
-def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
+def printed_pages(
+    scan: Scan,
+    run: ApplyRun,
+    document: dict,
+    fallbacks: dict[str, dict] | None = None,
+) -> dict:
     """Return the frozen printed-page map, in the final page space.
 
     The glued read, through the same reading as review 1
-    (``page_numbers.ocr_results_from_volume``), overlaid with the
-    curator's decisions: a ``SET_NUMBER`` row lands on the slot its
-    original page holds (a replaced or rotated page included), and an
-    inserted page carries the label its row was uploaded under. The
-    curator outranks the model. Citations use printed pages, so this
-    map is a product of the apply, not review scaffolding.
+    (``page_numbers.ocr_results_from_volume``, the other engines'
+    documents filling the blanks, #351), overlaid with the curator's
+    decisions: a ``SET_NUMBER`` row lands on the slot its original
+    page holds (a replaced or rotated page included), and an inserted
+    page carries the label its row was uploaded under. The curator
+    outranks the model. Citations use printed pages, so this map is a
+    product of the apply, not review scaffolding.
 
     :param scan: The scan.
     :param run: The built run.
     :param document: The final OCR volume, or the volume's own when the
         run aliases it.
+    :param fallbacks: The other engines' documents in the same page
+        space (:func:`_final_fallbacks`), or None.
     :returns: ``pages`` of ``final_page``, ``printed``, ``type``,
         ``by`` (``model``, ``curator`` or None) and ``source``.
     :rtype: dict
@@ -2229,7 +2297,7 @@ def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
     from scanning import page_numbers
 
     page_map = run.page_map
-    results = page_numbers.ocr_results_from_volume(document)
+    results = page_numbers.ocr_results_from_volume(document, fallbacks)
     by_final = {entry["pdf_page"]: entry for entry in results}
     pages = []
     for entry in page_map["pages"]:
@@ -2280,7 +2348,10 @@ def printed_pages(scan: Scan, run: ApplyRun, document: dict) -> dict:
 
 
 def _glue_detections(
-    scan: Scan, run: ApplyRun, rows: list[ExternalJob]
+    scan: Scan,
+    run: ApplyRun,
+    rows: list[ExternalJob],
+    volume_rows: list[ExternalJob] | None = None,
 ) -> str:
     """Write the final detections volume, in the final page space.
 
@@ -2293,12 +2364,16 @@ def _glue_detections(
     :param scan: The scan.
     :param run: The built run.
     :param rows: The run's rows.
+    :param volume_rows: The merged volume run to read, when the caller
+        holds one that is not consumed yet (:func:`refresh_detections`);
+        the live consumed run otherwise.
     :returns: The key of the final detections document.
     :rtype: str
     """
     from scanning import yolo
 
-    volume_rows = _volume_detect_run(scan)
+    if volume_rows is None:
+        volume_rows = _volume_detect_run(scan)
     if not volume_rows:
         raise ApplyError(f"scan {scan.pk} has no merged detection run to read")
     volume_key = yolo.merged_result_key(scan, volume_rows[0].run)
@@ -2460,6 +2535,97 @@ def glue_run(scan: Scan) -> ApplyRun:
         time.monotonic() - started,
     )
     return run
+
+
+def _detections_to_refresh(scan: Scan) -> ApplyRun | None:
+    """Return the standing run whose detections glue a new volume run
+    must write again, or None.
+
+    :param scan: The scan.
+    :returns: The standing built run when its detections are glued;
+        a run that has not glued them yet reads the live volume run
+        when it does. A run built over another original is None: the
+        new volume run describes a re-upload, and that run is replaced,
+        never glued again.
+    :rtype: ApplyRun | None
+    """
+    run = current_run(scan)
+    if run is None or not run.is_built or not run.detections_key:
+        return None
+    if (
+        run.source_fingerprint
+        and scan.source_fingerprint
+        and run.source_fingerprint != scan.source_fingerprint
+    ):
+        return None
+    return run
+
+
+def detections_refresh_waits(scan: Scan) -> bool:
+    """Return whether the re-glue of :func:`refresh_detections` must wait.
+
+    It waits while a row of the live detection run of the standing
+    run's edited pages is unstarted, in flight or dead, the rule of
+    :func:`_stage_blocked`: a re-read of those pages (#338) is the
+    input the new glue reads for them, and a dead one has no result to
+    read, so gluing past it would spend the merge ledger on a failure
+    that repeats. The live run alone, because the rows of an earlier
+    read of the same pages stay on the apply run; a dead re-read goes
+    back through ``enqueue_yolo_detect --stale-labels``, whose new run
+    carries every page that was read.
+
+    :param scan: The scan.
+    :returns: Whether to leave the merge of the volume run for a later
+        tick.
+    :rtype: bool
+    """
+    from scanning import jobs
+
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    rows = jobs.live_run(
+        scan, JobStage.DETECT, JobEngine.BLACKLETTER, apply_run=run
+    )
+    return any(row.status in BLOCKING_JOB_STATUSES for row in rows)
+
+
+def refresh_detections(scan: Scan, volume_rows: list[ExternalJob]) -> bool:
+    """Write the standing run's detections again from a new volume run.
+
+    ``detections_key`` is written once by :func:`_glue`, and the
+    compute reads that document and never the merged one, so a second
+    volume detection run (#338) merged over a corrected volume would
+    import the first run's detections again and stamp them as
+    measured against the second. The merge calls this before it
+    consumes the new run: an identity run's key is the new merged key,
+    and any other run's document is written again over the same key,
+    from the new merge plus the newest read of each edited page. JSON
+    work, so it runs on the collect tick like the glue it repeats.
+
+    :param scan: The scan.
+    :param volume_rows: The new volume run, merged and not consumed.
+    :returns: Whether a document was written.
+    :rtype: bool
+    :raises ApplyError: If the glue refuses its inputs.
+    """
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    rows = list(run.jobs.all())
+    key = _glue_detections(scan, run, rows, volume_rows=volume_rows)
+    ApplyRun.objects.filter(pk=run.pk).update(detections_key=key)
+    ExternalJob.objects.filter(
+        apply_run=run, stage=JobStage.DETECT, status=JobStatus.COMPLETED
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+    logger.info(
+        "apply: scan %s: run %s detections written again from detection "
+        "run %s",
+        scan.pk,
+        run.label,
+        volume_rows[0].run,
+    )
+    return True
 
 
 def reglue_ocr(scan: Scan, run: ApplyRun | None = None) -> bool:
@@ -2705,6 +2871,29 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
             f"not a printed-page map"
         )
     return document
+
+
+def printed_numbers(printed: dict) -> dict[int, str]:
+    """Return the approved page number of every final page (#396, #375).
+
+    **The one parse** of a printed-page map into numbers: the OCR glue
+    reads it for the page-number verdict and the text approval for the
+    page table. The map is the one review 1 approved, the model's
+    reading with the curator's own numbers over it. A page with no
+    number is absent, so a reader's ``get`` answers None.
+
+    :param printed: The document of :func:`load_printed_pages`.
+    :returns: ``{page_index: value}``, the index 0-based.
+    :rtype: dict[int, str]
+    """
+    numbers: dict[int, str] = {}
+    for page in printed.get("pages") or []:
+        if not isinstance(page, dict) or not page.get("printed"):
+            continue
+        final = page.get("final_page")
+        if isinstance(final, int) and final > 0:
+            numbers[final - 1] = str(page["printed"])
+    return numbers
 
 
 def viewer_pages(printed: dict) -> tuple[list[dict], dict[int, dict]]:

@@ -1,0 +1,870 @@
+{
+ "schema": 1,
+ "join_rule": 1,
+ "opinion": {
+  "first_printed_page": 25,
+  "index_in_page": 0,
+  "last_printed_page": 31,
+  "page_count": 7,
+  "glue_revision": 1,
+  "scan": 3593,
+  "edit_revision": 2
+ },
+ "approved_by": "curator",
+ "approved_at": "2026-09-26T01:08:49.160888+00:00",
+ "engines": [
+  "dots_mocr",
+  "mistral_ocr",
+  "surya"
+ ],
+ "pages": [
+  {
+   "page_in_opinion": 0,
+   "page_index": 24,
+   "printed": "25",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 1,
+   "page_index": 25,
+   "printed": "26",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 2,
+   "page_index": 26,
+   "printed": "27",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 3,
+   "page_index": 27,
+   "printed": "28",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 4,
+   "page_index": 28,
+   "printed": "29",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 5,
+   "page_index": 29,
+   "printed": "30",
+   "error": null,
+   "furniture": []
+  },
+  {
+   "page_in_opinion": 6,
+   "page_index": 30,
+   "printed": "31",
+   "error": null,
+   "furniture": []
+  }
+ ],
+ "body": [
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Mindy LEE, Appellant,",
+   "marks": [],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "v.",
+   "marks": [],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "ANIMAL AID, INC., and Rhoda Mann, Appellees.",
+   "marks": [
+    {
+     "start": 0,
+     "end": 44,
+     "kind": "strong"
+    }
+   ],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "No. 4D2023-0049",
+   "marks": [],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "District Court of Appeal of Florida, Fourth District.",
+   "marks": [],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "[June 12, 2024]",
+   "marks": [],
+   "pages": [
+    0
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Appeal from the Circuit Court for the Seventeenth Judicial Circuit, Broward County; Jeffrey R. Levenson, Judge; L.T. Case No. CACE18-005692.",
+   "marks": [],
+   "pages": [
+    1
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "V. Ashley Paxton and Thomas L. Hunker of Hunker Paxton Appeals & Trials, Fort Lauderdale, and Shai Ozery of Robert N. Hartsell, P.A., Pompano Beach, for appellant.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Kevin H. Fabrikant and Patrice Paldino of Fabrikant & Associates, PLLC, Hollywood, for appellee Animal Aid, Inc.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "heading",
+   "blockquote": false,
+   "text": "ON MOTION FOR REHEARING, REHEARING EN BANC, AND CERTIFICATION",
+   "marks": [
+    {
+     "start": 0,
+     "end": 61,
+     "kind": "strong"
+    }
+   ],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Levine, J.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "We deny appellant's motion for rehearing, rehearing en banc, and certification, withdraw our previously issued opinion, and substitute the following in its place.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Appellant, Mindy Lee, volunteered for appellee, Animal Aid, Inc., until she was no longer allowed to volunteer for the organization due to complaints about her.1 Animal Aid then sued Lee, alleging that Lee made defamatory statements about Animal Aid. Lee moved for summary judgment and in part relied on section 768.295, commonly referred to as the Anti-SLAPP (Strategic Lawsuits Against Public Participation) statute. The parties subsequently attended non-binding arbitration, and the trial court adopted the arbitrator's findings and dismissed both Animal Aid's complaint and Lee's counterclaim with prejudice. Lee moved for an award of attorney's fees pursuant to the Anti-SLAPP statute, which the trial court denied.",
+   "marks": [
+    {
+     "start": 160,
+     "end": 161,
+     "kind": "sup"
+    }
+   ],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "On appeal, Lee argues that the trial court erred by denying her motion for attorney's fees under the Anti-SLAPP statute. We find that the trial court correctly denied Lee's motion for attorney's fees pursuant to the Anti-SLAPP provision since the trial court made no specific find-\nings that Animal Aid's actions violated the Anti-SLAPP statute. Without the trial court making such an express finding that Animal Aid's defamation suit violated the Anti-SLAPP statute, then, as a result, Lee would not be entitled to attorney's fees pursuant to section 768.295(4). Thus, we affirm.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [
+    {
+     "offset": 282,
+     "at": "column"
+    }
+   ],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Animal Aid operates a not-for-profit corporation, offering services such as a low cost spay clinic and homeless pet recovery and adoption center. Animal Aid filed a complaint against Lee, a former volunteer, for defamation. Animal Aid's complaint described Lee as \"very often a difficult person to work with,\" and alleged that Lee was \"harsh, overly direct, hostile, and at times manipulative.\" Animal Aid also alleged that Lee began to harass and pick on other volunteers while she was volunteering for Animal Aid. Following a complaint by a fellow volunteer, Animal Aid told Lee that her conduct was unacceptable, asked her to leave, and told Lee that she would not be called upon to volunteer again.",
+   "marks": [],
+   "pages": [
+    2
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Animal Aid's complaint alleged that, after Lee had been discharged from volunteering for Animal Aid, Lee began publishing false statements about Animal Aid, including that Animal Aid used non-sterile surgical tools, did not use pain medications, and did not use protective cones or collars after surgical procedures. According to Animal Aid, Lee also suggested that Animal Aid's veterinarians were \"not licensed true veterinarians.\" In sum, Animal Aid alleged that Lee \"claim[ed] that Animal Aid is a scam, takes donation money, and does not provide the services or animal care it claims to.\" Animal Aid alleged that Lee published the defamatory statements in various ways, such as by posting\non Facebook, contacting local government agencies and news outlets, and posting negative comments on Yelp and Google reviews.",
+   "marks": [],
+   "pages": [
+    2,
+    3
+   ],
+   "page_breaks": [
+    {
+     "offset": 693,
+     "page_in_opinion": 3
+    }
+   ],
+   "joins": [
+    {
+     "offset": 693,
+     "at": "page"
+    }
+   ],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Following years of litigation, the trial court ordered the parties to submit to non-binding arbitration. Before the parties attended arbitration, Lee moved for summary judgment, which in part alleged that Animal Aid's defamation suit violated the Anti-SLAPP statute and was brought \"to silence public criticism of operations.\" Animal Aid did not respond to Lee's motion for summary judgment, and significantly Lee did not obtain a ruling from the trial court on her motion for summary judgment.",
+   "marks": [],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Subsequently, the parties attended non-binding arbitration. The arbitrator found that Lee was not liable to Animal Aid for defamation. The arbitrator determined that Animal Aid was a limited public figure, and Animal Aid failed to show evidence that Lee acted with actual malice, which is required to prove defamation of a limited public figure. Further, the arbitrator found that Lee's statements were either opinion or supported by her good faith belief in their truth. The arbitrator also found that Lee did not prove her counterclaims. Thus, the arbitrator's ultimate opinion was to enter judgment in favor of Lee on Animal Aid's claims and in favor of Animal Aid on Lee's counterclaims. The arbitrator recommended that no damages be awarded to either party.",
+   "marks": [],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Entitlement to an award of attorney's fees and costs was deferred to the trial court.",
+   "marks": [],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "The trial court entered a final order fully adopting the arbitrator's findings of fact and conclusions of law, noting that neither party had moved for a trial de novo within the time allotted by Florida Rule of Civil Procedure 1.820.2 The order dismissed Animal Aid's complaint and Lee's counterclaim with prejudice. The trial court retained jurisdiction to entertain any post-judgment motions, including motions for attorney's fees.",
+   "marks": [
+    {
+     "start": 233,
+     "end": 234,
+     "kind": "sup"
+    }
+   ],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Lee then moved for an award of attorney's fees pursuant to section 768.295(4), Florida Statutes (2018), the Anti-SLAPP statute. Though Lee had been previously represented by counsel, she filed this motion pro se alleging \"with assistance of Counsel,\" without further elaboration. Animal Aid filed a response, arguing in part that the arbitrator did not make any finding or ruling as to whether Animal Aid's complaint was a lawsuit precluded by the Anti-SLAPP statute. The trial court denied Lee's motion for attorney's fees \"as without baseis [sic].\" This appeal follows.",
+   "marks": [],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "\"Generally, a trial court's ruling on a motion for attorneys' fees is reviewed for abuse of discretion; '[h]owever, where entitlement depends on the interpretation of a statute or contract the ruling is reviewed de novo.'\" Kelly v. BankUnited, FSB, 159 So. 3d 403, 405 (Fla. 4th DCA 2015) (citation omitted).",
+   "marks": [
+    {
+     "start": 223,
+     "end": 248,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    3
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Lee's claim for attorney's fees fails because the trial court never made a finding that Animal Aid's actions violated the Anti-SLAPP statute. \"Florida's anti-SLAPP statute prohibits a person from filing a cause of action that is (a) 'without merit' and (b) 'primarily' because the defendant 'exercised the constitutional right of free speech in connection with a public issue.'\" Bongino v. Daily Beast Co., No. 19-14472-CIV, 2021 WL 4976287, at *4 (S.D. Fla. Feb. 9, 2021) (quoting § 768.295(3), Fla. Stat); WPB Residents for Integrity in Gov't, Inc. v. Materio, 284 So. 3d 555, 558 (Fla. 4th DCA 2019) (\"A SLAPP is a 'lawsuit, cause of action, claim, cross-claim, or counterclaim' filed against a person or entity that is 'without merit' and filed 'primarily because' the person or entity engaged in the exercise of a right protected by the First Amendment to the U.S. Constitution.\") (citation omitted).",
+   "marks": [
+    {
+     "start": 379,
+     "end": 406,
+     "kind": "em"
+    },
+    {
+     "start": 508,
+     "end": 562,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "The legislature outlined within the statute the purpose of the Anti-SLAPP provision:",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": true,
+   "text": "It is the intent of the Legislature to protect the right in Florida to exercise the rights of free speech in connection with public issues, and the rights to peacefully assemble, instruct representatives, and petition for redress of grievances before the various governmental entities of this state as protected by the First Amendment to the United States Constitution and s. 5, Art. I of the State Constitution. It is the public policy of this state that a person or governmental entity not engage in SLAPP suits because such actions are inconsistent with the right of persons to exercise such constitutional rights of free speech in connection with public issues.",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": true
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "§ 768.295(1), Fla. Stat. (2018).",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Further, section 768.295 provides for an award of attorney's fees to a party who prevails on an Anti-SLAPP claim:",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": true,
+   "text": "A person or entity sued by a governmental entity or another person in violation of this section has a right to an expeditious resolution of a claim that the suit is in violation of this section. A person or entity may move the court for an order dismissing the action or granting final judgment in favor of that person or entity. The person or entity may file a motion for summary judgment, together with supplemental affidavits, seeking a determination that the claimant's or governmental entity's lawsuit has been brought in violation of this section. The claimant or governmental entity shall thereafter file a response and any supplemental affidavits. As soon as practicable, the court shall set a hearing on the motion, which shall be held at the earliest possible time after the filing of the claimant's or governmental entity's response. The court may award, subject to the limitations in s. 768.28, the party sued by a governmental entity actual damages arising from a governmental entity's violation of this section. The court shall award the prevailing party reasonable attorney fees and costs incurred in connection with a claim that an action was filed in violation of this section.",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "§ 768.295(4), Fla. Stat. (2018).",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "A party who prevails on an Anti-SLAPP claim is entitled to attorney's fees under section 768.295(4). In Bongino, for example, the trial court",
+   "marks": [
+    {
+     "start": 104,
+     "end": 112,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": true,
+   "text": "adjudicated the merits of Plaintiff's anti-SLAPP claim before Plaintiff filed his dismissal notice.... [The trial court] concluded that Plaintiff's suit is \"without merit\" because Plaintiff failed to state a claim for defamation, and it arises of out \"free speech in connection with a public issue\" because it involves a news report on a public figure.",
+   "marks": [],
+   "pages": [
+    4
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "2021 WL 4976287, at *5. The trial court in Bongino found that the defendant was the prevailing party under the Anti-SLAPP statute, and, as a result, was entitled to attorney's fees. Thus, Bongino is unlike the present case, since the trial court here did not adjudicate at all on the merits of the Anti-SLAPP claim.",
+   "marks": [
+    {
+     "start": 43,
+     "end": 50,
+     "kind": "em"
+    },
+    {
+     "start": 188,
+     "end": 195,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Merely raising the Anti-SLAPP statute as an affirmative defense, where the court's order granting summary judgment neither mentioned nor relied on the Anti-SLAPP provision, will not entitle the party to fees under the Anti-SLAPP statute. Wentz v. Project Veritas, No. 6:17-cv-1164-Orl-18GJK, 2019 WL 4621069, at *2 (M.D. Fla. July 19, 2019). The court in Wentz concluded that merely raising Anti-SLAPP was insufficient, and such an argument was contrary to the \"plain meaning of the Anti-SLAPP act and would permit entitlement to fees simply by raising the anti-SLAPP act as a defense, without any ruling as to its applicability.\" Id.",
+   "marks": [
+    {
+     "start": 238,
+     "end": 263,
+     "kind": "em"
+    },
+    {
+     "start": 355,
+     "end": 360,
+     "kind": "em"
+    },
+    {
+     "start": 631,
+     "end": 634,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "It is clear that there must be an express finding by the trial court that the petitioner's suit violated the Anti-SLAPP statute for the defendant to be entitled to fees under section 768.295(4). 100PlusAnimalRescue, Inc. v. Butkus, No. 17-61893-CIV, 2021 WL 4635819, at *2 (S.D. Fla. June 14, 2021). In 100PlusAnimalRescue, the trial court determined:",
+   "marks": [
+    {
+     "start": 195,
+     "end": 231,
+     "kind": "em"
+    },
+    {
+     "start": 303,
+     "end": 323,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": true,
+   "text": "Plaintiffs are not entitled to fees under the anti-SLAPP statute. Defendant raised the anti-SLAPP statute in both her motion to dismiss and her motion for summary judgment. However, after reviewing the transcript on the motion to dismiss, the order denying Defendant's motion for summary judgment, and the order entering judgment in favor of Plaintiffs, the undersigned finds that no ruling was made in regard to the anti-SLAPP statute.",
+   "marks": [],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Id. The trial court in 100PlusAnimalRescue concluded that the \"[p]laintiffs are not\nthe prevailing party under the anti-SLAPP statute because the Court rendered no such ruling.\" Id. at *3. Similarly, in the present case, the trial court also rendered no such ruling, so, as a result, Lee is not the prevailing party under the Anti-SLAPP statute.",
+   "marks": [
+    {
+     "start": 0,
+     "end": 3,
+     "kind": "em"
+    },
+    {
+     "start": 23,
+     "end": 42,
+     "kind": "em"
+    },
+    {
+     "start": 178,
+     "end": 181,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [
+    {
+     "offset": 84,
+     "at": "column"
+    }
+   ],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "In this case, neither the arbitrator, nor the trial court, made any specific finding that Animal Aid's suit violated the Anti-SLAPP statute. The arbitrator and trial court never determined that Animal Aid's claim was \"without merit\" or that the claim was filed \"primarily\" because Lee \"exercised the constitutional right of free speech in connection with a public issue.\" Bongino, 2021 WL 4976287, at *4. Lee even admits that \"the arbitrator did not affirmatively (or at least, expressly) assume the task of determining whether Animal Aid's defamation action violates section 768.295, Fla. Stat.\"",
+   "marks": [
+    {
+     "start": 372,
+     "end": 380,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Lee had ample opportunities to obtain a ruling on this issue. However, Lee never scheduled a hearing on her motion for summary judgment. Further, Lee did not move for a trial de novo following the non-binding arbitration. At any of these points during the proceedings, Lee could have had the Anti-SLAPP claim adjudicated.",
+   "marks": [],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Because Lee did not have the merits of the Anti-SLAPP claim adjudicated at the trial court, Lee also effectively waived any challenge involving this claim on appeal. Fla. Dep't of Agric. & Consumer Servs. v. Mendez, 98 So. 3d 604, 608 (Fla. 4th DCA 2012) (\"Part of the preservation requirement is the securing of a ruling, and the Palm Beach County class has not secured one.\"); Hamilton v. R.L. Best Int'l, 996 So. 2d 233, 235 (Fla. 1st DCA 2008) (\"The preservation of error requirement is not ordinarily completed until the aggrieved party has obtained a ruling on the motion or objection made in the lower tribunal.\").",
+   "marks": [
+    {
+     "start": 166,
+     "end": 215,
+     "kind": "em"
+    },
+    {
+     "start": 379,
+     "end": 407,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    5
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "We can also affirm the denial of attorney's fees due to the fact that Lee filed her attorney's fees motion raising the Anti-SLAPP statute pro se. Although Lee claimed that this motion was filed \"with assistance of Counsel,\" there was no attorney of record for the case or for this particular motion. It goes without saying that non-attorneys proceeding pro se are not entitled to an award of attorney's fees. See Kay v. Ehrler, 499 U.S. 432, 435, 111 S.Ct. 1435, 113 L.Ed.2d 486 (1991) (\"[A] pro se litigant who is not a lawyer is not entitled to attorney's fees.\") (emphasis omitted); Massengale v. Ray, 267 F. 3d 1298, 1302-03 (11th Cir. 2001) (\"Because a party proceeding pro se cannot have incurred attorney's fees as an expense, a district court cannot order a violating party to pay a pro se litigant a reasonable attorney's fee as part of a sanction.\"); City of Riviera Beach v. Lozman, 672 Fed. Appx. 892, 899 (11th Cir. 2016) (\"[A]ttorneys' fees are not available to pro se parties even if a counseled party would be awarded them as a matter of right.\"); U.S. v. Evans, 561 Fed. Appx. 877, 880 (11th Cir. 2014) (\"[P]ro se litigants are entitled to an award of attorney fees only to the extent that the 'services of an attorney were utilized and fees incurred.'\") (citation omitted); Torres v. Miami-Dade Cnty., No. 15-24013-CIV, 2019 WL 1281213, at * 3 (S.D. Fla. Mar. 20, 2019) (\"Plaintiff's request for attorney's fees ... is denied as he is a pro se, non-lawyer, litigant not entitled to such fees.\"); DeBose v. Univ. of S. Fla. Bd. of Tr., No. 8:15-cv-2787, 2018 WL 8919870, at *1 (M.D. Fla. Oct. 19, 2018) (\"[A] pro se plaintiff, as a matter of law, cannot recover attorney's fees for representing herself.\").",
+   "marks": [
+    {
+     "start": 413,
+     "end": 427,
+     "kind": "em"
+    },
+    {
+     "start": 586,
+     "end": 604,
+     "kind": "em"
+    },
+    {
+     "start": 861,
+     "end": 893,
+     "kind": "em"
+    },
+    {
+     "start": 1064,
+     "end": 1078,
+     "kind": "em"
+    },
+    {
+     "start": 1292,
+     "end": 1319,
+     "kind": "em"
+    },
+    {
+     "start": 1358,
+     "end": 1359,
+     "kind": "sup"
+    },
+    {
+     "start": 1514,
+     "end": 1552,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    6
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Lee relies on the fact that she has incurred attorney's fees for \"four years in this case and incurred attorneys' fees up until just prior to the arbitration,\" without,\nas required, specifically delineating those attorney's fees in the filing of the Anti-SLAPP motion. Even if there had been an express finding by the trial court that Animal Aid's suit violated the Anti-SLAPP statute—which there was not—the Anti-SLAPP statute “provides only for ‘attorney fees and costs incurred in connection with a claim that an action was filed in violation of this section’—in other words, fees and costs incurred in connection with the SLAPP motion itself.” Berisha v. Lawson, 378 F. Supp. 3d 1145, 1157 n.8 (S.D. Fla. 2018) (quoting § 768.295(4), Fla. Stat.). Since Lee did not specifically delineate that she had incurred any attorney's fees in connection with the filing of this particular Anti-SLAPP motion, she is not entitled to fees under this statute.",
+   "marks": [
+    {
+     "start": 648,
+     "end": 666,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    6
+   ],
+   "page_breaks": [],
+   "joins": [
+    {
+     "offset": 169,
+     "at": "column"
+    }
+   ],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "In summary, the trial court correctly denied Lee's motion for attorney's fees under the provision of the Anti-SLAPP statute since Lee never obtained a ruling that Animal Aid's claim violated the Anti-SLAPP statute. Further, Lee, as a pro se litigant on her Anti-SLAPP motion, was not entitled to attorney's fees. As such, we affirm.",
+   "marks": [],
+   "pages": [
+    6
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Affirmed.",
+   "marks": [
+    {
+     "start": 0,
+     "end": 9,
+     "kind": "em"
+    }
+   ],
+   "pages": [
+    6
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  },
+  {
+   "kind": "paragraph",
+   "blockquote": false,
+   "text": "Kuntz and Artau, JJ., concur.",
+   "marks": [],
+   "pages": [
+    6
+   ],
+   "page_breaks": [],
+   "joins": [],
+   "human": false
+  }
+ ],
+ "footnotes": [
+  {
+   "label": "1",
+   "pages": [
+    2
+   ],
+   "paragraphs": [
+    {
+     "kind": "paragraph",
+     "blockquote": false,
+     "text": "Appellee Rhoda Mann was Lee's codefendant. She has not made any filings in this\nappeal.",
+     "marks": [],
+     "pages": [
+      2
+     ],
+     "page_breaks": [],
+     "joins": [
+      {
+       "offset": 80,
+       "at": "column"
+      }
+     ],
+     "human": false
+    }
+   ]
+  },
+  {
+   "label": "2",
+   "pages": [
+    3
+   ],
+   "paragraphs": [
+    {
+     "kind": "list_item",
+     "blockquote": false,
+     "text": "\"Any party may file a motion for trial.... If a motion for trial is not made within 20 days of service on the parties of the decision, the decision shall be referred to the presiding judge, who shall enter such orders and judgments as may be required to carry out the terms of the decision as provided by section 44.103(5), Florida Statutes.\" Fla. R. Civ. P. 1.820(h); § 44.103(5), Fla. Stat. (2018) (\"An arbitration decision shall be final if a request for a trial de novo is not filed within the time provided by rules promulgated by the Supreme Court.\"); Vitesse, Inc. v. MAPL Assocs.,",
+     "marks": [
+      {
+       "start": 558,
+       "end": 588,
+       "kind": "em"
+      }
+     ],
+     "pages": [
+      3
+     ],
+     "page_breaks": [],
+     "joins": [],
+     "human": false,
+     "list": null
+    },
+    {
+     "kind": "paragraph",
+     "blockquote": false,
+     "text": "358 So. 3d 437, 439 (Fla. 4th DCA 2023) (\"Under the rule's plain language, unless a party files a motion for trial de novo within twenty days of the arbitrator's decision, the trial court must enforce the arbitration award.\"); Stowe v. Univ. Prop. & Cas. Ins. Co., 937 So. 2d 156, 158 (Fla. 4th DCA 2006) (\"[F]ailure to request a trial de novo within the time provided in the rules creates a 'right to enforce an arbitration award that has become final and binding as a result of a failure to request a trial.'\") (citation omitted).",
+     "marks": [
+      {
+       "start": 188,
+       "end": 192,
+       "kind": "em"
+      },
+      {
+       "start": 227,
+       "end": 264,
+       "kind": "em"
+      }
+     ],
+     "pages": [
+      3
+     ],
+     "page_breaks": [],
+     "joins": [],
+     "human": true
+    }
+   ]
+  }
+ ]
+}

@@ -105,7 +105,8 @@ same pixels as theirs.
   lookup, no GPU) so a wrong base fails on the build host and not on a
   billed worker. The plain (non `-cu130`) tag keeps the image
   compatible with RunPod hosts whose drivers predate CUDA 13.
-- The `datalab-to/surya-ocr-2` snapshot baked into `/opt/hf`
+- The `freelawproject/surya-ocr-2` snapshot (our fork of
+  `datalab-to/surya-ocr-2`, pinned by `SURYA_REVISION`) baked into `/opt/hf`
   (`HF_HUB_OFFLINE=1` at runtime; the repo's README assets are left
   out), and an offline load gate that proves the base image's
   transformers can open it.

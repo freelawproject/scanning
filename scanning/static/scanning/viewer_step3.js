@@ -18,11 +18,13 @@
  *   so the render draws the boxes again. Nothing is positioned one
  *   time (#311). A page holds the scale it was drawn at, so it is
  *   drawn again only when that scale changes.
- * - **The document holds no markup.** A voted group holds tokens with
- *   a ``low_confidence`` flag, and this module builds the nodes. Every
- *   string enters the DOM with ``textContent``. The words that differ
- *   are measured here too (#380), over the text as it is shown and
- *   never over the key of ``ensemble.compare_text``.
+ * - **The document holds no markup.** A group holds a plain text,
+ *   standoff marks over it and a kind (#404), a voted group holds
+ *   tokens with a ``low_confidence`` flag, and this module builds the
+ *   nodes (:func:`markedNodes`). Every string enters the DOM with
+ *   ``textContent``. The words that differ are measured here too
+ *   (#380), over the text as it is shown and never over the key of
+ *   ``ensemble.compare_text``.
  * - **A box takes no pointer.** One hit test on the wrapper finds the
  *   box under the pointer, the rule of ``ocr_text.js``: a box that
  *   took the pointer would swallow the clicks of the page.
@@ -33,6 +35,41 @@
  *
  * The link between the columns is the group id. A text node carries
  * ``data-page`` and ``data-group``; so does its box.
+ *
+ * A group says its section (#399), and the section is read off the
+ * group and never off its place in the list: a page shows its body
+ * text, then its footnotes in a block of their own, and the page
+ * draws its footnote zones under the boxes. A footnote a person set
+ * gets a band of its own (:func:`handFootnoteBands`, #419), which is
+ * never a zone.
+ *
+ * A blockquote is a run the document writes (``page.blockquotes``,
+ * #411), and the viewer never derives one: the groups of a run go in
+ * one ``<blockquote>`` element, and the page draws the blockquote
+ * zones beside the footnote zones.
+ *
+ * A group says its risk (``level``, #419), and the viewer reads it and
+ * derives nothing: ``ensemble.disagreement_level`` is the one rule of
+ * the cards, the colours and the badge. A ``blocking`` group is red, a
+ * ``warning`` group is yellow, and the box of a group with no level
+ * (every engine read it alike) is quiet: it shows while its group is
+ * selected, or while the reviewer asks for every box. A document of an
+ * older schema has no level, and the page says so.
+ *
+ * A double click locks one group (#419): the pointer no longer moves
+ * the selection, and the readings of the group open under it. A
+ * single click outside the group, its readings and its box releases
+ * the lock.
+ *
+ * The human edits of the text (#376) are the buttons of the locked
+ * group's toolbar, and a write control exists nowhere else, so a hover
+ * or a stray click never edits. The toolbar offers what the endpoints
+ * take: a text edit on a group with a ``level``, a move, a section,
+ * and the Undo of each standing edit, all read off the document. A
+ * text edit opens a modal with the old and the new text and their
+ * difference. Every answer is a Django message, so the page reloads to
+ * show it, and the locked group is found again by its box and locked
+ * again: a move gives the groups other ids.
  */
 
 (function () {
@@ -60,6 +97,33 @@
     // browser.
     var MAX_DIFF_WORDS = 1000;
 
+    // The two sections of a page (#399), the values of
+    // ``ensemble.BODY`` and ``ensemble.FOOTNOTES``.
+    var BODY = 'text';
+    var FOOTNOTES = 'footnotes';
+
+    // The first schema of the ensemble document that writes ``level``
+    // on its groups (``ensemble.SCHEMA_VERSION``, #419).
+    var LEVEL_SCHEMA = 6;
+
+    // The key of the reviewer's choice to see every box, in this
+    // browser alone. A convenience: the page works without it.
+    var QUIET_KEY = 'opinion-review-show-quiet';
+
+    // The first schema of the ensemble document that holds the human
+    // edits (``ensemble.SCHEMA_VERSION``, #376). An older document has
+    // no ``edit_revision``, and every edit of it would be refused.
+    var EDIT_SCHEMA = 7;
+
+    // The key of the locked group over the reload of an edit (#376),
+    // in this tab alone. A convenience: the page works without it.
+    var PLACE_KEY = 'opinion-review-place';
+
+    // The least IoU of the stored box and a group's box that finds the
+    // locked group again after the reload: ``ensemble.OVERLAP``, the
+    // rule an edit lands by.
+    var PLACE_OVERLAP = 0.5;
+
     var root = null;
     var pagesColumn = null;
     var textColumn = null;
@@ -71,6 +135,16 @@
 
     // The group under the pointer, so a move clears the one before it.
     var selected = null;
+
+    // The group a double click locked, or null (#419). ``opened`` says
+    // whether the lock opened its readings, so the release closes the
+    // panel it opened and no other.
+    var locked = null;
+
+    // True for a moment after the curator kept their typed text at the
+    // release prompt (#376). A double click on another block is a click
+    // and then a ``dblclick``, and the second must not ask again.
+    var kept = false;
 
     // The page a card of the findings asked for before the text was
     // read. The text column holds no block until then, so the jump is
@@ -291,9 +365,7 @@
         var canvas = pageDiv.querySelector('.pdf-canvas');
         canvas.width = 0;
         canvas.height = 0;
-        pageDiv.querySelector('.canvas-wrapper')
-            .querySelectorAll('.ensemble-box')
-            .forEach(function (el) { el.remove(); });
+        clearOverlays(pageDiv.querySelector('.canvas-wrapper'));
         pageDiv.dataset.rendered = '';
         pageDiv.dataset.renderedScale = '';
     }
@@ -364,11 +436,13 @@
     }
 
     /**
-     * Draw the box of every group of one page.
+     * Draw the footnote zones and the box of every group of one page.
      *
      * A box is in the points of the volume page, and the opinion PDF
      * keeps the page size, so the scale of the render is the only
-     * conversion.
+     * conversion. The zones go in first, so every box is drawn over
+     * them. A zone is not a box: :func:`boxUnder` reads the boxes
+     * alone, so a zone never takes the hit test (#399).
      *
      * @param {HTMLElement} pageDiv - The container of the page.
      * @param {number} index - The 0-based page of the opinion.
@@ -376,11 +450,36 @@
      */
     function drawBoxes(pageDiv, index, scale) {
         var wrapper = pageDiv.querySelector('.canvas-wrapper');
-        wrapper.querySelectorAll('.ensemble-box').forEach(function (el) {
-            el.remove();
-        });
+        clearOverlays(wrapper);
         var page = pageOf(index);
         if (!page) { return; }
+        ((page.zones || {}).footnotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
+        handFootnoteBands(page).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-hand-zone';
+            zone.title = 'Footnotes set by hand';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
+        ((page.zones || {}).blockquotes || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-quote-zone';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
+        handDropped(page).forEach(function (drop) {
+            if (!drop.box_pt) { return; }
+            var junk = document.createElement('div');
+            junk.className = 'ensemble-junk';
+            junk.title = 'Taken out of the text as not text';
+            placeOver(junk, drop.box_pt, scale);
+            wrapper.appendChild(junk);
+        });
         (page.groups || []).forEach(function (group) {
             var box = group.box_pt;
             if (!box) { return; }
@@ -389,14 +488,95 @@
             el.dataset.page = String(index);
             el.dataset.group = String(group.id);
             el.dataset.agreement = group.agreement;
+            el.dataset.section = sectionOf(group);
             if (group.weak) { el.classList.add('weak'); }
-            el.style.left = (box[0] * scale) + 'px';
-            el.style.top = (box[1] * scale) + 'px';
-            el.style.width = ((box[2] - box[0]) * scale) + 'px';
-            el.style.height = ((box[3] - box[1]) * scale) + 'px';
+            if (group.footnote_doubt) { el.classList.add('ensemble-doubt'); }
+            if (group.blockquote) { el.dataset.blockquote = 'true'; }
+            if (group.quote_span) { el.dataset.blockquote = 'part'; }
+            if (hasLevels()) {
+                if (group.level) {
+                    el.dataset.level = group.level;
+                } else {
+                    el.classList.add('ensemble-quiet');
+                }
+            }
+            placeOver(el, box, scale);
             wrapper.appendChild(el);
         });
         if (selected && selected.page === index) { paintSelection(); }
+    }
+
+    /**
+     * Return the bands of the footnotes a person set on one page (#419).
+     *
+     * One band per column: the union of the boxes of the groups that a
+     * ``SECTION`` edit put in the footnotes. A union over both columns
+     * would cover the body text between them. The band is a view of
+     * the edits and never a zone: ``ensemble.section`` reads
+     * ``zones.footnotes`` alone, and so does the footnote doubt.
+     *
+     * @param {Object} page - The page entry.
+     * @returns {number[][]} The bands, in points.
+     */
+    function handFootnoteBands(page) {
+        var bands = {};
+        var order = [];
+        (page.groups || []).forEach(function (group) {
+            var box = group.box_pt;
+            if (!box || !group.section_edit) { return; }
+            if (sectionOf(group) !== FOOTNOTES) { return; }
+            var key = String(group.column);
+            var band = bands[key];
+            if (!band) {
+                bands[key] = box.slice();
+                order.push(key);
+                return;
+            }
+            band[0] = Math.min(band[0], box[0]);
+            band[1] = Math.min(band[1], box[1]);
+            band[2] = Math.max(band[2], box[2]);
+            band[3] = Math.max(band[3], box[3]);
+        });
+        return order.map(function (key) { return bands[key]; });
+    }
+
+    /**
+     * Remove every overlay of one page: the boxes and the zones.
+     *
+     * @param {HTMLElement} wrapper - The canvas wrapper of the page.
+     */
+    function clearOverlays(wrapper) {
+        wrapper.querySelectorAll('.ensemble-box, .ensemble-zone')
+            .forEach(function (el) { el.remove(); });
+    }
+
+    /**
+     * Put one element over a box of the page.
+     *
+     * @param {HTMLElement} el - The element.
+     * @param {number[]} box - ``[x0, y0, x1, y1]`` in points.
+     * @param {number} scale - The scale of the render.
+     */
+    function placeOver(el, box, scale) {
+        el.style.left = (box[0] * scale) + 'px';
+        el.style.top = (box[1] * scale) + 'px';
+        el.style.width = ((box[2] - box[0]) * scale) + 'px';
+        el.style.height = ((box[3] - box[1]) * scale) + 'px';
+    }
+
+    /**
+     * Return the section of one group: ``text`` or ``footnotes``.
+     *
+     * The group says it (``ensemble.section``, #399). The order of the
+     * groups is not the section, and a document written before the
+     * sections (schema 2) holds no ``section``, so its groups are body
+     * text, as they were.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {string} The section.
+     */
+    function sectionOf(group) {
+        return group.section === FOOTNOTES ? FOOTNOTES : BODY;
     }
 
     /**
@@ -457,6 +637,12 @@
 
     /**
      * Build the text column from the document.
+     *
+     * A page shows its body text, then its footnotes in a block of
+     * their own (#399). Each group says its section, and the order of
+     * the groups does not: the split reads :func:`sectionOf` and never
+     * the page's ``footnotes`` string, which is the text and not the
+     * groups. A page with no footnote group has no block.
      */
     function drawText() {
         textColumn.textContent = '';
@@ -469,7 +655,17 @@
             var label = document.createElement('div');
             label.className = 'opinion-text-label';
             label.textContent = 'Page ' + (page.page_in_opinion + 1);
+            if (Object.keys(page.order_edits || {}).length) {
+                label.textContent += ' (order set by hand)';
+            }
             block.appendChild(label);
+            if ((page.unresolved_edits || []).length) {
+                block.appendChild(unresolvedList(page.unresolved_edits));
+            }
+            var junk = handDropped(page);
+            if (junk.length) {
+                block.appendChild(droppedList(junk));
+            }
 
             if (page.error) {
                 block.appendChild(note('opinion-text-error', page.error));
@@ -478,12 +674,90 @@
                     'opinion-text-error', 'No block of this page holds text.'
                 ));
             } else {
+                var footnotes = [];
+                var runs = runOfGroup(page);
+                var quote = null;
+                var quoteRun = -1;
                 page.groups.forEach(function (group) {
-                    block.appendChild(groupNode(page, group));
+                    if (sectionOf(group) === FOOTNOTES) {
+                        footnotes.push(group);
+                        return;
+                    }
+                    var run = runs[group.id];
+                    // A group that quotes part of its text draws its
+                    // own quote inside its node (#419): the text around
+                    // the span is not in the quote.
+                    if (run === undefined || group.quote_span) {
+                        quote = null;
+                        block.appendChild(groupNode(page, group));
+                        return;
+                    }
+                    if (!quote || quoteRun !== run) {
+                        quote = blockquoteNode(page.blockquotes[run]);
+                        quoteRun = run;
+                        block.appendChild(quote);
+                    }
+                    quote.appendChild(groupNode(page, group));
                 });
+                if (footnotes.length) {
+                    block.appendChild(footnoteBlock(page, footnotes));
+                }
             }
             textColumn.appendChild(block);
         });
+    }
+
+    /**
+     * Return the blockquote run of every quoted group of one page.
+     *
+     * The runs are the document's (``ensemble.blockquote_runs``,
+     * #411): the viewer reads them and never finds its own, so the
+     * text column shows the quote the tagger reads.
+     *
+     * @param {Object} page - The page entry.
+     * @returns {Object} ``{group id: index into page.blockquotes}``.
+     */
+    function runOfGroup(page) {
+        var runs = {};
+        (page.blockquotes || []).forEach(function (run, index) {
+            (run.groups || []).forEach(function (id) { runs[id] = index; });
+        });
+        return runs;
+    }
+
+    /**
+     * Return whether a group is a list group of its blockquote (#411):
+     * the ensemble says so, off the engines that read it as a list.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {boolean} Whether it is.
+     */
+    function isQuotedList(page, group) {
+        return (page.blockquotes || []).some(function (run) {
+            return (run.list_groups || []).indexOf(group.id) >= 0;
+        });
+    }
+
+    /**
+     * Build the footnote block of one page.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object[]} groups - The footnote groups, in document order.
+     * @returns {HTMLElement} The block.
+     */
+    function footnoteBlock(page, groups) {
+        var block = document.createElement('div');
+        block.className = 'ensemble-footnotes';
+        var label = document.createElement('div');
+        label.className = 'ensemble-footnotes-label';
+        label.textContent = 'Footnotes';
+        label.title = 'The text under the footnote zone of this page.';
+        block.appendChild(label);
+        groups.forEach(function (group) {
+            block.appendChild(groupNode(page, group));
+        });
+        return block;
     }
 
     function note(className, text) {
@@ -494,129 +768,523 @@
     }
 
     /**
+     * The element a group's kind draws (#404). A table is built from
+     * its rows and holds no text of its own. A list item is a ``div``:
+     * a group holds one item or several, or the rest of an item above,
+     * and its items are the ``li`` marks (#428, :func:`itemParents`).
+     */
+    var KIND_ELEMENTS = {
+        heading: 'h3',
+        list_item: 'div',
+        table: 'div',
+        figure: 'figure',
+        paragraph: 'p'
+    };
+
+    /**
+     * CSS pixels per point: a picture of the text is drawn at the size
+     * it has on the page (#463), the rule of ``casebody.PIXELS_PER_POINT``.
+     */
+    var PIXELS_PER_POINT = 96 / 72;
+
+    /**
+     * Draw one picture of the text in its node (#463).
+     *
+     * The daemon cut it from the original, and ``opinion_figure_url``
+     * answers a presigned URL for it, named by the volume page and the
+     * box the document gives: the server builds the key, so the script
+     * spells no path. The picture holds the width it has on the page,
+     * and no more than the column. A picture the daemon has not cut
+     * says so, in text.
+     *
+     * @param {HTMLElement} node - The group node, a ``figure``.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function drawFigure(node, page, group) {
+        var size = group.figure || {};
+        var image = document.createElement('img');
+        image.className = 'ensemble-figure';
+        image.alt = 'A picture of the text, cut from the original';
+        if (size.width_pt) {
+            image.style.width = Math.round(size.width_pt * PIXELS_PER_POINT)
+                + 'px';
+        }
+        node.appendChild(image);
+        var address = endpoint('figureUrlEndpoint');
+        if (!address) { return; }
+        var query = '?page=' + encodeURIComponent(page.page_index)
+            + '&box=' + encodeURIComponent((group.box_pt || []).join(','));
+        fetch(address + query, { credentials: 'same-origin' })
+            .then(function (response) {
+                // A server fault can answer a page and no JSON: the line
+                // is then ours, never the parser's.
+                return response.json().catch(function () {
+                    return {};
+                }).then(function (data) {
+                    if (!response.ok || !data.url) {
+                        throw new Error(
+                            data.error || 'The picture could not be loaded.'
+                        );
+                    }
+                    image.src = data.url;
+                });
+            })
+            .catch(function (error) {
+                node.removeChild(image);
+                var line = document.createElement('p');
+                line.className = 'ensemble-figure-missing';
+                line.textContent = error.message;
+                node.appendChild(line);
+            });
+    }
+
+    /**
+     * Put one element per item of a list item group in its node (#428).
+     *
+     * The items are the group's ``li`` marks, which the ensemble voted,
+     * so the viewer finds none of its own. The text before the first
+     * item is the rest of an item above, and it gets an element with
+     * no bullet. A bullet list draws its bullet from the stylesheet
+     * (``data-list``); a numbered list has its numbers in the text.
+     *
+     * @param {HTMLElement} node - The group node.
+     * @param {Object} group - The group entry.
+     * @returns {Object} ``{cuts, parentAt}``: the offsets where the
+     *     text changes element, and the element of one offset.
+     */
+    function itemParents(node, group) {
+        var text = group.text || '';
+        var items = (group.marks || []).filter(function (mark) {
+            return mark.kind === 'li';
+        }).sort(function (a, b) { return a.start - b.start; });
+        if (!items.length) {
+            return {
+                cuts: [0, text.length],
+                parentAt: function () { return node; }
+            };
+        }
+        node.dataset.list = group.list || 'ul';
+        var rest = null;
+        if (items[0].start > 0) {
+            rest = document.createElement('span');
+            rest.className = 'ensemble-item ensemble-item-rest';
+            node.appendChild(rest);
+        }
+        var parents = items.map(function () {
+            var element = document.createElement('span');
+            element.className = 'ensemble-item';
+            node.appendChild(element);
+            return element;
+        });
+        var cuts = [0];
+        items.forEach(function (mark) {
+            if (mark.start > 0) { cuts.push(mark.start); }
+        });
+        cuts.push(text.length);
+        return {
+            cuts: cuts,
+            parentAt: function (offset) {
+                for (var i = items.length - 1; i >= 0; i -= 1) {
+                    if (offset >= items[i].start) { return parents[i]; }
+                }
+                return rest || node;
+            }
+        };
+    }
+
+    /**
+     * Fill ``parent`` with ``text`` and its marks.
+     *
+     * The marks are standoff: ``{start, end, kind}`` over ``text``,
+     * with ``kind`` one of ``em``, ``strong`` and ``sup``. The text is
+     * cut at every mark edge, and each piece is a text node wrapped
+     * in one element per mark that covers it, the innermost first.
+     * Every string still enters the DOM with ``textContent``.
+     *
+     * @param {HTMLElement} parent - The node to fill.
+     * @param {string} text - The plain text.
+     * @param {Object[]} marks - Its marks, in its own offsets.
+     */
+    function markedNodes(parent, text, marks) {
+        var edges = {0: true};
+        edges[text.length] = true;
+        (marks || []).forEach(function (mark) {
+            edges[mark.start] = true;
+            edges[mark.end] = true;
+        });
+        var cuts = Object.keys(edges).map(Number).sort(function (a, b) {
+            return a - b;
+        });
+        for (var i = 0; i + 1 < cuts.length; i += 1) {
+            var start = cuts[i];
+            var end = cuts[i + 1];
+            var piece = document.createTextNode(text.slice(start, end));
+            var wrapped = piece;
+            ['sup', 'em', 'strong'].forEach(function (kind) {
+                var covers = (marks || []).some(function (mark) {
+                    return mark.kind === kind
+                        && mark.start <= start && end <= mark.end;
+                });
+                if (covers) {
+                    var element = document.createElement(kind);
+                    element.appendChild(wrapped);
+                    wrapped = element;
+                }
+            });
+            parent.appendChild(wrapped);
+        }
+    }
+
+    /**
+     * The marks of one token of a voted group, in the token's own
+     * offsets: the group's marks cut to ``[at, at + length)``.
+     *
+     * @param {Object[]} marks - The group's marks.
+     * @param {number} at - Where the token starts in the group text.
+     * @param {number} length - The token's length.
+     * @returns {Object[]} The clipped marks.
+     */
+    function clipMarks(marks, at, length) {
+        var out = [];
+        (marks || []).forEach(function (mark) {
+            var start = Math.max(mark.start, at) - at;
+            var end = Math.min(mark.end, at + length) - at;
+            if (end > start) {
+                out.push({start: start, end: end, kind: mark.kind});
+            }
+        });
+        return out;
+    }
+
+    /**
+     * Build the table of a group whose kind is a table.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The table.
+     */
+    function tableNode(group) {
+        var table = document.createElement('table');
+        table.className = 'ensemble-table';
+        var body = document.createElement('tbody');
+        (group.table || []).forEach(function (row) {
+            var tr = document.createElement('tr');
+            row.forEach(function (cell) {
+                var td = document.createElement('td');
+                td.textContent = cell;
+                tr.appendChild(td);
+            });
+            body.appendChild(tr);
+        });
+        table.appendChild(body);
+        return table;
+    }
+
+    /**
      * Build the node of one group.
      *
      * A voted group is built token by token, so a word with no
      * majority carries its own mark. Every other group is one string.
      * The document holds no markup, and this is the one place that
-     * decides what a reading looks like.
+     * decides what a reading looks like: the element follows the
+     * group's ``kind`` and the text its ``marks`` (#404).
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @returns {HTMLElement} The node.
      */
     function groupNode(page, group) {
-        var node = document.createElement('p');
+        var kind = group.kind || 'paragraph';
+        // A quote over part of the text (#419) puts the parts in
+        // elements of the group's kind inside a ``div``, because a
+        // ``p`` holds no blockquote.
+        var span = kind !== 'table' ? group.quote_span : null;
+        var node = document.createElement(
+            span ? 'div' : (KIND_ELEMENTS[kind] || 'p')
+        );
         node.className = 'ensemble-group';
+        if (span) { node.classList.add('ensemble-part-quoted'); }
         node.dataset.page = String(page.page_in_opinion);
         node.dataset.group = String(group.id);
         node.dataset.agreement = group.agreement;
+        node.dataset.kind = kind;
         if (group.weak) { node.classList.add('weak'); }
+        if (group.footnote_doubt) { node.classList.add('ensemble-doubt'); }
+        if (group.human) { node.classList.add('ensemble-human'); }
+        if (hasLevels() && group.level) { node.dataset.level = group.level; }
 
-        var tokens = (group.tokens || []).filter(function (token) {
-            return token.text;
-        });
-        if (group.agreement === 'voted' && tokens.length) {
-            // The words join with one space, the rule the document's
-            // own ``text`` follows.
-            tokens.forEach(function (token, position) {
-                var span = document.createElement('span');
-                span.textContent = token.text;
-                if (token.low_confidence && token.inserted) {
-                    span.className = 'ensemble-low';
-                    span.title = 'The first engine that read here did'
-                        + ' not read this word. The engines that read'
-                        + ' it put it in.';
-                } else if (token.low_confidence) {
-                    span.className = 'ensemble-low';
-                    span.title = 'No majority settled this word. It is'
-                        + ' the reading of the first engine that read'
-                        + ' here.';
-                } else if (token.majority) {
-                    span.className = 'ensemble-voted';
-                    span.title = 'A majority chose this word, and not'
-                        + ' every engine read it so.';
+        if (kind === 'figure') {
+            // A picture holds no text and no reading to compare (#463).
+            drawFigure(node, page, group);
+            return node;
+        }
+        if (kind === 'table' && (group.table || []).length) {
+            node.appendChild(tableNode(group));
+        } else if (span) {
+            // The text before the span, the span in a blockquote, and
+            // the text after.
+            var text = group.text || '';
+            [[0, span[0], null], [span[0], span[1], 'quote'],
+                [span[1], text.length, null]].forEach(function (part) {
+                // The space between two parts is no word of either,
+                // and the column keeps whitespace.
+                while (part[0] < part[1] && /\s/.test(text[part[0]])) {
+                    part[0] += 1;
                 }
-                node.appendChild(span);
-                if (position < tokens.length - 1) {
-                    node.appendChild(document.createTextNode(' '));
+                while (part[1] > part[0] && /\s/.test(text[part[1] - 1])) {
+                    part[1] -= 1;
+                }
+                if (part[1] <= part[0]) { return; }
+                var el = document.createElement(KIND_ELEMENTS[kind] || 'p');
+                el.className = 'ensemble-part';
+                fillText(el, group, part[0], part[1]);
+                if (part[2]) {
+                    var quote = document.createElement('blockquote');
+                    quote.className = 'ensemble-blockquote';
+                    quote.title = 'A person quoted this part of the block.';
+                    quote.appendChild(el);
+                    node.appendChild(quote);
+                } else {
+                    node.appendChild(el);
                 }
             });
         } else {
-            node.textContent = group.text || '';
+            // One element per item of a list (#428), each drawn by the
+            // same helper, so a voted item keeps its token marks.
+            var whole = group.text || '';
+            var items = itemParents(node, group);
+            for (var cut = 0; cut + 1 < items.cuts.length; cut += 1) {
+                var from = items.cuts[cut];
+                // The whitespace before the next item is its line
+                // break, which the item element draws.
+                var to = from + whole.slice(from, items.cuts[cut + 1])
+                    .replace(/\s+$/, '').length;
+                fillText(items.parentAt(from), group, from, to);
+            }
         }
+        // The note and the badge go after the last words of the group.
+        var tail = span && node.lastElementChild
+            ? (node.lastElementChild.querySelector('.ensemble-part')
+                || node.lastElementChild)
+            : node;
 
         var line = groupNote(page, group);
         if (line) {
             var tag = document.createElement('span');
             tag.className = 'ensemble-note';
             tag.textContent = line;
-            tag.title = 'What the engines did here. Press the readings'
-                + ' badge to see each one.';
-            node.appendChild(document.createTextNode(' '));
-            node.appendChild(tag);
+            tag.title = 'What the engines did here. Double-click the'
+                + ' block to see each reading.';
+            tail.appendChild(document.createTextNode(' '));
+            tail.appendChild(tag);
         }
-        if (differs(page, group)) {
-            node.appendChild(document.createTextNode(' '));
-            node.appendChild(compareButton(page, group, node));
-            node.classList.add('differs');
+        var readers = readerCount(group);
+        if (readers < (page.engines || []).length) {
+            tail.appendChild(document.createTextNode(' '));
+            tail.appendChild(compareButton(page, group, node, readers));
         }
         return node;
     }
 
     /**
-     * Return whether the engines did not read one group alike.
+     * Put the words of one part of a group's text in an element.
      *
-     * The browser's copy of ``ensemble._differs``, which the card of
-     * the findings and the ``OpinionText`` row both read: a majority,
-     * a word vote, an engine that read nothing, or fewer engines in
-     * the group than the page holds. A group this answers for carries
-     * the badge that opens the readings.
+     * The part is ``[from, to)`` of the group's ``text``. A voted group
+     * draws its tokens with their flags; the words join with one space,
+     * the rule the document's own ``text`` follows, so a token starts
+     * where the one before it ends plus one, and a part cut at word
+     * edges (``opinion_edits.snap_span``) never cuts a token. Every
+     * other group draws its text with its marks cut to the part.
      *
-     * @param {Object} page - The page entry.
+     * @param {HTMLElement} target - The element.
      * @param {Object} group - The group entry.
-     * @returns {boolean} Whether they differ.
+     * @param {number} from - The first character of the part.
+     * @param {number} to - The character after the part.
      */
-    function differs(page, group) {
-        if (group.agreement === 'majority' || group.agreement === 'voted') {
-            return true;
+    function fillText(target, group, from, to) {
+        var tokens = (group.tokens || []).filter(function (token) {
+            return token.text;
+        });
+        var marked = group.agreement === 'voted'
+            || group.agreement === 'human';
+        if (!(marked && tokens.length)) {
+            markedNodes(
+                target, (group.text || '').slice(from, to),
+                clipMarks(group.marks, from, to - from)
+            );
+            return;
         }
-        if ((group.silent || []).length) { return true; }
-        var engines = (page.engines || []).length;
-        return engines > 0
-            && Object.keys(group.engines || {}).length < engines;
+        var at = 0;
+        var first = true;
+        tokens.forEach(function (token) {
+            var start = at;
+            at += token.text.length + 1;
+            if (start < from || start >= to) { return; }
+            var span = document.createElement('span');
+            markedNodes(
+                span, token.text,
+                clipMarks(group.marks, start, token.text.length)
+            );
+            if (token.low_confidence && token.inserted) {
+                span.className = 'ensemble-low';
+                span.title = 'The first engine that read here did'
+                    + ' not read this word. The engines that read'
+                    + ' it put it in.';
+            } else if (token.low_confidence) {
+                span.className = 'ensemble-low';
+                span.title = 'No majority settled this word. It is'
+                    + ' the reading of the first engine that read'
+                    + ' here.';
+            } else if (token.majority) {
+                span.className = 'ensemble-voted';
+                span.title = 'A majority chose this word, and not'
+                    + ' every engine read it so.';
+            }
+            if (token.gap || token.gap_after) {
+                // A gap beside this word: some engine read words there
+                // that the shown engine did not, and they are not in
+                // the text. The level is the gap's own.
+                var gapLevel = token.gap || token.gap_after;
+                span.classList.add(gapLevel === 'blocking' ? 'ensemble-low' : 'ensemble-voted');
+                span.title = (token.gap_after ? 'After' : 'Before') + ' this word an engine'
+                    + ' read words the shown engine did not'
+                    + (gapLevel === 'blocking'
+                        ? ', and no two engines read the same there.'
+                        : '; the other engines read nothing there.')
+                    + ' None of them is in the text; the readings show them.';
+            }
+            if (!first) {
+                // The separator the text holds there: a line break a
+                // person kept (``opinion_edits.fold``) stays one.
+                var between = (group.text || '').charAt(start - 1);
+                target.appendChild(document.createTextNode(
+                    between === '\n' ? '\n' : ' '
+                ));
+            }
+            first = false;
+            target.appendChild(span);
+        });
     }
 
     /**
-     * Build the badge that opens the readings of one group.
+     * Build the element of one blockquote run (#411). The groups go in
+     * it as the run lists them.
+     *
+     * @param {Object} run - The run entry of ``page.blockquotes``.
+     * @returns {HTMLElement} The element.
+     */
+    function blockquoteNode(run) {
+        var quote = document.createElement('blockquote');
+        quote.className = 'ensemble-blockquote';
+        quote.title = 'The text under a blockquote detection of this page.';
+        if ((run.list_groups || []).length) {
+            quote.classList.add('ensemble-quote-list');
+            quote.title = 'The text under a blockquote detection of this '
+                + 'page. Engines read part of it as a list, so it may be '
+                + 'a list and not a quote.';
+        }
+        return quote;
+    }
+
+    /**
+     * Return whether the document says the risk of its groups.
+     *
+     * A document of a schema before ``LEVEL_SCHEMA`` holds no
+     * ``level``, and the viewer derives none (#419): its groups keep
+     * the colour of their agreement and every box is drawn.
+     *
+     * @returns {boolean} Whether the groups carry ``level``.
+     */
+    function hasLevels() {
+        return !!doc && (doc.schema_version || 0) >= LEVEL_SCHEMA;
+    }
+
+    /**
+     * Return how many engines read words in one group.
+     *
+     * An engine with a box and no word here is ``silent``, and it is
+     * not a reading.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {number} The count.
+     */
+    function readerCount(group) {
+        var silent = group.silent || [];
+        return Object.keys(group.engines || {}).filter(function (name) {
+            return silent.indexOf(name) < 0;
+        }).length;
+    }
+
+    /**
+     * Build the badge of a group fewer engines read than the page
+     * holds (#419). Most groups hold a reading of every engine, and a
+     * badge on each would say nothing; the double click opens the
+     * readings of every group.
      *
      * @param {Object} page - The page entry.
      * @param {Object} group - The group entry.
      * @param {HTMLElement} node - The node of the group.
+     * @param {number} readers - How many engines read words here.
      * @returns {HTMLElement} The button.
      */
-    function compareButton(page, group, node) {
+    function compareButton(page, group, node, readers) {
         var button = document.createElement('button');
         button.type = 'button';
         button.className = 'ensemble-compare';
-        button.textContent = (page.engines || []).length + ' readings';
-        button.title = 'Show what each engine read here, and why this'
-            + ' reading won';
+        button.textContent = readers + (readers === 1 ? ' reading' : ' readings');
+        button.title = 'Only ' + readers + ' of the '
+            + (page.engines || []).length + ' engines read words here.'
+            + ' Show what each engine read, and why this reading won';
         button.addEventListener('click', function (event) {
             event.stopPropagation();
-            var standing = node.nextSibling;
-            if (standing && standing.classList
-                    && standing.classList.contains('ensemble-variants')) {
-                standing.remove();
-                button.classList.remove('open');
-                return;
+            if (readingsOf(node)) {
+                closeReadings(node);
+            } else {
+                openReadings(page, group, node);
             }
+        });
+        return button;
+    }
+
+    /**
+     * Return the readings panel open under one node, or null.
+     *
+     * @param {HTMLElement} node - The node of a group.
+     * @returns {HTMLElement|null} The panel.
+     */
+    function readingsOf(node) {
+        var next = node.nextSibling;
+        return (next && next.classList
+            && next.classList.contains('ensemble-variants')) ? next : null;
+    }
+
+    /**
+     * Open the readings of one group under its node, once.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {HTMLElement} node - The node of the group.
+     */
+    function openReadings(page, group, node) {
+        if (!readingsOf(node)) {
             node.parentNode.insertBefore(
                 variantsPanel(page, group), node.nextSibling
             );
-            button.classList.add('open');
-        });
-        return button;
+        }
+        var button = node.querySelector('.ensemble-compare');
+        if (button) { button.classList.add('open'); }
+    }
+
+    /**
+     * Close the readings of one group.
+     *
+     * @param {HTMLElement} node - The node of the group.
+     */
+    function closeReadings(node) {
+        var panel = readingsOf(node);
+        if (panel) { panel.remove(); }
+        var button = node.querySelector('.ensemble-compare');
+        if (button) { button.classList.remove('open'); }
     }
 
     /**
@@ -703,6 +1371,14 @@
         var source = group.source;
         var agreeing = group.agreeing || [];
         var reason;
+        if (group.agreement === 'human') {
+            // A person wrote the text (#376); the readings below are
+            // the engines' own, and none of them won.
+            return 'A person wrote this text'
+                + (group.human && group.human.by
+                    ? ' (' + group.human.by + ')' : '')
+                + '. The readings of the engines are below.';
+        }
         if (group.agreement === 'single') {
             reason = source + ' alone read words here, so the text'
                 + ' shows its reading.';
@@ -802,8 +1478,8 @@
     // see. So this code holds no table and normalizes nothing, and a
     // reader must not copy ``ensemble.compare_word`` into it.
     //
-    // The mark says nothing about the vote. ``differs`` alone decides
-    // which group carries the badge that opens the panel.
+    // The mark says nothing about the vote. The group's ``level``
+    // alone says where the engines did not read alike (#419).
     // -----------------------------------------------------------------
 
     /**
@@ -1018,6 +1694,12 @@
             return names.indexOf(name) < 0;
         });
         var parts = [];
+        if (group.human) {
+            parts.push('edited by ' + (group.human.by || 'a person'));
+        }
+        if (group.section_edit) {
+            parts.push('section set by hand');
+        }
         if (group.agreement === 'single') {
             // The engine that read, and not every engine with a box
             // here: a silent engine has a box and no word in it, and
@@ -1026,14 +1708,43 @@
         } else if (group.agreement === 'majority') {
             parts.push((group.agreeing || []).join(', ') + ' agree');
         }
-        if (silent.length) {
-            parts.push(silent.join(', ') + ' read nothing here');
+        // A silent engine read nothing here, or read it only under a
+        // redaction or a mask, which the ensemble took out of its
+        // reading: the entry says which (``excluded``).
+        var covered = silent.filter(function (name) {
+            return !!((group.engines || {})[name] || {}).excluded;
+        });
+        var quiet = silent.filter(function (name) {
+            return covered.indexOf(name) < 0;
+        });
+        if (quiet.length) {
+            parts.push(quiet.join(', ') + ' read nothing here');
+        }
+        if (covered.length) {
+            parts.push(covered.join(', ') + ' read it only under a box');
         }
         if (absent.length) {
             parts.push('no box from ' + absent.join(', '));
         }
         if (group.weak) {
             parts.push('the boxes hardly meet');
+        }
+        if (group.footnote_doubt) {
+            // The group is in the body, because the zone alone decides
+            // (#399). The engines named here are the document's own.
+            var labellers = group.footnote_by || [];
+            parts.push(
+                labellers.join(', ')
+                + (labellers.length === 1 ? ' calls' : ' call')
+                + ' this a footnote; no footnote zone here'
+            );
+        }
+        if (isQuotedList(page, group)) {
+            // The tag stays: the card warns and changes nothing (#411).
+            parts.push(
+                (group.list_by || []).join(', ')
+                + ' read this as a list; the blockquote may be a list'
+            );
         }
         return parts.length ? '[' + parts.join('; ') + ']' : '';
     }
@@ -1086,8 +1797,121 @@
             boxFor(selected.page, selected.group),
             nodeFor(selected.page, selected.group)
         ].forEach(function (el) {
-            if (el) { el.classList.add('ensemble-selected'); }
+            if (!el) { return; }
+            el.classList.add('ensemble-selected');
+            if (locked) { el.classList.add('ensemble-locked'); }
         });
+    }
+
+    /**
+     * Return the group entry of one page, or null.
+     *
+     * @param {Object} page - The page entry.
+     * @param {number} id - The id of the group inside that page.
+     * @returns {Object|null} The group.
+     */
+    function groupOf(page, id) {
+        var found = null;
+        ((page && page.groups) || []).forEach(function (group) {
+            if (group.id === id) { found = group; }
+        });
+        return found;
+    }
+
+    /**
+     * Lock one group, and open its readings (#419).
+     *
+     * The pointer no longer moves the selection, so the reviewer can
+     * take the mouse to the readings. A lock of the group locked
+     * already changes nothing; a lock of another group moves it.
+     *
+     * @param {number} page - The 0-based page of the opinion.
+     * @param {number} group - The id of the group inside that page.
+     * @param {string} from - ``text`` or ``page``: the column of the
+     *     double click, which is the column that does not move.
+     */
+    function lock(page, group, from) {
+        if (locked && locked.page === page && locked.group === group) {
+            return;
+        }
+        if (kept || !release()) { return; }
+        select(page, group, from);
+        var node = nodeFor(page, group);
+        var entry = groupOf(pageOf(page), group);
+        // A picture has no readings to open (#463).
+        var opened = !!(node && entry && entry.kind !== 'figure'
+            && !readingsOf(node));
+        if (opened) { openReadings(pageOf(page), entry, node); }
+        locked = {
+            page: page, group: group, opened: opened, bar: null, editor: null
+        };
+        if (node && entry && canEdit()) {
+            locked.bar = editBar(pageOf(page), entry);
+            var after = readingsOf(node) || node;
+            after.parentNode.insertBefore(locked.bar, after.nextSibling);
+        }
+        paintSelection();
+    }
+
+    /**
+     * Release the lock: close the readings it opened, and clear the
+     * selection. An editor with typed text asks first (#376).
+     *
+     * @returns {boolean} Whether the lock was released.
+     */
+    function release() {
+        if (!locked) { return true; }
+        // An open editor with typed text is the curator's work (#376):
+        // a stray click or a double click on another block must not
+        // throw it away without a word.
+        if (hasUnsavedText() && !window.confirm(
+            'Discard the text you typed for this block?'
+        )) {
+            return false;
+        }
+        var node = nodeFor(locked.page, locked.group);
+        if (node && locked.opened) { closeReadings(node); }
+        if (locked.bar) { locked.bar.remove(); }
+        root.querySelectorAll('.ensemble-locked').forEach(function (el) {
+            el.classList.remove('ensemble-locked');
+        });
+        locked = null;
+        clearSelection();
+        return true;
+    }
+
+    /**
+     * Return whether the editor of the locked group holds text the
+     * curator typed and did not save (#376).
+     *
+     * @returns {boolean} Whether it does.
+     */
+    function hasUnsavedText() {
+        var editor = locked && locked.editor;
+        if (!editor || !editor.area.isConnected) { return false; }
+        return editor.area.value.trim() !== editor.base.trim();
+    }
+
+    /**
+     * Return whether a click belongs to the locked group: its node, its
+     * readings, or its box on the page.
+     *
+     * @param {MouseEvent} event - The click.
+     * @returns {boolean} Whether it is inside.
+     */
+    function insideLock(event) {
+        var node = nodeFor(locked.page, locked.group);
+        var panel = node ? readingsOf(node) : null;
+        if (node && node.contains(event.target)) { return true; }
+        if (panel && panel.contains(event.target)) { return true; }
+        if (locked.bar && locked.bar.contains(event.target)) { return true; }
+        var wrapper = event.target.closest
+            ? event.target.closest('.canvas-wrapper') : null;
+        if (!wrapper) { return false; }
+        var box = boxAt(wrapper, event);
+        return !!box
+            && parseInt(box.dataset.page, 10) === locked.page
+            && parseInt(box.dataset.group, 10) === locked.group;
     }
 
     function boxFor(page, group) {
@@ -1171,8 +1995,25 @@
         return found;
     }
 
+    /**
+     * Find the box under one pointer event on a page.
+     *
+     * @param {HTMLElement} wrapper - The wrapper of the page.
+     * @param {MouseEvent} event - The event.
+     * @returns {HTMLElement|null} The box.
+     */
+    function boxAt(wrapper, event) {
+        var frame = wrapper.getBoundingClientRect();
+        return boxUnder(
+            wrapper,
+            event.clientX - frame.left,
+            event.clientY - frame.top
+        );
+    }
+
     function bindPointers() {
         textColumn.addEventListener('mouseover', function (event) {
+            if (locked) { return; }
             var node = event.target.closest('.ensemble-group');
             if (!node) { return; }
             select(
@@ -1182,14 +2023,10 @@
             );
         });
         pagesColumn.addEventListener('mousemove', function (event) {
+            if (locked) { return; }
             var wrapper = event.target.closest('.canvas-wrapper');
             if (!wrapper) { return; }
-            var frame = wrapper.getBoundingClientRect();
-            var box = boxUnder(
-                wrapper,
-                event.clientX - frame.left,
-                event.clientY - frame.top
-            );
+            var box = boxAt(wrapper, event);
             if (!box) { clearSelection(); return; }
             select(
                 parseInt(box.dataset.page, 10),
@@ -1197,6 +2034,66 @@
                 'page'
             );
         });
+        bindLock();
+    }
+
+    /**
+     * The lock of one group (#419): a double click sets it, a single
+     * click outside releases it.
+     */
+    function bindLock() {
+        // A double click selects a word of the text; the lock is what
+        // the reviewer asked for, so the second press selects nothing.
+        textColumn.addEventListener('mousedown', function (event) {
+            if (event.detail > 1 && event.target.closest('.ensemble-group')) {
+                event.preventDefault();
+            }
+        });
+        textColumn.addEventListener('dblclick', function (event) {
+            if (event.target.closest('button')) { return; }
+            var node = event.target.closest('.ensemble-group');
+            if (!node) { return; }
+            lock(
+                parseInt(node.dataset.page, 10),
+                parseInt(node.dataset.group, 10),
+                'text'
+            );
+        });
+        pagesColumn.addEventListener('dblclick', function (event) {
+            var wrapper = event.target.closest('.canvas-wrapper');
+            if (!wrapper) { return; }
+            var box = boxAt(wrapper, event);
+            if (!box) { return; }
+            lock(
+                parseInt(box.dataset.page, 10),
+                parseInt(box.dataset.group, 10),
+                'page'
+            );
+        });
+        // The clicks of a double click are one and two; the first one
+        // on another group releases the lock, and the double click
+        // then sets the new one. A click of the keyboard has a detail
+        // of 0 and releases it too. The listener runs in the capture
+        // phase, so a button that stops the click (a readings badge)
+        // releases the lock as well.
+        document.addEventListener('click', function (event) {
+            if (!locked || event.detail > 1) { return; }
+            if (insideLock(event)) { return; }
+            // The modal of an edit belongs to the locked group (#376).
+            if (event.target.closest && event.target.closest('.edit-modal')) {
+                return;
+            }
+            // The guide explains the lock, so a look at it keeps it.
+            if (event.target.closest && event.target.closest(
+                '#text-review-help-btn, #text-review-help-panel'
+            )) {
+                return;
+            }
+            if (!release()) {
+                kept = true;
+                setTimeout(function () { kept = false; }, 600);
+            }
+        }, true);
     }
 
     /**
@@ -1211,6 +2108,97 @@
                 });
             }
         );
+        // The dismissal of a card, and its undo (#419). The template
+        // writes the address; the answer's line survives the reload,
+        // because the counts of the strip are the server's.
+        document.querySelectorAll('.finding-dismiss, .finding-restore')
+            .forEach(function (button) {
+                button.addEventListener('click', function (event) {
+                    event.stopPropagation();
+                    postAndReload(
+                        button.dataset.dismissUrl || button.dataset.restoreUrl,
+                        button
+                    );
+                });
+            });
+    }
+
+    /**
+     * Post to one address, and reload the page on success.
+     *
+     * @param {string} address - The route.
+     * @param {HTMLButtonElement} button - The button that asked.
+     */
+    function postAndReload(address, button) {
+        button.disabled = true;
+        fetch(address, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'X-CSRFToken': csrfToken() }
+        })
+            .then(function (response) {
+                return response.json().then(function (data) {
+                    return { ok: response.ok, data: data };
+                });
+            })
+            .then(function (result) {
+                if (!result.ok) {
+                    showToast(result.data.message, 'error');
+                    button.disabled = false;
+                    return;
+                }
+                showSavedAfterReload(result.data);
+                window.location.reload();
+            })
+            .catch(function () {
+                showToast('The request failed. Try again.', 'error');
+                button.disabled = false;
+            });
+    }
+
+    /**
+     * The guide of the page (#419): the "?" opens it and closes it, and
+     * Escape closes it. It never opens by itself, and it keeps no key
+     * in the storage: the guide of review 2 opens once per session, and
+     * a reviewer of many opinions would meet this one on every page.
+     */
+    function bindHelp() {
+        var button = document.getElementById('text-review-help-btn');
+        var panel = document.getElementById('text-review-help-panel');
+        if (!button || !panel) { return; }
+        function setOpen(open) {
+            panel.hidden = !open;
+            button.setAttribute('aria-expanded', open ? 'true' : 'false');
+        }
+        button.addEventListener('click', function () {
+            setOpen(panel.hidden);
+        });
+        document.addEventListener('keydown', function (event) {
+            if (event.key === 'Escape' && !panel.hidden) { setOpen(false); }
+        });
+    }
+
+    /**
+     * The choice to see the boxes every engine read alike (#419). They
+     * are quiet by default: nothing there asks for the reviewer's eye.
+     * The choice is kept in this browser, and the page works without
+     * the storage.
+     */
+    function bindQuiet() {
+        var box = document.getElementById('show-quiet');
+        if (!box || !pagesColumn) { return; }
+        var stored = null;
+        try {
+            stored = window.localStorage.getItem(QUIET_KEY);
+        } catch (error) { stored = null; }
+        box.checked = stored === '1';
+        pagesColumn.classList.toggle('show-quiet', box.checked);
+        box.addEventListener('change', function () {
+            pagesColumn.classList.toggle('show-quiet', box.checked);
+            try {
+                window.localStorage.setItem(QUIET_KEY, box.checked ? '1' : '0');
+            } catch (error) { /* the page works without it */ }
+        });
     }
 
     /**
@@ -1230,6 +2218,622 @@
         pending = (text && pageSize) ? null : index;
         scrollWithin(textColumn, text);
         scrollWithin(pagesColumn, document.getElementById('op-page-' + index));
+    }
+
+    // -----------------------------------------------------------------
+    // The human edits of the text (#376)
+    // -----------------------------------------------------------------
+
+    /**
+     * Return whether the page offers the edits: the view says the
+     * opinion takes a write, and the document holds the edits.
+     *
+     * @returns {boolean} Whether it does.
+     */
+    function canEdit() {
+        return endpoint('canEdit') === '1'
+            && !!doc && (doc.schema_version || 0) >= EDIT_SCHEMA;
+    }
+
+    /**
+     * Return the groups of one section of one page, in the order of the
+     * document, which is the order the text column shows.
+     *
+     * @param {Object} page - The page entry.
+     * @param {string} section - ``text`` or ``footnotes``.
+     * @returns {Object[]} The groups.
+     */
+    function sectionGroups(page, section) {
+        return (page.groups || []).filter(function (group) {
+            return sectionOf(group) === section;
+        });
+    }
+
+    function barButton(label, title, onClick, disabled) {
+        var button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ensemble-edit-button';
+        button.textContent = label;
+        button.title = title;
+        button.disabled = !!disabled;
+        button.addEventListener('click', function (event) {
+            event.stopPropagation();
+            onClick(button);
+        });
+        return button;
+    }
+
+    /**
+     * Build the toolbar of the locked group: the one place a curator
+     * writes (#376). Each button is there only when the endpoint takes
+     * it, read off the document.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The toolbar.
+     */
+    function editBar(page, group) {
+        var bar = document.createElement('div');
+        bar.className = 'ensemble-edit-bar';
+        fillBar(bar, page, group);
+        return bar;
+    }
+
+    function fillBar(bar, page, group) {
+        bar.textContent = '';
+        var section = sectionOf(group);
+        var same = sectionGroups(page, section);
+        var place = same.indexOf(group);
+        var orderEdit = (page.order_edits || {})[section];
+        // A picture takes a move alone (#463): it is an IMAGE box of the
+        // redaction review, so it has no text, it is no footnote and no
+        // quote, and it is not for this review to take out; the edit
+        // views refuse all four.
+        var figure = group.kind === 'figure';
+
+        if (group.human) {
+            bar.appendChild(barButton(
+                'Undo the text edit',
+                'Give the block back the text the engines read',
+                function (button) {
+                    if (!window.confirm('Undo the text edit of this block?'
+                            + ' It goes back to the text the engines'
+                            + ' read.')) { return; }
+                    withdrawEdit(group.human.edit_id, button);
+                }
+            ));
+        } else if (group.level && group.kind !== 'table' && !figure) {
+            bar.appendChild(barButton(
+                'Edit text',
+                'Write the text of this block. The engines did not read'
+                    + ' it alike.',
+                function () { openEditor(bar, page, group); }
+            ));
+        }
+        bar.appendChild(barButton(
+            'Move up',
+            'Put this block before the one above it',
+            function (button) { moveBlock(page, group, 'up', button); },
+            place <= 0
+        ));
+        bar.appendChild(barButton(
+            'Move down',
+            'Put this block after the one below it',
+            function (button) { moveBlock(page, group, 'down', button); },
+            place < 0 || place >= same.length - 1
+        ));
+        if (orderEdit) {
+            bar.appendChild(barButton(
+                'Undo the order',
+                'Give the blocks of this part of the page the order the'
+                    + ' geometry read',
+                function (button) {
+                    if (!window.confirm('Undo the order set by hand on this'
+                            + ' part of the page?')) { return; }
+                    withdrawEdit(orderEdit, button);
+                }
+            ));
+        }
+        if (figure) {
+            return;
+        }
+        var other = section === FOOTNOTES ? BODY : FOOTNOTES;
+        // The body blocks below this one go to the footnotes with it
+        // (#419). The build names them (``ensemble.blocks_below``), and
+        // the endpoint reads the same list, so the count here is the
+        // count the server writes.
+        var below = other === FOOTNOTES ? (group.below || []).length : 0;
+        bar.appendChild(barButton(
+            other === FOOTNOTES ? 'Put in the footnotes' : 'Put in the body text',
+            other === FOOTNOTES
+                ? (below
+                    ? 'This block and the ' + below + ' block(s) below it'
+                        + ' are footnotes'
+                    : 'This block is a footnote')
+                : 'This block is body text, not a footnote',
+            function (button) {
+                var asked = other === FOOTNOTES
+                    ? (below
+                        ? 'Put this block and the ' + below + ' block(s)'
+                            + ' below it in the footnotes of the page? Each'
+                            + ' block gets its own Undo.'
+                        : 'Put this block in the footnotes of the page?')
+                    : 'Put this block in the body text of the page?';
+                if (!window.confirm(asked)) { return; }
+                postEdit(endpoint('editSectionUrl'), {
+                    page_in_opinion: page.page_in_opinion,
+                    group_id: group.id,
+                    section: other
+                }, button);
+            }
+        ));
+        if (group.section_edit) {
+            bar.appendChild(barButton(
+                'Undo the section',
+                'Give the block back the section the zones read',
+                function (button) {
+                    if (!window.confirm('Undo the section set by hand on'
+                            + ' this block?')) { return; }
+                    withdrawEdit(group.section_edit, button);
+                }
+            ));
+        }
+        quoteButtons(bar, page, group);
+        bar.appendChild(dropButton(page, group));
+    }
+
+    /**
+     * Return the button that takes a block out of the text, a ``DROP``
+     * edit. A picture takes none (#463): it is a box of the redaction
+     * review, and the drop view refuses it.
+     *
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @returns {HTMLElement} The button.
+     */
+    function dropButton(page, group) {
+        return barButton(
+            'Not text',
+            'Take this block out of the text: it is not text of the'
+                + ' opinion (the bleed-through of the page behind, a'
+                + ' stray mark)',
+            function (button) {
+                if (!window.confirm('Take this block out of the text? It is'
+                        + ' left out of the opinion until the edit is undone'
+                        + ' from the list under the page\'s label.')) {
+                    return;
+                }
+                postEdit(endpoint('editDropUrl'), {
+                    page_in_opinion: page.page_in_opinion,
+                    group_id: group.id
+                }, button);
+            }
+        );
+    }
+
+    /**
+     * Return the blocks of a page a person took out of the text: the
+     * drops that carry an edit (``ensemble.DROP_HUMAN``).
+     *
+     * @param {Object} page - The page entry.
+     * @returns {Array} The drops.
+     */
+    function handDropped(page) {
+        return (page.dropped || []).filter(function (drop) {
+            return !!(drop.edit && drop.edit.id);
+        });
+    }
+
+    /**
+     * Build the list of the blocks a person took out of one page, each
+     * with its Undo. A dropped block has no node to lock, so this list
+     * is the one place its Undo lives, the rule of the unresolved
+     * edits.
+     *
+     * @param {Array} drops - The drops of :func:`handDropped`.
+     * @returns {HTMLElement} The list.
+     */
+    function droppedList(drops) {
+        var list = document.createElement('div');
+        list.className = 'ensemble-dropped';
+        drops.forEach(function (drop) {
+            var line = document.createElement('div');
+            line.className = 'ensemble-dropped-line';
+            var said = document.createElement('span');
+            said.textContent = 'A block taken out of the text as not text'
+                + ' by ' + (drop.edit.by || 'a person');
+            line.appendChild(said);
+            if (canEdit()) {
+                line.appendChild(barButton(
+                    'Undo',
+                    'Put the block back in the text',
+                    function (button) {
+                        if (!window.confirm('Put this block back in the'
+                                + ' text?')) { return; }
+                        withdrawEdit(drop.edit.id, button);
+                    }
+                ));
+            }
+            list.appendChild(line);
+        });
+        return list;
+    }
+
+    /**
+     * Add the blockquote buttons of the locked group (#419): the whole
+     * block, a part of it, and the Undo. A footnote and a table hold no
+     * quote, the refusals of ``edit_opinion_blockquote``.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function quoteButtons(bar, page, group) {
+        if (sectionOf(group) !== BODY || group.kind === 'table') { return; }
+        function post(button, payload) {
+            payload.page_in_opinion = page.page_in_opinion;
+            payload.group_id = group.id;
+            postEdit(endpoint('editBlockquoteUrl'), payload, button);
+        }
+        if (group.blockquote || group.quote_span) {
+            bar.appendChild(barButton(
+                'Not a blockquote',
+                'No part of this block is a quote',
+                function (button) {
+                    if (!window.confirm('Take this block out of the'
+                            + ' blockquote?')) { return; }
+                    post(button, { quoted: false });
+                }
+            ));
+        }
+        if (!group.blockquote) {
+            bar.appendChild(barButton(
+                'Make a blockquote',
+                'The whole block is a quote',
+                function (button) {
+                    if (!window.confirm('Make the whole block a'
+                            + ' blockquote?')) { return; }
+                    post(button, { quoted: true });
+                }
+            ));
+        }
+        bar.appendChild(barButton(
+            'Quote part of it',
+            'Select the words of this block that are a quote',
+            function () { openQuotePicker(bar, page, group, post); }
+        ));
+        if (group.quote_edit) {
+            bar.appendChild(barButton(
+                'Undo the blockquote',
+                'Give the block back the quote the zones read',
+                function (button) {
+                    if (!window.confirm('Undo the blockquote set by hand'
+                            + ' on this block?')) { return; }
+                    withdrawEdit(group.quote_edit, button);
+                }
+            ));
+        }
+    }
+
+    /**
+     * Replace the toolbar with a picker of the quoted words (#419).
+     *
+     * The text is read-only: the curator selects the words, and the
+     * server moves the selection to the edges of its words. The offsets
+     * are of ``group.text``, the text the textarea holds.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     * @param {Function} post - The post of :func:`quoteButtons`.
+     */
+    function openQuotePicker(bar, page, group, post) {
+        bar.textContent = '';
+        bar.classList.add('ensemble-editor');
+        bar.appendChild(note(
+            'ensemble-edit-hint',
+            'Select the words that are a quote, then push Save.'
+        ));
+        var area = document.createElement('textarea');
+        area.className = 'ensemble-edit-area';
+        area.readOnly = true;
+        area.value = group.text || '';
+        area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
+        if (group.quote_span) {
+            area.setSelectionRange(group.quote_span[0], group.quote_span[1]);
+        }
+        bar.appendChild(area);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+        row.appendChild(barButton('Save', 'Quote the selected words',
+            function (button) {
+                if (area.selectionEnd <= area.selectionStart) {
+                    showToast('Select the words of the quote first.', 'error');
+                    return;
+                }
+                post(button, {
+                    quoted: true,
+                    span: [area.selectionStart, area.selectionEnd]
+                });
+            }));
+        row.appendChild(barButton('Cancel', 'Keep the block as it is',
+            function () {
+                bar.classList.remove('ensemble-editor');
+                fillBar(bar, page, group);
+            }));
+        bar.appendChild(row);
+        area.focus();
+    }
+
+    /**
+     * Replace the toolbar with the editor of the block's text.
+     *
+     * @param {HTMLElement} bar - The toolbar.
+     * @param {Object} page - The page entry.
+     * @param {Object} group - The group entry.
+     */
+    function openEditor(bar, page, group) {
+        bar.textContent = '';
+        bar.classList.add('ensemble-editor');
+        var area = document.createElement('textarea');
+        area.className = 'ensemble-edit-area';
+        area.value = group.text || '';
+        if (locked) { locked.editor = { area: area, base: area.value }; }
+        area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
+        bar.appendChild(area);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+        row.appendChild(barButton('Save', 'Compare the two texts, then save',
+            function (button) {
+                var text = area.value;
+                if (text.trim() === (group.text || '').trim()) {
+                    showToast('The text did not change.', 'error');
+                    return;
+                }
+                // The modal's own Save goes to the post, so a request
+                // with no answer gives that button back.
+                confirmText(group.text || '', text, function (saving) {
+                    postEdit(endpoint('editTextUrl'), {
+                        page_in_opinion: page.page_in_opinion,
+                        group_id: group.id,
+                        text: text
+                    }, saving);
+                });
+            }));
+        row.appendChild(barButton('Cancel', 'Keep the text as it is',
+            function () {
+                if (locked) { locked.editor = null; }
+                bar.classList.remove('ensemble-editor');
+                fillBar(bar, page, group);
+            }));
+        bar.appendChild(row);
+        area.focus();
+    }
+
+    /**
+     * Ask the curator to confirm a text edit: the old text and the new
+     * one side by side, each with the words the other does not hold
+     * marked, by the comparison of the readings panel (#380).
+     *
+     * @param {string} before - The text the block shows.
+     * @param {string} after - The text the curator wrote.
+     * @param {Function} onConfirm - What Save does. It takes the
+     *     modal's Save button, which the post disables and gives back.
+     */
+    function confirmText(before, after, onConfirm) {
+        var modal = document.createElement('div');
+        modal.className = 'edit-modal';
+        var box = document.createElement('div');
+        box.className = 'edit-modal-box';
+        box.setAttribute('role', 'dialog');
+        box.setAttribute('aria-modal', 'true');
+        var title = document.createElement('h3');
+        title.className = 'edit-modal-title';
+        title.textContent = 'Save this text?';
+        box.appendChild(title);
+        var columns = document.createElement('div');
+        columns.className = 'edit-modal-columns';
+        [
+            ['Before', before, diffSpans(after, before)],
+            ['After', after, diffSpans(before, after)]
+        ].forEach(function (side) {
+            var column = document.createElement('div');
+            var label = document.createElement('div');
+            label.className = 'edit-modal-label';
+            label.textContent = side[0];
+            column.appendChild(label);
+            var text = document.createElement('div');
+            text.className = 'edit-modal-text';
+            readingNodes(text, side[1], side[2]);
+            column.appendChild(text);
+            columns.appendChild(column);
+        });
+        box.appendChild(columns);
+        var row = document.createElement('div');
+        row.className = 'ensemble-edit-row';
+
+        function close() {
+            document.removeEventListener('keydown', onKey);
+            modal.remove();
+        }
+        function onKey(event) {
+            if (event.key === 'Escape') { close(); }
+        }
+        row.appendChild(barButton('Save', 'Save the text on the right',
+            function (button) { onConfirm(button); }));
+        row.appendChild(barButton('Cancel', 'Go back to the text',
+            function () { close(); }));
+        box.appendChild(row);
+        modal.appendChild(box);
+        modal.addEventListener('click', function (event) {
+            if (event.target === modal) { close(); }
+        });
+        document.addEventListener('keydown', onKey);
+        document.body.appendChild(modal);
+    }
+
+    /**
+     * Build the list of the edits a build did not apply (#376), each
+     * with its Undo. Such an edit has no block to lock, or its block
+     * offers no Undo, so this list is its one way out, and the
+     * ``UNRESOLVED_EDIT`` card waits on it. The line is the document's
+     * own (``said``); the browser spells no reason.
+     *
+     * @param {Object[]} entries - ``unresolved_edits`` of a page or of
+     *     the document.
+     * @returns {HTMLElement} The list.
+     */
+    function unresolvedList(entries) {
+        var list = document.createElement('div');
+        list.className = 'ensemble-unresolved';
+        entries.forEach(function (entry) {
+            var line = document.createElement('div');
+            line.className = 'ensemble-unresolved-line';
+            var said = document.createElement('span');
+            said.textContent = entry.said || entry.kind;
+            line.appendChild(said);
+            if (canEdit()) {
+                line.appendChild(barButton(
+                    'Undo',
+                    'Take this edit back. The text is written again'
+                        + ' without it.',
+                    function (button) {
+                        if (!window.confirm('Undo this edit? It is not'
+                                + ' in the text now.')) { return; }
+                        withdrawEdit(entry.edit_id, button);
+                    }
+                ));
+            }
+            list.appendChild(line);
+        });
+        return list;
+    }
+
+    /**
+     * Put the Undo of each unresolved edit on its card of the findings
+     * (#376): the card says to undo it, so the card holds the button.
+     * A card with no page is about the whole opinion.
+     */
+    function bindUnresolvedCards() {
+        document.querySelectorAll(
+            '.finding-card[data-check="unresolved_edit"]'
+        ).forEach(function (card) {
+            var entries = card.dataset.page === undefined
+                ? doc.unresolved_edits
+                : (pageOf(parseInt(card.dataset.page, 10)) || {})
+                    .unresolved_edits;
+            if ((entries || []).length) {
+                card.appendChild(unresolvedList(entries));
+            }
+        });
+    }
+
+    function moveBlock(page, group, direction, button) {
+        postEdit(endpoint('editMoveUrl'), {
+            page_in_opinion: page.page_in_opinion,
+            group_id: group.id,
+            direction: direction
+        }, button);
+    }
+
+    function withdrawEdit(editId, button) {
+        postEdit(endpoint('editWithdrawUrl'), { edit_id: editId }, button);
+    }
+
+    /**
+     * Post one edit, and reload the page to show its answer.
+     *
+     * Every answer of an edit, a success or a refusal, is a Django
+     * message the page shows after the reload (#376), so the script
+     * writes no line of its own. The revisions of the document go with
+     * the edit, and the server refuses an edit of a page drawn over
+     * another text. A request that got no answer reached no database,
+     * and it is the one line this script shows.
+     *
+     * @param {string} address - The route.
+     * @param {Object} payload - The body, without the revisions.
+     * @param {HTMLButtonElement} button - The button that asked.
+     */
+    function postEdit(address, payload, button) {
+        if (button) { button.disabled = true; }
+        payload.glue_revision = (doc.opinion || {}).glue_revision;
+        payload.edit_revision = doc.edit_revision;
+        fetch(address, {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: {
+                'X-CSRFToken': csrfToken(),
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
+        })
+            .then(function (response) { return response.json(); })
+            .then(function () {
+                rememberPlace();
+                window.location.reload();
+            })
+            .catch(function () {
+                showToast('The request got no answer. Try again.', 'error');
+                if (button) { button.disabled = false; }
+            });
+    }
+
+    /**
+     * Keep the locked group over the reload of an edit: its page and
+     * its box, because a move gives the groups other ids.
+     */
+    function rememberPlace() {
+        if (!locked) { return; }
+        var entry = groupOf(pageOf(locked.page), locked.group);
+        if (!entry) { return; }
+        try {
+            window.sessionStorage.setItem(PLACE_KEY, JSON.stringify({
+                where: endpoint('ensembleUrlEndpoint'),
+                page: locked.page,
+                box: entry.box_pt
+            }));
+        } catch (error) { /* the page works without it */ }
+    }
+
+    function boxIou(a, b) {
+        var width = Math.min(a[2], b[2]) - Math.max(a[0], b[0]);
+        var height = Math.min(a[3], b[3]) - Math.max(a[1], b[1]);
+        if (width <= 0 || height <= 0) { return 0; }
+        var inter = width * height;
+        var union = (a[2] - a[0]) * (a[3] - a[1])
+            + (b[2] - b[0]) * (b[3] - b[1]) - inter;
+        return union > 0 ? inter / union : 0;
+    }
+
+    /**
+     * Lock again the group an edit was made on, after the reload.
+     */
+    function restorePlace() {
+        var stored = null;
+        try {
+            stored = window.sessionStorage.getItem(PLACE_KEY);
+        } catch (error) { stored = null; }
+        try {
+            window.sessionStorage.removeItem(PLACE_KEY);
+        } catch (error) { /* the page works without it */ }
+        var place = null;
+        try {
+            place = JSON.parse(stored);
+        } catch (error) { place = null; }
+        if (!place || place.where !== endpoint('ensembleUrlEndpoint')) {
+            return;
+        }
+        var page = pageOf(place.page);
+        if (!page || !place.box) { return; }
+        var best = null;
+        var score = PLACE_OVERLAP;
+        (page.groups || []).forEach(function (group) {
+            var here = boxIou(place.box, group.box_pt || [0, 0, 0, 0]);
+            if (here >= score) { score = here; best = group; }
+        });
+        if (!best) { return; }
+        lock(place.page, best.id, 'text');
+        scrollWithin(textColumn, nodeFor(place.page, best.id));
     }
 
     // -----------------------------------------------------------------
@@ -1278,6 +2882,92 @@
         });
     }
 
+    /**
+     * The approval of the text, and its staff reopen (#375).
+     *
+     * The approval sends the revisions of the text this page drew
+     * (``postEdit``), so the curator approves the text they saw, and a
+     * page older than the stamped text is refused. A warning card asks
+     * for a confirm; a blocking card holds the button, which the
+     * template writes disabled, and the server refuses it too. Both
+     * answers are Django messages, so the page reloads to show them.
+     */
+    function holdOldApproval() {
+        // The approval reads a document of this schema or later (#375),
+        // and the endpoint refuses an older one. The render never reads
+        // the bucket, so the page holds the button once it has the
+        // document, and the template writes the least schema.
+        var approve = document.getElementById('approve-text');
+        if (!approve || !doc) { return; }
+        var least = Number(approve.dataset.minSchema || 0);
+        if ((doc.schema_version || 0) >= least) { return; }
+        approve.disabled = true;
+        approve.title = 'This text was written by an older version. Press '
+            + '"Read the OCR documents again", then approve.';
+        approve.textContent = 'Read the OCR documents again to approve';
+    }
+
+    function bindApproval() {
+        var approve = document.getElementById('approve-text');
+        if (approve) {
+            approve.addEventListener('click', function () {
+                if (approve.disabled) { return; }
+                if (!doc) {
+                    showToast('The text is not loaded yet. Wait, then '
+                        + 'approve.', 'error');
+                    return;
+                }
+                var warnings = Number(approve.dataset.openWarnings || 0);
+                var asked = warnings
+                    ? warnings + ' warning(s) of this opinion are open. '
+                        + 'Approve the text anyway?'
+                    : 'Approve the text of this opinion?';
+                if (!window.confirm(asked)) { return; }
+                postEdit(endpoint('approveUrl'), {}, approve);
+            });
+        }
+        var reopen = document.getElementById('reopen-text');
+        if (reopen) {
+            reopen.addEventListener('click', function () {
+                if (!window.confirm('Open the text review of this opinion '
+                    + 'again? The approved text stays until the next '
+                    + 'approval.')) { return; }
+                reopen.disabled = true;
+                fetch(endpoint('reopenUrl'), {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRFToken': csrfToken() }
+                })
+                    .then(function () { window.location.reload(); })
+                    .catch(function () {
+                        showToast('The request got no answer. Try again.',
+                            'error');
+                        reopen.disabled = false;
+                    });
+            });
+        }
+        // The tagger of the approved text (#272). The server answers a
+        // Django message either way, so the page reloads to show it.
+        var tag = document.getElementById('start-tagger');
+        if (tag) {
+            tag.addEventListener('click', function () {
+                if (tag.disabled) { return; }
+                tag.disabled = true;
+                fetch(endpoint('tagUrl'), {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'X-CSRFToken': csrfToken() }
+                })
+                    .then(function () { window.location.reload(); })
+                    .catch(function () {
+                        showToast('The request got no answer. Try again.',
+                            'error');
+                        tag.disabled = false;
+                    });
+            });
+        }
+    }
+
     // -----------------------------------------------------------------
     // The load
     // -----------------------------------------------------------------
@@ -1289,9 +2979,12 @@
         var summary = document.getElementById('ensemble-summary');
         if (!summary || !doc) { return; }
         var counts = doc.counts || {};
+        var footnotes = counts.footnote_groups
+            ? ', ' + counts.footnote_groups + ' of them footnotes'
+            : '';
         summary.textContent = (
             '— ' + (doc.engines || []).join(', ') + ', ' +
-            (counts.groups || 0) + ' block(s), ' +
+            (counts.groups || 0) + ' block(s)' + footnotes + ', ' +
             (counts.low_confidence || 0) + ' word(s) with no majority'
         );
     }
@@ -1304,9 +2997,27 @@
             .then(function (data) {
                 doc = data;
                 drawText();
+                if ((doc.unresolved_edits || []).length) {
+                    textColumn.insertBefore(
+                        unresolvedList(doc.unresolved_edits),
+                        textColumn.firstChild
+                    );
+                }
+                bindUnresolvedCards();
+                holdOldApproval();
+                if (!hasLevels()) {
+                    textColumn.insertBefore(note(
+                        'opinion-text-error',
+                        'This text was written before the risk levels, so'
+                        + ' no block shows its level and every box is drawn.'
+                        + ' Press "Read the OCR documents again" to write'
+                        + ' it again.'
+                    ), textColumn.firstChild);
+                }
                 summarise();
                 redrawBoxes();
                 if (pending !== null) { goToPage(pending); }
+                restorePlace();
             })
             .catch(function (error) {
                 textColumn.appendChild(note(
@@ -1341,14 +3052,40 @@
             });
     }
 
+    /** The walk buttons count their cards: a finding is one row per
+     *  page, and a page makes a card per open word or gap, so the
+     *  server's number is the finding count until the cards endpoint
+     *  answers with the real one. */
+    function bindCardCounts() {
+        var links = Array.prototype.slice.call(document.querySelectorAll('[data-card-count-url]'));
+        if (!links.length) { return; }
+        // One request for both numbers: the endpoint reads the document
+        // once and answers the two lengths, no card over the wire.
+        fetch(links[0].dataset.cardCountUrl + '?counts=1', { credentials: 'same-origin' })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (data) {
+                if (!data || data.status !== 'ok' || !data.counts) { return; }
+                links.forEach(function (link) {
+                    var count = link.querySelector('[data-card-count]');
+                    var value = data.counts[link.dataset.cardLevel];
+                    if (count && typeof value === 'number') { count.textContent = value; }
+                });
+            })
+            .catch(function () { /* the finding count stays */ });
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('opinion-review');
         if (!root) { return; }
         pagesColumn = document.getElementById('opinion-pages');
         textColumn = document.getElementById('opinion-text');
         bindRerun();
+        bindApproval();
         bindFindings();
+        bindCardCounts();
         bindZoom();
+        bindQuiet();
+        bindHelp();
         if (pagesColumn) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =
                 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/' +
@@ -1357,6 +3094,12 @@
             loadPdf();
         }
         loadText();
+        // A link from the blocking review names a page in the hash
+        // (``#op-page-{index}``, the id of the page's container). The
+        // jump is kept until both loads are in, the rule of a card's
+        // jump, and a stored place of a reload still wins over it.
+        var jump = /^#op-page-(\d+)$/.exec(window.location.hash || '');
+        if (jump) { goToPage(parseInt(jump[1], 10)); }
         if (pagesColumn && textColumn) { bindPointers(); }
         // A resize changes the width of a column, and the scale
         // follows that width, so the pages are drawn again. A page

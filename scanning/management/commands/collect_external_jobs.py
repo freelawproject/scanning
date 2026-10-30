@@ -1,6 +1,6 @@
 """Confirm in-flight external jobs and finish the scans they belong to.
 
-Thirteen passes, in order.
+Seventeen passes in four groups (``scanning.ticks``), in order.
 
 **1. ``jobs.sweep_jobs()`` asks after every job still in flight.** How
 it asks depends on the provider:
@@ -40,6 +40,13 @@ joins the per-shard payloads of any scan whose detection rows are all
 status and keeps the per-shard results: a page insert recomputes the
 merge from them.
 
+**5b. ``tagger.finish_ready_runs()`` glues finished tagger runs.** One
+row per approved opinion (#272); a ``COMPLETED`` row's spans are placed
+on the paragraphs of the approved text and written beside the input it
+was computed from, the opinion's ledger is stamped, and the row goes to
+``CONSUMED``. Writes no scan status and no opinion status: the assembly
+step reads the spans, not the review flow.
+
 **6. ``yolo.queue_ready_runs()`` queues the redaction computation.**
 It is a trigger, not the work: it takes a scan in
 ``PAGE_COMPLETENESS_REVIEW_DONE`` to ``QUEUED`` with
@@ -66,7 +73,9 @@ It joins the stored per-shard results of any scan whose Mistral rows
 are all ``COMPLETED`` into one volume JSON on S3 and flips the rows to
 ``CONSUMED`` (#245). Like the other two glues it writes no scan status
 and keeps the results: the glue is where every transform runs, so a
-better transform is a re-glue at no API cost.
+better transform is a re-glue at no API cost. A glued run hands a
+volume still in review 1 back to pass 4, so its document fills the page
+numbers dots.mocr left blank on the next tick (#351).
 
 **9. ``mistral_ocr.finish_ready_applies()`` reads the edited pages.**
 For a scan whose Mistral volume run is glued and whose corrected
@@ -81,8 +90,8 @@ review state reads its output.
 joins the stored per-shard results of any scan whose Surya rows are all
 ``COMPLETED`` into one volume JSON on S3 and flips the rows to
 ``CONSUMED`` (#368). The twin of pass 8, engine for engine: no scan
-status, the results kept, and the glue as the one transform of a
-result.
+status, the results kept, the glue as the one transform of a result,
+and the hand-back to pass 4 (#351).
 
 **11. ``surya.finish_ready_applies()`` reads the edited pages.** The
 twin of pass 9 for Surya (#368): for a scan whose Surya volume run is
@@ -114,6 +123,13 @@ know nothing of each other and either can be last, so the promotion is
 a pass of its own, the twin of pass 7 for a scan. It takes a row
 back to ``PROCESSING`` too, because a re-glue raises the revision and
 leaves the status where it was.
+
+**15. ``final_xml.export_due()`` stores the final XML of the approved
+opinions (#408).** For an opinion whose text review is done and whose
+spans are over the approved text, it writes the build of the review
+page at ``export/{scan}/{opinion}.xml``, the key CourtListener
+reads, and stamps the row. It deletes the object of a row that stopped
+being exportable (a reopen) first. Writes no status.
 
 Examples:
 
@@ -162,38 +178,12 @@ class Command(BaseCommand):
         """
         from django.db import OperationalError, connections
 
-        from scanning import (
-            apply,
-            bitonal,
-            dots_mocr,
-            ensemble,
-            jobs,
-            mistral_ocr,
-            opinion_ocr,
-            opinions,
-            review_states,
-            surya,
-            yolo,
-        )
+        from scanning import ticks
 
         for attempt in range(MAX_DB_RETRIES):
             connections.close_all()
             try:
-                summary = jobs.sweep_jobs()
-                finished = bitonal.finish_ready_scans()
-                glued = dots_mocr.finish_ready_runs()
-                applied = dots_mocr.apply_ready_runs()
-                detected = yolo.finish_ready_runs()
-                applied_edits = apply.queue_ready_scans()
-                queued = yolo.queue_ready_runs()
-                promoted = review_states.promote_ready_scans()
-                extracted = mistral_ocr.finish_ready_runs()
-                extracted_applies = mistral_ocr.finish_ready_applies()
-                read_surya = surya.finish_ready_runs()
-                surya_applies = surya.finish_ready_applies()
-                glued_opinions = opinion_ocr.glue_due()
-                read_opinions = ensemble.run_tick()
-                ready_opinions = opinions.promote_ready_opinions()
+                summary, counts = ticks.collect()
                 break
             except OperationalError as exc:
                 if attempt == MAX_DB_RETRIES - 1:
@@ -214,35 +204,25 @@ class Command(BaseCommand):
                 summary.retried,
                 summary.failed,
                 summary.errors,
-                finished,
-                glued,
-                applied,
-                detected,
-                applied_edits,
-                queued,
-                promoted,
-                extracted,
-                extracted_applies,
-                read_surya,
-                surya_applies,
-                glued_opinions,
-                read_opinions,
-                ready_opinions,
+                *counts.values(),
             )
         ):
+            c = counts
             self.stdout.write(
                 f"Completed {summary.completed}, retried {summary.retried}, "
                 f"failed {summary.failed}, still waiting {summary.pending}, "
-                f"check errors {summary.errors}; finished {finished} "
-                f"scan(s), glued {glued} OCR run(s), applied {applied}, "
-                f"merged {detected} detection run(s), queued "
-                f"{applied_edits} page edit apply(s) and {queued} "
-                f"redaction computation(s), opened {promoted} redaction "
-                f"review(s), glued {extracted} Mistral run(s) and "
-                f"{extracted_applies} corrected volume(s), glued "
-                f"{read_surya} Surya run(s) and {surya_applies} "
+                f"check errors {summary.errors}; finished {c['finished']} "
+                f"scan(s), glued {c['glued']} OCR run(s), applied {c['applied']}, "
+                f"merged {c['detected']} detection run(s), glued {c['tagged']} "
+                f"tagger run(s), queued {c['applied_edits']} page edit "
+                f"apply(s) and {c['queued']} "
+                f"redaction computation(s), opened {c['promoted']} redaction "
+                f"review(s), glued {c['extracted']} Mistral run(s) and "
+                f"{c['extracted_applies']} corrected volume(s), glued "
+                f"{c['read_surya']} Surya run(s) and {c['surya_applies']} "
                 f"corrected volume(s), wrote the OCR "
-                f"documents of {glued_opinions} opinion(s), wrote the "
-                f"text of {read_opinions} opinion(s), opened {ready_opinions} "
-                f"text review(s)"
+                f"documents of {c['glued_opinions']} opinion(s), wrote the "
+                f"text of {c['read_opinions']} opinion(s), opened {c['ready_opinions']} "
+                f"text review(s), exported or withdrew the final XML of "
+                f"{c['exported']} opinion(s)"
             )

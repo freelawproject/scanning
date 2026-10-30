@@ -341,6 +341,46 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
     return landed, stale
 
 
+def dismissed_boxes(
+    scan: Scan, rect_type: str, run: ApplyRun | None, page_indexes
+) -> dict[int, list[list[float]]]:
+    """Return the copied boxes of the standing dismissals of one type.
+
+    The boxes :func:`resolve` will land the dismissals by, keyed by the
+    page index of the space ``run`` names, through each page's address,
+    so a pass that reshapes a computed rect before the write can leave
+    alone the one a curator lifted (``text_fit.widen_running_heads``).
+    A dismiss of another original is left out, as :func:`resolve`
+    leaves it.
+
+    :param scan: The scan.
+    :param rect_type: The computed type the dismissals name.
+    :param run: The apply run of the space, or None for the original's.
+    :param page_indexes: The page indexes of the space to look up.
+    :returns: ``{page_index: [[x0, y0, x1, y1] in points]}``.
+    :rtype: dict[int, list[list[float]]]
+    """
+    by_address: dict[tuple, list[list[float]]] = {}
+    for dismiss in Redaction.objects.human().filter(
+        scan=scan, kind=Redaction.Kind.DISMISS, rect_type=rect_type
+    ):
+        if dismiss.target_bbox is None or is_stale(dismiss, scan):
+            continue
+        by_address.setdefault(
+            (dismiss.source_edit_id, dismiss.source_page), []
+        ).append(dismiss.target_bbox)
+    if not by_address:
+        return {}
+    boxes = {}
+    for page_index in page_indexes:
+        found = by_address.get(
+            detections.source_for_index(scan, page_index, run)
+        )
+        if found:
+            boxes[page_index] = found
+    return boxes
+
+
 def is_stale(row: Redaction, scan: Scan) -> bool:
     """Return whether a row was written against another original.
 
