@@ -343,8 +343,12 @@ def _finding(reading: EditorialReading) -> dict:
 
     The metadata is what ``findings.address_of`` keys a dismissal by,
     and what ``_getDetectionData`` in ``viewer_sidebar.js`` reads off
-    the card to highlight the band. It names no detection, so the card
-    offers no detection button.
+    the card to highlight the band and to add the box: the card's
+    "+ editor's note" writes an ``EDITORIAL`` row at ``bbox`` with
+    the label the card carries, through ``add_single_detection``, and
+    the live hand-drawn box covers the reading at the next rebuild.
+    It names no detection of the model's, so it offers no approve or
+    delete.
     """
     return {
         "check_name": CheckName.UNCOVERED_EDITORS_NOTE,
@@ -352,7 +356,8 @@ def _finding(reading: EditorialReading) -> dict:
         "page_number": reading.page_index + 1,
         "message": (
             f"The reader found an editor's note here ({reading.text}), "
-            "and no redaction covers it. Draw an EDITORIAL box over it."
+            "and no redaction covers it. Add an editor's note box over "
+            "it, or draw one."
         ),
         "metadata": {
             "page_index": reading.page_index,

@@ -48,7 +48,7 @@
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
     var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
-    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n' };
+    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
@@ -615,6 +615,7 @@
             }));
         } else {
             var verbsToAdd = addVerbs(card);
+            var grow = card.grow || {};
             if (card.kind !== 'link' && verbsToAdd.add) {
                 foot.appendChild(button(verbsToAdd.add, 'enter', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
@@ -622,7 +623,14 @@
                 }));
             }
             var footnoteLabel = labelNamed('FOOTNOTES');
-            if (card.kind === 'text' && footnoteLabel) {
+            if (card.kind === 'text' && grow.footnote) {
+                // The page's footnote box stopped short of this line:
+                // it grows down (or across) to take it.
+                foot.appendChild(button('Grow footnote box', 'n', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    growBox(card, node, grow.footnote, 'footnote box grown');
+                }));
+            } else if (card.kind === 'text' && footnoteLabel) {
                 // The text card's second answer: a footnote box, for the
                 // footnote line the page's footnote box stopped short
                 // of. It takes the box as the curator shaped it, else
@@ -635,6 +643,23 @@
                         labelId: footnoteLabel.id,
                         box: moved(card) ? card.box : (card.block || card.box),
                         added: 'footnote added'
+                    });
+                }));
+            }
+            var editorialLabel = labelNamed('EDITORIAL');
+            if (card.kind === 'text' && editorialLabel) {
+                // The text card's third answer: the block is the
+                // publisher's text (a Words and Phrases line, an
+                // editor's note), so an editor's note box over it,
+                // which the redaction blacks out. A quick add, never a
+                // grow: a grown note box blacks out whatever it reaches.
+                foot.appendChild(button("Add editor's note", 'e', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    add(card, node, {
+                        label: editorialLabel.name,
+                        labelId: editorialLabel.id,
+                        box: moved(card) ? card.box : (card.block || card.box),
+                        added: "editor's note added"
                     });
                 }));
             }
@@ -771,6 +796,32 @@
     function keep(card, node) {
         write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
+        });
+    }
+
+    /** Grow the box beside a text card's block over the block, through
+     *  the resize endpoint: one box where two would leave a seam. The
+     *  box becomes the union with the block, or with the box as the
+     *  curator shaped it. A model box becomes a hand-drawn one, as any
+     *  resize does, so the Undo puts the box back when it is still its
+     *  own row and withdraws the hand-drawn row otherwise. */
+    function growBox(card, node, target, label) {
+        var take = moved(card) ? card.box : (card.block || card.box);
+        var grown = [
+            Math.min(target.box[0], take[0]), Math.min(target.box[1], take[1]),
+            Math.max(target.box[2], take[2]), Math.max(target.box[3], take[3])
+        ];
+        write(card, node, cfg.urls.update_detection, {
+            detection_id: target.id, new_bbox: grown
+        }, label, function (data) {
+            var holder = data.detection_id;
+            card.others = (card.others || []).map(function (o) {
+                if (o.id !== target.id) { return o; }
+                return { id: holder, label: o.label, box: grown, own: true, mine: true };
+            });
+            return holder === target.id
+                ? { url: cfg.urls.update_detection, body: { detection_id: target.id, new_bbox: target.box } }
+                : { url: cfg.urls.delete_detection, body: { detection_id: holder } };
         });
     }
 

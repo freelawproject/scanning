@@ -60,7 +60,7 @@
      data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
      {% if issue.metadata.detection_id %}data-detection-id="{{ issue.metadata.detection_id }}"{% endif %}
      {% if issue.metadata.redaction_id and issue.metadata.cover %}data-redaction-id="{{ issue.metadata.redaction_id }}" data-cover="{{ issue.metadata.cover.0 }},{{ issue.metadata.cover.1 }},{{ issue.metadata.cover.2 }},{{ issue.metadata.cover.3 }}"{% endif %}
-     {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% elif issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' %}data-guess="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"{% endif %}
+     {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% elif issue.check_name == 'uncovered_editors_note' or issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' %}data-guess="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"{% endif %}
      onclick="highlightDetection(this)"
      {% elif issue.nav_pdf_index is not None %}
      data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)"
@@ -84,6 +84,10 @@
     {% if issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' and issue.metadata.bbox %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a caption box where the card guesses the caption is, the box the card flashes. Resize it on the page if it is off; the next compute starts the opinion on it. (The first key of the volume gets no +: its box is the key, not a caption.)"
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
+    {% endif %}
+    {% if issue.check_name == 'uncovered_editors_note' and issue.metadata.bbox %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add an editor's note box over the note the reader saw, the band the card flashes. The next compute blacks it out. The card goes now."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+ editor's note</button>
     {% endif %}
     {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a text column box over this block, the box the card flashes, and resize it on the page if it is short. A box in a column that has one already joins that column. The card goes now."

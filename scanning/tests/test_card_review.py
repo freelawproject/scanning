@@ -358,6 +358,55 @@ class TestTheCards(ScanningTestCase):
         )
         self.assertEqual(card_review.cards(self.scan), [])
 
+    def test_a_text_card_names_the_box_beside_its_block_to_grow(self):
+        """The page's footnote box ends at footnote 73 and the block is
+        74-75 right under it: the card carries that box as the one to
+        grow for the footnote answer; the column answer is always an
+        add, a page having two column boxes by design."""
+        footnotes = make_detection(
+            self.scan,
+            "FOOTNOTES",
+            0,
+            label_id=int(Label.FOOTNOTES),
+            x0=100.0,
+            y0=1500.0,
+            x1=800.0,
+            y1=1900.0,
+        )
+        make_detection(
+            self.scan,
+            "TEXT_COLUMN",
+            0,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=100.0,
+            y0=200.0,
+            x1=800.0,
+            y1=1400.0,
+        )
+        finding(
+            self.scan,
+            CheckName.UNDETECTED_TEXT,
+            {
+                "bbox": [100.0, 1910.0, 780.0, 2000.0],
+                "guess": [100.0, 1910.0, 780.0, 2000.0],
+                "label": "TEXT_COLUMN",
+                "label_id": int(Label.TEXT_COLUMN),
+            },
+        )
+
+        (card,) = [
+            c for c in card_review.cards(self.scan) if c["kind"] == "text"
+        ]
+
+        self.assertEqual(card["grow"]["footnote"]["id"], footnotes.pk)
+        self.assertEqual(
+            card["grow"]["footnote"]["grown"], [100.0, 1500.0, 800.0, 2000.0]
+        )
+        # The column and the editor's note answers always add: a page
+        # has two column boxes, and a grown note box blacks out whatever
+        # it reaches.
+        self.assertEqual(set(card["grow"]), {"footnote"})
+
     def test_a_hand_drawn_editorial_row_makes_no_card(self):
         """A kept box is a hand-drawn row (#414): judged, so no card."""
         make_detection(
@@ -440,6 +489,73 @@ class TestTheCards(ScanningTestCase):
         )
         self.assertIn("nothing is redacted yet", cards[weak.pk]["message"])
         self.assertNotIn("gate", cards[strong.pk]["message"])
+
+
+class TestNeighbourBox(ScanningTestCase):
+    """``neighbour_box``: the box a text card grows instead of adding."""
+
+    BLOCK = [100.0, 1910.0, 780.0, 2000.0]
+
+    def other(self, box, label="FOOTNOTES", pk=7):
+        return {"id": pk, "label": label, "box": box, "own": False}
+
+    def test_the_box_right_above_the_block_in_its_column_grows_over_it(
+        self,
+    ):
+        """Footnotes 67-73 boxed, 74-75 printed right under the box:
+        the box grows down to take them, one box, no seam."""
+        found = card_review.neighbour_box(
+            self.BLOCK,
+            [self.other([100.0, 1500.0, 800.0, 1900.0])],
+            "FOOTNOTES",
+        )
+        self.assertEqual(found["id"], 7)
+        self.assertEqual(found["box"], [100.0, 1500.0, 800.0, 1900.0])
+        self.assertEqual(found["grown"], [100.0, 1500.0, 800.0, 2000.0])
+
+    def test_a_box_below_the_block_grows_up_over_it(self):
+        found = card_review.neighbour_box(
+            self.BLOCK,
+            [self.other([100.0, 2020.0, 800.0, 2150.0])],
+            "FOOTNOTES",
+        )
+        self.assertEqual(found["grown"], [100.0, 1910.0, 800.0, 2150.0])
+
+    def test_a_box_too_far_or_in_the_other_column_is_no_neighbour(self):
+        far = self.other([100.0, 1500.0, 800.0, 1700.0])
+        other_column = self.other([900.0, 1500.0, 1600.0, 1900.0])
+        self.assertIsNone(
+            card_review.neighbour_box(
+                self.BLOCK, [far, other_column], "FOOTNOTES"
+            )
+        )
+
+    def test_a_box_beside_the_block_grows_across(self):
+        """The footnote box covers the left column's notes and the block
+        is the right column's, across the gutter: a page's footnotes
+        are one block, so the box grows across."""
+        found = card_review.neighbour_box(
+            [420.0, 1800.0, 800.0, 2000.0],
+            [self.other([100.0, 1800.0, 400.0, 2000.0])],
+            "FOOTNOTES",
+        )
+        self.assertEqual(found["grown"], [100.0, 1800.0, 800.0, 2000.0])
+
+    def test_the_label_must_match_and_the_nearest_wins(self):
+        column = self.other(
+            [100.0, 1890.0, 800.0, 1900.0], label="TEXT_COLUMN", pk=1
+        )
+        near = self.other([100.0, 1850.0, 800.0, 1905.0], pk=2)
+        farther = self.other([100.0, 1500.0, 800.0, 1800.0], pk=3)
+        self.assertIsNone(
+            card_review.neighbour_box(self.BLOCK, [column], "FOOTNOTES")
+        )
+        self.assertEqual(
+            card_review.neighbour_box(
+                self.BLOCK, [farther, near], "FOOTNOTES"
+            )["id"],
+            2,
+        )
 
 
 class TestThePageFollowsTheGroups(ScanningTestCase):

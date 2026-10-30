@@ -42,7 +42,7 @@ from __future__ import annotations
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 
-from scanning import boundaries, findings, opinion_ocr, redactions
+from scanning import boundaries, columns, findings, opinion_ocr, redactions
 from scanning.models import CheckName, Detection, Issue, Redaction, Scan
 
 #: What a card offers (``kind``). A ``caption`` card is a caption the
@@ -98,6 +98,16 @@ IMAGE_PAD_PX = 90.0
 #: so the line reads as the publisher's or the court's by what is
 #: printed around it.
 EDITORIAL_PAD_PX = 60.0
+
+#: How near the page's footnote box must be to a text card's block, in
+#: render pixels, for the card to grow that box over the block instead
+#: of adding a second one: a footnote line the box stopped short of
+#: sits right under it, or beside it. Two footnote boxes with a seam
+#: between them are a partial cover in review 3 and a hairline the glue
+#: has to bridge; the footnotes of a page are one block, across both
+#: columns, so the growth crosses the gutter on purpose. The reach is
+#: ``undetected``'s own gap between the cells of one block.
+GROW_GAP_PX = 150.0
 
 #: A bracket's crop reaches this many bracket heights below the guess:
 #: the first lines of the paragraph, enough to see the bracket and the
@@ -348,9 +358,16 @@ def text_card(issue: Issue) -> dict | None:
     of print no detection covers, or the column it sits in on a page
     with no column box), the label the one the finding names (a
     ``TEXT_COLUMN``), the crop the box and its pad, widened to its
-    column like every crop. The card answers two ways: Add column
+    column like every crop. The card answers three ways: Add column
     writes that box, Add footnote writes a ``FOOTNOTES`` box over the
-    block (``block``), with the label from the page's own table.
+    block (``block``), and Add editor's note an ``EDITORIAL`` box over
+    it, for the publisher's text the boxes missed (a Words and Phrases
+    line), which the redaction then blacks out; the labels come from
+    the page's own table. The footnote answer grows the footnote box
+    beside the block instead, when there is one (``neighbour_box``);
+    the column and the editor's note answers always add, because a
+    page has two column boxes by design and a second box in a column
+    joins it, and a grown note box blacks out whatever it reaches.
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -390,6 +407,61 @@ def text_card(issue: Issue) -> dict | None:
     # wider guess so the curator sees what that answer takes.
     card["block"] = block
     return card
+
+
+def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
+    """Return the live box of ``label`` a text card should grow over
+    ``block``, with the box it would become, or None.
+
+    A box in the block's column (``columns.column_groups`` over the
+    two, the one rule of "same column") that ends within
+    :data:`GROW_GAP_PX` above the block or starts within it below, or
+    one beside the block (sharing half the block's height) within that
+    gap sideways, gutter or no gutter: the caller grows a footnote box
+    with this, and a page's footnotes run across its columns. The
+    nearest when several. ``grown`` is the union, the box the resize
+    writes; ``box`` is the box as it stands, the Undo.
+
+    :param block: The block of print, in render pixels.
+    :param others: The page's other live boxes (``attach_others``).
+    :param label: The label of the box the answer would add.
+    :returns: ``{"id", "box", "grown"}`` or None.
+    :rtype: dict | None
+    """
+    bx0, by0, bx1, by1 = block
+    best: tuple[float, dict] | None = None
+    for other in others:
+        if other.get("label") != label:
+            continue
+        ox0, oy0, ox1, oy1 = other["box"]
+        same_column = len(columns.column_groups([(ox0, ox1), (bx0, bx1)])) == 1
+        vertical = max(by0 - oy1, oy0 - by1, 0.0)
+        sideways = max(bx0 - ox1, ox0 - bx1, 0.0)
+        beside = (
+            min(by1, oy1) - max(by0, oy0) >= (by1 - by0) / 2
+            and sideways <= GROW_GAP_PX
+        )
+        if same_column and vertical <= GROW_GAP_PX:
+            distance = vertical
+        elif beside:
+            distance = sideways
+        else:
+            continue
+        if best is None or distance < best[0]:
+            best = (
+                distance,
+                {
+                    "id": other["id"],
+                    "box": list(other["box"]),
+                    "grown": [
+                        min(ox0, bx0),
+                        min(oy0, by0),
+                        max(ox1, bx1),
+                        max(oy1, by1),
+                    ],
+                },
+            )
+    return best[1] if best else None
 
 
 def _model_box_card(
@@ -696,6 +768,22 @@ def cards(scan: Scan) -> list[dict]:
             built.append(card)
     widen_to_columns(built, scan)
     attach_others(built, scan)
+    # A text card grows the box of the kind beside its block instead
+    # of adding a second one, when there is one (``neighbour_box``).
+    for card in built:
+        if card["kind"] == TEXT:
+            block = card["block"]
+            # The footnote box alone grows. Not the column box: a page
+            # has two by design, and a second box in a column joins it
+            # (``columns.column_groups``), so that answer stays an add.
+            # Not the editor's note box: that answer is a quick add
+            # where the curator sees a note, and a grown note box
+            # blacks out whatever it reaches.
+            card["grow"] = {
+                "footnote": neighbour_box(
+                    block, card["others"], Label.FOOTNOTES.name
+                ),
+            }
     order = {group: i for i, group in enumerate(GROUPS)}
     built.sort(key=lambda c: (order[c["group"]], c["page_index"], c["key"]))
     return built
