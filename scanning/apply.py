@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2280,13 +2281,19 @@ def printed_pages(
     documents filling the blanks, #351), overlaid with the curator's
     decisions: a ``SET_NUMBER`` row lands on the slot its original
     page holds (a replaced or rotated page included), and an inserted
-    page carries the label its row was uploaded under, unless that
-    label is a range: a file filed under the span it fills (a 260-page
-    insert under ``1125-1381``) names no page's number, and a range
-    stamped on every page keys every opinion on them at the range's
-    end, so those pages keep the model's reading of each. The curator
-    outranks the model. Citations use printed pages, so this map is a
-    product of the apply, not review scaffolding.
+    page carries the label its row was uploaded under. A file of many
+    pages filed under a range is the one exception: that label is the
+    span the file fills (a 260-page insert under ``1125-1381``), not
+    any page's number, and a range stamped on every page keys every
+    opinion on them at the range's end. Those pages keep the model's
+    reading of each, and a page the model read no number on takes its
+    place in the range (the start plus its page in the file, ``by``
+    ``"label"``), so no inserted page is left with no number, which
+    would refuse an opinion starting on it. A one-page insert keeps
+    its label whatever its shape: a compressed opinion page filed
+    under ``913-925`` prints that range. The curator outranks the
+    model. Citations use printed pages, so this map is a product of
+    the apply, not review scaffolding.
 
     :param scan: The scan.
     :param run: The built run.
@@ -2328,18 +2335,34 @@ def printed_pages(
         final = slots.get(edit.pdf_page)
         if final is not None:
             curator(by_final_out[final], edit.value)
-    for page in pages:
+    inserted = [
+        page
+        for page in pages
+        if page["source"]["kind"] == "edit"
+        and page["source"]["edit_kind"] == str(PageEdit.Kind.INSERT_PAGE)
+    ]
+    pages_of = Counter(page["source"]["edit_id"] for page in inserted)
+    labels = dict(
+        PageEdit.objects.filter(pk__in=pages_of).values_list(
+            "pk", "logical_page"
+        )
+    )
+    for page in inserted:
         src = page["source"]
-        if src["kind"] == "edit" and src["edit_kind"] == str(
-            PageEdit.Kind.INSERT_PAGE
+        label = page_numbers.fold_dashes(labels.get(src["edit_id"]) or "")
+        if not label:
+            continue
+        if (
+            pages_of[src["edit_id"]] == 1
+            or page_numbers.number_type(label) != page_numbers.RANGE
         ):
-            label = (
-                PageEdit.objects.filter(pk=src["edit_id"])
-                .values_list("logical_page", flat=True)
-                .first()
-            )
-            if label and page_numbers.number_type(label) != page_numbers.RANGE:
-                curator(page, label)
+            curator(page, label)
+        elif not page["printed"]:
+            start = _range_start(label)
+            if start is not None:
+                page["printed"] = str(start + src["page"])
+                page["type"] = page_numbers.SINGLE
+                page["by"] = "label"
     return {
         "schema_version": MAP_SCHEMA_VERSION,
         "scan_pk": scan.pk,
@@ -2875,6 +2898,19 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
             f"not a printed-page map"
         )
     return document
+
+
+def _range_start(label: str) -> int | None:
+    """Return the first number of a range label, or None.
+
+    :param label: A label ``number_type`` read as a range.
+    :returns: The start, or None when it is not a number.
+    :rtype: int | None
+    """
+    try:
+        return int(label.split("-", 1)[0].strip())
+    except ValueError:
+        return None
 
 
 def printed_numbers(printed: dict) -> dict[int, str]:

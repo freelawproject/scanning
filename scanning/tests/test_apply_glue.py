@@ -28,7 +28,7 @@ from scanning.models import (
     Status,
 )
 from scanning.runpod_client import RESULT_SCHEMA_VERSION
-from scanning.tests.test_apply import MEDIA_ROOT, png_bytes
+from scanning.tests.test_apply import MEDIA_ROOT, pdf_bytes, png_bytes
 from scanning.tests.test_apply_build import BuildTestCase
 from scanning.tests.test_jobs import make_manifest
 
@@ -446,25 +446,70 @@ class TestGlues(GlueTestCase):
     def test_an_insert_filed_under_a_range_keeps_each_pages_own_number(
         self,
     ):
-        """A 260-page file inserted under ``1125-1381`` is filed under
+        """A 260-page file inserted under ``1125–1381`` is filed under
         the span it fills, not a page's number: stamped on every page
         as a range, it keyed every opinion of 698 F. Supp. 3d on those
-        pages at 1381. The pages keep the model's reading of each."""
+        pages at 1381. The pages keep the model's reading of each, and
+        a page the model read nothing on takes its place in the range
+        instead of no number at all. The label's en dash reads as the
+        range it is."""
         self.volume_ocr_run()
         run, (turn, swap, leaf) = self.built_run()
-        PageEdit.objects.filter(pk=leaf.pk).update(logical_page="1125-1381")
+        PageEdit.objects.filter(pk=leaf.pk).update(
+            logical_page="1125\u20131381"
+        )
+        row = run.jobs.get(
+            stage=JobStage.ANALYZE, input_manifest__edit_id=leaf.pk
+        )
+        self.objects[row.result_key]["payload"]["pages"][1] = {
+            "page_no": 1,
+            "cells": [],
+            "md": "",
+            "error": "loop",
+            "raw": "aaaa",
+        }
 
         apply.glue_run(self.scan)
 
         run.refresh_from_db()
         printed = self.objects[run.printed_pages_key]
         by_final = {p["final_page"]: p for p in printed["pages"]}
-        for final in (5, 6):
-            self.assertEqual(
-                (by_final[final]["printed"], by_final[final]["by"]),
-                (str(900 + leaf.pk), "model"),
-            )
-            self.assertEqual(by_final[final]["type"], "single")
+        self.assertEqual(
+            (by_final[5]["printed"], by_final[5]["by"]),
+            (str(900 + leaf.pk), "model"),
+        )
+        self.assertEqual(
+            (by_final[6]["printed"], by_final[6]["by"]), ("1126", "label")
+        )
+        self.assertEqual(
+            (by_final[5]["type"], by_final[6]["type"]), ("single", "single")
+        )
+
+    def test_a_one_page_insert_keeps_its_label_range_or_not(self):
+        """A compressed opinion page filed under its printed range,
+        ``913-925``, is one page whose number is that range: the
+        curator's label outranks the model, as on any one-page insert."""
+        self.volume_ocr_run()
+        one = self.upload_edit(
+            PageEdit.Kind.INSERT_PAGE,
+            "one.pdf",
+            pdf_bytes(1),
+            anchor_pdf_page=6,
+            logical_page="913-925",
+        )
+        run, _ = self.built_run()
+
+        apply.glue_run(self.scan)
+
+        run.refresh_from_db()
+        printed = self.objects[run.printed_pages_key]
+        page = next(
+            p for p in printed["pages"] if p["source"].get("edit_id") == one.pk
+        )
+        self.assertEqual(
+            (page["printed"], page["by"], page["type"]),
+            ("913-925", "curator", "range"),
+        )
 
     def test_the_detections_glue_drops_changed_pages_and_adds_new_ones(self):
         self.volume_detect_run()

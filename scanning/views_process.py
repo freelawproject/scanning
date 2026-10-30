@@ -4280,7 +4280,7 @@ def _page_number_value(raw) -> str | None:
     """
     if raw is None:
         return ""
-    text = str(raw).strip().replace("–", "-").replace("—", "-")
+    text = page_numbers.fold_dashes(str(raw).strip())
     if not text:
         return ""
     if page_numbers.number_type(text) == page_numbers.SUFFIXED:
@@ -4582,7 +4582,7 @@ def _page_label(raw: str) -> str | None:
         inserted page need not carry a printed number.
     :rtype: str | None
     """
-    label = (raw or "").strip()
+    label = page_numbers.fold_dashes((raw or "").strip())
     if not label:
         return ""
     if len(label) > 32 or not _PAGE_LABEL_RE.match(label):
