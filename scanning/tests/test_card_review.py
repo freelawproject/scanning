@@ -361,8 +361,8 @@ class TestTheCards(ScanningTestCase):
     def test_a_text_card_names_the_box_beside_its_block_to_grow(self):
         """The page's footnote box ends at footnote 73 and the block is
         74-75 right under it: the card carries that box as the one to
-        grow for the footnote answer, and no column box, since the
-        column box is not near the block."""
+        grow for the footnote answer; the column answer is always an
+        add, a page having two column boxes by design."""
         footnotes = make_detection(
             self.scan,
             "FOOTNOTES",
@@ -402,7 +402,9 @@ class TestTheCards(ScanningTestCase):
         self.assertEqual(
             card["grow"]["footnote"]["grown"], [100.0, 1500.0, 800.0, 2000.0]
         )
-        self.assertIsNone(card["grow"]["column"])
+        self.assertIsNone(card["grow"]["editorial"])
+        # The column answer always adds: a page has two column boxes.
+        self.assertEqual(set(card["grow"]), {"footnote", "editorial"})
 
     def test_a_hand_drawn_editorial_row_makes_no_card(self):
         """A kept box is a hand-drawn row (#414): judged, so no card."""

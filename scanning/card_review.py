@@ -99,14 +99,14 @@ IMAGE_PAD_PX = 90.0
 #: printed around it.
 EDITORIAL_PAD_PX = 60.0
 
-#: How near a live box of the label a text card adds must be, in render
-#: pixels, for the card to grow that box over the block instead of
-#: adding a second one: a footnote line the footnote box stopped short
-#: of sits right under it, and a block at a column's foot right under
-#: the column box. Two boxes of one kind with a seam between them are
-#: a partial cover in review 3 and a hairline the glue has to bridge;
-#: one box is what the page means. The reach is ``undetected``'s own
-#: gap between the cells of one block.
+#: How near a live footnote or editor's note box must be to a text
+#: card's block, in render pixels, for the card to grow that box over
+#: the block instead of adding a second one: a footnote line the
+#: footnote box stopped short of sits right under it. Two boxes of one
+#: kind with a seam between them are a partial cover in review 3 and a
+#: hairline the glue has to bridge; one box is what the page means.
+#: The reach is ``undetected``'s own gap between the cells of one
+#: block.
 GROW_GAP_PX = 150.0
 
 #: A bracket's crop reaches this many bracket heights below the guess:
@@ -358,9 +358,16 @@ def text_card(issue: Issue) -> dict | None:
     of print no detection covers, or the column it sits in on a page
     with no column box), the label the one the finding names (a
     ``TEXT_COLUMN``), the crop the box and its pad, widened to its
-    column like every crop. The card answers two ways: Add column
+    column like every crop. The card answers three ways: Add column
     writes that box, Add footnote writes a ``FOOTNOTES`` box over the
-    block (``block``), with the label from the page's own table.
+    block (``block``), and Add editor's note an ``EDITORIAL`` box over
+    it, for the publisher's text the boxes missed (a Words and Phrases
+    line), which the redaction then blacks out; the labels come from
+    the page's own table. The footnote and the editor's note answers
+    grow the box of their kind beside the block instead, when there is
+    one (``neighbour_box``); the column answer always adds, because a
+    page has two column boxes by design and a second box in a column
+    joins it.
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -764,10 +771,15 @@ def cards(scan: Scan) -> list[dict]:
     for card in built:
         if card["kind"] == TEXT:
             block = card["block"]
+            # Not the column box: a page has two by design, and a
+            # second box in a column joins it (``columns.column_groups``),
+            # so the column answer stays an add.
             card["grow"] = {
-                "column": neighbour_box(block, card["others"], card["label"]),
                 "footnote": neighbour_box(
                     block, card["others"], Label.FOOTNOTES.name
+                ),
+                "editorial": neighbour_box(
+                    block, card["others"], Label.EDITORIAL.name
                 ),
             }
     order = {group: i for i, group in enumerate(GROUPS)}

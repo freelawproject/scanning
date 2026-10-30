@@ -48,7 +48,7 @@
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
     var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
-    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n' };
+    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
@@ -616,14 +616,7 @@
         } else {
             var verbsToAdd = addVerbs(card);
             var grow = card.grow || {};
-            if (card.kind === 'text' && grow.column) {
-                // A column box right above, below or beside the block:
-                // it grows over the block, one box, no seam.
-                foot.appendChild(button('Grow column box', 'enter', 'btn-primary text-xs', function (btn) {
-                    btn.disabled = true;
-                    growBox(card, node, grow.column, 'column box grown');
-                }));
-            } else if (card.kind !== 'link' && verbsToAdd.add) {
+            if (card.kind !== 'link' && verbsToAdd.add) {
                 foot.appendChild(button(verbsToAdd.add, 'enter', 'btn-primary text-xs', function (btn) {
                     btn.disabled = true;
                     add(card, node);
@@ -650,6 +643,27 @@
                         labelId: footnoteLabel.id,
                         box: moved(card) ? card.box : (card.block || card.box),
                         added: 'footnote added'
+                    });
+                }));
+            }
+            var editorialLabel = labelNamed('EDITORIAL');
+            if (card.kind === 'text' && grow.editorial) {
+                foot.appendChild(button("Grow editor's note box", 'e', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    growBox(card, node, grow.editorial, "editor's note box grown");
+                }));
+            } else if (card.kind === 'text' && editorialLabel) {
+                // The text card's third answer: the block is the
+                // publisher's text (a Words and Phrases line, an
+                // editor's note), so an editor's note box over it,
+                // which the redaction blacks out.
+                foot.appendChild(button("Add editor's note", 'e', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    add(card, node, {
+                        label: editorialLabel.name,
+                        labelId: editorialLabel.id,
+                        box: moved(card) ? card.box : (card.block || card.box),
+                        added: "editor's note added"
                     });
                 }));
             }
