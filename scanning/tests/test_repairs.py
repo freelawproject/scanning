@@ -1079,13 +1079,17 @@ class TestRepairQueue(RepairTestCase):
         self.assertEqual(response.context["waiting_repairs_count"], 2)
         self.assertEqual(repairs.waiting_count(), 2)
 
+    @override_settings(TESTING=False)
     def test_the_header_count_is_cached_until_a_write_moves_it(self):
         """The count runs the fulfilled rule over every open request,
         so it is counted once and kept until a request or a page edit
-        is written, whose pk or stamp moves the key."""
+        is written, whose pk or stamp moves the key. Off the test flag,
+        which counts every time for the query-count pins."""
+        from django.core.cache import cache
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
 
+        cache.clear()
         self.assertEqual(repairs.waiting_count(), 1)
         with CaptureQueriesContext(connection) as ctx:
             self.assertEqual(repairs.waiting_count(), 1)

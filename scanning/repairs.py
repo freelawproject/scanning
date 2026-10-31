@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 
+from django.conf import settings
 from django.core.cache import cache
 from django.db.models import (
     BooleanField,
@@ -641,9 +642,16 @@ def waiting_count() -> int:
     over every open request, which on 10-31 took the web pods twenty
     seconds a page under load, six copies at once.
 
+    Under the test runner the count is counted every time: the pins
+    on the list pages' query counts (``assertNumQueries``) must not
+    depend on what an earlier test left in the cache. One test turns
+    the flag off to exercise the cache itself.
+
     :returns: The count.
     :rtype: int
     """
+    if getattr(settings, "TESTING", False):
+        return queue("waiting").count()
     key = _waiting_count_key()
     count = cache.get(key)
     if count is None:
