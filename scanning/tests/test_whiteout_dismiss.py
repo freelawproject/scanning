@@ -159,12 +159,15 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         detections.decide(
             self.scan, self.key, DetectionDecision.Kind.APPROVE, self.user
         )
-        response = self._post("add_redaction", {"page_index": 0, **self._cover()})
+        response = self._post(
+            "add_redaction", {"page_index": 0, **self._cover()}
+        )
         self.assertEqual(response.json()["dismissed"], [])
         self.key.refresh_from_db()
         self.assertTrue(self.key.active)
         self.assertEqual(
-            DetectionDecision.objects.get().kind, DetectionDecision.Kind.APPROVE
+            DetectionDecision.objects.get().kind,
+            DetectionDecision.Kind.APPROVE,
         )
 
     def test_a_withdrawn_whiteout_judges_nothing(self):
@@ -180,7 +183,10 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
             y1=90.0,
             author=self.user,
         )
-        self.assertEqual([r.pk for r in detections.under_whiteout(self.scan, row)], [self.key.pk])
+        self.assertEqual(
+            [r.pk for r in detections.under_whiteout(self.scan, row)],
+            [self.key.pk],
+        )
         Redaction.objects.filter(pk=row.pk).update(withdrawn_at=timezone.now())
         row.refresh_from_db()
         self.assertEqual(detections.under_whiteout(self.scan, row), [])
