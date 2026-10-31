@@ -1102,6 +1102,25 @@ class TestRepairQueue(RepairTestCase):
         repairs.dismiss(PageRepairRequest.objects.all(), self.user)
         self.assertEqual(repairs.waiting_count(), 0)
 
+    @override_settings(TESTING=False)
+    def test_one_recount_at_a_time_and_the_last_count_meanwhile(self):
+        """A caller that misses while another recounts serves the last
+        count stored instead of counting again; a cold cache counts."""
+        from django.core.cache import cache
+
+        cache.clear()
+        self.assertEqual(repairs.waiting_count(), 1)
+        self._replace(pdf_page=2)
+        # Another caller holds the lock: the last count is served.
+        cache.add(repairs.WAITING_COUNT_LOCK, 1, 30)
+        self.assertEqual(repairs.waiting_count(), 1)
+        cache.delete(repairs.WAITING_COUNT_LOCK)
+        self.assertEqual(repairs.waiting_count(), 2)
+        # A cold cache under a held lock still answers.
+        cache.clear()
+        cache.add(repairs.WAITING_COUNT_LOCK, 1, 30)
+        self.assertEqual(repairs.waiting_count(), 2)
+
     def test_login_is_required(self):
         self.client.logout()
         self.assertEqual(self._queue().status_code, 302)

@@ -612,6 +612,13 @@ def group_by_scan(rows: QuerySet, scan_ids: list[int]) -> list[dict]:
 #: see (a withdrawn page edit, which makes no row).
 WAITING_COUNT_SECONDS = 60
 
+#: The single-flight lock of the recount, and how long a dead holder
+#: keeps it; and the key of the last count stored, which a caller
+#: serves while another recounts.
+WAITING_COUNT_LOCK = "repairs.waiting_count.lock"
+WAITING_COUNT_LOCK_SECONDS = 30
+WAITING_COUNT_LAST = "repairs.waiting_count.last"
+
 
 def _waiting_count_key() -> str:
     """Return the cache key of the header's count: the last writes.
@@ -654,9 +661,23 @@ def waiting_count() -> int:
         return queue("waiting").count()
     key = _waiting_count_key()
     count = cache.get(key)
-    if count is None:
+    if count is not None:
+        return count
+    # One recount at a time: the key moves on every write and every
+    # minute, and under load each miss was the whole count again, three
+    # pods wide. The caller that takes the lock counts; the others
+    # serve the last count stored, a minute old at worst; only a cold
+    # cache with no last count counts anyway.
+    if not cache.add(WAITING_COUNT_LOCK, 1, WAITING_COUNT_LOCK_SECONDS):
+        last = cache.get(WAITING_COUNT_LAST)
+        if last is not None:
+            return last
+    try:
         count = queue("waiting").count()
         cache.set(key, count, WAITING_COUNT_SECONDS)
+        cache.set(WAITING_COUNT_LAST, count, None)
+    finally:
+        cache.delete(WAITING_COUNT_LOCK)
     return count
 
 
