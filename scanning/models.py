@@ -1604,6 +1604,18 @@ class Detection(AbstractDateTimeModel):
                 fields=["scan", "active"],
                 name="idx_det_scan_active",
             ),
+            # The hand-drawn rows of a scan alone, for the question the
+            # step-2 bar and the review-2 approval ask on every render
+            # (``detections.changed_since_compute``): was one added or
+            # withdrawn since the last compute. Without it the planner
+            # walks every detection of the volume to find the few
+            # manual ones, which on a large volume is a minute of disk
+            # reads per page load.
+            models.Index(
+                fields=["scan", "date_created", "withdrawn_at"],
+                condition=models.Q(model_name="manual"),
+                name="idx_det_manual_by_scan",
+            ),
         ]
 
     def __str__(self):
