@@ -61,7 +61,14 @@ from collections.abc import Iterator
 from blackletter.models import Label
 from django.db import transaction
 
-from scanning import boundaries, brackets, detections, opinion_ocr, redactions
+from scanning import (
+    boundaries,
+    brackets,
+    columns,
+    detections,
+    opinion_ocr,
+    redactions,
+)
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -311,6 +318,78 @@ def clusters(cells: list[dict], gap: float = CLUSTER_GAP_PX) -> list[dict]:
     return blocks
 
 
+#: How near the page's footnote box must be to a text card's block, in
+#: render pixels, for the card to grow that box over the block instead
+#: of adding a second one: a footnote line the box stopped short of
+#: sits right under it, or beside it. Two footnote boxes with a seam
+#: between them are a partial cover in review 3 and a hairline the glue
+#: has to bridge; the footnotes of a page are one block, across both
+#: columns, so the growth crosses the gutter on purpose. The reach is
+#: this module's own gap between the cells of one block.
+GROW_GAP_PX = 150.0
+
+Box = list[float]
+
+
+def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
+    """Return the live box of ``label`` a text card should grow over
+    ``block``, with the box it would become, or None.
+
+    A box in the block's column (``columns.column_groups`` over the
+    two, the one rule of "same column") that ends within
+    :data:`GROW_GAP_PX` above the block or starts within it below, or
+    one beside the block (sharing half the block's height) within that
+    gap sideways, gutter or no gutter: the caller grows a footnote box
+    with this, and a page's footnotes run across its columns. The
+    nearest when several. ``grown`` is the union, the box the resize
+    writes; ``box`` is the box as it stands, the Undo. The one rule,
+    read by the sidebar card (``metadata["grow"]``) and the cards page
+    (``card_review.cards``).
+
+    :param block: The card's block, ``[x0, y0, x1, y1]`` in render
+        pixels.
+    :param others: The page's live boxes, ``{"id", "label", "box"}``
+        in the same pixels.
+    :param label: The label of the box the answer would add.
+    :returns: ``{"id", "box", "grown"}`` or None.
+    :rtype: dict | None
+    """
+    bx0, by0, bx1, by1 = block
+    best: tuple[float, dict] | None = None
+    for other in others:
+        if other.get("label") != label:
+            continue
+        ox0, oy0, ox1, oy1 = other["box"]
+        same_column = len(columns.column_groups([(ox0, ox1), (bx0, bx1)])) == 1
+        vertical = max(by0 - oy1, oy0 - by1, 0.0)
+        sideways = max(bx0 - ox1, ox0 - bx1, 0.0)
+        beside = (
+            min(by1, oy1) - max(by0, oy0) >= (by1 - by0) / 2
+            and sideways <= GROW_GAP_PX
+        )
+        if same_column and vertical <= GROW_GAP_PX:
+            distance = vertical
+        elif beside:
+            distance = sideways
+        else:
+            continue
+        if best is None or distance < best[0]:
+            best = (
+                distance,
+                {
+                    "id": other["id"],
+                    "box": list(other["box"]),
+                    "grown": [
+                        min(ox0, bx0),
+                        min(oy0, by0),
+                        max(ox1, bx1),
+                        max(oy1, by1),
+                    ],
+                },
+            )
+    return best[1] if best else None
+
+
 def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
     """Yield one finding per block of text no detection covers.
 
@@ -378,8 +457,37 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
         missed = missed_cells(
             reading, frame, size, rects_by_page.get(reading.page_index, [])
         )
+        # The page's live boxes in the render the card's box is in, for
+        # the box the card grows (:func:`neighbour_box`): a row of
+        # another render size is scaled into it.
+        others = [
+            {
+                "id": r.pk,
+                "label": r.label,
+                "box": [
+                    r.x0 * width / r.img_width,
+                    r.y0 * height / r.img_height,
+                    r.x1 * width / r.img_width,
+                    r.y1 * height / r.img_height,
+                ],
+                # The row's own render, the space a resize of it is
+                # written in (``update_detection`` keeps the row's
+                # size), so the card's answer goes back through it.
+                "own_box": [r.x0, r.y0, r.x1, r.y1],
+                "own_scale": (r.img_width / width, r.img_height / height),
+            }
+            for r in rows
+            if r.img_width and r.img_height
+        ]
         for block in clusters(missed):
-            yield _finding(reading, block, width, height, no_column=no_column)
+            yield _finding(
+                reading,
+                block,
+                width,
+                height,
+                no_column=no_column,
+                others=others,
+            )
 
 
 def _finding(
@@ -388,6 +496,7 @@ def _finding(
     width: int,
     height: int,
     no_column: bool = False,
+    others: list[dict] | None = None,
 ) -> dict:
     """Build the finding dict of one block of text in no box.
 
@@ -476,7 +585,48 @@ def _finding(
             "source_page": reading.source_page,
             "cells": len(cells),
             "no_column": no_column,
+            # The page's footnote box beside the block, when there is
+            # one: the card's footnote answer grows it over the block
+            # instead of adding a second box (``neighbour_box``).
+            "grow": _grow_in_own_space(
+                neighbour_box(bbox, others or [], Label.FOOTNOTES.name),
+                others or [],
+            ),
         },
+    }
+
+
+def _grow_in_own_space(grow: dict | None, others: list[dict]) -> dict | None:
+    """Return a grow answer in the grown row's own render.
+
+    :func:`neighbour_box` measures in the card's render, where every
+    box of the page was scaled to compare; a resize is written in the
+    row's own (``update_detection`` keeps ``img_width`` and
+    ``img_height``), and a row of another render size would land off
+    the block if the card's pixels were written on it.
+
+    :param grow: What :func:`neighbour_box` answered, or None.
+    :param others: The page's boxes, with ``own_box`` and ``own_scale``.
+    :returns: The answer with ``box`` and ``grown`` in the row's own
+        pixels, or None.
+    :rtype: dict | None
+    """
+    if grow is None:
+        return None
+    other = next((o for o in others if o["id"] == grow["id"]), None)
+    if other is None or "own_scale" not in other:
+        return grow
+    sx, sy = other["own_scale"]
+    x0, y0, x1, y1 = grow["grown"]
+    return {
+        "id": grow["id"],
+        "box": list(other["own_box"]),
+        "grown": [
+            round(x0 * sx, 1),
+            round(y0 * sy, 1),
+            round(x1 * sx, 1),
+            round(y1 * sy, 1),
+        ],
     }
 
 

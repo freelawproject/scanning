@@ -2317,6 +2317,23 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
 
+    // A box the sidebar resized (the text card's "Grow footnote"): the
+    // entry takes the new box and the id the server answered, a model
+    // box having become a hand-drawn one, and its page is drawn again.
+    window.moveDetectionBox = function (oldId, newId, bbox, pageIndex) {
+        if (!allDetections) return;
+        for (var i = 0; i < allDetections.length; i++) {
+            var entry = allDetections[i];
+            if (entry.id !== oldId && entry.id !== newId) continue;
+            entry.bbox = bbox.slice();
+            if (newId !== undefined && newId !== null) entry.id = newId;
+            entry.manual = true;
+            entry.confidence = 1.0;
+            break;
+        }
+        var pageDiv = _pageDivForIndex(pageIndex);
+        if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+    };
     // A row the sidebar drew (the "add" of a missed-bracket card): one
     // entry, drawn on its page the way the drawer's own add is.
     window.addDetectionRow = function (det) {
