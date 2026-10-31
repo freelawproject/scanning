@@ -562,7 +562,10 @@ class TestRebuild(ScanningTestCase):
             self.assertTrue(findings.model_rows_are_bl_warm(scan))
         self.assertEqual(len(ctx.captured_queries), 2)
         self.assertTrue(
-            all(q["sql"].startswith("SELECT 1 AS") for q in ctx.captured_queries),
+            all(
+                q["sql"].startswith("SELECT 1 AS")
+                for q in ctx.captured_queries
+            ),
             "the check read the rows instead of asking EXISTS",
         )
         # One row of another family and the volume keeps the legacy
