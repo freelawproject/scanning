@@ -194,6 +194,39 @@ MOVED_OVER_COMPUTED_MESSAGE = (
 MOVED_OVER_MODEL_MESSAGE = (
     "The box was moved. Your box replaces the model box."
 )
+#: Appended to the add's and the move's line when a whiteout covered
+#: model boxes, which the write dismissed (``detections
+#: .dismiss_under_whiteout``). Each has its own Undo.
+DISMISSED_UNDER_WHITEOUT_MESSAGE = (
+    " {count} model box{plural} under the whiteout {verb} dismissed."
+)
+
+
+def _dismissed_under(scan: Scan, row, user) -> tuple[list[int], str]:
+    """Dismiss the model boxes a whiteout covers, for the two writers.
+
+    :param scan: The scan.
+    :param row: The whiteout as written.
+    :param user: The curator.
+    :returns: The ids dismissed, and the line to append to the answer
+        (empty when nothing was).
+    :rtype: tuple[list[int], str]
+    """
+    from scanning import detections
+
+    dismissed = [
+        d.pk for d in detections.dismiss_under_whiteout(scan, row, user)
+    ]
+    if not dismissed:
+        return [], ""
+    count = len(dismissed)
+    return dismissed, DISMISSED_UNDER_WHITEOUT_MESSAGE.format(
+        count=count,
+        plural="" if count == 1 else "es",
+        verb="was" if count == 1 else "were",
+    )
+
+
 DISMISSED_REDACTION_MESSAGE = "The box was dismissed. Nothing was deleted."
 WITHDRAWN_REDACTION_MESSAGE = "The box was withdrawn. Nothing was deleted."
 RESTORED_REDACTION_MESSAGE = "The box came back."
@@ -981,9 +1014,15 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
         row = redactions.add(scan, page_index, bbox, fill, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    dismissed, note = _dismissed_under(scan, row, request.user)
     _rebuild_findings(scan)
     return JsonResponse(
-        {"status": "ok", "id": row.pk, "message": SAVED_REDACTION_MESSAGE}
+        {
+            "status": "ok",
+            "id": row.pk,
+            "dismissed": dismissed,
+            "message": SAVED_REDACTION_MESSAGE + note,
+        }
     )
 
 
@@ -1025,16 +1064,22 @@ def move_redaction(
         holder = redactions.move(scan, row, bbox, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
+    # A whiteout pulled over model boxes dismisses them, one decision
+    # each, so a bleed-through page is one drag and not a drag plus a
+    # click on every box it covers.
+    dismissed, note = _dismissed_under(scan, holder, request.user)
     _rebuild_findings(scan)
     return JsonResponse(
         {
             "status": "ok",
             "id": holder.pk,
+            "dismissed": dismissed,
             "message": (
                 MOVED_BOX_MESSAGE
                 if holder.pk == row.pk
                 else MOVED_OVER_COMPUTED_MESSAGE
-            ),
+            )
+            + note,
         }
     )
 

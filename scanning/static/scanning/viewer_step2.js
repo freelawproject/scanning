@@ -937,12 +937,71 @@ document.addEventListener('DOMContentLoaded', function () {
                         showToast((data && data.message) || 'Failed to save the box');
                         return;
                     }
-                    showSaved(data);
+                    if (!dropDismissedUnder(data, pageDiv)) showSaved(data);
                     refreshOverlays();
                     if (window.refreshFindings) window.refreshFindings();
                 });
             }
         };
+    }
+    // The model boxes a whiteout covered are dismissed by the write,
+    // one decision each (``detections.dismiss_under_whiteout``). They
+    // leave the page at once, and the server's line gets one Undo for
+    // the lot, which restores each box through the endpoint the card
+    // review's Undo uses, so the per-box Undo elsewhere still holds.
+    // Answers whether it showed the line, so a write that dismissed
+    // nothing shows the plain one.
+    function dropDismissedUnder(data, pageDiv) {
+        var ids = (data && data.dismissed) || [];
+        if (!ids.length) return false;
+        var removed = [];
+        if (allDetections) {
+            allDetections = allDetections.filter(function (det) {
+                if (ids.indexOf(det.id) === -1) return true;
+                removed.push(det);
+                return false;
+            });
+        }
+        var pageIndex = pageDiv ? parseInt(pageDiv.dataset.pdfIndex, 10) : null;
+        if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+        showToast(data.message, 'success', {
+            label: 'Undo',
+            onClick: function () { restoreDismissed(ids, removed, pageDiv, pageIndex); },
+        });
+        return true;
+    }
+    // One restore after another, never all at once: every restore
+    // rebuilds the findings, and two in flight could leave the cards
+    // at the slower one's older snapshot. The page refreshes once, at
+    // the end, and the line shown is the server's own (#322).
+    function restoreDismissed(ids, removed, pageDiv, pageIndex) {
+        var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+        var failed = 0;
+        var last = null;
+        var chain = Promise.resolve();
+        ids.forEach(function (id) {
+            chain = chain.then(function () {
+                return fetch('/scans/' + documentId + '/restore-detection/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                    body: JSON.stringify({ detection_id: id }),
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data || data.status !== 'ok') { failed += 1; return; }
+                    last = data;
+                    var det = removed.filter(function (d) { return d.id === id; })[0];
+                    if (det && allDetections && allDetections.indexOf(det) === -1) allDetections.push(det);
+                })
+                .catch(function () { failed += 1; });
+            });
+        });
+        chain.then(function () {
+            if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+            if (window.refreshFindings) window.refreshFindings();
+            if (failed) showToast(failed + ' of the boxes could not be put back.');
+            else showSaved(last);
+        });
     }
 
     // --- Detection overlay ---
@@ -2158,7 +2217,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 rectData.origin = 'human';
                 div.dataset.id = data.id;
             }
-            showSaved(data);
+            if (!dropDismissedUnder(data, div.closest('.page-container'))) showSaved(data);
             if (window.refreshFindings) window.refreshFindings();
         }).catch(function() { showToast('Failed to save the box'); });
     }
