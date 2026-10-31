@@ -30,12 +30,14 @@ from __future__ import annotations
 
 import re
 
+from django.core.cache import cache
 from django.db.models import (
     BooleanField,
     Count,
     Exists,
     ExpressionWrapper,
     F,
+    Max,
     OuterRef,
     Q,
     QuerySet,
@@ -604,15 +606,50 @@ def group_by_scan(rows: QuerySet, scan_ids: list[int]) -> list[dict]:
     return [by_scan[pk] for pk in scan_ids if pk in by_scan]
 
 
+#: How long the header's count may stand before it is counted again,
+#: whatever the key says: the backstop for a write the key does not
+#: see (a withdrawn page edit, which makes no row).
+WAITING_COUNT_SECONDS = 60
+
+
+def _waiting_count_key() -> str:
+    """Return the cache key of the header's count: the last writes.
+
+    The count changes when a request is made or dismissed (a new pk,
+    or a new ``date_modified``, which :func:`dismiss` writes by hand)
+    and when a page edit answers one (a new ``PageEdit`` pk). Three
+    indexed maxima, so the key moves with every such write and a
+    stale count is never shown after one; the TTL covers the rest.
+
+    :returns: The key.
+    :rtype: str
+    """
+    requests = PageRepairRequest.objects.aggregate(
+        pk=Max("pk"), modified=Max("date_modified")
+    )
+    edits = PageEdit.objects.aggregate(pk=Max("pk"))
+    stamp = requests["modified"].isoformat() if requests["modified"] else ""
+    return f"repairs.waiting_count:{requests['pk']}:{stamp}:{edits['pk']}"
+
+
 def waiting_count() -> int:
     """Return how many requests wait, over every scan.
 
-    One query. The header shows it beside the "Repairs" link.
+    The header shows it beside the "Repairs" link on every page, so it
+    is cached (:func:`_waiting_count_key`, :data:`WAITING_COUNT_SECONDS`)
+    and not counted per request: the count runs the fulfilled rule
+    over every open request, which on 10-31 took the web pods twenty
+    seconds a page under load, six copies at once.
 
     :returns: The count.
     :rtype: int
     """
-    return queue("waiting").count()
+    key = _waiting_count_key()
+    count = cache.get(key)
+    if count is None:
+        count = queue("waiting").count()
+        cache.set(key, count, WAITING_COUNT_SECONDS)
+    return count
 
 
 def waiting_totals() -> tuple[int, int]:

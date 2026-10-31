@@ -1079,6 +1079,25 @@ class TestRepairQueue(RepairTestCase):
         self.assertEqual(response.context["waiting_repairs_count"], 2)
         self.assertEqual(repairs.waiting_count(), 2)
 
+    def test_the_header_count_is_cached_until_a_write_moves_it(self):
+        """The count runs the fulfilled rule over every open request,
+        so it is counted once and kept until a request or a page edit
+        is written, whose pk or stamp moves the key."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        self.assertEqual(repairs.waiting_count(), 1)
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertEqual(repairs.waiting_count(), 1)
+        self.assertFalse(
+            [q for q in ctx.captured_queries if "COUNT(*)" in q["sql"]],
+            "the second call counted again",
+        )
+        self._replace(pdf_page=2)
+        self.assertEqual(repairs.waiting_count(), 2)
+        repairs.dismiss(PageRepairRequest.objects.all(), self.user)
+        self.assertEqual(repairs.waiting_count(), 0)
+
     def test_login_is_required(self):
         self.client.logout()
         self.assertEqual(self._queue().status_code, 302)

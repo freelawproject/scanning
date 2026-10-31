@@ -1064,14 +1064,20 @@ def queue_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
+    # The status first and no ``order_by``, for the reason
+    # ``dots_mocr.apply_glued_runs`` gives: the join drives from the
+    # scans in an apply status, and the scan's default ordering stays
+    # out of the DISTINCT.
     scan_ids = (
         Scan.objects.filter(
+            status__in=APPLY_STATUSES,
             jobs__stage=JobStage.DETECT,
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
             jobs__apply_run__isnull=True,
         )
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
