@@ -548,6 +548,45 @@ class TestRebuild(ScanningTestCase):
         self.assertIn("0.25", rows[0].message)
         self.assertIn("0.30", rows[0].message)
 
+    def test_the_family_check_reads_no_row(self):
+        """The import stamps the family on every row, so the check is
+        two EXISTS and never the rows themselves: it streamed every
+        live row's ``found_by`` into the web pod on every click."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = make_scan()
+        make_detection(scan, "CASE_CAPTION", 0)
+        make_detection(scan, "KEY_ICON", 1)
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertTrue(findings.model_rows_are_bl_warm(scan))
+        self.assertEqual(len(ctx.captured_queries), 2)
+        self.assertTrue(
+            all(
+                q["sql"].startswith("SELECT 1 AS")
+                for q in ctx.captured_queries
+            ),
+            "the check read the rows instead of asking EXISTS",
+        )
+        # One row of another family and the volume keeps the legacy
+        # gates, blackletter's own rule; a row with no provenance says
+        # nothing, as before.
+        make_detection(scan, "HEADNOTE", 3, model_name="", found_by=[])
+        self.assertTrue(findings.model_rows_are_bl_warm(scan))
+        legacy = make_detection(
+            scan,
+            "HEADNOTE",
+            2,
+            model_name="",
+            found_by=[{"model": "small", "confidence": 0.4}],
+        )
+        self.assertFalse(findings.model_rows_are_bl_warm(scan))
+        Detection.objects.filter(pk=legacy.pk).update(active=False)
+        self.assertTrue(findings.model_rows_are_bl_warm(scan))
+        # A volume with no model row at all has no family.
+        Detection.objects.filter(scan=scan).update(active=False)
+        self.assertFalse(findings.model_rows_are_bl_warm(scan))
+
     def test_a_volume_with_no_bl_warm_provenance_reads_the_legacy_gate(self):
         """The compute reads the family off ``found_by`` (``rows_are_bl_warm``),
         and a set with no provenance keeps the 0.50 gate."""
