@@ -58,11 +58,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.models import Label
 from blackletter.scanner import HEAD_MATTER_LABELS, label_confidence
-from django.db import transaction
-from django.db.models import BooleanField, Count, Q
-from django.db.models.expressions import RawSQL
+from django.db import connection, transaction
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from scanning import (
@@ -601,6 +601,35 @@ def _over_a_paired_key(det: Detection, paired_rows: dict) -> bool:
     )
 
 
+def _found_by_models(scan: Scan) -> list[str | None]:
+    """Return the distinct model names in the live model rows' ``found_by``.
+
+    The projection the family rule needs, done where the rows are: one
+    query over the scan's live model boxes that unnests each box's
+    ``found_by`` and answers the distinct ``model`` names, a handful of
+    strings for a volume of tens of thousands of boxes. A null name is
+    kept, as blackletter's rule reads it.
+
+    :param scan: The scan.
+    :returns: The names.
+    :rtype: list[str | None]
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            """
+            SELECT DISTINCT e->>'model'
+            FROM scanning_detection AS d,
+                 jsonb_array_elements(d.found_by) AS e
+            WHERE d.scan_id = %s
+              AND d.active
+              AND d.model_name <> %s
+              AND jsonb_typeof(d.found_by) = 'array'
+            """,
+            [scan.pk, str(Detection.ModelName.MANUAL)],
+        )
+        return [row[0] for row in cursor.fetchall()]
+
+
 def model_rows_are_bl_warm(scan: Scan) -> bool:
     """Return whether bl-warm alone drew the scan's live model rows.
 
@@ -609,37 +638,21 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
     key icons of the pairing's rule (``blackletter.scanner.key_icons``)
     and the editor's note cards (``card_review.cards``).
 
-    The rule is blackletter's own (``bl_warm.rows_are_bl_warm``): every
-    row with provenance in ``found_by`` came from bl-warm, and a set
-    with none, or a mixed one, keeps the legacy gates. It is asked of
-    the database as two EXISTS over the live model rows, one for a
-    bl-warm entry and one for an entry of any other model, so no row
-    comes back. It used to stream every row's ``found_by`` into Python
-    and hand blackletter the list, tens of thousands of JSON values
-    per click on a big volume: on 10-31 three of those held the web
-    pod's threads for minutes each while the database sat idle.
+    The rule is blackletter's own and only (``bl_warm.rows_are_bl_warm``),
+    read off ``found_by`` as the compute reads it (``services
+    ._import_detections``); what the database does is the projection
+    (:func:`_found_by_models`), so no row comes back. It used to stream
+    every row's ``found_by`` into Python and hand blackletter the list,
+    tens of thousands of JSON values per click on a big volume: on
+    10-31 three of those held the web pod's threads for minutes each
+    while the database sat idle.
 
     :param scan: The scan.
-    :returns: Whether a bl-warm row exists and no row names another
-        model.
+    :returns: ``rows_are_bl_warm`` over the distinct provenance.
     """
-    rows = (
-        Detection.objects.live()
-        .filter(scan=scan)
-        .exclude(model_name=Detection.ModelName.MANUAL)
-        .exclude(found_by=[])
+    return rows_are_bl_warm(
+        [{"found_by": [{"model": name}]} for name in _found_by_models(scan)]
     )
-    if not rows.filter(found_by__contains=[{"model": "bl_warm"}]).exists():
-        return False
-    other = rows.annotate(
-        other_model=RawSQL(
-            "EXISTS (SELECT 1 FROM jsonb_array_elements(found_by) AS e "
-            "WHERE coalesce(e->>'model', '') <> %s)",
-            ("bl_warm",),
-            output_field=BooleanField(),
-        )
-    ).filter(other_model=True)
-    return not other.exists()
 
 
 def _caption_drawn_after(

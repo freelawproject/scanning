@@ -549,8 +549,8 @@ class TestRebuild(ScanningTestCase):
         self.assertIn("0.30", rows[0].message)
 
     def test_the_family_check_reads_no_row(self):
-        """The import stamps the family on every row, so the check is
-        two EXISTS and never the rows themselves: it streamed every
+        """The database projects the distinct model names and blackletter
+        judges them, so no row comes back: the check streamed every
         live row's ``found_by`` into the web pod on every click."""
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
@@ -560,13 +560,10 @@ class TestRebuild(ScanningTestCase):
         make_detection(scan, "KEY_ICON", 1)
         with CaptureQueriesContext(connection) as ctx:
             self.assertTrue(findings.model_rows_are_bl_warm(scan))
-        self.assertEqual(len(ctx.captured_queries), 2)
-        self.assertTrue(
-            all(
-                q["sql"].startswith("SELECT 1 AS")
-                for q in ctx.captured_queries
-            ),
-            "the check read the rows instead of asking EXISTS",
+        self.assertEqual(len(ctx.captured_queries), 1)
+        self.assertIn("DISTINCT", ctx.captured_queries[0]["sql"])
+        self.assertNotIn(
+            'SELECT "scanning_detection"."found_by"', ctx.captured_queries[0]["sql"]
         )
         # One row of another family and the volume keeps the legacy
         # gates, blackletter's own rule; a row with no provenance says
