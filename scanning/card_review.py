@@ -42,9 +42,12 @@ from __future__ import annotations
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 
-from scanning import boundaries, columns, findings, opinion_ocr, redactions
-from scanning.undetected import GROW_GAP_PX, neighbour_box  # noqa: F401 - the one rule
+from scanning import boundaries, findings, opinion_ocr, redactions
 from scanning.models import CheckName, Detection, Issue, Redaction, Scan
+from scanning.undetected import (  # noqa: F401 - the one rule
+    GROW_GAP_PX,
+    neighbour_box,
+)
 
 #: What a card offers (``kind``). A ``caption`` card is a caption the
 #: model did not box after a key icon, answered by adding the box where

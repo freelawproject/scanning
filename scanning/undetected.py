@@ -476,7 +476,12 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
         ]
         for block in clusters(missed):
             yield _finding(
-                reading, block, width, height, no_column=no_column, others=others
+                reading,
+                block,
+                width,
+                height,
+                no_column=no_column,
+                others=others,
             )
 
 
