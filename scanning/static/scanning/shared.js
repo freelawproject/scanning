@@ -504,7 +504,7 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
  * @param {string} [type="error"] - "error" (red), "info" (blue),
  *     "success" (green), or "warning" (amber).
  */
-function showToast(message, type) {
+function showToast(message, type, action) {
     type = type || 'error';
     var container = document.getElementById('toast-container');
     if (!container) {
@@ -534,6 +534,18 @@ function showToast(message, type) {
     text.textContent = message;
     toast.appendChild(text);
 
+    // An optional button on the line (``{label, onClick}``): the Undo of
+    // a write that took several things at once. The toast stays longer
+    // with one, so the button can be reached.
+    if (action && action.label && typeof action.onClick === 'function') {
+        var actionBtn = document.createElement('button');
+        actionBtn.textContent = action.label;
+        actionBtn.style.cssText = 'background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.6);color:#fff;cursor:pointer;font-size:12px;padding:2px 8px;border-radius:4px;flex-shrink:0;';
+        actionBtn.addEventListener('click', function () { dismiss(); action.onClick(); });
+        toast.appendChild(actionBtn);
+    }
+    var lifetime = action ? 15000 : 5000;
+
     var closeBtn = document.createElement('button');
     closeBtn.textContent = '✕';
     closeBtn.style.cssText = 'background:none;border:none;color:#fff;cursor:pointer;font-size:14px;padding:0;line-height:1;opacity:0.8;flex-shrink:0;';
@@ -552,12 +564,12 @@ function showToast(message, type) {
         removal = setTimeout(function () { toast.remove(); }, 400);
     }
 
-    var timer = setTimeout(dismiss, 5000);
+    var timer = setTimeout(dismiss, lifetime);
     toast._restart = function () {
         clearTimeout(timer);
         clearTimeout(removal);
         toast.style.opacity = '1';
-        timer = setTimeout(dismiss, 5000);
+        timer = setTimeout(dismiss, lifetime);
     };
     closeBtn.addEventListener('mouseenter', function () { clearTimeout(timer); });
     closeBtn.addEventListener('mouseleave', function () { timer = setTimeout(dismiss, 2000); });

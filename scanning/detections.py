@@ -391,6 +391,114 @@ def decide(
     return decision
 
 
+#: The labels of the running head's line. A whiteout dragged over them
+#: says nothing about them: the head's own whiteout is drawn from these
+#: boxes (``text_fit.widen_running_heads``), so a curator widening it
+#: must not take the boxes it is made of.
+HEAD_LINE_LABELS = frozenset({"PAGE_HEADER", "STATE_ABBREVIATION", "PAGE_NUMBER"})
+
+#: How much of a model box a whiteout must cover for the drag to dismiss
+#: it: four fifths of its area. A box the whiteout only touches stays.
+COVERED_SHARE = 0.8
+
+
+def covered_share(box: list[float], cover: list[float]) -> float:
+    """Return the share of ``box``'s area that lies inside ``cover``.
+
+    :param box: ``[x0, y0, x1, y1]``.
+    :param cover: ``[x0, y0, x1, y1]`` in the same space.
+    :returns: A value in ``[0, 1]``; 0 for an empty box.
+    :rtype: float
+    """
+    area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+    if area <= 0:
+        return 0.0
+    ix0, iy0 = max(box[0], cover[0]), max(box[1], cover[1])
+    ix1, iy1 = min(box[2], cover[2]), min(box[3], cover[3])
+    return max(0.0, ix1 - ix0) * max(0.0, iy1 - iy0) / area
+
+
+def under_whiteout(scan: Scan, redaction) -> list[Detection]:
+    """Return the live model boxes a whiteout covers.
+
+    The rule of the drag that dismisses what it covers: a curator who
+    pulls a whiteout over a key icon or a caption on a bleed-through
+    page is saying those boxes are junk, and used to say it again with
+    a click on each. Only a white box asks the question (a black one
+    redacts and judges nothing), only a model row answers it (a box a
+    person drew or approved is theirs to lift), only a row of the
+    whiteout's own page and space, covered by :data:`COVERED_SHARE` of
+    its area, and never a box of the running head's line
+    (:data:`HEAD_LINE_LABELS`).
+
+    The redaction is in points and the detections in render pixels, so
+    each box goes to points through ``boundaries.to_points`` before
+    the measure, the way the compute reads them.
+
+    :param scan: The scan.
+    :param redaction: The ``Redaction`` row as it stands after the move.
+    :returns: The rows, in page order.
+    :rtype: list[Detection]
+    """
+    from scanning import boundaries
+    from scanning.models import Redaction
+
+    if redaction.fill != Redaction.Fill.WHITE or redaction.bbox is None:
+        return []
+    rows = (
+        Detection.objects.live()
+        .model_rows()
+        .filter(
+            scan=scan,
+            page_index=redaction.page_index,
+            apply_run=redaction.apply_run,
+        )
+        .exclude(label__in=HEAD_LINE_LABELS)
+        .order_by("y0", "x0")
+    )
+    covered = []
+    for row in rows:
+        if not row.img_width or not row.img_height:
+            continue
+        x0, y0 = boundaries.to_points(row.x0, row.y0, row.img_width, row.img_height)
+        x1, y1 = boundaries.to_points(row.x1, row.y1, row.img_width, row.img_height)
+        if covered_share([x0, y0, x1, y1], redaction.bbox) >= COVERED_SHARE:
+            covered.append(row)
+    return covered
+
+
+def dismiss_under_whiteout(scan: Scan, redaction, user) -> list[Detection]:
+    """Dismiss the model boxes a moved whiteout covers, one decision each.
+
+    Each dismissal is the ``deactivate`` decision a click writes
+    (:func:`decide`), addressed and copied like any other, so every one
+    has its own Undo (``views_api.restore_detection``) and every import
+    keeps it. A row with no address is skipped and logged, never a
+    refusal of the move that found it.
+
+    :param scan: The scan.
+    :param redaction: The whiteout as it stands after the move.
+    :param user: The curator.
+    :returns: The rows dismissed.
+    :rtype: list[Detection]
+    """
+    run = measured_run(scan)
+    dismissed = []
+    for row in under_whiteout(scan, redaction):
+        try:
+            decide(scan, row, DetectionDecision.Kind.DEACTIVATE, user, run=run)
+        except UnaddressableDetection:
+            logger.warning(
+                "scan %s: detection %s under the whiteout has no address; "
+                "it stays",
+                scan.pk,
+                row.pk,
+            )
+            continue
+        dismissed.append(row)
+    return dismissed
+
+
 def withdraw_manual(row: Detection, user) -> bool:
     """Take back a hand-drawn row, and the deactivation it replaced.
 
