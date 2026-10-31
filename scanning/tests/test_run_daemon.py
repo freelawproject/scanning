@@ -29,6 +29,15 @@ class TestScheduledTask(TestCase):
 class TestRunDaemonSchedule(TestCase):
     """run_daemon builds the expected schedule from settings."""
 
+    def setUp(self):
+        # The loop beats for real, and a beat closes its session, which
+        # the test transaction cannot survive.
+        patcher = patch(
+            "scanning.management.commands.run_daemon.daemon_heartbeat.beat"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @override_settings(
         DAEMON_POLL_INTERVAL=5,
         DAEMON_SUBMIT_INTERVAL=5,
@@ -234,6 +243,15 @@ class TestHandleSignal(TestCase):
 class TestCeleryMode(TestCase):
     """With the switch on, the daemon is the clock and runs no pass."""
 
+    def setUp(self):
+        # The loop beats for real, and a beat closes its session, which
+        # the test transaction cannot survive.
+        patcher = patch(
+            "scanning.management.commands.run_daemon.daemon_heartbeat.beat"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     @override_settings(CELERY_ENABLED=True)
     def test_the_schedule_is_the_tick_table(self):
         from scanning import tasks
@@ -281,3 +299,50 @@ class TestCeleryMode(TestCase):
         self.assertTrue(cmd.shutdown)
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PROCESSING)
+
+
+class TestDaemonHeartbeat(TestCase):
+    """The loop stamps the heartbeat in both modes (#503)."""
+
+    def _run_once(self):
+        cmd = Command()
+        beats = []
+
+        def fake_sleep(seconds):
+            cmd.shutdown = True
+
+        with (
+            patch(
+                "scanning.management.commands.run_daemon.daemon_heartbeat.beat",
+                side_effect=beats.append,
+            ),
+            patch("scanning.management.commands.run_daemon.call_command"),
+            patch("scanning.tasks.Tick.send"),
+            patch("scanning.management.commands.run_daemon.signal.signal"),
+            patch(
+                "scanning.management.commands.run_daemon.time.sleep",
+                side_effect=fake_sleep,
+            ),
+            patch("scanning.opinion_pdf.release_mirrors"),
+        ):
+            cmd.handle()
+        return beats
+
+    def test_the_serial_loop_beats(self):
+        self.assertEqual(self._run_once(), ["serial"])
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_the_clock_beats(self):
+        self.assertEqual(self._run_once(), ["celery"])
+
+    def test_the_loop_beats_after_every_pass_once_the_interval_passed(self):
+        """A serial round runs every due pass back to back, and one of
+        them can hold the loop for minutes."""
+        with (
+            patch("scanning.daemon_heartbeat.INTERVAL_SECONDS", 0),
+            # Monotonic time counts from boot, so on a host up for less
+            # than a pass's interval (CI's) that pass is not due yet.
+            patch.object(ScheduledTask, "due", return_value=True),
+        ):
+            beats = self._run_once()
+        self.assertEqual(len(beats), 1 + len(Command()._build_schedule()))

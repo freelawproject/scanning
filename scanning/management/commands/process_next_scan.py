@@ -26,6 +26,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 logger = logging.getLogger(__name__)
@@ -258,14 +259,29 @@ def heartbeat(
     :param action: The action it was claimed for; see :func:`_claim_filter`.
     :return: A context manager.
     """
+    from scanning import daemon_heartbeat
+
     stop = threading.Event()
     period = HEARTBEAT_SECONDS if interval is None else interval
+    # The serial loop is held by this action, and the clock's beat
+    # follows the action's for at most the longest action: a hung one
+    # must still turn the daemon's check red.
+    beats_clock = not settings.CELERY_ENABLED
+    clock_until = time.monotonic() + settings.DAEMON_MAX_ACTION_SECONDS
 
     def beat() -> None:
+        stamps_scan = True
         try:
             while not stop.wait(period):
                 try:
-                    if not stamp_heartbeat(scan_pk, action):
+                    if stamps_scan and not stamp_heartbeat(scan_pk, action):
+                        # The scan left the claim (a park, a re-queue
+                        # for the next action), but the action's tail
+                        # still holds the serial loop.
+                        stamps_scan = False
+                    if beats_clock and time.monotonic() < clock_until:
+                        daemon_heartbeat.beat(daemon_heartbeat.MODE_SERIAL)
+                    elif not stamps_scan:
                         return
                 except Exception:
                     logger.warning(

@@ -427,6 +427,71 @@ class TestHeartbeat(TestCase):
         self.assertEqual(set(beats), {7})
         self.assertEqual(len(beats), count)
 
+    def _daemon_beats_under_an_action(self):
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        with (
+            patch.object(
+                process_next_scan, "stamp_heartbeat", return_value=1
+            ) as stamp,
+            patch.object(process_next_scan, "close_thread_connection"),
+            patch("scanning.daemon_heartbeat.beat") as beat,
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.05)
+        self.assertTrue(stamp.called)
+        return beat
+
+    @override_settings(CELERY_ENABLED=False)
+    def test_a_serial_action_beats_for_the_daemon(self):
+        """The serial loop is held by the action, and still alive."""
+        beat = self._daemon_beats_under_an_action()
+        self.assertTrue(beat.called)
+        beat.assert_called_with("serial")
+
+    @override_settings(CELERY_ENABLED=False, DAEMON_MAX_ACTION_SECONDS=0)
+    def test_a_serial_action_past_the_cap_stops_beating_for_the_daemon(self):
+        """A hung action must still turn the daemon's check red; the
+        scan's own stamp goes on."""
+        self._daemon_beats_under_an_action().assert_not_called()
+
+    def _scan_leaves_the_claim(self):
+        import time
+
+        from scanning.management.commands import process_next_scan
+
+        with (
+            patch.object(
+                process_next_scan, "stamp_heartbeat", return_value=0
+            ) as stamp,
+            patch.object(process_next_scan, "close_thread_connection"),
+            patch("scanning.daemon_heartbeat.beat") as beat,
+        ):
+            with process_next_scan.heartbeat(7, interval=0.01):
+                time.sleep(0.05)
+        return stamp, beat
+
+    @override_settings(CELERY_ENABLED=False)
+    def test_a_serial_action_beats_for_the_daemon_after_its_scan_left(self):
+        """A re-queue for the next action or a park comes before the
+        action returns, and its tail still holds the loop."""
+        stamp, beat = self._scan_leaves_the_claim()
+        stamp.assert_called_once()
+        self.assertGreater(beat.call_count, 1)
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_worker_thread_ends_when_its_scan_left_the_claim(self):
+        stamp, beat = self._scan_leaves_the_claim()
+        stamp.assert_called_once()
+        beat.assert_not_called()
+
+    @override_settings(CELERY_ENABLED=True)
+    def test_a_worker_action_never_beats_for_the_clock(self):
+        """A live worker must not hide a dead clock."""
+        self._daemon_beats_under_an_action().assert_not_called()
+
     def test_a_failed_beat_closes_its_connection_and_beats_again(self):
         """A dropped session would fail every later beat the same way."""
         import time
