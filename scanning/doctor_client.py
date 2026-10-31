@@ -131,6 +131,16 @@ def _redact(url: str) -> str:
     return f"{base}?***" if query else base
 
 
+def _auth_headers() -> dict[str, str]:
+    """The bearer token doctor requires once its own setting is on.
+
+    :returns: The ``Authorization`` header, or nothing while
+        ``DOCTOR_AUTH_TOKEN`` is blank.
+    """
+    token = settings.DOCTOR_AUTH_TOKEN
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def convert_bitonal(
     input_url: str,
     output_url: str,
@@ -196,11 +206,20 @@ def convert_bitonal(
         response = requests.post(
             url,
             data=payload,
+            headers=_auth_headers(),
             timeout=(
                 int(settings.DOCTOR_CONNECT_TIMEOUT),
                 int(settings.DOCTOR_READ_TIMEOUT),
             ),
         )
+    except requests.exceptions.InvalidHeader as exc:
+        # requests refused the token before sending anything, so this is
+        # a configuration error, not an unanswered request: terminal, or
+        # every shard would wait out its deadline on a bad secret.
+        raise DoctorError(
+            f"DOCTOR_AUTH_TOKEN is not a valid header value: {exc}",
+            error_code="BAD_AUTH_TOKEN",
+        ) from exc
     except requests.ConnectTimeout as exc:
         # Provably never reached the application, so nothing is running
         # and nothing will be uploaded: safe to resubmit at once.
