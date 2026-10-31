@@ -621,6 +621,48 @@ class TestTheCard(ScanningTestCase):
         self.assertEqual(card.severity, Issue.Severity.WARNING)
         self.assertEqual(card.metadata["guess"], OUTSIDE)
 
+    def test_the_card_names_the_footnote_box_beside_its_block(self):
+        """A footnote box that ends just above the block is the box the
+        sidebar's footnote answer grows, and the card says so: its id
+        and the union the resize writes (``undetected.neighbour_box``,
+        the rule the cards page reads too)."""
+        from django.urls import reverse
+
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=1000.0,
+            y0=40.0,
+            x1=1600.0,
+            y1=120.0,
+        )
+        findings.rebuild(self.scan, run=None)
+        grow = self.cards().get().metadata["grow"]
+        self.assertEqual(grow["id"], foot.pk)
+        self.assertEqual(grow["box"], [1000.0, 40.0, 1600.0, 120.0])
+        self.assertEqual(grow["grown"], [1000.0, 40.0, 1600.0, 600.0])
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("Grow footnote", html)
+        self.assertIn(f'data-grow-id="{foot.pk}"', html)
+        self.assertIn('data-grow-bbox="1000.0,40.0,1600.0,600.0"', html)
+        self.assertNotIn("+ footnote", html)
+
+    def test_a_card_with_no_footnote_box_near_offers_the_add(self):
+        from django.urls import reverse
+
+        findings.rebuild(self.scan, run=None)
+        self.assertIsNone(self.cards().get().metadata["grow"])
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("+ footnote", html)
+        self.assertNotIn("Grow footnote", html)
+
     def test_drawing_the_column_takes_the_card_away(self):
         findings.rebuild(self.scan, run=None)
         column(

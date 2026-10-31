@@ -92,8 +92,14 @@
     {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a text column box over this block, the box the card flashes, and resize it on the page if it is short. A box in a column that has one already joins that column. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this)">+ column</button>
+    {% if issue.metadata.grow %}
+    <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Grow the page's footnote box over this block: the footnote line it stopped short of. One footnote box, no seam. A model box becomes a hand-drawn one the next compute keeps. The card goes now."
+            data-grow-id="{{ issue.metadata.grow.id }}" data-grow-bbox="{{ issue.metadata.grow.grown.0 }},{{ issue.metadata.grow.grown.1 }},{{ issue.metadata.grow.grown.2 }},{{ issue.metadata.grow.grown.3 }}"
+            onclick="event.stopPropagation(); growDetection(this)">Grow footnote</button>
+    {% else %}
     <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Add a footnote box over this block: the footnote line the page's footnote box stopped short of. The opinion text takes it as a footnote. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
+    {% endif %}
     {% endif %}
     {% if issue.check_name == 'redaction_cuts_text' and issue.metadata.redaction_id and issue.metadata.cover %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Grow the box over the whole line, so no word of it prints beside the box. A computed box becomes a hand-drawn one the next compute keeps. The card goes now."
