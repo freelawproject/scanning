@@ -395,7 +395,9 @@ def decide(
 #: says nothing about them: the head's own whiteout is drawn from these
 #: boxes (``text_fit.widen_running_heads``), so a curator widening it
 #: must not take the boxes it is made of.
-HEAD_LINE_LABELS = frozenset({"PAGE_HEADER", "STATE_ABBREVIATION", "PAGE_NUMBER"})
+HEAD_LINE_LABELS = frozenset(
+    {"PAGE_HEADER", "STATE_ABBREVIATION", "PAGE_NUMBER"}
+)
 
 #: How much of a model box a whiteout must cover for the drag to dismiss
 #: it: four fifths of its area. A box the whiteout only touches stays.
@@ -460,8 +462,12 @@ def under_whiteout(scan: Scan, redaction) -> list[Detection]:
     for row in rows:
         if not row.img_width or not row.img_height:
             continue
-        x0, y0 = boundaries.to_points(row.x0, row.y0, row.img_width, row.img_height)
-        x1, y1 = boundaries.to_points(row.x1, row.y1, row.img_width, row.img_height)
+        x0, y0 = boundaries.to_points(
+            row.x0, row.y0, row.img_width, row.img_height
+        )
+        x1, y1 = boundaries.to_points(
+            row.x1, row.y1, row.img_width, row.img_height
+        )
         if covered_share([x0, y0, x1, y1], redaction.bbox) >= COVERED_SHARE:
             covered.append(row)
     return covered

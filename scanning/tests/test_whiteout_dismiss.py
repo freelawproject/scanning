@@ -13,7 +13,11 @@ from django.urls import reverse
 
 from scanning import detections, views_api
 from scanning.models import Detection, DetectionDecision, Redaction
-from scanning.tests.test_findings import make_detection, make_redaction, make_scan
+from scanning.tests.test_findings import (
+    make_detection,
+    make_redaction,
+    make_scan,
+)
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -59,7 +63,9 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         return {"x0": 20.0, "y0": 20.0, "x1": 140.0, "y1": 90.0, "fill": fill}
 
     def test_a_whiteout_drawn_over_a_model_box_dismisses_it(self):
-        response = self._post("add_redaction", {"page_index": 0, **self._cover()})
+        response = self._post(
+            "add_redaction", {"page_index": 0, **self._cover()}
+        )
         self.assertEqual(response.status_code, 200)
         answer = response.json()
         self.assertEqual(answer["dismissed"], [self.key.pk])
@@ -92,7 +98,10 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         response = self._post("move_redaction", body, redaction_id=row.pk)
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["dismissed"], [self.key.pk])
-        self.assertIn("1 model box under the whiteout was dismissed", response.json()["message"])
+        self.assertIn(
+            "1 model box under the whiteout was dismissed",
+            response.json()["message"],
+        )
         self.key.refresh_from_db()
         self.assertFalse(self.key.active)
 
@@ -104,9 +113,13 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         body["y1"] = 100.0
         response = self._post("add_redaction", {"page_index": 0, **body})
         self.assertEqual(
-            sorted(response.json()["dismissed"]), sorted([self.key.pk, caption.pk])
+            sorted(response.json()["dismissed"]),
+            sorted([self.key.pk, caption.pk]),
         )
-        self.assertIn("2 model boxes under the whiteout were dismissed", response.json()["message"])
+        self.assertIn(
+            "2 model boxes under the whiteout were dismissed",
+            response.json()["message"],
+        )
         self.assertEqual(DetectionDecision.objects.count(), 2)
 
     def test_a_black_box_dismisses_nothing(self):
@@ -114,7 +127,9 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
             "add_redaction", {"page_index": 0, **self._cover(fill="black")}
         )
         self.assertEqual(response.json()["dismissed"], [])
-        self.assertEqual(response.json()["message"], views_api.SAVED_REDACTION_MESSAGE)
+        self.assertEqual(
+            response.json()["message"], views_api.SAVED_REDACTION_MESSAGE
+        )
         self.key.refresh_from_db()
         self.assertTrue(self.key.active)
 
@@ -130,7 +145,9 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         self.key.model_name = Detection.ModelName.MANUAL
         self.key.found_by = []
         self.key.save(update_fields=["model_name", "found_by"])
-        response = self._post("add_redaction", {"page_index": 0, **self._cover()})
+        response = self._post(
+            "add_redaction", {"page_index": 0, **self._cover()}
+        )
         self.assertEqual(response.json()["dismissed"], [])
         self.key.refresh_from_db()
         self.assertTrue(self.key.active)
@@ -154,13 +171,17 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         detections.decide(
             self.scan, self.key, DetectionDecision.Kind.DEACTIVATE, self.user
         )
-        response = self._post("add_redaction", {"page_index": 0, **self._cover()})
+        response = self._post(
+            "add_redaction", {"page_index": 0, **self._cover()}
+        )
         self.assertEqual(response.json()["dismissed"], [])
         self.assertEqual(DetectionDecision.objects.count(), 1)
 
     def test_the_undo_is_the_restore_of_each_box(self):
         self._post("add_redaction", {"page_index": 0, **self._cover()})
-        response = self._post("restore_detection", {"detection_id": self.key.pk})
+        response = self._post(
+            "restore_detection", {"detection_id": self.key.pk}
+        )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["restored"], 1)
         self.key.refresh_from_db()

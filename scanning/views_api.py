@@ -214,7 +214,9 @@ def _dismissed_under(scan: Scan, row, user) -> tuple[list[int], str]:
     """
     from scanning import detections
 
-    dismissed = [d.pk for d in detections.dismiss_under_whiteout(scan, row, user)]
+    dismissed = [
+        d.pk for d in detections.dismiss_under_whiteout(scan, row, user)
+    ]
     if not dismissed:
         return [], ""
     count = len(dismissed)
@@ -223,6 +225,8 @@ def _dismissed_under(scan: Scan, row, user) -> tuple[list[int], str]:
         plural="" if count == 1 else "es",
         verb="was" if count == 1 else "were",
     )
+
+
 DISMISSED_REDACTION_MESSAGE = "The box was dismissed. Nothing was deleted."
 WITHDRAWN_REDACTION_MESSAGE = "The box was withdrawn. Nothing was deleted."
 RESTORED_REDACTION_MESSAGE = "The box came back."
