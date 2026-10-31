@@ -1399,6 +1399,9 @@ def ready_volume_runs(
             jobs__status=JobStatus.COMPLETED,
             jobs__apply_run__isnull=True,
         )
+        # No ``order_by``: the scan's default ordering would put its
+        # ``date_created`` into the DISTINCT and sort the join.
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )

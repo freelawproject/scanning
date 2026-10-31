@@ -284,6 +284,9 @@ def promote_ready_scans() -> int:
             # anyway, at the cost of a read per tick.
             jobs__apply_run__isnull=True,
         )
+        # No ``order_by``: the scan's default ordering would put its
+        # ``date_created`` into the DISTINCT and sort the join.
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )

@@ -1052,14 +1052,20 @@ def apply_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
+    # The status first, so the join drives from the few scans in an
+    # apply status and not from every consumed row of the stage, and
+    # no ``order_by``: the scan's default ordering would put its
+    # ``date_created`` into the DISTINCT and sort the join.
     scan_ids = (
         Scan.objects.filter(
+            status__in=APPLY_STATUSES,
             jobs__stage=JobStage.ANALYZE,
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
             jobs__apply_run__isnull=True,
         )
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
