@@ -58,11 +58,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from blackletter.bl_warm import rows_are_bl_warm
 from blackletter.models import Label
 from blackletter.scanner import HEAD_MATTER_LABELS, label_confidence
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import BooleanField, Count, Q
+from django.db.models.expressions import RawSQL
 from django.utils import timezone
 
 from scanning import (
@@ -609,19 +609,37 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
     key icons of the pairing's rule (``blackletter.scanner.key_icons``)
     and the editor's note cards (``card_review.cards``).
 
+    The rule is blackletter's own (``bl_warm.rows_are_bl_warm``): every
+    row with provenance in ``found_by`` came from bl-warm, and a set
+    with none, or a mixed one, keeps the legacy gates. It is asked of
+    the database as two EXISTS over the live model rows, one for a
+    bl-warm entry and one for an entry of any other model, so no row
+    comes back. It used to stream every row's ``found_by`` into Python
+    and hand blackletter the list, tens of thousands of JSON values
+    per click on a big volume: on 10-31 three of those held the web
+    pod's threads for minutes each while the database sat idle.
+
     :param scan: The scan.
-    :returns: ``rows_are_bl_warm`` over the live model rows' ``found_by``.
+    :returns: Whether a bl-warm row exists and no row names another
+        model.
     """
-    return rows_are_bl_warm(
-        [
-            {"found_by": found_by}
-            for found_by in Detection.objects.live()
-            .filter(scan=scan)
-            .exclude(model_name=Detection.ModelName.MANUAL)
-            .exclude(found_by=[])
-            .values_list("found_by", flat=True)
-        ]
+    rows = (
+        Detection.objects.live()
+        .filter(scan=scan)
+        .exclude(model_name=Detection.ModelName.MANUAL)
+        .exclude(found_by=[])
     )
+    if not rows.filter(found_by__contains=[{"model": "bl_warm"}]).exists():
+        return False
+    other = rows.annotate(
+        other_model=RawSQL(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements(found_by) AS e "
+            "WHERE coalesce(e->>'model', '') <> %s)",
+            ("bl_warm",),
+            output_field=BooleanField(),
+        )
+    ).filter(other_model=True)
+    return not other.exists()
 
 
 def _caption_drawn_after(
