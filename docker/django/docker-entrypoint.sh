@@ -37,6 +37,11 @@ case "$1" in
 'web-prod')
     mkdir -p /opt/scanning/scanning/assets/media/processed
     chown -R www-data:www-data /opt/scanning/scanning/assets/media
+    # The database cache's table (CACHES in settings/django.py): the
+    # header's repair count lives in it since #567. Idempotent, and a
+    # second of the start; without it every page read the cache and
+    # failed, on 10-31, until the table was made by hand.
+    python manage.py createcachetable
     exec gunicorn scanning.asgi:application \
         --chdir /opt/scanning/ \
         --user www-data \

@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import re
 
+import logging
+
 from django.conf import settings
 from django.core.cache import cache
 from django.db.models import (
@@ -49,6 +51,8 @@ from django.db.models.lookups import Exact
 from django.utils import formats, timezone
 
 from scanning.models import PageEdit, PageRepairRequest, Scan
+
+logger = logging.getLogger(__name__)
 
 #: The most characters a note keeps. A note is what the reviewer saw,
 #: in one or two sentences, not a report.
@@ -659,6 +663,24 @@ def waiting_count() -> int:
     """
     if getattr(settings, "TESTING", False):
         return queue("waiting").count()
+    try:
+        return _cached_waiting_count()
+    except Exception:
+        # The cache is a convenience and the badge is a number in the
+        # header: a cache that fails (the database cache's table not
+        # created, a broker gone) must never cost the page. Logged
+        # once per fault, and the count runs as it did before.
+        logger.warning("repairs: the waiting count's cache failed", exc_info=True)
+        return queue("waiting").count()
+
+
+def _cached_waiting_count() -> int:
+    """The cached count behind :func:`waiting_count`.
+
+    :returns: The count.
+    :rtype: int
+    :raises Exception: Whatever the cache backend raises.
+    """
     key = _waiting_count_key()
     count = cache.get(key)
     if count is not None:
