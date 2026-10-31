@@ -970,35 +970,37 @@ document.addEventListener('DOMContentLoaded', function () {
         });
         return true;
     }
+    // One restore after another, never all at once: every restore
+    // rebuilds the findings, and two in flight could leave the cards
+    // at the slower one's older snapshot. The page refreshes once, at
+    // the end, and the line shown is the server's own (#322).
     function restoreDismissed(ids, removed, pageDiv, pageIndex) {
         var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
-        var left = ids.length;
         var failed = 0;
-        // The line shown is the server's own (#322): the last
-        // restore's answer stands for the lot.
         var last = null;
+        var chain = Promise.resolve();
         ids.forEach(function (id) {
-            fetch('/scans/' + documentId + '/restore-detection/', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
-                body: JSON.stringify({ detection_id: id }),
-            })
-            .then(function (r) { return r.json(); })
-            .then(function (data) {
-                if (!data || data.status !== 'ok') { failed += 1; return; }
-                last = data;
-                var det = removed.filter(function (d) { return d.id === id; })[0];
-                if (det && allDetections && allDetections.indexOf(det) === -1) allDetections.push(det);
-            })
-            .catch(function () { failed += 1; })
-            .then(function () {
-                left -= 1;
-                if (left > 0) return;
-                if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
-                if (window.refreshFindings) window.refreshFindings();
-                if (failed) showToast(failed + ' of the boxes could not be put back.');
-                else showSaved(last);
+            chain = chain.then(function () {
+                return fetch('/scans/' + documentId + '/restore-detection/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                    body: JSON.stringify({ detection_id: id }),
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data || data.status !== 'ok') { failed += 1; return; }
+                    last = data;
+                    var det = removed.filter(function (d) { return d.id === id; })[0];
+                    if (det && allDetections && allDetections.indexOf(det) === -1) allDetections.push(det);
+                })
+                .catch(function () { failed += 1; });
             });
+        });
+        chain.then(function () {
+            if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+            if (window.refreshFindings) window.refreshFindings();
+            if (failed) showToast(failed + ' of the boxes could not be put back.');
+            else showSaved(last);
         });
     }
 

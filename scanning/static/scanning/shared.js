@@ -540,8 +540,9 @@ function showToast(message, type, action) {
     toast.appendChild(text);
 
     // An optional button on the line (``{label, onClick}``): the Undo of
-    // a write that took several things at once. The toast stays longer
-    // with one, so the button can be reached.
+    // a write that took several things at once. A line with one stays
+    // until it is closed or used, because the Undo is the one way back
+    // from a drag that took more than it should have.
     if (action && action.label && typeof action.onClick === 'function') {
         var actionBtn = document.createElement('button');
         actionBtn.textContent = action.label;
@@ -549,7 +550,7 @@ function showToast(message, type, action) {
         actionBtn.addEventListener('click', function () { dismiss(); action.onClick(); });
         toast.appendChild(actionBtn);
     }
-    var lifetime = action ? 15000 : 5000;
+    var lifetime = action ? null : 5000;
 
     var closeBtn = document.createElement('button');
     closeBtn.textContent = '✕';
@@ -569,15 +570,15 @@ function showToast(message, type, action) {
         removal = setTimeout(function () { toast.remove(); }, 400);
     }
 
-    var timer = setTimeout(dismiss, lifetime);
+    var timer = lifetime ? setTimeout(dismiss, lifetime) : null;
     toast._restart = function () {
         clearTimeout(timer);
         clearTimeout(removal);
         toast.style.opacity = '1';
-        timer = setTimeout(dismiss, lifetime);
+        timer = lifetime ? setTimeout(dismiss, lifetime) : null;
     };
     closeBtn.addEventListener('mouseenter', function () { clearTimeout(timer); });
-    closeBtn.addEventListener('mouseleave', function () { timer = setTimeout(dismiss, 2000); });
+    closeBtn.addEventListener('mouseleave', function () { if (lifetime) timer = setTimeout(dismiss, 2000); });
 }
 
 // The key the saved line waits under while the page reloads (#322).
