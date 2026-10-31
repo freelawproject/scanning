@@ -974,6 +974,9 @@ document.addEventListener('DOMContentLoaded', function () {
         var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
         var left = ids.length;
         var failed = 0;
+        // The line shown is the server's own (#322): the last
+        // restore's answer stands for the lot.
+        var last = null;
         ids.forEach(function (id) {
             fetch('/scans/' + documentId + '/restore-detection/', {
                 method: 'POST',
@@ -983,6 +986,7 @@ document.addEventListener('DOMContentLoaded', function () {
             .then(function (r) { return r.json(); })
             .then(function (data) {
                 if (!data || data.status !== 'ok') { failed += 1; return; }
+                last = data;
                 var det = removed.filter(function (d) { return d.id === id; })[0];
                 if (det && allDetections && allDetections.indexOf(det) === -1) allDetections.push(det);
             })
@@ -993,7 +997,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
                 if (window.refreshFindings) window.refreshFindings();
                 if (failed) showToast(failed + ' of the boxes could not be put back.');
-                else showToast('The boxes are back. Nothing was deleted.', 'success');
+                else showSaved(last);
             });
         });
     }

@@ -514,15 +514,20 @@ function showToast(message, type, action) {
         document.body.appendChild(container);
     }
     var key = type + '\n' + message;
-    for (var i = 0; i < container.children.length; i++) {
-        var standing = container.children[i];
-        if (standing.dataset.toastKey === key && standing._restart) {
-            standing._restart();
-            return;
+    // A line with an action is never folded into a standing one: two
+    // drags that dismissed the same number of boxes read alike, and
+    // each Undo must carry the ids of its own write.
+    if (!action) {
+        for (var i = 0; i < container.children.length; i++) {
+            var standing = container.children[i];
+            if (standing.dataset.toastKey === key && standing._restart) {
+                standing._restart();
+                return;
+            }
         }
     }
     var toast = document.createElement('div');
-    toast.dataset.toastKey = key;
+    toast.dataset.toastKey = action ? '' : key;
     var bg = '#2563eb';
     if (type === 'error') { bg = '#dc2626'; }
     else if (type === 'success') { bg = '#059669'; }

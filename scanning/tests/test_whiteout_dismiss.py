@@ -10,6 +10,7 @@ what the clicks said, so the write makes the same decisions: one
 import json
 
 from django.urls import reverse
+from django.utils import timezone
 
 from scanning import detections, views_api
 from scanning.models import Detection, DetectionDecision, Redaction
@@ -151,6 +152,38 @@ class TestWhiteoutDismissesUnder(ScanningTestCase):
         self.assertEqual(response.json()["dismissed"], [])
         self.key.refresh_from_db()
         self.assertTrue(self.key.active)
+
+    def test_a_box_a_curator_approved_stays(self):
+        """A legacy approval is a standing decision on a live model row;
+        the drag must not withdraw it for a dismissal."""
+        detections.decide(
+            self.scan, self.key, DetectionDecision.Kind.APPROVE, self.user
+        )
+        response = self._post("add_redaction", {"page_index": 0, **self._cover()})
+        self.assertEqual(response.json()["dismissed"], [])
+        self.key.refresh_from_db()
+        self.assertTrue(self.key.active)
+        self.assertEqual(
+            DetectionDecision.objects.get().kind, DetectionDecision.Kind.APPROVE
+        )
+
+    def test_a_withdrawn_whiteout_judges_nothing(self):
+        row = make_redaction(
+            self.scan,
+            origin=Redaction.Origin.HUMAN,
+            kind=Redaction.Kind.ADD,
+            rect_type=Redaction.MANUAL_TYPE,
+            fill=Redaction.Fill.WHITE,
+            x0=20.0,
+            y0=20.0,
+            x1=140.0,
+            y1=90.0,
+            author=self.user,
+        )
+        self.assertEqual([r.pk for r in detections.under_whiteout(self.scan, row)], [self.key.pk])
+        Redaction.objects.filter(pk=row.pk).update(withdrawn_at=timezone.now())
+        row.refresh_from_db()
+        self.assertEqual(detections.under_whiteout(self.scan, row), [])
 
     def test_a_box_of_the_running_head_stays(self):
         for label in sorted(detections.HEAD_LINE_LABELS):

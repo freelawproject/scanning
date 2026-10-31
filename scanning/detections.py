@@ -426,9 +426,10 @@ def under_whiteout(scan: Scan, redaction) -> list[Detection]:
     The rule of the drag that dismisses what it covers: a curator who
     pulls a whiteout over a key icon or a caption on a bleed-through
     page is saying those boxes are junk, and used to say it again with
-    a click on each. Only a white box asks the question (a black one
-    redacts and judges nothing), only a model row answers it (a box a
-    person drew or approved is theirs to lift), only a row of the
+    a click on each. Only a white box that stands asks the question (a
+    black one redacts and judges nothing, a withdrawn one paints
+    nothing), only a model row with no decision on it answers it (a box
+    a person drew or approved is theirs to lift), only a row of the
     whiteout's own page and space, covered by :data:`COVERED_SHARE` of
     its area, and never a box of the running head's line
     (:data:`HEAD_LINE_LABELS`).
@@ -445,8 +446,17 @@ def under_whiteout(scan: Scan, redaction) -> list[Detection]:
     from scanning import boundaries
     from scanning.models import Redaction
 
-    if redaction.fill != Redaction.Fill.WHITE or redaction.bbox is None:
+    if (
+        redaction.fill != Redaction.Fill.WHITE
+        or redaction.bbox is None
+        or redaction.withdrawn_at is not None
+    ):
+        # A withdrawn box paints nothing, so it judges nothing: a stale
+        # tab's drag of one must not take the boxes under it.
         return []
+    # A live model row with a decision landed on it is an approval (a
+    # dismissal would have taken it out of ``live``), and a curator's
+    # approval is theirs to lift: the drag leaves it alone.
     rows = (
         Detection.objects.live()
         .model_rows()
@@ -454,6 +464,7 @@ def under_whiteout(scan: Scan, redaction) -> list[Detection]:
             scan=scan,
             page_index=redaction.page_index,
             apply_run=redaction.apply_run,
+            decision__isnull=True,
         )
         .exclude(label__in=HEAD_LINE_LABELS)
         .order_by("y0", "x0")
@@ -497,6 +508,18 @@ def dismiss_under_whiteout(scan: Scan, redaction, user) -> list[Detection]:
             logger.warning(
                 "scan %s: detection %s under the whiteout has no address; "
                 "it stays",
+                scan.pk,
+                row.pk,
+            )
+            continue
+        except Detection.DoesNotExist:
+            # An import replaced the model rows between the read and
+            # the lock: the row is gone, and the import's own rows are
+            # judged by the next drag. Never a failure of the write
+            # that found it.
+            logger.info(
+                "scan %s: detection %s under the whiteout was replaced "
+                "by an import before it could be dismissed",
                 scan.pk,
                 row.pk,
             )
