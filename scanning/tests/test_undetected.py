@@ -651,6 +651,27 @@ class TestTheCard(ScanningTestCase):
         self.assertIn('data-grow-bbox="1000.0,40.0,1600.0,600.0"', html)
         self.assertNotIn("+ footnote", html)
 
+    def test_the_grow_is_written_in_the_footnote_rows_own_render(self):
+        """A footnote row of another render size (half the page's) is
+        measured in the card's pixels and answered in its own, the
+        space a resize of it is stored in."""
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=500.0,
+            y0=20.0,
+            x1=800.0,
+            y1=60.0,
+            img_width=850,
+            img_height=1100,
+        )
+        findings.rebuild(self.scan, run=None)
+        grow = self.cards().get().metadata["grow"]
+        self.assertEqual(grow["id"], foot.pk)
+        self.assertEqual(grow["box"], [500.0, 20.0, 800.0, 60.0])
+        self.assertEqual(grow["grown"], [500.0, 20.0, 800.0, 300.0])
+
     def test_a_card_with_no_footnote_box_near_offers_the_add(self):
         from django.urls import reverse
 

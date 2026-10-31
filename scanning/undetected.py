@@ -470,6 +470,11 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
                     r.x1 * width / r.img_width,
                     r.y1 * height / r.img_height,
                 ],
+                # The row's own render, the space a resize of it is
+                # written in (``update_detection`` keeps the row's
+                # size), so the card's answer goes back through it.
+                "own_box": [r.x0, r.y0, r.x1, r.y1],
+                "own_scale": (r.img_width / width, r.img_height / height),
             }
             for r in rows
             if r.img_width and r.img_height
@@ -583,8 +588,45 @@ def _finding(
             # The page's footnote box beside the block, when there is
             # one: the card's footnote answer grows it over the block
             # instead of adding a second box (``neighbour_box``).
-            "grow": neighbour_box(bbox, others or [], Label.FOOTNOTES.name),
+            "grow": _grow_in_own_space(
+                neighbour_box(bbox, others or [], Label.FOOTNOTES.name),
+                others or [],
+            ),
         },
+    }
+
+
+def _grow_in_own_space(grow: dict | None, others: list[dict]) -> dict | None:
+    """Return a grow answer in the grown row's own render.
+
+    :func:`neighbour_box` measures in the card's render, where every
+    box of the page was scaled to compare; a resize is written in the
+    row's own (``update_detection`` keeps ``img_width`` and
+    ``img_height``), and a row of another render size would land off
+    the block if the card's pixels were written on it.
+
+    :param grow: What :func:`neighbour_box` answered, or None.
+    :param others: The page's boxes, with ``own_box`` and ``own_scale``.
+    :returns: The answer with ``box`` and ``grown`` in the row's own
+        pixels, or None.
+    :rtype: dict | None
+    """
+    if grow is None:
+        return None
+    other = next((o for o in others if o["id"] == grow["id"]), None)
+    if other is None or "own_scale" not in other:
+        return grow
+    sx, sy = other["own_scale"]
+    x0, y0, x1, y1 = grow["grown"]
+    return {
+        "id": grow["id"],
+        "box": list(other["own_box"]),
+        "grown": [
+            round(x0 * sx, 1),
+            round(y0 * sy, 1),
+            round(x1 * sx, 1),
+            round(y1 * sy, 1),
+        ],
     }
 
 
