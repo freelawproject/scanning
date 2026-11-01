@@ -437,12 +437,7 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
             ]
             for d in images.get(reading.page_index, [])
         ]
-        page_area = reading.img_width * reading.img_height
-        for cluster in clusters(reading.marks or []):
-            if _area(cluster["box"]) < MIN_SHARE * page_area:
-                continue
-            if _lone_narrow_table(cluster, reading.img_width):
-                continue
+        for cluster in counted(reading):
             box = _scaled(cluster["box"], sx, sy)
             area = _area(box)
             if any(
@@ -461,6 +456,29 @@ def _lone_narrow_table(cluster: dict, width: int) -> bool:
         and cluster["kinds"] == [TABLE]
         and (box[2] - box[0]) < LONE_TABLE_WIDTH * width
     )
+
+
+def counted(reading: PictureReading) -> list[dict]:
+    """Return the readers' boxes of a page that count, in its render.
+
+    **The one filter** both readers of the rows apply (:func:`uncovered`
+    for the card, :func:`fit_for` for the refinement): the clusters of
+    the page's marks less a box under :data:`MIN_SHARE` of the page (a
+    key icon) and a table one reader alone marked inside a column
+    (:func:`_lone_narrow_table`), so a block the card calls noise is
+    never the box a model row is pulled to either.
+
+    :param reading: The page's row.
+    :returns: The clusters that count.
+    :rtype: list[dict]
+    """
+    page_area = reading.img_width * reading.img_height
+    return [
+        cluster
+        for cluster in clusters(reading.marks or [])
+        if _area(cluster["box"]) >= MIN_SHARE * page_area
+        and not _lone_narrow_table(cluster, reading.img_width)
+    ]
 
 
 def _finding(
@@ -552,13 +570,10 @@ def fit_for(
         sx = row.img_width / reading.img_width
         sy = row.img_height / reading.img_height
         own = [row.x0, row.y0, row.x1, row.y1]
-        page_area = row.img_width * row.img_height
         inside: list[tuple[Box, dict]] = []
         best = None
-        for cluster in clusters(reading.marks or []):
+        for cluster in counted(reading):
             box = _scaled(cluster["box"], sx, sy)
-            if _area(box) < MIN_SHARE * page_area:
-                continue
             if _inter(own, box) / _area(box) >= COVERED_SHARE:
                 inside.append((box, cluster))
             score = _iou(own, box)

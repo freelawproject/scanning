@@ -459,6 +459,17 @@ class TestFitFor(ScanningTestCase):
         fit = pictures.fit_for(self.scan, None, [row])[row.pk]
         self.assertEqual(fit["box"], PICTURE)
 
+    def test_a_lone_narrow_table_is_no_fit_either(self):
+        """The fit reads the marks the card reads: a heading one reader
+        called a table never becomes the box a model row is pulled to."""
+        heading = [300.0, 500.0, 800.0, 700.0]
+        reading(self.scan, [mark("mistral_ocr", heading, kind="table")])
+        row = image_row(self.scan, [250.0, 450.0, 900.0, 800.0])
+        self.assertEqual(
+            pictures.fit_for(self.scan, None, [row])[row.pk],
+            {"box": None, "readers": [], "kinds": [], "iou": 0.0},
+        )
+
     def test_a_box_the_readers_agree_with_gets_nothing(self):
         reading(self.scan, [mark("dots_mocr"), mark("surya")])
         row = image_row(self.scan, [305.0, 505.0, 1395.0, 1295.0])
