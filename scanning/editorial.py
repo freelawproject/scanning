@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 
 from blackletter.models import Label
@@ -265,7 +265,11 @@ def _in_detection(row: Detection, cx: float, cy: float) -> bool:
     )
 
 
-def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+def uncovered(
+    scan: Scan,
+    run: ApplyRun | None,
+    pages: Collection[int] | None = None,
+) -> Iterator[dict]:
     """Yield one finding per editor's note nothing redacts.
 
     Rows only: the readings of the measured run, the visible black
@@ -286,13 +290,13 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
     :yields: The finding dicts ``findings.rebuild`` writes.
     """
-    readings = [
-        r
-        for r in EditorialReading.objects.filter(scan=scan, apply_run=run)
-        if r.img_width and r.img_height
-    ]
+    rows = EditorialReading.objects.filter(scan=scan, apply_run=run)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    readings = [r for r in rows if r.img_width and r.img_height]
     if not readings:
         return
     pages = {r.page_index for r in readings}

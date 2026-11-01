@@ -56,6 +56,7 @@ Four rules run through the module:
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from typing import Any
 
 from blackletter.models import Label
@@ -149,23 +150,54 @@ class UnaddressableFinding(ValueError):
 # ---------------------------------------------------------------------------
 
 
-def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
+#: The checks of the passes that judge a page by its own rows alone:
+#: its readings, its live boxes and its redactions, nothing of another
+#: page. A write on one page rebuilds these for that page and no other
+#: (:func:`rebuild` with ``pages``), because the two text passes walk
+#: every cell of every page against every box in Python, which cost a
+#: click on a 900-page volume fourteen seconds on the web pod. The
+#: other checks read the boundaries, which cross pages, and are cheap,
+#: so every rebuild writes them whole.
+PAGE_CHECKS = frozenset(
+    {
+        CheckName.UNCOVERED_EDITORS_NOTE,
+        CheckName.UNDETECTED_TEXT,
+        CheckName.REDACTION_CUTS_TEXT,
+        CheckName.UNBOXED_PICTURE,
+    }
+)
+
+
+def rebuild(
+    scan: Scan,
+    run: ApplyRun | None | object = _RESOLVE,
+    pages: Collection[int] | None = None,
+) -> int:
     """Write the scan's review-2 findings again, from the rows.
 
     Deletes the scan's ``REVIEW2_CHECKS`` rows and writes the current
     findings, in one transaction. Called by the compute after its last
     row write (which passes the run it measured in, since its own stamp
     is not written yet), and by every review-2 endpoint after its
-    write (which passes nothing).
+    write (which passes nothing for the run).
+
+    With ``pages``, the passes of :data:`PAGE_CHECKS` run over those
+    pages alone and only their cards of those pages are replaced; the
+    cards of the other checks are written whole as ever. A write that
+    names a page (a box, a redaction, a decision) passes its page; a
+    boundary write, the compute and the commands pass nothing.
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None
         for the original's space; ``detections.measured_run`` when
         omitted.
+    :param pages: The page indexes (0-based, in the rows' space) a
+        write touched, or None for the whole volume.
     :returns: How many findings stand open (not dismissed).
     """
     if run is _RESOLVE:
         run = detections.measured_run(scan)
+    scoped = None if pages is None else set(pages)
     found = list(_stale_findings(scan, run))
     if OpinionBoundary.objects.computed().filter(scan=scan).exists():
         rows = boundaries.standing(scan)
@@ -175,10 +207,10 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(_uncovered_headnote_findings(scan, read))
         found.extend(_low_confidence_bracket_findings(scan))
         found.extend(brackets.missing(scan, rows, run))
-        found.extend(editorial.uncovered(scan, run))
-        found.extend(undetected.uncovered(scan, run))
-        found.extend(undetected.cut_lines(scan, run))
-        found.extend(pictures.uncovered(scan, run))
+        found.extend(editorial.uncovered(scan, run, scoped))
+        found.extend(undetected.uncovered(scan, run, scoped))
+        found.extend(undetected.cut_lines(scan, run, scoped))
+        found.extend(pictures.uncovered(scan, run, scoped))
     resolve(scan, found)
     with transaction.atomic():
         # One row lock on the scan serializes the rebuilds. Under READ
@@ -191,7 +223,15 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
             .filter(pk=scan.pk)
             .values_list("pk", flat=True)
         )
-        Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS).delete()
+        stale = Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS)
+        if scoped is not None:
+            # The page cards of the other pages stand: their rows did
+            # not move, and their passes did not run.
+            stale = stale.filter(
+                Q(check_name__in=REVIEW2_CHECKS - PAGE_CHECKS)
+                | Q(page_number__in=[index + 1 for index in scoped])
+            )
+        stale.delete()
         Issue.objects.bulk_create(
             [
                 Issue(
@@ -207,11 +247,18 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
                 for f in found
             ]
         )
-    open_count = sum(1 for f in found if not f.get("dismissal_id"))
+    if scoped is None:
+        open_count = sum(1 for f in found if not f.get("dismissal_id"))
+    else:
+        # The count is the volume's, the pages left alone included.
+        open_count = Issue.objects.filter(
+            scan=scan, check_name__in=REVIEW2_CHECKS, dismissal__isnull=True
+        ).count()
     logger.info(
-        "scan %s: %d review-2 finding(s) written, %d open, %d stale",
+        "scan %s: %d review-2 finding(s) written%s, %d open, %d stale",
         scan.pk,
         len(found),
+        "" if scoped is None else f" ({len(scoped)} page(s) rebuilt)",
         open_count,
         sum(1 for f in found if f["check_name"] in STALE_REVIEW2_CHECKS),
     )

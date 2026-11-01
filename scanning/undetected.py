@@ -56,7 +56,7 @@ add: the gutter passes read a page's column boxes as its two columns.
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 
 from blackletter.models import Label
 from django.db import transaction
@@ -390,24 +390,26 @@ def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
     return best[1] if best else None
 
 
-def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+def uncovered(
+    scan: Scan,
+    run: ApplyRun | None,
+    pages: Collection[int] | None = None,
+) -> Iterator[dict]:
     """Yield one finding per block of text no detection covers.
 
     Rows only: the readings of the measured run and the live detections
     of their pages. No S3 read and no render, so ``findings.rebuild``
     may call it in a request. The measure is the glue's
     (``opinion_ocr.page_frame``, ``opinion_ocr.undetected``), so a
-    card here is a drop there.
+    card here is a drop there. A page is judged by its own rows alone,
+    so a write on one page rebuilds that page (``pages``).
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
     :yields: The finding dicts ``findings.rebuild`` writes.
     """
-    readings = list(
-        TextReading.objects.filter(scan=scan, apply_run=run).order_by(
-            "page_index"
-        )
-    )
+    readings = list(_readings(scan, run, pages))
     if not readings:
         return
     # The run's space alone, every live row of it whatever its render
@@ -415,12 +417,10 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
     # human row ``relocate_rows`` could not place keeps its old index
     # and its old run, and is a stale card, never cover on the page
     # its old index names.
-    by_page: dict[int, list[Detection]] = {}
-    for row in Detection.objects.live().filter(scan=scan, apply_run=run):
-        by_page.setdefault(row.page_index, []).append(row)
+    by_page = _live_by_page(scan, run, pages)
     rects_by_page = {
         entry["page_index"]: entry["rects"]
-        for entry in redactions.visible_by_page(scan)
+        for entry in redactions.visible_by_page(scan, pages)
     }
     for reading in readings:
         rows = by_page.get(reading.page_index, [])
@@ -741,7 +741,39 @@ def cut_cells(
     return out
 
 
-def cut_lines(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+def _readings(scan: Scan, run: ApplyRun | None, pages: Collection[int] | None):
+    """Return the text readings of the run, of some pages or of every page."""
+    rows = TextReading.objects.filter(scan=scan, apply_run=run)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    return rows.order_by("page_index")
+
+
+def _live_by_page(
+    scan: Scan, run: ApplyRun | None, pages: Collection[int] | None
+) -> dict[int, list[Detection]]:
+    """Return the live rows of the run by page, of some pages or of every page.
+
+    The run's space alone, every live row of it whatever its render
+    size, the glue's own selection (``opinion_ocr.load_inputs``): a
+    human row ``relocate_rows`` could not place keeps its old index
+    and its old run, and is a stale card, never cover on the page its
+    old index names.
+    """
+    rows = Detection.objects.live().filter(scan=scan, apply_run=run)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    by_page: dict[int, list[Detection]] = {}
+    for row in rows:
+        by_page.setdefault(row.page_index, []).append(row)
+    return by_page
+
+
+def cut_lines(
+    scan: Scan,
+    run: ApplyRun | None,
+    pages: Collection[int] | None = None,
+) -> Iterator[dict]:
     """Yield one finding per line of text a redaction covers in part.
 
     The step-2 twin of review 3's ``PARTIAL_REDACTION`` card: a cell the
@@ -754,22 +786,17 @@ def cut_lines(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
     :yields: The finding dicts ``findings.rebuild`` writes.
     """
-    readings = list(
-        TextReading.objects.filter(scan=scan, apply_run=run).order_by(
-            "page_index"
-        )
-    )
+    readings = list(_readings(scan, run, pages))
     if not readings:
         return
     rects_by_page = {
         entry["page_index"]: entry["rects"]
-        for entry in redactions.visible_by_page(scan)
+        for entry in redactions.visible_by_page(scan, pages)
     }
-    by_page: dict[int, list[Detection]] = {}
-    for row in Detection.objects.live().filter(scan=scan, apply_run=run):
-        by_page.setdefault(row.page_index, []).append(row)
+    by_page = _live_by_page(scan, run, pages)
     for reading in readings:
         rects = rects_by_page.get(reading.page_index)
         if not rects or not reading.img_width or not reading.img_height:
