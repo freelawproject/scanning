@@ -410,7 +410,7 @@ class TestUncovered(ScanningTestCase):
         )
         html = fragment.json()["html"]
         self.assertIn("+ image", html)
-        self.assertIn('data-label-id="%d"' % int(Label.IMAGE), html)
+        self.assertIn(f'data-label-id="{int(Label.IMAGE)}"', html)
         self.assertIn('data-guess="300.0,500.0,1400.0,1300.0"', html)
 
 
