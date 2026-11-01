@@ -42,7 +42,14 @@ from __future__ import annotations
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 
-from scanning import boundaries, findings, opinion_ocr, redactions
+from scanning import (
+    boundaries,
+    detections,
+    findings,
+    opinion_ocr,
+    pictures,
+    redactions,
+)
 from scanning.models import CheckName, Detection, Issue, Redaction, Scan
 from scanning.undetected import (  # noqa: F401 - the one rule
     GROW_GAP_PX,
@@ -68,6 +75,7 @@ CAPTION = "caption"
 BRACKET = "bracket"
 FAINT = "faint"
 TEXT = "text"
+PICTURE = "picture"
 IMAGE = "image"
 EDITORIAL = "editorial"
 LINK = "link"
@@ -88,6 +96,7 @@ CHECKS = {
     CheckName.MISSING_HEADNOTE_BRACKET: BRACKET,
     CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET: FAINT,
     CheckName.UNDETECTED_TEXT: TEXT,
+    CheckName.UNBOXED_PICTURE: PICTURE,
 }
 
 #: The crop around a box, in render pixels: a fifth of an inch at
@@ -404,6 +413,44 @@ def text_card(issue: Issue) -> dict | None:
     return card
 
 
+def picture_card(issue: Issue) -> dict | None:
+    """Return the card of an ``unboxed_picture`` finding.
+
+    A picture or a table the readers marked that no image box covers
+    (``pictures.uncovered``): the box is the readers' own, the label an
+    ``IMAGE``, and the card sits in the Images section beside the
+    model's boxes, since the question is the same. Add image box writes
+    the box as drawn, or as the curator reshaped it; Not an image
+    dismisses the card.
+
+    :param issue: The finding.
+    :returns: The card, or None when the finding names no page.
+    :rtype: dict | None
+    """
+    metadata = issue.metadata or {}
+    page = _page_of(metadata)
+    box = _box(metadata.get("bbox"))
+    if page is None or box is None:
+        return None
+    page_index, width, height = page
+    card = _card(
+        kind=PICTURE,
+        group=IMAGE,
+        key=_finding_key(issue, page_index, box),
+        page_index=page_index,
+        width=width,
+        height=height,
+        crop=_pad(box, IMAGE_PAD_PX, width, height),
+        box=box,
+        label=Label.IMAGE.name,
+        message=issue.message,
+        issue_id=issue.pk,
+    )
+    card["readers"] = list(metadata.get("readers") or [])
+    card["kinds"] = list(metadata.get("kinds") or [])
+    return card
+
+
 def _model_box_card(
     row: Detection, kind: str, label: Label, pad: float, message: str
 ) -> dict | None:
@@ -552,6 +599,55 @@ MODEL_BOXES = {
 }
 
 
+def attach_fits(built: list[dict], rows: list[Detection], scan: Scan) -> None:
+    """Put the readers' box on every image card they draw differently.
+
+    ``fit`` is what Refine image box writes (``pictures.fit_for``, in
+    the row's own render): the readers' box when it differs from the
+    model's, an entry with no box when no reader marked a picture or a
+    table under the model's, and nothing when they agree or the page
+    was not read. The card's message says which, and its crop grows to
+    hold the readers' box, so the hover shows it whole.
+
+    :param built: The cards.
+    :param rows: The live model rows the image cards were built from.
+    :param scan: The scan.
+    """
+    cards = {c["detection_id"]: c for c in built if c["kind"] == IMAGE}
+    if not cards:
+        return
+    fits = pictures.fit_for(
+        scan,
+        detections.measured_run(scan),
+        [row for row in rows if row.pk in cards],
+    )
+    for pk, card in cards.items():
+        fit = fits.get(pk)
+        card["fit"] = fit
+        if fit is None:
+            continue
+        if not fit["box"]:
+            card["message"] += (
+                " No reader marked a picture or a table under this box."
+            )
+            continue
+        names = pictures.reader_names(fit["readers"])
+        what = " or ".join(fit["kinds"]) or "picture"
+        verb = "draws" if len(fit["readers"]) == 1 else "draw"
+        card["message"] += (
+            f" {names} {verb} the {what} differently: Refine image box "
+            "pulls this box to theirs."
+        )
+        padded = _pad(fit["box"], IMAGE_PAD_PX, card["img_width"], card["img_height"])
+        crop = card["crop"]
+        card["crop"] = [
+            min(crop[0], padded[0]),
+            min(crop[1], padded[1]),
+            max(crop[2], padded[2]),
+            max(crop[3], padded[3]),
+        ]
+
+
 def _column_of(box: Box, columns: list[Box]) -> Box | None:
     """Return the column box ``box`` sits in: the widest overlap, else
     the nearest by centre, else None."""
@@ -661,6 +757,7 @@ def cards(scan: Scan) -> list[dict]:
         BRACKET: bracket_card,
         FAINT: faint_bracket_card,
         TEXT: text_card,
+        PICTURE: picture_card,
     }
     issues = Issue.objects.filter(
         scan=scan, check_name__in=list(CHECKS), dismissal__isnull=True
@@ -706,6 +803,7 @@ def cards(scan: Scan) -> list[dict]:
             card = MODEL_BOXES[row.label](row)
         if card is not None:
             built.append(card)
+    attach_fits(built, rows, scan)
     widen_to_columns(built, scan)
     attach_others(built, scan)
     # A text card grows the box of the kind beside its block instead

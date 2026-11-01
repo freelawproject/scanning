@@ -1122,6 +1122,10 @@ class CheckName(models.TextChoices):
         "redaction_cuts_text",
         "Redaction covers part of a line of text",
     )
+    UNBOXED_PICTURE = (
+        "unboxed_picture",
+        "Picture or table in no image box",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1196,6 +1200,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_EDITORS_NOTE,
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
+        CheckName.UNBOXED_PICTURE,
     }
 )
 
@@ -2636,6 +2641,98 @@ class TextReading(AbstractDateTimeModel):
 
     def __str__(self):
         return f"{len(self.cells or [])} cell(s) p.{self.page_index + 1}"
+
+
+class PictureReading(AbstractDateTimeModel):
+    """The pictures and tables of one page, as the readers saw them
+    (``pictures``).
+
+    Every OCR engine labels a picture and a table beside its text
+    (dots.mocr a ``Picture`` cell, Mistral an ``image`` block, Surya a
+    ``Picture`` or ``Figure``), and the three agree with each other to
+    within a few percent, where the model's ``IMAGE`` box misses a
+    picture or runs over the text around it. This row is their measure
+    of the page, stored so that ``findings.rebuild`` and the card review
+    can compare it with the ``Detection`` rows without an S3 read
+    (``pictures.uncovered``, ``pictures.fit_for``).
+
+    **One row per page, not per mark.** ``marks`` is the list: one
+    ``{"engine", "kind", "box"}`` per picture or table a reader marked,
+    the engine a key of ``opinion_ocr.ENGINES``, the kind ``picture``
+    or ``table``, the box in the pixels of the row's render
+    (``img_width`` by ``img_height``, the first reader's), whatever
+    render the reader drew it in.
+
+    A disposable row, the rule of ``TextReading``: every compute
+    replaces the scan's set (``pictures.write_rows``), and a curator
+    never writes one. The address is the source page, the rule of
+    ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="picture_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The page edit whose one-page shard this page is. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+    page_index = models.PositiveIntegerField(db_index=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    marks = models.JSONField(
+        default=list,
+        help_text=(
+            "The pictures and tables of the page: "
+            "``[{engine, kind, box}, ...]``, the box in the pixels of "
+            "the row's render."
+        ),
+    )
+
+    class Meta:
+        ordering = ["page_index"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_picread_scan_run_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{len(self.marks or [])} mark(s) p.{self.page_index + 1}"
 
 
 class OpinionReviewStatus(models.TextChoices):

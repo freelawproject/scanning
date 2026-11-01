@@ -85,6 +85,10 @@
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a caption box where the card guesses the caption is, the box the card flashes. Resize it on the page if it is off; the next compute starts the opinion on it. (The first key of the volume gets no +: its box is the key, not a caption.)"
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
     {% endif %}
+    {% if issue.check_name == 'unboxed_picture' and issue.metadata.guess %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add an image box where the readers saw the picture or the table, the box the card flashes. The opinion PDF pastes the original scan of it over the page, and the opinion text leaves it out. The card goes now."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+ image</button>
+    {% endif %}
     {% if issue.check_name == 'uncovered_editors_note' and issue.metadata.bbox %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add an editor's note box over the note the reader saw, the band the card flashes. The next compute blacks it out. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this)">+ editor's note</button>

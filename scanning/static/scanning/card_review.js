@@ -56,6 +56,7 @@
         faint: 'bracket box under the gate',
         text: 'text in no box',
         image: 'image box',
+        picture: 'picture or table the readers saw',
         editorial: "editor's note box"
     };
     /** What a card is, in words: a link card reads by its group, since
@@ -79,6 +80,11 @@
             // page's own column box over the block (click its label on
             // the crop) answers the card too.
             return { add: 'Add column', none: 'Not text', added: 'column added' };
+        }
+        if (card.kind === 'picture') {
+            // The readers' box, added as an image box; resized first
+            // if need be.
+            return { add: 'Add image box', none: 'Not an image', added: 'image box added' };
         }
         return { add: 'Add caption', none: 'No caption', added: 'caption added' };
     }
@@ -609,6 +615,22 @@
             reset.dataset.role = 'reset';
             reset.hidden = !moved(card);
             foot.appendChild(reset);
+            if (card.kind === 'image' && card.fit && card.fit.box) {
+                // The readers' box for a picture the model boxed
+                // loosely: one click moves the card's box to theirs,
+                // handles and all, so the curator adjusts it if need
+                // be and saves it with Save size (Reset puts the
+                // model's box back). Hovering the button draws their
+                // box on the crop first, so the eye checks it before
+                // the click.
+                var refine = button('Refine image box', 'n', 'btn-primary text-xs', function () {
+                    hideFit(node);
+                    refineBox(card, node);
+                });
+                refine.addEventListener('mouseenter', function () { showFit(card, node); });
+                refine.addEventListener('mouseleave', function () { hideFit(node); });
+                foot.appendChild(refine);
+            }
             foot.appendChild(button(verbs.out, 'x', 'btn-outline text-xs', function (btn) {
                 btn.disabled = true;
                 takeOut(card, node);
@@ -823,6 +845,33 @@
                 ? { url: cfg.urls.update_detection, body: { detection_id: target.id, new_bbox: target.box } }
                 : { url: cfg.urls.delete_detection, body: { detection_id: holder } };
         });
+    }
+
+    /** Draw the readers' box on the crop, dashed and tagged, while the
+     *  pointer is on Refine image box. */
+    function showFit(card, node) {
+        var layer = node.querySelector('.cr-layer');
+        if (!layer || layer.querySelector('.cr-fit')) { return; }
+        var ghost = el('div', 'cr-fit');
+        ghost.appendChild(el('span', 'cr-other-tag', "image (the readers' box)"));
+        layer.appendChild(ghost);
+        placeBox(card, ghost, card.fit.box);
+    }
+
+    function hideFit(node) {
+        node.querySelectorAll('.cr-fit').forEach(function (ghost) { ghost.remove(); });
+    }
+
+    /** Move the card's box to the readers' box (``card.fit``). Nothing
+     *  is written: the box is now a moved box, so the primary button
+     *  reads Save size and writes it through the resize endpoint, Reset
+     *  puts the model's box back, and the handles let the curator
+     *  adjust it first. */
+    function refineBox(card, node) {
+        card.box = card.fit.box.slice();
+        drafts[card.key] = card.box.slice();
+        placeBox(card, node.querySelector('.cr-box'));
+        markMoved(card, node);
     }
 
     function resize(card, node) {
