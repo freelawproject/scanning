@@ -2035,6 +2035,7 @@ def run_compute_redactions(
         columns,
         editorial,
         findings,
+        pictures,
         redactions,
         review_states,
         s3_sync,
@@ -2220,6 +2221,13 @@ def run_compute_redactions(
         # block no box covers (``undetected``).
         with _log_stage("Text readings"):
             undetected.write_rows(scan, ocr_document, run)
+        # The pictures and tables every reader saw, the same way, for
+        # the image cards (``pictures``): the other engines' documents
+        # are read here, the one S3 read the readings add.
+        with _log_stage("Picture readings"):
+            pictures.write_rows(
+                scan, pictures.engine_documents(scan, run, ocr_document), run
+            )
 
         if importing:
             # Only after an import: the correction converges, so it is

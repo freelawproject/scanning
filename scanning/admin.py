@@ -30,6 +30,7 @@ from scanning.models import (
     PageEdit,
     PageRepairRequest,
     PendingUpload,
+    PictureReading,
     QueuedAction,
     Redaction,
     Reporter,
@@ -393,6 +394,7 @@ class ScanAdmin(admin.ModelAdmin):
             (BracketReading, "scan_id"),
             (EditorialReading, "scan_id"),
             (TextReading, "scan_id"),
+            (PictureReading, "scan_id"),
             (Opinion, "scan_id"),
             (WithdrawnOpinion, "scan_id"),
             (OpinionText, "opinion__scan_id"),
@@ -979,6 +981,36 @@ class TextReadingAdmin(admin.ModelAdmin):
     @admin.display(description="cells")
     def cell_count(self, obj):
         return len(obj.cells or [])
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(PictureReading)
+class PictureReadingAdmin(admin.ModelAdmin):
+    """The pictures and tables of one page, as the readers saw them.
+
+    Read-only, the rule of ``TextReadingAdmin``: the compute writes
+    every row and replaces the set at each compute.
+    """
+
+    list_display = [
+        "scan",
+        "page_index",
+        "source_page",
+        "mark_count",
+        "apply_run",
+        "date_created",
+    ]
+    raw_id_fields = ["scan", "source_edit", "apply_run"]
+    readonly_fields = [f.name for f in PictureReading._meta.fields]
+
+    @admin.display(description="marks")
+    def mark_count(self, obj):
+        return len(obj.marks or [])
 
     def has_add_permission(self, request):
         return False

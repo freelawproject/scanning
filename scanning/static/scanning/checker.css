@@ -1854,6 +1854,9 @@ div.ensemble-group[data-kind="list_item"] {
 .cr-box.cr-faint { border-color: #b7791f; background: rgba(183, 121, 31, 0.12); color: #b7791f; }
 .cr-box.cr-editorial { border-color: #7c3aed; background: rgba(124, 58, 237, 0.10); color: #7c3aed; }
 .cr-box.cr-frozen { cursor: default; opacity: 0.6; }
+/* The readers' box: dashed, so it reads as a reading and not as a row. A picture card's own box is one; .cr-fit is the hover of Refine image box. */
+.cr-box.cr-picture { border-style: dashed; border-color: #d97706; background: rgba(217, 119, 6, 0.10); color: #d97706; }
+.cr-fit { position: absolute; box-sizing: border-box; border: 2px dashed #d97706; background: rgba(217, 119, 6, 0.10); pointer-events: none; }
 .cr-anchor { position: absolute; box-sizing: border-box; border: 2px dashed #6b7280; pointer-events: none; }
 /* The block a text card's footnote answer takes, inside a wider guess. */
 .cr-block { position: absolute; box-sizing: border-box; border: 2px dotted #2563eb; pointer-events: none; }

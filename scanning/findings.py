@@ -70,6 +70,7 @@ from scanning import (
     brackets,
     detections,
     editorial,
+    pictures,
     redactions,
     undetected,
 )
@@ -177,6 +178,7 @@ def rebuild(scan: Scan, run: ApplyRun | None | object = _RESOLVE) -> int:
         found.extend(editorial.uncovered(scan, run))
         found.extend(undetected.uncovered(scan, run))
         found.extend(undetected.cut_lines(scan, run))
+        found.extend(pictures.uncovered(scan, run))
     resolve(scan, found)
     with transaction.atomic():
         # One row lock on the scan serializes the rebuilds. Under READ
