@@ -144,6 +144,60 @@ class TestOpinionList(ScanningTestCase):
 
                 self.assertEqual(response.status_code, 200)
 
+    def test_one_scan_reads_in_page_order_and_the_corpus_newest_first(self):
+        """The order never crosses a table: a scan's opinions by page
+        and index, a reporter's scan by scan, the whole list by id."""
+        later_volume = ScanFactory(reporter=self.reporter, volume=238)
+        rows = [
+            OpinionFactory(scan=later_volume, first_printed_page=1),
+            OpinionFactory(
+                scan=self.scan, first_printed_page=412, index_in_page=1
+            ),
+            OpinionFactory(scan=self.scan, first_printed_page=9),
+        ]
+        by_scan = self.client.get(
+            reverse("opinion_list"), {"scan": self.scan.pk}
+        )
+        self.assertEqual(
+            [row.pk for row in by_scan.context["page_obj"]],
+            [rows[2].pk, self.opinion.pk, rows[1].pk],
+        )
+        by_reporter = self.client.get(
+            reverse("opinion_list"), {"reporter": self.reporter.pk}
+        )
+        self.assertEqual(
+            [row.pk for row in by_reporter.context["page_obj"]],
+            [rows[2].pk, self.opinion.pk, rows[1].pk, rows[0].pk],
+        )
+        whole = self.client.get(reverse("opinion_list"))
+        self.assertEqual(
+            [row.pk for row in whole.context["page_obj"]],
+            sorted((r.pk for r in rows + [self.opinion]), reverse=True),
+        )
+
+    def test_the_scan_filter_offers_the_scanned_volumes(self):
+        """Every scan with an opinion, in the list's order, and no scan
+        without one."""
+        empty = ScanFactory(reporter=self.reporter, volume=1)
+        response = self.client.get(reverse("opinion_list"))
+        choices = response.context["scan_choices"]
+        self.assertEqual(
+            choices,
+            [
+                (
+                    str(self.scan.pk),
+                    f"vol. 237 {self.reporter.cite_name}, scan {self.scan.pk}",
+                )
+            ],
+        )
+        self.assertNotIn(str(empty.pk), [value for value, _ in choices])
+        self.assertContains(response, 'name="scan"')
+        self.assertContains(response, "All volumes")
+        narrowed = self.client.get(
+            reverse("opinion_list"), {"scan": self.scan.pk}
+        )
+        self.assertContains(narrowed, f'value="{self.scan.pk}" selected')
+
     def test_the_ordering_is_total(self):
         """Two scans of one reporter and volume tie on the four keys
         above the pk, so a paginated walk could show one opinion twice
@@ -159,7 +213,10 @@ class TestOpinionList(ScanningTestCase):
         response = self.client.get(reverse("opinion_list"))
 
         rows = list(response.context["page_obj"])
-        self.assertEqual([row.pk for row in rows], sorted(r.pk for r in rows))
+        self.assertEqual(
+            [row.pk for row in rows],
+            sorted((r.pk for r in rows), reverse=True),
+        )
 
     def test_the_row_links_carry_the_filters(self):
         response = self.client.get(
@@ -245,7 +302,9 @@ class TestOpinionList(ScanningTestCase):
                 first_printed_page=500 + index,
                 index_in_page=0,
             )
-        with self.assertNumQueries(7):
+        # One more than before: the scan filter's choices, one query
+        # over the scans whatever the row count.
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
         for index in range(20):
@@ -254,7 +313,7 @@ class TestOpinionList(ScanningTestCase):
                 first_printed_page=600 + index,
                 index_in_page=0,
             )
-        with self.assertNumQueries(7):
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
     def pictured(self):
@@ -333,7 +392,7 @@ class TestOpinionList(ScanningTestCase):
                 index_in_page=0,
                 apply_run=run,
             )
-        with self.assertNumQueries(8):
+        with self.assertNumQueries(9):
             self.client.get(reverse("opinion_list"))
 
         for index in range(20):
@@ -343,7 +402,7 @@ class TestOpinionList(ScanningTestCase):
                 index_in_page=0,
                 apply_run=run,
             )
-        with self.assertNumQueries(8):
+        with self.assertNumQueries(9):
             self.client.get(reverse("opinion_list"))
 
 
