@@ -638,7 +638,9 @@ def attach_fits(built: list[dict], rows: list[Detection], scan: Scan) -> None:
             f" {names} {verb} the {what} differently: Refine image box "
             "pulls this box to theirs."
         )
-        padded = _pad(fit["box"], IMAGE_PAD_PX, card["img_width"], card["img_height"])
+        padded = _pad(
+            fit["box"], IMAGE_PAD_PX, card["img_width"], card["img_height"]
+        )
         crop = card["crop"]
         card["crop"] = [
             min(crop[0], padded[0]),

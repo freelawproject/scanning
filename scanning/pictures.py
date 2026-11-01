@@ -64,7 +64,11 @@ PICTURE_LABELS: dict[str, dict[str, str]] = {
 }
 
 #: What a person calls each reader on a card.
-READER_NAMES = {"dots_mocr": "dots.mocr", "mistral_ocr": "Mistral", "surya": "Surya"}
+READER_NAMES = {
+    "dots_mocr": "dots.mocr",
+    "mistral_ocr": "Mistral",
+    "surya": "Surya",
+}
 
 #: The share of the page a mark must cover to count. Every reader marks
 #: the West key at the head of each opinion as a picture, a hundred a
@@ -100,7 +104,11 @@ Box = list[float]
 
 
 def _positive(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value > 0
+    )
 
 
 def _box(value) -> Box | None:
@@ -217,7 +225,9 @@ def read_documents(
     return {index: entry for index, entry in pages.items() if entry[2]}
 
 
-def engine_documents(scan: Scan, run: ApplyRun | None, primary) -> dict[str, dict]:
+def engine_documents(
+    scan: Scan, run: ApplyRun | None, primary
+) -> dict[str, dict]:
     """Return the readers' documents of the space ``run`` names, by engine.
 
     The primary read (dots.mocr) is passed in, the compute's one read
@@ -435,7 +445,9 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
                 continue
             box = _scaled(cluster["box"], sx, sy)
             area = _area(box)
-            if any(_inter(box, cover) / area >= COVERED_SHARE for cover in covers):
+            if any(
+                _inter(box, cover) / area >= COVERED_SHARE for cover in covers
+            ):
                 continue
             yield _finding(reading, cluster, box, width, height)
 
@@ -521,7 +533,9 @@ def fit_for(
     readings = {
         r.page_index: r
         for r in PictureReading.objects.filter(
-            scan=scan, apply_run=run, page_index__in={r.page_index for r in rows}
+            scan=scan,
+            apply_run=run,
+            page_index__in={r.page_index for r in rows},
         )
     }
     out: dict[int, dict] = {}
@@ -564,7 +578,9 @@ def fit_for(
         if score < FIT_IOU:
             out[row.pk] = {
                 "box": [round(v, 1) for v in fit],
-                "readers": sorted({r for _, c in chosen for r in c["readers"]}),
+                "readers": sorted(
+                    {r for _, c in chosen for r in c["readers"]}
+                ),
                 "kinds": sorted({k for _, c in chosen for k in c["kinds"]}),
                 "iou": round(score, 2),
             }

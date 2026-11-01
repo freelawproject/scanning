@@ -109,10 +109,14 @@ class TestTheLabels(ScanningTestCase):
         for name, labels in pictures.PICTURE_LABELS.items():
             spec = opinion_ocr.ENGINES[name]
             picture_labels = {
-                label for label, kind in labels.items() if kind == pictures.PICTURE
+                label
+                for label, kind in labels.items()
+                if kind == pictures.PICTURE
             }
             self.assertFalse(picture_labels & set(spec.kind_types), name)
-        self.assertEqual(set(pictures.PICTURE_LABELS), set(opinion_ocr.ENGINES))
+        self.assertEqual(
+            set(pictures.PICTURE_LABELS), set(opinion_ocr.ENGINES)
+        )
 
 
 class TestReadDocuments(ScanningTestCase):
@@ -127,7 +131,9 @@ class TestReadDocuments(ScanningTestCase):
                     width=850,
                     height=1100,
                 ),
-                "surya": surya(surya_page(0, ("Table", [200, 1600, 900, 2000]))),
+                "surya": surya(
+                    surya_page(0, ("Table", [200, 1600, 900, 2000]))
+                ),
             }
         )
         width, height, marks = by_page[0]
@@ -159,7 +165,9 @@ class TestReadDocuments(ScanningTestCase):
             }
         )
         self.assertEqual(list(by_page), [1])
-        self.assertEqual([m["kind"] for m in by_page[1][2]], ["table", "picture"])
+        self.assertEqual(
+            [m["kind"] for m in by_page[1][2]], ["table", "picture"]
+        )
 
 
 class TestClusters(ScanningTestCase):
@@ -172,7 +180,9 @@ class TestClusters(ScanningTestCase):
             ]
         )
         self.assertEqual(len(groups), 1)
-        self.assertEqual(groups[0]["readers"], ["dots_mocr", "mistral_ocr", "surya"])
+        self.assertEqual(
+            groups[0]["readers"], ["dots_mocr", "mistral_ocr", "surya"]
+        )
         self.assertEqual(groups[0]["kinds"], ["picture", "table"])
         self.assertEqual(groups[0]["box"], [300.0, 500.0, 1400.0, 1300.0])
 
@@ -199,7 +209,8 @@ class TestWriteRows(ScanningTestCase):
             self.scan,
             {
                 "dots_mocr": dots(
-                    dots_page(0, ("Picture", PICTURE)), dots_page(1, ("Text", PICTURE))
+                    dots_page(0, ("Picture", PICTURE)),
+                    dots_page(1, ("Text", PICTURE)),
                 ),
                 "surya": surya(surya_page(2, ("Figure", PICTURE))),
             },
@@ -217,17 +228,27 @@ class TestWriteRows(ScanningTestCase):
         self.assertEqual(
             pictures.write_rows(self.scan, {"surya": surya()}, None), 0
         )
-        self.assertEqual(PictureReading.objects.filter(scan=self.scan).count(), 1)
+        self.assertEqual(
+            PictureReading.objects.filter(scan=self.scan).count(), 1
+        )
 
     def test_a_second_write_replaces_the_set(self):
         pictures.write_rows(
-            self.scan, {"dots_mocr": dots(dots_page(0, ("Picture", PICTURE)))}, None
+            self.scan,
+            {"dots_mocr": dots(dots_page(0, ("Picture", PICTURE)))},
+            None,
         )
         pictures.write_rows(
-            self.scan, {"dots_mocr": dots(dots_page(3, ("Picture", PICTURE)))}, None
+            self.scan,
+            {"dots_mocr": dots(dots_page(3, ("Picture", PICTURE)))},
+            None,
         )
         self.assertEqual(
-            list(PictureReading.objects.filter(scan=self.scan).values_list("page_index", flat=True)),
+            list(
+                PictureReading.objects.filter(scan=self.scan).values_list(
+                    "page_index", flat=True
+                )
+            ),
             [3],
         )
 
@@ -237,27 +258,39 @@ class TestEngineDocuments(ScanningTestCase):
         self.scan = make_scan()
 
     def test_the_run_documents_are_read_and_a_fault_is_left_out(self):
-        run = mock.Mock(ocr_key="k/dots", extract_key="k/mistral", surya_key="")
+        run = mock.Mock(
+            ocr_key="k/dots", extract_key="k/mistral", surya_key=""
+        )
         with mock.patch(
             "scanning.s3_sync.download_json_object",
             side_effect=lambda key: {"pages": [], "key": key},
         ) as download:
-            documents = pictures.engine_documents(self.scan, run, {"pages": []})
+            documents = pictures.engine_documents(
+                self.scan, run, {"pages": []}
+            )
         self.assertEqual(list(documents), ["dots_mocr", "mistral_ocr"])
         self.assertEqual(documents["mistral_ocr"]["key"], "k/mistral")
         download.assert_called_once_with("k/mistral")
         with mock.patch(
-            "scanning.s3_sync.download_json_object", side_effect=OSError("down")
+            "scanning.s3_sync.download_json_object",
+            side_effect=OSError("down"),
         ):
-            documents = pictures.engine_documents(self.scan, run, {"pages": []})
+            documents = pictures.engine_documents(
+                self.scan, run, {"pages": []}
+            )
         self.assertEqual(list(documents), ["dots_mocr"])
 
     def test_without_a_run_the_glued_volume_keys_are_read(self):
         with (
-            mock.patch("scanning.mistral_ocr.glued_volume_key", return_value=""),
-            mock.patch("scanning.surya.glued_volume_key", return_value="k/surya"),
             mock.patch(
-                "scanning.s3_sync.download_json_object", return_value={"pages": []}
+                "scanning.mistral_ocr.glued_volume_key", return_value=""
+            ),
+            mock.patch(
+                "scanning.surya.glued_volume_key", return_value="k/surya"
+            ),
+            mock.patch(
+                "scanning.s3_sync.download_json_object",
+                return_value={"pages": []},
             ) as download,
         ):
             documents = pictures.engine_documents(self.scan, None, None)
@@ -272,7 +305,11 @@ class TestUncovered(ScanningTestCase):
     def test_a_picture_the_readers_saw_with_no_image_box_is_a_card(self):
         reading(
             self.scan,
-            [mark("dots_mocr"), mark("surya", kind="table"), mark("dots_mocr", KEY)],
+            [
+                mark("dots_mocr"),
+                mark("surya", kind="table"),
+                mark("dots_mocr", KEY),
+            ],
         )
         # The detections' render is half the readers': the box comes
         # back in the detections' pixels, the space of every finding.
@@ -296,7 +333,10 @@ class TestUncovered(ScanningTestCase):
         self.assertEqual(meta["label_id"], int(Label.IMAGE))
         self.assertEqual(meta["readers"], ["dots_mocr", "surya"])
         self.assertEqual(meta["kinds"], ["picture", "table"])
-        self.assertIn("dots.mocr and Surya read a picture or table here", finding["message"])
+        self.assertIn(
+            "dots.mocr and Surya read a picture or table here",
+            finding["message"],
+        )
         # The address a dismissal is keyed by.
         address = findings.address_of(finding)
         self.assertEqual(address["source_page"], 1)
@@ -336,7 +376,10 @@ class TestUncovered(ScanningTestCase):
         PictureReading.objects.filter(scan=self.scan).delete()
         reading(
             self.scan,
-            [mark("mistral_ocr", narrow, kind="table"), mark("surya", narrow, kind="table")],
+            [
+                mark("mistral_ocr", narrow, kind="table"),
+                mark("surya", narrow, kind="table"),
+            ],
         )
         self.assertEqual(len(list(pictures.uncovered(self.scan, None))), 1)
         PictureReading.objects.filter(scan=self.scan).delete()
@@ -355,8 +398,12 @@ class TestUncovered(ScanningTestCase):
         )
         reading(self.scan, [mark("dots_mocr"), mark("mistral_ocr")])
         findings.rebuild(self.scan, run=None)
-        issue = Issue.objects.get(scan=self.scan, check_name=CheckName.UNBOXED_PICTURE)
-        self.assertEqual(issue.metadata["readers"], ["dots_mocr", "mistral_ocr"])
+        issue = Issue.objects.get(
+            scan=self.scan, check_name=CheckName.UNBOXED_PICTURE
+        )
+        self.assertEqual(
+            issue.metadata["readers"], ["dots_mocr", "mistral_ocr"]
+        )
         self.client.force_login(self.make_user())
         fragment = self.client.get(
             reverse("review_findings", kwargs={"pk": self.scan.pk})
@@ -377,7 +424,10 @@ class TestFitFor(ScanningTestCase):
         reading(self.scan, [mark("dots_mocr"), mark("surya")])
         # The model's box at half the readers' render, twice the picture.
         row = image_row(
-            self.scan, [50.0, 100.0, 800.0, 1000.0], img_width=850, img_height=1100
+            self.scan,
+            [50.0, 100.0, 800.0, 1000.0],
+            img_width=850,
+            img_height=1100,
         )
         fits = pictures.fit_for(self.scan, None, [row])
         self.assertEqual(fits[row.pk]["box"], [150.0, 250.0, 700.0, 650.0])
@@ -391,7 +441,12 @@ class TestFitFor(ScanningTestCase):
         right = [900.0, 500.0, 1400.0, 1300.0]
         reading(
             self.scan,
-            [mark("dots_mocr", left), mark("surya", left), mark("surya", right), mark("mistral_ocr", right)],
+            [
+                mark("dots_mocr", left),
+                mark("surya", left),
+                mark("surya", right),
+                mark("mistral_ocr", right),
+            ],
         )
         row = image_row(self.scan, [100.0, 300.0, 1600.0, 1500.0])
         fit = pictures.fit_for(self.scan, None, [row])[row.pk]
@@ -466,8 +521,12 @@ class TestTheCards(ScanningTestCase):
     ):
         self._picture_issue(page_index=2)
         reading(self.scan, [mark("dots_mocr"), mark("surya")], page_index=1)
-        loose = image_row(self.scan, [50.0, 100.0, 1600.0, 2000.0], page_index=1)
-        agreed = image_row(self.scan, [305.0, 505.0, 1395.0, 1295.0], page_index=3)
+        loose = image_row(
+            self.scan, [50.0, 100.0, 1600.0, 2000.0], page_index=1
+        )
+        agreed = image_row(
+            self.scan, [305.0, 505.0, 1395.0, 1295.0], page_index=3
+        )
         reading(self.scan, [mark("dots_mocr")], page_index=3)
         cards = self.client.get(
             reverse("scan_review_cards", kwargs={"pk": self.scan.pk})
@@ -478,7 +537,10 @@ class TestTheCards(ScanningTestCase):
         )
         fit = cards[0]["fit"]
         self.assertEqual(fit["box"], PICTURE)
-        self.assertIn("dots.mocr and Surya draw the picture differently", cards[0]["message"])
+        self.assertIn(
+            "dots.mocr and Surya draw the picture differently",
+            cards[0]["message"],
+        )
         self.assertEqual(cards[0]["detection_id"], loose.pk)
         self.assertIsNone(cards[2]["fit"])
         self.assertEqual(cards[2]["detection_id"], agreed.pk)
