@@ -55,19 +55,22 @@ from scanning.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _rebuild_findings(scan: Scan) -> None:
+def _rebuild_findings(scan: Scan, pages: set[int] | None = None) -> None:
     """Write the review-2 findings again after a curator's write (#240 PR D).
 
     Every finding is derived from the detection, boundary and redaction
     rows, so the endpoint that changed a row is what keeps the cards
-    true. A few queries over label-filtered rows.
+    true. A write that names a page passes it, and the page passes run
+    over that page alone (``findings.PAGE_CHECKS``); a boundary write
+    passes nothing, because the boundaries cross pages.
 
     :param scan: The scan.
+    :param pages: The page indexes the write touched, or None.
     :return: None.
     """
     from scanning import findings
 
-    findings.rebuild(scan)
+    findings.rebuild(scan, pages=pages)
 
 
 #: The 409 of every write of review 2 before that review is open
@@ -1015,7 +1018,7 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
     dismissed, note = _dismissed_under(scan, row, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -1068,7 +1071,7 @@ def move_redaction(
     # each, so a bleed-through page is one drag and not a drag plus a
     # click on every box it covers.
     dismissed, note = _dismissed_under(scan, holder, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index, holder.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -1107,7 +1110,7 @@ def dismiss_redaction(
         return _redaction_error("Redaction not found", 404)
     human = row.origin == Redaction.Origin.HUMAN
     redactions.dismiss(scan, row, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -1141,7 +1144,7 @@ def restore_redaction(
     if row is None:
         return _redaction_error("Redaction not found", 404)
     restored = redactions.restore(scan, row, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -2940,7 +2943,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -3013,7 +3016,7 @@ def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
             restored = detections.withdraw(
                 DetectionDecision.objects.filter(pk=decision.pk), request.user
             )
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -3071,7 +3074,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -3192,7 +3195,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 holder = detections.approve_model_row(scan, near, request.user)
             except detections.UnaddressableDetection:
                 return _unaddressable()
-        _rebuild_findings(scan)
+        _rebuild_findings(scan, {near.page_index})
         return JsonResponse(
             {
                 "status": "ok",
@@ -3216,7 +3219,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         )
     except detections.UnaddressableDetection:
         return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",
@@ -3288,7 +3291,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             holder = detections.approve_model_row(scan, row, request.user)
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index})
     return JsonResponse(
         {
             "status": "ok",

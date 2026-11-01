@@ -40,6 +40,7 @@ described from the curator.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from statistics import median
 
 from django.db import transaction
@@ -401,22 +402,24 @@ def is_stale(row: Redaction, scan: Scan) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def visible_by_page(scan: Scan) -> list[dict]:
+def visible_by_page(
+    scan: Scan, pages: Collection[int] | None = None
+) -> list[dict]:
     """Return the boxes to paint, grouped by page, in the viewer's shape.
 
     ``[{"page_index": i, "rects": [{"id", "x0", "y0", "x1", "y1", "fill",
     "rect_type", "origin"}]}]``, points, pages in order.
 
     :param scan: The scan.
+    :param pages: The page indexes to read, or None for every page.
     :returns: The list.
     """
-    pages: dict[int, list[dict]] = {}
-    for row in (
-        Redaction.objects.visible()
-        .filter(scan=scan)
-        .order_by("page_index", "y0", "x0")
-    ):
-        pages.setdefault(row.page_index, []).append(
+    rows = Redaction.objects.visible().filter(scan=scan)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    pages_out: dict[int, list[dict]] = {}
+    for row in rows.order_by("page_index", "y0", "x0"):
+        pages_out.setdefault(row.page_index, []).append(
             {
                 "id": row.pk,
                 "x0": row.x0,
@@ -430,7 +433,7 @@ def visible_by_page(scan: Scan) -> list[dict]:
         )
     return [
         {"page_index": index, "rects": rects}
-        for index, rects in sorted(pages.items())
+        for index, rects in sorted(pages_out.items())
     ]
 
 

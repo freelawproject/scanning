@@ -32,7 +32,7 @@ with dots alone gets dots' boxes; a later recompute reads the others.
 
 import logging
 import statistics
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 
 from blackletter.models import Label
 from django.db import transaction
@@ -390,7 +390,11 @@ def _sized_rows(scan: Scan, run: ApplyRun | None, pages: set[int]):
     ]
 
 
-def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+def uncovered(
+    scan: Scan,
+    run: ApplyRun | None,
+    pages: Collection[int] | None = None,
+) -> Iterator[dict]:
     """Yield one finding per picture or table no image box covers.
 
     Rows only: the readings of the measured run and the live ``IMAGE``
@@ -404,13 +408,13 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
     :yields: The finding dicts ``findings.rebuild`` writes.
     """
-    readings = list(
-        PictureReading.objects.filter(scan=scan, apply_run=run).order_by(
-            "page_index"
-        )
-    )
+    rows = PictureReading.objects.filter(scan=scan, apply_run=run)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    readings = list(rows.order_by("page_index"))
     if not readings:
         return
     sized: dict[int, Detection] = {}

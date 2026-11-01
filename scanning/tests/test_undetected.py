@@ -7,9 +7,14 @@ with the OCR glue's own measure (``opinion_ocr.page_frame``,
 over the block, or a dismissal.
 """
 
+import json
+from unittest.mock import patch
+
 from blackletter.models import Label
+from django.urls import reverse
 
 from scanning import findings, opinion_ocr, undetected
+from scanning.factories import UserFactory
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -907,3 +912,166 @@ class TestTheCutLine(ScanningTestCase):
                 scan=self.scan, check_name=CheckName.REDACTION_CUTS_TEXT
             ).exists()
         )
+
+
+class TestThePageScopedRebuild(ScanningTestCase):
+    """A write on one page rebuilds the page passes for that page alone
+    (``findings.rebuild`` with ``pages``, ``findings.PAGE_CHECKS``)."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = make_scan()
+        caption = make_detection(self.scan, "CASE_CAPTION", page_index=0)
+        key = make_detection(self.scan, "KEY_ICON", page_index=2)
+        make_boundary(self.scan, caption, key)
+        column(self.scan, page_index=0)
+        column(self.scan, page_index=1)
+        # A block outside the column on each of two pages.
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left out on one")),
+                page(1, cell("Inside", INSIDE), cell("Left out on two")),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+
+    def cards(self):
+        return Issue.objects.filter(
+            scan=self.scan, check_name=CheckName.UNDETECTED_TEXT
+        ).order_by("page_number")
+
+    def test_the_whole_rebuild_writes_a_card_per_page(self):
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1, 2]
+        )
+
+    def test_a_page_rebuild_replaces_that_pages_cards_and_keeps_the_rest(self):
+        kept = self.cards().get(page_number=2)
+        # The write: a column box over the block of page one.
+        column(self.scan, page_index=0, bbox=OUTSIDE)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+
+        cards = list(self.cards())
+        self.assertEqual([c.page_number for c in cards], [2])
+        # Untouched, not rewritten: the row is the same.
+        self.assertEqual(cards[0].pk, kept.pk)
+
+    def test_a_page_rebuild_does_not_judge_the_other_pages(self):
+        """The box went on page two, but the write named page one, so
+        page two's card stands until a write names page two."""
+        column(self.scan, page_index=1, bbox=OUTSIDE)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1, 2]
+        )
+
+        findings.rebuild(self.scan, run=None, pages={1})
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1]
+        )
+
+    def test_a_page_rebuild_writes_the_whole_volume_checks(self):
+        """The checks that cross pages are rewritten by every rebuild:
+        a key icon no boundary names, on a page the write did not
+        touch, gets its card from a rebuild of page one."""
+        make_detection(self.scan, "KEY_ICON", page_index=3, x0=300.0, x1=540.0)
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.UNMATCHED_KEY_ICON
+            ).exists()
+        )
+
+        open_count = findings.rebuild(self.scan, run=None, pages={0})
+
+        self.assertTrue(
+            self.scan.issues.filter(
+                check_name=CheckName.UNMATCHED_KEY_ICON
+            ).exists()
+        )
+        # The count answered is the volume's: both text cards, the key
+        # icon's and whatever else the volume checks wrote.
+        standing = self.scan.issues.filter(
+            check_name__in=findings.REVIEW2_CHECKS, dismissal__isnull=True
+        ).count()
+        self.assertGreater(standing, 2)
+        self.assertEqual(open_count, standing)
+
+    def test_a_page_rebuild_lands_a_dismissal_like_the_whole_one(self):
+        card = self.cards().get(page_number=1)
+        self.client.force_login(UserFactory())
+        response = self.client.post(
+            reverse("dismiss_finding", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"issue_id": card.pk}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+
+        self.assertIsNotNone(self.cards().get(page_number=1).dismissal_id)
+        self.assertIsNone(self.cards().get(page_number=2).dismissal_id)
+
+    def test_the_page_checks_are_the_passes_that_take_pages(self):
+        """Every check of ``PAGE_CHECKS`` is written by a pass that
+        takes ``pages``, and no other review-2 pass does: the delete of
+        a page rebuild must name exactly the checks it rewrote."""
+        import inspect
+
+        from scanning import editorial, pictures
+        from scanning.models import REVIEW2_CHECKS
+
+        takers = {
+            editorial.uncovered: CheckName.UNCOVERED_EDITORS_NOTE,
+            undetected.uncovered: CheckName.UNDETECTED_TEXT,
+            undetected.cut_lines: CheckName.REDACTION_CUTS_TEXT,
+            pictures.uncovered: CheckName.UNBOXED_PICTURE,
+        }
+        for fn in takers:
+            self.assertIn("pages", inspect.signature(fn).parameters, fn)
+        self.assertEqual(set(takers.values()), set(findings.PAGE_CHECKS))
+        self.assertTrue(findings.PAGE_CHECKS < REVIEW2_CHECKS)
+
+
+class TestTheWritesPassTheirPage(ScanningTestCase):
+    """A write that names a page rebuilds that page; a boundary write
+    rebuilds the volume."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = make_scan()
+        self.client.force_login(UserFactory())
+
+    def test_an_added_box_rebuilds_its_page(self):
+        with patch("scanning.findings.rebuild") as rebuild:
+            response = self.client.post(
+                reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+                data=json.dumps(
+                    {
+                        "page_index": 2,
+                        "label_id": int(Label.TEXT_COLUMN),
+                        "bbox": [100, 100, 140, 140],
+                        "img_width": WIDTH,
+                        "img_height": HEIGHT,
+                    }
+                ),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(self.scan, pages={2})
+
+    def test_a_dismissed_boundary_rebuilds_the_volume(self):
+        caption = make_detection(self.scan, "CASE_CAPTION", page_index=0)
+        key = make_detection(self.scan, "KEY_ICON", page_index=1)
+        boundary = make_boundary(self.scan, caption, key)
+        with patch("scanning.findings.rebuild") as rebuild:
+            response = self.client.post(
+                reverse("dismiss_boundary", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"boundary_id": boundary.pk}),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(self.scan, pages=None)
