@@ -225,20 +225,7 @@ def _filtered_opinions(request: HttpRequest):
         "opinion", "blocking"})``, the current values as the form shows
         them.
     """
-    opinions_qs = Opinion.objects.select_related(
-        "scan", "scan__reporter"
-    ).order_by(
-        "scan__reporter__short_name",
-        "scan__volume",
-        "first_printed_page",
-        "index_in_page",
-        # The last key makes the ordering total. ``Scan`` has no unique
-        # key over (reporter, volume) -- a volume comes in parts -- so
-        # two scans tie on the four keys above, and Postgres may rank
-        # tied rows differently for each page of a LIMIT/OFFSET walk.
-        # An opinion would then show on two pages, or on none.
-        "pk",
-    )
+    opinions_qs = Opinion.objects.select_related("scan", "scan__reporter")
 
     scan_filter = request.GET.get("scan")
     if _whole_number(scan_filter) is not None:
@@ -271,6 +258,21 @@ def _filtered_opinions(request: HttpRequest):
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The order never crosses a table: ordered by the reporter's name,
+    # the scan's volume and the opinion's page at once, no index served
+    # the sort, and at a hundred thousand rows Postgres joined and
+    # sorted them all for every page. One scan is read in page order
+    # (the unique key over scan, page and index is the index); a
+    # reporter or a volume number scan by scan in page order; the whole
+    # corpus newest first, which is the primary key. The last key makes
+    # every order total, so a LIMIT/OFFSET walk shows each opinion once.
+    if scan_filter or opinion_filter:
+        order = ("first_printed_page", "index_in_page", "pk")
+    elif reporter_filter or volume_filter:
+        order = ("scan_id", "first_printed_page", "index_in_page", "pk")
+    else:
+        order = ("-pk",)
+    opinions_qs = opinions_qs.order_by(*order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
@@ -323,6 +325,27 @@ def _review_url(current: dict, route: str) -> str | None:
     return f"{address}?{urlencode(query)}" if query else address
 
 
+def _scan_choices() -> list[tuple[str, str]]:
+    """Return the volumes the list's scan filter offers.
+
+    Every scan with an opinion row, in the list's order, named as the
+    rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
+    the scans, with the opinions as a semi-join on their scan index.
+
+    :returns: ``(scan pk, label)`` pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    scans = (
+        Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
+        .select_related("reporter")
+        .order_by("reporter__short_name", "volume", "pk")
+    )
+    return [
+        (str(s.pk), f"vol. {s.volume} {s.reporter.cite_name}, scan {s.pk}")
+        for s in scans
+    ]
+
+
 @login_required
 def opinion_list(request: HttpRequest) -> HttpResponse:
     """List the opinions of the third review (#334).
@@ -367,6 +390,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
+            "scan_choices": _scan_choices(),
             "current_scan": current["scan"],
             "current_reporter": current["reporter"],
             "current_status": current["status"],
