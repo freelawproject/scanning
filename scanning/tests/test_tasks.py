@@ -21,7 +21,8 @@ TICK_TASKS = (
     tasks.enqueue_runs,
     tasks.submit_runpod,
     tasks.submit_doctor,
-    tasks.submit_mistral,
+    tasks.submit_mistral_a,
+    tasks.submit_mistral_b,
     tasks.sweep_runpod,
     tasks.sweep_doctor,
     tasks.sweep_mistral,
@@ -639,6 +640,22 @@ class TestDispatch(TestCase):
         self.assertEqual(send.call_args.kwargs["queue"], tasks.QUEUE_IO)
 
     @override_settings(CELERY_ENABLED=True)
+    def test_the_mistral_button_sends_both_waves(self):
+        """The rows a button created go to whichever Mistral worker is
+        free first (#575): both ticks are sent, each to its queue."""
+        with (
+            patch.object(tasks.submit_mistral_a, "apply_async") as send_a,
+            patch.object(tasks.submit_mistral_b, "apply_async") as send_b,
+        ):
+            self.assertTrue(tasks.submit_soon(JobProvider.MISTRAL))
+        self.assertEqual(
+            send_a.call_args.kwargs["queue"], tasks.QUEUE_MISTRAL_A
+        )
+        self.assertEqual(
+            send_b.call_args.kwargs["queue"], tasks.QUEUE_MISTRAL_B
+        )
+
+    @override_settings(CELERY_ENABLED=True)
     def test_an_unknown_provider_sends_nothing(self):
         self.assertFalse(tasks.submit_soon("nobody"))
 
@@ -747,7 +764,8 @@ class TestWaves(TestCase):
         for task, provider in (
             (tasks.submit_runpod, JobProvider.RUNPOD),
             (tasks.submit_doctor, JobProvider.DOCTOR),
-            (tasks.submit_mistral, JobProvider.MISTRAL),
+            (tasks.submit_mistral_a, JobProvider.MISTRAL),
+            (tasks.submit_mistral_b, JobProvider.MISTRAL),
         ):
             with (
                 self.subTest(provider=provider),
@@ -758,6 +776,29 @@ class TestWaves(TestCase):
             ):
                 self.assertEqual(task(), 2)
             submit.assert_called_once_with(providers=(provider,))
+
+    def test_the_mistral_waves_run_on_their_own_queues(self):
+        """One wave task per Mistral worker (#575), each on its queue
+        and in the tick table; the old name on the heavy queue runs
+        the same wave for a clock of the release before, and is no
+        tick."""
+        for task, queue in (
+            (tasks.submit_mistral_a, tasks.QUEUE_MISTRAL_A),
+            (tasks.submit_mistral_b, tasks.QUEUE_MISTRAL_B),
+        ):
+            with self.subTest(task=task.name):
+                self.assertEqual(task.queue, queue)
+                self.assertEqual(
+                    next(t.queue for t in tasks.TICKS if t.task is task), queue
+                )
+        self.assertEqual(tasks.submit_mistral.queue, tasks.QUEUE_HEAVY)
+        self.assertNotIn(tasks.submit_mistral, {t.task for t in tasks.TICKS})
+        with patch(
+            "scanning.jobs.submit_pending",
+            return_value=SubmitSummary(submitted=1),
+        ) as submit:
+            self.assertEqual(tasks.submit_mistral(), 1)
+        submit.assert_called_once_with(providers=(JobProvider.MISTRAL,))
 
 
 class TestQueuedWritersDispatch(TestCase):

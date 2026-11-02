@@ -57,7 +57,22 @@ QUEUE_FAST = "fast"
 QUEUE_IO = "io"
 QUEUE_HEAVY = "heavy"
 QUEUE_OPINIONS = "opinions"
-QUEUES = (QUEUE_FAST, QUEUE_IO, QUEUE_HEAVY, QUEUE_OPINIONS)
+#: The Mistral submit's own queues (#575), one worker deployment each:
+#: the render held the heavy worker for minutes a shard, with the
+#: merges and the glues behind it. Two queues and not one with two
+#: replicas because that is what was deployed; the submit lock is per
+#: row (``mistral_ocr.submit_lock``), so the two pods take different
+#: shards whichever queue they listen on.
+QUEUE_MISTRAL_A = "mistral-a"
+QUEUE_MISTRAL_B = "mistral-b"
+QUEUES = (
+    QUEUE_FAST,
+    QUEUE_IO,
+    QUEUE_HEAVY,
+    QUEUE_OPINIONS,
+    QUEUE_MISTRAL_A,
+    QUEUE_MISTRAL_B,
+)
 
 #: The lock the three opinion passes share: they read and release one
 #: local mirror (``apply.local_copy`` under ``Scan.output_dir``).
@@ -331,19 +346,18 @@ def submit_doctor() -> int:
     return _submit(JobProvider.DOCTOR)
 
 
-@app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
-@locked("submit_mistral")
-def submit_mistral() -> int:
-    """Render and submit a wave of shards to Mistral: minutes, on the
-    heavy queue.
+def _submit_mistral() -> int:
+    """Render and submit a wave of shards to Mistral: minutes.
 
     The wave takes one shard (``mistral_ocr.submits_per_tick``), so
-    the task is minutes and not a quarter of an hour: the merges and
-    the glues share this queue, and a spot pod goes with little
-    warning. Locked like the other waves: one wave at a time keeps the batch
-    cap (``mistral_ocr.max_concurrency``, counted before the claim)
-    exact, and two workers never pay for two renders when one was
-    wanted.
+    the task is minutes and not a quarter of an hour, and a spot pod
+    that goes mid-task loses one claim. The two Mistral workers each
+    run their own tick (#575): the claim is a compare-and-swap and the
+    submit lock is the row's (``mistral_ocr.submit_lock``), so neither
+    waits on the other and neither renders the other's shard. What
+    the two can do at once is overshoot the batch cap
+    (``mistral_ocr.max_concurrency``, counted before each claim) by
+    one shard each, which the cap has room for.
 
     :returns: The submitted count.
     :rtype: int
@@ -351,6 +365,47 @@ def submit_mistral() -> int:
     from scanning.models import JobProvider
 
     return _submit(JobProvider.MISTRAL)
+
+
+@app.task(name="scanning.tasks.submit_mistral_a", queue=QUEUE_MISTRAL_A)
+@locked("submit_mistral_a")
+def submit_mistral_a() -> int:
+    """The Mistral wave of the ``mistral-a`` worker; see
+    :func:`_submit_mistral`. Locked per queue, so two ticks on one
+    worker never overlap.
+
+    :returns: The submitted count.
+    :rtype: int
+    """
+    return _submit_mistral()
+
+
+@app.task(name="scanning.tasks.submit_mistral_b", queue=QUEUE_MISTRAL_B)
+@locked("submit_mistral_b")
+def submit_mistral_b() -> int:
+    """The Mistral wave of the ``mistral-b`` worker; see
+    :func:`_submit_mistral`.
+
+    :returns: The submitted count.
+    :rtype: int
+    """
+    return _submit_mistral()
+
+
+@app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
+@locked("submit_mistral")
+def submit_mistral() -> int:
+    """The Mistral wave on the heavy queue, as it ran before #575.
+
+    Registered for the rollout alone, not in ``TICKS``: a clock from
+    the release before sends this name until its pod restarts, and a
+    worker that did not know it would log an unregistered task every
+    submit interval. Delete once that release has rolled out.
+
+    :returns: The submitted count.
+    :rtype: int
+    """
+    return _submit_mistral()
 
 
 def _sweep(provider: str | None) -> int:
@@ -621,7 +676,16 @@ TICKS: tuple[Tick, ...] = (
     Tick("submit_runpod", submit_runpod, "DAEMON_SUBMIT_INTERVAL", QUEUE_FAST),
     Tick("submit_doctor", submit_doctor, "DAEMON_SUBMIT_INTERVAL", QUEUE_IO),
     Tick(
-        "submit_mistral", submit_mistral, "DAEMON_SUBMIT_INTERVAL", QUEUE_HEAVY
+        "submit_mistral_a",
+        submit_mistral_a,
+        "DAEMON_SUBMIT_INTERVAL",
+        QUEUE_MISTRAL_A,
+    ),
+    Tick(
+        "submit_mistral_b",
+        submit_mistral_b,
+        "DAEMON_SUBMIT_INTERVAL",
+        QUEUE_MISTRAL_B,
     ),
     Tick("sweep_runpod", sweep_runpod, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
     Tick("sweep_doctor", sweep_doctor, "DAEMON_COLLECT_INTERVAL", QUEUE_IO),
@@ -815,10 +879,12 @@ def _send_scan(scan_pk: int, action: str) -> bool:
     return True
 
 
+#: The wave tasks of each provider: Mistral's two, one per worker, so
+#: a button's rows are taken by whichever is free first.
 _SUBMITTERS = {
-    "runpod": submit_runpod,
-    "doctor": submit_doctor,
-    "mistral": submit_mistral,
+    "runpod": (submit_runpod,),
+    "doctor": (submit_doctor,),
+    "mistral": (submit_mistral_a, submit_mistral_b),
 }
 
 
@@ -834,10 +900,10 @@ def submit_soon(provider: str) -> bool:
     :returns: Whether a task was sent.
     :rtype: bool
     """
-    task = _SUBMITTERS.get(provider)
-    if task is None:
+    wave_tasks = _SUBMITTERS.get(provider)
+    if not wave_tasks:
         return False
-    return bool(nudge(task))
+    return bool(nudge(*wave_tasks))
 
 
 # -- the worker's start --------------------------------------------------

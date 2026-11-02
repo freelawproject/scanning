@@ -178,6 +178,8 @@ jobs:
           - scanning-celery-worker-io
           - scanning-celery-worker-heavy
           - scanning-celery-worker-opinions
+          - scanning-celery-worker-mistral-a
+          - scanning-celery-worker-mistral-b
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
