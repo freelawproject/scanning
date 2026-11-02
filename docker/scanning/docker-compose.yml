@@ -98,7 +98,11 @@ services:
       - ../../.env.dev
     environment:
       - CELERY_ENABLED=True
-      - CELERY_CONCURRENCY=2
+      # One process more than the two Mistral queues this worker also
+      # serves (#575): a Mistral wave holds its process for a shard's
+      # minutes, and two of them must leave one process for the other
+      # queues.
+      - CELERY_CONCURRENCY=3
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}

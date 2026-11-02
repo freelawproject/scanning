@@ -168,6 +168,9 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ !contains(needs.get-pr-labels.outputs.labels, 'skip-daemon-deploy') }}
     strategy:
+      # One leg's failure must not cancel the others: a missing
+      # required deployment is that deployment's failure alone.
+      fail-fast: false
       matrix:
         # The Celery workers (#503): one deployment per queue of
         # scanning.tasks, each the daemon image with the `worker`
@@ -178,6 +181,20 @@ jobs:
           - scanning-celery-worker-io
           - scanning-celery-worker-heavy
           - scanning-celery-worker-opinions
+          - scanning-celery-worker-mistral-a
+          - scanning-celery-worker-mistral-b
+        include:
+          # The Mistral workers (#575) are the only consumers of their
+          # queues: with them missing while the other workers run, no
+          # Mistral read is submitted and nothing says so. Their legs
+          # fail instead of skipping, so a deploy before
+          # freelawproject/infrastructure#891 is loud. A cluster with
+          # no worker deployments at all (the switch off, the daemon
+          # running every pass itself) still skips them.
+          - deployment: scanning-celery-worker-mistral-a
+            required: true
+          - deployment: scanning-celery-worker-mistral-b
+            required: true
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v5
@@ -202,6 +219,9 @@ jobs:
           if [ -n "$found" ]; then
             kubectl set image -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }} ${{ matrix.deployment }}=freelawproject/scanning:${{ needs.setup-deploy.outputs.sha_short }}-daemon
             kubectl rollout status -n ${{ env.EKS_NAMESPACE }} deployment/${{ matrix.deployment }}
+          elif [ "${{ matrix.required }}" = "true" ] && [ -n "$(kubectl get -n ${{ env.EKS_NAMESPACE }} deployment/scanning-celery-worker-heavy --ignore-not-found -o name)" ]; then
+            echo "::error::deployment/${{ matrix.deployment }} does not exist while the other workers do; nothing consumes its queue, so no Mistral read would be submitted"
+            exit 1
           else
             echo "deployment/${{ matrix.deployment }} does not exist yet; skipped"
           fi

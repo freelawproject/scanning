@@ -110,6 +110,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -117,7 +118,6 @@ from pathlib import Path
 import fitz
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
-from django.db.models import Max
 from django.utils import timezone
 from PIL import Image
 
@@ -197,19 +197,55 @@ LEFTOVER_SECONDS_PER_TICK = 20.0
 #: shutdown never waits out a backoff.
 STOP_POLL_SECONDS = 0.5
 
-#: The lock the wave holds from its claim to the write of the batch id
-#: (#534), in both modes. A claimed row with no batch id is alive while
-#: a session holds it, and lost once none does: a killed holder's
-#: session ends with it, or within ``locks.KEEPALIVE`` when its node
-#: vanished. A clock cannot tell a slow render from a dead one.
-SUBMIT_LOCK = "mistral_submit"
-
-#: For the release that ships #534 alone: a wave of a pod still on the
-#: code before it takes no :data:`SUBMIT_LOCK`, so during a rolling
-#: deploy a claim younger than this with no lock held is read as alive,
-#: the clock the sweep used before. Delete it, and its branch in
-#: :func:`_claim_alive`, once that release has fully rolled out.
+#: For the release that ships #575 alone: a wave of a pod still on the
+#: code before it holds one lock for every row and not the row's, so
+#: during a rolling deploy a claim younger than this with no lock held
+#: is read as alive, the clock the sweep used before #534. Delete it,
+#: and its branch in :func:`_claim_alive`, once that release has fully
+#: rolled out; :data:`LOCK_GRACE` stays.
 LEGACY_CLAIM_GRACE = timedelta(minutes=30)
+
+#: The wave claims a row, then takes its lock: a sweep that reads the
+#: row in between finds no holder. A claim younger than this with no
+#: lock held is alive, so that gap, milliseconds wide, never costs a
+#: live shard its files; a render takes minutes, so a dead claim is
+#: still found inside one sweep interval of this.
+LOCK_GRACE = timedelta(minutes=2)
+
+
+def submit_lock(job: ExternalJob) -> str:
+    """Return the name of the lock the wave holds for one claimed row.
+
+    Held from the claim to the write of the batch id (#534), in both
+    modes, and the row's own since #575: a claimed row with no batch
+    id is alive while a session holds its lock, and lost once none
+    does, because a killed holder's session ends with it, or within
+    ``locks.KEEPALIVE`` when its node vanished. A clock cannot tell a
+    slow render from a dead one. One lock per row and not per wave,
+    so the Mistral workers claim side by side and the sweep judges
+    each claim by its own holder.
+
+    The lock lives in ``locks.ROW_NAMESPACE``, apart from the passes'
+    names, so a row's key can collide with another row's at worst and
+    never with a pass's lock held for minutes.
+
+    :param job: The claimed row.
+    :returns: ``"mistral_submit:{pk}"``.
+    :rtype: str
+    """
+    return f"mistral_submit:{job.pk}"
+
+
+def hold_row(job: ExternalJob):
+    """Return the context that holds one row's submit lock, if it can
+    be had (:func:`locks.held` under ``ROW_NAMESPACE``)."""
+    return locks.held(submit_lock(job), namespace=locks.ROW_NAMESPACE)
+
+
+def row_held(job: ExternalJob) -> bool:
+    """Return whether any session holds one row's submit lock."""
+    return locks.is_held(submit_lock(job), namespace=locks.ROW_NAMESPACE)
+
 
 #: Submissions a row gets before it is failed. Two, because a lost
 #: create may have made a job nothing we hold names, and every attempt
@@ -1125,26 +1161,18 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     (:class:`_Uploads`), so the uploads in flight and the pages in
     memory are the wave's whatever the shard count.
 
-    The wave holds :data:`SUBMIT_LOCK` from before its claim until the
-    batch id is written (#534), so the sweep can tell a shard still
-    rendering from one whose worker died; a second wave that finds it
-    held claims nothing.
+    The wave holds each claimed row's lock (:func:`submit_lock`) from
+    the claim until its batch id is written (#534, #575), so the sweep
+    can tell a shard still rendering from one whose worker died. The
+    claim is a compare-and-swap, so two waves on two workers take
+    different rows and neither waits on the other; a row whose lock
+    some session still holds at the claim (a holder the sweep handed
+    on under the legacy grace before its session was reaped) is handed
+    back with its attempt.
 
     :param summary: Counts to update.
     :param limit: In-flight override; defaults to
         :func:`max_concurrency`. The per-tick cap is not overridden.
-    :return: None.
-    """
-    with locks.held(SUBMIT_LOCK) as got:
-        if got:
-            _submit_locked(summary, limit)
-
-
-def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
-    """The body of :func:`submit_wave`, under :data:`SUBMIT_LOCK`.
-
-    :param summary: Counts to update.
-    :param limit: In-flight override.
     :return: None.
     """
     claimed = jobs.claim_for_wave(
@@ -1164,7 +1192,37 @@ def _submit_locked(summary: jobs.SubmitSummary, limit: int | None) -> None:
     )
     if not claimed:
         return
+    # Every row's lock is held on this thread, the one that writes the
+    # ids, and let go once the whole wave's outcomes are written: a
+    # finished row's lock held a little longer costs nothing, because
+    # the sweep reads a lock only on a row with no id.
+    with ExitStack() as held:
+        rows = []
+        for job, urls in claimed:
+            if held.enter_context(hold_row(job)):
+                rows.append((job, urls))
+                continue
+            result = jobs._defer(
+                job,
+                "LOCK_HELD",
+                "another session still holds this row's submit lock",
+                timezone.now(),
+            )
+            setattr(summary, result, getattr(summary, result) + 1)
+        if rows:
+            _submit_held(rows, summary)
 
+
+def _submit_held(
+    claimed: list[tuple[ExternalJob, tuple]], summary: jobs.SubmitSummary
+) -> None:
+    """The body of :func:`submit_wave`, with every row's lock held.
+
+    :param claimed: The claimed rows, as :func:`jobs.claim_for_wave`
+        returned them.
+    :param summary: Counts to update.
+    :return: None.
+    """
     logger.info(
         "rendering and submitting %d shard(s) to Mistral", len(claimed)
     )
@@ -1252,7 +1310,7 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
     The provider table's ``sweep_job`` for Mistral. A row with no
     ``external_id`` is a shard a wave is still rendering, or a claim
     whose worker died (#503, #534). :func:`_claim_alive` tells the two
-    apart by the wave's lock and never by a clock; a lost claim's files
+    apart by the row's lock and never by a clock; a lost claim's files
     are found by name and deleted (:func:`discard_lost_files`), and the
     row is retried rather than waited on for a day.
 
@@ -1325,12 +1383,13 @@ def sweep_job(job: ExternalJob, now, summary: jobs.SweepSummary) -> None:
 def _claim_alive(job: ExternalJob, now) -> bool:
     """Return whether a wave is still submitting this claimed row.
 
-    Alive while a session holds :data:`SUBMIT_LOCK` and the row is the
-    newest claim with no batch id: one wave runs at a time and claims
-    its rows at one instant, so an older row with no id is a claim a
-    killed worker left behind, whoever holds the lock now. With no lock
-    held, a claim inside :data:`LEGACY_CLAIM_GRACE` is alive too, for a
-    pod on the code before the lock.
+    Alive while a session holds the row's own lock
+    (:func:`submit_lock`): the wave takes it right after the claim and
+    lets it go after the batch id is written, so a claim with no id
+    and no holder is one a killed worker left behind, once it is older
+    than :data:`LOCK_GRACE`, the gap between the claim and the lock.
+    With no lock held, a claim inside :data:`LEGACY_CLAIM_GRACE` is
+    alive too, for a pod on the code before the per-row lock.
 
     :param job: A SUBMITTED row with no ``external_id``.
     :param now: Comparison time.
@@ -1339,16 +1398,10 @@ def _claim_alive(job: ExternalJob, now) -> bool:
     """
     if job.submitted_at is None:
         return False
-    if not locks.is_held(SUBMIT_LOCK):
-        return (now - job.submitted_at) < LEGACY_CLAIM_GRACE
-    newest = ExternalJob.objects.filter(
-        provider=JobProvider.MISTRAL,
-        stage=JobStage.EXTRACT,
-        engine=JobEngine.MISTRAL_OCR,
-        status=job.status,
-        external_id="",
-    ).aggregate(newest=Max("submitted_at"))["newest"]
-    return newest is None or job.submitted_at >= newest
+    if row_held(job):
+        return True
+    age = now - job.submitted_at
+    return age < LOCK_GRACE or age < LEGACY_CLAIM_GRACE
 
 
 def discard_lost_files(job: ExternalJob) -> int | None:

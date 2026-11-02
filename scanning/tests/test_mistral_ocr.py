@@ -615,11 +615,14 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(ahead, [3])
         self.assertEqual(len(rendered), 6)
 
-    def test_a_held_submit_lock_claims_nothing(self):
-        # Another worker's wave holds the lock: this one claims no row.
+    def test_a_held_row_lock_hands_the_claim_back(self):
+        # Another session still holds this row's lock (a holder the
+        # sweep handed on under the legacy grace): the wave claims the
+        # row, renders nothing and hands it back with its attempt.
+        job = extract_jobs(self.scan)[0]
         other = connections.create_connection("default")
         self.addCleanup(other.close)
-        key = [locks.NAMESPACE, locks.key(mistral_ocr.SUBMIT_LOCK)]
+        key = [locks.ROW_NAMESPACE, locks.key(mistral_ocr.submit_lock(job))]
         with other.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_lock(%s, %s)", key)
         try:
@@ -628,8 +631,50 @@ class TestSubmitWave(ScanningTestCase):
             with other.cursor() as cursor:
                 cursor.execute("SELECT pg_advisory_unlock(%s, %s)", key)
         self.assertEqual(summary.submitted, 0)
+        self.assertEqual(summary.deferred, 1)
         mocks["upload"].assert_not_called()
-        self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.PENDING)
+        job.refresh_from_db()
+        self.assertEqual(job.status, JobStatus.PENDING)
+        self.assertEqual(job.attempt, 1)
+        self.assertEqual(job.error_code, "LOCK_HELD")
+
+    def test_the_row_s_lock_is_held_while_its_shard_is_submitted(self):
+        # The lock the sweep reads (#534) is the row's own (#575): held
+        # on the wave's thread from the claim to the write of the id,
+        # seen from any other session meanwhile, and free after.
+        job = extract_jobs(self.scan)[0]
+        seen = []
+        real = mistral_ocr._prepare_and_submit
+
+        def spy(row, uploads):
+            seen.append(mistral_ocr.row_held(row))
+            return real(row, uploads)
+
+        with patch("scanning.mistral_ocr._prepare_and_submit", spy):
+            summary, _ = self._tick()
+        self.assertEqual(summary.submitted, 1)
+        self.assertEqual(seen, [True])
+        self.assertFalse(mistral_ocr.row_held(job))
+        # In its own namespace: a pass's lock of the same key is not
+        # read as this row's holder.
+        with locks.held(mistral_ocr.submit_lock(job)):
+            self.assertFalse(mistral_ocr.row_held(job))
+
+    def test_two_ticks_take_two_different_shards(self):
+        # Two waves, as two workers run them: each claims a row the
+        # other has not, because the claim is a compare-and-swap, and
+        # each creates its own batch.
+        ExternalJob.objects.filter(scan=self.scan).delete()
+        mistral_ocr.ensure_extract_jobs(
+            self.scan, make_manifest(shard_count=2, pages_per_shard=2)
+        )
+        first, _ = self._tick(create="batch-a")
+        second, _ = self._tick(create="batch-b")
+        self.assertEqual((first.submitted, second.submitted), (1, 1))
+        self.assertEqual(
+            [job.external_id for job in extract_jobs(self.scan)],
+            ["batch-a", "batch-b"],
+        )
 
     def test_the_scratch_dir_names_the_scan_and_is_removed(self):
         # The shard PDF is rendered in a system temp dir the #215 sweep
@@ -2132,10 +2177,10 @@ class TestSweep(ScanningTestCase):
         return summary, mocks
 
     def test_a_claim_under_a_held_submit_lock_is_still_rendering(self):
-        # A wave holds the lock (#534): the newest claim with no id is
-        # the shard it renders now, however long that takes.
+        # A wave holds the row's lock (#534, #575): the shard is the one
+        # it renders now, however long that takes.
         self._lose_the_id()
-        with locks.held(mistral_ocr.SUBMIT_LOCK):
+        with mistral_ocr.hold_row(self.job):
             summary, mocks = self._sweep_lost(
                 now=timezone.now() + timedelta(hours=2)
             )
@@ -2212,8 +2257,9 @@ class TestSweep(ScanningTestCase):
         mocks["delete"].assert_not_called()
 
     def test_a_young_claim_with_no_lock_held_waits_for_one_release(self):
-        # A pod on the code before the lock submits without it, so
-        # during the rollout a young claim with no lock is alive.
+        # A pod on the code before the per-row lock holds one lock for
+        # every row, so during the rollout a young claim with no lock
+        # of its own is alive.
         self._lose_the_id()
         summary, mocks = self._sweep_lost(
             now=self.job.submitted_at
@@ -2225,17 +2271,42 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         mocks["find"].assert_not_called()
 
-    def test_an_older_claim_under_a_held_lock_is_lost(self):
-        # The lock is held by a wave rendering a newer claim: this one
-        # was left by a worker that died before it.
+    def test_a_claim_in_the_gap_before_its_lock_is_alive(self):
+        # The wave claims, then locks: a sweep in between finds no
+        # holder, and a claim younger than LOCK_GRACE is alive for it.
+        # The one rule that outlives the legacy grace.
+        self._lose_the_id()
+        with patch.object(mistral_ocr, "LEGACY_CLAIM_GRACE", timedelta(0)):
+            summary, mocks = self._sweep_lost(
+                now=self.job.submitted_at
+                + mistral_ocr.LOCK_GRACE
+                - timedelta(seconds=1)
+            )
+            self.assertEqual(summary.pending, 1)
+            self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+            mocks["find"].assert_not_called()
+            summary, mocks = self._sweep_lost(
+                found=["f0"],
+                now=self.job.submitted_at + mistral_ocr.LOCK_GRACE,
+            )
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(self.job.status, JobStatus.PENDING)
+
+    def test_a_claim_whose_own_lock_is_free_is_lost_beside_a_held_one(self):
+        # Another row's lock is held by a wave rendering it: this one,
+        # with no holder of its own and past the legacy grace, was
+        # left by a worker that died; the held one is alive whatever
+        # its age.
         self._lose_the_id()
         newer = ExternalJob.objects.get(pk=self.job.pk)
         newer.pk = None
         newer.run = self.job.run + 1
         newer.submitted_at = self.job.submitted_at + timedelta(minutes=1)
         newer.save()
-        with locks.held(mistral_ocr.SUBMIT_LOCK):
-            summary, _ = self._sweep_lost()
+        with mistral_ocr.hold_row(newer):
+            summary, _ = self._sweep_lost(
+                now=self.job.submitted_at + timedelta(hours=2)
+            )
         self.assertEqual(summary.retried, 1)
         self.assertEqual(summary.pending, 1)
         self.assertEqual(self.job.error_code, "LOST_CLAIM")
