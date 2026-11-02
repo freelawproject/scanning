@@ -622,7 +622,7 @@ class TestSubmitWave(ScanningTestCase):
         job = extract_jobs(self.scan)[0]
         other = connections.create_connection("default")
         self.addCleanup(other.close)
-        key = [locks.NAMESPACE, locks.key(mistral_ocr.submit_lock(job))]
+        key = [locks.ROW_NAMESPACE, locks.key(mistral_ocr.submit_lock(job))]
         with other.cursor() as cursor:
             cursor.execute("SELECT pg_advisory_lock(%s, %s)", key)
         try:
@@ -647,14 +647,18 @@ class TestSubmitWave(ScanningTestCase):
         real = mistral_ocr._prepare_and_submit
 
         def spy(row, uploads):
-            seen.append(locks.is_held(mistral_ocr.submit_lock(row)))
+            seen.append(mistral_ocr.row_held(row))
             return real(row, uploads)
 
         with patch("scanning.mistral_ocr._prepare_and_submit", spy):
             summary, _ = self._tick()
         self.assertEqual(summary.submitted, 1)
         self.assertEqual(seen, [True])
-        self.assertFalse(locks.is_held(mistral_ocr.submit_lock(job)))
+        self.assertFalse(mistral_ocr.row_held(job))
+        # In its own namespace: a pass's lock of the same key is not
+        # read as this row's holder.
+        with locks.held(mistral_ocr.submit_lock(job)):
+            self.assertFalse(mistral_ocr.row_held(job))
 
     def test_two_ticks_take_two_different_shards(self):
         # Two waves, as two workers run them: each claims a row the
@@ -2176,7 +2180,7 @@ class TestSweep(ScanningTestCase):
         # A wave holds the row's lock (#534, #575): the shard is the one
         # it renders now, however long that takes.
         self._lose_the_id()
-        with locks.held(mistral_ocr.submit_lock(self.job)):
+        with mistral_ocr.hold_row(self.job):
             summary, mocks = self._sweep_lost(
                 now=timezone.now() + timedelta(hours=2)
             )
@@ -2253,8 +2257,9 @@ class TestSweep(ScanningTestCase):
         mocks["delete"].assert_not_called()
 
     def test_a_young_claim_with_no_lock_held_waits_for_one_release(self):
-        # A pod on the code before the lock submits without it, so
-        # during the rollout a young claim with no lock is alive.
+        # A pod on the code before the per-row lock holds one lock for
+        # every row, so during the rollout a young claim with no lock
+        # of its own is alive.
         self._lose_the_id()
         summary, mocks = self._sweep_lost(
             now=self.job.submitted_at
@@ -2265,6 +2270,27 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(summary.retried, 0)
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         mocks["find"].assert_not_called()
+
+    def test_a_claim_in_the_gap_before_its_lock_is_alive(self):
+        # The wave claims, then locks: a sweep in between finds no
+        # holder, and a claim younger than LOCK_GRACE is alive for it.
+        # The one rule that outlives the legacy grace.
+        self._lose_the_id()
+        with patch.object(mistral_ocr, "LEGACY_CLAIM_GRACE", timedelta(0)):
+            summary, mocks = self._sweep_lost(
+                now=self.job.submitted_at
+                + mistral_ocr.LOCK_GRACE
+                - timedelta(seconds=1)
+            )
+            self.assertEqual(summary.pending, 1)
+            self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+            mocks["find"].assert_not_called()
+            summary, mocks = self._sweep_lost(
+                found=["f0"],
+                now=self.job.submitted_at + mistral_ocr.LOCK_GRACE,
+            )
+        self.assertEqual(summary.retried, 1)
+        self.assertEqual(self.job.status, JobStatus.PENDING)
 
     def test_a_claim_whose_own_lock_is_free_is_lost_beside_a_held_one(self):
         # Another row's lock is held by a wave rendering it: this one,
@@ -2277,7 +2303,7 @@ class TestSweep(ScanningTestCase):
         newer.run = self.job.run + 1
         newer.submitted_at = self.job.submitted_at + timedelta(minutes=1)
         newer.save()
-        with locks.held(mistral_ocr.submit_lock(newer)):
+        with mistral_ocr.hold_row(newer):
             summary, _ = self._sweep_lost(
                 now=self.job.submitted_at + timedelta(hours=2)
             )

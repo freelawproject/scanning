@@ -11,7 +11,11 @@ transaction must not span.
 
 A lock is keyed by its name's CRC under one namespace, so a new pass
 needs no registry: two names collide only on a CRC collision, which
-costs a skipped tick and never a wrong write.
+costs a skipped tick and never a wrong write. A family of names that
+grows with the data (one lock per Mistral row, #575) takes a namespace
+of its own (:data:`ROW_NAMESPACE`), so a row's key can collide with
+another row's and never with a pass's: a pass's lock held for minutes
+would read as that row's holder for as long.
 
 A session lock outlives a client that vanished without closing its
 socket (a node failure, a spot reclaim, a partition) for as long as
@@ -37,6 +41,9 @@ logger = logging.getLogger(__name__)
 #: The ``classid`` every lock of this module uses; ``final_xml`` keeps
 #: its one-argument lock apart from these.
 NAMESPACE = 503
+#: The ``classid`` of the locks named per row (``mistral_ocr.submit_lock``,
+#: #575), apart from the passes' names.
+ROW_NAMESPACE = 575
 
 #: The server-side TCP keepalives of a locking session, in seconds:
 #: idle before the first probe, between probes, and how many may go
@@ -83,7 +90,9 @@ def _bound_session(cursor) -> None:
 
 
 @contextmanager
-def held(name: str, wait: bool = False) -> Iterator[bool]:
+def held(
+    name: str, wait: bool = False, namespace: int = NAMESPACE
+) -> Iterator[bool]:
     """Hold the named lock for the block, if it can be had.
 
     :param name: The lock's name.
@@ -91,6 +100,8 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
         :data:`WAIT_TIMEOUT_SECONDS`, instead of answering ``False``
         at once. For a short pass that must run after the one holding
         the lock, never for a tick.
+    :param namespace: The ``classid``; :data:`ROW_NAMESPACE` for a
+        lock named per row.
     :returns: (as the context value) Whether this call holds the lock.
         With ``wait``, ``False`` only when the wait timed out.
     """
@@ -103,7 +114,7 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
             )
             try:
                 cursor.execute(
-                    "SELECT pg_advisory_lock(%s, %s)", [NAMESPACE, key(name)]
+                    "SELECT pg_advisory_lock(%s, %s)", [namespace, key(name)]
                 )
                 got = True
             except OperationalError:
@@ -116,7 +127,7 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
                 cursor.execute("SET lock_timeout = 0")
         else:
             cursor.execute(
-                "SELECT pg_try_advisory_lock(%s, %s)", [NAMESPACE, key(name)]
+                "SELECT pg_try_advisory_lock(%s, %s)", [namespace, key(name)]
             )
             got = bool(cursor.fetchone()[0])
     try:
@@ -125,11 +136,11 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
         if got:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT pg_advisory_unlock(%s, %s)", [NAMESPACE, key(name)]
+                    "SELECT pg_advisory_unlock(%s, %s)", [namespace, key(name)]
                 )
 
 
-def is_held(name: str) -> bool:
+def is_held(name: str, namespace: int = NAMESPACE) -> bool:
     """Return whether any session holds the named lock now (#534).
 
     Read from ``pg_locks`` and never by taking the lock, so the reader
@@ -138,6 +149,8 @@ def is_held(name: str) -> bool:
     which is what lets a caller read this as "the holder is alive".
 
     :param name: The lock's name.
+    :param namespace: The ``classid``; :data:`ROW_NAMESPACE` for a
+        lock named per row.
     :returns: Whether a session of this database holds it.
     :rtype: bool
     """
@@ -148,6 +161,6 @@ def is_held(name: str) -> bool:
             " AND database = (SELECT oid FROM pg_database"
             " WHERE datname = current_database())"
             " AND classid = %s AND objid = %s AND objsubid = 2)",
-            [NAMESPACE, key(name)],
+            [namespace, key(name)],
         )
         return bool(cursor.fetchone()[0])

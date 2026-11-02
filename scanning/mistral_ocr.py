@@ -202,8 +202,15 @@ STOP_POLL_SECONDS = 0.5
 #: during a rolling deploy a claim younger than this with no lock held
 #: is read as alive, the clock the sweep used before #534. Delete it,
 #: and its branch in :func:`_claim_alive`, once that release has fully
-#: rolled out.
+#: rolled out; :data:`LOCK_GRACE` stays.
 LEGACY_CLAIM_GRACE = timedelta(minutes=30)
+
+#: The wave claims a row, then takes its lock: a sweep that reads the
+#: row in between finds no holder. A claim younger than this with no
+#: lock held is alive, so that gap, milliseconds wide, never costs a
+#: live shard its files; a render takes minutes, so a dead claim is
+#: still found inside one sweep interval of this.
+LOCK_GRACE = timedelta(minutes=2)
 
 
 def submit_lock(job: ExternalJob) -> str:
@@ -218,11 +225,26 @@ def submit_lock(job: ExternalJob) -> str:
     so the Mistral workers claim side by side and the sweep judges
     each claim by its own holder.
 
+    The lock lives in ``locks.ROW_NAMESPACE``, apart from the passes'
+    names, so a row's key can collide with another row's at worst and
+    never with a pass's lock held for minutes.
+
     :param job: The claimed row.
     :returns: ``"mistral_submit:{pk}"``.
     :rtype: str
     """
     return f"mistral_submit:{job.pk}"
+
+
+def hold_row(job: ExternalJob):
+    """Return the context that holds one row's submit lock, if it can
+    be had (:func:`locks.held` under ``ROW_NAMESPACE``)."""
+    return locks.held(submit_lock(job), namespace=locks.ROW_NAMESPACE)
+
+
+def row_held(job: ExternalJob) -> bool:
+    """Return whether any session holds one row's submit lock."""
+    return locks.is_held(submit_lock(job), namespace=locks.ROW_NAMESPACE)
 
 
 #: Submissions a row gets before it is failed. Two, because a lost
@@ -1177,7 +1199,7 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
     with ExitStack() as held:
         rows = []
         for job, urls in claimed:
-            if held.enter_context(locks.held(submit_lock(job))):
+            if held.enter_context(hold_row(job)):
                 rows.append((job, urls))
                 continue
             result = jobs._defer(
@@ -1362,11 +1384,12 @@ def _claim_alive(job: ExternalJob, now) -> bool:
     """Return whether a wave is still submitting this claimed row.
 
     Alive while a session holds the row's own lock
-    (:func:`submit_lock`): the wave takes it at the claim and lets it
-    go after the batch id is written, so a claim with no id and no
-    holder is one a killed worker left behind. With no lock held, a
-    claim inside :data:`LEGACY_CLAIM_GRACE` is alive too, for a pod on
-    the code before the per-row lock.
+    (:func:`submit_lock`): the wave takes it right after the claim and
+    lets it go after the batch id is written, so a claim with no id
+    and no holder is one a killed worker left behind, once it is older
+    than :data:`LOCK_GRACE`, the gap between the claim and the lock.
+    With no lock held, a claim inside :data:`LEGACY_CLAIM_GRACE` is
+    alive too, for a pod on the code before the per-row lock.
 
     :param job: A SUBMITTED row with no ``external_id``.
     :param now: Comparison time.
@@ -1375,9 +1398,10 @@ def _claim_alive(job: ExternalJob, now) -> bool:
     """
     if job.submitted_at is None:
         return False
-    if locks.is_held(submit_lock(job)):
+    if row_held(job):
         return True
-    return (now - job.submitted_at) < LEGACY_CLAIM_GRACE
+    age = now - job.submitted_at
+    return age < LOCK_GRACE or age < LEGACY_CLAIM_GRACE
 
 
 def discard_lost_files(job: ExternalJob) -> int | None:
