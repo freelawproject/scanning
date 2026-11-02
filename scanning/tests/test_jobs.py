@@ -602,6 +602,46 @@ class TestApplyRowsGoFirst(ScanningTestCase):
                 self.assertTrue(self._sent(apply_row))
                 self.assertFalse(self._sent(volume))
 
+    def test_the_slice_ranks_ids_before_it_joins(self):
+        """The rank reads the job table alone, and the joins touch the
+        rows the wave keeps. Ranked with the joins in place, every
+        pending row of the engine was joined to its scan and sorted,
+        six times every five seconds (2026-11-02)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = ScanFactory()
+        volume = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+        queryset = ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        )
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs._pending_slice(queryset, 2)
+        self.assertEqual(
+            [row.pk for row in rows], [apply_row.pk, min(r.pk for r in volume)]
+        )
+        self.assertEqual(len(captured), 2)
+        self.assertNotIn('"scanning_scan"', captured[0]["sql"])
+        self.assertIn('"scanning_scan"', captured[1]["sql"])
+        # The rows carry their joins: the claim reads the apply run's
+        # number and the scan without another query.
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].apply_run.scan_id, scan.pk)
+            self.assertEqual(rows[1].scan.reporter.pk, scan.reporter.pk)
+        self.assertEqual(jobs._pending_slice(queryset.none(), 2), [])
+
+    def test_the_polls_have_their_indexes(self):
+        """The wave's slice and the two sweeps' probes read an index,
+        never the table (the 2026-11-02 outage)."""
+        names = {index.name for index in ExternalJob._meta.indexes}
+        self.assertLessEqual(
+            {"idx_job_pending_wave", "idx_job_detect_probe", "idx_job_analyze_probe"},
+            names,
+        )
+
     def test_two_apply_rows_keep_the_creation_order(self):
         """The id stays the second key: one class drains fairly."""
         scan = ScanFactory()

@@ -26,6 +26,13 @@ DAEMON_MAX_INTERRUPTIONS = env.int("DAEMON_MAX_INTERRUPTIONS", default=5)
 # waves rather than a promise about them.
 DAEMON_SUBMIT_INTERVAL = env.int("DAEMON_SUBMIT_INTERVAL", default=5)
 
+# How often (in seconds) the clock sweeps for a volume with no detection
+# run or no OCR run yet (``enqueue_runs``). A volume needs a run once,
+# and the sweep asks the job table once per volume in the review
+# statuses every time it runs, so it runs a minute apart; a new upload's
+# runs start within that minute.
+DAEMON_ENQUEUE_INTERVAL = env.int("DAEMON_ENQUEUE_INTERVAL", default=60)
+
 # How often (in seconds) the daemon confirms in-flight external jobs
 # (an S3 HEAD per row) and finishes any scan whose jobs are all done.
 DAEMON_COLLECT_INTERVAL = env.int("DAEMON_COLLECT_INTERVAL", default=15)
