@@ -567,6 +567,13 @@ class TestThePageFollowsTheGroups(ScanningTestCase):
         sections = re.findall(r'data-group="([a-z]+)"', TEMPLATE.read_text())
         self.assertEqual(sections, list(card_review.GROUPS))
 
+    def test_the_script_sends_one_write_at_a_time(self):
+        """Four answers at once were four rebuilds queued on one lock
+        (2026-11-02)."""
+        source = SCRIPT.read_text()
+        self.assertIn("var writes = Promise.resolve();", source)
+        self.assertIn("writes.then(send, send)", source)
+
     def test_the_script_lists_the_groups(self):
         source = SCRIPT.read_text()
         match = re.search(r"var GROUPS = \[([^\]]*)\];", source)

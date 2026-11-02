@@ -123,13 +123,23 @@
         return fetch(url, { credentials: 'same-origin' }).then(parse);
     }
 
+    // One write in flight at a time: every write ends in a rebuild of
+    // the volume's cards on the server, and four sent at once were four
+    // rebuilds queued on one lock (2026-11-02). A failed write holds
+    // the next one back by nothing.
+    var writes = Promise.resolve();
     function postJson(url, body) {
-        return fetch(url, {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken() },
-            body: JSON.stringify(body || {})
-        }).then(parse);
+        var send = function () {
+            return fetch(url, {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken() },
+                body: JSON.stringify(body || {})
+            }).then(parse);
+        };
+        var turn = writes.then(send, send);
+        writes = turn.then(function () {}, function () {});
+        return turn;
     }
 
     function failed(answer) {

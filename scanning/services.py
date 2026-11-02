@@ -805,6 +805,52 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
     return dropped, len(report.cut)
 
 
+def detection_entry(d: Detection, page_numbers: dict) -> dict:
+    """Return one live row in the shape blackletter reads.
+
+    The one lift of a row into the dict :func:`detection_entries` lists
+    and :func:`drop_junk_entries` judges, so ``findings.read_ids`` lifts
+    the rows it judges the same way.
+
+    :param d: The row.
+    :param page_numbers: The ``{page_index: (start, end)}`` lookup, or
+        an empty dict for no printed numbers.
+    :return: The dict.
+    """
+    entry = {
+        # The row pk, so the compute can name the caption and the
+        # key rows of each opinion exactly (#240 PR C). blackletter
+        # reads the keys it knows and ignores this one.
+        "id": d.pk,
+        "page_index": d.page_index,
+        "label": d.label,
+        "label_id": d.label_id,
+        "confidence": d.confidence,
+        "bbox": [d.x0, d.y0, d.x1, d.y1],
+        "img_width": d.img_width,
+        "img_height": d.img_height,
+        "model_count": d.model_count,
+    }
+    if d.found_by and d.model_name != Detection.ModelName.MANUAL:
+        # Load-bearing, not decoration: the confidence gates are per
+        # model family since blackletter #73, and
+        # ``rows_are_bl_warm`` reads this provenance off the list.
+        # ``blackletter.api.pair`` reads it from here, so a list
+        # without it pairs a bl-warm volume on the legacy gates.
+        # A hand-added detection carries none, and must not: it
+        # would read as a second model family and send the whole
+        # volume back to those gates. Rows written before #196 carry
+        # a "manual" claim, so the row kind is the guard, not the
+        # field.
+        entry["found_by"] = d.found_by
+    pn = page_numbers.get(d.page_index)
+    if pn:
+        entry["page_number"] = pn[0]
+        if pn[1] is not None:
+            entry["page_number_end"] = pn[1]
+    return entry
+
+
 def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     """The live detections of a scan, in the shape blackletter reads.
 
@@ -833,40 +879,7 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
         .filter(scan_id=scan_pk)
         .order_by("page_index", "y0", "x0", "pk")
     )
-    det_data = []
-    for d in all_saved:
-        entry = {
-            # The row pk, so the compute can name the caption and the
-            # key rows of each opinion exactly (#240 PR C). blackletter
-            # reads the keys it knows and ignores this one.
-            "id": d.pk,
-            "page_index": d.page_index,
-            "label": d.label,
-            "label_id": d.label_id,
-            "confidence": d.confidence,
-            "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width,
-            "img_height": d.img_height,
-            "model_count": d.model_count,
-        }
-        if d.found_by and d.model_name != Detection.ModelName.MANUAL:
-            # Load-bearing, not decoration: the confidence gates are per
-            # model family since blackletter #73, and
-            # ``rows_are_bl_warm`` reads this provenance off the list.
-            # ``blackletter.api.pair`` reads it from here, so a list
-            # without it pairs a bl-warm volume on the legacy gates.
-            # A hand-added detection carries none, and must not: it
-            # would read as a second model family and send the whole
-            # volume back to those gates. Rows written before #196 carry
-            # a "manual" claim, so the row kind is the guard, not the
-            # field.
-            entry["found_by"] = d.found_by
-        pn = page_numbers.get(d.page_index)
-        if pn:
-            entry["page_number"] = pn[0]
-            if pn[1] is not None:
-                entry["page_number_end"] = pn[1]
-        det_data.append(entry)
+    det_data = [detection_entry(d, page_numbers) for d in all_saved]
     # The blot along the top or the bottom edge that the model boxes as
     # a key icon or a headnote, the image box that is a text box's twin
     # and the key that is the show-through of the leaf's other side are

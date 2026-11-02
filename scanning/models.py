@@ -555,6 +555,19 @@ class opinion_pdf_path:
 
 
 class Scan(AbstractDateTimeModel):
+    #: The columns that hold a volume's caches and logs, kilobytes to
+    #: megabytes a row. A list of scans defers them (``views.scan_list``):
+    #: a page of twenty-five that read them pulled every volume's OCR
+    #: cache off disk (2026-11-02). A reader that needs one loads it on
+    #: access.
+    LARGE_FIELDS = (
+        "progress_log",
+        "ocr_results",
+        "page_map",
+        "missing_pages",
+        "page_scores",
+    )
+
     volume_obj = models.ForeignKey(
         Volume,
         on_delete=models.PROTECT,
