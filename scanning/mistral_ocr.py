@@ -110,6 +110,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -539,12 +540,21 @@ class _Submission:
     :ivar files: Every file id uploaded: the pages, then the manifest.
     :ivar page_count: Pages rendered and uploaded.
     :ivar duration_ms: Wall clock of download, render, upload, create.
+    :ivar phases: Where that wall clock went, in milliseconds:
+        ``download_ms`` (the shard from S3), ``render_ms`` (the pages
+        on this thread), ``upload_wait_ms`` (this thread waiting on
+        the upload pool, at the backlog and for the last uploads to
+        land), ``create_ms`` (the manifest and the batch), and
+        ``pages_per_second`` over the whole. A slow shard says which
+        of the four was slow: the bucket, the CPU, the network or
+        Mistral's throttling, or the batch API.
     """
 
     job_id: str
     files: list[str] = field(default_factory=list)
     page_count: int = 0
     duration_ms: int = 0
+    phases: dict = field(default_factory=dict)
 
 
 def _delete_files(
@@ -897,6 +907,7 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
         str(f) for f in (job.provider_meta or {}).get("files_left") or []
     ]
     left = _delete_files(carried, pool=uploads.pool)
+    clock = _Phases()
     try:
         # Named after the scan and the shard, as the other stages name
         # theirs: an orphan of a SIGKILL holds a shard PDF of up to
@@ -906,15 +917,23 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             prefix=f"{RENDER_TMP_PREFIX}{job.scan_id}-s{job.shard_index}-"
         ) as tmp:
             pdf_path = Path(tmp) / "shard.pdf"
-            s3_sync.download_object(job.input_key, pdf_path)
+            with clock.measure("download_ms"):
+                s3_sync.download_object(job.input_key, pdf_path)
             try:
-                for page_no, png in render_shard_pages(
+                rendered = render_shard_pages(
                     pdf_path,
                     whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
-                ):
+                )
+                while True:
+                    with clock.measure("render_ms"):
+                        page = next(rendered, None)
+                    if page is None:
+                        break
+                    page_no, png = page
                     # The slot is taken here and given back by the
                     # upload, or below for a page cancelled unstarted.
-                    _take_slot(uploads, pages)
+                    with clock.measure("upload_wait_ms"):
+                        _take_slot(uploads, pages)
                     pages.append(
                         (
                             page_no,
@@ -936,7 +955,8 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
         # in flight would land after the delete; and a page that
         # failed after the last was handed over ends the shard as one
         # that failed during the render does.
-        wait([future for _, future in pages], return_when=FIRST_EXCEPTION)
+        with clock.measure("upload_wait_ms"):
+            wait([future for _, future in pages], return_when=FIRST_EXCEPTION)
         failed = _first_failure(pages)
         if failed is not None:
             _let_go(uploads, pages, abandoned)
@@ -948,22 +968,24 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             files.append(file_id)
             lines.append(_manifest_line(page_no, file_id, model))
         _stop_if_asked()
-        manifest_id = mistral_client.upload_file(
-            f"{prefix}manifest.jsonl",
-            "\n".join(lines).encode("utf-8"),
-            MANIFEST_FILE_PURPOSE,
-        )
+        with clock.measure("create_ms"):
+            manifest_id = mistral_client.upload_file(
+                f"{prefix}manifest.jsonl",
+                "\n".join(lines).encode("utf-8"),
+                MANIFEST_FILE_PURPOSE,
+            )
         tail.append(manifest_id)
         _stop_if_asked()
-        job_id = mistral_client.create_batch(
-            manifest_id,
-            metadata={
-                "scan": str(job.scan_id),
-                "job": str(job.pk),
-                "shard": str(job.shard_index),
-            },
-            timeout_hours=BATCH_TIMEOUT_HOURS,
-        )
+        with clock.measure("create_ms"):
+            job_id = mistral_client.create_batch(
+                manifest_id,
+                metadata={
+                    "scan": str(job.scan_id),
+                    "job": str(job.pk),
+                    "shard": str(job.shard_index),
+                },
+                timeout_hours=BATCH_TIMEOUT_HOURS,
+            )
     except Exception:
         landed = _uploaded(pages) + tail
         uploads.tried[job.pk] = carried + landed
@@ -971,12 +993,58 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
         raise
     uploads.tried[job.pk] = carried
     uploads.left[job.pk] = left
+    duration_ms = int((time.monotonic() - started) * 1000)
     return _Submission(
         job_id=job_id,
         files=files + tail,
         page_count=len(files),
-        duration_ms=int((time.monotonic() - started) * 1000),
+        duration_ms=duration_ms,
+        phases=clock.report(len(files), duration_ms),
     )
+
+
+class _Phases:
+    """The clock of one shard's submission, phase by phase.
+
+    Each :meth:`measure` adds the block's wall time to the named phase,
+    so a phase entered many times (every page's render, every wait at
+    the backlog) is one number.
+    """
+
+    def __init__(self) -> None:
+        self.ms: dict[str, int] = {}
+
+    @contextmanager
+    def measure(self, phase: str) -> Iterator[None]:
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.ms[phase] = self.ms.get(phase, 0) + int(
+                (time.monotonic() - started) * 1000
+            )
+
+    def report(self, page_count: int, duration_ms: int) -> dict:
+        """Return the phases with the pages per second over the whole.
+
+        :param page_count: Pages the shard had.
+        :param duration_ms: The shard's whole wall clock.
+        :returns: The ledger ``_apply_outcome`` writes.
+        :rtype: dict
+        """
+        report = {
+            phase: self.ms.get(phase, 0)
+            for phase in (
+                "download_ms",
+                "render_ms",
+                "upload_wait_ms",
+                "create_ms",
+            )
+        }
+        report["pages_per_second"] = (
+            round(page_count * 1000 / duration_ms, 2) if duration_ms else None
+        )
+        return report
 
 
 def _stop_if_asked() -> None:
@@ -1054,6 +1122,7 @@ def _apply_outcome(
             "page_count": submission.page_count,
             "duration_ms": submission.duration_ms,
             "model": model_for(job),
+            **submission.phases,
         }
         written = jobs._write(
             job, external_id=submission.job_id, provider_meta=meta
@@ -1072,15 +1141,22 @@ def _apply_outcome(
                 job, submission.job_id, files=list(submission.files) + left
             )
             return "skipped"
+        phases = submission.phases
         logger.info(
             "job %s (scan %s shard %s): %d page(s) submitted as Mistral "
-            "batch %s in %d ms",
+            "batch %s in %d ms (download %s, render %s, upload wait %s, "
+            "create %s; %s pages/s)",
             job.pk,
             job.scan_id,
             job.shard_index,
             submission.page_count,
             submission.job_id,
             submission.duration_ms,
+            phases.get("download_ms"),
+            phases.get("render_ms"),
+            phases.get("upload_wait_ms"),
+            phases.get("create_ms"),
+            phases.get("pages_per_second"),
         )
         return "submitted"
 
@@ -1717,6 +1793,44 @@ def _record_progress(job: ExternalJob, outcome, now) -> bool:
     )
 
 
+def batch_timings(batch, now) -> dict:
+    """Return where a finished batch's time went on Mistral's side.
+
+    Off the batch object's own clocks, epoch seconds: ``batch_wait_ms``
+    from its creation to its start (Mistral's queue), ``batch_run_ms``
+    from its start to its end (Mistral's read), and ``poll_lag_ms``
+    from its end to the tick that harvested it (our poll interval).
+    Beside the row's ``duration_ms``, claim to harvest, the three say
+    whether a slow shard waited on us or on Mistral. A clock the
+    object lacks leaves its number out.
+
+    :param batch: The batch object, as the poll returned it.
+    :param now: The harvest time.
+    :returns: The timings that could be read.
+    :rtype: dict
+    """
+    if not isinstance(batch, dict):
+        return {}
+
+    def seconds(name):
+        value = batch.get(name)
+        return float(value) if isinstance(value, (int, float)) else None
+
+    created = seconds("created_at")
+    started = seconds("started_at")
+    completed = seconds("completed_at")
+    timings = {}
+    if created is not None and started is not None:
+        timings["batch_wait_ms"] = max(0, int((started - created) * 1000))
+    if started is not None and completed is not None:
+        timings["batch_run_ms"] = max(0, int((completed - started) * 1000))
+    if completed is not None:
+        timings["poll_lag_ms"] = max(
+            0, int((now.timestamp() - completed) * 1000)
+        )
+    return timings
+
+
 def harvest(
     job: ExternalJob, outcome: mistral_client.BatchOutcome, now
 ) -> bool:
@@ -1822,6 +1936,7 @@ def harvest(
         "duration_ms": int((now - job.submitted_at).total_seconds() * 1000)
         if job.submitted_at
         else None,
+        **batch_timings(outcome.job, now),
     }
     meta = job.provider_meta or {}
     files = [str(f) for f in meta.get("files") or []] + [
@@ -1848,6 +1963,21 @@ def harvest(
         _carry_files_left(job, outputs, _delete_files(outputs))
         return False
     _carry_files_left(job, files + outputs, _delete_files(files + outputs))
+    logger.info(
+        "job %s (scan %s shard %s): batch %s harvested, %d page(s), %d "
+        "failed; claim to harvest %s ms, of which Mistral queued %s ms, "
+        "ran %s ms, and the poll lagged %s ms",
+        job.pk,
+        job.scan_id,
+        job.shard_index,
+        job.external_id,
+        page_count,
+        len(failed_pages),
+        summary.get("duration_ms"),
+        summary.get("batch_wait_ms"),
+        summary.get("batch_run_ms"),
+        summary.get("poll_lag_ms"),
+    )
     return True
 
 

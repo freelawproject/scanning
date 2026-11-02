@@ -412,7 +412,28 @@ class TestSubmitWave(ScanningTestCase):
         self.assertEqual(job.status, JobStatus.SUBMITTED)
         self.assertEqual(job.external_id, "batch-1")
         self.assertEqual(job.provider_meta["files"], ["f0", "f1", "m1"])
-        self.assertEqual(job.provider_meta["submission"]["page_count"], 2)
+        submission = job.provider_meta["submission"]
+        self.assertEqual(submission["page_count"], 2)
+        # Where the submission's time went, phase by phase: the four
+        # add up to no more than the whole, and the rate is over the
+        # whole.
+        phases = [
+            submission[key]
+            for key in (
+                "download_ms",
+                "render_ms",
+                "upload_wait_ms",
+                "create_ms",
+            )
+        ]
+        self.assertTrue(all(isinstance(ms, int) and ms >= 0 for ms in phases))
+        self.assertLessEqual(sum(phases), submission["duration_ms"] + 1)
+        self.assertEqual(
+            submission["pages_per_second"],
+            round(2000 / submission["duration_ms"], 2)
+            if submission["duration_ms"]
+            else None,
+        )
         self.assertEqual(job.deadline - job.submitted_at, timedelta(hours=25))
         self.assertTrue(job.result_key.endswith("r1-s0-a1.json"))
         self.assertIn("jobs/extract/mistral_ocr/", job.result_key)
@@ -1572,6 +1593,51 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.IN_PROGRESS)
         self.assertEqual(self.job.deadline, before)
         self.assertEqual(self.job.provider_meta["progress"]["succeeded"], 1)
+
+    def test_the_harvest_records_where_the_batch_s_time_went(self):
+        # Off the batch object's own clocks: Mistral's queue, Mistral's
+        # read, and our poll's lag behind the end. Beside the row's
+        # claim-to-harvest total, they say whose the wait was.
+        completed = timezone.now()
+        created = int(completed.timestamp()) - 100
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            total=2,
+            succeeded=2,
+            output_file="out-1",
+            job={
+                "id": "batch-1",
+                "status": "SUCCESS",
+                "created_at": created,
+                "started_at": created + 10,
+                "completed_at": created + 100,
+            },
+        )
+        with self.assertLogs("scanning.mistral_ocr", "INFO") as logs:
+            summary, _ = self._sweep(
+                outcome,
+                output=self.OUTPUT,
+                now=completed + timedelta(seconds=30),
+            )
+        self.assertEqual(summary.completed, 1)
+        output = self.job.provider_meta["output"]
+        self.assertEqual(output["batch_wait_ms"], 10_000)
+        self.assertEqual(output["batch_run_ms"], 90_000)
+        self.assertAlmostEqual(output["poll_lag_ms"], 30_000, delta=1000)
+        self.assertTrue(
+            any("Mistral queued 10000 ms" in line for line in logs.output)
+        )
+
+    def test_batch_timings_leave_out_a_clock_the_object_lacks(self):
+        now = timezone.now()
+        self.assertEqual(mistral_ocr.batch_timings(None, now), {})
+        self.assertEqual(mistral_ocr.batch_timings({"id": "b"}, now), {})
+        only_end = mistral_ocr.batch_timings(
+            {"completed_at": int(now.timestamp()) - 5}, now
+        )
+        self.assertEqual(list(only_end), ["poll_lag_ms"])
+        self.assertAlmostEqual(only_end["poll_lag_ms"], 5000, delta=1000)
 
     def test_success_stores_the_output_whole_and_completes(self):
         outcome = mistral_client.BatchOutcome(
