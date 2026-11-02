@@ -2668,8 +2668,12 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     )
     if not ids:
         return []
-    # ``s3_job_attempt_key`` reads the apply run's number (#224).
-    rows = ExternalJob.objects.filter(pk__in=ids).select_related(
+    # Read again as PENDING: the claim's compare-and-swap (``_write``)
+    # tests the status it read, so a row cancelled or failed between the
+    # two queries must not be read at all, or it would be swapped from
+    # that status into SUBMITTED. ``s3_job_attempt_key`` reads the apply
+    # run's number (#224).
+    rows = queryset.filter(pk__in=ids, status=JobStatus.PENDING).select_related(
         "scan", "scan__reporter", "apply_run"
     )
     by_id = {row.pk: row for row in rows}

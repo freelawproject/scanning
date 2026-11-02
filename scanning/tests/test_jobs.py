@@ -626,6 +626,11 @@ class TestApplyRowsGoFirst(ScanningTestCase):
         self.assertEqual(len(captured), 2)
         self.assertNotIn('"scanning_scan"', captured[0]["sql"])
         self.assertIn('"scanning_scan"', captured[1]["sql"])
+        # Both reads ask for PENDING: the claim swaps on the status it
+        # read, so a row another writer moved between the two queries
+        # must not come back at all.
+        for query in captured:
+            self.assertIn("'pending'", query["sql"])
         # The rows carry their joins: the claim reads the apply run's
         # number and the scan without another query.
         with self.assertNumQueries(0):
