@@ -638,7 +638,11 @@ class TestApplyRowsGoFirst(ScanningTestCase):
         never the table (the 2026-11-02 outage)."""
         names = {index.name for index in ExternalJob._meta.indexes}
         self.assertLessEqual(
-            {"idx_job_pending_wave", "idx_job_detect_probe", "idx_job_analyze_probe"},
+            {
+                "idx_job_pending_wave",
+                "idx_job_detect_probe",
+                "idx_job_analyze_probe",
+            },
             names,
         )
 
