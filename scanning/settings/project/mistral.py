@@ -27,10 +27,10 @@ env = environ.FileAwareEnv()
 MISTRAL_API_KEY = env.str("MISTRAL_API_KEY", default="")
 MISTRAL_MODEL = env.str("MISTRAL_MODEL", default="mistral-ocr-latest")
 
-# Shards one submit wave renders and uploads at once. Zero is "by mode"
-# (``mistral_ocr.submits_per_tick``): one under the daemon, whose
-# serial scheduler the wave blocks, and a volume's worth under Celery,
-# where the wave is its own locked task.
+# Shards one submit wave renders and uploads at once. Zero is one
+# (``mistral_ocr.submits_per_tick``): a wave of a volume's worth held
+# the heavy worker for the whole volume's render, so this is raised
+# only for a measurement.
 MISTRAL_SUBMITS_PER_TICK = env.int("MISTRAL_SUBMITS_PER_TICK", default=0)
 
 # Batch jobs in flight at Mistral at once, over every volume. Batches
