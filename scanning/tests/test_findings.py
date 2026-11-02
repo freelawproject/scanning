@@ -155,6 +155,127 @@ def checks_of(scan) -> list[str]:
     )
 
 
+class TestReadIds(ScanningTestCase):
+    """The junk verdict of a key icon reads the key icons, and of a
+    headnote its page's edge bands, so the set is judged over those rows
+    and never the volume (2026-11-02)."""
+
+    def _volume(self):
+        scan = make_scan()
+        rows = {
+            "key0": make_detection(scan, "KEY_ICON", 0),
+            "key1": make_detection(scan, "KEY_ICON", 1, y0=600.0, y1=690.0),
+            # The show-through of key1 on the facing page: mirrored about
+            # the page's vertical axis, at the same height, faint.
+            "ghost": make_detection(
+                scan,
+                "KEY_ICON",
+                2,
+                x0=1700.0 - 340.0,
+                x1=1700.0 - 100.0,
+                y0=600.0,
+                y1=690.0,
+                confidence=0.4,
+            ),
+            # A narrow box the model called a key, on the blot along the
+            # top edge (blackletter junk.BAND: the first six per cent).
+            "blot_key": make_detection(
+                scan,
+                "KEY_ICON",
+                1,
+                x0=100.0,
+                x1=160.0,
+                y0=0.0,
+                y1=40.0,
+                confidence=0.5,
+            ),
+            "headnote": make_detection(scan, "HEADNOTE", 0, confidence=0.95),
+            "headnote1": make_detection(scan, "HEADNOTE", 1, confidence=0.95),
+            "blot_headnote": make_detection(
+                scan, "HEADNOTE", 2, confidence=0.95, y0=0.0, y1=40.0
+            ),
+            "column": make_detection(
+                scan,
+                "TEXT_COLUMN",
+                0,
+                label_id=int(Label.TEXT_COLUMN),
+                x0=90.0,
+                y0=50.0,
+                x1=800.0,
+                y1=2000.0,
+            ),
+            # An image box that is the column's twin: the image rule
+            # drops it, and it is no key and no headnote.
+            "twin": make_detection(
+                scan,
+                "IMAGE",
+                0,
+                label_id=int(Label.IMAGE),
+                x0=90.0,
+                y0=50.0,
+                x1=800.0,
+                y1=2000.0,
+            ),
+        }
+        # blackletter reads the label off its id first, so the ids are
+        # its own: the helper's are the step-2 viewer's shorthand.
+        for name in ("KEY_ICON", "HEADNOTE"):
+            Detection.objects.filter(scan=scan, label=name).update(
+                label_id=int(Label[name])
+            )
+        return scan, rows
+
+    def test_the_verdicts_are_the_computes(self):
+        """Over one volume, the set is the compute's own pass (every
+        row, every rule) filtered to the two labels."""
+        from scanning import services
+
+        scan, rows = self._volume()
+        full = {
+            e["id"]
+            for e in services.detection_entries(scan.pk, page_numbers={})
+        }
+        judged = {
+            r.pk
+            for r in Detection.objects.filter(
+                scan=scan, label__in=["KEY_ICON", "HEADNOTE"]
+            )
+        }
+        read = findings.read_ids(scan)
+        self.assertEqual(read, full & judged)
+        self.assertIn(rows["key0"].pk, read)
+        self.assertIn(rows["headnote"].pk, read)
+        self.assertNotIn(rows["blot_key"].pk, read)
+        self.assertNotIn(rows["blot_headnote"].pk, read)
+
+    def test_it_loads_the_two_labels_and_no_other_row(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan, rows = self._volume()
+        with CaptureQueriesContext(connection) as captured:
+            findings.read_ids(scan)
+        self.assertEqual(len(captured), 1)
+        sql = captured[0]["sql"]
+        self.assertIn("'KEY_ICON'", sql)
+        self.assertIn("'HEADNOTE'", sql)
+        self.assertIn('"label" IN', sql)
+
+    def test_pages_limit_the_headnotes_and_never_the_keys(self):
+        scan, rows = self._volume()
+        read = findings.read_ids(scan, pages={0})
+        self.assertIn(rows["headnote"].pk, read)
+        self.assertNotIn(rows["headnote1"].pk, read)
+        self.assertNotIn(rows["blot_headnote"].pk, read)
+        # The keys are judged as the volume's whatever the pages: each
+        # one's verdict reads the others (the median, the facing page).
+        keys = {
+            r.pk for r in Detection.objects.filter(scan=scan, label="KEY_ICON")
+        }
+        self.assertEqual(read & keys, findings.read_ids(scan) & keys)
+        self.assertIn(rows["key0"].pk, read)
+
+
 class TestRebuild(ScanningTestCase):
     """Every finding is derived from the rows."""
 
@@ -169,6 +290,86 @@ class TestRebuild(ScanningTestCase):
         self.assertEqual(findings.rebuild(scan), 0)
 
         self.assertEqual(checks_of(scan), [])
+
+    def test_the_rebuild_holds_the_volumes_lock_before_its_first_read(self):
+        """Two rebuilds run in turn, and the later one reads the earlier
+        write: five at once left the cards at whichever finished last
+        (2026-11-02)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = make_scan()
+        with CaptureQueriesContext(connection) as captured:
+            findings.rebuild(scan)
+        sqls = [q["sql"] for q in captured]
+        lock = next(
+            i for i, sql in enumerate(sqls) if "pg_advisory_xact_lock" in sql
+        )
+        reads = [i for i, sql in enumerate(sqls) if 'FROM "scanning_' in sql]
+        self.assertTrue(reads)
+        self.assertLess(lock, min(reads))
+
+    def test_the_landed_decision_ids_carry_no_ordering(self):
+        """The model's default order would ride into the DISTINCT and
+        widen it to every row of the volume."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = make_scan()
+        with CaptureQueriesContext(connection) as captured:
+            list(findings._stale_findings(scan, None))
+        distinct = [q["sql"] for q in captured if "DISTINCT" in q["sql"]]
+        self.assertEqual(len(distinct), 3)
+        for sql in distinct:
+            self.assertNotIn("ORDER BY", sql)
+            self.assertNotIn("page_index", sql)
+
+    def test_a_page_rebuild_replaces_the_headnote_cards_of_its_page_alone(
+        self,
+    ):
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(scan, "HEADNOTE", 0, confidence=0.95)
+        make_detection(scan, "HEADNOTE", 1, confidence=0.95)
+        findings.rebuild(scan)
+        cards = {
+            row.page_number: row.pk
+            for row in scan.issues.filter(
+                check_name=CheckName.UNCOVERED_HEADNOTE
+            )
+        }
+        self.assertEqual(set(cards), {1, 2})
+        findings.rebuild(scan, pages={0})
+        after = {
+            row.page_number: row.pk
+            for row in scan.issues.filter(
+                check_name=CheckName.UNCOVERED_HEADNOTE
+            )
+        }
+        self.assertEqual(set(after), {1, 2})
+        self.assertEqual(after[2], cards[2])
+        self.assertNotEqual(after[1], cards[1])
+
+    def test_a_page_rebuild_reads_no_other_pages_headnotes(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = make_scan()
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 3)
+        make_boundary(scan, caption, key)
+        make_detection(scan, "HEADNOTE", 0, confidence=0.95)
+        make_detection(scan, "HEADNOTE", 1, confidence=0.95)
+        with CaptureQueriesContext(connection) as captured:
+            findings.rebuild(scan, pages={0})
+        headnote_reads = [
+            q["sql"] for q in captured if "'HEADNOTE'" in q["sql"]
+        ]
+        self.assertTrue(headnote_reads)
+        for sql in headnote_reads:
+            self.assertIn('"page_index" IN', sql)
 
     def test_a_key_icon_no_boundary_names_is_unmatched(self):
         scan = make_scan()

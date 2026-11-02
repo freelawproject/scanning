@@ -123,6 +123,8 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
+        # The row's caches and logs stay on disk: the list prints none.
+        .defer(*Scan.LARGE_FIELDS)
         # The legacy rows, on purpose: ``opinions`` is the new
         # ``Opinion`` table since #335, and this column counts what the
         # legacy pipeline generated. #334 gives the new rows their own

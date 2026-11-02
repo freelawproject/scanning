@@ -1029,6 +1029,7 @@ class TestThePageScopedRebuild(ScanningTestCase):
             undetected.uncovered: CheckName.UNDETECTED_TEXT,
             undetected.cut_lines: CheckName.REDACTION_CUTS_TEXT,
             pictures.uncovered: CheckName.UNBOXED_PICTURE,
+            findings._uncovered_headnote_findings: CheckName.UNCOVERED_HEADNOTE,
         }
         for fn in takers:
             self.assertIn("pages", inspect.signature(fn).parameters, fn)

@@ -61,7 +61,7 @@ from typing import Any
 
 from blackletter.models import Label
 from blackletter.scanner import HEAD_MATTER_LABELS, label_confidence
-from django.db import transaction
+from django.db import connection, transaction
 from django.db.models import BooleanField, Count, Q
 from django.db.models.expressions import RawSQL
 from django.utils import timezone
@@ -164,8 +164,16 @@ PAGE_CHECKS = frozenset(
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
         CheckName.UNBOXED_PICTURE,
+        # A headnote box is judged against the black boxes of its own
+        # page, so a write on a page rebuilds that page's cards alone.
+        CheckName.UNCOVERED_HEADNOTE,
     }
 )
+
+#: The advisory-lock namespace of :func:`rebuild`'s per-volume lock,
+#: keyed by the scan's pk. Apart from ``locks.NAMESPACE`` (session locks
+#: keyed by a name's hash) so a pk can never collide with a name.
+LOCK_NAMESPACE = 504
 
 
 def rebuild(
@@ -195,34 +203,38 @@ def rebuild(
         write touched, or None for the whole volume.
     :returns: How many findings stand open (not dismissed).
     """
-    if run is _RESOLVE:
-        run = detections.measured_run(scan)
     scoped = None if pages is None else set(pages)
-    found = list(_stale_findings(scan, run))
-    if OpinionBoundary.objects.computed().filter(scan=scan).exists():
-        rows = boundaries.standing(scan)
-        read = read_ids(scan)
-        found.extend(_unmatched_findings(scan, rows, read))
-        found.extend(_uncovered_pages_findings(scan, rows, run))
-        found.extend(_uncovered_headnote_findings(scan, read))
-        found.extend(_low_confidence_bracket_findings(scan))
-        found.extend(brackets.missing(scan, rows, run))
-        found.extend(editorial.uncovered(scan, run, scoped))
-        found.extend(undetected.uncovered(scan, run, scoped))
-        found.extend(undetected.cut_lines(scan, run, scoped))
-        found.extend(pictures.uncovered(scan, run, scoped))
-    resolve(scan, found)
     with transaction.atomic():
-        # One row lock on the scan serializes the rebuilds. Under READ
-        # COMMITTED a second DELETE that starts before the first
-        # transaction commits does not see its new rows, and both sets
-        # survive: two tabs, a double click, or a curator write during
-        # a compute doubled every card.
-        list(
-            Scan.objects.select_for_update()
-            .filter(pk=scan.pk)
-            .values_list("pk", flat=True)
-        )
+        # One advisory lock per volume, held from the first read to the
+        # card write, so two rebuilds run in turn and the later one
+        # reads the earlier one's write. The row lock that only wrapped
+        # the write (#240) kept two card sets from both surviving a
+        # double click, but not the reads before it: five writes at
+        # once each rebuilt from a snapshot of its own age, and the
+        # cards were left at whichever finished last (2026-11-02). A
+        # transaction lock releases at commit and holds no row, so a
+        # status swap or a heartbeat on the scan never waits on it.
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s, %s)",
+                [LOCK_NAMESPACE, scan.pk],
+            )
+        if run is _RESOLVE:
+            run = detections.measured_run(scan)
+        found = list(_stale_findings(scan, run))
+        if OpinionBoundary.objects.computed().filter(scan=scan).exists():
+            rows = boundaries.standing(scan)
+            read = read_ids(scan, scoped)
+            found.extend(_unmatched_findings(scan, rows, read))
+            found.extend(_uncovered_pages_findings(scan, rows, run))
+            found.extend(_uncovered_headnote_findings(scan, read, scoped))
+            found.extend(_low_confidence_bracket_findings(scan))
+            found.extend(brackets.missing(scan, rows, run))
+            found.extend(editorial.uncovered(scan, run, scoped))
+            found.extend(undetected.uncovered(scan, run, scoped))
+            found.extend(undetected.cut_lines(scan, run, scoped))
+            found.extend(pictures.uncovered(scan, run, scoped))
+        resolve(scan, found)
         stale = Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS)
         if scoped is not None:
             # The page cards of the other pages stand: their rows did
@@ -339,6 +351,9 @@ def _stale_findings(scan: Scan, run: ApplyRun | None):
     # Detection decisions: standing, and no model row points at them.
     landed = set(
         Detection.objects.filter(scan=scan, decision__isnull=False)
+        # No ordering: the model's default order would ride into the
+        # DISTINCT and widen it to every row of the volume.
+        .order_by()
         .values_list("decision_id", flat=True)
         .distinct()
     )
@@ -369,6 +384,9 @@ def _stale_findings(scan: Scan, run: ApplyRun | None):
     # Redactions: a dismiss no computed row points at, an add unplaced.
     landed = set(
         Redaction.objects.filter(scan=scan, decision__isnull=False)
+        # No ordering: the model's default order would ride into the
+        # DISTINCT and widen it to every row of the volume.
+        .order_by()
         .values_list("decision_id", flat=True)
         .distinct()
     )
@@ -384,6 +402,9 @@ def _stale_findings(scan: Scan, run: ApplyRun | None):
     # Boundaries: the same two rules over the start anchor.
     landed = set(
         OpinionBoundary.objects.filter(scan=scan, decision__isnull=False)
+        # No ordering: the model's default order would ride into the
+        # DISTINCT and widen it to every row of the volume.
+        .order_by()
         .values_list("decision_id", flat=True)
         .distinct()
     )
@@ -463,8 +484,8 @@ def _caption_is_continuation(
     return False
 
 
-def read_ids(scan: Scan) -> set[int]:
-    """Return the ids of the live rows the compute read.
+def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
+    """Return the ids of the live key icons and headnotes the compute read.
 
     ``services.detection_entries`` is the one list the compute pairs
     and measures, and blackletter's junk pass has run over it: a key
@@ -476,17 +497,40 @@ def read_ids(scan: Scan) -> set[int]:
     was never part of. The rows themselves stay live: only the list
     changes.
 
+    Two checks ask, about key icons (``_unmatched_findings``) and
+    headnotes (``_uncovered_headnote_findings``), and for those two
+    labels the junk rules read nothing else: a key is judged by the
+    edge bands, the median width of the volume's keys and the keys of
+    the facing pages; a headnote by the edge bands alone; the image
+    twin rule drops images. So the pass runs here over the volume's
+    key icons and the headnotes of ``pages``, the same verdicts the
+    compute's pass gave them, and never over the volume's other rows:
+    loading every detection of a volume for every click was the volume
+    read behind the 2026-11-02 hangs.
+
     :param scan: The scan.
-    :returns: The ``Detection`` pks of the entries.
+    :param pages: The page indexes whose headnotes are wanted, or None
+        for every page. The key icons are always the volume's, because
+        each one's verdict reads the others.
+    :returns: The ``Detection`` pks the compute read, of those labels.
     :rtype: set[int]
     """
-    from scanning.services import detection_entries
+    from scanning.services import detection_entry, drop_junk_entries
 
-    return {
-        entry["id"]
-        for entry in detection_entries(scan.pk, page_numbers={})
-        if entry.get("id") is not None
-    }
+    rows = Detection.objects.live().filter(scan=scan)
+    if pages is None:
+        rows = rows.filter(label__in=["KEY_ICON", "HEADNOTE"])
+    else:
+        rows = rows.filter(
+            Q(label="KEY_ICON")
+            | Q(label="HEADNOTE", page_index__in=list(pages))
+        )
+    entries = [
+        detection_entry(row, {})
+        for row in rows.order_by("page_index", "y0", "x0", "pk")
+    ]
+    drop_junk_entries(entries)
+    return {entry["id"] for entry in entries}
 
 
 def _unmatched_findings(
@@ -1019,7 +1063,11 @@ def _uncovered_pages_findings(
         }
 
 
-def _uncovered_headnote_findings(scan: Scan, read: set[int] | None = None):
+def _uncovered_headnote_findings(
+    scan: Scan,
+    read: set[int] | None = None,
+    pages: Collection[int] | None = None,
+):
     """Yield one finding per confident headnote box no headnote box covers.
 
     The detections are in the render's pixels and the redactions in
@@ -1031,10 +1079,19 @@ def _uncovered_headnote_findings(scan: Scan, read: set[int] | None = None):
     another type (a key number) is not cover, whatever it overlaps.
     """
     boxes: dict[int, list[tuple[float, float, float, float]]] = {}
-    for row in (
-        Redaction.objects.visible()
-        .filter(scan=scan, fill=Redaction.Fill.BLACK)
-        .filter(Q(rect_type="headnote") | Q(origin=Redaction.Origin.HUMAN))
+    blacks = Redaction.objects.visible().filter(
+        scan=scan, fill=Redaction.Fill.BLACK
+    )
+    headnotes = Detection.objects.live().filter(
+        scan=scan, label="HEADNOTE", confidence__gte=HEADNOTE_CONFIDENCE
+    )
+    if pages is not None:
+        # A page's boxes are judged against its own black boxes, so a
+        # write on a page reads that page and no other.
+        blacks = blacks.filter(page_index__in=list(pages))
+        headnotes = headnotes.filter(page_index__in=list(pages))
+    for row in blacks.filter(
+        Q(rect_type="headnote") | Q(origin=Redaction.Origin.HUMAN)
     ):
         boxes.setdefault(row.page_index, []).append(
             (row.x0, row.y0, row.x1, row.y1)
@@ -1043,17 +1100,8 @@ def _uncovered_headnote_findings(scan: Scan, read: set[int] | None = None):
     # the blot along the page edge had no redaction because it was
     # never in the document, and it is no card.
     if read is None:
-        read = read_ids(scan)
-    for det in (
-        Detection.objects.live()
-        .filter(
-            scan=scan,
-            label="HEADNOTE",
-            confidence__gte=HEADNOTE_CONFIDENCE,
-            pk__in=read,
-        )
-        .order_by("page_index", "y0")
-    ):
+        read = read_ids(scan, pages)
+    for det in headnotes.filter(pk__in=read).order_by("page_index", "y0"):
         cx, cy = boundaries.to_points(
             (det.x0 + det.x1) / 2,
             (det.y0 + det.y1) / 2,

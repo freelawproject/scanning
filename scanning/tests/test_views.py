@@ -147,6 +147,20 @@ class TestAuthentication(ScanningTestCase):
 class TestScanList(ScanningTestCase):
     """Test the scan list view."""
 
+    def test_the_list_leaves_the_volumes_caches_on_disk(self):
+        """A page of twenty-five that read every scan's OCR cache pulled
+        megabytes a page off the database (2026-11-02)."""
+        from scanning.factories import ScanFactory
+        from scanning.models import Scan
+
+        ScanFactory()
+        self.client.force_login(self.make_user())
+        response = self.client.get(reverse("scan_list"))
+        scan = response.context["page_obj"][0]
+        self.assertLessEqual(
+            set(Scan.LARGE_FIELDS), scan.get_deferred_fields()
+        )
+
     def test_shows_all_scans(self):
         user = self.make_user()
         self.client.force_login(user)
