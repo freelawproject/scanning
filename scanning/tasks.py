@@ -617,7 +617,7 @@ class Tick:
 #: them; the order matters nothing to the workers.
 TICKS: tuple[Tick, ...] = (
     Tick("claim_scans", claim_scans, "DAEMON_POLL_INTERVAL", QUEUE_HEAVY),
-    Tick("enqueue_runs", enqueue_runs, "DAEMON_SUBMIT_INTERVAL", QUEUE_FAST),
+    Tick("enqueue_runs", enqueue_runs, "DAEMON_ENQUEUE_INTERVAL", QUEUE_FAST),
     Tick("submit_runpod", submit_runpod, "DAEMON_SUBMIT_INTERVAL", QUEUE_FAST),
     Tick("submit_doctor", submit_doctor, "DAEMON_SUBMIT_INTERVAL", QUEUE_IO),
     Tick(

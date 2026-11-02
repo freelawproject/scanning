@@ -81,6 +81,15 @@ class TestTicks(TestCase):
         # replayed behind a busy worker.
         send.assert_called_once_with(queue=tasks.QUEUE_FAST, expires=42.0)
 
+    @override_settings(DAEMON_ENQUEUE_INTERVAL=61)
+    def test_the_missing_run_sweep_has_an_interval_of_its_own(self):
+        """A volume needs a run once, and the sweep asks the job table
+        once per volume every time it runs, so it is not on the submit
+        interval."""
+        tick = next(t for t in tasks.TICKS if t.name == "enqueue_runs")
+        self.assertEqual(tick.interval(), 61.0)
+        self.assertEqual(tick.queue, tasks.QUEUE_FAST)
+
     def test_a_broker_fault_on_a_send_is_a_warning(self):
         tick = next(t for t in tasks.TICKS if t.name == "sweep_runpod")
         with (

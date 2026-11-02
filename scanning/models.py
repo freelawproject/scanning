@@ -5137,6 +5137,41 @@ class ExternalJob(AbstractDateTimeModel):
                 fields=["status", "deadline"],
                 name="idx_job_status_deadline",
             ),
+            # The submit wave's slice (``jobs._pending_slice``): one
+            # engine's pending rows ranked apply-run-first, then by id,
+            # off the index alone. The pending rows are few against the
+            # table and a row leaves the index when it is sent.
+            models.Index(
+                fields=["provider", "stage", "engine", "apply_run", "id"],
+                condition=models.Q(status="pending"),
+                name="idx_job_pending_wave",
+            ),
+            # The missing-run sweeps' probe (``yolo`` and ``dots_mocr
+            # .enqueue_missing_runs``): "has this volume a detect (an
+            # analyze) run for this fingerprint", asked once per volume
+            # in the sweep statuses every time the sweep runs, answered
+            # off the index without the row. Both conditions spell the
+            # probe's filter, or the planner cannot use them.
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="detect",
+                    engine="blackletter",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_detect_probe",
+            ),
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="analyze",
+                    engine="dots_mocr",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_analyze_probe",
+            ),
             models.Index(
                 fields=["scan", "stage", "run"],
                 name="idx_job_scan_stage_run",

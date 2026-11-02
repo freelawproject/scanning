@@ -2652,13 +2652,32 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
         most ``room`` of them.
     :rtype: list[ExternalJob]
     """
-    return list(
+    # The ids first, off the pending index alone, and the rows after.
+    # The rank's first key is a computed column, so the top ``room``
+    # cannot come off an index; ranked with the joins in place, Postgres
+    # joined every pending row of the engine to its scan (and the scan's
+    # JSON columns), its reporter and its apply run, sorted the lot and
+    # kept ``room``, six times every five seconds: the first statement
+    # on the database's list in the 2026-11-02 outage. The joins now
+    # touch the rows the wave keeps.
+    ids = list(
         queryset.filter(status=JobStatus.PENDING)
-        # ``s3_job_attempt_key`` reads the apply run's number (#224).
-        .select_related("scan", "scan__reporter", "apply_run")
         .annotate(is_apply=Q(apply_run__isnull=False))
-        .order_by("-is_apply", "id")[:room]
+        .order_by("-is_apply", "id")
+        .values_list("id", flat=True)[:room]
     )
+    if not ids:
+        return []
+    # Read again as PENDING: the claim's compare-and-swap (``_write``)
+    # tests the status it read, so a row cancelled or failed between the
+    # two queries must not be read at all, or it would be swapped from
+    # that status into SUBMITTED. ``s3_job_attempt_key`` reads the apply
+    # run's number (#224).
+    rows = queryset.filter(
+        pk__in=ids, status=JobStatus.PENDING
+    ).select_related("scan", "scan__reporter", "apply_run")
+    by_id = {row.pk: row for row in rows}
+    return [by_id[pk] for pk in ids if pk in by_id]
 
 
 def _apply_doctor_outcome(
