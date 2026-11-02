@@ -337,9 +337,10 @@ def submit_mistral() -> int:
     """Render and submit a wave of shards to Mistral: minutes, on the
     heavy queue.
 
-    The wave takes a volume's worth of shards here
-    (``mistral_ocr.submits_per_tick``), because nothing waits behind
-    it. Locked like the other waves: one wave at a time keeps the batch
+    The wave takes one shard (``mistral_ocr.submits_per_tick``), so
+    the task is minutes and not a quarter of an hour: the merges and
+    the glues share this queue, and a spot pod goes with little
+    warning. Locked like the other waves: one wave at a time keeps the batch
     cap (``mistral_ocr.max_concurrency``, counted before the claim)
     exact, and two workers never pay for two renders when one was
     wanted.

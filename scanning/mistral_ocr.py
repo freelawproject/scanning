@@ -58,13 +58,16 @@ Mistral, and must not be broken:
 - **The deadline is Mistral's own timeout**, stamped once at the first
   claim and never restamped on ``RUNNING``: a batch is queued and run
   inside one budget Mistral enforces.
-- **The wave takes one shard per tick under the daemon and a volume's
-  worth under Celery** (:func:`submits_per_tick`): the daemon's serial
-  scheduler waits behind the wave, and a Celery wave is its own locked
-  task that nothing waits behind. The shards of a wave share one
-  upload pool (``MISTRAL_UPLOAD_WORKERS``) and one backlog of rendered
-  pages, so the uploads in flight and the PNGs in memory are bounded
-  by the wave and never by the shard count; a throttled page waits
+- **The wave takes one shard per tick** (:func:`submits_per_tick`),
+  under the daemon and under Celery alike: the daemon's serial
+  scheduler waits behind the wave, and a Celery wave of a volume's
+  worth held the heavy worker, and the merges and glues queued behind
+  it, for the whole volume's render, so that wave went back to one
+  shard. ``MISTRAL_SUBMITS_PER_TICK`` raises it for a measurement. The
+  shards of a wave share one upload pool (``MISTRAL_UPLOAD_WORKERS``)
+  and one backlog of rendered pages, so the uploads in flight and the
+  PNGs in memory are bounded by the wave and never by the shard count;
+  a throttled page waits
   and is tried again on its own thread (``UPLOAD_RETRIES``), thinning
   the pool while the limit holds. The in-flight cap
   (``MISTRAL_MAX_CONCURRENCY``) is batches at Mistral, a separate
@@ -157,15 +160,6 @@ SOURCE = "original"
 #: What every manifest line asks for, as the branch did.
 INCLUDE_BLOCKS = True
 TABLE_FORMAT = "html"
-
-#: Shards one Celery wave takes when ``MISTRAL_SUBMITS_PER_TICK`` is
-#: unset: a normal volume (1100 pages at 100 a shard is 11-14 shards),
-#: so a volume is rendered and uploaded in one wave. The wave is its
-#: own locked task on the heavy queue (#503), so nothing waits behind
-#: it; under the daemon the wave blocks the serial scheduler (#156)
-#: for as long as its slowest shard takes, and every poll, the glue
-#: and both applies wait behind it, so there the default stays one.
-VOLUME_SHARDS = 16
 
 #: Rendered pages the wave may hold ahead of the uploads, per upload
 #: thread: one in flight and one waiting on each. A stalled network
@@ -267,18 +261,20 @@ class SubmitStopped(Exception):
 def submits_per_tick() -> int:
     """Return how many shards one wave renders and uploads.
 
-    ``MISTRAL_SUBMITS_PER_TICK`` when set; else one under the daemon,
-    whose serial scheduler waits behind the wave, and
-    :data:`VOLUME_SHARDS` under Celery, where the wave is its own
-    locked task (#503).
+    ``MISTRAL_SUBMITS_PER_TICK`` when set; else one, under the daemon
+    and under Celery alike. Under the daemon the serial scheduler
+    waits behind the wave (#156). Under Celery the wave is its own
+    locked task (#503), and a wave of a volume's worth held the heavy
+    worker for the whole volume's render, a quarter of an hour, with
+    the merges and the glues queued behind it and the whole wave's
+    claims lost with the pod: a task should be short, so the wave took
+    one shard again.
 
     :returns: The per-tick cap, at least one.
     :rtype: int
     """
     configured = int(getattr(settings, "MISTRAL_SUBMITS_PER_TICK", 0) or 0)
-    if configured > 0:
-        return configured
-    return VOLUME_SHARDS if getattr(settings, "CELERY_ENABLED", False) else 1
+    return configured if configured > 0 else 1
 
 
 def max_concurrency() -> int:
@@ -1121,10 +1117,10 @@ def submit_wave(summary: jobs.SubmitSummary, limit: int | None) -> None:
 
     Two caps, on purpose. :func:`max_concurrency` bounds the batches in
     flight at Mistral; :func:`submits_per_tick` bounds how many shards
-    this tick renders and uploads: one under the daemon, which is what
-    blocks the serial scheduler, a volume's worth under Celery. The
+    this tick renders and uploads: one, unless a setting raises it. The
     first keeps a volume draining while batches wait for hours; the
-    second keeps every other daemon task waiting for one shard at most.
+    second keeps every other task, and a pod's shutdown, waiting for
+    one shard at most.
     The shards of a wave share one upload pool and one backlog
     (:class:`_Uploads`), so the uploads in flight and the pages in
     memory are the wave's whatever the shard count.

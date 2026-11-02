@@ -966,10 +966,11 @@ class TestSubmitWave(ScanningTestCase):
         ]
         self.assertEqual(statuses.count(JobStatus.SUBMITTED), 2)
 
-    def test_the_per_tick_cap_follows_the_mode(self):
+    def test_the_per_tick_cap_is_one_in_both_modes(self):
         # One shard per tick under the daemon, whose serial scheduler
-        # waits behind the wave; a volume's worth under Celery, where
-        # the wave is its own locked task; the setting overrides both.
+        # waits behind the wave, and under Celery too, where a wave of
+        # a volume's worth held the heavy worker for the whole render;
+        # the setting raises it for a measurement.
         with override_settings(
             CELERY_ENABLED=False, MISTRAL_SUBMITS_PER_TICK=0
         ):
@@ -977,17 +978,16 @@ class TestSubmitWave(ScanningTestCase):
         with override_settings(
             CELERY_ENABLED=True, MISTRAL_SUBMITS_PER_TICK=0
         ):
-            self.assertEqual(
-                mistral_ocr.submits_per_tick(), mistral_ocr.VOLUME_SHARDS
-            )
+            self.assertEqual(mistral_ocr.submits_per_tick(), 1)
         with override_settings(
-            CELERY_ENABLED=False, MISTRAL_SUBMITS_PER_TICK=3
+            CELERY_ENABLED=True, MISTRAL_SUBMITS_PER_TICK=3
         ):
             self.assertEqual(mistral_ocr.submits_per_tick(), 3)
 
-    def test_a_volume_s_shards_go_in_one_wave(self):
-        # With the cap at a volume's worth, one tick renders, uploads
-        # and submits every shard of the volume, each as its own batch.
+    def test_a_raised_cap_takes_a_volume_s_shards_in_one_wave(self):
+        # With the setting raised to a volume's worth, one tick renders,
+        # uploads and submits every shard of the volume, each as its
+        # own batch.
         scan = ScanFactory()
         mistral_ocr.ensure_extract_jobs(
             scan, make_manifest(shard_count=3, pages_per_shard=2)
