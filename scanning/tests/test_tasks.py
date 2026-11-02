@@ -779,9 +779,9 @@ class TestWaves(TestCase):
 
     def test_the_mistral_waves_run_on_their_own_queues(self):
         """One wave task per Mistral worker (#575), each on its queue
-        and in the tick table; the old name on the heavy queue runs
-        the same wave for a clock of the release before, and is no
-        tick."""
+        and in the tick table; the old name on the heavy queue is kept
+        for a clock of the release before, is no tick, and renders
+        nothing: heavy never runs the wave again."""
         for task, queue in (
             (tasks.submit_mistral_a, tasks.QUEUE_MISTRAL_A),
             (tasks.submit_mistral_b, tasks.QUEUE_MISTRAL_B),
@@ -797,8 +797,8 @@ class TestWaves(TestCase):
             "scanning.jobs.submit_pending",
             return_value=SubmitSummary(submitted=1),
         ) as submit:
-            self.assertEqual(tasks.submit_mistral(), 1)
-        submit.assert_called_once_with(providers=(JobProvider.MISTRAL,))
+            self.assertEqual(tasks.submit_mistral(), 0)
+        submit.assert_not_called()
 
 
 class TestQueuedWritersDispatch(TestCase):

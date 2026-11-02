@@ -393,19 +393,27 @@ def submit_mistral_b() -> int:
 
 
 @app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
-@locked("submit_mistral")
 def submit_mistral() -> int:
-    """The Mistral wave on the heavy queue, as it ran before #575.
+    """The name of the Mistral wave on the heavy queue before #575.
 
-    Registered for the rollout alone, not in ``TICKS``: a clock from
-    the release before sends this name until its pod restarts, and a
-    worker that did not know it would log an unregistered task every
-    submit interval. Delete once that release has rolled out.
+    Registered for the rollout alone, not in ``TICKS``, and it runs
+    nothing: a clock from the release before sends this name to
+    ``heavy`` until its pod restarts, and a worker that did not know it
+    would log an unregistered task every submit interval, while a
+    worker that ran the wave would hold ``heavy`` for a render again.
+    The shards wait for the Mistral workers' own ticks. Delete once
+    that release has rolled out.
 
-    :returns: The submitted count.
+    :returns: Zero.
     :rtype: int
     """
-    return _submit_mistral()
+    logger.info(
+        "submit_mistral: sent by a clock of the release before; the "
+        "Mistral wave runs on %s and %s now, not on heavy",
+        QUEUE_MISTRAL_A,
+        QUEUE_MISTRAL_B,
+    )
+    return 0
 
 
 def _sweep(provider: str | None) -> int:
