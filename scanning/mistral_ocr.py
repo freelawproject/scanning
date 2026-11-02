@@ -110,7 +110,7 @@ from concurrent.futures import (
     as_completed,
     wait,
 )
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -919,34 +919,35 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
             pdf_path = Path(tmp) / "shard.pdf"
             with clock.measure("download_ms"):
                 s3_sync.download_object(job.input_key, pdf_path)
+            # ``closing``, because the loop below steps the generator
+            # by hand: a ``for`` dropped it, and its open document,
+            # the moment the body raised, and a generator a traceback
+            # keeps alive would hold the shard PDF until the wave ends.
             try:
-                rendered = render_shard_pages(
-                    pdf_path,
-                    whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
-                )
-                while True:
-                    with clock.measure("render_ms"):
-                        page = next(rendered, None)
-                    if page is None:
-                        break
-                    page_no, png = page
-                    # The slot is taken here and given back by the
-                    # upload, or below for a page cancelled unstarted.
-                    with clock.measure("upload_wait_ms"):
-                        _take_slot(uploads, pages)
-                    pages.append(
-                        (
-                            page_no,
-                            uploads.pool.submit(
-                                _upload_page,
-                                prefix,
-                                page_no,
-                                png,
-                                abandoned,
-                                uploads.slots,
-                            ),
-                        )
+                with closing(
+                    render_shard_pages(
+                        pdf_path,
+                        whiteout=bool(settings.PERPENDICULARS_WHITEOUT),
                     )
+                ) as rendered:
+                    for page_no, png in _timed(rendered, clock):
+                        # The slot is taken here and given back by the
+                        # upload, or below for a page cancelled unstarted.
+                        with clock.measure("upload_wait_ms"):
+                            _take_slot(uploads, pages)
+                        pages.append(
+                            (
+                                page_no,
+                                uploads.pool.submit(
+                                    _upload_page,
+                                    prefix,
+                                    page_no,
+                                    png,
+                                    abandoned,
+                                    uploads.slots,
+                                ),
+                            )
+                        )
             except BaseException:
                 _let_go(uploads, pages, abandoned)
                 raise
@@ -1001,6 +1002,17 @@ def _prepare_and_submit(job: ExternalJob, uploads: _Uploads) -> _Submission:
         duration_ms=duration_ms,
         phases=clock.report(len(files), duration_ms),
     )
+
+
+def _timed(rendered: Iterator, clock: _Phases) -> Iterator:
+    """Yield what ``rendered`` yields, charging each step to the
+    render phase and nothing of what the caller does between steps."""
+    while True:
+        with clock.measure("render_ms"):
+            page = next(rendered, None)
+        if page is None:
+            return
+        yield page
 
 
 class _Phases:
@@ -1963,10 +1975,18 @@ def harvest(
         _carry_files_left(job, outputs, _delete_files(outputs))
         return False
     _carry_files_left(job, files + outputs, _delete_files(files + outputs))
+    clauses = [
+        text % summary[key]
+        for key, text in (
+            ("batch_wait_ms", "Mistral queued %s ms"),
+            ("batch_run_ms", "ran %s ms"),
+            ("poll_lag_ms", "the poll lagged %s ms"),
+        )
+        if key in summary
+    ]
     logger.info(
         "job %s (scan %s shard %s): batch %s harvested, %d page(s), %d "
-        "failed; claim to harvest %s ms, of which Mistral queued %s ms, "
-        "ran %s ms, and the poll lagged %s ms",
+        "failed; claim to harvest %s ms%s",
         job.pk,
         job.scan_id,
         job.shard_index,
@@ -1974,9 +1994,7 @@ def harvest(
         page_count,
         len(failed_pages),
         summary.get("duration_ms"),
-        summary.get("batch_wait_ms"),
-        summary.get("batch_run_ms"),
-        summary.get("poll_lag_ms"),
+        f", of which {', '.join(clauses)}" if clauses else "",
     )
     return True
 

@@ -652,6 +652,25 @@ class TestSubmitWave(ScanningTestCase):
         mocks["upload"].assert_not_called()
         self.assertEqual(extract_jobs(self.scan)[0].status, JobStatus.PENDING)
 
+    def test_a_failed_shard_closes_its_render_and_its_document(self):
+        # The timed loop steps the render generator by hand: a failure
+        # mid-shard must still close it, or the open document and the
+        # shard PDF it holds outlive the shard until the wave ends.
+        closed = []
+        real = mistral_ocr.render_shard_pages
+
+        def spy(pdf_path, whiteout=False):
+            try:
+                yield from real(pdf_path, whiteout=whiteout)
+            finally:
+                closed.append(True)
+
+        refused = mistral_client.MistralError("no", "HTTP_400", 400)
+        with patch("scanning.mistral_ocr.render_shard_pages", spy):
+            summary, _ = self._tick(upload_error=[refused])
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(closed, [True])
+
     def test_the_scratch_dir_names_the_scan_and_is_removed(self):
         # The shard PDF is rendered in a system temp dir the #215 sweep
         # reclaims by prefix; the name carries the scan and the shard,
@@ -1625,9 +1644,25 @@ class TestSweep(ScanningTestCase):
         self.assertEqual(output["batch_wait_ms"], 10_000)
         self.assertEqual(output["batch_run_ms"], 90_000)
         self.assertAlmostEqual(output["poll_lag_ms"], 30_000, delta=1000)
-        self.assertTrue(
-            any("Mistral queued 10000 ms" in line for line in logs.output)
+        harvested = next(line for line in logs.output if "harvested" in line)
+        self.assertIn("Mistral queued 10000 ms, ran 90000 ms", harvested)
+
+    def test_the_harvest_log_names_only_the_clocks_the_batch_had(self):
+        outcome = mistral_client.BatchOutcome(
+            status=JobStatus.COMPLETED,
+            provider_status="SUCCESS",
+            total=2,
+            succeeded=2,
+            output_file="out-1",
+            job={"id": "batch-1", "status": "SUCCESS"},
         )
+        with self.assertLogs("scanning.mistral_ocr", "INFO") as logs:
+            summary, _ = self._sweep(outcome, output=self.OUTPUT)
+        self.assertEqual(summary.completed, 1)
+        harvested = next(line for line in logs.output if "harvested" in line)
+        self.assertNotIn("of which", harvested)
+        self.assertNotIn("None", harvested)
+        self.assertNotIn("batch_wait_ms", self.job.provider_meta["output"])
 
     def test_batch_timings_leave_out_a_clock_the_object_lacks(self):
         now = timezone.now()
