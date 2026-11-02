@@ -76,6 +76,27 @@ BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE, FIGURE)
 #: the order :func:`marks_of` sorts marks that start together.
 _NESTING = (STRONG, EM, SUP)
 
+#: The C0 controls an engine's text loses (#538): XML 1.0 refuses them
+#: and Postgres refuses a NUL in ``text`` and ``jsonb``. Python reads
+#: ``\x0b``, ``\x0c`` and ``\x1c``-``\x1f`` as whitespace and they
+#: may part two words, so they become a space; the rest are deleted.
+#: Tab, LF and CR stay.
+_CONTROLS = {
+    code: (" " if chr(code).isspace() else None)
+    for code in range(0x20)
+    if chr(code) not in "\t\n\r"
+}
+
+
+def strip_controls(text: str) -> str:
+    """Return an engine's ``text`` without its XML-invalid controls.
+
+    :param text: Text as an engine wrote it.
+    :returns: The text with every C0 control but tab, LF and CR gone.
+    :rtype: str
+    """
+    return text.translate(_CONTROLS)
+
 
 @dataclass(frozen=True)
 class Mark:

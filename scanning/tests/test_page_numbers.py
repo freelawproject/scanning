@@ -78,6 +78,13 @@ class TestExtractPageNumber(SimpleTestCase):
         self.assertEqual(entry["img_height"], HEIGHT)
         self.assertEqual(entry["pdf_page"], 1)
 
+    def test_a_control_character_leaves_the_stored_line(self):
+        """``Scan.ocr_results`` is jsonb, which refuses a NUL (#538)."""
+        entry = self.extract([cell("67\x007")])
+
+        self.assertEqual(entry["detected"], "677")
+        self.assertEqual(entry["ocr"], "677")
+
     def test_an_even_page_number_leads_the_running_head(self):
         entry = self.extract([cell("678 ATLANTIC REPORTER, 2d SERIES")])
 

@@ -1256,6 +1256,23 @@ class TestTheParsedUnit(OpinionOcrTestCase):
                 self.document(engine)["counts"]["headings"], 1, engine
             )
 
+    def test_the_controls_leave_every_engine_s_text(self):
+        # Surya read Mondelēz as ``Mondel\x00\x00z`` (#537), and
+        # Postgres refused the NUL in the rows (#538).
+        read = "Mondel\x00\x00z v.\x1cKraft"
+        self.set_body_a(
+            2,
+            dots={"text": read},
+            mistral={"content": read},
+            surya={"html": f"<p>{read}</p>", "text": read},
+        )
+
+        opinion_ocr.write(self.opinion, self.inputs())
+
+        for engine in opinion_ocr.ENGINES:
+            unit = self.document(engine)["pages"][1]["units"][1]
+            self.assertEqual(unit["text"], "Mondelz v. Kraft", engine)
+
     def test_a_heading_mark_names_the_kind_and_leaves_the_text(self):
         self.set_body_a(2, dots={"text": "## DISCUSSION"})
 
