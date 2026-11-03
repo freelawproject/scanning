@@ -16,6 +16,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db import IntegrityError, transaction
+from django.db.models import F, Func, IntegerField
 from django.http import (
     FileResponse,
     Http404,
@@ -1128,26 +1129,55 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
 
+#: The stored size of a scan's OCR cache, the progress poll's test of
+#: "changed since the last poll". ``pg_column_size`` reads the size off
+#: the stored value's header, so the cache is never read to answer it,
+#: which a count of its pages would do on every poll.
+OCR_SIZE = Func(
+    F("ocr_results"), function="pg_column_size", output_field=IntegerField()
+)
+
+
 @login_required
 def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     """Return current processing progress for a scan.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with status, progress, and log fields.
+    :return: JSON response with the status and the progress, and the
+        OCR cache when it changed since the size the browser sent.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    # Every open tab on a busy scan asks this every second, so it reads
+    # the columns it answers and no cache (#586): the OCR cache is
+    # megabytes, and it was read and sent on every poll.
+    scan = get_object_or_404(
+        Scan.objects.only(
+            "pk",
+            "status",
+            "progress_current",
+            "progress_total",
+            "progress_message",
+        ).annotate(ocr_size=OCR_SIZE),
+        pk=pk,
+    )
     data = {
         "status": scan.status,
         "current": scan.progress_current,
         "total": scan.progress_total,
         "message": scan.progress_message,
-        "log": scan.progress_log,
+        "ocr_size": scan.ocr_size,
     }
-    # Include ocr_results when available so the frontend can render
-    # the pages sidebar live without a full page reload.
-    if scan.ocr_results:
-        data["ocr_results"] = scan.ocr_results
+    # The pages sidebar renders live without a reload, and the browser
+    # sends the size of the cache it holds: the cache is sent only when
+    # it changed since.
+    if str(scan.ocr_size) != request.GET.get("ocr_size"):
+        ocr_results = (
+            Scan.objects.filter(pk=pk)
+            .values_list("ocr_results", flat=True)
+            .first()
+        )
+        if ocr_results:
+            data["ocr_results"] = ocr_results
     # Neither GPU stage moves a scan status, so a viewer polling this
     # would otherwise see nothing happen for a whole run (#190, #195).
     dots_run = dots_mocr.run_summary(scan)

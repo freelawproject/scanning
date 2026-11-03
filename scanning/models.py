@@ -563,6 +563,7 @@ class Scan(AbstractDateTimeModel):
     #: on every row it returns. A reader that needs one loads it on
     #: access.
     LARGE_FIELDS = (
+        "process_output",
         "progress_log",
         "ocr_results",
         "page_map",

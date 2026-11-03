@@ -81,7 +81,7 @@ from datetime import datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Max, Q
+from django.db.models import Max, Q, Subquery
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync, sharding
@@ -1864,18 +1864,18 @@ def live_run(
         list when the engine has never run for this target.
     :rtype: list[ExternalJob]
     """
-    rows = list(
-        ExternalJob.objects.filter(
-            scan=scan,
-            stage=stage,
-            engine=engine,
-            opinion=opinion,
-            apply_run=apply_run,
-        ).order_by("-run", "shard_index")
+    target = ExternalJob.objects.filter(
+        scan=scan,
+        stage=stage,
+        engine=engine,
+        opinion=opinion,
+        apply_run=apply_run,
     )
-    if not rows:
-        return []
-    return [job for job in rows if job.run == rows[0].run]
+    # The latest run in the query, never in Python: every run before it
+    # is history, a volume holds a row per shard of each, and the
+    # progress poll asks for four engines every second.
+    latest = target.order_by("-run").values("run")[:1]
+    return list(target.filter(run=Subquery(latest)).order_by("shard_index"))
 
 
 def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:

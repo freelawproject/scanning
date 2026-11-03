@@ -262,6 +262,30 @@ class EstimatingPaginator(Paginator):
         return row[0]
 
 
+class ScanCachesDeferred:
+    """Join a list's scan without its caches (#582).
+
+    Every changelist below shows its row's scan, a page of a hundred
+    rows, and the join repeats the scan's columns on each:
+    ``Scan.LARGE_FIELDS`` are kilobytes to megabytes a row, and a page
+    of one volume's detections read its OCR cache a hundred times. The
+    reporter comes in the same join, because ``Scan.__str__`` reads it.
+    An admin that names its own ``list_select_related`` must keep
+    ``scan__reporter`` in it.
+    """
+
+    list_select_related = ["scan__reporter"]
+
+    def get_queryset(self, request):
+        """Return the rows with their scan joined and its caches deferred."""
+        return (
+            super()
+            .get_queryset(request)
+            .select_related("scan__reporter")
+            .defer(*Scan.large_fields("scan__"))
+        )
+
+
 @admin.register(Reporter)
 class ReporterAdmin(admin.ModelAdmin):
     list_display = ["short_name", "full_name", "date_created"]
@@ -311,6 +335,21 @@ class ScanAdmin(admin.ModelAdmin):
         "missing_pages",
         "process_output",
     ]
+
+    def get_queryset(self, request):
+        """Return the scans with their caches on disk (#582).
+
+        A changelist page of a hundred scans read every volume's caches
+        for a table that shows none; the change form excludes the
+        largest, and a field it does show loads on access.
+        """
+        return (
+            super()
+            .get_queryset(request)
+            .select_related("reporter", "uploaded_by")
+            .defer(*Scan.large_fields())
+        )
+
     date_hierarchy = "date_created"
     actions = [
         "requeue_scans",
@@ -712,7 +751,7 @@ class ScanAdmin(admin.ModelAdmin):
 
 
 @admin.register(OpinionScan)
-class OpinionScanAdmin(admin.ModelAdmin):
+class OpinionScanAdmin(ScanCachesDeferred, admin.ModelAdmin):
     list_display = [
         "reporter",
         "volume",
@@ -753,7 +792,7 @@ class OpinionFindingInline(admin.TabularInline):
 
 
 @admin.register(Opinion)
-class OpinionAdmin(admin.ModelAdmin):
+class OpinionAdmin(ScanCachesDeferred, admin.ModelAdmin):
     list_display = [
         "__str__",
         "scan",
@@ -786,7 +825,7 @@ class OpinionAdmin(admin.ModelAdmin):
 
 
 @admin.register(WithdrawnOpinion)
-class WithdrawnOpinionAdmin(admin.ModelAdmin):
+class WithdrawnOpinionAdmin(ScanCachesDeferred, admin.ModelAdmin):
     list_display = [
         "__str__",
         "scan",
@@ -817,7 +856,7 @@ class VolumeAdmin(admin.ModelAdmin):
 
 
 @admin.register(Issue)
-class IssueAdmin(admin.ModelAdmin):
+class IssueAdmin(ScanCachesDeferred, admin.ModelAdmin):
     list_display = [
         "scan",
         "page_number",
@@ -833,7 +872,7 @@ class IssueAdmin(admin.ModelAdmin):
 
 
 @admin.register(ReviewDismissal)
-class ReviewDismissalAdmin(admin.ModelAdmin):
+class ReviewDismissalAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One curator dismissal of one review-2 finding (issue #240, PR D).
 
     Read-only: a row records what a person decided, and the way to
@@ -866,7 +905,7 @@ class ReviewDismissalAdmin(admin.ModelAdmin):
 
 
 @admin.register(Detection)
-class DetectionAdmin(admin.ModelAdmin):
+class DetectionAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One detection row, of a table that holds millions (issue #359).
 
     Every default of the changelist that reads the whole table is
@@ -881,7 +920,6 @@ class DetectionAdmin(admin.ModelAdmin):
     ordering = ["-pk"]
     show_full_result_count = False
     paginator = EstimatingPaginator
-    list_select_related = ["scan__reporter"]
     list_display = [
         "scan",
         "page_index",
@@ -904,7 +942,7 @@ class DetectionAdmin(admin.ModelAdmin):
 
 
 @admin.register(BracketReading)
-class BracketReadingAdmin(admin.ModelAdmin):
+class BracketReadingAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One headnote bracket the OCR read (issue #328).
 
     Read-only: the compute writes every row and replaces the set at
@@ -934,7 +972,7 @@ class BracketReadingAdmin(admin.ModelAdmin):
 
 
 @admin.register(EditorialReading)
-class EditorialReadingAdmin(admin.ModelAdmin):
+class EditorialReadingAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One editor's note the OCR read (issue #450).
 
     Read-only, the rule of ``BracketReadingAdmin``: the compute writes
@@ -960,7 +998,7 @@ class EditorialReadingAdmin(admin.ModelAdmin):
 
 
 @admin.register(TextReading)
-class TextReadingAdmin(admin.ModelAdmin):
+class TextReadingAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """The text cells of one page, as the OCR read them.
 
     Read-only, the rule of ``BracketReadingAdmin``: the compute writes
@@ -990,7 +1028,7 @@ class TextReadingAdmin(admin.ModelAdmin):
 
 
 @admin.register(PictureReading)
-class PictureReadingAdmin(admin.ModelAdmin):
+class PictureReadingAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """The pictures and tables of one page, as the readers saw them.
 
     Read-only, the rule of ``TextReadingAdmin``: the compute writes
@@ -1020,7 +1058,7 @@ class PictureReadingAdmin(admin.ModelAdmin):
 
 
 @admin.register(DetectionDecision)
-class DetectionDecisionAdmin(admin.ModelAdmin):
+class DetectionDecisionAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One curator decision about one model detection (issue #240).
 
     Read-only: a row records what a person decided, and the way to
@@ -1049,7 +1087,7 @@ class DetectionDecisionAdmin(admin.ModelAdmin):
 
 
 @admin.register(OpinionBoundary)
-class OpinionBoundaryAdmin(admin.ModelAdmin):
+class OpinionBoundaryAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One opinion, or one curator decision about one (issue #240, PR C).
 
     Read-only: a computed row is rebuilt at each compute and a human
@@ -1093,7 +1131,7 @@ class OpinionBoundaryAdmin(admin.ModelAdmin):
 
 
 @admin.register(PageEdit)
-class PageEditAdmin(admin.ModelAdmin):
+class PageEditAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One human decision about one page (issue #214).
 
     Read-only but for the apply stamp: a row records what a person
@@ -1136,7 +1174,7 @@ class PageEditAdmin(admin.ModelAdmin):
 
 
 @admin.register(ApplyRun)
-class ApplyRunAdmin(admin.ModelAdmin):
+class ApplyRunAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One build of the final volume from the page edits (issue #224).
 
     Read-only: the row is the daemon's ledger. The one thing an
@@ -1182,7 +1220,6 @@ class ApplyRunAdmin(admin.ModelAdmin):
         "date_created",
         "date_modified",
     ]
-    list_select_related = ["scan__reporter"]
     actions = ["supersede_runs"]
 
     def has_delete_permission(self, request, obj=None):
@@ -1218,7 +1255,7 @@ class ApplyRunAdmin(admin.ModelAdmin):
 
 
 @admin.register(PageRepairRequest)
-class PageRepairRequestAdmin(admin.ModelAdmin):
+class PageRepairRequestAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One page a reviewer asked a scanner to scan (issue #249).
 
     Read-only: a row records what a person asked for, and an admin
@@ -1257,7 +1294,7 @@ class PageRepairRequestAdmin(admin.ModelAdmin):
 
 
 @admin.register(PendingUpload)
-class PendingUploadAdmin(admin.ModelAdmin):
+class PendingUploadAdmin(ScanCachesDeferred, admin.ModelAdmin):
     list_display = [
         "id",
         "scan",
@@ -1272,7 +1309,7 @@ class PendingUploadAdmin(admin.ModelAdmin):
 
 
 @admin.register(ExternalJob)
-class ExternalJobAdmin(admin.ModelAdmin):
+class ExternalJobAdmin(ScanCachesDeferred, admin.ModelAdmin):
     # Left editable: a job row carries operational state (status, retry
     # budget, deadline) an operator may need to nudge. The provenance
     # pair is the exception. ``input_key`` is not self-verifying, since
@@ -1326,7 +1363,7 @@ class ExternalJobAdmin(admin.ModelAdmin):
 
 
 @admin.register(Redaction)
-class RedactionAdmin(admin.ModelAdmin):
+class RedactionAdmin(ScanCachesDeferred, admin.ModelAdmin):
     """One box to paint, or one curator decision about one (issue #240).
 
     Read-only: the compute writes the computed rows and the review page
