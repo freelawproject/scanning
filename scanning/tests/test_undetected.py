@@ -319,6 +319,187 @@ class TestTheRule(ScanningTestCase):
             other["metadata"]["guess"], [100.0, 200.0, 900.0, 600.0]
         )
 
+    def test_on_a_page_with_no_column_the_guess_leaves_the_picture_out(self):
+        # An addendum page: a table in an image box under a heading in
+        # no box. The column the + adds covers the heading and never
+        # the table, whose cells overlap the heading sideways; a column
+        # over both was resized by hand on every such page.
+        make_detection(
+            self.scan,
+            "IMAGE",
+            page_index=0,
+            x0=1000.0,
+            y0=700.0,
+            x1=1600.0,
+            y1=2000.0,
+        )
+        self.write(
+            cell("ADDENDUM A"),
+            cell("A row of the table", [1050.0, 800.0, 1550.0, 900.0]),
+            cell("Another row", [1050.0, 1500.0, 1550.0, 1600.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        card = found[0]
+        self.assertTrue(card["metadata"]["no_column"])
+        self.assertEqual(card["metadata"]["guess"], OUTSIDE)
+
+    def test_on_a_page_with_no_column_the_guess_is_as_wide_as_the_volumes_column(
+        self,
+    ):
+        # The page beside has two column boxes: the block in the right
+        # column gets that column's width, and the cell under it in the
+        # same column stretches the box down to it.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(
+            cell("A heading in the right column"),
+            cell("Under it", [1000.0, 700.0, 1600.0, 900.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertTrue(meta["no_column"])
+        self.assertEqual(meta["guess"], [880.0, 200.0, 1600.0, 900.0])
+
+    def test_a_line_merged_across_the_gutter_is_a_card_per_column(self):
+        # The reader drew one cell across both columns: each half is
+        # its own card, with its own column's box.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = {f["metadata"]["half"]: f for f in self.found()}
+        self.assertEqual(set(found), {"left", "right"})
+        left, right = found["left"]["metadata"], found["right"]["metadata"]
+        self.assertEqual(left["bbox"], [150.0, 200.0, 820.0, 600.0])
+        self.assertEqual(left["guess"], [100.0, 200.0, 820.0, 600.0])
+        self.assertEqual(right["bbox"], [880.0, 200.0, 1550.0, 600.0])
+        self.assertEqual(right["guess"], [880.0, 200.0, 1600.0, 600.0])
+        self.assertIn("left half of a line", found["left"]["message"])
+        self.assertIn("keeps the line", found["left"]["message"])
+
+    def test_the_half_with_no_box_is_a_card_once_the_other_has_one(self):
+        # One column box drawn, or one of two taken away: the cell is
+        # half covered, which the glue keeps, and the other column
+        # still asks for its box.
+        column(self.scan, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertEqual(meta["half"], "right")
+        self.assertFalse(meta["no_column"])
+        self.assertEqual(meta["bbox"], [880.0, 200.0, 1550.0, 600.0])
+        self.assertEqual(meta["guess"], [880.0, 200.0, 1600.0, 600.0])
+        self.assertIn("that column has no box", found[0]["message"])
+
+    def test_a_wide_cell_of_a_one_column_volume_is_one_card(self):
+        # No page with two column boxes nearby: nothing says where the
+        # gutter is, so the cell is judged whole.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertIsNone(found[0]["metadata"]["half"])
+        self.assertEqual(
+            found[0]["metadata"]["guess"], [150.0, 200.0, 1550.0, 600.0]
+        )
+
+    def test_a_block_that_straddles_the_gutter_goes_to_one_column(self):
+        # A heading in the left column and, on the next line, a line
+        # that reaches across the gutter but lies mostly in the right
+        # column: two blocks, one per column, and no box wider than a
+        # column.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(
+            cell("ATTACHMENT", [150.0, 200.0, 500.0, 260.0]),
+            cell("983 FEDERAL REPORTER", [700.0, 250.0, 1200.0, 300.0]),
+        )
+        found = {tuple(f["metadata"]["bbox"]): f for f in self.found()}
+        self.assertEqual(
+            set(found),
+            {(150.0, 200.0, 500.0, 260.0), (700.0, 250.0, 1200.0, 300.0)},
+        )
+        self.assertEqual(
+            found[(150.0, 200.0, 500.0, 260.0)]["metadata"]["guess"],
+            [100.0, 200.0, 820.0, 260.0],
+        )
+        self.assertEqual(
+            found[(700.0, 250.0, 1200.0, 300.0)]["metadata"]["guess"],
+            [880.0, 250.0, 1600.0, 300.0],
+        )
+
+    def test_a_merged_footnote_line_stays_whole_and_grows_the_box(self):
+        # A footnote line the reader merged across the gutter, under
+        # the page's footnote box: never cut, one card, and the grown
+        # box runs across the columns as the footnotes do.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=100.0,
+            y0=1500.0,
+            x1=820.0,
+            y1=1700.0,
+        )
+        self.write(cell("A footnote across", [150.0, 1750.0, 1550.0, 1800.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertIsNone(meta["half"])
+        self.assertEqual(meta["bbox"], [150.0, 1750.0, 1550.0, 1800.0])
+        self.assertEqual(meta["grow"]["id"], foot.pk)
+        self.assertEqual(
+            meta["grow"]["grown"], [100.0, 1500.0, 1550.0, 1800.0]
+        )
+
+    def test_a_footnote_box_under_the_left_half_of_a_wide_block_grows(self):
+        # The block starts to the right of the footnote box's left edge
+        # and runs across the gutter: the two share the box's width, so
+        # the box is in the block's column.
+        grow = undetected.neighbour_box(
+            [300.0, 1750.0, 1550.0, 1800.0],
+            [
+                {
+                    "id": 7,
+                    "label": "FOOTNOTES",
+                    "box": [100.0, 1500.0, 820.0, 1700.0],
+                }
+            ],
+            "FOOTNOTES",
+        )
+        self.assertEqual(grow["id"], 7)
+        self.assertEqual(grow["grown"], [100.0, 1500.0, 1550.0, 1800.0])
+
+    def test_the_guess_never_crosses_a_picture(self):
+        # A figure across the page with text above it and below it: the
+        # block above keeps its own box, and so does the block below.
+        make_detection(
+            self.scan,
+            "IMAGE",
+            page_index=0,
+            x0=200.0,
+            y0=700.0,
+            x1=1500.0,
+            y1=1500.0,
+        )
+        self.write(
+            cell("Above the figure"),
+            cell("Below the figure", [1000.0, 1600.0, 1600.0, 1900.0]),
+        )
+        found = {tuple(f["metadata"]["bbox"]): f for f in self.found()}
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[tuple(OUTSIDE)]["metadata"]["guess"], OUTSIDE)
+        self.assertEqual(
+            found[(1000.0, 1600.0, 1600.0, 1900.0)]["metadata"]["guess"],
+            [1000.0, 1600.0, 1600.0, 1900.0],
+        )
+
     def test_on_a_page_with_a_column_the_guess_is_the_block(self):
         # A page with a column box: the guess is the block alone, and a
         # cell inside the column is covered.
@@ -625,6 +806,35 @@ class TestTheCard(ScanningTestCase):
         card = self.cards().get()
         self.assertEqual(card.severity, Issue.Severity.WARNING)
         self.assertEqual(card.metadata["guess"], OUTSIDE)
+
+    def test_a_line_merged_across_the_gutter_makes_two_sidebar_rows(self):
+        # A page with no column box, a line the reader merged across
+        # the gutter, and a page beside with two column boxes: one row
+        # per column, each with its own column's box.
+        column(self.scan, page_index=3, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=3, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left outside")),
+                page(
+                    2, cell("Across the page", [150.0, 200.0, 1550.0, 600.0])
+                ),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+        cards = self.cards().filter(page_number=3)
+        self.assertEqual(
+            sorted(c.metadata["guess"] for c in cards),
+            [[100.0, 200.0, 820.0, 600.0], [880.0, 200.0, 1600.0, 600.0]],
+        )
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn('data-guess="100.0,200.0,820.0,600.0"', html)
+        self.assertIn('data-guess="880.0,200.0,1600.0,600.0"', html)
 
     def test_the_card_names_the_footnote_box_beside_its_block(self):
         """A footnote box that ends just above the block is the box the
