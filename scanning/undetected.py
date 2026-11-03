@@ -56,7 +56,7 @@ add: the gutter passes read a page's column boxes as its two columns.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Iterator
+from collections.abc import Callable, Collection, Iterator
 
 from blackletter.models import Label
 from django.db import transaction
@@ -92,6 +92,14 @@ MAX_TEXT_CHARS = 48
 #: render (three quarters of an inch at 200 dpi), and side by side,
 #: are one block.
 CLUSTER_GAP_PX = 150.0
+
+#: A cell wider than this share of the reader's page may be a line the
+#: reader merged across the gutter, when the volume's columns say so
+#: (``_by_column``): judged half by half, so each column asks for its
+#: own column box. Body text only: a cell the page's footnote box would
+#: grow over (``neighbour_box``) stays whole, because a page's
+#: footnotes run across its columns and the grown box must too.
+MERGED_CELL_RATIO = 0.5
 
 Box = list[float]
 
@@ -214,11 +222,192 @@ def _inside(box: Box, rect: dict) -> bool:
     )
 
 
+#: How far either way the guess looks for a page with two column boxes,
+#: for the width of a column and the place of the gutter.
+NEIGHBOUR_PAGES = 10
+
+
+def _in_a_picture(cell: Box, pictures: list[Box]) -> bool:
+    """Return whether the cell's centre lies in a live image box.
+
+    Both in the reader's render. The centre and not the whole box, so
+    a cell that overhangs the picture's edge by a little is the
+    picture's.
+    """
+    cx = (cell[0] + cell[2]) / 2
+    cy = (cell[1] + cell[3]) / 2
+    return any(b[0] <= cx <= b[2] and b[1] <= cy <= b[3] for b in pictures)
+
+
+def _across_a_picture(block: Box, cell: Box, pictures: list[Box]) -> bool:
+    """Return whether a live image box lies between the block and the cell.
+
+    A figure across the page with text above it and below it: the text
+    on the far side is the next column box, never this one. The
+    picture counts when it overlaps the two sideways and its vertical
+    centre falls in the gap between them, so a box that touches either
+    by a few pixels still separates them.
+    """
+    if cell[1] >= block[3]:
+        top, bottom = block[3], cell[1]
+    elif cell[3] <= block[1]:
+        top, bottom = cell[3], block[1]
+    else:
+        return False
+    left = min(block[0], cell[0])
+    right = max(block[2], cell[2])
+    for picture in pictures:
+        if picture[2] <= left or picture[0] >= right:
+            continue
+        if top <= (picture[1] + picture[3]) / 2 <= bottom:
+            return True
+    return False
+
+
+def _column_rows(
+    scan: Scan, run: ApplyRun | None, pages: Collection[int] | None
+) -> dict[int, list]:
+    """Return the live ``TEXT_COLUMN`` rows of the run by page, once per rebuild.
+
+    Every page the rebuild judges, and :data:`NEIGHBOUR_PAGES` either
+    side of them, in one query: a page's guess reads the column boxes
+    of the pages beside it (:func:`_column_geometry`), and a query per
+    page was one per page of a one-column volume, whose every line is
+    wider than half the page.
+    """
+    rows = Detection.objects.live().filter(
+        scan=scan, apply_run=run, label=Label.TEXT_COLUMN.name
+    )
+    if pages:
+        rows = rows.filter(
+            page_index__range=(
+                min(pages) - NEIGHBOUR_PAGES,
+                max(pages) + NEIGHBOUR_PAGES,
+            )
+        )
+    by_page: dict[int, list] = {}
+    for row in rows:
+        if row.img_width:
+            by_page.setdefault(row.page_index, []).append(row)
+    return by_page
+
+
+def _column_geometry(
+    column_rows: dict[int, list], page_index: int, width: float
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    """Return the x-ranges of the volume's two columns, or None.
+
+    From the nearest page within :data:`NEIGHBOUR_PAGES` whose live
+    ``TEXT_COLUMN`` boxes make two columns (``columns.column_groups``,
+    so a picture that cuts a column into two boxes still reads as one
+    column), in the render ``width`` of the page asked about. The
+    nearest page of the same parity first: a recto and a verso set
+    their text at different distances from the binding, so the facing
+    page's columns sit a margin's width off. A page with one column,
+    or three, says nothing, and a volume with no such page nearby gives
+    None, where the guess falls back to the cells.
+
+    :param column_rows: :func:`_column_rows`.
+    :param page_index: The page asked about, which never answers for
+        itself.
+    :param width: Its render width.
+    """
+    candidates = (
+        i
+        for i in column_rows
+        if i != page_index and abs(i - page_index) <= NEIGHBOUR_PAGES
+    )
+    for index in sorted(
+        candidates,
+        key=lambda i: ((i - page_index) % 2, abs(i - page_index), i),
+    ):
+        spans = [
+            (r.x0 * width / r.img_width, r.x1 * width / r.img_width)
+            for r in column_rows[index]
+        ]
+        groups = columns.column_groups(spans)
+        if len(groups) != 2:
+            continue
+        left, right = (
+            (min(spans[i][0] for i in g), max(spans[i][1] for i in g))
+            for g in groups
+        )
+        return left, right
+    return None
+
+
+#: The volume's two columns, ``((x0, x1), (x0, x1))``, left then right.
+Columns = tuple[tuple[float, float], tuple[float, float]]
+
+
+def _by_column(
+    cells: list[dict],
+    columns_px: Columns | None,
+    keep_whole: Callable[[Box], bool] | None = None,
+):
+    """Yield the cells, each in one of the volume's columns.
+
+    With the columns known, every cell is tagged ``column`` (0 the
+    left, 1 the right): the column that holds more of it, so a centred
+    heading that straddles the gutter goes to one side, and
+    :func:`clusters` joins no cells of two columns, so no block and no
+    box the card offers is wider than a column. A line the reader
+    merged across the gutter (a page with a figure across it, an
+    addendum's heading) covers both columns by more than
+    ``columns.COLUMN_SHARE`` of each and is two cells here, cut at the
+    column edges and tagged ``half`` too: judged whole, with one column
+    boxed the cell was half covered, over the quarter the glue keeps a
+    unit at, so the other column had no box and no card asked for one.
+    The glue still keeps the unit whole; the card asks for the box the
+    column lacks, not for text. A merged line ``keep_whole`` answers
+    for (one the page's footnote box would grow over) is not cut: it
+    keeps its tag, so it clusters with its column's other lines, and
+    its whole box, so the footnote box grown over it runs across the
+    columns as the footnotes do.
+    """
+    for cell in cells:
+        box = _box(cell.get("box"))
+        if box is None or columns_px is None:
+            yield cell
+            continue
+        held = [min(box[2], x1) - max(box[0], x0) for x0, x1 in columns_px]
+        merged = all(
+            h > (x1 - x0) * columns.COLUMN_SHARE
+            for h, (x0, x1) in zip(held, columns_px, strict=True)
+        )
+        if merged and not (keep_whole is not None and keep_whole(box)):
+            (lx0, lx1), (rx0, rx1) = columns_px
+            yield {
+                **cell,
+                "box": [box[0], box[1], min(box[2], lx1), box[3]],
+                "column": 0,
+                "half": "left",
+            }
+            yield {
+                **cell,
+                "box": [max(box[0], rx0), box[1], box[2], box[3]],
+                "column": 1,
+                "half": "right",
+            }
+            continue
+        if held[0] == held[1]:
+            centre = (box[0] + box[2]) / 2
+            column = min(
+                range(2),
+                key=lambda i: abs(sum(columns_px[i]) / 2 - centre),
+            )
+        else:
+            column = 0 if held[0] > held[1] else 1
+        yield {**cell, "column": column}
+
+
 def missed_cells(
     reading: TextReading,
     frame: list[dict],
     size: tuple[float, float],
     rects: list[dict] = (),
+    columns_px: Columns | None = None,
+    keep_whole: Callable[[Box], bool] | None = None,
 ) -> list[dict]:
     """Return the text cells of a page the frame does not cover.
 
@@ -229,11 +418,16 @@ def missed_cells(
         lands on the same page.
     :param rects: The page's visible redactions, in points
         (``redactions.visible_by_page``): the verdict's first test.
+    :param columns_px: The volume's two columns in the reader's pixels,
+        or None: a cell across both is judged half by half
+        (:func:`_by_column`).
+    :param keep_whole: Says which cell is never cut, in the reader's
+        pixels: the one a footnote box would grow over.
     :returns: The cells, as the reading holds them.
     :rtype: list[dict]
     """
     missed = []
-    for cell in reading.cells or []:
+    for cell in _by_column(reading.cells or [], columns_px, keep_whole):
         # Every cell with a box is text, whatever the reader called it
         # and however short: the cover tests below are the whole rule.
         box = _box(cell.get("box"))
@@ -287,8 +481,10 @@ def clusters(cells: list[dict], gap: float = CLUSTER_GAP_PX) -> list[dict]:
     """Group the missed cells of a page into blocks.
 
     A cell joins the first block whose bottom is within ``gap`` above
-    its top and whose columns it shares (an overlap in x), so the two
-    columns of a page make two blocks and a one-column page makes one.
+    its top, whose columns it shares (an overlap in x), and whose
+    ``column`` tag is its own (:func:`_by_column`, where the volume's
+    columns are known), so the two columns of a page make two blocks
+    and a one-column page makes one.
 
     :param cells: The cells, each with a ``box``.
     :param gap: The largest vertical gap inside a block, in the cells'
@@ -300,6 +496,8 @@ def clusters(cells: list[dict], gap: float = CLUSTER_GAP_PX) -> list[dict]:
     for cell in sorted(cells, key=lambda c: (c["box"][1], c["box"][0])):
         box = cell["box"]
         for block in blocks:
+            if block.get("column") != cell.get("column"):
+                continue
             union = block["box"]
             if box[1] - union[3] > gap:
                 continue
@@ -314,7 +512,13 @@ def clusters(cells: list[dict], gap: float = CLUSTER_GAP_PX) -> list[dict]:
             ]
             break
         else:
-            blocks.append({"box": list(box), "cells": [cell]})
+            blocks.append(
+                {
+                    "box": list(box),
+                    "cells": [cell],
+                    "column": cell.get("column"),
+                }
+            )
     return blocks
 
 
@@ -335,8 +539,9 @@ def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
     """Return the live box of ``label`` a text card should grow over
     ``block``, with the box it would become, or None.
 
-    A box in the block's column (``columns.column_groups`` over the
-    two, the one rule of "same column") that ends within
+    A box in the block's column (the two share more than half of the
+    narrower one's width, so a line the reader merged across the gutter
+    still finds the footnote box under its left half) that ends within
     :data:`GROW_GAP_PX` above the block or starts within it below, or
     one beside the block (sharing half the block's height) within that
     gap sideways, gutter or no gutter: the caller grows a footnote box
@@ -360,7 +565,12 @@ def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
         if other.get("label") != label:
             continue
         ox0, oy0, ox1, oy1 = other["box"]
-        same_column = len(columns.column_groups([(ox0, ox1), (bx0, bx1)])) == 1
+        # The two share more than half of the narrower one's width:
+        # ``columns.column_groups`` reads the pair from the left, so a
+        # line merged across the gutter found the footnote box under
+        # its left half only when the line started first.
+        shared = min(bx1, ox1) - max(bx0, ox0)
+        same_column = shared > columns.COLUMN_SHARE * min(bx1 - bx0, ox1 - ox0)
         vertical = max(by0 - oy1, oy0 - by1, 0.0)
         sideways = max(bx0 - ox1, ox0 - bx1, 0.0)
         beside = (
@@ -402,7 +612,10 @@ def uncovered(
     may call it in a request. The measure is the glue's
     (``opinion_ocr.page_frame``, ``opinion_ocr.undetected``), so a
     card here is a drop there. A page is judged by its own rows alone,
-    so a write on one page rebuilds that page (``pages``).
+    so a write on one page rebuilds that page (``pages``); only the
+    shape of its cards' ``+ column`` box reads the column boxes of the
+    pages beside it (:func:`_column_geometry`), so a column box drawn
+    on one page moves its neighbours' guesses at their next rebuild.
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
@@ -418,6 +631,7 @@ def uncovered(
     # and its old run, and is a stale card, never cover on the page
     # its old index names.
     by_page = _live_by_page(scan, run, pages)
+    column_rows = _column_rows(scan, run, pages)
     rects_by_page = {
         entry["page_index"]: entry["rects"]
         for entry in redactions.visible_by_page(scan, pages)
@@ -454,8 +668,23 @@ def uncovered(
                 {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
                 for box in opinion_ocr.zones_pt(rows, size)
             ]
-        missed = missed_cells(
-            reading, frame, size, rects_by_page.get(reading.page_index, [])
+        # The volume's columns (``_column_geometry``), read when the page
+        # has no column box (the guess is as wide as a column) or holds
+        # a cell wider than half the page (a line the reader merged
+        # across the gutter is judged half by half), never otherwise:
+        # it is a query per page.
+        sx = width / reading.img_width
+        geometry = None
+        if no_column or any(
+            b[2] - b[0] > reading.img_width * MERGED_CELL_RATIO
+            for b in (_box(c.get("box")) for c in reading.cells or [])
+            if b
+        ):
+            geometry = _column_geometry(column_rows, reading.page_index, width)
+        columns_px = (
+            tuple((x0 / sx, x1 / sx) for x0, x1 in geometry)
+            if geometry
+            else None
         )
         # The page's live boxes in the render the card's box is in, for
         # the box the card grows (:func:`neighbour_box`): a row of
@@ -479,6 +708,25 @@ def uncovered(
             for r in rows
             if r.img_width and r.img_height
         ]
+        sy = height / reading.img_height
+
+        def footnote_candidate(box: Box) -> bool:
+            # A cell the footnote answer would take: never cut at the
+            # gutter, so the grown box runs across the columns as the
+            # footnotes do.
+            scaled = [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy]
+            return (
+                neighbour_box(scaled, others, Label.FOOTNOTES.name) is not None
+            )
+
+        missed = missed_cells(
+            reading,
+            frame,
+            size,
+            rects_by_page.get(reading.page_index, []),
+            columns_px=columns_px,
+            keep_whole=footnote_candidate,
+        )
         for block in clusters(missed):
             yield _finding(
                 reading,
@@ -487,6 +735,7 @@ def uncovered(
                 height,
                 no_column=no_column,
                 others=others,
+                geometry=geometry,
             )
 
 
@@ -497,6 +746,7 @@ def _finding(
     height: int,
     no_column: bool = False,
     others: list[dict] | None = None,
+    geometry: tuple[tuple[float, float], tuple[float, float]] | None = None,
 ) -> dict:
     """Build the finding dict of one block of text in no box.
 
@@ -522,44 +772,102 @@ def _finding(
         ]
 
     bbox = scaled(box)
+    # A block of the halves of a line the reader merged across the
+    # gutter (``_split_merged``), all of one side.
+    halves = {c.get("half") for c in cells}
+    half = halves.pop() if len(halves) == 1 and None not in halves else None
     # The box the + adds. On a page with a column box it is the block,
-    # and the curator pulls the column over it or adds the block. On a
+    # and the curator pulls the column over it or adds the block; a
+    # half takes its column's width, the box the column lacks. On a
     # page with none, the first column box turns the glue's judgement
     # on for the whole page, and a block-sized box would leave the
     # rest of its column, the footnotes under it included, outside
-    # every box. So
-    # there the guess is the column the block sits in: every cell of
-    # the page beside the running head, the foot and the pictures that
-    # overlaps the block sideways, the way a double click fills a
-    # caption's column.
+    # every box. So there the guess is the column the block sits in,
+    # as wide as the volume's columns are (``_column_geometry``, off
+    # the nearest page with two column boxes) and as tall as the cells
+    # of that column beside the block make it: every cell of the page
+    # but the running head, the foot and the pictures, the way a
+    # double click fills a caption's column; a volume with no page of
+    # two columns nearby gets the cells' own union. The cells a live
+    # image box holds stay out (an addendum page is a table in an
+    # image box under a heading in no box), and the union never
+    # crosses one (a figure across the page with text above it and
+    # below it): a column drawn over the picture as well was resized
+    # by hand on every such page.
     guess = bbox
+    columns_px = (
+        [(c[0] / sx, c[1] / sx) for c in geometry] if geometry else None
+    )
+    column = cells[0].get("column") if columns_px else None
+    side = columns_px[column] if column is not None else None
+    if half and side:
+        guess = scaled([side[0], box[1], side[1], box[3]])
     if no_column:
-        column = list(box)
+        pictures = [
+            [
+                o["box"][0] / sx,
+                o["box"][1] / sy,
+                o["box"][2] / sx,
+                o["box"][3] / sy,
+            ]
+            for o in others or []
+            if o["label"] == Label.IMAGE.name
+        ]
+        beside = []
         for cell in reading.cells or []:
             other = _box(cell.get("box"))
             if other is None or cell.get("kind") in _NOT_COLUMN_KINDS:
                 continue
             if other[2] <= box[0] or other[0] >= box[2]:
                 continue
-            column = [
-                min(column[0], other[0]),
-                min(column[1], other[1]),
-                max(column[2], other[2]),
-                max(column[3], other[3]),
-            ]
-        guess = scaled(column)
+            if _in_a_picture(other, pictures):
+                continue
+            if _across_a_picture(box, other, pictures):
+                continue
+            beside.append(other)
+        if side is None:
+            column_box = list(box)
+            for other in beside:
+                column_box = [
+                    min(column_box[0], other[0]),
+                    min(column_box[1], other[1]),
+                    max(column_box[2], other[2]),
+                    max(column_box[3], other[3]),
+                ]
+            guess = scaled(column_box)
+        else:
+            x0, x1 = side
+            y0, y1 = box[1], box[3]
+            for other in beside:
+                held = min(other[2], x1) - max(other[0], x0)
+                if held <= (other[2] - other[0]) * columns.COLUMN_SHARE:
+                    continue
+                y0, y1 = min(y0, other[1]), max(y1, other[3])
+            guess = scaled([x0, y0, x1, y1])
     text = (cells[0].get("text") or "").strip()
-    count = (
-        "A block of text here is"
-        if len(cells) == 1
-        else f"{len(cells)} blocks of text here are"
-    )
+    if half:
+        count = (
+            f"The {half} half of a line the reader merged across both "
+            "columns is"
+        )
+    elif len(cells) == 1:
+        count = "A block of text here is"
+    else:
+        count = f"{len(cells)} blocks of text here are"
     if no_column:
         message = (
             f"{count} in no box, and the page has no column box "
-            f"(“{text}”). The opinion text keeps the block but has no "
-            "column to place it in. Draw the column box over the text, "
-            "or dismiss the card if it is not text."
+            f"(“{text}”). The opinion text keeps the "
+            f"{'line' if half else 'block'} but has no column to place "
+            "it in. Draw the column box over the text, or dismiss the "
+            "card if it is not text."
+        )
+    elif half:
+        message = (
+            f"{count} in no box (“{text}”). The opinion text keeps the "
+            "line, but that column has no box. Add the column box over "
+            "it or pull the page's over it, or dismiss the card if it "
+            "is not text."
         )
     else:
         message = (
@@ -585,6 +893,8 @@ def _finding(
             "source_page": reading.source_page,
             "cells": len(cells),
             "no_column": no_column,
+            # Which half of a merged line the block is, or None.
+            "half": half,
             # The page's footnote box beside the block, when there is
             # one: the card's footnote answer grows it over the block
             # instead of adding a second box (``neighbour_box``).
