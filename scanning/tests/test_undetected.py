@@ -476,6 +476,48 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(grow["id"], 7)
         self.assertEqual(grow["grown"], [100.0, 1500.0, 1550.0, 1800.0])
 
+    def test_a_columns_lines_near_the_footnote_box_stay_one_card(self):
+        # Two missed lines of the left column, the lower one within the
+        # grow gap of the footnote box: one block, one card, as on the
+        # base branch, and the grow answer on it.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=100.0,
+            y0=1500.0,
+            x1=820.0,
+            y1=1700.0,
+        )
+        self.write(
+            cell("A line", [150.0, 1200.0, 800.0, 1300.0]),
+            cell("The line under it", [150.0, 1320.0, 800.0, 1450.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertEqual(meta["bbox"], [150.0, 1200.0, 800.0, 1450.0])
+        self.assertEqual(meta["grow"]["id"], foot.pk)
+
+    def test_the_geometry_prefers_the_page_of_the_same_parity(self):
+        # The facing page's columns sit a margin's width over; the page
+        # two away is laid out like this one.
+        column(self.scan, page_index=1, bbox=[150.0, 100.0, 870.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[930.0, 100.0, 1650.0, 2000.0])
+        column(self.scan, page_index=2, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=2, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = {f["metadata"]["half"]: f for f in self.found()}
+        self.assertEqual(
+            found["left"]["metadata"]["guess"], [100.0, 200.0, 820.0, 600.0]
+        )
+        self.assertEqual(
+            found["right"]["metadata"]["guess"],
+            [880.0, 200.0, 1600.0, 600.0],
+        )
+
     def test_the_guess_never_crosses_a_picture(self):
         # A figure across the page with text above it and below it: the
         # block above keeps its own box, and so does the block below.

@@ -264,39 +264,66 @@ def _across_a_picture(block: Box, cell: Box, pictures: list[Box]) -> bool:
     return False
 
 
+def _column_rows(
+    scan: Scan, run: ApplyRun | None, pages: Collection[int] | None
+) -> dict[int, list]:
+    """Return the live ``TEXT_COLUMN`` rows of the run by page, once per rebuild.
+
+    Every page the rebuild judges, and :data:`NEIGHBOUR_PAGES` either
+    side of them, in one query: a page's guess reads the column boxes
+    of the pages beside it (:func:`_column_geometry`), and a query per
+    page was one per page of a one-column volume, whose every line is
+    wider than half the page.
+    """
+    rows = Detection.objects.live().filter(
+        scan=scan, apply_run=run, label=Label.TEXT_COLUMN.name
+    )
+    if pages:
+        rows = rows.filter(
+            page_index__range=(
+                min(pages) - NEIGHBOUR_PAGES,
+                max(pages) + NEIGHBOUR_PAGES,
+            )
+        )
+    by_page: dict[int, list] = {}
+    for row in rows:
+        if row.img_width:
+            by_page.setdefault(row.page_index, []).append(row)
+    return by_page
+
+
 def _column_geometry(
-    scan: Scan, run: ApplyRun | None, page_index: int, width: float
+    column_rows: dict[int, list], page_index: int, width: float
 ) -> tuple[tuple[float, float], tuple[float, float]] | None:
     """Return the x-ranges of the volume's two columns, or None.
 
     From the nearest page within :data:`NEIGHBOUR_PAGES` whose live
     ``TEXT_COLUMN`` boxes make two columns (``columns.column_groups``,
     so a picture that cuts a column into two boxes still reads as one
-    column), in the render ``width`` of the page asked about. A page
-    with one column, or three, says nothing, and a volume with no such
-    page nearby gives None, where the guess falls back to the cells.
+    column), in the render ``width`` of the page asked about. The
+    nearest page of the same parity first: a recto and a verso set
+    their text at different distances from the binding, so the facing
+    page's columns sit a margin's width off. A page with one column,
+    or three, says nothing, and a volume with no such page nearby gives
+    None, where the guess falls back to the cells.
+
+    :param column_rows: :func:`_column_rows`.
+    :param page_index: The page asked about, which never answers for
+        itself.
+    :param width: Its render width.
     """
-    rows = (
-        Detection.objects.live()
-        .filter(
-            scan=scan,
-            apply_run=run,
-            label=Label.TEXT_COLUMN.name,
-            page_index__range=(
-                page_index - NEIGHBOUR_PAGES,
-                page_index + NEIGHBOUR_PAGES,
-            ),
-        )
-        .exclude(page_index=page_index)
+    candidates = (
+        i
+        for i in column_rows
+        if i != page_index and abs(i - page_index) <= NEIGHBOUR_PAGES
     )
-    by_page: dict[int, list] = {}
-    for row in rows:
-        if row.img_width:
-            by_page.setdefault(row.page_index, []).append(row)
-    for index in sorted(by_page, key=lambda i: (abs(i - page_index), i)):
+    for index in sorted(
+        candidates,
+        key=lambda i: ((i - page_index) % 2, abs(i - page_index), i),
+    ):
         spans = [
             (r.x0 * width / r.img_width, r.x1 * width / r.img_width)
-            for r in by_page[index]
+            for r in column_rows[index]
         ]
         groups = columns.column_groups(spans)
         if len(groups) != 2:
@@ -309,6 +336,7 @@ def _column_geometry(
     return None
 
 
+#: The volume's two columns, ``((x0, x1), (x0, x1))``, left then right.
 Columns = tuple[tuple[float, float], tuple[float, float]]
 
 
@@ -331,24 +359,23 @@ def _by_column(
     boxed the cell was half covered, over the quarter the glue keeps a
     unit at, so the other column had no box and no card asked for one.
     The glue still keeps the unit whole; the card asks for the box the
-    column lacks, not for text. A cell ``keep_whole`` answers for (one
-    the page's footnote box would grow over) is yielded as it is,
-    untagged: a footnote line runs across the columns, and so must the
-    box that grows over it.
+    column lacks, not for text. A merged line ``keep_whole`` answers
+    for (one the page's footnote box would grow over) is not cut: it
+    keeps its tag, so it clusters with its column's other lines, and
+    its whole box, so the footnote box grown over it runs across the
+    columns as the footnotes do.
     """
     for cell in cells:
         box = _box(cell.get("box"))
         if box is None or columns_px is None:
             yield cell
             continue
-        if keep_whole is not None and keep_whole(box):
-            yield cell
-            continue
         held = [min(box[2], x1) - max(box[0], x0) for x0, x1 in columns_px]
-        if all(
+        merged = all(
             h > (x1 - x0) * columns.COLUMN_SHARE
             for h, (x0, x1) in zip(held, columns_px, strict=True)
-        ):
+        )
+        if merged and not (keep_whole is not None and keep_whole(box)):
             (lx0, lx1), (rx0, rx1) = columns_px
             yield {
                 **cell,
@@ -585,7 +612,10 @@ def uncovered(
     may call it in a request. The measure is the glue's
     (``opinion_ocr.page_frame``, ``opinion_ocr.undetected``), so a
     card here is a drop there. A page is judged by its own rows alone,
-    so a write on one page rebuilds that page (``pages``).
+    so a write on one page rebuilds that page (``pages``); only the
+    shape of its cards' ``+ column`` box reads the column boxes of the
+    pages beside it (:func:`_column_geometry`), so a column box drawn
+    on one page moves its neighbours' guesses at their next rebuild.
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
@@ -601,6 +631,7 @@ def uncovered(
     # and its old run, and is a stale card, never cover on the page
     # its old index names.
     by_page = _live_by_page(scan, run, pages)
+    column_rows = _column_rows(scan, run, pages)
     rects_by_page = {
         entry["page_index"]: entry["rects"]
         for entry in redactions.visible_by_page(scan, pages)
@@ -649,7 +680,7 @@ def uncovered(
             for b in (_box(c.get("box")) for c in reading.cells or [])
             if b
         ):
-            geometry = _column_geometry(scan, run, reading.page_index, width)
+            geometry = _column_geometry(column_rows, reading.page_index, width)
         columns_px = (
             tuple((x0 / sx, x1 / sx) for x0, x1 in geometry)
             if geometry
