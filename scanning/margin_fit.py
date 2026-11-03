@@ -472,6 +472,68 @@ def ensure_strips(
     return added
 
 
+def content_box(entry: dict) -> tuple[float, float, float, float]:
+    """Return the box the margin strips of one page leave, in points.
+
+    The strips are named by the page edge each lies on (:func:`_sides`,
+    the one rule), and the box is what the four leave between them; a
+    side the entry lacks is the page edge. It is the box the text
+    rects are held in (``redactions.strip_content_box``, #371), and it
+    is the strips *as measured*: :func:`hold_off_page_numbers` records
+    it on the entry before it moves a strip off the page number, or a
+    pulled strip would let a headnote's black box out over the number
+    it keeps visible, and a dropped one out to the page edge.
+
+    :param entry: One ``compute_margin_rects`` entry.
+    :returns: ``(x0, y0, x1, y1)``, in points.
+    :rtype: tuple[float, float, float, float]
+    """
+    recorded = entry.get("content_box")
+    if recorded:
+        return tuple(float(v) for v in recorded)
+    sides = _sides(entry)
+    x0, y0 = 0.0, 0.0
+    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
+    if sides["top"] is not None:
+        y0 = float(sides["top"]["y1"])
+    if sides["bottom"] is not None:
+        y1 = float(sides["bottom"]["y0"])
+    if sides["left"] is not None:
+        x0 = float(sides["left"]["x1"])
+    if sides["right"] is not None:
+        x1 = float(sides["right"]["x0"])
+    return x0, y0, x1, y1
+
+
+def _pull_back(rect: dict, boxes: list, pw: float, ph: float) -> bool:
+    """Pull one strip back off the boxes it covers, blackletter's geometry.
+
+    A strip is anchored to a page edge, and which edge says which of
+    its own edges moves (``margins._shrink_rects_for_detections``).
+
+    :returns: Whether the strip moved.
+    """
+    before = dict(rect)
+    full_width = rect["x0"] <= 1 and rect["x1"] >= pw - 1
+    for box in boxes:
+        if not (
+            box.x1 < rect["x1"]
+            and box.x2 > rect["x0"]
+            and box.y1 < rect["y1"]
+            and box.y2 > rect["y0"]
+        ):
+            continue
+        if full_width and rect["y0"] <= 1:
+            rect["y1"] = round(min(rect["y1"], box.y1), 1)
+        elif full_width and rect["y1"] >= ph - 1:
+            rect["y0"] = round(max(rect["y0"], box.y2), 1)
+        elif rect["x0"] <= 1:
+            rect["x1"] = round(min(rect["x1"], box.x1), 1)
+        elif rect["x1"] >= pw - 1:
+            rect["x0"] = round(max(rect["x0"], box.x2), 1)
+    return rect != before
+
+
 def hold_off_page_numbers(entries: list, pages=None) -> int:
     """Pull every strip back off the page's ``PAGE_NUMBER`` boxes.
 
@@ -480,15 +542,18 @@ def hold_off_page_numbers(entries: list, pages=None) -> int:
     moves a side strip in to the columns' edge: on a short page, an
     exhibit's list indented inside the columns, that put the right
     strip over the printed page number. The number stays visible, so
-    this runs after the measure and the handles, with blackletter's own
-    geometry: a strip anchored to a page edge pulls its inner edge back
-    to the box, and one that collapses is dropped. In place, in PDF
-    points.
+    this runs after the measure and the handles, in place and in PDF
+    points: the content box is recorded first (:func:`content_box`),
+    so the text rects keep their bound; the top and bottom strips are
+    pulled back; the side strips are stretched to them as
+    :func:`ensure_strips` lays the sides out, so a corner a row gave
+    up stays white, and pulled back too; a strip that collapses is
+    dropped.
 
     :param entries: The ``compute_margin_rects`` entries.
     :param pages: The blackletter pages the entries were measured on,
         matched by index.
-    :returns: How many strips were pulled back or dropped.
+    :returns: How many strips were moved or dropped.
     :rtype: int
     """
     by_index = {page.index: page for page in pages or []}
@@ -511,31 +576,32 @@ def hold_off_page_numbers(entries: list, pages=None) -> int:
         ]
         if not boxes:
             continue
-        kept = []
-        for rect in rects:
+        entry["content_box"] = list(content_box(entry))
+        sides = _sides(entry)
+        touched: set[int] = set()
+        for name in ("top", "bottom"):
+            rect = sides[name]
+            if rect is not None and _pull_back(rect, boxes, pw, ph):
+                touched.add(id(rect))
+        for name in ("left", "right"):
+            rect = sides[name]
+            if rect is None:
+                continue
             before = dict(rect)
-            full_width = rect["x0"] <= 1 and rect["x1"] >= pw - 1
-            for box in boxes:
-                if not (
-                    box.x1 < rect["x1"]
-                    and box.x2 > rect["x0"]
-                    and box.y1 < rect["y1"]
-                    and box.y2 > rect["y0"]
-                ):
-                    continue
-                if full_width and rect["y0"] <= 1:
-                    rect["y1"] = round(min(rect["y1"], box.y1), 1)
-                elif full_width and rect["y1"] >= ph - 1:
-                    rect["y0"] = round(max(rect["y0"], box.y2), 1)
-                elif rect["x0"] <= 1:
-                    rect["x1"] = round(min(rect["x1"], box.x1), 1)
-                elif rect["x1"] >= pw - 1:
-                    rect["x0"] = round(max(rect["x0"], box.x2), 1)
-            if rect != before:
-                moved += 1
-            if rect["x1"] - rect["x0"] > 1 and rect["y1"] - rect["y0"] > 1:
-                kept.append(rect)
+            if sides["top"] is not None:
+                rect["y0"] = sides["top"]["y1"]
+            if sides["bottom"] is not None:
+                rect["y1"] = sides["bottom"]["y0"]
+            if _pull_back(rect, boxes, pw, ph) or rect != before:
+                touched.add(id(rect))
+        kept = [
+            r for r in rects if r["x1"] - r["x0"] > 1 and r["y1"] - r["y0"] > 1
+        ]
+        touched.update(id(r) for r in rects if r not in kept)
         entry["rects"] = kept
+        moved += len(touched)
     if moved:
-        logger.info("Margin strips: %d pulled back off a page number", moved)
+        logger.info(
+            "Margin strips: %d moved or dropped off a page number", moved
+        )
     return moved

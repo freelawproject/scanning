@@ -629,3 +629,31 @@ class TestHoldOffPageNumbers(TestCase):
         entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
         self.assertEqual(margin_fit.hold_off_page_numbers([entry], []), 0)
         self.assertEqual(margin_fit._sides(entry)["right"], right)
+
+    def test_the_text_rect_bound_is_the_strips_as_measured(self):
+        from scanning import redactions
+
+        right = {"x0": 448.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
+        margin_fit.hold_off_page_numbers(
+            [entry], [self._number(1362.0, 114.0, 1438.0, 157.0)]
+        )
+        self.assertAlmostEqual(
+            margin_fit._sides(entry)["right"]["x0"], 517.7, places=1
+        )
+        self.assertEqual(margin_fit.content_box(entry)[2], 448.0)
+        self.assertEqual(redactions.strip_content_box(entry)[2], 448.0)
+
+    def test_the_sides_stretch_to_a_row_pulled_off_the_number(self):
+        top = {"x0": 0, "y0": 0, "x1": 612.0, "y1": 60.0}
+        left = {"x0": 0, "y0": 60.0, "x1": 64.7, "y1": 736.8}
+        right = {"x0": 564.8, "y0": 60.0, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(top, self.BOTTOM, left, right)
+        margin_fit.hold_off_page_numbers(
+            [entry], [self._number(1362.0, 114.0, 1438.0, 157.0)]
+        )
+        sides = margin_fit._sides(entry)
+        self.assertAlmostEqual(sides["top"]["y1"], 41.0, places=1)
+        self.assertAlmostEqual(sides["left"]["y0"], 41.0, places=1)
+        self.assertAlmostEqual(sides["right"]["y0"], 41.0, places=1)
+        self.assertEqual(sides["left"]["y1"], 736.8)
