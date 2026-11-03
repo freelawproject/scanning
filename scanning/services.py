@@ -1086,7 +1086,9 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
     the measure gave no page is a thin handle at the edge for the
     curator to widen, held off the detections like every strip, so a
     page whose content box blackletter could not establish gets four
-    handles too.
+    handles too. Last, every strip is pulled back off the page's
+    ``PAGE_NUMBER`` boxes (``margin_fit.hold_off_page_numbers``), which
+    blackletter's own pull-back exempts: the printed page number stays.
 
     :param pdf_path: Path to the PDF to compute margins for.
     :param document: The snapped document the rects were measured from.
@@ -1104,6 +1106,7 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
         pages = margin_fit.clipped_pages(document.pages)
         entries = compute_margin_rects(str(pdf_path), pages=pages)
         margin_fit.ensure_strips(entries, pages)
+        margin_fit.hold_off_page_numbers(entries, pages)
         return entries
 
 

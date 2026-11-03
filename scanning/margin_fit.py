@@ -112,6 +112,19 @@ X_ONLY_LABELS = frozenset({Label.TEXT_COLUMN})
 #: pinning the strip as it does today.
 CLIP_MIN_KEEP_RATIO = 0.5
 
+#: The confidence of a box a person drew or approved. Such a box is
+#: never clipped: the clip is for the model's box drawn out onto a
+#: blot, and a curator's image box over an exhibit page reaches past
+#: the page's text on purpose, so a strip held at the clipped edge
+#: whited out the bottom of the exhibit.
+DRAWN_CONFIDENCE = 1.0
+
+#: The labels a margin strip never covers, after every measure: the
+#: printed page number stays, so a side strip pulled in over it on a
+#: short page (blackletter's column band, which exempts the running
+#: head's labels from its own pull-back) is pushed back off it.
+KEPT_VISIBLE_LABELS = frozenset({Label.PAGE_NUMBER})
+
 #: The width, in PDF points, of a strip :func:`ensure_strips` adds where
 #: the measure gave none. About 2 mm: invisible on a trimmed reporter
 #: page, and one resize handle wide in the step-2 viewer.
@@ -300,7 +313,10 @@ def clipped_pages(pages) -> list:
         detections = []
         changed = False
         for det in page.detections:
-            if det.label not in CLIPPED_LABELS:
+            if (
+                det.label not in CLIPPED_LABELS
+                or det.confidence >= DRAWN_CONFIDENCE
+            ):
                 detections.append(det)
                 continue
             held = _clipped_box(det.bbox, frame, det.label in X_ONLY_LABELS)
@@ -454,3 +470,72 @@ def ensure_strips(
             held,
         )
     return added
+
+
+def hold_off_page_numbers(entries: list, pages=None) -> int:
+    """Pull every strip back off the page's ``PAGE_NUMBER`` boxes.
+
+    blackletter pulls a strip back off every detection but the running
+    head's labels (``margins.NO_PUSHBACK_LABELS``), and its column band
+    moves a side strip in to the columns' edge: on a short page, an
+    exhibit's list indented inside the columns, that put the right
+    strip over the printed page number. The number stays visible, so
+    this runs after the measure and the handles, with blackletter's own
+    geometry: a strip anchored to a page edge pulls its inner edge back
+    to the box, and one that collapses is dropped. In place, in PDF
+    points.
+
+    :param entries: The ``compute_margin_rects`` entries.
+    :param pages: The blackletter pages the entries were measured on,
+        matched by index.
+    :returns: How many strips were pulled back or dropped.
+    :rtype: int
+    """
+    by_index = {page.index: page for page in pages or []}
+    moved = 0
+    for entry in entries:
+        page = by_index.get(entry.get("page_index"))
+        rects = entry.get("rects") or []
+        if page is None or not rects:
+            continue
+        pw = float(entry.get("page_width") or 0)
+        ph = float(entry.get("page_height") or 0)
+        if not _page_size_agrees(page, pw, ph):
+            continue
+        boxes = [
+            d.bbox.to_pdf(page.scale_x, page.scale_y)
+            for d in page.detections
+            if d.label in KEPT_VISIBLE_LABELS
+            and d.bbox.width > 1
+            and d.bbox.height > 1
+        ]
+        if not boxes:
+            continue
+        kept = []
+        for rect in rects:
+            before = dict(rect)
+            full_width = rect["x0"] <= 1 and rect["x1"] >= pw - 1
+            for box in boxes:
+                if not (
+                    box.x1 < rect["x1"]
+                    and box.x2 > rect["x0"]
+                    and box.y1 < rect["y1"]
+                    and box.y2 > rect["y0"]
+                ):
+                    continue
+                if full_width and rect["y0"] <= 1:
+                    rect["y1"] = round(min(rect["y1"], box.y1), 1)
+                elif full_width and rect["y1"] >= ph - 1:
+                    rect["y0"] = round(max(rect["y0"], box.y2), 1)
+                elif rect["x0"] <= 1:
+                    rect["x1"] = round(min(rect["x1"], box.x1), 1)
+                elif rect["x1"] >= pw - 1:
+                    rect["x0"] = round(max(rect["x0"], box.x2), 1)
+            if rect != before:
+                moved += 1
+            if rect["x1"] - rect["x0"] > 1 and rect["y1"] - rect["y0"] > 1:
+                kept.append(rect)
+        entry["rects"] = kept
+    if moved:
+        logger.info("Margin strips: %d pulled back off a page number", moved)
+    return moved

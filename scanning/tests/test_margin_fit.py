@@ -342,6 +342,19 @@ class TestClippedPages(TestCase):
         (clipped,) = margin_fit.clipped_pages([self._page(icon)])
         self.assertIs(clipped.detections[0], icon)
 
+    def test_a_drawn_image_box_is_never_clipped(self):
+        """A curator's image box over an exhibit reaches past the text
+        on purpose; the model's is held at the text box."""
+        drawn = self._detection(
+            Label.IMAGE, 100.0, 300.0, 1500.0, 1900.0, confidence=1.0
+        )
+        subject = self._page(drawn)
+        (clipped,) = margin_fit.clipped_pages([subject])
+        self.assertIs(clipped, subject)
+        model = self._detection(Label.IMAGE, 100.0, 300.0, 1500.0, 1900.0)
+        (clipped,) = margin_fit.clipped_pages([self._page(model)])
+        self.assertNotEqual(clipped.detections[0].bbox, model.bbox)
+
     def test_a_page_with_no_text_box_is_the_same_object(self):
         column = self._detection(Label.TEXT_COLUMN, 0.5, 130.0, 760.0, 2050.0)
         subject = self._page(column, text_box=None)
@@ -538,3 +551,81 @@ class TestEnsureStrips(TestCase):
         column.pdf_width = 500.0
         entry = self._entry(self.TOP, self.BOTTOM, self.RIGHT)
         self.assertEqual(margin_fit.ensure_strips([entry], [column]), 1)
+
+
+class TestHoldOffPageNumbers(TestCase):
+    """A margin strip never covers the printed page number."""
+
+    def _entry(self, *rects):
+        return {
+            "page_index": 0,
+            "page_width": POINTS[0],
+            "page_height": POINTS[1],
+            "rects": [dict(r) for r in rects],
+        }
+
+    @staticmethod
+    def _number(*box):
+        return page(
+            detections=(
+                BLDetection(
+                    bbox=BBox(x1=box[0], y1=box[1], x2=box[2], y2=box[3]),
+                    label=Label.PAGE_NUMBER,
+                    confidence=0.8,
+                    page_index=0,
+                ),
+            )
+        )
+
+    TOP = {"x0": 0, "y0": 0, "x1": 612.0, "y1": 22.4}
+    BOTTOM = {"x0": 0, "y0": 736.8, "x1": 612.0, "y1": 792.0}
+    LEFT = {"x0": 0, "y0": 22.4, "x1": 64.7, "y1": 736.8}
+
+    def test_a_side_strip_is_pulled_back_off_the_number(self):
+        # Page 1241 of 627 F. Supp. 3d: the right strip came in to the
+        # columns' edge over the number at the top right.
+        right = {"x0": 448.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
+        subject = self._number(1362.0, 114.0, 1438.0, 157.0)
+        self.assertEqual(
+            margin_fit.hold_off_page_numbers([entry], [subject]), 1
+        )
+        held = margin_fit._sides(entry)["right"]
+        self.assertAlmostEqual(held["x0"], 1438.0 * 612.0 / 1700.0, places=1)
+        self.assertEqual(len(entry["rects"]), 4)
+
+    def test_the_top_strip_stops_above_the_number(self):
+        top = {"x0": 0, "y0": 0, "x1": 612.0, "y1": 60.0}
+        entry = self._entry(top, self.BOTTOM, self.LEFT)
+        subject = self._number(1362.0, 114.0, 1438.0, 157.0)
+        margin_fit.hold_off_page_numbers([entry], [subject])
+        self.assertAlmostEqual(
+            margin_fit._sides(entry)["top"]["y1"],
+            114.0 * 792.0 / 2200.0,
+            places=1,
+        )
+
+    def test_a_strip_that_collapses_on_the_number_is_dropped(self):
+        right = {"x0": 600.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
+        subject = self._number(1660.0, 114.0, 1699.0, 157.0)
+        self.assertEqual(
+            margin_fit.hold_off_page_numbers([entry], [subject]), 1
+        )
+        self.assertIsNone(margin_fit._sides(entry)["right"])
+        self.assertEqual(len(entry["rects"]), 3)
+
+    def test_a_strip_clear_of_the_number_is_left_alone(self):
+        right = {"x0": 564.8, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
+        subject = self._number(1362.0, 114.0, 1438.0, 157.0)
+        self.assertEqual(
+            margin_fit.hold_off_page_numbers([entry], [subject]), 0
+        )
+        self.assertEqual(margin_fit._sides(entry)["right"], right)
+
+    def test_a_page_the_measure_did_not_read_is_left_alone(self):
+        right = {"x0": 448.0, "y0": 22.4, "x1": 612.0, "y1": 736.8}
+        entry = self._entry(self.TOP, self.BOTTOM, self.LEFT, right)
+        self.assertEqual(margin_fit.hold_off_page_numbers([entry], []), 0)
+        self.assertEqual(margin_fit._sides(entry)["right"], right)
