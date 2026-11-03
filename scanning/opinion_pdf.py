@@ -275,6 +275,8 @@ def owed() -> QuerySet:
         .exclude(status=OpinionReviewStatus.ERROR)
         .exclude(redacted_pdf_revision=F("glue_revision"))
         .select_related("scan", "scan__reporter", "boundary")
+        # The scan's caches stay on disk (#582): the PDF reads none.
+        .defer(*Scan.large_fields("scan__"))
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
 
@@ -1097,7 +1099,7 @@ def release_mirrors() -> int:
     removed = 0
     for scan in Scan.objects.filter(
         pk__in=pks, status__in=OPINION_PDF_STATUSES
-    ):
+    ).defer(*Scan.large_fields()):
         if s3_sync.release_local_processing(scan):
             removed += 1
     if removed:

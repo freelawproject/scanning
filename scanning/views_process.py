@@ -2045,9 +2045,11 @@ def opinion_blocking_cards(
     """
     from scanning import blocking_review, ensemble, opinion_review, s3_sync
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.objects.defer(*Scan.large_fields()), pk=pk)
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan", "apply_run"),
+        Opinion.objects.select_related("scan", "apply_run").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
         scan=scan,
     )
@@ -2582,9 +2584,11 @@ def serve_opinion_final_xml(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: The XML, or a JSON 404 or 409.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.objects.defer(*Scan.large_fields()), pk=pk)
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan__reporter"),
+        Opinion.objects.select_related("scan__reporter").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
         scan=scan,
     )
@@ -2654,9 +2658,11 @@ def opinion_final_xml(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: The page, or a JSON 404 or 409.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.objects.defer(*Scan.large_fields()), pk=pk)
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan__reporter"),
+        Opinion.objects.select_related("scan__reporter").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
         scan=scan,
     )

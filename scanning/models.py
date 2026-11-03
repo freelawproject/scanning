@@ -558,7 +558,9 @@ class Scan(AbstractDateTimeModel):
     #: The columns that hold a volume's caches and logs, kilobytes to
     #: megabytes a row. A list of scans defers them (``views.scan_list``):
     #: a page of twenty-five that read them pulled every volume's OCR
-    #: cache off disk (2026-11-02). A reader that needs one loads it on
+    #: cache off disk (2026-11-02). So does a query that joins the scan
+    #: (:meth:`large_fields`, #582): the join repeats the scan's columns
+    #: on every row it returns. A reader that needs one loads it on
     #: access.
     LARGE_FIELDS = (
         "progress_log",
@@ -567,6 +569,18 @@ class Scan(AbstractDateTimeModel):
         "missing_pages",
         "page_scores",
     )
+
+    @classmethod
+    def large_fields(cls, prefix: str = "") -> list[str]:
+        """Return :attr:`LARGE_FIELDS` as ``defer()`` names.
+
+        :param prefix: The path to the scan from the queried model, such
+            as ``"scan__"`` for a query that joins it with
+            ``select_related("scan")``; empty for a query of scans.
+        :returns: The names, in the order of :attr:`LARGE_FIELDS`.
+        :rtype: list[str]
+        """
+        return [f"{prefix}{name}" for name in cls.LARGE_FIELDS]
 
     volume_obj = models.ForeignKey(
         Volume,

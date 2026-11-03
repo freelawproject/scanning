@@ -122,7 +122,7 @@ from django.db import DatabaseError, connection
 from django.db.models import Case, F, Q, QuerySet, Value, When
 
 from scanning import casebody, s3_sync, tagger
-from scanning.models import Opinion, OpinionReviewStatus
+from scanning.models import Opinion, OpinionReviewStatus, Scan
 
 logger = logging.getLogger(__name__)
 
@@ -665,7 +665,13 @@ def export_rows(limit: int | None, opinions: QuerySet | None) -> int:
     left = None if limit is None else limit - done
     if left is not None and left <= 0:
         return done
-    for opinion in due_rows(opinions).select_related("scan__reporter")[:left]:
+    rows = (
+        due_rows(opinions)
+        .select_related("scan__reporter")
+        # The scan's caches stay on disk (#582): the export reads none.
+        .defer(*Scan.large_fields("scan__"))
+    )
+    for opinion in rows[:left]:
         try:
             wrote = export(opinion)
         except TransientFault as exc:

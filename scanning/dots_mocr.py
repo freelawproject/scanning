@@ -284,6 +284,8 @@ def enqueue_missing_runs() -> int:
         .exclude(pk__in=skipped)
         .annotate(read=Exists(read))
         .filter(read=False)
+        # The caches stay on disk (#582): the enqueue reads none.
+        .defer(*Scan.large_fields())
         .order_by("-pk")[: settings.DOTS_MOCR_MAX_CONCURRENCY]
     )
 

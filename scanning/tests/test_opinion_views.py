@@ -67,6 +67,54 @@ class TestOpinionList(ScanningTestCase):
 
         self.assertContains(response, reverse("legacy_opinion_list"))
 
+    def test_the_list_leaves_the_volumes_caches_on_disk(self):
+        """The join repeated the scan's OCR cache on each of fifty rows,
+        and a page of one volume's opinions took minutes on a starved
+        database (#582). No query of the page reads a cache column, so
+        no reader loads the deferred field row by row either."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.models import Scan
+        from scanning.tests.test_views import large_scan_columns
+
+        for page in (420, 430):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=page,
+                last_printed_page=page + 3,
+                page_count=4,
+            )
+
+        for query in ({}, {"scan": self.scan.pk}, {"volume": 237}):
+            with self.subTest(query=query):
+                with CaptureQueriesContext(connection) as captured:
+                    response = self.client.get(reverse("opinion_list"), query)
+
+                self.assertEqual(response.status_code, 200)
+                rows = list(response.context["page_obj"])
+                self.assertEqual(len(rows), 3)
+                for row in rows:
+                    self.assertLessEqual(
+                        set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+                    )
+                self.assertEqual(large_scan_columns(captured), [])
+
+    def test_the_blocking_review_leaves_the_volumes_caches_on_disk(self):
+        """The blocking review reads the list's query (#582)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(
+                reverse("opinion_blocking_review"), {"scan": self.scan.pk}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(large_scan_columns(captured), [])
+
     def test_the_scan_filter_narrows_the_list(self):
         other = OpinionFactory()
 

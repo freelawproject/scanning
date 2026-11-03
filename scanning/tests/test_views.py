@@ -53,6 +53,25 @@ from scanning.models import (
 MEDIA_ROOT = tempfile.mkdtemp()
 
 
+def large_scan_columns(queries) -> list[str]:
+    """Return the ``Scan.LARGE_FIELDS`` columns some queries read (#582).
+
+    A query that names none of them is one that left the caches on
+    disk, whether it read the scan in a join or on its own, and so is a
+    deferred field that something loaded on access row by row.
+
+    :param queries: ``CaptureQueriesContext.captured_queries``.
+    :returns: Each ``"scanning_scan"."<column>"`` found, once per query.
+    """
+    columns = [f'"scanning_scan"."{name}"' for name in Scan.LARGE_FIELDS]
+    return [
+        column
+        for query in queries
+        for column in columns
+        if column in query["sql"]
+    ]
+
+
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
 class ScanningTestCase(TestCase):
     """Base test case with shared helper methods.

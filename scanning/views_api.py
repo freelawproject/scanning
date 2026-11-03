@@ -1498,6 +1498,7 @@ def _edit_context(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -1609,8 +1610,10 @@ def _build_after_edit(
 
     reason = ""
     for _attempt in range(2):
-        fresh = Opinion.objects.select_related("scan", "apply_run").get(
-            pk=opinion.pk
+        fresh = (
+            Opinion.objects.select_related("scan", "apply_run")
+            .defer(*Scan.large_fields("scan__"))
+            .get(pk=opinion.pk)
         )
         try:
             ensemble.rerun(fresh)
@@ -2075,6 +2078,7 @@ def withdraw_opinion_edit(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -2139,6 +2143,7 @@ def approve_opinion_text(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -2243,6 +2248,7 @@ def start_caselaw_tagger(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:

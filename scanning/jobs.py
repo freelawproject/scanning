@@ -94,6 +94,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Scan,
 )
 
 logger = logging.getLogger(__name__)
@@ -2672,10 +2673,13 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
     # tests the status it read, so a row cancelled or failed between the
     # two queries must not be read at all, or it would be swapped from
     # that status into SUBMITTED. ``s3_job_attempt_key`` reads the apply
-    # run's number (#224).
-    rows = queryset.filter(
-        pk__in=ids, status=JobStatus.PENDING
-    ).select_related("scan", "scan__reporter", "apply_run")
+    # run's number (#224). The scan's caches stay on disk (#582): no
+    # submit reads one.
+    rows = (
+        queryset.filter(pk__in=ids, status=JobStatus.PENDING)
+        .select_related("scan", "scan__reporter", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
+    )
     by_id = {row.pk: row for row in rows}
     return [by_id[pk] for pk in ids if pk in by_id]
 
@@ -3290,9 +3294,14 @@ def sweep_jobs(
     summary = SweepSummary()
     now = now or timezone.now()
 
-    in_flight = ExternalJob.objects.filter(
-        status__in=IN_FLIGHT_JOB_STATUSES
-    ).select_related("scan", "scan__reporter")
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # every row of a volume's shards, on every tick of every provider's
+    # sweep, and no sweep reads one.
+    in_flight = (
+        ExternalJob.objects.filter(status__in=IN_FLIGHT_JOB_STATUSES)
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if providers is not None:
         in_flight = in_flight.filter(provider__in=providers)
     for job in in_flight:
@@ -3312,11 +3321,15 @@ def sweep_jobs(
     # rows stamped at creation before the move. A row never claimed
     # carries no deadline and waits for its engine instead: our own
     # queue is not a fault, however long it is.
-    stranded = ExternalJob.objects.filter(
-        status=JobStatus.PENDING,
-        deadline__isnull=False,
-        deadline__lt=now,
-    ).select_related("scan", "scan__reporter")
+    stranded = (
+        ExternalJob.objects.filter(
+            status=JobStatus.PENDING,
+            deadline__isnull=False,
+            deadline__lt=now,
+        )
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if providers is not None:
         stranded = stranded.filter(provider__in=providers)
     for job in stranded:
@@ -3421,8 +3434,10 @@ def abandon_open(
             getattr(scan, "pk", scan),
             reason,
         )
-    for job in ExternalJob.objects.filter(pk__in=doomed).select_related(
-        "scan"
+    for job in (
+        ExternalJob.objects.filter(pk__in=doomed)
+        .select_related("scan")
+        .defer(*Scan.large_fields("scan__"))
     ):
         _cancel_provider_job(job)
     return cancelled

@@ -289,6 +289,20 @@ class TestSubmitPending(ScanningTestCase):
             self.assertEqual(job.provider_meta["output"], {"pages": 10})
             self.assertEqual(job.provider_meta["confirmed_by"], "response")
 
+    def test_a_wave_leaves_the_volumes_caches_on_disk(self):
+        """No query of a submit wave reads a cache column of the scan
+        (#582), the slice's join or a submit that loads one later."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        with CaptureQueriesContext(connection) as captured:
+            summary, _ = self._summary(return_value={"pages": 10})
+
+        self.assertEqual(summary.submitted, 3)
+        self.assertEqual(large_scan_columns(captured), [])
+
     def test_each_row_gets_its_own_attempt_scoped_result_key(self):
         self._summary(return_value={"pages": 10})
 
@@ -638,6 +652,30 @@ class TestApplyRowsGoFirst(ScanningTestCase):
             self.assertEqual(rows[1].scan.reporter.pk, scan.reporter.pk)
         self.assertEqual(jobs._pending_slice(queryset.none(), 2), [])
 
+    def test_the_slice_leaves_the_volumes_caches_on_disk(self):
+        """The join read the scan's OCR cache once per row of the wave
+        (#582), and no submit reads one."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.models import Scan
+        from scanning.tests.test_views import large_scan_columns
+
+        scan = ScanFactory()
+        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        queryset = ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        )
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs._pending_slice(queryset, 3)
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(large_scan_columns(captured), [])
+        for row in rows:
+            self.assertLessEqual(
+                set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+            )
+
     def test_the_polls_have_their_indexes(self):
         """The wave's slice and the two sweeps' probes read an index,
         never the table (the 2026-11-02 outage)."""
@@ -920,6 +958,56 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(summary.failed, 1)
         self.assertEqual(stranded.status, JobStatus.FAILED)
         self.assertEqual(stranded.error_code, "QUEUE_TIMEOUT")
+
+    def test_the_sweep_leaves_the_volumes_caches_on_disk(self):
+        """Every in-flight row was joined to its scan's OCR cache, on
+        every tick of every provider's sweep (#582). No query of a
+        sweep reads a cache column: not the join, and not a reader that
+        loads the deferred field row by row, waiting or completing."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        shards = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=3)
+        )
+        now = timezone.now()
+        for job in shards:
+            ExternalJob.objects.filter(pk=job.pk).update(
+                status=JobStatus.SUBMITTED,
+                result_key=f"processing/jobs/convert/bitonal/{job.pk}.pdf",
+                submitted_at=now,
+                deadline=now + timedelta(seconds=900),
+            )
+        stranded = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=stranded.pk).update(
+            deadline=now - timedelta(seconds=1)
+        )
+
+        # Nothing landed yet: every row waits, and the stranded one is
+        # written off.
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=False),
+            self.assertLogs("scanning.jobs", level="ERROR"),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            summary = jobs.sweep_jobs()
+        self.assertEqual(large_scan_columns(captured), [])
+        self.assertEqual(summary.pending, 4)
+        self.assertEqual(summary.failed, 1)
+
+        # Every result landed: every row completes, polled again once
+        # its interval is out and inside its deadline.
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            summary = jobs.sweep_jobs(now=now + timedelta(seconds=600))
+        self.assertEqual(large_scan_columns(captured), [])
+        self.assertEqual(summary.completed, 4)
 
 
 class TestVolumeResultKey(ScanningTestCase):

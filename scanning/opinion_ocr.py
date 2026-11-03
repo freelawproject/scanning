@@ -2152,7 +2152,9 @@ def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
         due().order_by("-scan_id").values_list("scan_id", flat=True).distinct()
     )
     for scan_id in scan_ids:
-        scan = Scan.objects.get(pk=scan_id)
+        # The caches stay on disk (#582): a held scan is read again on
+        # every tick, and the glue reads none of them.
+        scan = Scan.objects.defer(*Scan.large_fields()).get(pk=scan_id)
         try:
             inputs = load_inputs(scan)
         except ScanHeld as exc:
@@ -2179,6 +2181,7 @@ def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
         due()
         .filter(scan=scan)
         .select_related("boundary", "scan")
+        .defer(*Scan.large_fields("scan__"))
         .order_by("first_printed_page", "index_in_page")[:limit]
     )
     started = time.monotonic()
@@ -2249,9 +2252,11 @@ def reglue_rows(scan: Scan | None = None) -> QuerySet:
     :returns: The rows.
     :rtype: QuerySet
     """
-    rows = Opinion.objects.exclude(
-        status=OpinionReviewStatus.TEXT_REVIEW_DONE
-    ).select_related("scan", "scan__reporter")
+    rows = (
+        Opinion.objects.exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if scan is not None:
         rows = rows.filter(scan=scan)
     return rows.order_by("scan_id", "first_printed_page", "index_in_page")

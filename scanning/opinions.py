@@ -1039,11 +1039,16 @@ def promote_ready_opinions(limit: int = PROMOTIONS_PER_TICK) -> int:
     """
     from scanning.opinion_pdf import OPINION_PDF_STATUSES
 
-    ready = Opinion.objects.filter(
-        _live_stamps(),
-        scan__status__in=OPINION_PDF_STATUSES,
-        status=OpinionReviewStatus.PROCESSING,
-    ).select_related("scan", "scan__reporter")[:limit]
+    ready = (
+        Opinion.objects.filter(
+            _live_stamps(),
+            scan__status__in=OPINION_PDF_STATUSES,
+            status=OpinionReviewStatus.PROCESSING,
+        )
+        .select_related("scan", "scan__reporter")
+        # The scan's caches stay on disk (#582): the promotion reads none.
+        .defer(*Scan.large_fields("scan__"))[:limit]
+    )
     moved = sum(1 for row in ready if promote_ready(row))
     stale = Opinion.objects.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW

@@ -557,6 +557,8 @@ def queue(state: str = "waiting") -> QuerySet:
             "requested_by",
             "dismissed_by",
         )
+        # The scan's caches stay on disk (#582): the list prints none.
+        .defer(*Scan.large_fields("scan__"))
     )
     if state == "dismissed":
         rows = rows.filter(dismissed_at__isnull=False)
