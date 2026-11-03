@@ -83,28 +83,15 @@ def _round(value: float) -> float:
 def strip_content_box(entry: dict) -> tuple[float, float, float, float]:
     """Return the box the margin strips of one page leave, in points.
 
-    The strips are named by the page edge each lies on
-    (``margin_fit._sides``, the one rule), and the box is what the four
-    leave between them. Every page has its four strips
-    (``margin_fit.ensure_strips``, #370); a side the entry still lacks
-    is the page edge.
+    ``margin_fit.content_box``: the strips as measured, before the
+    page-number hold-off moved one, so a pulled strip never widens the
+    box a text rect is held in.
 
     :param entry: One ``compute_margin_rects`` entry, with its
         ``page_width``, ``page_height`` and ``rects`` in points.
     :returns: ``(x0, y0, x1, y1)``, in points.
     """
-    sides = margin_fit._sides(entry)
-    x0, y0 = 0.0, 0.0
-    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
-    if sides["top"] is not None:
-        y0 = float(sides["top"]["y1"])
-    if sides["bottom"] is not None:
-        y1 = float(sides["bottom"]["y0"])
-    if sides["left"] is not None:
-        x0 = float(sides["left"]["x1"])
-    if sides["right"] is not None:
-        x1 = float(sides["right"]["x0"])
-    return x0, y0, x1, y1
+    return margin_fit.content_box(entry)
 
 
 def clip_to_content(
