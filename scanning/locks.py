@@ -129,6 +129,38 @@ def held(name: str, wait: bool = False) -> Iterator[bool]:
                 )
 
 
+def take(name: str) -> bool:
+    """Take the named session lock now, or answer ``False``.
+
+    The split form of :func:`held`, for a lock whose holder outlives
+    one block: a compute slot is taken in the claim and released when
+    the action ends (``process_next_scan``). The caller releases it
+    with :func:`release`; a session that vanishes loses it with the
+    keepalives :func:`_bound_session` set.
+
+    :param name: The lock's name.
+    :returns: Whether this session holds it now.
+    :rtype: bool
+    """
+    with connection.cursor() as cursor:
+        _bound_session(cursor)
+        cursor.execute(
+            "SELECT pg_try_advisory_lock(%s, %s)", [NAMESPACE, key(name)]
+        )
+        return bool(cursor.fetchone()[0])
+
+
+def release(name: str) -> None:
+    """Release a lock :func:`take` gave this session.
+
+    :param name: The lock's name.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT pg_advisory_unlock(%s, %s)", [NAMESPACE, key(name)]
+        )
+
+
 def is_held(name: str) -> bool:
     """Return whether any session holds the named lock now (#534).
 

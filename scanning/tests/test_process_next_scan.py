@@ -11,6 +11,7 @@ from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from scanning.factories import ExternalJobFactory, ScanFactory
+from scanning.management.commands import process_next_scan
 from scanning.management.commands.process_next_scan import (
     CLAIM_LIFT_SECONDS,
     MAX_DB_RETRIES,
@@ -523,3 +524,117 @@ class TestHeartbeat(TestCase):
             process_next_scan.dispatch(scan, QueuedAction.CREATE_OPINIONS)
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.ERROR)
+
+
+class TestComputeSlots(TestCase):
+    """A compute is claimed only with a compute slot (2026-11-03)."""
+
+    def setUp(self):
+        super().setUp()
+        from scanning import locks
+
+        process_next_scan._compute_slots.clear()
+        # A claim in another test took the real lock on this session
+        # and never dispatched; a session lock counts its takes.
+        for name in ("compute:0", "compute:1"):
+            for _ in range(10):
+                if not locks.is_held(name):
+                    break
+                locks.release(name)
+
+    @staticmethod
+    def _queued(action, minutes=0):
+        scan = ScanFactory(status=Status.QUEUED, queued_action=action)
+        Scan.objects.filter(pk=scan.pk).update(
+            date_created=timezone.now() + timedelta(minutes=minutes)
+        )
+        return scan
+
+    def test_a_compute_with_no_free_slot_is_passed_over_for_the_next_row(
+        self,
+    ):
+        compute = self._queued(QueuedAction.COMPUTE_REDACTIONS)
+        apply_scan = self._queued(QueuedAction.APPLY_PAGE_EDITS, minutes=1)
+        with patch("scanning.locks.take", return_value=False) as take:
+            scan, action = process_next_scan.claim_next()
+        self.assertEqual(scan.pk, apply_scan.pk)
+        self.assertEqual(action, QueuedAction.APPLY_PAGE_EDITS)
+        take.assert_called_once_with("compute:0")
+        compute.refresh_from_db()
+        self.assertEqual(compute.status, Status.QUEUED)
+        self.assertEqual(process_next_scan._compute_slots, {})
+
+    def test_only_computes_queued_and_no_slot_claims_nothing(self):
+        compute = self._queued(QueuedAction.COMPUTE_THEN_CREATE_OPINIONS)
+        with patch("scanning.locks.take", return_value=False):
+            self.assertIsNone(process_next_scan.claim_next())
+        compute.refresh_from_db()
+        self.assertEqual(compute.status, Status.QUEUED)
+
+    def test_a_claimed_compute_holds_its_slot_until_its_dispatch_ends(self):
+        self._queued(QueuedAction.COMPUTE_REDACTIONS)
+        with (
+            patch("scanning.locks.take", return_value=True) as take,
+            patch("scanning.locks.release") as release,
+        ):
+            scan, action = process_next_scan.claim_next()
+            take.assert_called_once_with("compute:0")
+            self.assertEqual(
+                process_next_scan._compute_slots, {scan.pk: "compute:0"}
+            )
+            release.assert_not_called()
+            with (
+                patch.object(process_next_scan, "heartbeat"),
+                patch("scanning.services.run_compute_redactions") as fn,
+            ):
+                process_next_scan.dispatch(scan, action)
+            fn.assert_called_once_with(scan.pk)
+            release.assert_called_once_with("compute:0")
+        self.assertEqual(process_next_scan._compute_slots, {})
+
+    def test_the_slot_is_released_when_the_action_raises(self):
+        self._queued(QueuedAction.COMPUTE_REDACTIONS)
+        with (
+            patch("scanning.locks.take", return_value=True),
+            patch("scanning.locks.release") as release,
+        ):
+            scan, action = process_next_scan.claim_next()
+            with (
+                patch.object(process_next_scan, "heartbeat"),
+                patch(
+                    "scanning.services.run_compute_redactions",
+                    side_effect=RuntimeError("boom"),
+                ),
+            ):
+                process_next_scan.dispatch(scan, action)
+            release.assert_called_once_with("compute:0")
+        self.assertEqual(process_next_scan._compute_slots, {})
+
+    def test_an_upload_takes_no_slot(self):
+        self._queued(QueuedAction.FULL_PIPELINE)
+        with patch("scanning.locks.take") as take:
+            scan, action = process_next_scan.claim_next()
+        self.assertEqual(action, QueuedAction.FULL_PIPELINE)
+        take.assert_not_called()
+
+    @override_settings(COMPUTE_MAX_CONCURRENCY=2)
+    def test_the_slots_are_as_many_as_the_setting(self):
+        self._queued(QueuedAction.COMPUTE_REDACTIONS)
+        with patch("scanning.locks.take", side_effect=[False, True]) as take:
+            scan, action = process_next_scan.claim_next()
+        self.assertEqual(
+            [c.args[0] for c in take.call_args_list],
+            ["compute:0", "compute:1"],
+        )
+        self.assertEqual(
+            process_next_scan._compute_slots[scan.pk], "compute:1"
+        )
+
+    def test_the_real_lock_is_taken_and_given_back(self):
+        from scanning import locks
+
+        self._queued(QueuedAction.COMPUTE_REDACTIONS)
+        scan, action = process_next_scan.claim_next()
+        self.assertTrue(locks.is_held("compute:0"))
+        process_next_scan.release_compute_slot(scan.pk)
+        self.assertFalse(locks.is_held("compute:0"))

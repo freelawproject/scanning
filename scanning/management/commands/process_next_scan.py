@@ -58,6 +58,55 @@ CLAIM_PRIORITY = (
 #: ``date_modified``.
 CLAIM_LIFT_SECONDS = 15 * 60
 
+#: The actions that run the redaction compute, capped at
+#: ``COMPUTE_MAX_CONCURRENCY`` at once (2026-11-03): a compute replaces
+#: a volume's rows in one transaction, and three together took the
+#: database down with them.
+COMPUTE_ACTIONS = frozenset(
+    {"compute_redactions", "compute_then_create_opinions"}
+)
+
+#: How many ranked QUEUED rows one claim looks through for a row it may
+#: take: with no compute slot free, the compute rows are passed over
+#: for the upload or the apply behind them.
+CLAIM_WINDOW = 50
+
+#: The compute slot each running action of this process holds, by scan
+#: pk, released when its dispatch ends.
+_compute_slots: dict[int, str] = {}
+
+
+def _take_compute_slot() -> str | None:
+    """Take a free compute slot, or answer None.
+
+    One session lock per slot (``compute:0`` upward), as many as
+    ``COMPUTE_MAX_CONCURRENCY``; the lock lives on this worker's
+    connection until :func:`release_compute_slot`, and dies with a
+    worker that vanishes.
+
+    :returns: The slot's lock name, or None when every slot is held.
+    :rtype: str | None
+    """
+    from django.conf import settings
+
+    from scanning import locks
+
+    slots = max(1, int(getattr(settings, "COMPUTE_MAX_CONCURRENCY", 1) or 1))
+    for i in range(slots):
+        name = f"compute:{i}"
+        if locks.take(name):
+            return name
+    return None
+
+
+def release_compute_slot(scan_pk: int) -> None:
+    """Release the compute slot the action of ``scan_pk`` held, if any."""
+    from scanning import locks
+
+    name = _compute_slots.pop(scan_pk, None)
+    if name:
+        locks.release(name)
+
 
 def recover_stale() -> None:
     """Reset scans stuck in PROCESSING past the timeout back to QUEUED.
@@ -136,45 +185,79 @@ def claim_next():
     """Atomically claim the next queued scan by rank and mark it
     PROCESSING.
 
-    The claim is ``SELECT ... FOR UPDATE SKIP LOCKED`` over
-    ``status=QUEUED``, so any number of workers may call it at once
-    and each gets its own scan. The one claim rule, for the tick and
-    for a scan task alike (``tasks.run_scan``, #503): a task names the
-    scan a view queued, but it claims by ``CLAIM_PRIORITY`` like the
-    tick, so a person's upload never waits behind a dispatched backfill
-    apply, and a message from before a re-queue runs the row's current
-    action and never the message's.
+    The claim is ``SELECT ... FOR UPDATE SKIP LOCKED`` over one QUEUED
+    row at a time, so any number of workers may call it at once and
+    each gets its own scan. The one claim rule, for the tick and for a
+    scan task alike (``tasks.run_scan``, #503): a task names the scan a
+    view queued, but it claims by ``CLAIM_PRIORITY`` like the tick, so
+    a person's upload never waits behind a dispatched backfill apply,
+    and a message from before a re-queue runs the row's current action
+    and never the message's.
+
+    A compute (``COMPUTE_ACTIONS``) is claimed only with a compute slot
+    (:func:`_take_compute_slot`), taken before the swap and held until
+    the action's dispatch ends, so ``COMPUTE_MAX_CONCURRENCY`` of them
+    run at once across every worker. A worker with no slot passes the
+    compute rows over, up to ``CLAIM_WINDOW`` ranked rows, for the
+    next row it may take.
 
     :return: ``(scan, action)`` for the claimed scan, or ``None`` if no
-        scan is queued.
+        scan it may take is queued.
     :rtype: tuple | None
     """
     from django.db import transaction
     from django.utils import timezone
 
+    from scanning import locks
     from scanning.models import QueuedAction, Scan, Status
 
-    with transaction.atomic():
-        scan = (
-            Scan.objects.select_for_update(skip_locked=True)
-            .filter(status=Status.QUEUED)
-            .annotate(claim_rank=_claim_rank())
-            .order_by("claim_rank", "date_created")
-            .first()
-        )
-        if scan is None:
-            return None
-
-        action = scan.queued_action or QueuedAction.FULL_PIPELINE
-        Scan.objects.filter(pk=scan.pk).update(
-            status=Status.PROCESSING,
-            processed_at=timezone.now(),
-            progress_message=f"Starting {action}...",
-            progress_current=0,
-            progress_total=0,
-        )
-
-    return scan, action
+    window = list(
+        Scan.objects.filter(status=Status.QUEUED)
+        .annotate(claim_rank=_claim_rank())
+        .order_by("claim_rank", "date_created")
+        .values_list("pk", "queued_action")[:CLAIM_WINDOW]
+    )
+    for pk, queued_action in window:
+        slot = None
+        if (queued_action or QueuedAction.FULL_PIPELINE) in COMPUTE_ACTIONS:
+            slot = _take_compute_slot()
+            if slot is None:
+                continue
+        with transaction.atomic():
+            scan = (
+                Scan.objects.select_for_update(skip_locked=True)
+                .filter(pk=pk, status=Status.QUEUED)
+                .first()
+            )
+            if scan is None:
+                claimed = False
+            else:
+                # The row's current action, not the window's: a scan
+                # queued again for another action since runs that one.
+                action = scan.queued_action or QueuedAction.FULL_PIPELINE
+                if action in COMPUTE_ACTIONS and slot is None:
+                    slot = _take_compute_slot()
+                claimed = action not in COMPUTE_ACTIONS or slot is not None
+                if claimed:
+                    Scan.objects.filter(pk=scan.pk).update(
+                        status=Status.PROCESSING,
+                        processed_at=timezone.now(),
+                        progress_message=f"Starting {action}...",
+                        progress_current=0,
+                        progress_total=0,
+                    )
+        if not claimed:
+            if slot is not None:
+                locks.release(slot)
+            continue
+        if slot is not None:
+            if action in COMPUTE_ACTIONS:
+                _compute_slots[scan.pk] = slot
+            else:
+                # The window said compute; the row says otherwise now.
+                locks.release(slot)
+        return scan, action
+    return None
 
 
 #: How often (seconds) a running action stamps ``processed_at`` (#503).
@@ -290,6 +373,19 @@ def heartbeat(
 
 
 def dispatch(scan, action) -> None:
+    """Run the claimed action, and give its compute slot back when it ends.
+
+    :func:`_dispatch` is the body; the slot (:func:`claim_next`) is
+    released here whatever the body did, so a compute that raised or
+    was parked frees its slot for the next.
+    """
+    try:
+        _dispatch(scan, action)
+    finally:
+        release_compute_slot(scan.pk)
+
+
+def _dispatch(scan, action) -> None:
     """Run the queued action for an already-claimed scan.
 
     :param scan: The claimed Scan instance (status PROCESSING).

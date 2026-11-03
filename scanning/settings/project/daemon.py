@@ -102,3 +102,14 @@ OPINION_ENSEMBLE_MIN_ENGINES = env.int(
 # or approved has confidence 1.0 and always counts. A change is a
 # re-glue (reglue_opinion_ocr).
 BLOCKQUOTE_MIN_CONFIDENCE = env.float("BLOCKQUOTE_MIN_CONFIDENCE", default=0.8)
+
+# How many redaction computes may run at once across every heavy worker
+# (2026-11-03). A compute replaces its volume's redaction and detection
+# rows in one transaction, tens of thousands of rows through the row
+# tables' indexes; three at once on the database took every statement
+# to minutes, the heartbeats with them, and the web pods queued behind
+# the row locks. The cap is a slot lock a worker takes before it claims
+# a compute row and holds until the action ends
+# (``process_next_scan.claim_next``), so a worker that finds no slot
+# claims an upload or an apply instead.
+COMPUTE_MAX_CONCURRENCY = env.int("COMPUTE_MAX_CONCURRENCY", default=1)
