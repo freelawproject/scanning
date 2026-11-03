@@ -57,7 +57,7 @@ from scanning import (
     redactions,
     s3_sync,
 )
-from scanning.models import Opinion, OpinionReviewStatus
+from scanning.models import Opinion, OpinionReviewStatus, Scan
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,8 @@ def owed() -> QuerySet:
             )
         )
         .select_related("scan", "scan__reporter", "apply_run", "boundary")
+        # The scan's caches stay on disk (#582): the cut reads none.
+        .defer(*Scan.large_fields("scan__"))
         .order_by("-scan_id", "first_printed_page", "index_in_page")
     )
 

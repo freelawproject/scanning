@@ -1749,6 +1749,8 @@ def queue_ready_scans() -> int:
     for scan in (
         Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
         .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
         .order_by("-pk")
     ):
         if queued >= room:

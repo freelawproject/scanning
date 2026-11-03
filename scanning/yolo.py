@@ -375,6 +375,8 @@ def enqueue_missing_runs() -> int:
         .exclude(pk__in=skipped)
         .annotate(detected=Exists(detected))
         .filter(detected=False)
+        # The caches stay on disk (#582): the enqueue reads none.
+        .defer(*Scan.large_fields())
         .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
     )
 
@@ -1082,9 +1084,12 @@ def queue_ready_runs() -> int:
         .distinct()
     )
     queued = 0
-    for scan in Scan.objects.filter(
-        pk__in=list(scan_ids), status__in=APPLY_STATUSES
-    ).select_related("reporter"):
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids), status__in=APPLY_STATUSES)
+        .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
+    ):
         rows = live_detect_jobs(scan)
         if not rows:
             continue

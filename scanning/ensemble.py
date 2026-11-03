@@ -178,6 +178,7 @@ from scanning.models import (
     OpinionFindingDismissal,
     OpinionReviewStatus,
     OpinionText,
+    Scan,
     Status,
 )
 
@@ -5451,7 +5452,12 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     """
     if not s3_sync.s3_active():
         return 0
-    rows = list(due(limit).select_related("scan", "apply_run"))
+    # The scan's caches stay on disk (#582): the ensemble reads none.
+    rows = list(
+        due(limit)
+        .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if not rows:
         return 0
     started = time.monotonic()

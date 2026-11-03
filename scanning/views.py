@@ -124,7 +124,7 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
         # The row's caches and logs stay on disk: the list prints none.
-        .defer(*Scan.LARGE_FIELDS)
+        .defer(*Scan.large_fields())
         # The legacy rows, on purpose: ``opinions`` is the new
         # ``Opinion`` table since #335, and this column counts what the
         # legacy pipeline generated. #334 gives the new rows their own
@@ -227,7 +227,11 @@ def _filtered_opinions(request: HttpRequest):
         "opinion", "blocking"})``, the current values as the form shows
         them.
     """
-    opinions_qs = Opinion.objects.select_related("scan", "scan__reporter")
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # each of a page's fifty rows, and no reader of the list needs one.
+    opinions_qs = Opinion.objects.select_related(
+        "scan", "scan__reporter"
+    ).defer(*Scan.large_fields("scan__"))
 
     scan_filter = request.GET.get("scan")
     if _whole_number(scan_filter) is not None:
@@ -332,7 +336,8 @@ def _scan_choices() -> list[tuple[str, str]]:
 
     Every scan with an opinion row, in the list's order, named as the
     rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
-    the scans, with the opinions as a semi-join on their scan index.
+    the scans, with the opinions as a semi-join on their scan index,
+    and the caches of every one of them left on disk (#582).
 
     :returns: ``(scan pk, label)`` pairs.
     :rtype: list[tuple[str, str]]
@@ -340,6 +345,7 @@ def _scan_choices() -> list[tuple[str, str]]:
     scans = (
         Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
         .select_related("reporter")
+        .defer(*Scan.large_fields())
         .order_by("reporter__short_name", "volume", "pk")
     )
     return [
@@ -520,9 +526,12 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     """
     # Not ``opinions``: that name holds the module this view's twin
     # calls for its warning badge, and a local would hide it.
-    opinions_qs = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start", "pk")
+    opinions_qs = (
+        OpinionScan.objects.select_related("reporter", "scan")
+        # The scan's caches stay on disk (#582): the list prints none.
+        .defer(*Scan.large_fields("scan__"))
+        .order_by("reporter__short_name", "volume", "page_start", "pk")
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -613,7 +622,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     opinion = get_object_or_404(
         Opinion.objects.select_related(
             "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
-        ),
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
     findings = list(
@@ -816,7 +825,9 @@ def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
-        OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
+        OpinionScan.objects.select_related(
+            "reporter", "scan", "uploaded_by"
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
 
