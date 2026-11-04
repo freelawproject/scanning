@@ -20,6 +20,7 @@ from scanning.models import (
     CheckName,
     Detection,
     Issue,
+    Redaction,
     ReviewDismissal,
     TextReading,
 )
@@ -877,6 +878,59 @@ class TestTheCard(ScanningTestCase):
         ).json()["html"]
         self.assertIn('data-guess="100.0,200.0,820.0,600.0"', html)
         self.assertIn('data-guess="880.0,200.0,1600.0,600.0"', html)
+
+    def test_the_card_offers_the_bottom_margin_over_a_block_at_the_foot(self):
+        """A page with no live box under the block: the page's bottom
+        strip can rise over it, and the card names the strip and the
+        box it would take (``undetected.margin_answer``). The page with
+        a column box reaching under the block offers none."""
+        from django.urls import reverse
+
+        strip = make_redaction(
+            self.scan,
+            page_index=2,
+            rect_type="margin",
+            fill=Redaction.Fill.WHITE,
+            x0=0.0,
+            y0=770.0,
+            x1=612.0,
+            y1=792.0,
+        )
+        make_redaction(
+            self.scan,
+            page_index=0,
+            rect_type="margin",
+            fill=Redaction.Fill.WHITE,
+            x0=0.0,
+            y0=770.0,
+            x1=612.0,
+            y1=792.0,
+        )
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left outside")),
+                page(
+                    2,
+                    cell("Scanned 18:22:01", [300.0, 1900.0, 1200.0, 1950.0]),
+                ),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+        margin = self.cards().get(page_number=3).metadata["margin"]
+        self.assertEqual(margin["id"], strip.pk)
+        self.assertEqual(margin["box"], [0.0, 770.0, 612.0, 792.0])
+        # 1900 px of 2200 is 684 pt; two points above it.
+        self.assertEqual(margin["grown"], [0.0, 682.0, 612.0, 792.0])
+        self.assertIsNone(self.cards().get(page_number=1).metadata["margin"])
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn(f'data-margin-id="{strip.pk}"', html)
+        self.assertIn('data-margin-grown="0.0,682.0,612.0,792.0"', html)
+        self.assertIn("Grow margin", html)
 
     def test_the_card_names_the_footnote_box_beside_its_block(self):
         """A footnote box that ends just above the block is the box the

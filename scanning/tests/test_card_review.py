@@ -149,6 +149,27 @@ class TestTheBuilders(ScanningTestCase):
         # The footnote answer takes the block itself.
         self.assertEqual(card["block"], card["box"])
 
+    def test_a_text_card_carries_the_margin_answer(self):
+        margin = {
+            "id": 9,
+            "box": [0.0, 770.0, 612.0, 792.0],
+            "grown": [0.0, 682.0, 612.0, 792.0],
+        }
+        issue = finding(
+            self.scan,
+            CheckName.UNDETECTED_TEXT,
+            {
+                "bbox": [1000.0, 200.0, 1600.0, 600.0],
+                "guess": [1000.0, 200.0, 1600.0, 600.0],
+                "label": "TEXT_COLUMN",
+                "label_id": int(Label.TEXT_COLUMN),
+                "margin": margin,
+            },
+        )
+        self.assertEqual(card_review.text_card(issue)["margin"], margin)
+        issue.metadata.pop("margin")
+        self.assertNotIn("margin", card_review.text_card(issue))
+
     def test_a_text_finding_with_no_label_makes_no_card(self):
         issue = finding(
             self.scan,

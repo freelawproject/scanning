@@ -104,6 +104,11 @@
     <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Add a footnote box over this block: the footnote line the page's footnote box stopped short of. The opinion text takes it as a footnote. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
     {% endif %}
+    {% if issue.metadata.margin %}
+    <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Pull the page's bottom margin strip up over this block and everything under it: the strip whites it out in the opinion PDF and the text leaves it out. For a scanner's footer, a stamp or bleed-through at the foot of a page. The card goes now."
+            data-margin-id="{{ issue.metadata.margin.id }}" data-margin-grown="{{ issue.metadata.margin.grown.0 }},{{ issue.metadata.margin.grown.1 }},{{ issue.metadata.margin.grown.2 }},{{ issue.metadata.margin.grown.3 }}"
+            onclick="event.stopPropagation(); growMargin(this)">Grow margin</button>
+    {% endif %}
     {% endif %}
     {% if issue.check_name == 'redaction_cuts_text' and issue.metadata.redaction_id and issue.metadata.cover %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Grow the box over the whole line, so no word of it prints beside the box. A computed box becomes a hand-drawn one the next compute keeps. The card goes now."

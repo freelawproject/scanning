@@ -460,10 +460,29 @@ function growDetection(btn) {
 function coverCutLine(btn) {
     var row = btn.closest("[data-redaction-id]");
     if (!row) return;
-    var cfg = window.SCAN_CONFIG;
     var id = parseInt(row.dataset.redactionId);
     var cover = row.dataset.cover.split(",").map(function (v) { return parseFloat(v); });
-    var bbox = { x0: cover[0], y0: cover[1], x1: cover[2], y1: cover[3] };
+    moveRedactionTo(btn, parseInt(row.dataset.pageIndex), id, { x0: cover[0], y0: cover[1], x1: cover[2], y1: cover[3] });
+}
+
+// The text card's "Grow margin": the page's bottom margin strip is
+// pulled up over the block and everything under it (the card's
+// ``margin.grown``, ``undetected.margin_answer``), through the same
+// move as a cut line's cover. A computed strip becomes a hand-drawn
+// one the next compute keeps, and the card goes with the rebuild.
+function growMargin(btn) {
+    var row = btn.closest("[data-page-index]");
+    var id = parseInt(btn.dataset.marginId, 10);
+    var grown = (btn.dataset.marginGrown || "").split(",").map(function (v) { return parseFloat(v); });
+    if (!row || !id || grown.length !== 4 || grown.some(isNaN)) return;
+    moveRedactionTo(btn, parseInt(row.dataset.pageIndex), id, { x0: grown[0], y0: grown[1], x1: grown[2], y1: grown[3] });
+}
+
+// One redaction moved to a box, in points, through the endpoint a
+// drag of its handles uses; the viewer follows the id the server
+// answers, since a computed box is replaced by a hand-drawn one.
+function moveRedactionTo(btn, pageIndex, id, bbox) {
+    var cfg = window.SCAN_CONFIG;
     var label = btn.textContent;
     btn.disabled = true;
     btn.textContent = "...";
@@ -481,7 +500,7 @@ function coverCutLine(btn) {
                 return;
             }
             if (window.applyRedactionMove) {
-                window.applyRedactionMove(parseInt(row.dataset.pageIndex), id, data.id, bbox);
+                window.applyRedactionMove(pageIndex, id, data.id, bbox);
             }
             showSaved(data);
             refreshFindings();

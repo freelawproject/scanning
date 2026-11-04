@@ -48,7 +48,7 @@
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
     var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
-    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e' };
+    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e', m: 'm' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
@@ -695,6 +695,16 @@
                     });
                 }));
             }
+            if (card.kind === 'text' && card.margin) {
+                // The text card's fourth answer: the page's bottom
+                // margin strip pulled up over the block and everything
+                // under it, for a scanner's footer, a stamp or
+                // bleed-through at the foot of a page.
+                foot.appendChild(button('Grow margin', 'm', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    growMargin(card, node);
+                }));
+            }
             foot.appendChild(button(verbsToAdd.none, 'x', 'btn-outline text-xs', function (btn) {
                 btn.disabled = true;
                 dismiss(card, node);
@@ -835,6 +845,25 @@
      *  curator shaped it. A model box becomes a hand-drawn one, as any
      *  resize does, so the Undo puts the box back when it is still its
      *  own row and withdraws the hand-drawn row otherwise. */
+    /** The page's bottom margin strip up over the block: ``card.margin``
+     *  (``undetected.margin_answer``), moved through the redaction move
+     *  endpoint. The Undo moves the strip the answer gave back to where
+     *  the measure put it. */
+    function growMargin(card, node) {
+        var m = card.margin;
+        write(card, node, moveUrl(m.id), {
+            x0: m.grown[0], y0: m.grown[1], x1: m.grown[2], y1: m.grown[3]
+        }, 'margin grown', function (data) {
+            return { url: moveUrl(data.id), body: { x0: m.box[0], y0: m.box[1], x1: m.box[2], y1: m.box[3] } };
+        });
+    }
+
+    /** The move endpoint of one redaction: the server's route with the
+     *  row's id in it. */
+    function moveUrl(id) {
+        return cfg.urls.move_redaction.replace('/0/move/', '/' + id + '/move/');
+    }
+
     function growBox(card, node, target, label) {
         var take = moved(card) ? card.box : (card.block || card.box);
         var grown = [

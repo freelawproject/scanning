@@ -410,6 +410,11 @@ def text_card(issue: Issue) -> dict | None:
     # the curator reshaped the box; the page shows the block inside a
     # wider guess so the curator sees what that answer takes.
     card["block"] = block
+    # The fourth answer: the page's bottom margin strip pulled up over
+    # the block (``undetected.margin_answer``), when it can rise.
+    margin = metadata.get("margin")
+    if isinstance(margin, dict) and margin.get("id") and margin.get("grown"):
+        card["margin"] = margin
     return card
 
 

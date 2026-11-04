@@ -5427,6 +5427,12 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
             name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
         },
     }
+    # The move of a redaction names its row in the path: the route with
+    # a placeholder, which the page fills with the strip's id (the text
+    # card's "Grow margin").
+    config["urls"]["move_redaction"] = reverse(
+        "move_redaction", kwargs={**kwargs, "redaction_id": 0}
+    )
     return render(
         request,
         "scanning/scan_card_review.html",

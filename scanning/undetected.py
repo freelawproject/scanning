@@ -532,7 +532,78 @@ def clusters(cells: list[dict], gap: float = CLUSTER_GAP_PX) -> list[dict]:
 #: this module's own gap between the cells of one block.
 GROW_GAP_PX = 150.0
 
+#: How far above the block's top the page's bottom margin strip rises
+#: when a text card's "Grow margin" pulls it up, in points: a hair of
+#: white over the block's first line.
+MARGIN_PAD_PT = 2.0
+
+#: The labels a margin strip may cover: the running head's, whited out
+#: by their own redactions. Every other live box holds the strip off,
+#: the page number included.
+MARGIN_COVERABLE_LABELS = frozenset({"PAGE_HEADER", "STATE_ABBREVIATION"})
+
 Box = list[float]
+
+
+def margin_answer(
+    bbox: Box,
+    rects: list[dict],
+    others: list[dict],
+    width: float,
+    height: float,
+    size: tuple[float, float],
+) -> dict | None:
+    """Return the page's bottom margin strip and the box it would take
+    to cover the block, or None.
+
+    The strip the measure gave the page's foot (``margin_fit.ensure_strips``
+    gives every page one): the ``margin`` rect full width at the page's
+    bottom edge, grown up to :data:`MARGIN_PAD_PT` above the block's
+    top. A scanner's footer, a stamp or bleed-through at the foot of
+    an exhibit page is then whited out by the strip in the opinion PDF
+    and left out of the text, as everything under a strip is. Offered
+    only when the grown strip would cover no live box of the page but
+    the running head's (:data:`MARGIN_COVERABLE_LABELS`): a page number
+    or a column box in its way withholds it, so the strip never whites
+    out a box. ``box`` and ``grown`` are in points, the redaction's own
+    space (``move_redaction``); ``bbox`` and ``others`` are in the
+    render's pixels. The one rule, read by the sidebar card
+    (``metadata["margin"]``) and the cards page.
+    """
+    strip = next(
+        (
+            r
+            for r in rects
+            if r.get("rect_type") == "margin"
+            and r["x0"] <= 1
+            and r["x1"] >= size[0] - 1
+            and r["y1"] >= size[1] - 1
+            and r["y0"] > 1
+        ),
+        None,
+    )
+    if strip is None:
+        return None
+    _, top_pt = boundaries.to_points(bbox[0], bbox[1], width, height, *size)
+    grown_top = round(max(0.0, top_pt - MARGIN_PAD_PT), 1)
+    if grown_top >= strip["y0"]:
+        return None
+    grown_top_px = grown_top * height / size[1]
+    for other in others:
+        if other["label"] in MARGIN_COVERABLE_LABELS:
+            continue
+        if other["box"][3] > grown_top_px:
+            return None
+    return {
+        "id": strip["id"],
+        "box": [round(float(strip[k]), 1) for k in ("x0", "y0", "x1", "y1")],
+        "grown": [
+            round(float(strip["x0"]), 1),
+            grown_top,
+            round(float(strip["x1"]), 1),
+            round(float(strip["y1"]), 1),
+        ],
+    }
 
 
 def neighbour_box(block: Box, others: list[dict], label: str) -> dict | None:
@@ -736,6 +807,8 @@ def uncovered(
                 no_column=no_column,
                 others=others,
                 geometry=geometry,
+                rects=rects_by_page.get(reading.page_index, []),
+                size=size,
             )
 
 
@@ -747,6 +820,8 @@ def _finding(
     no_column: bool = False,
     others: list[dict] | None = None,
     geometry: tuple[tuple[float, float], tuple[float, float]] | None = None,
+    rects: list[dict] | None = None,
+    size: tuple[float, float] | None = None,
 ) -> dict:
     """Build the finding dict of one block of text in no box.
 
@@ -901,6 +976,13 @@ def _finding(
             "grow": _grow_in_own_space(
                 neighbour_box(bbox, others or [], Label.FOOTNOTES.name),
                 others or [],
+            ),
+            # The page's bottom margin strip, when it can rise over the
+            # block: the card's "Grow margin" (``margin_answer``).
+            "margin": (
+                margin_answer(bbox, rects, others or [], width, height, size)
+                if rects is not None and size is not None
+                else None
             ),
         },
     }
