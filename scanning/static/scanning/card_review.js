@@ -1100,8 +1100,8 @@
 
     /** Whether the reader can see the card: at least half of its crop
      *  is inside the window. A card whose top edge has just come up at
-     *  the foot of the window is not seen, whatever the cursor says,
-     *  so Return never answers a card before its picture is shown; a
+     *  the foot of the window is not seen, so Return never answers a
+     *  card before its picture is shown and brings it up instead; a
      *  crop taller than the window is seen when it fills half of it. */
     function seen(node) {
         var rect = (node.querySelector('.bk-cropwrap') || node).getBoundingClientRect();
@@ -1110,14 +1110,15 @@
         return shown >= Math.min(rect.height, window.innerHeight) / 2;
     }
 
-    /** The card the keys act on: the active one while the reader can
-     *  see it, else the one in view. The page never scrolls on its
-     *  own after an answer, so the cursor moves on to a card that may
-     *  sit below the fold, and a key then acts on what is in front of
-     *  the reader, never on a card out of sight. */
+    /** The card the keys act on: the selected one, wherever it is.
+     *  The selection moves with the arrow keys and after an answer,
+     *  never with the scroll: a key that went to whichever card was in
+     *  view answered the wrong card once the reader scrolled on. A
+     *  page with no selection yet takes the card in view. A selected
+     *  card out of sight is not answered blind: the press brings it
+     *  in front of the reader (``onKey``), and the next one answers. */
     function keyCard() {
-        var active = activeCard();
-        return active && seen(active) ? active : cardInView();
+        return activeCard() || cardInView();
     }
 
     /** The card whose middle is nearest the middle of the window. */
@@ -1182,8 +1183,9 @@
         }
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            // From the selected card, never from the one in view.
             event.preventDefault();
-            setActive(keyCard());
+            if (!activeCard()) { setActive(cardInView()); }
             step(event.key === 'ArrowDown' ? 1 : -1);
             return;
         }
@@ -1204,6 +1206,13 @@
         }
         if (!card) { return; }
         setActive(card);
+        if (!seen(card)) {
+            // The selected card sits off screen: this press brings it
+            // in front of the reader, and the next one answers it.
+            event.preventDefault();
+            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            return;
+        }
         var btn = card.querySelector('[data-key="' + key + '"]');
         if (btn && !btn.disabled && !btn.hidden) {
             event.preventDefault();
