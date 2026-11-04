@@ -701,10 +701,8 @@
             }));
         }
         foot.appendChild(button('Skip', 's', 'btn-outline text-xs', function () {
-            var advance = viaKey;
             skipped[card.key] = true;
             replace(card, node);
-            if (advance) { moveOn(); }
         }));
         return foot;
     }
@@ -782,7 +780,6 @@
 
     // ── the answers ──────────────────────────────────────────────────
     function write(card, node, url, body, label, undoOf) {
-        var advance = viaKey;
         return postJson(url, body).then(function (answer) {
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
@@ -794,7 +791,6 @@
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
             replace(card, node);
-            if (advance) { moveOn(); }
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
             replace(card, node);
@@ -1111,13 +1107,10 @@
         return shown >= Math.min(rect.height, window.innerHeight) / 2;
     }
 
-    /** The card the keys act on: the selected one, wherever it is.
-     *  The selection moves with the arrow keys and after an answer
-     *  from a key, never with the scroll: a key that went to whichever card was in
-     *  view answered the wrong card once the reader scrolled on. A
-     *  page with no selection yet takes the card in view. A selected
-     *  card out of sight is not answered blind: the press brings it
-     *  in front of the reader (``onKey``), and the next one answers. */
+    /** The card the keys act on: the selected one, which the scroll
+     *  and the arrow keys keep in front of the reader
+     *  (``followScroll``, ``step``). A page with no selection yet
+     *  takes the card in view. */
     function keyCard() {
         return activeCard() || cardInView();
     }
@@ -1135,16 +1128,7 @@
         return best;
     }
 
-    /** Whether the answer under way came from a key. The selection
-     *  then moves on to the next open card and brings it into view
-     *  (``moveOn``), so Return answers card after card with the card
-     *  always in front of the reader; an answer by a click leaves the
-     *  page where it is, because a scroll under the pointer put the
-     *  next click on the wrong card. */
-    var viaKey = false;
-
-    /** The first open card takes the cursor when the page loads, and
-     *  the next one after an answer from a key. */
+    /** The first open card takes the cursor when the page loads. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
@@ -1158,20 +1142,33 @@
         setActive(next);
     }
 
-    /** After an answer from a key: the next open card, in view. */
-    function moveOn() {
-        focusNextCard();
-        var next = activeCard();
-        if (next) { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
-    }
-
+    /** The arrow keys: the next card up or down takes the cursor and
+     *  comes into view at once. An instant jump, not a smooth one, so
+     *  the scroll never passes through the cards between and
+     *  ``followScroll`` sees the card it was aimed at. */
     function step(delta) {
         var list = allCards();
         if (!list.length) { return; }
         var at = list.indexOf(activeCard());
         var next = list[Math.max(0, Math.min(list.length - 1, at + delta))];
         setActive(next);
-        next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        next.scrollIntoView({ behavior: 'auto', block: 'center' });
+    }
+
+    /** The cursor follows the reader's scroll: once the selected card
+     *  is out of sight, the card in view is the selected one. So the
+     *  keys always act on what is in front of the reader, whether
+     *  they scrolled there by hand or stepped there with the arrows;
+     *  an answer moves nothing, and the reader moves on when ready. */
+    var following = false;
+    function followScroll() {
+        if (following) { return; }
+        following = true;
+        window.requestAnimationFrame(function () {
+            following = false;
+            var active = activeCard();
+            if (!active || !seen(active)) { setActive(cardInView()); }
+        });
     }
 
     function onKey(event) {
@@ -1220,18 +1217,10 @@
         }
         if (!card) { return; }
         setActive(card);
-        if (!seen(card)) {
-            // The selected card sits off screen: this press brings it
-            // in front of the reader, and the next one answers it.
-            event.preventDefault();
-            card.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            return;
-        }
         var btn = card.querySelector('[data-key="' + key + '"]');
         if (btn && !btn.disabled && !btn.hidden) {
             event.preventDefault();
-            viaKey = true;
-            try { btn.click(); } finally { viaKey = false; }
+            btn.click();
         }
     }
 
@@ -1254,6 +1243,12 @@
             });
         }, { rootMargin: '800px 0px' });
         document.addEventListener('keydown', onKey);
+        window.addEventListener('scroll', followScroll, { passive: true });
+        // A click on a card selects it, so the keys go on from there.
+        root.addEventListener('mousedown', function (event) {
+            var card = event.target.closest && event.target.closest('.bk-card');
+            if (card) { setActive(card); }
+        });
         root.querySelector('[data-role="reload"]').addEventListener('click', function () { load(); });
         root.querySelector('[data-role="undo-edit"]').addEventListener('click', function () { undoEdit(); });
         root.querySelector('[data-role="recompute"]').addEventListener('click', function (event) {
