@@ -71,7 +71,7 @@
     {% if issue.metadata.conf %}<span class="text-gray-500 dark:text-gray-400">{{ issue.metadata.conf }}</span>{% endif %}
   </div>
   <p class="mt-0.5 text-gray-700 dark:text-gray-300">{{ issue.message }}</p>
-  <div class="flex gap-1 mt-1">
+  <div class="flex flex-wrap gap-1 mt-1">
     {% if issue.is_dismissed %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Take the dismissal back" onclick="event.stopPropagation(); restoreFinding(this, {{ issue.pk }})">Undo</button>
     {% elif issue.is_stale %}
@@ -105,6 +105,8 @@
             onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
     {% endif %}
     {% if issue.metadata.margin %}
+    {# The second row: the margin answer and the dismissal under the two adds. #}
+    <span class="w-full h-0"></span>
     <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Pull the page's bottom margin strip up over this block and everything under it: the strip whites it out in the opinion PDF and the text leaves it out. For a scanner's footer, a stamp or bleed-through at the foot of a page. The card goes now."
             data-margin-id="{{ issue.metadata.margin.id }}" data-margin-grown="{{ issue.metadata.margin.grown.0 }},{{ issue.metadata.margin.grown.1 }},{{ issue.metadata.margin.grown.2 }},{{ issue.metadata.margin.grown.3 }}"
             onclick="event.stopPropagation(); growMargin(this)">Grow margin</button>
