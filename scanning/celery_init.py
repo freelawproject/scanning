@@ -33,12 +33,16 @@ from celery import Celery
 from celery.signals import setup_logging, worker_init, worker_shutting_down
 
 from scanning import stopping
+from scanning.worker_heartbeat import Heartbeat
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "scanning.settings")
 
 app = Celery("scanning")
 app.config_from_object("django.conf:settings", namespace="CELERY")
 app.autodiscover_tasks(["scanning"])
+# Each worker writes a key on the broker while it lives, which the
+# monitoring view reads (``scanning.worker_heartbeat``).
+app.steps["consumer"].add(Heartbeat)
 
 
 @setup_logging.connect
