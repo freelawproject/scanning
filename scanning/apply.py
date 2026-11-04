@@ -734,11 +734,19 @@ def latest_run(scan: Scan) -> ApplyRun | None:
     :returns: The run with the highest number, or None.
     :rtype: ApplyRun | None
     """
-    return scan.apply_runs.order_by("-number").first()
+    return (
+        scan.apply_runs.defer(*ApplyRun.LARGE_FIELDS)
+        .order_by("-number")
+        .first()
+    )
 
 
 def current_run(scan: Scan) -> ApplyRun | None:
     """Return the scan's newest apply run that still stands.
+
+    The page map stays on disk (#588): the tick checks call this per
+    waiting scan, every tick, and read the run's keys and stamps alone.
+    A reader of ``page_map`` loads it on access.
 
     :param scan: The scan.
     :returns: The newest run without ``superseded_at``, or None.
@@ -746,6 +754,7 @@ def current_run(scan: Scan) -> ApplyRun | None:
     """
     return (
         scan.apply_runs.filter(superseded_at__isnull=True)
+        .defer(*ApplyRun.LARGE_FIELDS)
         .order_by("-number")
         .first()
     )
@@ -1665,13 +1674,17 @@ def _note_dead_rows() -> int:
     """
     noted = 0
     blocking = list(GLUE_STAGES.values())
-    runs = ApplyRun.objects.filter(
-        superseded_at__isnull=True,
-        built_at__isnull=False,
-        dead_row_noted_at__isnull=True,
-        jobs__status__in=DEAD_JOB_STATUSES,
-        jobs__stage__in=blocking,
-    ).distinct()
+    runs = (
+        ApplyRun.objects.filter(
+            superseded_at__isnull=True,
+            built_at__isnull=False,
+            dead_row_noted_at__isnull=True,
+            jobs__status__in=DEAD_JOB_STATUSES,
+            jobs__stage__in=blocking,
+        )
+        .defer(*ApplyRun.LARGE_FIELDS)
+        .distinct()
+    )
     for run in runs:
         dead = (
             run.jobs.filter(status__in=DEAD_JOB_STATUSES, stage__in=blocking)

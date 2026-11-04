@@ -4171,6 +4171,13 @@ class ApplyRun(AbstractDateTimeModel):
     written for every run, because it is a product.
     """
 
+    #: The column that holds a whole volume's page map, kilobytes to
+    #: hundreds of kilobytes a row (#588). The tick checks read a run's
+    #: keys and stamps alone, so the readers of the standing run defer
+    #: it (:func:`apply.current_run`), and a reader that needs it loads
+    #: it on access, one run at a time.
+    LARGE_FIELDS = ("page_map",)
+
     scan = models.ForeignKey(
         Scan,
         on_delete=models.CASCADE,
@@ -5199,6 +5206,18 @@ class ExternalJob(AbstractDateTimeModel):
                     apply_run__isnull=True,
                 ),
                 name="idx_job_analyze_probe",
+            ),
+            # The volume runs of one engine, scan by scan
+            # (``jobs.ready_apply_runs`` and ``ready_volume_runs``): the
+            # live run of every scan and the runs not yet consumed, asked
+            # every collect tick for each engine. Without it each ask
+            # read the whole table, seconds of disk a tick (#588); with
+            # the status carried, the index answers both alone.
+            models.Index(
+                fields=["stage", "engine", "provider", "scan", "run"],
+                include=["status"],
+                condition=models.Q(apply_run__isnull=True),
+                name="idx_job_volume_runs",
             ),
             models.Index(
                 fields=["scan", "stage", "run"],

@@ -475,3 +475,152 @@ class TestTaggerGlue(_CacheColumns):
 
         with patch("scanning.s3_sync.s3_active", return_value=True):
             self.assert_caches_stay_on_disk(tagger.finish_ready_runs)
+
+
+PAGE_MAP_COLUMN = '"scanning_applyrun"."page_map"'
+
+
+class TestApplyRunPageMap(ScanningTestCase):
+    """The apply run's page map stays on disk where a check reads none (#588)."""
+
+    def setUp(self):
+        from scanning.models import ApplyRun
+
+        self.scan = ScanFactory(status=Status.PAGE_COMPLETENESS_REVIEW_DONE)
+        self.page_map = {"pages": [{"original": 1}], "final_page_count": 1}
+        self.run = ApplyRun.objects.create(
+            scan=self.scan, number=1, page_map=self.page_map
+        )
+
+    def assert_no_page_map(self, run):
+        """Run ``run`` and assert it read the apply run without its map."""
+        with CaptureQueriesContext(connection) as captured:
+            result = run()
+        self.assertTrue(
+            any('"scanning_applyrun"' in q["sql"] for q in captured),
+            "no query read the apply run, so the test proves nothing",
+        )
+        self.assertEqual(
+            [q["sql"] for q in captured if PAGE_MAP_COLUMN in q["sql"]], []
+        )
+        return result
+
+    def test_the_standing_and_the_latest_run(self):
+        from scanning import apply
+
+        for name in ("current_run", "latest_run"):
+            with self.subTest(name):
+                run = self.assert_no_page_map(
+                    lambda: getattr(apply, name)(self.scan)
+                )
+                self.assertEqual(run.pk, self.run.pk)
+                # A reader of the map still gets it, on access.
+                self.assertEqual(run.page_map, self.page_map)
+
+    def test_the_promotion_of_the_scans(self):
+        from scanning import review_states
+
+        ExternalJobFactory(scan=self.scan, status=JobStatus.CONSUMED)
+
+        self.assert_no_page_map(review_states.promote_ready_scans)
+
+    def test_the_dead_row_note(self):
+        from django.utils import timezone
+
+        from scanning import apply
+
+        type(self.run).objects.filter(pk=self.run.pk).update(
+            built_at=timezone.now()
+        )
+        ExternalJobFactory(
+            scan=self.scan,
+            apply_run=self.run,
+            stage=JobStage.CONVERT,
+            engine=JobEngine.BITONAL,
+            provider=JobProvider.DOCTOR,
+            status=JobStatus.FAILED,
+        )
+
+        noted = self.assert_no_page_map(apply._note_dead_rows)
+
+        self.assertEqual(noted, 1)
+
+    def test_the_apply_glue_precheck(self):
+        from django.utils import timezone
+
+        from scanning import jobs, mistral_ocr
+
+        type(self.run).objects.filter(pk=self.run.pk).update(
+            built_at=timezone.now()
+        )
+        ExternalJobFactory(
+            scan=self.scan,
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            status=JobStatus.CONSUMED,
+        )
+
+        self.assert_no_page_map(
+            lambda: list(
+                jobs.ready_apply_runs(
+                    mistral_ocr.APPLY_GLUE_TARGET,
+                    mistral_ocr.live_extract_jobs,
+                    mistral_ocr.GLUE_MAX_ATTEMPTS,
+                )
+            )
+        )
+
+
+class TestVolumeRunsIndex(ScanningTestCase):
+    """The apply glue's pre-check has an index to read (#588).
+
+    The plan itself is the planner's choice, and a tiny test table with
+    the statistics another test left is no measure of it: the test pins
+    the index and the two queries' fit to it instead.
+    """
+
+    def test_the_index_carries_the_status_for_the_volume_runs(self):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = %s",
+                ["idx_job_volume_runs"],
+            )
+            (definition,) = cursor.fetchone()
+
+        self.assertIn("(stage, engine, provider, scan_id, run)", definition)
+        self.assertIn("INCLUDE (status)", definition)
+        self.assertIn("WHERE (apply_run_id IS NULL)", definition)
+
+    def test_both_questions_fit_the_index(self):
+        """Each filters the index's leading columns and its condition."""
+        from scanning import jobs, mistral_ocr
+
+        ExternalJobFactory(
+            stage=JobStage.EXTRACT,
+            engine=JobEngine.MISTRAL_OCR,
+            provider=JobProvider.MISTRAL,
+            status=JobStatus.CONSUMED,
+        )
+        with CaptureQueriesContext(connection) as captured:
+            list(
+                jobs.ready_apply_runs(
+                    mistral_ocr.APPLY_GLUE_TARGET,
+                    mistral_ocr.live_extract_jobs,
+                    mistral_ocr.GLUE_MAX_ATTEMPTS,
+                )
+            )
+        prechecks = [
+            q["sql"]
+            for q in captured
+            if q["sql"].startswith('SELECT "scanning_externaljob"."scan_id"')
+        ]
+
+        self.assertEqual(len(prechecks), 2, prechecks)
+        for sql in prechecks:
+            with self.subTest(sql[:60]):
+                for column in ("stage", "engine", "provider"):
+                    self.assertIn(f'"scanning_externaljob"."{column}" =', sql)
+                self.assertIn(
+                    '"scanning_externaljob"."apply_run_id" IS NULL', sql
+                )
