@@ -1009,6 +1009,54 @@
         root.querySelector('[data-role="done"]').textContent = String(done);
         root.querySelector('[data-role="skipped"]').textContent = String(skips);
         refreshUndoEdit();
+        bulkBars();
+    }
+
+    /** The two answers a section's remaining cards share, as buttons
+     *  in its header: the Return answer and the x answer of every
+     *  open card there, for all of them at once. A press clicks the
+     *  cards' own buttons one after the other, so the writes go out
+     *  one at a time as every write here does and each card keeps its
+     *  own Undo. The remaining cards are the open ones: a card
+     *  answered, skipped, or with a box being moved is left alone, so
+     *  a reader walks the section, fixes what needs a hand, skips what
+     *  needs thought, and answers the rest in one press. */
+    function bulkBars() {
+        GROUPS.forEach(function (group) {
+            var section = root.querySelector('[data-group="' + group + '"]');
+            var bar = section && section.querySelector('[data-role="bulk"]');
+            if (!bar) { return; }
+            bar.replaceChildren();
+            var open = Array.prototype.slice.call(section.querySelectorAll('.bk-card')).filter(function (node) {
+                return isOpen(node) && !node.querySelector('.cr-layer.cr-editing, .cr-layer.cr-drawing');
+            });
+            ['enter', 'x'].forEach(function (key) {
+                var nodes = open.filter(function (node) {
+                    var btn = node.querySelector('[data-key="' + key + '"]');
+                    return btn && !btn.disabled && !btn.hidden;
+                });
+                if (!nodes.length) { return; }
+                var labels = [];
+                nodes.forEach(function (node) {
+                    var text = node.querySelector('[data-key="' + key + '"]').textContent;
+                    if (labels.indexOf(text) < 0) { labels.push(text); }
+                });
+                var verb = labels.join(' / ');
+                var btn = el('button', key === 'enter' ? 'btn-primary text-xs' : 'btn-outline text-xs',
+                    verb + ' \u00b7 the rest (' + nodes.length + ')');
+                btn.type = 'button';
+                btn.title = 'Answer every remaining card of this section this way, one after the other. Each keeps its own Undo.';
+                btn.addEventListener('click', function () {
+                    var ask = verb + ' on the remaining ' + nodes.length + ' card' + (nodes.length === 1 ? '' : 's') + ' of this section?';
+                    if (!window.confirm(ask)) { return; }
+                    nodes.forEach(function (node) {
+                        var b = node.isConnected && node.querySelector('[data-key="' + key + '"]');
+                        if (b && !b.disabled && !b.hidden) { b.click(); }
+                    });
+                });
+                bar.appendChild(btn);
+            });
+        });
     }
 
     function render() {

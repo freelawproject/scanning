@@ -567,6 +567,15 @@ class TestThePageFollowsTheGroups(ScanningTestCase):
         sections = re.findall(r'data-group="([a-z]+)"', TEMPLATE.read_text())
         self.assertEqual(sections, list(card_review.GROUPS))
 
+    def test_every_section_offers_its_answers_for_the_rest(self):
+        """Each section's header holds the bar the script fills with the
+        Return answer and the x answer of its remaining cards."""
+        self.assertEqual(
+            TEMPLATE.read_text().count('data-role="bulk"'),
+            len(card_review.GROUPS),
+        )
+        self.assertIn("function bulkBars()", SCRIPT.read_text())
+
     def test_the_script_sends_one_write_at_a_time(self):
         """Four answers at once were four rebuilds queued on one lock
         (2026-11-02)."""

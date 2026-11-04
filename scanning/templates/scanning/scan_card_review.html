@@ -49,6 +49,7 @@
       <h2 class="text-lg font-bold">Captions <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
       <span class="text-xs text-gray-500 dark:text-gray-400">A caption the model did not box after a key icon. The box is where it is likely to be: move it onto the caption and add it, and the next recompute starts an opinion there.</span>
     </header>
+    <div class="flex flex-wrap items-center gap-2 mb-3" data-role="bulk"></div>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
 
@@ -57,6 +58,7 @@
       <h2 class="text-lg font-bold">Headnote brackets <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
       <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either.</span>
     </header>
+    <div class="flex flex-wrap items-center gap-2 mb-3" data-role="bulk"></div>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
 
@@ -65,6 +67,7 @@
       <h2 class="text-lg font-bold">Text in no box <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
       <span class="text-xs text-gray-500 dark:text-gray-400">A block of print the reader saw that no box covers, a footnote line outside the footnote box included. The opinion text leaves out what the boxes miss: add a column box over the block (resize it first if it is short), grow the footnote box beside the block over it (one box, no seam; one is added when none is near), or pull the page's own column box over it (click the box's label on the crop and drag its edge); box it as an editor's note when it is the publisher's text (a Words and Phrases line), which the redaction then blacks out; or say it is not text (the print of the leaf behind, a stray mark).</span>
     </header>
+    <div class="flex flex-wrap items-center gap-2 mb-3" data-role="bulk"></div>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
 
@@ -73,6 +76,7 @@
       <h2 class="text-lg font-bold">Images <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
       <span class="text-xs text-gray-500 dark:text-gray-400">An image box the model drew and nobody has judged, and a picture or a table the readers (dots.mocr, Mistral, Surya) saw that no image box covers. The opinion PDF pastes the original scan of an image box over the page, so a box over text pastes a photograph of the text, and a picture with no box is read as words. Keep a box, pull it in, or take it out; where the readers draw the picture differently, Refine image box pulls the box to theirs (hover the button to see where); add an image box at the readers' box, or say it is not an image.</span>
     </header>
+    <div class="flex flex-wrap items-center gap-2 mb-3" data-role="bulk"></div>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
 
@@ -81,6 +85,7 @@
       <h2 class="text-lg font-bold">Editor's notes <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
       <span class="text-xs text-gray-500 dark:text-gray-400">An editor's note box the model drew and nobody has judged, outside the head matter's blackout, where a box is black either way. A box under blackletter's gate redacts nothing yet, and its card says so: Keep blacks it out at the next recompute. Keep it over an editor's note or a Words and Phrases line, pull it in to that text, or take it out when it holds the court's own words.</span>
     </header>
+    <div class="flex flex-wrap items-center gap-2 mb-3" data-role="bulk"></div>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
 </div>
