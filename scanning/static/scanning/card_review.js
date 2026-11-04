@@ -950,15 +950,13 @@
         }).catch(function (error) { toast('The request failed: ' + error.message, 'error'); });
     }
 
-    /** Read the cards again and come back to one, or to the next open
-     *  one when it is gone. The page stays where it is. */
+    /** Read the cards again and come back to one. The page stays
+     *  where it is; a card that is gone leaves nothing selected, and
+     *  the next key or scroll takes the card in view. */
     function reloadAt(key) {
         return load().then(function () {
             var again = key ? root.querySelector('.bk-card[data-key="' + key + '"]') : null;
-            if (again) {
-                setActive(again);
-            } else {
-            }
+            if (again) { setActive(again); }
         });
     }
 
@@ -1107,12 +1105,15 @@
         return shown >= Math.min(rect.height, window.innerHeight) / 2;
     }
 
-    /** The card the keys act on: the selected one, which the scroll
-     *  and the arrow keys keep in front of the reader
-     *  (``followScroll``, ``step``). A page with no selection yet
-     *  takes the card in view. */
+    /** The card the keys act on: the selected one while the reader
+     *  can see it, else the one in view. The scroll and the arrow keys
+     *  keep the selection in front of the reader (``followScroll``,
+     *  ``step``), and this check covers the gap before the next frame,
+     *  a layout shift and the page's first paint, so a key never
+     *  answers a card out of sight. */
     function keyCard() {
-        return activeCard() || cardInView();
+        var active = activeCard();
+        return active && seen(active) ? active : cardInView();
     }
 
     /** The card whose middle is nearest the middle of the window. */
@@ -1202,7 +1203,11 @@
         }
         var key = event.key === 'Enter' ? 'enter' : String(event.key).toLowerCase();
         if (!KEY_NAMES[key]) { return; }
-        var card = keyCard();
+        // A card with a box being drawn or moved owns the keys until it
+        // is done, wherever the reader scrolled meanwhile: Return saves
+        // that box, and never answers the card that came into view.
+        var busy = drawing || editing;
+        var card = busy ? busy.closest('.bk-card') : keyCard();
         if (key === 'u' && lastEdit()) {
             // A box edit was the last thing done: u takes it back.
             event.preventDefault();
@@ -1213,7 +1218,7 @@
             // The cursor moved on after the answer: u takes back the
             // last answer, wherever it is on the page.
             card = root.querySelector('.bk-card[data-key="' + history[history.length - 1] + '"]');
-            if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+            if (card) { card.scrollIntoView({ behavior: 'auto', block: 'center' }); }
         }
         if (!card) { return; }
         setActive(card);
