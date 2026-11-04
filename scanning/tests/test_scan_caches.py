@@ -19,7 +19,9 @@ follow (#586).
 from unittest.mock import patch
 
 from django.contrib import admin
+from django.core.exceptions import FieldDoesNotExist
 from django.db import connection
+from django.test import RequestFactory
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
@@ -411,6 +413,38 @@ class TestAdminLists(_CacheColumns):
                     lambda: self.client.get(self._changelist(model))
                 )
                 self.assertEqual(response.status_code, 200)
+
+    def test_every_fk_column_stays_joined(self):
+        """A list of joins replaces Django's join of every FK column."""
+        request = RequestFactory().get("/")
+        for model, model_admin in admin.site._registry.items():
+            if not isinstance(model_admin, ScanCachesDeferred):
+                continue
+            joined = model_admin.get_list_select_related(request)
+            for name in model_admin.get_list_display(request):
+                try:
+                    field = model._meta.get_field(name)
+                except FieldDoesNotExist:
+                    continue
+                if field.many_to_one or field.one_to_one:
+                    with self.subTest(f"{model.__name__}.{name}"):
+                        self.assertIn(name, joined)
+
+    def test_the_legacy_opinion_list_costs_the_same_with_more_rows(self):
+        """The reporter column is joined, never read row by row."""
+        url = self._changelist(OpinionScanFactory._meta.model)
+        OpinionScanFactory()
+
+        def queries():
+            with CaptureQueriesContext(connection) as captured:
+                self.assertEqual(self.client.get(url).status_code, 200)
+            return len(captured)
+
+        one = queries()
+        OpinionScanFactory()
+        OpinionScanFactory()
+
+        self.assertEqual(queries(), one)
 
     def test_the_scan_list(self):
         ScanFactory(ocr_results=[{"pdf_page": 1}])

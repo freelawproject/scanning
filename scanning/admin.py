@@ -3,6 +3,7 @@ import logging
 from blackletter.models import Label
 from django.contrib import admin, messages
 from django.contrib.admin.utils import quote
+from django.core.exceptions import FieldDoesNotExist
 from django.core.paginator import Paginator
 from django.db import connection, transaction
 from django.urls import NoReverseMatch, reverse
@@ -263,25 +264,51 @@ class EstimatingPaginator(Paginator):
 
 
 class ScanCachesDeferred:
-    """Join a list's scan without its caches (#582).
+    """Join a list's scan without its caches (#586).
 
     Every changelist below shows its row's scan, a page of a hundred
     rows, and the join repeats the scan's columns on each:
     ``Scan.LARGE_FIELDS`` are kilobytes to megabytes a row, and a page
     of one volume's detections read its OCR cache a hundred times. The
     reporter comes in the same join, because ``Scan.__str__`` reads it.
-    An admin that names its own ``list_select_related`` must keep
-    ``scan__reporter`` in it.
     """
 
-    list_select_related = ["scan__reporter"]
+    def get_list_select_related(self, request):
+        """Return the joins of the list: its own, every FK column, the scan's.
+
+        A list of names replaces Django's default, which joins every
+        foreign key column of ``list_display`` through a bare
+        ``select_related()``, so those columns are named here too, or
+        each would load one row per row of the page (the reporter of a
+        legacy opinion).
+
+        :param request: The current request.
+        :returns: The paths to join.
+        :rtype: list[str]
+        """
+        own = super().get_list_select_related(request)
+        paths = set(own) if isinstance(own, (list, tuple)) else set()
+        for name in self.get_list_display(request):
+            try:
+                field = self.model._meta.get_field(name)
+            except FieldDoesNotExist:
+                continue
+            if field.many_to_one or field.one_to_one:
+                paths.add(name)
+        paths.add("scan__reporter")
+        return sorted(paths)
 
     def get_queryset(self, request):
-        """Return the rows with their scan joined and its caches deferred."""
+        """Return the rows with their joins and the scan's caches deferred.
+
+        The joins are the whole list of :meth:`get_list_select_related`:
+        the changelist applies its own only to a queryset with no join
+        yet, so a join here is the changelist's whole set.
+        """
         return (
             super()
             .get_queryset(request)
-            .select_related("scan__reporter")
+            .select_related(*self.get_list_select_related(request))
             .defer(*Scan.large_fields("scan__"))
         )
 
