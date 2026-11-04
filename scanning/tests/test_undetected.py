@@ -932,6 +932,37 @@ class TestTheCard(ScanningTestCase):
         self.assertIn('data-margin-grown="0.0,682.0,612.0,792.0"', html)
         self.assertIn("Grow margin", html)
 
+    def test_a_column_box_ending_under_the_blocks_top_moves_the_strip_down(
+        self,
+    ):
+        """496 P.3d p.788: the column boxes end four pixels under the
+        block's first line. The strip rises to their bottom edge and
+        takes the block from there, instead of being withheld."""
+        strip = make_redaction(
+            self.scan,
+            page_index=2,
+            rect_type="margin",
+            fill=Redaction.Fill.WHITE,
+            x0=0.0,
+            y0=770.0,
+            x1=612.0,
+            y1=792.0,
+        )
+        column(self.scan, page_index=2, bbox=[100.0, 100.0, 900.0, 1210.0])
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left outside")),
+                page(2, cell("The rest", [150.0, 1200.0, 800.0, 1900.0])),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+        margin = self.cards().get(page_number=3).metadata["margin"]
+        self.assertEqual(margin["id"], strip.pk)
+        # The box's bottom, 1210 px of 2200, is 435.6 pt.
+        self.assertEqual(margin["grown"], [0.0, 435.6, 612.0, 792.0])
+
     def test_the_card_names_the_footnote_box_beside_its_block(self):
         """A footnote box that ends just above the block is the box the
         sidebar's footnote answer grows, and the card says so: its id

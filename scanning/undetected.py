@@ -561,11 +561,13 @@ def margin_answer(
     bottom edge, grown up to :data:`MARGIN_PAD_PT` above the block's
     top. A scanner's footer, a stamp or bleed-through at the foot of
     an exhibit page is then whited out by the strip in the opinion PDF
-    and left out of the text, as everything under a strip is. Offered
-    only when the grown strip would cover no live box of the page but
-    the running head's (:data:`MARGIN_COVERABLE_LABELS`): a page number
-    or a column box in its way withholds it, so the strip never whites
-    out a box. ``box`` and ``grown`` are in points, the redaction's own
+    and left out of the text, as everything under a strip is. The
+    strip never whites out a live box but the running head's
+    (:data:`MARGIN_COVERABLE_LABELS`): a box that reaches under the
+    block's top pushes the strip's top down to its own bottom edge,
+    and a box lying wholly under the strip's top, a page number or a
+    footnote box at the foot, withholds the answer, as does a top that
+    would leave the block uncovered. ``box`` and ``grown`` are in points, the redaction's own
     space (``move_redaction``); ``bbox`` and ``others`` are in the
     render's pixels. The one rule, read by the sidebar card
     (``metadata["margin"]``) and the cards page.
@@ -585,15 +587,25 @@ def margin_answer(
     if strip is None:
         return None
     _, top_pt = boundaries.to_points(bbox[0], bbox[1], width, height, *size)
-    grown_top = round(max(0.0, top_pt - MARGIN_PAD_PT), 1)
-    if grown_top >= strip["y0"]:
-        return None
-    grown_top_px = grown_top * height / size[1]
+    _, bottom_pt = boundaries.to_points(bbox[2], bbox[3], width, height, *size)
+    grown_top = max(0.0, top_pt - MARGIN_PAD_PT)
+    # A live box that reaches under the block's top pushes the strip's
+    # top down to its own bottom edge: a column box that ends a few
+    # pixels under the block's first line keeps its pixels, and the
+    # strip takes the block from there down. A box lying wholly under
+    # the strip's top would be covered, so it withholds the answer.
     for other in others:
         if other["label"] in MARGIN_COVERABLE_LABELS:
             continue
-        if other["box"][3] > grown_top_px:
+        box_top = other["box"][1] * size[1] / height
+        box_bottom = other["box"][3] * size[1] / height
+        if box_top >= grown_top:
             return None
+        if box_bottom > grown_top:
+            grown_top = box_bottom
+    grown_top = round(grown_top, 1)
+    if grown_top >= strip["y0"] or grown_top >= bottom_pt:
+        return None
     return {
         "id": strip["id"],
         "box": [round(float(strip[k]), 1) for k in ("x0", "y0", "x1", "y1")],
