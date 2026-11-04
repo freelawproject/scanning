@@ -703,7 +703,6 @@
         foot.appendChild(button('Skip', 's', 'btn-outline text-xs', function () {
             skipped[card.key] = true;
             replace(card, node);
-            focusNextCard();
         }));
         return foot;
     }
@@ -792,7 +791,6 @@
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
             replace(card, node);
-            focusNextCard();
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
             replace(card, node);
@@ -952,16 +950,13 @@
         }).catch(function (error) { toast('The request failed: ' + error.message, 'error'); });
     }
 
-    /** Read the cards again and come back to one, or to the next open
-     *  one when it is gone. The page stays where it is. */
+    /** Read the cards again and come back to one. The page stays
+     *  where it is; a card that is gone leaves nothing selected, and
+     *  the next key or scroll takes the card in view. */
     function reloadAt(key) {
         return load().then(function () {
             var again = key ? root.querySelector('.bk-card[data-key="' + key + '"]') : null;
-            if (again) {
-                setActive(again);
-            } else {
-                focusNextCard();
-            }
+            if (again) { setActive(again); }
         });
     }
 
@@ -1100,8 +1095,8 @@
 
     /** Whether the reader can see the card: at least half of its crop
      *  is inside the window. A card whose top edge has just come up at
-     *  the foot of the window is not seen, whatever the cursor says,
-     *  so Return never answers a card before its picture is shown; a
+     *  the foot of the window is not seen, so Return never answers a
+     *  card before its picture is shown and brings it up instead; a
      *  crop taller than the window is seen when it fills half of it. */
     function seen(node) {
         var rect = (node.querySelector('.bk-cropwrap') || node).getBoundingClientRect();
@@ -1110,11 +1105,12 @@
         return shown >= Math.min(rect.height, window.innerHeight) / 2;
     }
 
-    /** The card the keys act on: the active one while the reader can
-     *  see it, else the one in view. The page never scrolls on its
-     *  own after an answer, so the cursor moves on to a card that may
-     *  sit below the fold, and a key then acts on what is in front of
-     *  the reader, never on a card out of sight. */
+    /** The card the keys act on: the selected one while the reader
+     *  can see it, else the one in view. The scroll and the arrow keys
+     *  keep the selection in front of the reader (``followScroll``,
+     *  ``step``), and this check covers the gap before the next frame,
+     *  a layout shift and the page's first paint, so a key never
+     *  answers a card out of sight. */
     function keyCard() {
         var active = activeCard();
         return active && seen(active) ? active : cardInView();
@@ -1133,10 +1129,7 @@
         return best;
     }
 
-    /** The next open card takes the cursor, and the page stays where
-     *  it is: a scroll after every answer moved the cards under the
-     *  pointer, and the reader's next click landed on the wrong one.
-     *  The reader scrolls, by hand or with the arrow keys. */
+    /** The first open card takes the cursor when the page loads. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
@@ -1150,13 +1143,33 @@
         setActive(next);
     }
 
+    /** The arrow keys: the next card up or down takes the cursor and
+     *  comes into view at once. An instant jump, not a smooth one, so
+     *  the scroll never passes through the cards between and
+     *  ``followScroll`` sees the card it was aimed at. */
     function step(delta) {
         var list = allCards();
         if (!list.length) { return; }
         var at = list.indexOf(activeCard());
         var next = list[Math.max(0, Math.min(list.length - 1, at + delta))];
         setActive(next);
-        next.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        next.scrollIntoView({ behavior: 'auto', block: 'center' });
+    }
+
+    /** The cursor follows the reader's scroll: once the selected card
+     *  is out of sight, the card in view is the selected one. So the
+     *  keys always act on what is in front of the reader, whether
+     *  they scrolled there by hand or stepped there with the arrows;
+     *  an answer moves nothing, and the reader moves on when ready. */
+    var following = false;
+    function followScroll() {
+        if (following) { return; }
+        following = true;
+        window.requestAnimationFrame(function () {
+            following = false;
+            var active = activeCard();
+            if (!active || !seen(active)) { setActive(cardInView()); }
+        });
     }
 
     function onKey(event) {
@@ -1182,14 +1195,19 @@
         }
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+            // From the selected card, never from the one in view.
             event.preventDefault();
-            setActive(keyCard());
+            if (!activeCard()) { setActive(cardInView()); }
             step(event.key === 'ArrowDown' ? 1 : -1);
             return;
         }
         var key = event.key === 'Enter' ? 'enter' : String(event.key).toLowerCase();
         if (!KEY_NAMES[key]) { return; }
-        var card = keyCard();
+        // A card with a box being drawn or moved owns the keys until it
+        // is done, wherever the reader scrolled meanwhile: Return saves
+        // that box, and never answers the card that came into view.
+        var busy = drawing || editing;
+        var card = busy ? busy.closest('.bk-card') : keyCard();
         if (key === 'u' && lastEdit()) {
             // A box edit was the last thing done: u takes it back.
             event.preventDefault();
@@ -1200,7 +1218,7 @@
             // The cursor moved on after the answer: u takes back the
             // last answer, wherever it is on the page.
             card = root.querySelector('.bk-card[data-key="' + history[history.length - 1] + '"]');
-            if (card) { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
+            if (card) { card.scrollIntoView({ behavior: 'auto', block: 'center' }); }
         }
         if (!card) { return; }
         setActive(card);
@@ -1230,6 +1248,12 @@
             });
         }, { rootMargin: '800px 0px' });
         document.addEventListener('keydown', onKey);
+        window.addEventListener('scroll', followScroll, { passive: true });
+        // A click on a card selects it, so the keys go on from there.
+        root.addEventListener('mousedown', function (event) {
+            var card = event.target.closest && event.target.closest('.bk-card');
+            if (card) { setActive(card); }
+        });
         root.querySelector('[data-role="reload"]').addEventListener('click', function () { load(); });
         root.querySelector('[data-role="undo-edit"]').addEventListener('click', function () { undoEdit(); });
         root.querySelector('[data-role="recompute"]').addEventListener('click', function (event) {
