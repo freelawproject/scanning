@@ -701,8 +701,10 @@
             }));
         }
         foot.appendChild(button('Skip', 's', 'btn-outline text-xs', function () {
+            var advance = viaKey;
             skipped[card.key] = true;
             replace(card, node);
+            if (advance) { moveOn(); }
         }));
         return foot;
     }
@@ -780,6 +782,7 @@
 
     // ── the answers ──────────────────────────────────────────────────
     function write(card, node, url, body, label, undoOf) {
+        var advance = viaKey;
         return postJson(url, body).then(function (answer) {
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
@@ -791,6 +794,7 @@
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
             replace(card, node);
+            if (advance) { moveOn(); }
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
             replace(card, node);
@@ -1108,8 +1112,8 @@
     }
 
     /** The card the keys act on: the selected one, wherever it is.
-     *  The selection moves with the arrow keys and nothing else,
-     *  never with the scroll and never after an answer: a key that went to whichever card was in
+     *  The selection moves with the arrow keys and after an answer
+     *  from a key, never with the scroll: a key that went to whichever card was in
      *  view answered the wrong card once the reader scrolled on. A
      *  page with no selection yet takes the card in view. A selected
      *  card out of sight is not answered blind: the press brings it
@@ -1131,9 +1135,16 @@
         return best;
     }
 
-    /** The first open card takes the cursor when the page loads. An
-     *  answer leaves the cursor on the card it answered: the reader
-     *  moves it with the arrow keys, and nothing else moves it. */
+    /** Whether the answer under way came from a key. The selection
+     *  then moves on to the next open card and brings it into view
+     *  (``moveOn``), so Return answers card after card with the card
+     *  always in front of the reader; an answer by a click leaves the
+     *  page where it is, because a scroll under the pointer put the
+     *  next click on the wrong card. */
+    var viaKey = false;
+
+    /** The first open card takes the cursor when the page loads, and
+     *  the next one after an answer from a key. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
@@ -1145,6 +1156,13 @@
             if (isOpen(list[i])) { next = list[i]; }
         }
         setActive(next);
+    }
+
+    /** After an answer from a key: the next open card, in view. */
+    function moveOn() {
+        focusNextCard();
+        var next = activeCard();
+        if (next) { next.scrollIntoView({ behavior: 'smooth', block: 'center' }); }
     }
 
     function step(delta) {
@@ -1212,7 +1230,8 @@
         var btn = card.querySelector('[data-key="' + key + '"]');
         if (btn && !btn.disabled && !btn.hidden) {
             event.preventDefault();
-            btn.click();
+            viaKey = true;
+            try { btn.click(); } finally { viaKey = false; }
         }
     }
 
