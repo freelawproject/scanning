@@ -792,7 +792,6 @@
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
             replace(card, node);
-            focusNextCard();
         }).catch(function (error) {
             toast('The request failed: ' + error.message, 'error');
             replace(card, node);
@@ -1111,8 +1110,8 @@
     }
 
     /** The card the keys act on: the selected one, wherever it is.
-     *  The selection moves with the arrow keys and after an answer,
-     *  never with the scroll: a key that went to whichever card was in
+     *  The selection moves with the arrow keys and nothing else,
+     *  never with the scroll and never after an answer: a key that went to whichever card was in
      *  view answered the wrong card once the reader scrolled on. A
      *  page with no selection yet takes the card in view. A selected
      *  card out of sight is not answered blind: the press brings it
@@ -1134,10 +1133,9 @@
         return best;
     }
 
-    /** The next open card takes the cursor, and the page stays where
-     *  it is: a scroll after every answer moved the cards under the
-     *  pointer, and the reader's next click landed on the wrong one.
-     *  The reader scrolls, by hand or with the arrow keys. */
+    /** The first open card takes the cursor when the page loads. An
+     *  answer leaves the cursor on the card it answered: the reader
+     *  moves it with the arrow keys, and nothing else moves it. */
     function focusNextCard() {
         var list = allCards();
         var at = list.indexOf(activeCard());
