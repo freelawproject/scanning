@@ -398,10 +398,70 @@ class TestTheCard(ScanningTestCase):
             x0=200.0, y0=1000.0, x1=800.0, y1=1400.0, numbers=[8], raw="[8]"
         )
         self.assertEqual(brackets._bracket_shape([]), brackets.DEFAULT_SHAPE)
-        # 6% of the width in, 9% wide, 5.5% of the width tall.
+        # 32 px in, 12.75 px a character for three characters, 30 px tall.
         self.assertEqual(
             brackets._guess(reading, brackets.DEFAULT_SHAPE),
-            [236.0, 1000.0, 290.0, 1033.0],
+            [232.0, 1000.0, 270.2, 1030.0],
+        )
+
+    def test_the_guess_is_as_wide_as_the_token(self):
+        # ``[31, 32]`` is eight characters to ``[30]``'s four, and a
+        # short one-line cell gets the same bracket as a paragraph.
+        one = BracketReading(
+            x0=200.0, y0=1000.0, x1=400.0, y1=1050.0, numbers=[30], raw="[30]"
+        )
+        two = BracketReading(
+            x0=200.0,
+            y0=1000.0,
+            x1=800.0,
+            y1=1400.0,
+            numbers=[31, 32],
+            raw="[31, 32]",
+        )
+        g1 = brackets._guess(one, brackets.DEFAULT_SHAPE)
+        g2 = brackets._guess(two, brackets.DEFAULT_SHAPE)
+        self.assertEqual(g1, [232.0, 1000.0, 283.0, 1030.0])
+        self.assertEqual(g2, [232.0, 1000.0, 334.0, 1030.0])
+
+    def test_the_shape_scales_with_the_readings_render(self):
+        # A reading rendered at half the reference width gets a bracket
+        # half the size, in its own pixels.
+        reading = BracketReading(
+            x0=100.0,
+            y0=500.0,
+            x1=400.0,
+            y1=700.0,
+            numbers=[8],
+            raw="[8]",
+            img_width=850,
+            img_height=1100,
+        )
+        self.assertEqual(
+            brackets._guess(reading, brackets.DEFAULT_SHAPE),
+            [116.0, 500.0, 135.1, 515.0],
+        )
+
+    def test_a_sample_measures_the_width_per_character(self):
+        reading = BracketReading(
+            x0=200.0,
+            y0=1000.0,
+            x1=800.0,
+            y1=1400.0,
+            numbers=[31, 32],
+            raw="[31, 32]",
+            img_width=1700,
+            img_height=2200,
+        )
+        row = Detection(
+            x0=240.0,
+            y0=1004.0,
+            x1=340.0,
+            y1=1036.0,
+            img_width=1700,
+            img_height=2200,
+        )
+        self.assertEqual(
+            brackets._shape_sample(row, reading), (40.0, 4.0, 12.5, 32.0)
         )
 
     def test_a_dismissal_lands_on_the_card_again(self):

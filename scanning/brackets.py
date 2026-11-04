@@ -468,31 +468,41 @@ def missing(
         yield _finding(reading, holes, _guess(reading, shape))
 
 
-#: The bracket's place in its cell when the volume has no model
-#: bracket to measure it from, as shares of the cell's width: the
-#: paragraph indent, the token's width and its height. Measured on
-#: 722 S.W.3d, where a 550 px cell holds a 51 by 30 px bracket 32 px
-#: in from its edge.
-DEFAULT_SHAPE = (0.06, 0.0, 0.09, 0.055)
+#: The render width the bracket shape is measured at: a reporter page
+#: at 200 dpi. A reading of another render scales the shape by its own
+#: width, so the two meet without either knowing the other's density.
+REFERENCE_WIDTH = 1700.0
+
+#: The bracket's place in its cell when the volume has no model bracket
+#: to measure it from, in the pixels of :data:`REFERENCE_WIDTH`: the
+#: paragraph indent, the drop from the cell's top, the width of one
+#: character of the token and the token's height. Measured on
+#: 722 S.W.3d, where a 51 by 30 px ``[nn]`` sits 32 px in from the
+#: cell's edge. Per character, so ``[31, 32]`` is twice ``[30]``; in
+#: pixels and not shares of the cell, so a one-line cell gets a bracket
+#: the size of its type and not a fraction of its short width.
+DEFAULT_SHAPE = (32.0, 0.0, 12.75, 30.0)
 
 
 def _shape_sample(row: Detection, reading: BracketReading) -> tuple:
-    """Return where ``row`` sits in ``reading``'s cell, as shares of its width.
+    """Return where ``row`` sits in ``reading``'s cell, in reference pixels.
 
-    The offset of the box from the cell's top-left corner and the
-    box's size, each divided by the cell's width, so that a cell of
-    another width places its own bracket by the same type.
+    The offset of the box from the cell's top-left corner, the box's
+    width per character of the token the reading printed, and its
+    height, all scaled to :data:`REFERENCE_WIDTH`, so that a cell of
+    any width places its own bracket by the type of this volume.
     """
-    width = max(float(reading.x1 - reading.x0), 1.0)
+    scale = REFERENCE_WIDTH / float(reading.img_width or REFERENCE_WIDTH)
     sx = float(reading.img_width) / float(row.img_width or reading.img_width)
     sy = float(reading.img_height) / float(
         row.img_height or reading.img_height
     )
+    chars = max(len(reading.raw or ""), 1)
     return (
-        (row.x0 * sx - reading.x0) / width,
-        (row.y0 * sy - reading.y0) / width,
-        (row.x1 - row.x0) * sx / width,
-        (row.y1 - row.y0) * sy / width,
+        (row.x0 * sx - reading.x0) * scale,
+        (row.y0 * sy - reading.y0) * scale,
+        (row.x1 - row.x0) * sx * scale / chars,
+        (row.y1 - row.y0) * sy * scale,
     )
 
 
@@ -500,8 +510,8 @@ def _bracket_shape(samples: list[tuple]) -> tuple:
     """Return the volume's bracket shape: the median of each measure.
 
     The brackets the model did find say where a bracket sits in a
-    paragraph of this volume's type; with none found, the shape of
-    722 S.W.3d stands in.
+    paragraph of this volume's type and how wide its characters are;
+    with none found, the shape of 722 S.W.3d stands in.
     """
     if not samples:
         return DEFAULT_SHAPE
@@ -513,12 +523,14 @@ def _guess(reading: BracketReading, shape: tuple) -> list[float]:
 
     The cell is the paragraph; the bracket is its first token. The
     guess is the volume's bracket shape laid at the cell's top-left
-    corner, held inside the cell, so the card can flash the token and
-    not the paragraph, and an "add" can draw the box there.
+    corner, as wide as the token's characters, scaled to the reading's
+    render and held inside the cell, so the card can flash the token
+    and not the paragraph, and an "add" can draw the box there.
     """
     x0, y0, x1, y1 = (float(v) for v in reading.bbox)
-    width = max(x1 - x0, 1.0)
-    dx, dy, w, h = (share * width for share in shape)
+    scale = float(reading.img_width or REFERENCE_WIDTH) / REFERENCE_WIDTH
+    dx, dy, per_char, h = (measure * scale for measure in shape)
+    w = per_char * max(len(reading.raw or ""), 1)
     gx0 = min(max(x0 + dx, x0), x1)
     gy0 = min(max(y0 + dy, y0), y1)
     gx1 = min(max(gx0 + w, gx0 + 1.0), x1)
