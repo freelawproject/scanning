@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -929,7 +929,17 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
     volumes = (
         Volume.objects.select_related("reporter", "assigned_to")
-        .prefetch_related("scans")
+        # A row per scan under its volume, a badge and a page range: the
+        # caches stay on disk, and the uploader comes in the same query
+        # instead of one more per scan.
+        .prefetch_related(
+            Prefetch(
+                "scans",
+                queryset=Scan.objects.select_related("uploaded_by").defer(
+                    *Scan.large_fields()
+                ),
+            )
+        )
         .order_by("reporter__short_name", "volume_number")
     )
 
@@ -1098,7 +1108,11 @@ def queue_detail_view(
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-    scans = volume.scans.select_related("uploaded_by").order_by("start_page")
+    scans = (
+        volume.scans.select_related("uploaded_by")
+        .defer(*Scan.large_fields())
+        .order_by("start_page")
+    )
 
     return render(
         request,

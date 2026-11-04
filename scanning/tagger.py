@@ -61,6 +61,7 @@ from scanning.models import (
     JobStatus,
     Opinion,
     OpinionReviewStatus,
+    Scan,
 )
 
 logger = logging.getLogger(__name__)
@@ -631,6 +632,8 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
             opinion__isnull=False,
         )
         .select_related("opinion", "opinion__scan")
+        # The caches stay on disk (#582): the glue reads the scan's keys.
+        .defer(*Scan.large_fields("opinion__scan__"))
         .order_by("completed_at", "pk")
     )
     glued = 0

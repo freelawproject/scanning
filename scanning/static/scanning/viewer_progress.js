@@ -13,6 +13,9 @@
 
     var apiUrl = cfg.progressUrl;
     var lastPageCount = 0;
+    // The stored size of the OCR cache the last answer carried: the
+    // server sends the cache again only when its size moved.
+    var ocrSize = null;
 
     function renderPages(results) {
         var spages = document.getElementById("sidebar-pages");
@@ -111,7 +114,11 @@
     }
 
     function poll() {
-        fetch(apiUrl)
+        var url =
+            typeof ocrSize === "number"
+                ? apiUrl + "?ocr_size=" + encodeURIComponent(ocrSize)
+                : apiUrl;
+        fetch(url)
             .then(function (r) {
                 return r.json();
             })
@@ -128,6 +135,7 @@
                 if (pmsg) pmsg.textContent = data.message || "";
 
                 if (data.ocr_results) renderPages(data.ocr_results);
+                if (typeof data.ocr_size === "number") ocrSize = data.ocr_size;
 
                 if (
                     data.status === "approved" ||
