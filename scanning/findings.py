@@ -499,14 +499,19 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
 
     Two checks ask, about key icons (``_unmatched_findings``) and
     headnotes (``_uncovered_headnote_findings``), and for those two
-    labels the junk rules read nothing else: a key is judged by the
+    labels the junk rules read little else: a key is judged by the
     edge bands, the median width of the volume's keys and the keys of
-    the facing pages; a headnote by the edge bands alone; the image
-    twin rule drops images. So the pass runs here over the volume's
-    key icons and the headnotes of ``pages``, the same verdicts the
+    the facing pages, **on a page with no column box**; a headnote by
+    the edge bands alone; the image twin rule drops images. So the
+    pass runs here over the volume's key icons, the headnotes of
+    ``pages`` and the volume's column boxes, the same verdicts the
     compute's pass gave them, and never over the volume's other rows:
     loading every detection of a volume for every click was the volume
-    read behind the 2026-11-02 hangs.
+    read behind the 2026-11-02 hangs. The column boxes go in as
+    context and never come out: without them the show-through rule
+    saw every page as one with no column box and dropped every key
+    that lines up with the facing page's, which in a volume of orders
+    is every key (230 N.E.3d, 2026-11-04).
 
     :param scan: The scan.
     :param pages: The page indexes whose headnotes are wanted, or None
@@ -519,10 +524,10 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
 
     rows = Detection.objects.live().filter(scan=scan)
     if pages is None:
-        rows = rows.filter(label__in=["KEY_ICON", "HEADNOTE"])
+        rows = rows.filter(label__in=["KEY_ICON", "HEADNOTE", "TEXT_COLUMN"])
     else:
         rows = rows.filter(
-            Q(label="KEY_ICON")
+            Q(label__in=["KEY_ICON", "TEXT_COLUMN"])
             | Q(label="HEADNOTE", page_index__in=list(pages))
         )
     entries = [
@@ -530,7 +535,11 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
         for row in rows.order_by("page_index", "y0", "x0", "pk")
     ]
     drop_junk_entries(entries)
-    return {entry["id"] for entry in entries}
+    return {
+        entry["id"]
+        for entry in entries
+        if entry.get("label") in ("KEY_ICON", "HEADNOTE")
+    }
 
 
 def _unmatched_findings(

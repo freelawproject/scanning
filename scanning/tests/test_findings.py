@@ -248,18 +248,55 @@ class TestReadIds(ScanningTestCase):
         self.assertNotIn(rows["blot_key"].pk, read)
         self.assertNotIn(rows["blot_headnote"].pk, read)
 
-    def test_it_loads_the_two_labels_and_no_other_row(self):
+    def test_it_loads_the_two_labels_the_columns_and_no_other_row(self):
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
 
         scan, rows = self._volume()
         with CaptureQueriesContext(connection) as captured:
-            findings.read_ids(scan)
+            read = findings.read_ids(scan)
         self.assertEqual(len(captured), 1)
         sql = captured[0]["sql"]
         self.assertIn("'KEY_ICON'", sql)
         self.assertIn("'HEADNOTE'", sql)
+        self.assertIn("'TEXT_COLUMN'", sql)
         self.assertIn('"label" IN', sql)
+        # The columns are context for the show-through rule, never an
+        # answer.
+        self.assertNotIn(rows["column"].pk, read)
+
+    def test_a_lined_up_key_on_a_page_with_a_column_box_is_read(self):
+        """The show-through rule drops a mirrored key only on a page
+        with no column box: with the page's columns in the pass, a key
+        that lines up with the facing page's stays, as the compute's
+        own pass keeps it (230 N.E.3d, 2026-11-04)."""
+        from scanning import services
+
+        scan, rows = self._volume()
+        self.assertNotIn(rows["ghost"].pk, findings.read_ids(scan))
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            2,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=900.0,
+            y0=50.0,
+            x1=1610.0,
+            y1=2000.0,
+        )
+        read = findings.read_ids(scan)
+        self.assertIn(rows["ghost"].pk, read)
+        full = {
+            e["id"]
+            for e in services.detection_entries(scan.pk, page_numbers={})
+        }
+        judged = {
+            r.pk
+            for r in Detection.objects.filter(
+                scan=scan, label__in=["KEY_ICON", "HEADNOTE"]
+            )
+        }
+        self.assertEqual(read, full & judged)
 
     def test_pages_limit_the_headnotes_and_never_the_keys(self):
         scan, rows = self._volume()
