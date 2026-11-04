@@ -1536,11 +1536,13 @@ def ready_apply_runs(
     if not live:
         return
     candidates = {}
+    # The page map stays on disk (#588): the test reads two fields,
+    # and the glue of the one candidate it keeps loads the map.
     for run in ApplyRun.objects.filter(
         scan_id__in=list(live),
         superseded_at__isnull=True,
         built_at__isnull=False,
-    ):
+    ).defer(*ApplyRun.LARGE_FIELDS):
         volume_run = live[run.scan_id]
         if (
             getattr(run, target.key_field)
