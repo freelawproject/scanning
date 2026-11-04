@@ -703,7 +703,6 @@
         foot.appendChild(button('Skip', 's', 'btn-outline text-xs', function () {
             skipped[card.key] = true;
             replace(card, node);
-            focusNextCard();
         }));
         return foot;
     }
@@ -959,7 +958,6 @@
             if (again) {
                 setActive(again);
             } else {
-                focusNextCard();
             }
         });
     }
