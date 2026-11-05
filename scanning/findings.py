@@ -513,8 +513,8 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     dropped every key that lines up with the facing page's, which in a
     volume of orders is every key (230 N.E.3d, 2026-11-04). The rule
     reads the key's own page alone, so the columns of the other pages
-    stay on disk: the volume's two a page were every page's heap
-    block, and a click read the whole volume again (2026-11-05).
+    stay on disk: the volume's, two a page, were a read of the whole
+    volume on every click (2026-11-05).
 
     :param scan: The scan.
     :param pages: The page indexes whose headnotes are wanted, or None
@@ -525,7 +525,9 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     """
     from scanning.services import detection_entry, drop_junk_entries
 
-    live = Detection.objects.live().filter(scan=scan)
+    # No ``order_by``: the rows are sorted here, once, over the three
+    # reads together.
+    live = Detection.objects.live().filter(scan=scan).order_by()
     keys = list(live.filter(label="KEY_ICON"))
     headnotes = live.filter(label="HEADNOTE")
     if pages is not None:
@@ -536,7 +538,9 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     # volume's: two column boxes a page is every page's heap block, and
     # a click on a 1,300-page volume read the whole volume again under
     # the rebuild lock, eleven clicks queued behind it (1919,
-    # 2026-11-05). The key pages' blocks are read for the keys already.
+    # 2026-11-05). The saving is the rows not fetched: it is largest in
+    # a volume whose keys sit on few of its pages, and a volume of
+    # orders, a key on most pages, still reads most of its columns.
     key_pages = {row.page_index for row in keys}
     columns = (
         live.filter(label="TEXT_COLUMN", page_index__in=list(key_pages))
