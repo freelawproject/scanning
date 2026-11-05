@@ -972,8 +972,9 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     """Return the page of every curated picture of some runs.
 
     :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
-    two queries, the image boxes and then every live row of their pages,
-    which the junk rule judges them against.
+    two queries whatever the number of runs, the image boxes and then
+    every live row of their pages, which the junk rule judges them
+    against.
 
     :param run_ids: The ``ApplyRun`` ids.
     :returns: ``{run id: [page_index, ...]}``, one entry per picture;
@@ -988,16 +989,21 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     )
     if not pairs:
         return {}
-    by_run: dict[int, dict[int, list]] = {}
+    # One query for every run, never one per run (#599): a page of the
+    # opinions list spans many volumes. Each run's own pages, an exact
+    # lookup on ``idx_det_live_run_page``.
+    of_their_pages = Q()
     for run_id, pages in _pages_by_run(pairs).items():
-        for row in (
-            Detection.objects.live()
-            .filter(apply_run_id=run_id, page_index__in=pages)
-            .only(*PICTURE_FIELDS)
-        ):
-            by_run.setdefault(run_id, {}).setdefault(
-                row.page_index, []
-            ).append(row)
+        of_their_pages |= Q(apply_run_id=run_id, page_index__in=pages)
+    by_run: dict[int, dict[int, list]] = {}
+    for row in (
+        Detection.objects.live()
+        .filter(of_their_pages)
+        .only("apply_run_id", *PICTURE_FIELDS)
+    ):
+        by_run.setdefault(row.apply_run_id, {}).setdefault(
+            row.page_index, []
+        ).append(row)
     out: dict[int, list[int]] = {}
     for run_id, rows_by_page in by_run.items():
         for page_index, pictures in kept_pictures(rows_by_page).items():

@@ -654,32 +654,36 @@ class TestOpinionListIndexes(ScanningTestCase):
             "(status, id)", self._definition("idx_opinion_status_id")
         )
 
-    def test_the_picture_count_reads_one_run_live(self):
+    def test_the_picture_count_reads_every_run_live_in_two_queries(self):
+        """A page that spans several volumes costs two reads, not 1 + N."""
         from scanning import opinions
         from scanning.models import ApplyRun, Detection
 
-        scan = ScanFactory()
-        run = ApplyRun.objects.create(scan=scan, number=1)
-        opinion = OpinionFactory(scan=scan, apply_run=run)
-        Detection.objects.create(
-            scan=scan,
-            apply_run=run,
-            page_index=0,
-            label="IMAGE",
-            label_id=0,
-            confidence=0.9,
-            x0=100.0,
-            y0=100.0,
-            x1=900.0,
-            y1=900.0,
-            img_width=1700,
-            img_height=2200,
-            source_page=1,
-        )
+        rows = []
+        for page_index in (0, 1):
+            scan = ScanFactory()
+            run = ApplyRun.objects.create(scan=scan, number=1)
+            rows.append(OpinionFactory(scan=scan, apply_run=run))
+            Detection.objects.create(
+                scan=scan,
+                apply_run=run,
+                page_index=page_index,
+                label="IMAGE",
+                label_id=0,
+                confidence=0.9,
+                x0=100.0,
+                y0=100.0,
+                x1=900.0,
+                y1=900.0,
+                img_width=1700,
+                img_height=2200,
+                source_page=page_index + 1,
+            )
 
         with CaptureQueriesContext(connection) as captured:
-            opinions.picture_counts([opinion])
+            counts = opinions.picture_counts(rows)
 
+        self.assertEqual(counts, {rows[0].pk: 1, rows[1].pk: 1})
         reads = [
             q["sql"] for q in captured if '"scanning_detection"' in q["sql"]
         ]
