@@ -504,14 +504,17 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     the facing pages, **on a page with no column box**; a headnote by
     the edge bands alone; the image twin rule drops images. So the
     pass runs here over the volume's key icons, the headnotes of
-    ``pages`` and the volume's column boxes, the same verdicts the
-    compute's pass gave them, and never over the volume's other rows:
-    loading every detection of a volume for every click was the volume
-    read behind the 2026-11-02 hangs. The column boxes go in as
-    context and never come out: without them the show-through rule
-    saw every page as one with no column box and dropped every key
-    that lines up with the facing page's, which in a volume of orders
-    is every key (230 N.E.3d, 2026-11-04).
+    ``pages`` and the column boxes of the pages that hold a key, the
+    same verdicts the compute's pass gave them, and never over the
+    volume's other rows: loading every detection of a volume for every
+    click was the volume read behind the 2026-11-02 hangs. The column
+    boxes go in as context and never come out: without them the
+    show-through rule saw every page as one with no column box and
+    dropped every key that lines up with the facing page's, which in a
+    volume of orders is every key (230 N.E.3d, 2026-11-04). The rule
+    reads the key's own page alone, so the columns of the other pages
+    stay on disk: the volume's, two a page, were a read of the whole
+    volume on every click (2026-11-05).
 
     :param scan: The scan.
     :param pages: The page indexes whose headnotes are wanted, or None
@@ -522,18 +525,33 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     """
     from scanning.services import detection_entry, drop_junk_entries
 
-    rows = Detection.objects.live().filter(scan=scan)
-    if pages is None:
-        rows = rows.filter(label__in=["KEY_ICON", "HEADNOTE", "TEXT_COLUMN"])
-    else:
-        rows = rows.filter(
-            Q(label__in=["KEY_ICON", "TEXT_COLUMN"])
-            | Q(label="HEADNOTE", page_index__in=list(pages))
-        )
-    entries = [
-        detection_entry(row, {})
-        for row in rows.order_by("page_index", "y0", "x0", "pk")
-    ]
+    # No ``order_by``: the rows are sorted here, once, over the three
+    # reads together.
+    live = Detection.objects.live().filter(scan=scan).order_by()
+    keys = list(live.filter(label="KEY_ICON"))
+    headnotes = live.filter(label="HEADNOTE")
+    if pages is not None:
+        headnotes = headnotes.filter(page_index__in=list(pages))
+    # The show-through rule asks one thing of a column box: whether
+    # the key's own page has one (``blackletter.junk.mirror_keys``).
+    # So the columns of the pages that hold a key go in, and never the
+    # volume's: two column boxes a page is every page's heap block, and
+    # a click on a 1,300-page volume read the whole volume again under
+    # the rebuild lock, eleven clicks queued behind it (1919,
+    # 2026-11-05). The saving is the rows not fetched: it is largest in
+    # a volume whose keys sit on few of its pages, and a volume of
+    # orders, a key on most pages, still reads most of its columns.
+    key_pages = {row.page_index for row in keys}
+    columns = (
+        live.filter(label="TEXT_COLUMN", page_index__in=list(key_pages))
+        if key_pages
+        else live.none()
+    )
+    rows = sorted(
+        [*keys, *headnotes, *columns],
+        key=lambda row: (row.page_index, row.y0, row.x0, row.pk),
+    )
+    entries = [detection_entry(row, {}) for row in rows]
     drop_junk_entries(entries)
     return {
         entry["id"]
