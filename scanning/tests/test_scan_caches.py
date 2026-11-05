@@ -39,6 +39,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    OpinionReviewStatus,
     PageRepairRequest,
     Scan,
     Status,
@@ -624,3 +625,87 @@ class TestVolumeRunsIndex(ScanningTestCase):
                 self.assertIn(
                     '"scanning_externaljob"."apply_run_id" IS NULL', sql
                 )
+
+
+class TestOpinionListIndexes(ScanningTestCase):
+    """The opinions list's Pictures column and status filter (#599).
+
+    Each index is pinned by its definition, and each query by the
+    columns it filters, so the planner can read the index. The plan is
+    not asserted: a test table is too small to measure its choice.
+    """
+
+    def _definition(self, name):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = %s", [name]
+            )
+            (definition,) = cursor.fetchone()
+        return definition
+
+    def test_the_live_detections_of_a_run_by_page(self):
+        definition = self._definition("idx_det_live_run_page")
+
+        self.assertIn("(apply_run_id, page_index, label)", definition)
+        self.assertIn("WHERE active", definition)
+
+    def test_the_opinions_by_status(self):
+        self.assertIn(
+            "(status, id)", self._definition("idx_opinion_status_id")
+        )
+
+    def test_the_picture_count_reads_one_run_live(self):
+        from scanning import opinions
+        from scanning.models import ApplyRun, Detection
+
+        scan = ScanFactory()
+        run = ApplyRun.objects.create(scan=scan, number=1)
+        opinion = OpinionFactory(scan=scan, apply_run=run)
+        Detection.objects.create(
+            scan=scan,
+            apply_run=run,
+            page_index=0,
+            label="IMAGE",
+            label_id=0,
+            confidence=0.9,
+            x0=100.0,
+            y0=100.0,
+            x1=900.0,
+            y1=900.0,
+            img_width=1700,
+            img_height=2200,
+            source_page=1,
+        )
+
+        with CaptureQueriesContext(connection) as captured:
+            opinions.picture_counts([opinion])
+
+        reads = [
+            q["sql"] for q in captured if '"scanning_detection"' in q["sql"]
+        ]
+        self.assertEqual(len(reads), 2, reads)
+        for sql in reads:
+            with self.subTest(sql[:60]):
+                self.assertIn('"scanning_detection"."active"', sql)
+                self.assertIn('"scanning_detection"."apply_run_id"', sql)
+        self.assertIn('"scanning_detection"."page_index" IN', reads[1])
+
+    def test_a_status_filter_pages_newest_first(self):
+        self.client.force_login(self.make_user())
+        OpinionFactory(status=OpinionReviewStatus.ERROR)
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(
+                reverse("opinion_list"), {"status": "error"}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        page = [
+            q["sql"]
+            for q in captured
+            if q["sql"].startswith('SELECT "scanning_opinion"."id"')
+            and "LIMIT" in q["sql"]
+        ]
+        self.assertEqual(len(page), 1, page)
+        self.assertIn(""""scanning_opinion"."status" = 'error'""", page[0])
+        self.assertIn('ORDER BY "scanning_opinion"."id" DESC', page[0])
