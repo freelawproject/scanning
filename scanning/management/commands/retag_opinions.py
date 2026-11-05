@@ -4,9 +4,11 @@ The tagger's weights are part of every row's identity (``tagger.MODEL``),
 so a new checkpoint leaves the spans of the old one in place: they
 still export, and the review page offers the tag again. This command
 starts the new run for the backlog at once: every ``TEXT_REVIEW_DONE``
-opinion whose spans other weights wrote (``tagger.is_written`` without
-``tagger.is_current``), through ``tagger.ensure_tag_jobs``, the call the
-button makes. An opinion that was never tagged is left to the button.
+opinion whose spans other weights wrote (``Opinion.tag_model`` is not
+``tagger.MODEL``), through ``tagger.ensure_tag_jobs``, the call the
+button makes. That includes an opinion approved again after its old
+run, whose spans are over an earlier text: the run reads the text
+approved now. An opinion that was never tagged is left to the button.
 
 Creating a row is what costs money, so run it with ``--dry-run`` first:
 it lists what it would start and starts nothing. An opinion whose run
@@ -38,6 +40,9 @@ from scanning.models import (
 def candidates(scan_pks: list[int] | None):
     """Return the approved opinions whose spans other weights wrote.
 
+    Read off ``tag_model`` alone, never :func:`tagger.is_written`: spans
+    of an earlier approved text are spans of the old weights too.
+
     :param scan_pks: The volumes to walk, or None for every volume.
     :returns: The opinions, with ``scan``, by scan and key.
     :rtype: list[Opinion]
@@ -53,11 +58,7 @@ def candidates(scan_pks: list[int] | None):
     )
     if scan_pks is not None:
         rows = rows.filter(scan_id__in=scan_pks)
-    return [
-        opinion
-        for opinion in rows
-        if tagger.is_written(opinion) and not tagger.is_current(opinion)
-    ]
+    return list(rows)
 
 
 class Command(BaseCommand):

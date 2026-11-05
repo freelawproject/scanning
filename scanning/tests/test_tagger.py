@@ -940,6 +940,27 @@ class TestRetagOpinions(_OldSpansCase):
         self.assertEqual(len(tag_jobs(self.opinion)), 1)
         self.assertEqual(tag_jobs(untagged), [])
 
+    def test_old_spans_of_an_earlier_approval_start_a_run(self):
+        # Approved again after the old run: its spans are over an earlier
+        # text and of the old weights, and the run reads the text now.
+        self.old_spans()
+        self.approve_again("Another text.")
+        self.assertFalse(tagger.is_written(self.opinion))
+
+        out, _ = self.run_command("--all")
+
+        self.assertIn("1 run(s) started", out)
+        row = tag_jobs(self.opinion)[-1]
+        self.assertEqual(row.status, JobStatus.PENDING)
+        self.assertEqual(
+            row.input_manifest["digest"],
+            tagger.text_digest(
+                markup.project(
+                    self.stored[self.opinion.approved_text_key]["body"]
+                ).text
+            ),
+        )
+
     def test_a_run_in_flight_is_skipped(self):
         self.old_spans()
         tagger.ensure_tag_jobs(self.opinion)
