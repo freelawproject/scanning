@@ -784,11 +784,10 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             ),
             "tag_url": address("start_caselaw_tagger"),
             # The final XML (#432): built from the spans, so offered
-            # where the spans exist and nowhere else, whatever weights
-            # wrote them (#573): spans of older weights still export.
+            # where the spans exist and nowhere else.
             "final_xml_url": (
                 address("opinion_final_xml")
-                if tag_state is not None and tagger.is_written(opinion)
+                if tag_state == tagger.DONE
                 else ""
             ),
             # Absent when the PDF pass has not written the file at

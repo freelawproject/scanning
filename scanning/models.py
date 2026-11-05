@@ -3099,18 +3099,6 @@ class Opinion(AbstractDateTimeModel):
             "equal (``tagger.is_written``)."
         ),
     )
-    tag_model = models.CharField(
-        max_length=255,
-        blank=True,
-        default="",
-        help_text=(
-            "The weights that wrote the spans at ``tag_key``, as the "
-            "worker reports them (``repo@revision``, #573). The spans "
-            "are of the current weights when this is ``tagger.MODEL`` "
-            "(``tagger.is_current``). Blank for spans glued before the "
-            "field: the per-token weights."
-        ),
-    )
     final_xml_tag_key = models.CharField(
         max_length=512,
         blank=True,

@@ -814,14 +814,14 @@ class TestTheWeights(_OldSpansCase):
         self.assertEqual(second.input_manifest["model"], "org/next@abc")
         self.assertEqual(second.status, JobStatus.PENDING)
 
-    def test_the_glue_stamps_the_weights(self):
+    def test_spans_of_the_current_weights(self):
         self.finished_row()
 
         tagger.finish_ready_runs()
 
         self.opinion.refresh_from_db()
-        self.assertEqual(self.opinion.tag_model, tagger.MODEL)
-        self.assertTrue(tagger.is_current(self.opinion))
+        self.assertTrue(tagger.has_current_spans(self.opinion))
+        self.assertFalse(tagger.has_current_run(self.opinion))
         self.assertEqual(
             self.stored[self.opinion.tag_key]["model"], tagger.MODEL
         )
@@ -850,9 +850,9 @@ class TestTheWeights(_OldSpansCase):
         self.old_spans()
 
         self.assertTrue(tagger.is_written(self.opinion))
-        self.assertFalse(tagger.is_current(self.opinion))
-        self.assertEqual(self.opinion.tag_model, OLD_MODEL)
-        self.assertEqual(tagger.state(self.opinion), tagger.STALE)
+        self.assertFalse(tagger.has_current_spans(self.opinion))
+        # They still export: the button reads them as tagged.
+        self.assertEqual(tagger.state(self.opinion), tagger.DONE)
 
     def test_a_press_over_old_spans_starts_a_run_of_the_new_weights(self):
         old = self.old_spans()
@@ -865,31 +865,16 @@ class TestTheWeights(_OldSpansCase):
         # The old spans stay placed until the new run is glued.
         self.opinion.refresh_from_db()
         self.assertTrue(tagger.is_written(self.opinion))
-        self.assertEqual(tagger.state(self.opinion), tagger.RUNNING)
+        self.assertTrue(tagger.has_current_run(self.opinion))
+        self.assertFalse(tagger.has_current_spans(self.opinion))
 
-
-@override_settings(**TAGGER)
-class TestThePageOverOldSpans(_OldSpansCase):
-    def setUp(self):
-        super().setUp()
-        self.client.force_login(self.make_user())
-
-    def test_old_spans_offer_the_tag_again_and_still_export(self):
+    def test_a_failed_run_of_the_new_weights_leaves_old_spans(self):
         self.old_spans()
+        row = tagger.ensure_tag_jobs(self.opinion)[0]
+        ExternalJob.objects.filter(pk=row.pk).update(status=JobStatus.FAILED)
 
-        response = self.client.get(
-            reverse("opinion_review", kwargs={"pk": self.opinion.pk})
-        )
-
-        self.assertContains(response, 'id="start-tagger"')
-        self.assertContains(response, "Tag the text again")
-        self.assertContains(
-            response,
-            reverse(
-                "opinion_final_xml",
-                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
-            ),
-        )
+        self.assertFalse(tagger.has_current_run(self.opinion))
+        self.assertFalse(tagger.has_current_spans(self.opinion))
 
 
 @override_settings(**TAGGER)
@@ -960,6 +945,23 @@ class TestRetagOpinions(_OldSpansCase):
                 ).text
             ),
         )
+
+    def test_a_second_call_starts_nothing(self):
+        self.old_spans()
+        self.run_command("--all")
+        row = tag_jobs(self.opinion)[-1]
+        row.result_key = f"{tagger.prefix(self.opinion)}r{row.run}-s0-a1.json"
+        row.status = JobStatus.COMPLETED
+        row.attempt = 1
+        row.save()
+        self.stored[row.result_key] = self.envelope(row)
+        tagger.finish_ready_runs()
+
+        out, submit = self.run_command("--all")
+
+        self.assertIn("0 run(s) started", out)
+        self.assertEqual(len(tag_jobs(self.opinion)), 2)
+        submit.assert_not_called()
 
     def test_a_run_in_flight_is_skipped(self):
         self.old_spans()

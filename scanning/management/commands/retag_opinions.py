@@ -1,14 +1,15 @@
 """Tag the approved opinions again after a change of the weights (#573).
 
 The tagger's weights are part of every row's identity (``tagger.MODEL``),
-so a new checkpoint leaves the spans of the old one in place: they
-still export, and the review page offers the tag again. This command
-starts the new run for the backlog at once: every ``TEXT_REVIEW_DONE``
-opinion whose spans other weights wrote (``Opinion.tag_model`` is not
-``tagger.MODEL``), through ``tagger.ensure_tag_jobs``, the call the
-button makes. That includes an opinion approved again after its old
-run, whose spans are over an earlier text: the run reads the text
-approved now. An opinion that was never tagged is left to the button.
+so a new checkpoint leaves the spans of the old one in place, and they
+still export. This command tags the approved opinions again with the
+current weights: every ``TEXT_REVIEW_DONE`` opinion that holds spans
+the current weights did not place (``tagger.has_current_spans``),
+through ``tagger.ensure_tag_jobs``, the call the button makes. That
+includes an opinion approved again after its old run, whose spans are
+over an earlier text: the run reads the text approved now. A second
+call starts nothing for an opinion the first one tagged. An opinion
+that was never tagged is left to the button.
 
 Creating a row is what costs money, so run it with ``--dry-run`` first:
 it lists what it would start and starts nothing. An opinion whose run
@@ -40,9 +41,6 @@ from scanning.models import (
 def candidates(scan_pks: list[int] | None):
     """Return the approved opinions whose spans other weights wrote.
 
-    Read off ``tag_model`` alone, never :func:`tagger.is_written`: spans
-    of an earlier approved text are spans of the old weights too.
-
     :param scan_pks: The volumes to walk, or None for every volume.
     :returns: The opinions, with ``scan``, by scan and key.
     :rtype: list[Opinion]
@@ -51,14 +49,13 @@ def candidates(scan_pks: list[int] | None):
         Opinion.objects.filter(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
         .exclude(approved_text_key="")
         .exclude(tag_key="")
-        .exclude(tag_model=tagger.MODEL)
         .select_related("scan")
         .defer(*Scan.large_fields("scan__"))
         .order_by("scan_id", "first_printed_page", "index_in_page")
     )
     if scan_pks is not None:
         rows = rows.filter(scan_id__in=scan_pks)
-    return list(rows)
+    return [o for o in rows if not tagger.has_current_spans(o)]
 
 
 class Command(BaseCommand):
@@ -122,7 +119,7 @@ class Command(BaseCommand):
                 )
 
         found = candidates(pks or None)
-        running = [o for o in found if tagger.state(o) == tagger.RUNNING]
+        running = [o for o in found if tagger.has_current_run(o)]
         due = [o for o in found if o not in running]
         for opinion in running:
             self.stdout.write(
@@ -132,8 +129,7 @@ class Command(BaseCommand):
         if dry_run:
             for opinion in due:
                 self.stdout.write(
-                    f"would tag {opinion} of scan {opinion.scan_id} again "
-                    f"(spans of {opinion.tag_model or 'the per-token weights'})"
+                    f"would tag {opinion} of scan {opinion.scan_id} again"
                 )
             self.stdout.write(
                 f"{len(due)} opinion(s) would be tagged again with "

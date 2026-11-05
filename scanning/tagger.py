@@ -417,19 +417,51 @@ def is_written(opinion: Opinion) -> bool:
     )
 
 
-def is_current(opinion: Opinion) -> bool:
-    """Return whether the spans exist and the current weights wrote them.
+def has_current_spans(opinion: Opinion) -> bool:
+    """Return whether the current weights placed the spans it holds.
 
-    :func:`is_written` is what the export reads: spans of older weights
-    still export (``casebody.repair_spans`` answers their cut words).
-    This is what the button and ``retag_opinions`` read (#573).
+    The rule of ``retag_opinions`` (#573): the spans exist
+    (:func:`is_written`) and the live row, the run that placed them, is
+    consumed and names :data:`MODEL`. A run of the current weights that
+    failed, or that other weights answered (:class:`WrongModel`), is a
+    dead live row, so the spans it holds are older.
 
     :param opinion: The row.
-    :returns: Whether :func:`is_written` holds and ``tag_model`` is
-        :data:`MODEL`.
+    :returns: Whether the spans are of the current weights.
     :rtype: bool
     """
-    return is_written(opinion) and opinion.tag_model == MODEL
+    if not is_written(opinion):
+        return False
+    rows = live_tag_jobs(opinion)
+    return bool(
+        rows
+        and rows[0].status == JobStatus.CONSUMED
+        and (rows[0].input_manifest or {}).get("model") == MODEL
+    )
+
+
+def has_current_run(opinion: Opinion) -> bool:
+    """Return whether a run of the current weights is on its way.
+
+    Open at the provider, or completed and waiting for its glue: the
+    rows ``retag_opinions`` leaves to the ticks (#573). A completed row
+    whose glue gave up is not on its way; a press places it.
+
+    :param opinion: The row.
+    :returns: Whether the live row names :data:`MODEL` and is not done.
+    :rtype: bool
+    """
+    rows = live_tag_jobs(opinion)
+    if not rows:
+        return False
+    row = rows[0]
+    if (row.input_manifest or {}).get("model") != MODEL:
+        return False
+    if row.status in DEAD_JOB_STATUSES or row.status == JobStatus.CONSUMED:
+        return False
+    if row.status == JobStatus.COMPLETED:
+        return _glue_attempts(row) < GLUE_MAX_ATTEMPTS
+    return True
 
 
 def _glue_attempts(row: ExternalJob) -> int:
@@ -442,14 +474,13 @@ def state(opinion: Opinion) -> str:
     """Return what the tagger has done with the approved text.
 
     :param opinion: The row.
-    :returns: :data:`DONE` when :func:`is_current`; :data:`RUNNING`
+    :returns: :data:`DONE` when :func:`is_written`; :data:`RUNNING`
         while the live row is open or waits for its glue; :data:`FAILED`
         when it is dead or its glue gave up; :data:`STALE` when a run
-        read an earlier approved text or ran older weights (#573);
-        :data:`NONE` before any run.
+        read an earlier approved text; :data:`NONE` before any run.
     :rtype: str
     """
-    if is_current(opinion):
+    if is_written(opinion):
         return DONE
     rows = live_tag_jobs(opinion)
     if not rows:
@@ -578,14 +609,10 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
     # New spans are new inputs of the export (#408): its fault count
     # starts again.
     Opinion.objects.filter(pk=opinion.pk).update(
-        tag_key=key,
-        tagged_text_key=approved_key,
-        tag_model=model or "",
-        final_xml_attempts=0,
+        tag_key=key, tagged_text_key=approved_key, final_xml_attempts=0
     )
     opinion.tag_key = key
     opinion.tagged_text_key = approved_key
-    opinion.tag_model = model or ""
     logger.info(
         "%s of scan %s: tagger run %d placed %d span(s) -> %s",
         opinion,
