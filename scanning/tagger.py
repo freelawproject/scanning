@@ -421,10 +421,14 @@ def has_current_spans(opinion: Opinion) -> bool:
     """Return whether the current weights placed the spans it holds.
 
     The rule of ``retag_opinions`` (#573): the spans exist
-    (:func:`is_written`) and the live row, the run that placed them, is
-    consumed and names :data:`MODEL`. A run of the current weights that
-    failed, or that other weights answered (:class:`WrongModel`), is a
-    dead live row, so the spans it holds are older.
+    (:func:`is_written`), the live row, the run that placed them, is
+    consumed, and the weights that answered it are :data:`MODEL`. Those
+    are recorded by the glue (``provider_meta["model"]``), so a row from
+    before the weights joined the identity that the new image answered
+    counts as current; a row glued before this rule falls back on its
+    identity. A run of the current weights that failed, or that other
+    weights answered (:class:`WrongModel`), is a dead live row, so the
+    spans it holds are older.
 
     :param opinion: The row.
     :returns: Whether the spans are of the current weights.
@@ -433,11 +437,12 @@ def has_current_spans(opinion: Opinion) -> bool:
     if not is_written(opinion):
         return False
     rows = live_tag_jobs(opinion)
-    return bool(
-        rows
-        and rows[0].status == JobStatus.CONSUMED
-        and (rows[0].input_manifest or {}).get("model") == MODEL
-    )
+    if not rows or rows[0].status != JobStatus.CONSUMED:
+        return False
+    answered = (rows[0].provider_meta or {}).get("model")
+    if answered is None:
+        answered = (rows[0].input_manifest or {}).get("model")
+    return answered == MODEL
 
 
 def has_current_run(opinion: Opinion) -> bool:
@@ -510,9 +515,10 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
     :param row: Its live row, ``COMPLETED`` or ``CONSUMED``.
     :returns: The key written.
     :rtype: str
-    :raises TextMoved: If the approved text is not the text the run read.
     :raises WrongModel: If the result names weights other than the
-        row's identity (#573).
+        row's identity (#573). Checked before the text, so such a result
+        is failed and never consumed.
+    :raises TextMoved: If the approved text is not the text the run read.
     :raises TaggerGlueError: If the result or the approved text cannot
         be read, or the write fails.
     """
@@ -529,11 +535,6 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
         raise TaggerGlueError(str(exc)) from exc
     projection = project(approved)
     identity = row.input_manifest or {}
-    if text_digest(projection.text) != identity.get("digest"):
-        raise TextMoved(
-            f"{opinion}: the approved text {approved_key} is not the text "
-            f"run {row.run} read"
-        )
     if not row.result_key:
         raise TaggerGlueError(f"{opinion} run {row.run} has no result key")
     try:
@@ -552,6 +553,13 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
         raise WrongModel(
             f"{opinion} run {row.run}: the result was written by "
             f"{model!r}, the row asked for {identity['model']!r}"
+        )
+    # After the weights, so a result of other weights is failed even when
+    # the text moved too: consumed, the carry would hand it on.
+    if text_digest(projection.text) != identity.get("digest"):
+        raise TextMoved(
+            f"{opinion}: the approved text {approved_key} is not the text "
+            f"run {row.run} read"
         )
     sequences = payload.get("sequences")
     if not isinstance(sequences, list) or len(sequences) != 1:
@@ -606,6 +614,9 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
         raise TaggerGlueError(
             f"{opinion} run {row.run}: could not write {key}"
         )
+    # The weights that wrote the spans (#573): a row from before the
+    # weights joined the identity names none there, whatever answered it.
+    jobs.swap_provider_meta(row, lambda meta: meta.update(model=model))
     # New spans are new inputs of the export (#408): its fault count
     # starts again.
     Opinion.objects.filter(pk=opinion.pk).update(
@@ -667,10 +678,16 @@ def _reject(row: ExternalJob, exc: WrongModel) -> None:
     """Write off a row whose result other weights wrote (#573).
 
     A compare-and-swap over the finished statuses, the only ones a glue
-    reads. The result object is kept, like every tagger result.
+    reads, on the row and on the row its result was carried from
+    (``provider_meta["carried_from"]``): a finished row is what the carry
+    copies (``jobs._reusable_results``), so a source left standing would
+    hand the same result to every next run. The result object is kept,
+    like every tagger result.
     """
+    carried = ((row.provider_meta or {}).get("carried_from") or {}).get("job")
+    pks = [row.pk] + ([carried] if carried else [])
     written = ExternalJob.objects.filter(
-        pk=row.pk, status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED)
+        pk__in=pks, status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED)
     ).update(
         status=JobStatus.FAILED,
         error_code=WRONG_MODEL,

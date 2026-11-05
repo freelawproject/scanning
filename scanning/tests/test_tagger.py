@@ -846,6 +846,65 @@ class TestTheWeights(_OldSpansCase):
         self.assertGreater(retry.run, row.run)
         self.assertEqual(retry.status, JobStatus.PENDING)
 
+    def wrong_model_row(self):
+        row = self.completed_row()
+        env = self.envelope(row)
+        env["payload"]["model"] = OLD_MODEL
+        self.stored[row.result_key] = env
+        return row
+
+    def test_other_weights_are_failed_even_when_the_text_moved(self):
+        # Consumed by the text check, the result would be carried into
+        # the next run of the same text and refused again for good.
+        row = self.wrong_model_row()
+        self.approve_again("Another text.")
+
+        tagger.finish_ready_runs()
+
+        row.refresh_from_db()
+        self.assertEqual(row.status, JobStatus.FAILED)
+        self.assertEqual(row.error_code, tagger.WRONG_MODEL)
+
+    def test_a_carried_result_of_other_weights_fails_its_source(self):
+        source = self.wrong_model_row()
+        ExternalJob.objects.filter(pk=source.pk).update(
+            status=JobStatus.CONSUMED
+        )
+        # A later run of the same text died, so the next press starts a
+        # run, and the carry copies the source's result into it.
+        dead = tagger.ensure_tag_jobs(self.opinion, force_new_run=True)[0]
+        ExternalJob.objects.filter(pk=dead.pk).update(status=JobStatus.FAILED)
+        carried = tagger.ensure_tag_jobs(self.opinion)[0]
+        self.assertEqual(carried.status, JobStatus.COMPLETED)
+        self.assertEqual(
+            carried.provider_meta["carried_from"]["job"], source.pk
+        )
+
+        with self.assertRaises(tagger.WrongModel):
+            tagger.place(self.opinion, carried)
+
+        source.refresh_from_db()
+        self.assertEqual(source.status, JobStatus.FAILED)
+        fresh = tagger.ensure_tag_jobs(self.opinion)[0]
+        self.assertGreater(fresh.run, carried.run)
+        self.assertEqual(fresh.status, JobStatus.PENDING)
+
+    def test_a_row_from_before_the_weights_answered_by_them_is_current(self):
+        # Created before the portal deploy, answered by the new image.
+        row = self.completed_row()
+        manifest = dict(row.input_manifest)
+        manifest.pop("model")
+        ExternalJob.objects.filter(pk=row.pk).update(input_manifest=manifest)
+        row.refresh_from_db()
+        self.stored[row.result_key] = self.envelope(row)
+
+        tagger.finish_ready_runs()
+
+        row.refresh_from_db()
+        self.opinion.refresh_from_db()
+        self.assertEqual(row.provider_meta["model"], tagger.MODEL)
+        self.assertTrue(tagger.has_current_spans(self.opinion))
+
     def test_a_row_from_before_the_weights_is_placed_as_before(self):
         self.old_spans()
 
