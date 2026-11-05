@@ -248,22 +248,69 @@ class TestReadIds(ScanningTestCase):
         self.assertNotIn(rows["blot_key"].pk, read)
         self.assertNotIn(rows["blot_headnote"].pk, read)
 
-    def test_it_loads_the_two_labels_the_columns_and_no_other_row(self):
+    def test_it_loads_the_two_labels_the_key_pages_columns_and_no_other_row(
+        self,
+    ):
+        """Three reads: the keys, the headnotes, and the column boxes of
+        the pages that hold a key. The show-through rule reads the key's
+        own page alone, so a column box on a page with no key stays on
+        disk: the volume's column boxes were every page's heap block,
+        and a click read the whole volume again (1919, 2026-11-05)."""
         from django.db import connection
         from django.test.utils import CaptureQueriesContext
 
         scan, rows = self._volume()
+        # A column box on a page with no key, far from the keys.
+        make_detection(
+            scan,
+            "TEXT_COLUMN",
+            7,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=100.0,
+            y0=50.0,
+            x1=800.0,
+            y1=2000.0,
+        )
         with CaptureQueriesContext(connection) as captured:
             read = findings.read_ids(scan)
-        self.assertEqual(len(captured), 1)
-        sql = captured[0]["sql"]
-        self.assertIn("'KEY_ICON'", sql)
-        self.assertIn("'HEADNOTE'", sql)
-        self.assertIn("'TEXT_COLUMN'", sql)
-        self.assertIn('"label" IN', sql)
+        self.assertEqual(len(captured), 3)
+        by_label = {}
+        for query in captured:
+            for label in ("KEY_ICON", "HEADNOTE", "TEXT_COLUMN"):
+                if f"'{label}'" in query["sql"]:
+                    by_label[label] = query["sql"]
+        self.assertEqual(
+            set(by_label), {"KEY_ICON", "HEADNOTE", "TEXT_COLUMN"}
+        )
+        # The keys are the volume's: no page in the WHERE.
+        self.assertNotIn('"page_index" IN', by_label["KEY_ICON"])
+        key_pages = sorted(
+            {
+                r.page_index
+                for r in Detection.objects.filter(scan=scan, label="KEY_ICON")
+            }
+        )
+        self.assertIn('"page_index" IN', by_label["TEXT_COLUMN"])
+        for page in key_pages:
+            self.assertIn(str(page), by_label["TEXT_COLUMN"])
+        self.assertNotIn(7, key_pages)
         # The columns are context for the show-through rule, never an
         # answer.
         self.assertNotIn(rows["column"].pk, read)
+
+    def test_a_volume_with_no_key_reads_no_column_box(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan, rows = self._volume()
+        Detection.objects.filter(scan=scan, label="KEY_ICON").delete()
+        with CaptureQueriesContext(connection) as captured:
+            read = findings.read_ids(scan)
+        self.assertNotIn(rows["column"].pk, read)
+        self.assertFalse(
+            any("'TEXT_COLUMN'" in q["sql"] for q in captured),
+            [q["sql"] for q in captured],
+        )
 
     def test_a_lined_up_key_on_a_page_with_a_column_box_is_read(self):
         """The show-through rule drops a mirrored key only on a page
