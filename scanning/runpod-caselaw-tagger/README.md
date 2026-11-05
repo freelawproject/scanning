@@ -1,8 +1,8 @@
 # caselaw-tagger-gpu-worker
 
 GPU worker image for [RunPod Serverless] that runs
-[freelawproject/caselaw-block-tagger](https://huggingface.co/freelawproject/caselaw-block-tagger),
-a ModernBERT-large token classifier that labels the structural parts
+[freelawproject/caselaw-block-tagger-wordlevel](https://huggingface.co/freelawproject/caselaw-block-tagger-wordlevel)
+(pinned to commit `00a26dda`), a ModernBERT-large token classifier that labels the structural parts
 of a U.S. case-law opinion — party, separator, docket number, court,
 attorneys, judges, date filed, other date, history, disposition,
 author, heading — as character spans over the case text.
@@ -165,6 +165,7 @@ Returns:
       "id": "c1",
       "token_count": 611,
       "window_count": 1,
+      "healed_blocks": 0,
       "spans": [
         {"start": 3, "end": 22, "label": "party", "text": "Jane ROE, Appellant"},
         {"start": 30, "end": 32, "label": "separator", "text": "v."},
@@ -176,12 +177,13 @@ Returns:
       "id": "c2",
       "token_count": 9014,
       "window_count": 3,
+      "healed_blocks": 0,
       "spans": []
     }
   ],
   "sequence_count": 2,
   "failed_sequences": [],
-  "model": "freelawproject/caselaw-block-tagger",
+  "model": "freelawproject/caselaw-block-tagger-wordlevel@00a26dda233db0f77268019020f5ae96a221ba44",
   "max_tokens": 8192,
   "duration_ms": 2310,
   "worker_boot_ms": 41200,
@@ -193,16 +195,35 @@ Returns:
 Notes:
 
 - `start`/`end` are **character offsets into the input `text`**, `end`
-  exclusive, trimmed to the text they cover. `label` is the class
-  without its BIO prefix. Spans come in text order.
-- The decoder is lenient in one way: an `I-x` that follows nothing, or
-  follows a different class, opens a span rather than being discarded.
-  Predictions on markup and whitespace are ignored, because markup
-  tokens were excluded from the training loss. Span edges are trimmed
-  to actual text. The bytes of one multi-byte character (byte-level
-  BPE gives each the same offsets) can neither open nor close a span
-  in the middle of it, so a West key symbol never splits a heading. A span crossing inline formatting can still contain
-  markup inside its `text`, which is the original source substring.
+  exclusive. `label` is the class without its BIO prefix. Spans come in
+  text order.
+- **The decoder is word-level** (`wordlevel.py`, `decode_word_spans`).
+  The weights were trained with a label on the first token of each word
+  alone, so the worker reads one label per word, from that token, and
+  every span starts and ends on a word. A word is a run of characters
+  that are neither whitespace nor inside one of the tags the portal's
+  projection writes (`<p>`, `<blockquote>`, `<em>`, `<sup>`, and
+  `<footnotes>`); punctuation glued to a word is part of it, and a page
+  mark glued to the front of a word (`↓47ORDER`) is a word of its own.
+  Markup and whitespace never open or split a span, and the bytes of
+  one multi-byte character (the West key) lie inside one word. The
+  projection escapes `&`, `<` and `>`, so a literal bracket of the print
+  is text, never a tag. The decoder is lenient in one way: an `I-x`
+  that follows nothing, or follows a different class, opens a span
+  rather than being discarded. Back-to-back spans of one label come
+  back as one span, the way the model was shown them. A span crossing
+  inline formatting can still contain markup inside its `text`, which
+  is the original source substring.
+- **The disposition heal** (`heal.py`, `heal_disposition`) runs after
+  the decoder: two or more `disposition` spans inside one `<p>` become
+  one span over the block's inner text, and every other span inside
+  that block is dropped. A block with one disposition span, and a
+  `<blockquote>`, are left alone. `healed_blocks` counts the blocks it
+  joined.
+- `wordlevel.py` and `heal.py` are copies of the ai-research
+  `tagger_wordlevel` modules the weights were scored with; they are
+  kept as written there (the formatter skips them), and a new copy
+  comes with the checkpoint it was scored with.
 - `token_count` counts the original tokenization, including special
   tokens; it does not double-count overlap. `window_count` reports the
   number of model windows for that case (illustrative above; the exact
@@ -281,8 +302,15 @@ PATCHes the RunPod template to the SHA-pinned tag.
 Repo secrets used: `RUNPOD_API_KEY` (shared) and
 `RUNPOD_CASELAW_TAGGER_TEMPLATE_ID` (this endpoint's backing template).
 
-A new checkpoint is a rebuild, not an input change: `TAGGER_MODEL` is a
-build arg, and the image is offline at run time.
+A new checkpoint is a rebuild, not an input change: `TAGGER_MODEL` and
+`TAGGER_MODEL_REVISION` are build args (the snapshot is pinned to one
+commit, so a push to the Hugging Face repository changes no build), and
+the image is offline at run time. The bake and the handler both refuse
+a snapshot whose `label_maps.json` does not say `word_level: true`. The
+portal names the weights it expects (`tagger.MODEL`, the same
+`repo@revision` the payload reports) and places no spans of other
+weights, so a new checkpoint is the two build args, a `tagger.MODEL`
+bump and `retag_opinions --all`.
 
 ## Updating Python deps
 
