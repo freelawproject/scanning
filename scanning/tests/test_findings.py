@@ -1142,6 +1142,61 @@ class TestRebuildTouch(ScanningTestCase):
         self.assertNotEqual(after, brackets)
         self.assertFalse([q for q in sqls if "'KEY_ICON'" in q])
 
+    def _reading(self, scan, page):
+        from scanning.models import BracketReading
+
+        return BracketReading.objects.create(
+            scan=scan,
+            apply_run=None,
+            page_index=page,
+            x0=100.0,
+            y0=300.0,
+            x1=700.0,
+            y1=340.0,
+            img_width=1700,
+            img_height=2200,
+            numbers=[1],
+            raw="[1]",
+        )
+
+    def test_a_column_write_on_a_page_with_a_reading_rebuilds_the_bracket_cards(
+        self,
+    ):
+        """The readings are placed in their opinions by the column
+        boundary of their page, so a column box there can move one
+        across an opinion's start."""
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        structure = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self._rebuild(scan, {7}, {"TEXT_COLUMN"})
+        after = self._cards(scan, findings.BRACKET_CHECKS)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in before})
+        self.assertNotEqual(after, before)
+        # Page 7 is far from every key: the key cards stand.
+        self.assertEqual(
+            self._cards(scan, findings.STRUCTURE_CHECKS), structure
+        )
+
+    def test_a_column_write_on_an_opinion_start_rebuilds_the_bracket_cards(
+        self,
+    ):
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        # Page 0 holds the caption the standing opinion starts at.
+        self._rebuild(scan, {0}, {"TEXT_COLUMN"})
+        self.assertNotEqual(self._cards(scan, findings.BRACKET_CHECKS), before)
+
+    def test_a_column_write_on_another_page_keeps_the_bracket_cards(self):
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        # Page 6: no reading, no opinion start, and no key beside it.
+        sqls = self._rebuild(scan, {6}, {"TEXT_COLUMN"})
+        self.assertEqual(self._cards(scan, findings.BRACKET_CHECKS), before)
+        self.assertFalse([q for q in sqls if "'HEADNOTE_BRACKET'" in q])
+
     def test_a_page_write_of_unknown_touch_runs_every_pass(self):
         scan, _ = self._volume()
         before = self._cards(scan, self.STRUCTURE)

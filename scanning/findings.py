@@ -79,6 +79,7 @@ from scanning.models import (
     REVIEW2_CHECKS,
     STALE_REVIEW2_CHECKS,
     ApplyRun,
+    BracketReading,
     CheckName,
     Detection,
     DetectionDecision,
@@ -203,8 +204,9 @@ NEAR_KEY_LABELS = (
 
 #: The checks that read the volume's bracket boxes: the readings the
 #: model missed, named across each opinion, and the model's boxes
-#: under the gate. A write of a bracket box runs them; no other write
-#: changes what they read.
+#: under the gate. A write of a bracket box runs them, and a column
+#: box on a page that holds a reading or an opinion's start
+#: (:func:`_bracketed`); no other write changes what they read.
 BRACKET_CHECKS = frozenset(
     {
         CheckName.MISSING_HEADNOTE_BRACKET,
@@ -275,11 +277,7 @@ def rebuild(
         if run is _RESOLVE:
             run = detections.measured_run(scan)
         structural = _structural(scan, scoped, labels)
-        bracketed = (
-            scoped is None
-            or labels is None
-            or bool(BRACKET_LABELS & set(labels))
-        )
+        bracketed = _bracketed(scan, scoped, labels, run)
         found = list(_stale_findings(scan, run))
         if OpinionBoundary.objects.computed().filter(scan=scan).exists():
             rows = boundaries.standing(scan) if structural or bracketed else []
@@ -382,6 +380,53 @@ def _structural(
         Detection.objects.live()
         .filter(scan=scan, label="KEY_ICON", page_index__in=list(near))
         .exists()
+    )
+
+
+def _bracketed(
+    scan: Scan,
+    pages: set[int] | None,
+    labels: Collection[str] | None,
+    run: ApplyRun | None,
+) -> bool:
+    """Return whether a write can change a :data:`BRACKET_CHECKS` card.
+
+    A rebuild of the volume or of unknown touch can. A page write can
+    when it touched a bracket box (:data:`BRACKET_LABELS`), or a
+    column box on a page that holds a bracket reading of the measured
+    run or the start of a standing opinion: ``brackets.missing``
+    places each reading in its opinion by the column boundary of its
+    page and of every opinion's start page
+    (``brackets._ordered_opinions``, ``boundaries.column_boundaries``),
+    so a column box drawn or moved there can carry a reading across an
+    opinion's start, and the numbers an opinion names with it.
+
+    :param scan: The scan.
+    :param pages: The page indexes the write touched, or None.
+    :param labels: The labels the write touched, or None.
+    :param run: The apply run the readings are measured against.
+    :returns: Whether the bracket passes run.
+    :rtype: bool
+    """
+    if pages is None or labels is None:
+        return True
+    touched = set(labels)
+    if touched & BRACKET_LABELS:
+        return True
+    if "TEXT_COLUMN" not in touched:
+        return False
+    if (
+        BracketReading.objects.filter(
+            scan=scan, apply_run=run, page_index__in=list(pages)
+        )
+        .order_by()
+        .exists()
+    ):
+        return True
+    return any(
+        row.start_page_index in pages
+        for row in boundaries.standing(scan)
+        if not row.is_dismissed
     )
 
 
