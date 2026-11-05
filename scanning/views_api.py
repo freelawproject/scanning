@@ -55,22 +55,31 @@ from scanning.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _rebuild_findings(scan: Scan, pages: set[int] | None = None) -> None:
+def _rebuild_findings(
+    scan: Scan,
+    pages: set[int] | None = None,
+    labels: frozenset[str] | set[str] | None = None,
+) -> None:
     """Write the review-2 findings again after a curator's write (#240 PR D).
 
     Every finding is derived from the detection, boundary and redaction
     rows, so the endpoint that changed a row is what keeps the cards
-    true. A write that names a page passes it, and the page passes run
-    over that page alone (``findings.PAGE_CHECKS``); a boundary write
-    passes nothing, because the boundaries cross pages.
+    true. A write that names a page passes it and the labels of the
+    boxes it touched, and the page passes run over that page alone
+    (``findings.PAGE_CHECKS``) while the volume's key and bracket
+    passes run only for a label they read (``findings._structural``,
+    ``findings.BRACKET_LABELS``); a boundary write passes nothing,
+    because the boundaries cross pages.
 
     :param scan: The scan.
     :param pages: The page indexes the write touched, or None.
+    :param labels: The labels of the boxes the write wrote or
+        dismissed; an empty set for a redaction that dismissed none.
     :return: None.
     """
     from scanning import findings
 
-    findings.rebuild(scan, pages=pages)
+    findings.rebuild(scan, pages=pages, labels=labels)
 
 
 #: The 409 of every write of review 2 before that review is open
@@ -205,28 +214,36 @@ DISMISSED_UNDER_WHITEOUT_MESSAGE = (
 )
 
 
-def _dismissed_under(scan: Scan, row, user) -> tuple[list[int], str]:
+def _dismissed_under(
+    scan: Scan, row, user
+) -> tuple[list[int], frozenset[str], str]:
     """Dismiss the model boxes a whiteout covers, for the two writers.
 
     :param scan: The scan.
     :param row: The whiteout as written.
     :param user: The curator.
-    :returns: The ids dismissed, and the line to append to the answer
-        (empty when nothing was).
-    :rtype: tuple[list[int], str]
+    :returns: The ids dismissed, their labels (what the rebuild is
+        told the write touched: a whiteout over a key icon changes the
+        key cards), and the line to append to the answer (empty when
+        nothing was).
+    :rtype: tuple[list[int], frozenset[str], str]
     """
     from scanning import detections
 
-    dismissed = [
-        d.pk for d in detections.dismiss_under_whiteout(scan, row, user)
-    ]
+    rows = detections.dismiss_under_whiteout(scan, row, user)
+    dismissed = [d.pk for d in rows]
+    labels = frozenset(d.label for d in rows)
     if not dismissed:
-        return [], ""
+        return [], labels, ""
     count = len(dismissed)
-    return dismissed, DISMISSED_UNDER_WHITEOUT_MESSAGE.format(
-        count=count,
-        plural="" if count == 1 else "es",
-        verb="was" if count == 1 else "were",
+    return (
+        dismissed,
+        labels,
+        DISMISSED_UNDER_WHITEOUT_MESSAGE.format(
+            count=count,
+            plural="" if count == 1 else "es",
+            verb="was" if count == 1 else "were",
+        ),
     )
 
 
@@ -1017,8 +1034,8 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
         row = redactions.add(scan, page_index, bbox, fill, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
-    dismissed, note = _dismissed_under(scan, row, request.user)
-    _rebuild_findings(scan, {row.page_index})
+    dismissed, labels, note = _dismissed_under(scan, row, request.user)
+    _rebuild_findings(scan, {row.page_index}, labels)
     return JsonResponse(
         {
             "status": "ok",
@@ -1070,8 +1087,8 @@ def move_redaction(
     # A whiteout pulled over model boxes dismisses them, one decision
     # each, so a bleed-through page is one drag and not a drag plus a
     # click on every box it covers.
-    dismissed, note = _dismissed_under(scan, holder, request.user)
-    _rebuild_findings(scan, {row.page_index, holder.page_index})
+    dismissed, labels, note = _dismissed_under(scan, holder, request.user)
+    _rebuild_findings(scan, {row.page_index, holder.page_index}, labels)
     return JsonResponse(
         {
             "status": "ok",
@@ -1110,7 +1127,7 @@ def dismiss_redaction(
         return _redaction_error("Redaction not found", 404)
     human = row.origin == Redaction.Origin.HUMAN
     redactions.dismiss(scan, row, request.user)
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, frozenset())
     return JsonResponse(
         {
             "status": "ok",
@@ -1144,7 +1161,7 @@ def restore_redaction(
     if row is None:
         return _redaction_error("Redaction not found", 404)
     restored = redactions.restore(scan, row, request.user)
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, frozenset())
     return JsonResponse(
         {
             "status": "ok",
@@ -2949,7 +2966,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -3022,7 +3039,7 @@ def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
             restored = detections.withdraw(
                 DetectionDecision.objects.filter(pk=decision.pk), request.user
             )
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -3080,7 +3097,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -3201,7 +3218,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 holder = detections.approve_model_row(scan, near, request.user)
             except detections.UnaddressableDetection:
                 return _unaddressable()
-        _rebuild_findings(scan, {near.page_index})
+        _rebuild_findings(scan, {near.page_index}, {near.label})
         return JsonResponse(
             {
                 "status": "ok",
@@ -3225,7 +3242,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         )
     except detections.UnaddressableDetection:
         return _unaddressable()
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -3297,7 +3314,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             holder = detections.approve_model_row(scan, row, request.user)
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan, {row.page_index})
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",

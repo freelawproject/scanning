@@ -1314,7 +1314,9 @@ class TestTheWritesPassTheirPage(ScanningTestCase):
                 content_type="application/json",
             )
         self.assertEqual(response.status_code, 200, response.content)
-        rebuild.assert_called_once_with(self.scan, pages={2})
+        rebuild.assert_called_once_with(
+            self.scan, pages={2}, labels={"TEXT_COLUMN"}
+        )
 
     def test_a_dismissed_boundary_rebuilds_the_volume(self):
         caption = make_detection(self.scan, "CASE_CAPTION", page_index=0)
@@ -1327,4 +1329,4 @@ class TestTheWritesPassTheirPage(ScanningTestCase):
                 content_type="application/json",
             )
         self.assertEqual(response.status_code, 200, response.content)
-        rebuild.assert_called_once_with(self.scan, pages=None)
+        rebuild.assert_called_once_with(self.scan, pages=None, labels=None)
