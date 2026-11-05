@@ -79,6 +79,7 @@ from scanning.models import (
     REVIEW2_CHECKS,
     STALE_REVIEW2_CHECKS,
     ApplyRun,
+    BracketReading,
     CheckName,
     Detection,
     DetectionDecision,
@@ -170,6 +171,52 @@ PAGE_CHECKS = frozenset(
     }
 )
 
+#: The checks that read the opinion structure: the volume's key icons
+#: and captions against the standing boundaries, and the pages no
+#: boundary covers. A write of a page runs them only when it can
+#: change them (:func:`_structural`); otherwise their cards stand,
+#: because the keys are read for the whole volume (each key's verdict
+#: reads the others), and that read on every click was the lock queue
+#: of 2026-11-05.
+STRUCTURE_CHECKS = frozenset(
+    {
+        CheckName.UNMATCHED_KEY_ICON,
+        CheckName.UNMATCHED_CAPTION,
+        CheckName.MISSING_CAPTION,
+        CheckName.UNCOVERED_PAGES,
+    }
+)
+
+#: The labels whose write changes a structure card wherever it lands:
+#: a key icon is the check's subject, and a caption no boundary names
+#: is its own card.
+STRUCTURE_LABELS = frozenset({"KEY_ICON", "CASE_CAPTION"})
+
+#: The labels whose write changes a structure card only beside a key:
+#: the caption guess and the drawn-caption test read the column,
+#: sequence and head-matter boxes of the key's page and its
+#: neighbours, and the show-through rule the key's own page's column
+#: boxes. A write of one of these a page or more from every key
+#: changes nothing those passes read.
+NEAR_KEY_LABELS = (
+    frozenset({"TEXT_COLUMN", "CASE_SEQUENCE"}) | HEAD_MATTER_NAMES
+)
+
+#: The checks that read the volume's bracket boxes: the readings the
+#: model missed, named across each opinion, and the model's boxes
+#: under the gate. A write of a bracket box runs them, and a column
+#: box on a page that holds a reading or an opinion's start
+#: (:func:`_bracketed`); no other write changes what they read.
+BRACKET_CHECKS = frozenset(
+    {
+        CheckName.MISSING_HEADNOTE_BRACKET,
+        CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+    }
+)
+
+#: The labels whose write runs :data:`BRACKET_CHECKS`.
+BRACKET_LABELS = frozenset({"HEADNOTE_BRACKET"})
+
 #: The advisory-lock namespace of :func:`rebuild`'s per-volume lock,
 #: keyed by the scan's pk. Apart from ``locks.NAMESPACE`` (session locks
 #: keyed by a name's hash) so a pk can never collide with a name.
@@ -180,6 +227,7 @@ def rebuild(
     scan: Scan,
     run: ApplyRun | None | object = _RESOLVE,
     pages: Collection[int] | None = None,
+    labels: Collection[str] | None = None,
 ) -> int:
     """Write the scan's review-2 findings again, from the rows.
 
@@ -190,10 +238,15 @@ def rebuild(
     write (which passes nothing for the run).
 
     With ``pages``, the passes of :data:`PAGE_CHECKS` run over those
-    pages alone and only their cards of those pages are replaced; the
-    cards of the other checks are written whole as ever. A write that
-    names a page (a box, a redaction, a decision) passes its page; a
-    boundary write, the compute and the commands pass nothing.
+    pages alone and only their cards of those pages are replaced. With
+    ``labels`` beside it, the passes of :data:`STRUCTURE_CHECKS` and
+    :data:`BRACKET_CHECKS` run only when a label the write touched is
+    one they read (:func:`_structural`, :data:`BRACKET_LABELS`), and
+    otherwise their cards stand; the stale checks run every time, over
+    the few human rows. A write that names a page (a box, a redaction,
+    a decision) passes its page and the labels of the boxes it wrote
+    or dismissed (none for a redaction); a boundary write, the compute
+    and the commands pass nothing, and every pass runs over the volume.
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None
@@ -201,6 +254,8 @@ def rebuild(
         omitted.
     :param pages: The page indexes (0-based, in the rows' space) a
         write touched, or None for the whole volume.
+    :param labels: The detection labels the write touched, or None
+        when unknown, which runs every pass.
     :returns: How many findings stand open (not dismissed).
     """
     scoped = None if pages is None else set(pages)
@@ -221,15 +276,19 @@ def rebuild(
             )
         if run is _RESOLVE:
             run = detections.measured_run(scan)
+        structural = _structural(scan, scoped, labels)
+        bracketed = _bracketed(scan, scoped, labels, run)
         found = list(_stale_findings(scan, run))
         if OpinionBoundary.objects.computed().filter(scan=scan).exists():
-            rows = boundaries.standing(scan)
-            read = read_ids(scan, scoped)
-            found.extend(_unmatched_findings(scan, rows, read))
-            found.extend(_uncovered_pages_findings(scan, rows, run))
+            rows = boundaries.standing(scan) if structural or bracketed else []
+            read = read_ids(scan, scoped, keys=structural)
+            if structural:
+                found.extend(_unmatched_findings(scan, rows, read))
+                found.extend(_uncovered_pages_findings(scan, rows, run))
             found.extend(_uncovered_headnote_findings(scan, read, scoped))
-            found.extend(_low_confidence_bracket_findings(scan))
-            found.extend(brackets.missing(scan, rows, run))
+            if bracketed:
+                found.extend(_low_confidence_bracket_findings(scan))
+                found.extend(brackets.missing(scan, rows, run))
             found.extend(editorial.uncovered(scan, run, scoped))
             found.extend(undetected.uncovered(scan, run, scoped))
             found.extend(undetected.cut_lines(scan, run, scoped))
@@ -237,11 +296,19 @@ def rebuild(
         resolve(scan, found)
         stale = Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS)
         if scoped is not None:
-            # The page cards of the other pages stand: their rows did
-            # not move, and their passes did not run.
+            # The cards of a pass that did not run stand, and the page
+            # cards of the other pages: their rows did not move.
+            whole = set(STALE_REVIEW2_CHECKS)
+            if structural:
+                whole |= STRUCTURE_CHECKS
+            if bracketed:
+                whole |= BRACKET_CHECKS
             stale = stale.filter(
-                Q(check_name__in=REVIEW2_CHECKS - PAGE_CHECKS)
-                | Q(page_number__in=[index + 1 for index in scoped])
+                Q(check_name__in=whole)
+                | Q(
+                    check_name__in=PAGE_CHECKS,
+                    page_number__in=[index + 1 for index in scoped],
+                )
             )
         stale.delete()
         Issue.objects.bulk_create(
@@ -270,11 +337,97 @@ def rebuild(
         "scan %s: %d review-2 finding(s) written%s, %d open, %d stale",
         scan.pk,
         len(found),
-        "" if scoped is None else f" ({len(scoped)} page(s) rebuilt)",
+        ""
+        if scoped is None
+        else (
+            f" ({len(scoped)} page(s) rebuilt"
+            f"{'' if structural else ', structure kept'}"
+            f"{'' if bracketed else ', brackets kept'})"
+        ),
         open_count,
         sum(1 for f in found if f["check_name"] in STALE_REVIEW2_CHECKS),
     )
     return open_count
+
+
+def _structural(
+    scan: Scan, pages: set[int] | None, labels: Collection[str] | None
+) -> bool:
+    """Return whether a write can change a :data:`STRUCTURE_CHECKS` card.
+
+    A rebuild of the volume (no pages) or of unknown touch (no labels)
+    can. A page write can when it touched a :data:`STRUCTURE_LABELS`
+    box, or a :data:`NEAR_KEY_LABELS` box on a page beside a live key
+    icon, read with one query over the key label. Any other write (a
+    redaction, a footnote box, a headnote far from every key) leaves
+    every row those passes read as it was.
+
+    :param scan: The scan.
+    :param pages: The page indexes the write touched, or None.
+    :param labels: The labels the write touched, or None.
+    :returns: Whether the structure passes run.
+    :rtype: bool
+    """
+    if pages is None or labels is None:
+        return True
+    touched = set(labels)
+    if touched & STRUCTURE_LABELS:
+        return True
+    if not touched & NEAR_KEY_LABELS:
+        return False
+    near = {page + step for page in pages for step in (-1, 0, 1)}
+    return (
+        Detection.objects.live()
+        .filter(scan=scan, label="KEY_ICON", page_index__in=list(near))
+        .exists()
+    )
+
+
+def _bracketed(
+    scan: Scan,
+    pages: set[int] | None,
+    labels: Collection[str] | None,
+    run: ApplyRun | None,
+) -> bool:
+    """Return whether a write can change a :data:`BRACKET_CHECKS` card.
+
+    A rebuild of the volume or of unknown touch can. A page write can
+    when it touched a bracket box (:data:`BRACKET_LABELS`), or a
+    column box on a page that holds a bracket reading of the measured
+    run or the start of a standing opinion: ``brackets.missing``
+    places each reading in its opinion by the column boundary of its
+    page and of every opinion's start page
+    (``brackets._ordered_opinions``, ``boundaries.column_boundaries``),
+    so a column box drawn or moved there can carry a reading across an
+    opinion's start, and the numbers an opinion names with it.
+
+    :param scan: The scan.
+    :param pages: The page indexes the write touched, or None.
+    :param labels: The labels the write touched, or None.
+    :param run: The apply run the readings are measured against.
+    :returns: Whether the bracket passes run.
+    :rtype: bool
+    """
+    if pages is None or labels is None:
+        return True
+    touched = set(labels)
+    if touched & BRACKET_LABELS:
+        return True
+    if "TEXT_COLUMN" not in touched:
+        return False
+    if (
+        BracketReading.objects.filter(
+            scan=scan, apply_run=run, page_index__in=list(pages)
+        )
+        .order_by()
+        .exists()
+    ):
+        return True
+    return any(
+        row.start_page_index in pages
+        for row in boundaries.standing(scan)
+        if not row.is_dismissed
+    )
 
 
 def _fingerprint_stale(row, scan: Scan) -> bool:
@@ -484,7 +637,9 @@ def _caption_is_continuation(
     return False
 
 
-def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
+def read_ids(
+    scan: Scan, pages: Collection[int] | None = None, keys: bool = True
+) -> set[int]:
     """Return the ids of the live key icons and headnotes the compute read.
 
     ``services.detection_entries`` is the one list the compute pairs
@@ -516,10 +671,17 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     stay on disk: the volume's, two a page, were a read of the whole
     volume on every click (2026-11-05).
 
+    With ``keys`` false, the headnotes of ``pages`` alone are read and
+    judged: a headnote's verdict is the edge bands' and reads no key
+    and no column, so a write that cannot change the key cards
+    (:func:`_structural`) asks about its page's headnotes and loads
+    nothing of the volume.
+
     :param scan: The scan.
     :param pages: The page indexes whose headnotes are wanted, or None
         for every page. The key icons are always the volume's, because
         each one's verdict reads the others.
+    :param keys: Whether the key icons are read at all.
     :returns: The ``Detection`` pks the compute read, of those labels.
     :rtype: set[int]
     """
@@ -528,7 +690,7 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     # No ``order_by``: the rows are sorted here, once, over the three
     # reads together.
     live = Detection.objects.live().filter(scan=scan).order_by()
-    keys = list(live.filter(label="KEY_ICON"))
+    key_rows = list(live.filter(label="KEY_ICON")) if keys else []
     headnotes = live.filter(label="HEADNOTE")
     if pages is not None:
         headnotes = headnotes.filter(page_index__in=list(pages))
@@ -541,14 +703,14 @@ def read_ids(scan: Scan, pages: Collection[int] | None = None) -> set[int]:
     # 2026-11-05). The saving is the rows not fetched: it is largest in
     # a volume whose keys sit on few of its pages, and a volume of
     # orders, a key on most pages, still reads most of its columns.
-    key_pages = {row.page_index for row in keys}
+    key_pages = {row.page_index for row in key_rows}
     columns = (
         live.filter(label="TEXT_COLUMN", page_index__in=list(key_pages))
         if key_pages
         else live.none()
     )
     rows = sorted(
-        [*keys, *headnotes, *columns],
+        [*key_rows, *headnotes, *columns],
         key=lambda row: (row.page_index, row.y0, row.x0, row.pk),
     )
     entries = [detection_entry(row, {}) for row in rows]

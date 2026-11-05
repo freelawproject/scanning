@@ -22,6 +22,7 @@ from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import (
     BUSY_STATUSES,
     REVIEW2_CHECKS,
+    STALE_REVIEW2_CHECKS,
     ApplyRun,
     CheckName,
     Detection,
@@ -1001,6 +1002,210 @@ class TestRebuild(ScanningTestCase):
         self.assertNotIn(CheckName.UNMATCHED_KEY_ICON, checks_of(scan))
 
 
+class TestRebuildTouch(ScanningTestCase):
+    """A page write runs the volume's key and bracket passes only when it
+    touched a label they read; otherwise their cards stand, and the
+    click reads nothing of the volume but the human rows."""
+
+    STRUCTURE = findings.STRUCTURE_CHECKS | findings.BRACKET_CHECKS
+
+    def _volume(self):
+        scan = make_scan(page_count=8, end_page=8)
+        caption = make_detection(scan, "CASE_CAPTION", 0)
+        key = make_detection(scan, "KEY_ICON", 1)
+        make_boundary(scan, caption, key)
+        # A second key no boundary names: an unmatched-key card.
+        loose = make_detection(scan, "KEY_ICON", 4, y0=600.0, y1=690.0)
+        make_detection(scan, "HEADNOTE", 4, confidence=0.95)
+        # A bracket under the gate: a low-confidence bracket card.
+        make_detection(scan, "HEADNOTE_BRACKET", 4, confidence=0.25)
+        findings.rebuild(scan)
+        self.assertEqual(
+            checks_of(scan),
+            sorted(
+                [
+                    CheckName.UNMATCHED_KEY_ICON,
+                    CheckName.UNCOVERED_PAGES,
+                    CheckName.UNCOVERED_HEADNOTE,
+                    CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
+                ]
+            ),
+        )
+        return scan, loose
+
+    def _cards(self, scan, checks):
+        return {
+            (r.check_name, r.pk)
+            for r in scan.issues.filter(check_name__in=checks)
+        }
+
+    def _rebuild(self, scan, pages, labels):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as captured:
+            findings.rebuild(scan, pages=pages, labels=labels)
+        return [q["sql"] for q in captured]
+
+    def test_the_four_groups_partition_the_checks_of_review_2(self):
+        groups = [
+            STALE_REVIEW2_CHECKS,
+            findings.STRUCTURE_CHECKS,
+            findings.BRACKET_CHECKS,
+            findings.PAGE_CHECKS,
+        ]
+        self.assertEqual(frozenset().union(*groups), REVIEW2_CHECKS)
+        self.assertEqual(sum(len(g) for g in groups), len(REVIEW2_CHECKS))
+
+    def test_a_write_of_another_label_keeps_the_volume_cards_and_reads_no_key(
+        self,
+    ):
+        scan, _ = self._volume()
+        before = self._cards(scan, self.STRUCTURE)
+        headnote = self._cards(scan, {CheckName.UNCOVERED_HEADNOTE})
+        sqls = self._rebuild(scan, {4}, {"FOOTNOTES"})
+        self.assertEqual(self._cards(scan, self.STRUCTURE), before)
+        # The page passes ran: the page's headnote card is written anew.
+        after = self._cards(scan, {CheckName.UNCOVERED_HEADNOTE})
+        self.assertEqual(len(after), 1)
+        self.assertNotEqual(after, headnote)
+        self.assertFalse([q for q in sqls if "'KEY_ICON'" in q])
+        self.assertFalse([q for q in sqls if "'HEADNOTE_BRACKET'" in q])
+        self.assertFalse([q for q in sqls if "scanning_bracketreading" in q])
+
+    def test_a_redaction_write_passes_no_label_and_keeps_them_too(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, self.STRUCTURE)
+        sqls = self._rebuild(scan, {4}, frozenset())
+        self.assertEqual(self._cards(scan, self.STRUCTURE), before)
+        self.assertFalse([q for q in sqls if "'KEY_ICON'" in q])
+
+    def test_a_key_write_rebuilds_the_key_cards(self):
+        scan, loose = self._volume()
+        Detection.objects.filter(pk=loose.pk).update(active=False)
+        self._rebuild(scan, {4}, {"KEY_ICON"})
+        self.assertNotIn(CheckName.UNMATCHED_KEY_ICON, checks_of(scan))
+
+    def test_a_caption_write_anywhere_rebuilds_the_key_cards(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, findings.STRUCTURE_CHECKS)
+        sqls = self._rebuild(scan, {7}, {"CASE_CAPTION"})
+        after = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in before})
+        self.assertNotEqual(after, before)
+        keys = [q for q in sqls if "'KEY_ICON'" in q]
+        self.assertTrue(keys)
+
+    def test_a_column_write_far_from_every_key_keeps_the_key_cards(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, findings.STRUCTURE_CHECKS)
+        sqls = self._rebuild(scan, {7}, {"TEXT_COLUMN"})
+        self.assertEqual(self._cards(scan, findings.STRUCTURE_CHECKS), before)
+        # One EXISTS over the key label beside the page, and no read.
+        keys = [q for q in sqls if "'KEY_ICON'" in q]
+        self.assertEqual(len(keys), 1)
+        self.assertIn('"page_index" IN', keys[0])
+        for page in (6, 7, 8):
+            self.assertIn(str(page), keys[0])
+
+    def test_a_column_write_beside_a_key_rebuilds_the_key_cards(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, findings.STRUCTURE_CHECKS)
+        # Page 5 is beside the loose key on page 4.
+        self._rebuild(scan, {5}, {"TEXT_COLUMN"})
+        after = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in before})
+        self.assertNotEqual(after, before)
+
+    def test_a_head_matter_write_beside_a_key_rebuilds_the_key_cards(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self._rebuild(scan, {3}, {"HEADNOTE"})
+        self.assertNotEqual(
+            self._cards(scan, findings.STRUCTURE_CHECKS), before
+        )
+        # And a headnote far from every key leaves them.
+        before = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self._rebuild(scan, {7}, {"HEADNOTE"})
+        self.assertEqual(self._cards(scan, findings.STRUCTURE_CHECKS), before)
+
+    def test_a_bracket_write_rebuilds_the_bracket_cards_alone(self):
+        scan, _ = self._volume()
+        structure = self._cards(scan, findings.STRUCTURE_CHECKS)
+        brackets = self._cards(scan, findings.BRACKET_CHECKS)
+        sqls = self._rebuild(scan, {7}, {"HEADNOTE_BRACKET"})
+        self.assertEqual(
+            self._cards(scan, findings.STRUCTURE_CHECKS), structure
+        )
+        after = self._cards(scan, findings.BRACKET_CHECKS)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in brackets})
+        self.assertNotEqual(after, brackets)
+        self.assertFalse([q for q in sqls if "'KEY_ICON'" in q])
+
+    def _reading(self, scan, page):
+        from scanning.models import BracketReading
+
+        return BracketReading.objects.create(
+            scan=scan,
+            apply_run=None,
+            page_index=page,
+            x0=100.0,
+            y0=300.0,
+            x1=700.0,
+            y1=340.0,
+            img_width=1700,
+            img_height=2200,
+            numbers=[1],
+            raw="[1]",
+        )
+
+    def test_a_column_write_on_a_page_with_a_reading_rebuilds_the_bracket_cards(
+        self,
+    ):
+        """The readings are placed in their opinions by the column
+        boundary of their page, so a column box there can move one
+        across an opinion's start."""
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        structure = self._cards(scan, findings.STRUCTURE_CHECKS)
+        self._rebuild(scan, {7}, {"TEXT_COLUMN"})
+        after = self._cards(scan, findings.BRACKET_CHECKS)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in before})
+        self.assertNotEqual(after, before)
+        # Page 7 is far from every key: the key cards stand.
+        self.assertEqual(
+            self._cards(scan, findings.STRUCTURE_CHECKS), structure
+        )
+
+    def test_a_column_write_on_an_opinion_start_rebuilds_the_bracket_cards(
+        self,
+    ):
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        # Page 0 holds the caption the standing opinion starts at.
+        self._rebuild(scan, {0}, {"TEXT_COLUMN"})
+        self.assertNotEqual(self._cards(scan, findings.BRACKET_CHECKS), before)
+
+    def test_a_column_write_on_another_page_keeps_the_bracket_cards(self):
+        scan, _ = self._volume()
+        self._reading(scan, 7)
+        before = self._cards(scan, findings.BRACKET_CHECKS)
+        # Page 6: no reading, no opinion start, and no key beside it.
+        sqls = self._rebuild(scan, {6}, {"TEXT_COLUMN"})
+        self.assertEqual(self._cards(scan, findings.BRACKET_CHECKS), before)
+        self.assertFalse([q for q in sqls if "'HEADNOTE_BRACKET'" in q])
+
+    def test_a_page_write_of_unknown_touch_runs_every_pass(self):
+        scan, _ = self._volume()
+        before = self._cards(scan, self.STRUCTURE)
+        self._rebuild(scan, {7}, None)
+        after = self._cards(scan, self.STRUCTURE)
+        self.assertEqual({c for c, _ in after}, {c for c, _ in before})
+        self.assertNotEqual(after, before)
+
+
 class TestStaleFindings(ScanningTestCase):
     """A curator's row the compute could not land or place."""
 
@@ -1355,6 +1560,57 @@ class TestFindingEndpoints(ScanningTestCase):
             reverse(name, kwargs={"pk": self.scan.pk}),
             data=json.dumps(body),
             content_type="application/json",
+        )
+
+    def test_a_box_write_tells_the_rebuild_its_page_and_its_label(self):
+        """The view is what knows what it wrote: the rebuild reads the
+        label to decide whether the volume's key passes run."""
+        from unittest.mock import patch
+
+        row = make_detection(
+            self.scan,
+            "FOOTNOTES",
+            2,
+            model_name=Detection.ModelName.MANUAL,
+            found_by=[],
+        )
+        with patch("scanning.findings.rebuild") as rebuild:
+            response = self._post(
+                "update_detection",
+                {"detection_id": row.pk, "new_bbox": [10, 10, 200, 300]},
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(
+            self.scan, pages={2}, labels={"FOOTNOTES"}
+        )
+
+    def test_a_whiteout_tells_the_rebuild_the_labels_it_dismissed(self):
+        """A redaction touches no label of its own, but a whiteout pulled
+        over a model key icon dismisses it, and the key cards must be
+        read again."""
+        from unittest.mock import patch
+
+        with (
+            patch("scanning.findings.rebuild") as rebuild,
+            patch(
+                "scanning.views_api._dismissed_under",
+                return_value=([7], frozenset({"KEY_ICON"}), ""),
+            ),
+        ):
+            response = self._post(
+                "add_redaction",
+                {
+                    "page_index": 2,
+                    "x0": 10,
+                    "y0": 10,
+                    "x1": 200,
+                    "y1": 300,
+                    "fill": "white",
+                },
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(
+            self.scan, pages={2}, labels=frozenset({"KEY_ICON"})
         )
 
     def test_dismiss_and_restore(self):

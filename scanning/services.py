@@ -2378,6 +2378,20 @@ def run_compute_redactions(
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
+        # The rows the compute wrote before it failed are the rows the
+        # next click reads, and a click's rebuild keeps the volume
+        # cards it does not recompute (``findings.rebuild``): write
+        # every card from the rows as they stand, so no card of an
+        # older row set outlives them. Best effort, the failure itself
+        # is logged above.
+        try:
+            findings.rebuild(scan, run=run if merged else None)
+        except Exception:
+            logger.exception(
+                "compute_redactions: scan %s: the findings were not "
+                "rebuilt after the failure",
+                scan_pk,
+            )
         _park_after_redactions(scan_pk, unapproved(message), park())
         return
 
