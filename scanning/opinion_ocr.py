@@ -153,6 +153,7 @@ from scanning import (
     redactions,
     review_states,
     s3_sync,
+    shared_footnotes,
     surya,
     yolo,
 )
@@ -175,8 +176,10 @@ logger = logging.getLogger(__name__)
 #: beside the footnote zone (#411); 6 keeps a ``manual`` bracket box
 #: out of the verdict of the unit whose bracket token it deleted
 #: (#419); 7 takes the bullet of a list item off its text and marks
-#: every item with an ``li`` mark (#428); 8 gives a picture unit the
-#: ``figure`` kind (#463).
+#: every item with an ``li`` mark (#428); 8 names a unit the
+#: first-page footnote mask takes (:data:`NEIGHBOUR_FOOTNOTES`, #457)
+#: and the zones it takes (:data:`TAKEN_FOOTNOTES`), and gives a
+#: picture unit the ``figure`` kind (#463).
 SCHEMA_VERSION = 8
 
 #: The redaction types whose box can delete the bracket token of the
@@ -253,6 +256,13 @@ ZONES: dict[str, Zone] = {
         BLOCKQUOTE_LABEL, "blockquote_zones", "BLOCKQUOTE_MIN_CONFIDENCE"
     ),
 }
+
+#: The footnote zones of a page the first-page footnote mask takes
+#: (#457), under ``zones`` beside the zones of :data:`ZONES`, on a
+#: page where the mask took one. The
+#: footnote zone stays whole, because the section of a group reads it;
+#: the viewer draws a zone of the page's own notes alone.
+TAKEN_FOOTNOTES = "footnotes_taken"
 
 #: The verdict of a unit on the running head's line: the height of a
 #: ``PAGE_HEADER``, ``STATE_ABBREVIATION`` or ``PAGE_NUMBER`` detection
@@ -359,6 +369,12 @@ UNJUDGED = "unjudged"
 #: in the head or the foot band, and one of its lines ends in the
 #: approved number of its page. Taken whole, running head included.
 PAGE_NUMBER = "page_number"
+
+#: The verdict of a unit under the footnote mask of a first page the
+#: opinion before ends on (``boundaries.FOOTNOTES_MASK``, #457): a note
+#: of the earlier opinion. Its own reason, beside ``outside``, so the
+#: ensemble can write the ``SHARED_FOOTNOTES`` card from the drops.
+NEIGHBOUR_FOOTNOTES = "neighbour_footnotes"
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's: the field is
@@ -736,6 +752,8 @@ class ScanInputs:
         rows of every :data:`ZONES` label in the run (#399, #411), in
         render pixels. They become the page's zones in points once the
         page size is known.
+    :param shared_pages: ``boundaries.shared_first_pages`` over every
+        live boundary (#457), read once for the rows of the tick.
     """
 
     run: object
@@ -747,6 +765,7 @@ class ScanInputs:
     detected: dict[int, list] = field(default_factory=dict)
     printed: dict[int, str] = field(default_factory=dict)
     zones: dict[str, dict[int, list]] = field(default_factory=dict)
+    shared_pages: dict[int, float] = field(default_factory=dict)
     #: ``{page_index: [picture]}``, the curated pictures in render
     #: pixels (:func:`curated_pictures`), each with its own render size;
     #: :func:`pictures_pt` puts them in points once the page size is
@@ -839,6 +858,10 @@ def load_inputs(scan: Scan) -> ScanInputs:
         name = by_label.get(row.label)
         if name is not None and ZONES[name].counts(row):
             inputs.zones[name].setdefault(row.page_index, []).append(row)
+    # The shared first pages of every opinion (#457), once per scan and
+    # not once per row: the rule walks every live boundary.
+    live = boundaries.live(scan)
+    inputs.shared_pages = boundaries.shared_first_pages(scan, live, live)
     inputs.pictures = curated_pictures(inputs)
     return inputs
 
@@ -1504,7 +1527,8 @@ def verdict(
     """Return one unit's ``(exclusion, share)``.
 
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
-    names itself; else a neighbour's mask that does; else the printed
+    names itself; else a neighbour's mask that does, the footnote mask
+    of a shared first page under its own reason (#457); else the printed
     page number, when the unit sits in the head or the foot zone and
     one of its lines ends in the approved number of its page (#396).
     A cover below :data:`FULL_SHARE` on the page number's unit is the
@@ -1545,7 +1569,7 @@ def verdict(
     if on_head_line(box_pt, head_lines):
         return {"reason": RUNNING_HEAD}, 1.0
     red_share, hit = covered_share(box_pt, rects)
-    out_share, _ = covered_share(box_pt, masks)
+    out_share, mask = covered_share(box_pt, masks)
     share = max(red_share, out_share)
     page_number = is_page_number(box_pt, text, printed, height_pt, label)
     if page_number and share < FULL_SHARE:
@@ -1567,7 +1591,13 @@ def verdict(
             "fill": hit.get("fill") or "",
         }
     elif out_share >= EXCLUDE_SHARE:
-        exclusion = {"reason": "outside"}
+        exclusion = {
+            "reason": (
+                NEIGHBOUR_FOOTNOTES
+                if (mask or {}).get("kind") == boundaries.FOOTNOTES_MASK
+                else "outside"
+            )
+        }
     elif page_number:
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
@@ -1689,6 +1719,18 @@ def is_page_number(
     return page_numbers.carries_number(text, printed)
 
 
+def _taken(box: list[float], masks: list[dict]) -> bool:
+    """Return whether the footnote mask covers most of one zone (#457).
+
+    :param box: The zone, in points.
+    :param masks: The masks of the page, in points.
+    :returns: Whether a footnote mask covers :data:`FULL_SHARE` of it.
+    :rtype: bool
+    """
+    notes = [m for m in masks if m.get("kind") == boundaries.FOOTNOTES_MASK]
+    return covered_share(box, notes)[0] >= FULL_SHARE
+
+
 def kept_units(page: dict) -> list[dict]:
     """Return the units of a glued page that carry no exclusion.
 
@@ -1796,6 +1838,13 @@ def build_document(
                     inputs.zones.get(name, {}).get(page_index, []), size
                 )
                 counts[zone.count_key] += len(entry["zones"][name])
+            taken = [
+                box
+                for box in entry["zones"]["footnotes"]
+                if _taken(box, masks.get(page_index, []))
+            ]
+            if taken:
+                entry["zones"][TAKEN_FOOTNOTES] = taken
         if "error" in page:
             entry["error"] = page["error"]
             failed.append(page_index)
@@ -2034,9 +2083,15 @@ def write(opinion: Opinion, inputs: ScanInputs) -> list[str]:
             "review again"
         )
     masks: dict[int, list[dict]] = {}
-    for rect in boundaries.outside_rects(opinion.scan, [boundary]).get(
-        boundary.pk, []
-    ):
+    # A person who kept the first-page footnotes lifts their mask
+    # (#457); the PDF pass reads the same rule.
+    kept = {boundary.pk} if shared_footnotes.kept(opinion) else set()
+    for rect in boundaries.outside_rects(
+        opinion.scan,
+        [boundary],
+        kept_footnotes=kept,
+        shared=inputs.shared_pages,
+    ).get(boundary.pk, []):
         masks.setdefault(rect["page_index"], []).append(rect)
 
     written: dict[str, dict] = {}
