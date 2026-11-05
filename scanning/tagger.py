@@ -25,9 +25,9 @@ The pieces, in the shape of ``dots_mocr.py`` and ``yolo.py``:
 - :func:`ensure_tag_jobs` writes the input under the opinion's own
   prefix, addressed by the digest of its text, and creates **one** row
   at ``TAG``/``CASELAW_TAGGER``/``RUNPOD`` with ``opinion`` set,
-  through ``jobs.ensure_run_jobs``. The identity is the digest and
-  :data:`PROJECTION_VERSION`, so a second approval of the same text
-  reuses the paid run.
+  through ``jobs.ensure_run_jobs``. The identity is the digest,
+  :data:`PROJECTION_VERSION` and :data:`MODEL`, so a second approval of
+  the same text reuses the paid run, and new weights start a new one.
 - The daemon's submit wave presigns the input for a GET and the result
   key for a PUT and posts :func:`build_payload`; the poll, the
   deadlines, the retries and the cancel are the shared machinery.
@@ -37,8 +37,9 @@ The pieces, in the shape of ``dots_mocr.py`` and ``yolo.py``:
   result object is kept.
 
 Nothing enqueues this stage on a tick. The button of the review page
-(``views_api.start_caselaw_tagger``) is the one caller of
-:func:`ensure_tag_jobs`, pinned by ``TestKnownEnqueuePaths``.
+(``views_api.start_caselaw_tagger``) and the backlog command
+``retag_opinions`` are the callers of :func:`ensure_tag_jobs`, pinned
+by ``TestKnownEnqueuePaths``.
 """
 
 from __future__ import annotations
@@ -76,6 +77,18 @@ ENGINE = JobEngine.CASELAW_TAGGER
 #: approved body. Part of every row's identity, so a projection change
 #: starts a new run rather than reusing spans over another text.
 PROJECTION_VERSION = 2
+
+#: The weights the portal asks for, ``repo@revision``: the value the
+#: worker reports as ``model`` in every payload (#573). Part of every
+#: row's identity, so a change of the weights starts a new run and
+#: leaves the paid run behind, and the glue places no spans of other
+#: weights (:class:`WrongModel`). Bumped with the worker's
+#: ``TAGGER_MODEL``/``TAGGER_MODEL_REVISION`` build args, then
+#: ``retag_opinions --all`` tags the approved texts again.
+MODEL = (
+    "freelawproject/caselaw-block-tagger-wordlevel"
+    "@00a26dda233db0f77268019020f5ae96a221ba44"
+)
 
 #: The characters of tagger input one page allowance of the running-job
 #: deadline covers (``jobs.runpod_execution_deadline``). A page of a
@@ -115,6 +128,18 @@ class TextMoved(TaggerGlueError):
     A fact about the opinion, not a fault of the glue: a new approval
     wrote another text after the press. The row is consumed without a
     stamp, and the button offers the tag again.
+    """
+
+
+class WrongModel(TaggerGlueError):
+    """The result was written by weights other than the row's (#573).
+
+    An old worker image answered a row of new weights (the image and
+    the portal roll out in either order), so its spans are never placed
+    under the new identity. The row is written off (:func:`_reject`),
+    not consumed: a ``CONSUMED`` row of this identity would be carried
+    into the next run (``jobs._reusable_results``) and refused again,
+    while a dead run is replaced by the next press.
     """
 
 
@@ -335,6 +360,9 @@ def ensure_tag_jobs(
     identity = {
         "digest": digest,
         "projection": PROJECTION_VERSION,
+        # The weights (#573): a change starts a new run, and the glue
+        # refuses a result of other weights.
+        "model": MODEL,
         "chars": len(projection.text),
         "paragraphs": len(projection.paragraphs),
         # What the running-job deadline multiplies by
@@ -389,6 +417,21 @@ def is_written(opinion: Opinion) -> bool:
     )
 
 
+def is_current(opinion: Opinion) -> bool:
+    """Return whether the spans exist and the current weights wrote them.
+
+    :func:`is_written` is what the export reads: spans of older weights
+    still export (``casebody.repair_spans`` answers their cut words).
+    This is what the button and ``retag_opinions`` read (#573).
+
+    :param opinion: The row.
+    :returns: Whether :func:`is_written` holds and ``tag_model`` is
+        :data:`MODEL`.
+    :rtype: bool
+    """
+    return is_written(opinion) and opinion.tag_model == MODEL
+
+
 def _glue_attempts(row: ExternalJob) -> int:
     return int(
         ((row.provider_meta or {}).get("glue") or {}).get("attempts") or 0
@@ -399,13 +442,14 @@ def state(opinion: Opinion) -> str:
     """Return what the tagger has done with the approved text.
 
     :param opinion: The row.
-    :returns: :data:`DONE` when :func:`is_written`; :data:`RUNNING`
+    :returns: :data:`DONE` when :func:`is_current`; :data:`RUNNING`
         while the live row is open or waits for its glue; :data:`FAILED`
         when it is dead or its glue gave up; :data:`STALE` when a run
-        read an earlier approved text; :data:`NONE` before any run.
+        read an earlier approved text or ran older weights (#573);
+        :data:`NONE` before any run.
     :rtype: str
     """
-    if is_written(opinion):
+    if is_current(opinion):
         return DONE
     rows = live_tag_jobs(opinion)
     if not rows:
@@ -436,6 +480,8 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
     :returns: The key written.
     :rtype: str
     :raises TextMoved: If the approved text is not the text the run read.
+    :raises WrongModel: If the result names weights other than the
+        row's identity (#573).
     :raises TaggerGlueError: If the result or the approved text cannot
         be read, or the write fails.
     """
@@ -468,6 +514,14 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
     payload = jobs.check_result_envelope(
         opinion.scan, row, envelope, ACTION, TaggerGlueError
     )
+    model = payload.get("model")
+    # A row from before the weights joined the identity names none, and
+    # its result is placed as it always was.
+    if "model" in identity and model != identity["model"]:
+        raise WrongModel(
+            f"{opinion} run {row.run}: the result was written by "
+            f"{model!r}, the row asked for {identity['model']!r}"
+        )
     sequences = payload.get("sequences")
     if not isinstance(sequences, list) or len(sequences) != 1:
         raise TaggerGlueError(
@@ -507,7 +561,7 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
         "input_key": row.input_key,
         "digest": identity.get("digest"),
         "projection": identity.get("projection"),
-        "model": payload.get("model"),
+        "model": model,
         "max_tokens": payload.get("max_tokens"),
         # The spans in the offsets of the approved body: ``paragraph``
         # indexes ``body``, and ``start``/``end`` index its ``text``.
@@ -524,10 +578,14 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
     # New spans are new inputs of the export (#408): its fault count
     # starts again.
     Opinion.objects.filter(pk=opinion.pk).update(
-        tag_key=key, tagged_text_key=approved_key, final_xml_attempts=0
+        tag_key=key,
+        tagged_text_key=approved_key,
+        tag_model=model or "",
+        final_xml_attempts=0,
     )
     opinion.tag_key = key
     opinion.tagged_text_key = approved_key
+    opinion.tag_model = model or ""
     logger.info(
         "%s of scan %s: tagger run %d placed %d span(s) -> %s",
         opinion,
@@ -574,6 +632,28 @@ def _consume(row: ExternalJob) -> None:
     )
 
 
+#: The error code of a row whose result other weights wrote.
+WRONG_MODEL = "WRONG_MODEL"
+
+
+def _reject(row: ExternalJob, exc: WrongModel) -> None:
+    """Write off a row whose result other weights wrote (#573).
+
+    A compare-and-swap over the finished statuses, the only ones a glue
+    reads. The result object is kept, like every tagger result.
+    """
+    written = ExternalJob.objects.filter(
+        pk=row.pk, status__in=(JobStatus.COMPLETED, JobStatus.CONSUMED)
+    ).update(
+        status=JobStatus.FAILED,
+        error_code=WRONG_MODEL,
+        error_message=str(exc)[:2000],
+    )
+    if written:
+        row.status = JobStatus.FAILED
+    logger.warning("%s; the row is failed and the spans are not placed", exc)
+
+
 def place(opinion: Opinion, row: ExternalJob) -> str:
     """Place a finished row's spans now, in the request of a press.
 
@@ -590,12 +670,17 @@ def place(opinion: Opinion, row: ExternalJob) -> str:
     :returns: The key written.
     :rtype: str
     :raises TaggerGlueError: If the glue fails; :class:`TextMoved` when
-        the approved text moved, after the row is consumed.
+        the approved text moved, after the row is consumed;
+        :class:`WrongModel` when other weights wrote the result, after
+        the row is failed.
     """
     try:
         key = glue_run(opinion, row)
     except TextMoved:
         _consume(row)
+        raise
+    except WrongModel as exc:
+        _reject(row, exc)
         raise
     except TaggerGlueError as exc:
         if row.status == JobStatus.COMPLETED:
@@ -611,10 +696,11 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
     A row is ready when it is ``COMPLETED`` and is its opinion's live
     row; an older run's row is left alone. A row whose approved text
     moved (:class:`TextMoved`) is consumed without a stamp, because the
-    result still describes the text it read. Writes no scan status and
-    no opinion status: the spans are the output, and what reads them is
-    the export of the final XML (``final_xml``, #408), not the review
-    flow.
+    result still describes the text it read; a row whose result other
+    weights wrote (:class:`WrongModel`) is failed, so the next press
+    starts a run. Writes no scan status and no opinion status: the
+    spans are the output, and what reads them is the export of the
+    final XML (``final_xml``, #408), not the review flow.
 
     :param limit: The most rows this call glues.
     :returns: How many rows were glued and consumed.
@@ -654,6 +740,9 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
         except TextMoved as exc:
             logger.info("%s; the result is kept and not placed", exc)
             _consume(row)
+            continue
+        except WrongModel as exc:
+            _reject(row, exc)
             continue
         except Exception as exc:
             _record_glue_failure(row, exc)

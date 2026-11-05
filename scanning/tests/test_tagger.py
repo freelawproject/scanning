@@ -1,7 +1,8 @@
 """Tests for the tagger stage (``scanning/tagger.py``, #272): one row per
 approved opinion, the input written once by digest from the approved
 text, the glue that places the spans on that text, and the button of
-the review page that is its only caller.
+the review page and the backlog command that call it, and the weights
+in the row identity (#573).
 
 No HTTP and no S3: ``s3_sync`` is patched at the functions the stage
 calls, and the approved text is a dict in the shape of
@@ -10,11 +11,13 @@ calls, and the approved text is a dict in the shape of
 
 from __future__ import annotations
 
+import io
 import json
 from unittest.mock import patch
 
 from django.contrib import messages
 from django.contrib.messages import get_messages
+from django.core.management import CommandError, call_command
 from django.test import override_settings
 from django.urls import reverse
 
@@ -174,7 +177,7 @@ class _S3Case(ScanningTestCase):
                 ],
                 "sequence_count": 1,
                 "failed_sequences": [],
-                "model": "freelawproject/caselaw-block-tagger",
+                "model": tagger.MODEL,
                 "max_tokens": 8192,
             },
         }
@@ -246,6 +249,7 @@ class TestEnsureTagJobs(_S3Case):
             {
                 "digest": tagger.text_digest(text),
                 "projection": tagger.PROJECTION_VERSION,
+                "model": tagger.MODEL,
                 "chars": len(text),
                 "paragraphs": 3,
                 "page_count": 1,
@@ -765,3 +769,195 @@ class TestThePage(_S3Case):
         )
 
         self.assertEqual(response.status_code, 404)
+
+
+#: Weights older than :data:`tagger.MODEL`, as the per-token image
+#: reported them.
+OLD_MODEL = "freelawproject/caselaw-block-tagger"
+
+
+class _OldSpansCase(_S3Case):
+    """Spans placed by a row from before the weights joined the identity."""
+
+    def old_spans(self):
+        row = self.completed_row()
+        manifest = dict(row.input_manifest)
+        manifest.pop("model")
+        ExternalJob.objects.filter(pk=row.pk).update(input_manifest=manifest)
+        row.refresh_from_db()
+        env = self.envelope(row)
+        env["payload"]["model"] = OLD_MODEL
+        self.stored[row.result_key] = env
+        self.assertEqual(tagger.finish_ready_runs(), 1)
+        self.opinion.refresh_from_db()
+        return row
+
+
+class TestTheWeights(_OldSpansCase):
+    """The weights are part of the identity, and the glue checks them."""
+
+    def test_the_identity_names_the_weights(self):
+        row = tagger.ensure_tag_jobs(self.opinion)[0]
+
+        self.assertEqual(row.input_manifest["model"], tagger.MODEL)
+
+    def test_new_weights_start_a_new_run(self):
+        first = tagger.ensure_tag_jobs(self.opinion)[0]
+        ExternalJob.objects.filter(pk=first.pk).update(
+            status=JobStatus.CONSUMED
+        )
+
+        with patch.object(tagger, "MODEL", "org/next@abc"):
+            second = tagger.ensure_tag_jobs(self.opinion)[0]
+
+        self.assertGreater(second.run, first.run)
+        self.assertEqual(second.input_manifest["model"], "org/next@abc")
+        self.assertEqual(second.status, JobStatus.PENDING)
+
+    def test_the_glue_stamps_the_weights(self):
+        self.finished_row()
+
+        tagger.finish_ready_runs()
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.tag_model, tagger.MODEL)
+        self.assertTrue(tagger.is_current(self.opinion))
+        self.assertEqual(
+            self.stored[self.opinion.tag_key]["model"], tagger.MODEL
+        )
+
+    def test_a_result_of_other_weights_is_not_placed(self):
+        # An old image answered a row of the new weights.
+        row = self.completed_row()
+        env = self.envelope(row)
+        env["payload"]["model"] = OLD_MODEL
+        self.stored[row.result_key] = env
+
+        self.assertEqual(tagger.finish_ready_runs(), 0)
+
+        row.refresh_from_db()
+        self.opinion.refresh_from_db()
+        self.assertEqual(row.status, JobStatus.FAILED)
+        self.assertEqual(row.error_code, tagger.WRONG_MODEL)
+        self.assertFalse(tagger.is_written(self.opinion))
+        self.assertEqual(tagger.state(self.opinion), tagger.FAILED)
+        # Never carried into the next run: a dead run is replaced.
+        retry = tagger.ensure_tag_jobs(self.opinion)[0]
+        self.assertGreater(retry.run, row.run)
+        self.assertEqual(retry.status, JobStatus.PENDING)
+
+    def test_a_row_from_before_the_weights_is_placed_as_before(self):
+        self.old_spans()
+
+        self.assertTrue(tagger.is_written(self.opinion))
+        self.assertFalse(tagger.is_current(self.opinion))
+        self.assertEqual(self.opinion.tag_model, OLD_MODEL)
+        self.assertEqual(tagger.state(self.opinion), tagger.STALE)
+
+    def test_a_press_over_old_spans_starts_a_run_of_the_new_weights(self):
+        old = self.old_spans()
+
+        rows = tagger.ensure_tag_jobs(self.opinion)
+
+        self.assertGreater(rows[0].run, old.run)
+        self.assertEqual(rows[0].status, JobStatus.PENDING)
+        self.assertEqual(rows[0].input_manifest["model"], tagger.MODEL)
+        # The old spans stay placed until the new run is glued.
+        self.opinion.refresh_from_db()
+        self.assertTrue(tagger.is_written(self.opinion))
+        self.assertEqual(tagger.state(self.opinion), tagger.RUNNING)
+
+
+@override_settings(**TAGGER)
+class TestThePageOverOldSpans(_OldSpansCase):
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.make_user())
+
+    def test_old_spans_offer_the_tag_again_and_still_export(self):
+        self.old_spans()
+
+        response = self.client.get(
+            reverse("opinion_review", kwargs={"pk": self.opinion.pk})
+        )
+
+        self.assertContains(response, 'id="start-tagger"')
+        self.assertContains(response, "Tag the text again")
+        self.assertContains(
+            response,
+            reverse(
+                "opinion_final_xml",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+
+
+@override_settings(**TAGGER)
+class TestRetagOpinions(_OldSpansCase):
+    """``retag_opinions``: the backlog, through the button's call."""
+
+    def run_command(self, *args):
+        out = io.StringIO()
+        with patch("scanning.tasks.submit_soon") as submit:
+            call_command("retag_opinions", *args, stdout=out, stderr=out)
+        return out.getvalue(), submit
+
+    def test_a_dry_run_lists_and_starts_nothing(self):
+        old = self.old_spans()
+
+        out, submit = self.run_command("--all", "--dry-run")
+
+        self.assertIn("would tag", out)
+        self.assertIn("1 opinion(s) would be tagged again", out)
+        self.assertEqual([r.pk for r in tag_jobs(self.opinion)], [old.pk])
+        submit.assert_not_called()
+
+    def test_old_spans_start_a_run(self):
+        old = self.old_spans()
+
+        out, submit = self.run_command(str(self.scan.pk))
+
+        rows = tag_jobs(self.opinion)
+        self.assertEqual(len(rows), 2)
+        self.assertGreater(rows[-1].run, old.run)
+        self.assertEqual(rows[-1].status, JobStatus.PENDING)
+        self.assertIn("1 run(s) started", out)
+        submit.assert_called_once_with(JobProvider.RUNPOD)
+
+    def test_current_spans_and_untagged_opinions_are_left_alone(self):
+        self.finished_row()
+        tagger.finish_ready_runs()
+        untagged = OpinionFactory(
+            scan=self.scan,
+            first_printed_page=510,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            approved_text_key=APPROVED_KEY + ".other",
+        )
+
+        out, _ = self.run_command("--all")
+
+        self.assertIn("0 run(s) started", out)
+        self.assertEqual(len(tag_jobs(self.opinion)), 1)
+        self.assertEqual(tag_jobs(untagged), [])
+
+    def test_a_run_in_flight_is_skipped(self):
+        self.old_spans()
+        tagger.ensure_tag_jobs(self.opinion)
+
+        out, _ = self.run_command("--all")
+
+        self.assertIn("in flight", out)
+        self.assertEqual(len(tag_jobs(self.opinion)), 2)
+
+    @override_settings(TAGGER_ENABLED=False)
+    def test_a_disabled_stage_is_refused_outside_a_dry_run(self):
+        self.old_spans()
+
+        with self.assertRaisesRegex(CommandError, "tagger is off"):
+            self.run_command("--all")
+
+    def test_scans_and_all_are_exclusive(self):
+        with self.assertRaises(CommandError):
+            self.run_command("--all", str(self.scan.pk))
+        with self.assertRaises(CommandError):
+            self.run_command()
