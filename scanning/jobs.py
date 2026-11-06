@@ -1407,8 +1407,12 @@ def ready_volume_runs(
         .distinct()
     )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    # The caches stay on disk (#602): a candidate's run is judged on its
+    # rows, and most candidates are skipped before a glue reads the scan.
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
     ):
         rows = live_rows(scan)
         if not rows:
@@ -1552,8 +1556,11 @@ def ready_apply_runs(
         candidates[run.scan_id] = run
     if not candidates:
         return
-    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
-        "reporter"
+    # The caches stay on disk (#602), as in :func:`ready_volume_runs`.
+    for scan in (
+        Scan.objects.filter(pk__in=list(candidates))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
     ):
         volume_rows = live_rows(scan)
         if not volume_rows or any(

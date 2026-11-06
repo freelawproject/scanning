@@ -170,6 +170,7 @@ from django.utils import timezone
 
 from scanning import detections, markup, opinion_ocr, s3_sync
 from scanning.models import (
+    ApplyRun,
     Issue,
     Opinion,
     OpinionCheck,
@@ -5452,11 +5453,15 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     """
     if not s3_sync.s3_active():
         return 0
-    # The scan's caches stay on disk (#582): the ensemble reads none.
+    # The scan's caches stay on disk (#582), and the run's page map
+    # (#602): the ensemble reads neither.
     rows = list(
         due(limit)
         .select_related("scan", "apply_run")
-        .defer(*Scan.large_fields("scan__"))
+        .defer(
+            *Scan.large_fields("scan__"),
+            *(f"apply_run__{name}" for name in ApplyRun.LARGE_FIELDS),
+        )
     )
     if not rows:
         return 0

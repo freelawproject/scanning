@@ -209,7 +209,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: The primary key of the scan.
     :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return redirect("scan_process", pk=scan.pk)
 
 

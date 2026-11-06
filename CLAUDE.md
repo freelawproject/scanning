@@ -114,6 +114,7 @@ This file holds what the code and the git history cannot tell a reader: the comm
 - A gate lives in the view, not only in the template: `start_detect`, `approve_page_completeness`, `generate_files` refuse a direct POST
 - A refused request answers `{status: "error", message}` (409 for a rule, 404 for an address outside the volume), and the viewer shows the message and changes nothing
 - The step action bar is two rows, a status row over a button row (`data-row`), and both wrappers are in `_process_actions.html`, never in the page: `refreshProcessActionBar` replaces the bar's innerHTML with the fragment (#333)
+- A view fetches its scan through `Scan.without_caches(*keep)`, never `get_object_or_404(Scan, pk=pk)`, and keeps only the caches it reads in the common path, through a helper too (`process_actions` reads `ocr_results` through `_review_flags`); a deferred cache read is one more query, never a wrong answer (#602)
 
 ## Pipeline
 

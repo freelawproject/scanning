@@ -627,6 +627,186 @@ class TestVolumeRunsIndex(ScanningTestCase):
                 )
 
 
+class TestScanFetches(_CacheColumns):
+    """The views that fetch one scan, and the daemon reads of #602."""
+
+    def setUp(self):
+        self.client.force_login(self.make_staff_user())
+
+    def test_no_view_fetches_the_whole_scan(self):
+        """Every one-scan fetch of a view names what it keeps."""
+        import inspect
+        import re
+
+        from scanning import views, views_api, views_process
+
+        for module in (views, views_api, views_process):
+            with self.subTest(module.__name__):
+                self.assertEqual(
+                    re.findall(
+                        r"get_object_or_404\(\s*Scan\s*,\s*pk=pk\s*\)",
+                        inspect.getsource(module),
+                    ),
+                    [],
+                )
+
+    def test_a_keep_must_name_a_cache(self):
+        with self.assertRaises(ValueError):
+            Scan.without_caches("status")
+
+    def test_the_review_and_the_preview_reads(self):
+        scan = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        for name in (
+            "serve_detections",
+            "serve_redactions",
+            "review_findings",
+            "serve_scan_pdf",
+        ):
+            with self.subTest(name):
+                response = self.assert_caches_stay_on_disk(
+                    lambda: self.client.get(
+                        reverse(name, kwargs={"pk": scan.pk})
+                    )
+                )
+                self.assertLess(response.status_code, 500)
+
+    def test_the_opinion_urls(self):
+        opinion = OpinionFactory()
+        kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
+        for name in ("opinion_pdf_url", "opinion_blocking_cards"):
+            with self.subTest(name):
+                response = self.assert_caches_stay_on_disk(
+                    lambda: self.client.get(reverse(name, kwargs=kwargs))
+                )
+                self.assertLess(response.status_code, 500)
+
+    def test_the_blocking_cards_read_the_scan_in_the_join(self):
+        opinion = OpinionFactory()
+        url = reverse(
+            "opinion_blocking_cards",
+            kwargs={"pk": opinion.scan_id, "opinion_pk": opinion.pk},
+        )
+
+        with CaptureQueriesContext(connection) as captured:
+            self.client.get(url)
+
+        self.assertEqual(
+            [q["sql"] for q in captured if 'FROM "scanning_scan"' in q["sql"]],
+            [],
+        )
+
+    def test_the_blocking_cards_of_another_scan_are_not_found(self):
+        opinion = OpinionFactory()
+        other = ScanFactory()
+
+        response = self.client.get(
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": other.pk, "opinion_pk": opinion.pk},
+            )
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_claim(self):
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(status=Status.QUEUED)
+
+        claimed = self.assert_caches_stay_on_disk(process_next_scan.claim_next)
+
+        self.assertEqual(claimed[0].pk, scan.pk)
+
+    def test_the_stale_sweep(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(status=Status.PROCESSING)
+        Scan.objects.filter(pk=scan.pk).update(
+            processed_at=timezone.now() - timedelta(days=1)
+        )
+
+        self.assert_caches_stay_on_disk(process_next_scan.recover_stale)
+
+    def test_the_volume_glue_candidates(self):
+        from scanning import jobs
+
+        ExternalJobFactory(status=JobStatus.COMPLETED)
+
+        def walk():
+            return list(
+                jobs.ready_volume_runs(
+                    JobStage.DETECT,
+                    JobEngine.BLACKLETTER,
+                    JobProvider.RUNPOD,
+                    lambda scan: jobs.live_run(
+                        scan, JobStage.DETECT, JobEngine.BLACKLETTER
+                    ),
+                    lambda rows: 0,
+                    3,
+                )
+            )
+
+        self.assertEqual(len(self.assert_caches_stay_on_disk(walk)), 1)
+
+
+class TestApplyPrefilter(ScanningTestCase):
+    """The page-number apply judges only a run that owes it (#602)."""
+
+    def _scan(self, apply_state=None, status=JobStatus.CONSUMED):
+        scan = ScanFactory(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.ANALYZE,
+            engine=JobEngine.DOTS_MOCR,
+            status=status,
+            provider_meta={"apply": apply_state} if apply_state else {},
+        )
+        return scan
+
+    def _run(self):
+        from scanning import dots_mocr
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.services.run_compute_issues", return_value=True
+            ) as compute,
+        ):
+            dots_mocr.apply_ready_runs()
+        return {call.args[0].pk for call in compute.call_args_list}
+
+    def test_an_unapplied_run_is_applied(self):
+        scan = self._scan()
+
+        self.assertEqual(self._run(), {scan.pk})
+
+    def test_an_applied_run_reads_no_scan(self):
+        self._scan({"applied_at": "2026-11-01T00:00:00+00:00"})
+        self._scan({"attempts": 3})
+
+        with patch("scanning.dots_mocr.live_analyze_jobs") as live:
+            self.assertEqual(self._run(), set())
+
+        live.assert_not_called()
+
+    def test_the_ledger_is_the_live_runs(self):
+        """An older run's applied stamp does not hold a new run back."""
+        scan = self._scan({"applied_at": "2026-11-01T00:00:00+00:00"})
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.ANALYZE,
+            engine=JobEngine.DOTS_MOCR,
+            status=JobStatus.CONSUMED,
+            run=2,
+        )
+
+        self.assertEqual(self._run(), {scan.pk})
+
+
 class TestOpinionListIndexes(ScanningTestCase):
     """The opinions list's Pictures column and status filter (#599).
 
