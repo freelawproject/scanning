@@ -1099,15 +1099,36 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
     return zones
 
 
+#: The labels whose boxes are the frame of a page (:func:`page_frame`):
+#: the regions print sits in, the columns, the footnote block and the
+#: pictures, with the running head's line and the two marks that sit
+#: between the columns, the key icon and the case sequence. Every other
+#: label names what a piece of text is, a caption, a headnote, a
+#: syllabus, an editor's note, the judges, a heading, a blockquote, and
+#: must sit inside one of these: a model ``BLOCKQUOTE`` box over a whole
+#: column that had no ``TEXT_COLUMN`` box counted as cover, so no text
+#: card asked for the column in review 2 and the column rode into
+#: review 3 as one long quote (659 S.W.3d 243, 2026-11-06).
+FRAME_LABELS = HEAD_LINE_LABELS | frozenset(
+    {
+        Label.TEXT_COLUMN.name,
+        Label.FOOTNOTES.name,
+        Label.IMAGE.name,
+        Label.KEY_ICON.name,
+        Label.CASE_SEQUENCE.name,
+    }
+)
+
+
 def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
     """Return the frame of one page, in points, or None.
 
-    The union of every detection of the page, in the shape
-    :func:`covered_share` measures: a unit that lies in none of them
-    is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
+    The union of the page's detections of :data:`FRAME_LABELS`, in the
+    shape :func:`covered_share` measures: a unit that lies in none of
+    them is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
     detection, because the rule needs the detections to have read the
-    page: a page they missed whole keeps every unit, and the vote
-    says what it says.
+    page: a page they missed whole keeps every unit, and the vote says
+    what it says.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
@@ -1118,7 +1139,9 @@ def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
         return None
     return [
         {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
-        for box in zones_pt(rows, size)
+        for box in zones_pt(
+            [row for row in rows if row.label in FRAME_LABELS], size
+        )
     ]
 
 
