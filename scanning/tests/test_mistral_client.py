@@ -8,6 +8,7 @@ line is handed back whole.
 """
 
 import json
+import threading
 from unittest.mock import MagicMock, patch
 
 from django.test import SimpleTestCase, override_settings
@@ -49,6 +50,32 @@ class TestEnabled(SimpleTestCase):
     @override_settings(**{**MISTRAL, "MISTRAL_API_KEY": ""})
     def test_no_key_means_off(self):
         self.assertFalse(mistral_client.enabled())
+
+    @override_settings(**MISTRAL)
+    def test_the_client_is_built_once_per_thread_and_key(self):
+        # Two calls on one thread share the client; another thread and
+        # another key each build their own.
+        built = []
+
+        def sdk(**kwargs):
+            built.append(kwargs)
+            return MagicMock()
+
+        with patch("mistralai.client.Mistral", side_effect=sdk):
+            first = mistral_client.client()
+            self.assertIs(mistral_client.client(), first)
+            seen = []
+            thread = threading.Thread(
+                target=lambda: seen.append(mistral_client.client())
+            )
+            thread.start()
+            thread.join()
+            self.assertIsNot(seen[0], first)
+            with override_settings(MISTRAL_API_KEY="key-2"):
+                self.assertIsNot(mistral_client.client(), first)
+        self.assertEqual(
+            [b["api_key"] for b in built], ["key-1", "key-1", "key-2"]
+        )
 
     @override_settings(**{**MISTRAL, "MISTRAL_API_KEY": ""})
     def test_the_client_refuses_to_build_without_a_key(self):
@@ -288,7 +315,74 @@ class TestBestEffort(SimpleTestCase):
 
     def test_delete_file_swallows_a_failure(self):
         patcher, sdk = _client()
-        sdk.files.delete.side_effect = _StatusError(404)
+        sdk.files.delete.side_effect = _StatusError(400)
         with patcher, self.assertLogs("scanning.mistral_client", "WARNING"):
+            self.assertFalse(mistral_client.delete_file("file-1"))
+        sdk.files.delete.assert_called_once_with(file_id="file-1")
+
+    def test_a_file_already_gone_counts_as_deleted(self):
+        patcher, sdk = _client()
+        sdk.files.delete.side_effect = _StatusError(404)
+        with patcher:
+            self.assertTrue(mistral_client.delete_file("file-1"))
+
+    def test_a_throttled_delete_is_raised_for_the_caller_to_wait_out(self):
+        # One call and no sleep: the wait is the caller's, who reads the
+        # stop flag and bounds a whole shard's cleanup.
+        patcher, sdk = _client()
+        sdk.files.delete.side_effect = _StatusError(429)
+        with patcher, self.assertRaises(mistral_client.MistralBusy):
             mistral_client.delete_file("file-1")
         sdk.files.delete.assert_called_once_with(file_id="file-1")
+
+
+@override_settings(**MISTRAL)
+class TestFindFiles(SimpleTestCase):
+    """The files a killed submit left are found by their names (#534)."""
+
+    def _file(self, file_id, filename):
+        return _sdk_object(id=file_id, filename=filename)
+
+    def test_only_names_under_the_prefix_are_kept(self):
+        # Mistral's search may match more loosely than a prefix; the
+        # check here keeps another attempt's file out of the delete.
+        patcher, sdk = _client()
+        sdk.files.list.return_value = _sdk_object(
+            data=[
+                self._file("f0", "scan7-job3-a1-p0.png"),
+                self._file("f1", "scan7-job3-a1-manifest.jsonl"),
+                self._file("x", "scan7-job3-a12-p0.png"),
+                self._file("y", "other-scan7-job3-a1-p0.png"),
+            ]
+        )
+        with patcher:
+            found = mistral_client.find_files("scan7-job3-a1-")
+        self.assertEqual(found, ["f0", "f1"])
+        sdk.files.list.assert_called_once_with(
+            page=0,
+            page_size=mistral_client.LIST_PAGE_SIZE,
+            search="scan7-job3-a1-",
+        )
+
+    def test_a_full_page_reads_the_next(self):
+        patcher, sdk = _client()
+        full = [
+            self._file(f"f{i}", f"p-{i}")
+            for i in range(mistral_client.LIST_PAGE_SIZE)
+        ]
+        sdk.files.list.side_effect = [
+            _sdk_object(data=full),
+            _sdk_object(data=[self._file("last", "p-last")]),
+        ]
+        with patcher:
+            found = mistral_client.find_files("p-")
+        self.assertEqual(len(found), mistral_client.LIST_PAGE_SIZE + 1)
+        self.assertEqual(sdk.files.list.call_args.kwargs["page"], 1)
+
+    def test_a_failed_listing_raises_for_the_claim_to_wait(self):
+        # A partial list read as the whole would hand the row on with
+        # its other files unnamed for good.
+        patcher, sdk = _client()
+        sdk.files.list.side_effect = _StatusError(500)
+        with patcher, self.assertRaises(mistral_client.MistralError):
+            mistral_client.find_files("scan7-")

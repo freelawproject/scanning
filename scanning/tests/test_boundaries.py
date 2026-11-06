@@ -789,6 +789,46 @@ class TestStanding(TestCase):
 
         self.assertEqual([r.pk for r in rows], [left_low.pk, right_high.pk])
 
+    def test_a_block_box_in_a_column_moves_the_divide_nowhere(self):
+        # The two column boxes and a block a curator added over a
+        # paragraph of the right column, narrower than the column and
+        # centred right of it: the divide stays in the gutter, so a
+        # start in the left column near the gutter still reads left.
+        scan = ScanFactory(page_count=1)
+        for x0, x1 in ((100, 800), (900, 1600), (1300, 1600)):
+            model_row(
+                scan,
+                label="TEXT_COLUMN",
+                label_id=int(Label.TEXT_COLUMN),
+                x0=x0,
+                y0=100,
+                x1=x1,
+                y1=2100,
+                img_width=IMG_W,
+                img_height=IMG_H,
+            )
+
+        divide = boundaries.column_boundaries(scan, {0})[0]
+
+        self.assertAlmostEqual(divide, 850 * PAGE_W / IMG_W)
+
+    def test_two_boxes_in_one_column_are_one_column(self):
+        scan = ScanFactory(page_count=1)
+        for x0, x1 in ((100, 800), (100, 500)):
+            model_row(
+                scan,
+                label="TEXT_COLUMN",
+                label_id=int(Label.TEXT_COLUMN),
+                x0=x0,
+                y0=100,
+                x1=x1,
+                y1=2100,
+                img_width=IMG_W,
+                img_height=IMG_H,
+            )
+
+        self.assertEqual(boundaries.column_boundaries(scan, {0}), {})
+
     def test_one_column_orders_by_y(self):
         scan = ScanFactory(page_count=1)
         right_high = OpinionBoundaryFactory(

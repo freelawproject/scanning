@@ -169,6 +169,38 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 # ---------------------------------------------------------------------------
 
 
+def key_icon_rows(rows: list[Detection], bl_warm: bool) -> list[Detection]:
+    """Return the rows of ``rows`` that are key icons.
+
+    blackletter's rule for "this box is a key icon"
+    (``blackletter.scanner.key_icons``: the gate for the family and the
+    size filter over the whole volume) over ``Detection`` rows, for a
+    reader that has no document: each row is lifted into a blackletter
+    detection in its own pixels, and the gate and the size filter are
+    scale-free, so the answer is the pairing's.
+
+    :param rows: ``KEY_ICON`` rows of one scan, every one of them, so
+        the median is the volume's.
+    :param bl_warm: Whether bl-warm alone drew them.
+    :returns: The rows that are key icons, in the order given.
+    """
+    from blackletter.models import BBox, Label
+    from blackletter.models import Detection as BLDetection
+    from blackletter.scanner import key_icons
+
+    lifted = {}
+    for row in rows:
+        det = BLDetection(
+            bbox=BBox(x1=row.x0, y1=row.y0, x2=row.x1, y2=row.y1),
+            label=Label.KEY_ICON,
+            confidence=row.confidence,
+            page_index=row.page_index,
+        )
+        lifted[id(det)] = (det, row)
+    kept = key_icons([det for det, _ in lifted.values()], bl_warm)
+    return [lifted[id(det)][1] for det in kept]
+
+
 def write_computed(
     scan: Scan,
     document,
@@ -200,12 +232,21 @@ def write_computed(
     :param run: The apply run whose space the document is in; None for
         the original's space.
     :param detect_run: The ``ExternalJob.run`` the rows came from.
-    :returns: The ``(caption, key)`` pairs, as ``_pair_opinions`` gives
-        them.
+    :returns: The ``(caption, key)`` pairs, as blackletter's
+        ``_pair_opinions`` gives them, in reading order: the gate
+        pairing, then the keys it left unmatched paired on the key
+        before them (``_pair_on_keys_before``).
     """
+    from blackletter.models import CaptionMarker
     from blackletter.scanner import _pair_opinions
 
     pairs = _pair_opinions(document) if document.pages else []
+    # An opinion paired on the key before starts at a marker under that
+    # key, one pixel tall, that names the caption box it was paired on:
+    # the boundary's start FK names the box's row.
+    for caption, _ in pairs:
+        if isinstance(caption, CaptionMarker) and id(caption.box) in row_ids:
+            row_ids[id(caption)] = row_ids[id(caption.box)]
     pages_by_index = {p.index: p for p in document.pages}
     scan.refresh_from_db(fields=["source_fingerprint"])
     rows = []
@@ -676,10 +717,14 @@ def add(
 def column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
     """Return the x, in points, that divides the two columns of each page.
 
-    From the live ``TEXT_COLUMN`` rows of the page, the rule of
-    blackletter's ``_column_bounds_pdf``: the middle of the gap between
-    the leftmost and the rightmost box. A page with fewer than two boxes
-    has one column and is absent.
+    From the live ``TEXT_COLUMN`` rows of the page, grouped into its
+    columns first (``columns.column_groups``, the rule of the gutter
+    passes): the middle of the gap between the left group's right edge
+    and the right group's left edge. A box narrower than its column (a
+    block a curator added over a paragraph) joins its column's group
+    and moves nothing, where the two boxes with the outermost centres
+    would have put the divide inside a column. A page with fewer than
+    two groups has one column and is absent.
 
     :param scan: The scan.
     :param page_indexes: The pages to answer for.
@@ -692,15 +737,20 @@ def column_boundaries(scan: Scan, page_indexes: set[int]) -> dict[int, float]:
         scan=scan, label="TEXT_COLUMN", page_index__in=page_indexes
     ):
         columns.setdefault(row.page_index, []).append(row)
+    from scanning.columns import column_groups
+
     boundaries: dict[int, float] = {}
     for page_index, rows in columns.items():
         if len(rows) < 2:
             continue
-        rows.sort(key=lambda r: (r.x0 + r.x1) / 2)
-        left, right = rows[0], rows[-1]
-        px = (left.x1 + right.x0) / 2
+        groups = column_groups([(r.x0, r.x1) for r in rows])
+        if len(groups) < 2:
+            continue
+        left_edge = max(rows[i].x1 for i in groups[0])
+        right_edge = min(rows[i].x0 for i in groups[1])
+        px = (left_edge + right_edge) / 2
         boundaries[page_index] = to_points(
-            px, 0, left.img_width, left.img_height
+            px, 0, rows[0].img_width, rows[0].img_height
         )[0]
     return boundaries
 

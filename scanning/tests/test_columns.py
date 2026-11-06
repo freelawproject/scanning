@@ -293,6 +293,74 @@ class TestSeparateRows(TestCase):
         only.refresh_from_db()
         self.assertEqual(only.x1, LEFT_BOX[2])
 
+    def test_a_picture_that_cuts_the_columns_into_four_keeps_the_gutter(self):
+        """Each column is two boxes, above and below the picture: the
+        gutter is read between the two columns and every box takes it."""
+        boxes = [
+            self.column((LEFT_BOX[0], 176.6, LEFT_BOX[2], 900.0)),
+            self.column((LEFT_BOX[0], 1000.0, LEFT_BOX[2], 1983.5)),
+            self.column((RIGHT_BOX[0], 176.6, RIGHT_BOX[2], 900.0)),
+            self.column((RIGHT_BOX[0], 1000.0, RIGHT_BOX[2], 1983.5)),
+        ]
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 4
+        )
+
+        for row in boxes:
+            row.refresh_from_db()
+        self.assertAlmostEqual(boxes[0].x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[2].x0, RIGHT_TEXT_START, places=1)
+        self.assertAlmostEqual(boxes[3].x0, RIGHT_TEXT_START, places=1)
+
+    def test_a_third_box_at_a_columns_foot_keeps_the_pair(self):
+        """A box over a block at the left column's foot is the left
+        column's, not a column of its own, and short of the gutter it
+        keeps its own edge."""
+        left = self.column(LEFT_BOX)
+        right = self.column(RIGHT_BOX)
+        foot = self.column((240.0, 1900.0, 700.0, 2000.0))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 2
+        )
+
+        left.refresh_from_db()
+        right.refresh_from_db()
+        foot.refresh_from_db()
+        self.assertAlmostEqual(left.x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(right.x0, RIGHT_TEXT_START, places=1)
+        self.assertEqual(foot.x1, 700.0)
+
+    def test_a_pair_that_overlaps_at_the_gutter_is_still_a_pair(self):
+        """The model's two boxes meet or overlap by a sliver before the
+        import separates them: that sliver is the gutter, not a column."""
+        left = self.column((LEFT_BOX[0], LEFT_BOX[1], 840.0, LEFT_BOX[3]))
+        right = self.column((810.0, RIGHT_BOX[1], RIGHT_BOX[2], RIGHT_BOX[3]))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 2
+        )
+
+        left.refresh_from_db()
+        right.refresh_from_db()
+        self.assertAlmostEqual(left.x1, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(right.x0, RIGHT_TEXT_START, places=1)
+
+    def test_two_boxes_in_one_column_are_no_pair(self):
+        upper = self.column(LEFT_BOX)
+        lower = self.column((240.0, 1990.0, 820.0, 2100.0))
+
+        self.assertEqual(
+            columns.separate_rows(self.scan, {0: cells_of(*body_cells())}), 0
+        )
+
+        upper.refresh_from_db()
+        lower.refresh_from_db()
+        self.assertEqual(upper.x1, LEFT_BOX[2])
+        self.assertEqual(lower.x0, 240.0)
+
     def test_a_hand_drawn_pair_is_not_written(self):
         """A box reaches the database exactly as the reviewer drew it.
         ``separate_document`` corrects the geometry's copy instead."""
@@ -357,6 +425,48 @@ class TestSeparateDocument(TestCase):
         self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
         self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
 
+    def test_a_picture_that_cuts_the_columns_into_four_keeps_the_gutter(self):
+        document = self.document(
+            (LEFT_BOX[0], 176.6, LEFT_BOX[2], 900.0),
+            (RIGHT_BOX[0], 176.6, RIGHT_BOX[2], 900.0),
+            (LEFT_BOX[0], 1000.0, LEFT_BOX[2], 1983.5),
+            (RIGHT_BOX[0], 1000.0, RIGHT_BOX[2], 1983.5),
+        )
+
+        moved = columns.separate_document(
+            document, {0: cells_of(*body_cells())}
+        )
+
+        boxes = [d.bbox for d in document.pages[0].detections]
+        self.assertEqual(moved, 4)
+        self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[2].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
+        self.assertAlmostEqual(boxes[3].x1, RIGHT_TEXT_START, places=1)
+
+    def test_a_third_box_at_a_columns_foot_keeps_the_pair(self):
+        document = self.document(
+            LEFT_BOX, RIGHT_BOX, (240.0, 1900.0, 700.0, 2000.0)
+        )
+
+        moved = columns.separate_document(
+            document, {0: cells_of(*body_cells())}
+        )
+
+        boxes = [d.bbox for d in document.pages[0].detections]
+        self.assertEqual(moved, 2)
+        self.assertAlmostEqual(boxes[0].x2, LEFT_TEXT_END, places=1)
+        self.assertAlmostEqual(boxes[1].x1, RIGHT_TEXT_START, places=1)
+        self.assertEqual(boxes[2].x2, 700.0)
+
+    def test_two_boxes_in_one_column_are_no_pair(self):
+        document = self.document(LEFT_BOX, (240.0, 1990.0, 820.0, 2100.0))
+
+        self.assertEqual(
+            columns.separate_document(document, {0: cells_of(*body_cells())}),
+            0,
+        )
+
     def test_the_order_of_the_detections_is_kept(self):
         document = self.document(RIGHT_BOX, LEFT_BOX)
 
@@ -370,3 +480,91 @@ class TestSeparateDocument(TestCase):
         self.assertEqual(
             columns.separate_document(SimpleNamespace(pages=[]), {}), 0
         )
+
+
+class TestTheImportShapesTheRowsFirst(TestCase):
+    """A decision is made on the shaped row, so the import shapes the
+    new rows before the decisions land on them.
+
+    The trim writes a smaller box, and a curator's decision copies that
+    box. The next import writes the model's untrimmed rows; landed on
+    those by IoU, a decision on a column the trim had cut by more than
+    half would miss, and the model's box would come back.
+    """
+
+    def _scan_with_a_trimmed_column(self):
+        from blackletter.models import Label
+
+        from scanning.models import DetectionDecision
+        from scanning.tests.test_findings import make_detection, make_scan
+
+        scan = make_scan()
+        # The print ends at 800; the model's box runs to 2100.
+        cells = {0: cells_of(cell(100, 100, 800, 800))}
+        row = make_detection(
+            scan,
+            "TEXT_COLUMN",
+            0,
+            label_id=int(Label.TEXT_COLUMN),
+            x0=100.0,
+            y0=100.0,
+            x1=800.0,
+            y1=2100.0,
+        )
+        columns.trim_feet(scan, cells)
+        row.refresh_from_db()
+        self.assertEqual(row.y1, 800.0)
+        # The curator takes the trimmed column out: the decision copies
+        # the box as the curator saw it.
+        DetectionDecision.objects.create(
+            scan=scan,
+            kind=DetectionDecision.Kind.DEACTIVATE,
+            source_page=1,
+            source_fingerprint=scan.source_fingerprint,
+            label="TEXT_COLUMN",
+            label_id=int(Label.TEXT_COLUMN),
+            target_x0=100.0,
+            target_y0=100.0,
+            target_x1=800.0,
+            target_y1=800.0,
+            img_width=1700,
+            img_height=2200,
+        )
+        entry = {
+            "page_index": 0,
+            "label": "TEXT_COLUMN",
+            "label_id": int(Label.TEXT_COLUMN),
+            "confidence": 0.9,
+            "bbox": [100.0, 100.0, 800.0, 2100.0],
+            "img_width": 1700,
+            "img_height": 2200,
+            "found_by": [{"model": "bl_warm", "confidence": 0.9}],
+            "pdf_page": 1,
+        }
+        return scan, cells, entry
+
+    def test_the_decision_lands_on_the_shaped_row(self):
+        from scanning import services
+        from scanning.models import Detection
+
+        scan, cells, entry = self._scan_with_a_trimmed_column()
+
+        services._import_detections(scan.pk, [entry], cells=cells)
+
+        row = Detection.objects.get(scan=scan, label="TEXT_COLUMN")
+        self.assertEqual(row.y1, 800.0)
+        self.assertFalse(row.active)
+
+    def test_without_the_cells_the_decision_misses_the_unshaped_row(self):
+        """What the shaping is for: the same decision against the
+        untrimmed box is under the IoU floor, and the box comes back."""
+        from scanning import services
+        from scanning.models import Detection
+
+        scan, _cells, entry = self._scan_with_a_trimmed_column()
+
+        services._import_detections(scan.pk, [entry])
+
+        row = Detection.objects.get(scan=scan, label="TEXT_COLUMN")
+        self.assertEqual(row.y1, 2100.0)
+        self.assertTrue(row.active)

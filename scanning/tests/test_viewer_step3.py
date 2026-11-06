@@ -290,6 +290,7 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
             "editTextUrl",
             "editSectionUrl",
             "editBlockquoteUrl",
+            "editDropUrl",
             "editMoveUrl",
             "editWithdrawUrl",
         ):
@@ -317,6 +318,21 @@ class TestTheEditsAreTheLockedBlocks(SimpleTestCase):
             'data-check="unresolved_edit"',
         ):
             self.assertIn(reader, source)
+
+    def test_a_block_taken_out_has_its_undo(self):
+        """A block a person took out of the text has no node to lock,
+        so its Undo is on the list under the page's label, and its box
+        is drawn apart from the groups, where the hit test never finds
+        it."""
+        source = VIEWER.read_text()
+        lines = source[source.index("function droppedList(") :]
+        lines = lines[: lines.index("\n    }\n")]
+        self.assertIn("withdrawEdit(drop.edit.id", lines)
+        self.assertIn("block.appendChild(droppedList(", source)
+        boxes = source[source.index("function drawBoxes(") :]
+        boxes = boxes[: boxes.index("\n    }\n")]
+        self.assertIn("handDropped(page)", boxes)
+        self.assertIn("junk.className = 'ensemble-junk'", boxes)
 
     def test_the_edit_reads_the_level_and_derives_none(self):
         source = VIEWER.read_text()

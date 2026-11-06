@@ -5,6 +5,7 @@ from .project.dots_mocr import *
 from .project.logging import *
 from .project.mistral import *
 from .project.observability import *
+from .project.perpendiculars import *
 from .project.processing_storage import *
 from .project.runpod import *
 from .project.security import *
@@ -14,4 +15,5 @@ from .project.tagger import *
 from .project.testing import *
 from .project.yolo import *
 from .third_party.aws import *
+from .third_party.celery import *
 from .third_party.sentry import *

@@ -47,7 +47,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from scanning import dots_mocr
+from scanning import dots_mocr, page_numbers
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +375,125 @@ def fit_rects(rects: list[dict], cells: dict[int, PageCells], pages) -> int:
             counts.fitted += 1
     _log(counts, "the compute")
     return counts.fitted
+
+
+#: The redaction type of a running head's whiteout, blackletter's
+#: white box over a ``PAGE_HEADER`` detection.
+HEAD_RECT_TYPE = "PAGE_HEADER"
+
+
+def widen_running_heads(
+    rects: list[dict],
+    pages,
+    dismissed: dict[int, list[list[float]]] | None = None,
+) -> int:
+    """Grow each running head's whiteout across the width of the text.
+
+    blackletter whites the running head out by the ``PAGE_HEADER`` box
+    shrunk to the ink inside it, so a box the model drew short leaves
+    the last letters of the line on the page ("218 ATLANTIC REPORTER,
+    3d SERI" and an "ES" beside it: 148 even pages of 218 A.3d, by a
+    median of 8.8 pt). Nothing on the running head's line is the
+    opinion, so the whiteout grows sideways, at its own height, to the
+    outer edges of the page's ``TEXT_COLUMN`` detections, and a
+    ``PAGE_NUMBER`` detection on the line is cut out of it, because the
+    page number stays: the whiteout becomes a piece on each side of the
+    number. It never shrinks, and a page with no column keeps its box.
+    Wider is the safe direction here and only here: a running head is
+    never the opinion's text, and a short box is what shows.
+
+    Three whiteouts keep their width, because the line may not be the
+    running head's alone:
+
+    - one outside the head and the foot band
+      (``page_numbers.edge_in_band``), a box the model drew in the body;
+    - one whose bottom passes the top of the page's columns, whose
+      height a line of the opinion shares (1 of 1,291 on 218 A.3d);
+    - one a standing dismiss points at (``dismissed``), or the dismiss,
+      which lands on one row by IoU (``redactions.resolve``), would find
+      pieces of another size and the strip the curator lifted returns.
+
+    :param rects: blackletter's rects of the compute, in render pixels,
+        mutated in place (:func:`fit_rects`'s input).
+    :param pages: The blackletter ``Page`` objects, for the columns and
+        the page-number boxes.
+    :param dismissed: ``{page_index: [box in points]}``, the copied
+        boxes of the standing ``PAGE_HEADER`` dismissals of each page.
+    :returns: How many whiteouts changed.
+    :rtype: int
+    """
+    from blackletter.models import Label
+
+    from scanning.detections import IOU_THRESHOLD, iou
+
+    by_index = {page.index: page for page in pages}
+    dismissed = dismissed or {}
+    changed = 0
+    for entry in rects:
+        page = by_index.get(entry.get("page_index"))
+        if page is None:
+            continue
+        columns = [
+            d.bbox
+            for d in (getattr(page, "detections", None) or [])
+            if d.label == Label.TEXT_COLUMN
+        ]
+        if not columns:
+            continue
+        left = min(c.x1 for c in columns)
+        right = max(c.x2 for c in columns)
+        column_top = min(c.y1 for c in columns)
+        numbers = [
+            d.bbox
+            for d in (getattr(page, "detections", None) or [])
+            if d.label == Label.PAGE_NUMBER
+        ]
+        lifted = dismissed.get(entry["page_index"], [])
+        # Pixels to points, the scale ``redactions.write_computed`` uses.
+        sx = page.pdf_width / page.img_width
+        sy = page.pdf_height / page.img_height
+        out: list[dict] = []
+        for rect in entry.get("rects") or []:
+            box = [rect["x0"], rect["y0"], rect["x1"], rect["y1"]]
+            if (
+                rect.get("type") != HEAD_RECT_TYPE
+                or not page_numbers.edge_in_band(box, page.img_height)
+                or rect["y1"] > column_top
+                or any(
+                    iou(
+                        [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy],
+                        copy,
+                    )
+                    >= IOU_THRESHOLD
+                    for copy in lifted
+                )
+            ):
+                out.append(rect)
+                continue
+            x0, x1 = min(rect["x0"], left), max(rect["x1"], right)
+            pieces = [(x0, x1)]
+            for n in numbers:
+                if min(n.y2, rect["y1"]) <= max(n.y1, rect["y0"]):
+                    continue
+                pieces = [
+                    piece
+                    for a, b in pieces
+                    for piece in ((a, min(b, n.x1)), (max(a, n.x2), b))
+                    if piece[1] - piece[0] > 1
+                ]
+            if pieces == [(rect["x0"], rect["x1"])]:
+                out.append(rect)
+                continue
+            changed += 1
+            for a, b in pieces:
+                out.append({**rect, "x0": round(a, 1), "x1": round(b, 1)})
+        entry["rects"] = out
+    if changed:
+        logger.info(
+            "Running heads: %d whiteout(s) grown across the text width",
+            changed,
+        )
+    return changed
 
 
 def fit_rows(scan, cells: dict[int, PageCells], run=None) -> FitCounts:

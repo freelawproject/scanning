@@ -246,6 +246,9 @@
 .cb-fn p { margin: 0.2em 0; text-indent: 0; }
 
 .cb-tb { border-collapse: collapse; margin: 0.6em 0; max-width: 100%; }
+/* A picture of the text (#463), at its printed size within the column. */
+.cb-figure { margin: 0.6em 0; }
+.cb-figure img { display: block; max-width: 100%; height: auto; margin: 0 auto; }
 .cb-tb td {
   padding: 2px 8px;
   border: 1px solid var(--cb-line);

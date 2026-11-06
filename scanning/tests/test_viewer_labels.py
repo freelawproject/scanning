@@ -38,6 +38,16 @@ VIEWER = (
 #: draws the page edges in the same table, and no id is posted for it.
 NOT_A_LABEL = frozenset({"EDGES"})
 
+#: The two labels the drawer offers that the overlay draws only when a
+#: curator drew the box. They affect no redaction, and the model's boxes
+#: of them crowd the page; a curator's own box of either still draws,
+#: through the ``d.manual`` half of the overlay's gate.
+HAND_DRAWN_ONLY = frozenset({"HEADING", "BLOCKQUOTE"})
+
+#: The overlay's gate, as the source spells it: a curator's box draws
+#: whatever its label, a model box only when ``USED_LABELS`` names it.
+DRAW_GATE = "d.manual || USED_LABELS[d.label]"
+
 
 def _literal(name: str, opener: str, closer: str) -> str:
     """Return the source text of one object or array literal.
@@ -133,12 +143,24 @@ class TestViewerLabelIds(ScanningTestCase):
     def test_every_name_the_menu_offers_is_drawn(self):
         """The filter one layer up. A label the drawer can add but the
         overlay does not name is held back from the page with no
-        message, which is the failure of #343 a layer up."""
+        message, which is the failure of #343 a layer up. The two
+        opinion-body labels are the one exception, and a named one: the
+        model's boxes of them are not drawn, a curator's are."""
         drawn = viewer_used_labels()
 
         for name in viewer_menu_labels():
             with self.subTest(label=name):
-                self.assertIn(name, drawn)
+                if name in HAND_DRAWN_ONLY:
+                    self.assertNotIn(name, drawn)
+                else:
+                    self.assertIn(name, drawn)
+
+    def test_a_curators_box_draws_whatever_its_label(self):
+        """The other half of the gate: the two labels the filter does
+        not name still draw when the row is the curator's own, or the
+        box a curator drew of a heading would vanish on the next page
+        load, the failure of #343 in a new coat."""
+        self.assertIn(DRAW_GATE, VIEWER.read_text())
 
     def test_every_drawn_label_is_a_real_label(self):
         """A name the enum does not carry draws nothing and says

@@ -61,6 +61,7 @@ from scanning.models import (
     JobStatus,
     Opinion,
     OpinionReviewStatus,
+    Scan,
 )
 
 logger = logging.getLogger(__name__)
@@ -541,13 +542,17 @@ def glue_run(opinion: Opinion, row: ExternalJob) -> str:
 def _record_glue_failure(row: ExternalJob, exc: Exception) -> None:
     """Count a glue failure on the row, loud at the crossing into "out
     of tries" and quiet after, the dots.mocr glue's shape."""
-    meta = dict(row.provider_meta or {})
-    glue = dict(meta.get("glue") or {})
-    glue["attempts"] = int(glue.get("attempts") or 0) + 1
-    glue["last_error"] = str(exc)[:500]
-    glue["last_attempt_at"] = timezone.now().isoformat()
-    meta["glue"] = glue
-    ExternalJob.objects.filter(pk=row.pk).update(provider_meta=meta)
+    glue: dict = {}
+
+    def bump(meta: dict) -> None:
+        glue.clear()
+        glue.update(meta.get("glue") or {})
+        glue["attempts"] = int(glue.get("attempts") or 0) + 1
+        glue["last_error"] = str(exc)[:500]
+        glue["last_attempt_at"] = timezone.now().isoformat()
+        meta["glue"] = dict(glue)
+
+    jobs.swap_provider_meta(row, bump)
     log = (
         logger.error
         if glue["attempts"] >= GLUE_MAX_ATTEMPTS
@@ -627,6 +632,8 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
             opinion__isnull=False,
         )
         .select_related("opinion", "opinion__scan")
+        # The caches stay on disk (#582): the glue reads the scan's keys.
+        .defer(*Scan.large_fields("opinion__scan__"))
         .order_by("completed_at", "pk")
     )
     glued = 0

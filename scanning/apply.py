@@ -44,6 +44,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,7 +53,7 @@ import fitz
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import page_edits, s3_sync
+from scanning import page_edits, s3_sync, tasks
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -733,11 +734,19 @@ def latest_run(scan: Scan) -> ApplyRun | None:
     :returns: The run with the highest number, or None.
     :rtype: ApplyRun | None
     """
-    return scan.apply_runs.order_by("-number").first()
+    return (
+        scan.apply_runs.defer(*ApplyRun.LARGE_FIELDS)
+        .order_by("-number")
+        .first()
+    )
 
 
 def current_run(scan: Scan) -> ApplyRun | None:
     """Return the scan's newest apply run that still stands.
+
+    The page map stays on disk (#588): the tick checks call this per
+    waiting scan, every tick, and read the run's keys and stamps alone.
+    A reader of ``page_map`` loads it on access.
 
     :param scan: The scan.
     :returns: The newest run without ``superseded_at``, or None.
@@ -745,6 +754,7 @@ def current_run(scan: Scan) -> ApplyRun | None:
     """
     return (
         scan.apply_runs.filter(superseded_at__isnull=True)
+        .defer(*ApplyRun.LARGE_FIELDS)
         .order_by("-number")
         .first()
     )
@@ -1664,13 +1674,17 @@ def _note_dead_rows() -> int:
     """
     noted = 0
     blocking = list(GLUE_STAGES.values())
-    runs = ApplyRun.objects.filter(
-        superseded_at__isnull=True,
-        built_at__isnull=False,
-        dead_row_noted_at__isnull=True,
-        jobs__status__in=DEAD_JOB_STATUSES,
-        jobs__stage__in=blocking,
-    ).distinct()
+    runs = (
+        ApplyRun.objects.filter(
+            superseded_at__isnull=True,
+            built_at__isnull=False,
+            dead_row_noted_at__isnull=True,
+            jobs__status__in=DEAD_JOB_STATUSES,
+            jobs__stage__in=blocking,
+        )
+        .defer(*ApplyRun.LARGE_FIELDS)
+        .distinct()
+    )
     for run in runs:
         dead = (
             run.jobs.filter(status__in=DEAD_JOB_STATUSES, stage__in=blocking)
@@ -1748,6 +1762,8 @@ def queue_ready_scans() -> int:
     for scan in (
         Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
         .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
         .order_by("-pk")
     ):
         if queued >= room:
@@ -1773,6 +1789,7 @@ def queue_ready_scans() -> int:
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
             queued += claimed
+            tasks.dispatch_scan(scan.pk, QueuedAction.APPLY_PAGE_EDITS)
     return queued
 
 
@@ -1842,6 +1859,10 @@ def _rows_by_edit(
 ) -> dict[int, ExternalJob]:
     """Return one stage's rows of a run, keyed by the edit they read.
 
+    The newest job run wins an edit: a re-read of the edited pages
+    (``enqueue_yolo_detect --stale-labels``, #338) leaves the first
+    read's rows on the apply run beside the new ones.
+
     :param rows: The run's rows.
     :param stage: A ``JobStage`` value.
     :returns: ``{edit pk: row}``.
@@ -1849,7 +1870,7 @@ def _rows_by_edit(
     """
     return {
         row.input_manifest["edit_id"]: row
-        for row in rows
+        for row in sorted(rows, key=lambda row: (row.run, row.attempt))
         if row.stage == stage and "edit_id" in (row.input_manifest or {})
     }
 
@@ -2275,9 +2296,19 @@ def printed_pages(
     documents filling the blanks, #351), overlaid with the curator's
     decisions: a ``SET_NUMBER`` row lands on the slot its original
     page holds (a replaced or rotated page included), and an inserted
-    page carries the label its row was uploaded under. The curator
-    outranks the model. Citations use printed pages, so this map is a
-    product of the apply, not review scaffolding.
+    page carries the label its row was uploaded under. A file of many
+    pages filed under a range is the one exception: that label is the
+    span the file fills (a 260-page insert under ``1125-1381``), not
+    any page's number, and a range stamped on every page keys every
+    opinion on them at the range's end. Those pages keep the model's
+    reading of each, and a page the model read no number on takes its
+    place in the range (the start plus its page in the file, ``by``
+    ``"label"``), so no inserted page is left with no number, which
+    would refuse an opinion starting on it. A one-page insert keeps
+    its label whatever its shape: a compressed opinion page filed
+    under ``913-925`` prints that range. The curator outranks the
+    model. Citations use printed pages, so this map is a product of
+    the apply, not review scaffolding.
 
     :param scan: The scan.
     :param run: The built run.
@@ -2319,18 +2350,34 @@ def printed_pages(
         final = slots.get(edit.pdf_page)
         if final is not None:
             curator(by_final_out[final], edit.value)
-    for page in pages:
+    inserted = [
+        page
+        for page in pages
+        if page["source"]["kind"] == "edit"
+        and page["source"]["edit_kind"] == str(PageEdit.Kind.INSERT_PAGE)
+    ]
+    pages_of = Counter(page["source"]["edit_id"] for page in inserted)
+    labels = dict(
+        PageEdit.objects.filter(pk__in=pages_of).values_list(
+            "pk", "logical_page"
+        )
+    )
+    for page in inserted:
         src = page["source"]
-        if src["kind"] == "edit" and src["edit_kind"] == str(
-            PageEdit.Kind.INSERT_PAGE
+        label = page_numbers.fold_dashes(labels.get(src["edit_id"]) or "")
+        if not label:
+            continue
+        if (
+            pages_of[src["edit_id"]] == 1
+            or page_numbers.number_type(label) != page_numbers.RANGE
         ):
-            label = (
-                PageEdit.objects.filter(pk=src["edit_id"])
-                .values_list("logical_page", flat=True)
-                .first()
-            )
-            if label:
-                curator(page, label)
+            curator(page, label)
+        elif not page["printed"]:
+            start = _range_start(label)
+            if start is not None:
+                page["printed"] = str(start + src["page"])
+                page["type"] = page_numbers.SINGLE
+                page["by"] = "label"
     return {
         "schema_version": MAP_SCHEMA_VERSION,
         "scan_pk": scan.pk,
@@ -2343,7 +2390,10 @@ def printed_pages(
 
 
 def _glue_detections(
-    scan: Scan, run: ApplyRun, rows: list[ExternalJob]
+    scan: Scan,
+    run: ApplyRun,
+    rows: list[ExternalJob],
+    volume_rows: list[ExternalJob] | None = None,
 ) -> str:
     """Write the final detections volume, in the final page space.
 
@@ -2356,12 +2406,16 @@ def _glue_detections(
     :param scan: The scan.
     :param run: The built run.
     :param rows: The run's rows.
+    :param volume_rows: The merged volume run to read, when the caller
+        holds one that is not consumed yet (:func:`refresh_detections`);
+        the live consumed run otherwise.
     :returns: The key of the final detections document.
     :rtype: str
     """
     from scanning import yolo
 
-    volume_rows = _volume_detect_run(scan)
+    if volume_rows is None:
+        volume_rows = _volume_detect_run(scan)
     if not volume_rows:
         raise ApplyError(f"scan {scan.pk} has no merged detection run to read")
     volume_key = yolo.merged_result_key(scan, volume_rows[0].run)
@@ -2523,6 +2577,97 @@ def glue_run(scan: Scan) -> ApplyRun:
         time.monotonic() - started,
     )
     return run
+
+
+def _detections_to_refresh(scan: Scan) -> ApplyRun | None:
+    """Return the standing run whose detections glue a new volume run
+    must write again, or None.
+
+    :param scan: The scan.
+    :returns: The standing built run when its detections are glued;
+        a run that has not glued them yet reads the live volume run
+        when it does. A run built over another original is None: the
+        new volume run describes a re-upload, and that run is replaced,
+        never glued again.
+    :rtype: ApplyRun | None
+    """
+    run = current_run(scan)
+    if run is None or not run.is_built or not run.detections_key:
+        return None
+    if (
+        run.source_fingerprint
+        and scan.source_fingerprint
+        and run.source_fingerprint != scan.source_fingerprint
+    ):
+        return None
+    return run
+
+
+def detections_refresh_waits(scan: Scan) -> bool:
+    """Return whether the re-glue of :func:`refresh_detections` must wait.
+
+    It waits while a row of the live detection run of the standing
+    run's edited pages is unstarted, in flight or dead, the rule of
+    :func:`_stage_blocked`: a re-read of those pages (#338) is the
+    input the new glue reads for them, and a dead one has no result to
+    read, so gluing past it would spend the merge ledger on a failure
+    that repeats. The live run alone, because the rows of an earlier
+    read of the same pages stay on the apply run; a dead re-read goes
+    back through ``enqueue_yolo_detect --stale-labels``, whose new run
+    carries every page that was read.
+
+    :param scan: The scan.
+    :returns: Whether to leave the merge of the volume run for a later
+        tick.
+    :rtype: bool
+    """
+    from scanning import jobs
+
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    rows = jobs.live_run(
+        scan, JobStage.DETECT, JobEngine.BLACKLETTER, apply_run=run
+    )
+    return any(row.status in BLOCKING_JOB_STATUSES for row in rows)
+
+
+def refresh_detections(scan: Scan, volume_rows: list[ExternalJob]) -> bool:
+    """Write the standing run's detections again from a new volume run.
+
+    ``detections_key`` is written once by :func:`_glue`, and the
+    compute reads that document and never the merged one, so a second
+    volume detection run (#338) merged over a corrected volume would
+    import the first run's detections again and stamp them as
+    measured against the second. The merge calls this before it
+    consumes the new run: an identity run's key is the new merged key,
+    and any other run's document is written again over the same key,
+    from the new merge plus the newest read of each edited page. JSON
+    work, so it runs on the collect tick like the glue it repeats.
+
+    :param scan: The scan.
+    :param volume_rows: The new volume run, merged and not consumed.
+    :returns: Whether a document was written.
+    :rtype: bool
+    :raises ApplyError: If the glue refuses its inputs.
+    """
+    run = _detections_to_refresh(scan)
+    if run is None:
+        return False
+    rows = list(run.jobs.all())
+    key = _glue_detections(scan, run, rows, volume_rows=volume_rows)
+    ApplyRun.objects.filter(pk=run.pk).update(detections_key=key)
+    ExternalJob.objects.filter(
+        apply_run=run, stage=JobStage.DETECT, status=JobStatus.COMPLETED
+    ).update(status=JobStatus.CONSUMED, consumed_at=timezone.now())
+    logger.info(
+        "apply: scan %s: run %s detections written again from detection "
+        "run %s",
+        scan.pk,
+        run.label,
+        volume_rows[0].run,
+    )
+    return True
 
 
 def reglue_ocr(scan: Scan, run: ApplyRun | None = None) -> bool:
@@ -2768,6 +2913,19 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
             f"not a printed-page map"
         )
     return document
+
+
+def _range_start(label: str) -> int | None:
+    """Return the first number of a range label, or None.
+
+    :param label: A label ``number_type`` read as a range.
+    :returns: The start, or None when it is not a number.
+    :rtype: int | None
+    """
+    try:
+        return int(label.split("-", 1)[0].strip())
+    except ValueError:
+        return None
 
 
 def printed_numbers(printed: dict) -> dict[int, str]:

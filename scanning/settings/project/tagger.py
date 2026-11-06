@@ -35,8 +35,8 @@ RUNPOD_TAGGER_ENDPOINT_ID = env.str("RUNPOD_TAGGER_ENDPOINT_ID", default="")
 
 # How many jobs may be in flight at once, which is also how many rows
 # one submit tick claims. One job is one opinion, so this is opinions
-# in flight; the endpoint's ``max_workers`` (3) must be at least this.
-TAGGER_MAX_CONCURRENCY = env.int("TAGGER_MAX_CONCURRENCY", default=3)
+# in flight; the endpoint's ``max_workers`` (8) must be at least this.
+TAGGER_MAX_CONCURRENCY = env.int("TAGGER_MAX_CONCURRENCY", default=8)
 
 # Attempts per opinion before its job is failed.
 TAGGER_MAX_ATTEMPTS = env.int("TAGGER_MAX_ATTEMPTS", default=3)

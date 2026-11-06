@@ -7,6 +7,7 @@ pages keep their tests in ``test_views.py``, under their new names.
 
 from unittest.mock import patch
 
+from blackletter.models import Label
 from django.urls import reverse
 
 from scanning import stats
@@ -27,6 +28,7 @@ from scanning.models import (
     OpinionReviewStatus,
     Status,
 )
+from scanning.tests.test_detections import model_row
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -64,6 +66,54 @@ class TestOpinionList(ScanningTestCase):
         response = self.client.get(reverse("opinion_list"))
 
         self.assertContains(response, reverse("legacy_opinion_list"))
+
+    def test_the_list_leaves_the_volumes_caches_on_disk(self):
+        """The join repeated the scan's OCR cache on each of fifty rows,
+        and a page of one volume's opinions took minutes on a starved
+        database (#582). No query of the page reads a cache column, so
+        no reader loads the deferred field row by row either."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.models import Scan
+        from scanning.tests.test_views import large_scan_columns
+
+        for page in (420, 430):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=page,
+                last_printed_page=page + 3,
+                page_count=4,
+            )
+
+        for query in ({}, {"scan": self.scan.pk}, {"volume": 237}):
+            with self.subTest(query=query):
+                with CaptureQueriesContext(connection) as captured:
+                    response = self.client.get(reverse("opinion_list"), query)
+
+                self.assertEqual(response.status_code, 200)
+                rows = list(response.context["page_obj"])
+                self.assertEqual(len(rows), 3)
+                for row in rows:
+                    self.assertLessEqual(
+                        set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+                    )
+                self.assertEqual(large_scan_columns(captured), [])
+
+    def test_the_blocking_review_leaves_the_volumes_caches_on_disk(self):
+        """The blocking review reads the list's query (#582)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(
+                reverse("opinion_blocking_review"), {"scan": self.scan.pk}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(large_scan_columns(captured), [])
 
     def test_the_scan_filter_narrows_the_list(self):
         other = OpinionFactory()
@@ -142,6 +192,60 @@ class TestOpinionList(ScanningTestCase):
 
                 self.assertEqual(response.status_code, 200)
 
+    def test_one_scan_reads_in_page_order_and_the_corpus_newest_first(self):
+        """The order never crosses a table: a scan's opinions by page
+        and index, a reporter's scan by scan, the whole list by id."""
+        later_volume = ScanFactory(reporter=self.reporter, volume=238)
+        rows = [
+            OpinionFactory(scan=later_volume, first_printed_page=1),
+            OpinionFactory(
+                scan=self.scan, first_printed_page=412, index_in_page=1
+            ),
+            OpinionFactory(scan=self.scan, first_printed_page=9),
+        ]
+        by_scan = self.client.get(
+            reverse("opinion_list"), {"scan": self.scan.pk}
+        )
+        self.assertEqual(
+            [row.pk for row in by_scan.context["page_obj"]],
+            [rows[2].pk, self.opinion.pk, rows[1].pk],
+        )
+        by_reporter = self.client.get(
+            reverse("opinion_list"), {"reporter": self.reporter.pk}
+        )
+        self.assertEqual(
+            [row.pk for row in by_reporter.context["page_obj"]],
+            [rows[2].pk, self.opinion.pk, rows[1].pk, rows[0].pk],
+        )
+        whole = self.client.get(reverse("opinion_list"))
+        self.assertEqual(
+            [row.pk for row in whole.context["page_obj"]],
+            sorted((r.pk for r in rows + [self.opinion]), reverse=True),
+        )
+
+    def test_the_scan_filter_offers_the_scanned_volumes(self):
+        """Every scan with an opinion, in the list's order, and no scan
+        without one."""
+        empty = ScanFactory(reporter=self.reporter, volume=1)
+        response = self.client.get(reverse("opinion_list"))
+        choices = response.context["scan_choices"]
+        self.assertEqual(
+            choices,
+            [
+                (
+                    str(self.scan.pk),
+                    f"vol. 237 {self.reporter.cite_name}, scan {self.scan.pk}",
+                )
+            ],
+        )
+        self.assertNotIn(str(empty.pk), [value for value, _ in choices])
+        self.assertContains(response, 'name="scan"')
+        self.assertContains(response, "All volumes")
+        narrowed = self.client.get(
+            reverse("opinion_list"), {"scan": self.scan.pk}
+        )
+        self.assertContains(narrowed, f'value="{self.scan.pk}" selected')
+
     def test_the_ordering_is_total(self):
         """Two scans of one reporter and volume tie on the four keys
         above the pk, so a paginated walk could show one opinion twice
@@ -157,7 +261,10 @@ class TestOpinionList(ScanningTestCase):
         response = self.client.get(reverse("opinion_list"))
 
         rows = list(response.context["page_obj"])
-        self.assertEqual([row.pk for row in rows], sorted(r.pk for r in rows))
+        self.assertEqual(
+            [row.pk for row in rows],
+            sorted((r.pk for r in rows), reverse=True),
+        )
 
     def test_the_row_links_carry_the_filters(self):
         response = self.client.get(
@@ -192,6 +299,49 @@ class TestOpinionList(ScanningTestCase):
         row = response.context["page_obj"][0]
         self.assertEqual((row.open_findings, row.stale_findings), (0, 0))
 
+    def tag(self, status=OpinionReviewStatus.TEXT_REVIEW_DONE):
+        """Give the opinion an approved text and its spans."""
+        key = "processing/1/jobs/opinions/412.0/approved/r0.e0.j1.t1.json"
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=status,
+            approved_text_key=key,
+            tagged_text_key=key,
+            tag_key="processing/1/jobs/opinions/412.0/tag/spans.json",
+        )
+
+    def xml_url(self):
+        return reverse(
+            "opinion_final_xml",
+            kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+        )
+
+    def test_a_tagged_opinion_links_its_final_xml(self):
+        self.tag()
+
+        response = self.client.get(
+            reverse("opinion_list"),
+            {"status": OpinionReviewStatus.TEXT_REVIEW_DONE},
+        )
+
+        self.assertContains(response, self.xml_url())
+
+    def test_an_opinion_with_no_spans_links_no_final_xml(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
+    def test_a_reopened_opinion_links_no_final_xml(self):
+        """The rule of the review page's link: the text review is done."""
+        self.tag(status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW)
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertNotContains(response, self.xml_url())
+
     def test_the_badge_costs_no_query_per_row(self):
         """The count is one grouped query, whatever the row count."""
         for index in range(4):
@@ -200,7 +350,9 @@ class TestOpinionList(ScanningTestCase):
                 first_printed_page=500 + index,
                 index_in_page=0,
             )
-        with self.assertNumQueries(7):
+        # One more than before: the scan filter's choices, one query
+        # over the scans whatever the row count.
+        with self.assertNumQueries(8):
             self.client.get(reverse("opinion_list"))
 
         for index in range(20):
@@ -209,7 +361,96 @@ class TestOpinionList(ScanningTestCase):
                 first_printed_page=600 + index,
                 index_in_page=0,
             )
-        with self.assertNumQueries(7):
+        with self.assertNumQueries(8):
+            self.client.get(reverse("opinion_list"))
+
+    def pictured(self):
+        """A run, and the opinion over its pages 3 to 5 (indexes 2-4)."""
+        run = ApplyRun.objects.create(scan=self.scan, number=1)
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            apply_run=run, start_page_index=2, end_page_index=4
+        )
+        return run
+
+    def test_the_pictures_column_counts_review_2s_image_boxes(self):
+        run = self.pictured()
+        for page in (2, 4):
+            model_row(
+                self.scan,
+                apply_run=run,
+                page_index=page,
+                label="IMAGE",
+                label_id=int(Label.IMAGE),
+            )
+        # Outside the span, another label, and a box the curator
+        # dismissed: none of them is a picture of this opinion.
+        model_row(
+            self.scan, apply_run=run, page_index=5, label="IMAGE", label_id=8
+        )
+        model_row(self.scan, apply_run=run, page_index=3)
+        model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+            active=False,
+        )
+
+        response = self.client.get(reverse("opinion_list"))
+
+        row = response.context["page_obj"][0]
+        self.assertEqual(row.pictures, 2)
+        self.assertContains(response, ">Pictures</th>")
+
+    def test_a_junk_box_is_no_picture(self):
+        """The column counts the glue's pictures: a box the junk rule
+        drops from every screen is not one."""
+        run = self.pictured()
+        row = model_row(
+            self.scan,
+            apply_run=run,
+            page_index=3,
+            label="IMAGE",
+            label_id=int(Label.IMAGE),
+        )
+
+        def drop(entries):
+            entries[:] = [e for e in entries if e.get("id") != row.pk]
+            return {row.pk}, 0
+
+        with patch("scanning.services.drop_junk_entries", side_effect=drop):
+            response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_an_opinion_with_no_picture_shows_a_dash(self):
+        self.pictured()
+
+        response = self.client.get(reverse("opinion_list"))
+
+        self.assertEqual(response.context["page_obj"][0].pictures, 0)
+
+    def test_the_pictures_cost_one_query_per_page(self):
+        run = self.pictured()
+        for index in range(4):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=500 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(9):
+            self.client.get(reverse("opinion_list"))
+
+        for index in range(20):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=600 + index,
+                index_in_page=0,
+                apply_run=run,
+            )
+        with self.assertNumQueries(9):
             self.client.get(reverse("opinion_list"))
 
 
@@ -408,6 +649,18 @@ class TestOpinionReview(ScanningTestCase):
         self.assertEqual(response.context["open_to_check"], 2)
         self.assertEqual(response.context["open_warnings"], 1)
         self.assertContains(response, "Check these before the approval")
+        # The walk buttons count their cards through the cards
+        # endpoint: the numbers above are findings, and a page makes
+        # a card per open word or gap.
+        self.assertEqual(
+            response.context["cards_url"],
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": self.scan.pk, "opinion_pk": self.opinion.pk},
+            ),
+        )
+        self.assertContains(response, 'data-card-level="blocking"')
+        self.assertContains(response, 'data-card-level="warning"')
 
     def test_the_back_link_keeps_the_filters(self):
         response = self.client.get(self.url, {"scan": self.scan.pk})

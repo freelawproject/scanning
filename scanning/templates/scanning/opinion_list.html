@@ -9,7 +9,8 @@
   which the view stamps after the pagination from
   opinions.finding_counts: one grouped query for the 50 rows of this
   page, the badge rule of the scan list. The blocking count is the gate
-  of the approval of the text (#375).
+  of the approval of the text (#375). pictures is the count of review
+  2's IMAGE boxes in the opinion's pages (opinions.picture_counts).
 {% endcomment %}
 
 {% block title %}Opinions - FLP Scanning Portal{% endblock %}
@@ -27,8 +28,16 @@
 <!-- Filters -->
 <div class="card mb-6">
   <form method="get">
-    {% if current_scan %}<input type="hidden" name="scan" value="{{ current_scan }}">{% endif %}
     <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-scan" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Scanned volume</label>
+        <select id="filter-scan" name="scan" class="input-text w-full" title="One scanned volume: the opinions of that scan alone">
+          <option value="">All volumes</option>
+          {% for value, label in scan_choices %}
+          <option value="{{ value }}" {% if current_scan == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div class="flex-1">
         <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
         <select id="filter-reporter" name="reporter" class="input-text w-full">
@@ -67,6 +76,9 @@
         {% else %}
         <span class="btn-primary text-sm opacity-50 cursor-not-allowed" title="Filter to one scan or one volume first: the blocking review takes one volume at a time"><i class="fa-solid fa-list-check"></i> Review all blocking</span>
         {% endif %}
+        {% if warning_review_url %}
+        <a href="{{ warning_review_url }}" class="btn-outline text-sm" title="Walk every open warning card of this volume, one after the next; a warning gates nothing"><i class="fa-solid fa-list-check"></i> Review all warnings</a>
+        {% endif %}
         <a href="{% url 'opinion_list' %}" class="btn-ghost text-sm"><i class="fa-solid fa-xmark"></i> Clear filters</a>
         <button type="submit" class="btn-outline"><i class="fa-solid fa-magnifying-glass"></i> Filter</button>
       </div>
@@ -84,6 +96,7 @@
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Printed pages</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
         <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Warnings</th>
+        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider" title="The IMAGE boxes of the redaction review in this opinion's pages">Pictures</th>
         <th class="px-4 py-3"></th>
       </tr>
     </thead>
@@ -121,7 +134,13 @@
           <span class="text-gray-400">&mdash;</span>
           {% endif %}
         </td>
+        <td class="px-4 py-3 text-sm whitespace-nowrap">
+          {% if opinion.pictures %}<span class="font-medium" title="IMAGE boxes of the redaction review"><i class="fa-regular fa-image mr-1"></i>{{ opinion.pictures }}</span>{% else %}<span class="text-gray-400">&mdash;</span>{% endif %}
+        </td>
         <td class="px-4 py-3 text-sm text-right">
+          {% if opinion.final_xml_ready %}
+          <a href="{% url 'opinion_final_xml' pk=opinion.scan.pk opinion_pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1 mr-1" title="Open the final XML of this opinion"><i class="fa-solid fa-code"></i> XML</a>
+          {% endif %}
           <a href="{% url 'opinion_review' pk=opinion.pk %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" class="btn-outline text-xs px-2 py-1">Review</a>
         </td>
       </tr>

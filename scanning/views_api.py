@@ -41,6 +41,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionScan,
     Redaction,
+    ReviewDismissal,
     Scan,
     Stage,
     Status,
@@ -54,19 +55,31 @@ from scanning.utils import (
 logger = logging.getLogger(__name__)
 
 
-def _rebuild_findings(scan: Scan) -> None:
+def _rebuild_findings(
+    scan: Scan,
+    pages: set[int] | None = None,
+    labels: frozenset[str] | set[str] | None = None,
+) -> None:
     """Write the review-2 findings again after a curator's write (#240 PR D).
 
     Every finding is derived from the detection, boundary and redaction
     rows, so the endpoint that changed a row is what keeps the cards
-    true. A few queries over label-filtered rows.
+    true. A write that names a page passes it and the labels of the
+    boxes it touched, and the page passes run over that page alone
+    (``findings.PAGE_CHECKS``) while the volume's key and bracket
+    passes run only for a label they read (``findings._structural``,
+    ``findings.BRACKET_LABELS``); a boundary write passes nothing,
+    because the boundaries cross pages.
 
     :param scan: The scan.
+    :param pages: The page indexes the write touched, or None.
+    :param labels: The labels of the boxes the write wrote or
+        dismissed; an empty set for a redaction that dismissed none.
     :return: None.
     """
     from scanning import findings
 
-    findings.rebuild(scan)
+    findings.rebuild(scan, pages=pages, labels=labels)
 
 
 #: The 409 of every write of review 2 before that review is open
@@ -193,6 +206,47 @@ MOVED_OVER_COMPUTED_MESSAGE = (
 MOVED_OVER_MODEL_MESSAGE = (
     "The box was moved. Your box replaces the model box."
 )
+#: Appended to the add's and the move's line when a whiteout covered
+#: model boxes, which the write dismissed (``detections
+#: .dismiss_under_whiteout``). Each has its own Undo.
+DISMISSED_UNDER_WHITEOUT_MESSAGE = (
+    " {count} model box{plural} under the whiteout {verb} dismissed."
+)
+
+
+def _dismissed_under(
+    scan: Scan, row, user
+) -> tuple[list[int], frozenset[str], str]:
+    """Dismiss the model boxes a whiteout covers, for the two writers.
+
+    :param scan: The scan.
+    :param row: The whiteout as written.
+    :param user: The curator.
+    :returns: The ids dismissed, their labels (what the rebuild is
+        told the write touched: a whiteout over a key icon changes the
+        key cards), and the line to append to the answer (empty when
+        nothing was).
+    :rtype: tuple[list[int], frozenset[str], str]
+    """
+    from scanning import detections
+
+    rows = detections.dismiss_under_whiteout(scan, row, user)
+    dismissed = [d.pk for d in rows]
+    labels = frozenset(d.label for d in rows)
+    if not dismissed:
+        return [], labels, ""
+    count = len(dismissed)
+    return (
+        dismissed,
+        labels,
+        DISMISSED_UNDER_WHITEOUT_MESSAGE.format(
+            count=count,
+            plural="" if count == 1 else "es",
+            verb="was" if count == 1 else "were",
+        ),
+    )
+
+
 DISMISSED_REDACTION_MESSAGE = "The box was dismissed. Nothing was deleted."
 WITHDRAWN_REDACTION_MESSAGE = "The box was withdrawn. Nothing was deleted."
 RESTORED_REDACTION_MESSAGE = "The box came back."
@@ -226,6 +280,23 @@ DISMISSED_DETECTION_MESSAGE = (
 )
 WITHDRAWN_DETECTION_MESSAGE = (
     "The detection was withdrawn. Nothing was deleted."
+)
+#: The Undo of a dismissal of a model box (``restore_detection``).
+RESTORED_DETECTION_MESSAGE = "The box is back. Nothing was deleted."
+#: ``restore_detection`` on a box no dismissal stands on.
+DETECTION_NOT_DISMISSED_MESSAGE = (
+    "This box was not dismissed, so there is nothing to take back."
+)
+#: ``restore_detection`` on a hand-drawn row (409).
+RESTORE_MODEL_ONLY_MESSAGE = (
+    "Only a dismissed model box comes back this way. A box you drew is "
+    "withdrawn and drawn again."
+)
+#: ``restore_detection`` on a model box a move or an approval replaced
+#: (409): the box the curator sees holds it now.
+RESTORE_REPLACED_MESSAGE = (
+    "This box was moved or approved, so the box you see holds it now. "
+    "Withdraw that box and the model's comes back."
 )
 ADDED_BOUNDARY_MESSAGE = "The opinion boundary was added."
 MOVED_BOUNDARY_MESSAGE = "The opinion boundary was moved."
@@ -325,6 +396,10 @@ EDIT_QUOTE_SAVED_MESSAGE = {
     "none": "The block is not a blockquote now.",
     "span": "The selected text is a blockquote now.",
 }
+EDIT_DROP_SAVED_MESSAGE = (
+    "The block was taken out of the text. Its Undo is in the list of "
+    "the blocks taken out, under the page's label."
+)
 EDIT_MOVE_SAVED_MESSAGE = {
     "up": "The block was moved up.",
     "down": "The block was moved down.",
@@ -382,6 +457,14 @@ EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
 )
 EDIT_QUOTE_TABLE_MESSAGE = "A table holds no blockquote."
+#: A picture of the text (#463) takes a move alone: it is a curated
+#: IMAGE box of review 2, so it has no text, it is no footnote and no
+#: quote, and it is not for review 3 to take out.
+EDIT_FIGURE_MESSAGE = (
+    "A picture takes no edit but a move (Move up or Move down). It is "
+    "an IMAGE box of the redaction review: dismiss it there and compute "
+    "again."
+)
 EDIT_QUOTE_NO_WORD_MESSAGE = (
     "Select at least one word of the block, then save."
 )
@@ -431,6 +514,10 @@ APPROVE_REFUSED_MESSAGES = {
     "moved": (
         "The text or the findings of this opinion changed during the "
         "approval. The page was loaded again: look and approve again."
+    ),
+    "figures": (
+        "A picture of this opinion is not cut yet, so the approved text "
+        "was not written. Wait a minute and approve again."
     ),
 }
 REOPENED_TEXT_MESSAGE = (
@@ -502,8 +589,9 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON response with a list of detection dicts.
     """
     from scanning import review_states, yolo
+    from scanning.services import drop_junk_entries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if review_states.preview_only(scan):
         try:
             return JsonResponse(yolo.preview_entries(scan), safe=False)
@@ -540,9 +628,22 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
             # "approve" is a row written before #414; since then an
             # approval is a hand-drawn row (``manual``) over a dismiss.
             "decision": d.decision.kind if d.decision_id else None,
+            # Read by the junk rule below, and not sent.
+            "found_by": (
+                d.found_by
+                if d.found_by and d.model_name != Detection.ModelName.MANUAL
+                else None
+            ),
         }
         for d in dets
     ]
+    # The blot along the top or the bottom edge the model boxed as a key
+    # icon or a headnote is not drawn, and a box that runs down onto the
+    # bottom one is cut at the band top: the compute reads the boxes that way
+    # (``services.detection_entries``), so a page must show them that way.
+    drop_junk_entries(data)
+    for entry in data:
+        del entry["found_by"]
     return JsonResponse(data, safe=False)
 
 
@@ -561,7 +662,7 @@ def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries, review_states
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     if review_states.preview_only(scan):
         # The pairing is the compute's own output (#388): a row here
         # belongs to a run the preview does not show.
@@ -615,7 +716,7 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -663,7 +764,7 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -746,7 +847,7 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries, detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -835,7 +936,7 @@ def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import redactions, review_states
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if review_states.preview_only(scan):
         # A preview shows the model's boxes and no measured geometry
         # (#388), including the rows a reopened volume left behind.
@@ -911,7 +1012,7 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -933,9 +1034,15 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
         row = redactions.add(scan, page_index, bbox, fill, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
-    _rebuild_findings(scan)
+    dismissed, labels, note = _dismissed_under(scan, row, request.user)
+    _rebuild_findings(scan, {row.page_index}, labels)
     return JsonResponse(
-        {"status": "ok", "id": row.pk, "message": SAVED_REDACTION_MESSAGE}
+        {
+            "status": "ok",
+            "id": row.pk,
+            "dismissed": dismissed,
+            "message": SAVED_REDACTION_MESSAGE + note,
+        }
     )
 
 
@@ -957,7 +1064,7 @@ def move_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -977,16 +1084,22 @@ def move_redaction(
         holder = redactions.move(scan, row, bbox, request.user)
     except redactions.UnaddressableRedaction:
         return _redaction_error(REDACTION_UNADDRESSABLE_MESSAGE, 409)
-    _rebuild_findings(scan)
+    # A whiteout pulled over model boxes dismisses them, one decision
+    # each, so a bleed-through page is one drag and not a drag plus a
+    # click on every box it covers.
+    dismissed, labels, note = _dismissed_under(scan, holder, request.user)
+    _rebuild_findings(scan, {row.page_index, holder.page_index}, labels)
     return JsonResponse(
         {
             "status": "ok",
             "id": holder.pk,
+            "dismissed": dismissed,
             "message": (
                 MOVED_BOX_MESSAGE
                 if holder.pk == row.pk
                 else MOVED_OVER_COMPUTED_MESSAGE
-            ),
+            )
+            + note,
         }
     )
 
@@ -1006,7 +1119,7 @@ def dismiss_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     row = _redaction_of(scan, redaction_id)
@@ -1014,7 +1127,7 @@ def dismiss_redaction(
         return _redaction_error("Redaction not found", 404)
     human = row.origin == Redaction.Origin.HUMAN
     redactions.dismiss(scan, row, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, frozenset())
     return JsonResponse(
         {
             "status": "ok",
@@ -1041,14 +1154,14 @@ def restore_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     row = _redaction_of(scan, redaction_id)
     if row is None:
         return _redaction_error("Redaction not found", 404)
     restored = redactions.restore(scan, row, request.user)
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, frozenset())
     return JsonResponse(
         {
             "status": "ok",
@@ -1122,7 +1235,7 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
         takes no compute (``services.REDACTION_COMPUTE_STATUSES``: a
         closed review 2 is one, and the way back is the re-queue).
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse(
             {"status": "error", "message": NO_DETECTIONS_MESSAGE}, status=400
@@ -1170,7 +1283,7 @@ def rerun_opinion_ensemble(
     from scanning import ensemble, opinion_ocr, s3_sync
     from scanning.models import OpinionReviewStatus
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE:
         return JsonResponse(
@@ -1265,7 +1378,7 @@ def _opinion_finding_or_refusal(
     """
     from scanning.models import OpinionFinding, OpinionReviewStatus
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     finding = get_object_or_404(OpinionFinding, pk=finding_pk, opinion=opinion)
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
@@ -1402,6 +1515,7 @@ def _edit_context(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -1513,8 +1627,10 @@ def _build_after_edit(
 
     reason = ""
     for _attempt in range(2):
-        fresh = Opinion.objects.select_related("scan", "apply_run").get(
-            pk=opinion.pk
+        fresh = (
+            Opinion.objects.select_related("scan", "apply_run")
+            .defer(*Scan.large_fields("scan__"))
+            .get(pk=opinion.pk)
         )
         try:
             ensemble.rerun(fresh)
@@ -1582,7 +1698,10 @@ def edit_opinion_text(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
-    if group.get("human"):
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
+    human = group.get("human") or {}
+    if human and group.get("level") is None:
         return _edit_refusal(request, EDIT_HUMAN_ALREADY_MESSAGE)
     if group.get("level") is None:
         return _edit_refusal(request, EDIT_UNANIMOUS_MESSAGE)
@@ -1601,6 +1720,21 @@ def edit_opinion_text(
         )
     if text == group["text"]:
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
+    # The span the person judged, in the text they saw: the word card
+    # of the blocking review sends its word's, and the build then
+    # keeps the block's other open words open (``ensemble._kept_open``);
+    # the block card and the edit box send none, a whole-block
+    # judgement. A gap card's span is empty: the words go in there.
+    span = body.get("span")
+    if span is not None and (
+        not isinstance(span, list)
+        or len(span) != 2
+        or not all(
+            isinstance(v, int) and not isinstance(v, bool) for v in span
+        )
+        or not 0 <= span[0] <= span[1] <= len(group["text"])
+    ):
+        return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
     edit = opinion_edits.supersede(
         opinion,
         request.user,
@@ -1610,8 +1744,13 @@ def edit_opinion_text(
         page_in_opinion=page["page_in_opinion"],
         box_pt=group["box_pt"],
         section=group.get("section") or ensemble.BODY,
-        base_text=group["text"],
+        # A second edit on a block a person wrote, for an open word
+        # the first left as it was, judges the engines' text the first
+        # judged, and supersedes it: the build compares ``base_text``
+        # with the engines' reading, never with the person's.
+        base_text=human.get("base_text") or group["text"],
         text=text,
+        span=span,
         glue_revision=opinion.glue_revision,
     )
     logger.info(
@@ -1646,7 +1785,7 @@ def edit_opinion_section(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: ``{status, message}``; 404, 400 or 409 on a refusal.
     """
-    from scanning import ensemble, opinion_edits
+    from scanning import ensemble, markup, opinion_edits
     from scanning.models import OpinionEdit
 
     context = _edit_context(request, pk, opinion_pk)
@@ -1657,6 +1796,8 @@ def edit_opinion_section(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     section = body.get("section")
     if section not in (ensemble.BODY, ensemble.FOOTNOTES):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
@@ -1731,6 +1872,8 @@ def edit_opinion_blockquote(
     if isinstance(target, JsonResponse):
         return target
     page, group, address = target
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
     quoted = body.get("quoted")
     span = body.get("span")
     if not isinstance(quoted, bool):
@@ -1789,6 +1932,71 @@ def edit_opinion_blockquote(
         span or "",
     )
     return _build_after_edit(request, opinion, EDIT_QUOTE_SAVED_MESSAGE[said])
+
+
+@login_required
+@require_POST
+def edit_opinion_drop(
+    request: HttpRequest, pk: int, opinion_pk: int
+) -> JsonResponse:
+    """Say that one block of an opinion is not text.
+
+    The bleed-through of the page behind, a stray mark, the label of a
+    picture: the engines read words there, no redaction covers them,
+    and the vote cannot settle what no page prints. A person takes the
+    block out. The build drops it with a reason of its own
+    (``ensemble.DROP_HUMAN``) and the edit on the drop, the approved
+    text leaves it out, and the Undo is the one of every edit
+    (``withdraw_opinion_edit``), offered on the page's list of the
+    blocks taken out, because a dropped block has no node to lock. One
+    standing edit per block.
+
+    :param request: The HTTP request.
+    :param pk: Scan primary key.
+    :param opinion_pk: The ``Opinion`` primary key.
+    :return: ``{status, message}``; 404, 400 or 409 on a refusal.
+    """
+    from scanning import ensemble, markup, opinion_edits
+    from scanning.models import OpinionEdit
+
+    context = _edit_context(request, pk, opinion_pk)
+    if isinstance(context, JsonResponse):
+        return context
+    opinion, body, document = context
+    target = _edit_target(request, document, body)
+    if isinstance(target, JsonResponse):
+        return target
+    page, group, address = target
+    # A picture takes no drop (#463): it is a box a person kept in
+    # review 2, and the words under it stay out whatever review 3 says.
+    if group.get("kind") == markup.FIGURE:
+        return _edit_refusal(request, EDIT_FIGURE_MESSAGE)
+    row = opinion_edits.supersede(
+        opinion,
+        request.user,
+        kind=OpinionEdit.Kind.DROP,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=group.get("section") or ensemble.BODY,
+        glue_revision=opinion.glue_revision,
+    )
+    logger.info(
+        "%s of scan %s: %s took block %s of page %s out of the text as "
+        "not text: %r",
+        opinion,
+        pk,
+        request.user,
+        group["id"],
+        page["page_in_opinion"],
+        (group.get("text") or "")[:80],
+    )
+    # The id, for the Undo of the blocking review, the rule of the
+    # text edit.
+    return _build_after_edit(
+        request, opinion, EDIT_DROP_SAVED_MESSAGE, {"edit_id": row.pk}
+    )
 
 
 @login_required
@@ -1887,6 +2095,7 @@ def withdraw_opinion_edit(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -1951,6 +2160,7 @@ def approve_opinion_text(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -2055,6 +2265,7 @@ def start_caselaw_tagger(
     opinion = (
         Opinion.objects.filter(pk=opinion_pk, scan_id=pk)
         .select_related("scan")
+        .defer(*Scan.large_fields("scan__"))
         .first()
     )
     if opinion is None:
@@ -2085,6 +2296,11 @@ def start_caselaw_tagger(
         )
         return _edit_refusal(request, TAG_FAILED_MESSAGE.format(reason=exc))
     message = TAG_STARTED_MESSAGE
+    if rows and rows[0].status == JobStatus.PENDING:
+        from scanning import tasks
+        from scanning.models import JobProvider
+
+        tasks.submit_soon(JobProvider.RUNPOD)
     if rows and rows[0].status in (JobStatus.COMPLETED, JobStatus.CONSUMED):
         # A result that is paid for already: carried from an earlier
         # run of the same text, a glue the tick gave up on, or a second
@@ -2139,7 +2355,7 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if scan.status not in (
         Status.REDACTION_REVIEW_DONE,
         Status.PENDING_REVIEW,
@@ -2169,7 +2385,7 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     """
     from scanning.services import refresh_volume_queue_status_for_scan
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
 
     if scan.stage != Stage.APPROVED:
         messages.error(
@@ -2329,7 +2545,7 @@ def apply_rect_to_opinion(
     :param opinion_pk: OpinionScan primary key.
     :return: JSON response confirming the operation.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
@@ -2365,7 +2581,7 @@ def serve_redacted_pdf(
     :param pk: Scan primary key.
     :return: File response streaming the PDF.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
 
     # 1. Try the explicit redacted PDF path
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
@@ -2421,7 +2637,7 @@ def serve_ocr_results(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with a list of OCR result dicts.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     if scan.ocr_results:
         return JsonResponse(scan.ocr_results, safe=False)
     return JsonResponse([], safe=False)
@@ -2484,7 +2700,7 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2519,22 +2735,40 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
 def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """Take back the dismissal of a finding: the card comes back.
 
-    :param request: The HTTP request (JSON body with ``issue_id``).
+    By ``issue_id``, the card as the page holds it, or by
+    ``dismissal_id``, the row ``dismiss_finding`` answered: a finding's
+    pk dies at the next rebuild, which every later write runs, while a
+    dismissal is never deleted, so a page that keeps an Undo across
+    other writes (the card review) sends the dismissal.
+
+    :param request: The HTTP request (JSON body with ``issue_id`` or
+        ``dismissal_id``).
     :param pk: Scan primary key.
     :return: ``{status, restored, message}``.
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
     if isinstance(data, JsonResponse):
         return data
-    row = _finding_or_404(scan, data)
-    if isinstance(row, JsonResponse):
-        return row
-    restored = findings.restore(scan, row, request.user)
+    if data.get("dismissal_id") is not None:
+        rows = ReviewDismissal.objects.filter(
+            pk=data["dismissal_id"], scan=scan
+        )
+        if not rows.exists():
+            return JsonResponse(
+                {"status": "error", "message": "Dismissal not found"},
+                status=404,
+            )
+        restored = bool(findings.withdraw(rows, request.user))
+    else:
+        row = _finding_or_404(scan, data)
+        if isinstance(row, JsonResponse):
+            return row
+        restored = findings.restore(scan, row, request.user)
     return JsonResponse(
         {
             "status": "ok",
@@ -2564,7 +2798,7 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2610,7 +2844,9 @@ def _findings_payload(scan: Scan, request: HttpRequest) -> dict:
     """
     from scanning import findings
 
-    context = findings.viewer_groups(scan)
+    # The scan rides along for the link to the card review
+    # (``card_review``), which the page's own context carries already.
+    context = {**findings.viewer_groups(scan), "scan": scan}
     return {
         "html": render_to_string(
             "scanning/_review_findings.html", context, request=request
@@ -2630,7 +2866,7 @@ def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: ``{html, open, stale}``.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return JsonResponse(_findings_payload(scan, request))
 
 
@@ -2670,7 +2906,7 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan, approved_ok=True)) is not None:
         return refusal
     if scan.status in BUSY_STATUSES:
@@ -2709,7 +2945,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2730,7 +2966,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -2739,6 +2975,79 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 WITHDRAWN_DETECTION_MESSAGE
                 if manual
                 else DISMISSED_DETECTION_MESSAGE
+            ),
+        }
+    )
+
+
+@login_required
+@require_POST
+def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
+    """Take back the dismissal of a model box: the box is live again.
+
+    The Undo of :func:`delete_detection` on a model row, which the card
+    review offers on a box it took out (``card_review``). The standing
+    ``deactivate`` decision is withdrawn (``detections.withdraw``), the
+    row gets its own value back, and the findings are written again. A
+    hand-drawn row has no dismissal to take back: it is withdrawn and
+    drawn again, so the request is refused.
+
+    :param request: The HTTP request (JSON body with ``detection_id``
+        (int, DB pk)).
+    :param pk: Scan primary key.
+    :return: ``{status, restored, message}``; 404 when the row is gone,
+        409 for a hand-drawn row.
+    """
+    from scanning import detections
+
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
+    if (refusal := _refuse_closed_review(scan)) is not None:
+        return refusal
+    data = _parse_json_body(request)
+    if isinstance(data, JsonResponse):
+        return data
+    row = Detection.objects.filter(
+        pk=data.get("detection_id"), scan=scan
+    ).first()
+    if row is None:
+        return JsonResponse(
+            {"status": "error", "message": "Detection not found"}, status=404
+        )
+    if row.model_name == Detection.ModelName.MANUAL:
+        return JsonResponse(
+            {"status": "error", "message": RESTORE_MODEL_ONLY_MESSAGE},
+            status=409,
+        )
+    restored = 0
+    with transaction.atomic():
+        # The lock first, the decision after it, in its own query
+        # (``detections.standing_decision``).
+        row = Detection.objects.select_for_update(of=("self",)).get(pk=row.pk)
+        decision = detections.standing_decision(row)
+        if (
+            decision is not None
+            and decision.kind == DetectionDecision.Kind.DEACTIVATE
+        ):
+            # A move or an approval is a dismiss plus a hand-drawn row
+            # that names it (#414): withdrawing the dismiss alone would
+            # put the model's box back beside that row.
+            if Detection.objects.live().filter(replaces=decision).exists():
+                return JsonResponse(
+                    {"status": "error", "message": RESTORE_REPLACED_MESSAGE},
+                    status=409,
+                )
+            restored = detections.withdraw(
+                DetectionDecision.objects.filter(pk=decision.pk), request.user
+            )
+    _rebuild_findings(scan, {row.page_index}, {row.label})
+    return JsonResponse(
+        {
+            "status": "ok",
+            "restored": restored,
+            "message": (
+                RESTORED_DETECTION_MESSAGE
+                if restored
+                else DETECTION_NOT_DISMISSED_MESSAGE
             ),
         }
     )
@@ -2764,7 +3073,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2788,7 +3097,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
             )
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -2855,7 +3164,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
 
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     det = _parse_json_body(request)
@@ -2909,7 +3218,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
                 holder = detections.approve_model_row(scan, near, request.user)
             except detections.UnaddressableDetection:
                 return _unaddressable()
-        _rebuild_findings(scan)
+        _rebuild_findings(scan, {near.page_index}, {near.label})
         return JsonResponse(
             {
                 "status": "ok",
@@ -2933,7 +3242,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
         )
     except detections.UnaddressableDetection:
         return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -2987,7 +3296,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -3005,7 +3314,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
             holder = detections.approve_model_row(scan, row, request.user)
         except detections.UnaddressableDetection:
             return _unaddressable()
-    _rebuild_findings(scan)
+    _rebuild_findings(scan, {row.page_index}, {row.label})
     return JsonResponse(
         {
             "status": "ok",
@@ -3026,7 +3335,7 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the bake result.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     if not Path(scan.output_dir).is_dir():
@@ -3080,7 +3389,7 @@ def export_pdf(
     """
     from scanning import apply
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # Resolve the source PDF before the temp file exists, so a missing
     # original is a clean 404 rather than a leaked temp file.
     original = local_original_pdf(scan)

@@ -500,7 +500,25 @@ class TestTheAlignment(TestCase):
         self.assertTrue(groups[0]["weak"])
         self.assertLess(groups[0]["alignment_iou"], ensemble.WEAK_IOU)
 
-    def test_a_group_carries_the_exclusion_of_its_members(self):
+    def test_a_group_is_out_when_no_engine_read_it_clean(self):
+        excluded = {"reason": "redaction"}
+        units = [
+            unit("dots_mocr", 0, (36, 108, 288, 324), "alpha", excluded, 1.0),
+            unit(
+                "mistral_ocr", 0, (36, 108, 288, 324), "alpha", excluded, 0.5
+            ),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(groups[0]["excluded"])
+        self.assertEqual(groups[0]["reason"], "redaction")
+        self.assertTrue(groups[0]["partial"])
+
+    def test_a_reading_the_verdict_took_is_silent_beside_a_clean_one(self):
+        """One engine's unit is under a box and the other's is clean.
+        The group stays on the clean reading, and the excluded engine
+        has no word in it: the vote names it silent."""
         units = [
             unit("dots_mocr", 0, (36, 108, 288, 324), "alpha"),
             unit(
@@ -515,9 +533,313 @@ class TestTheAlignment(TestCase):
 
         groups = ensemble.align_page(units, WIDTH, HEIGHT)
 
-        self.assertTrue(groups[0]["excluded"])
+        self.assertFalse(groups[0]["excluded"])
         self.assertEqual(groups[0]["reason"], "redaction")
-        self.assertTrue(groups[0]["partial"])
+        self.assertTrue(groups[0]["engines"]["mistral_ocr"]["excluded"])
+        self.assertEqual(groups[0]["engines"]["mistral_ocr"]["text"], "")
+        self.assertEqual(groups[0]["engines"]["dots_mocr"]["text"], "alpha")
+        self.assertEqual(
+            ensemble.resolve(groups[0])["silent"], ["mistral_ocr"]
+        )
+
+    def test_the_clean_members_of_an_engine_are_its_reading(self):
+        """Mistral draws the sequence number its own box, covered
+        whole, and the caption beside it: its reading is the caption,
+        with the number out of it."""
+        outside = {"reason": "outside"}
+        units = [
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+            unit("dots_mocr", 0, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        # The number's box touches no other, so it is a group of its
+        # own, excluded; the caption is the other, read alike.
+        self.assertEqual(
+            sorted(group["excluded"] for group in groups), [False, True]
+        )
+        caption = next(group for group in groups if not group["excluded"])
+        mistral = caption["engines"]["mistral_ocr"]
+        self.assertEqual(mistral["text"], "CITY v. COSME")
+        self.assertEqual(mistral["ids"], [1])
+        self.assertEqual(
+            ensemble.resolve(caption)["agreement"], ensemble.UNANIMOUS
+        )
+
+    def test_a_reading_a_box_covers_in_part_keeps_what_it_did_not_hide(self):
+        """dots.mocr folds the "2" into the caption block and the mask
+        takes the "2". Mistral and Surya drew it its own box, covered
+        whole, so the thing under the box is known: it comes out of the
+        dots.mocr reading, and the three engines vote on the caption."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME\nNo. 1",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit(
+                "mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME\nNo. 1"
+            ),
+            unit("surya", 0, (148, 106, 172, 120), "2", outside, 1.0),
+            unit("surya", 1, (36, 120, 288, 200), "CITY v. COSME\nNo. 1"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(dots["text"], "CITY v. COSME No. 1")
+        self.assertEqual(dots["uncovered"], 1)
+        self.assertFalse(dots["excluded"])
+        read = ensemble.resolve(groups[0])
+        self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(read["silent"], [])
+
+    def test_a_thing_under_the_box_is_found_under_any_reading_of_it(self):
+        """Surya read the "2" as "Z": one thing, two readings, and the
+        one Mistral gave is in the dots.mocr text."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+            unit("surya", 0, (148, 106, 172, 120), "Z", outside, 1.0),
+            unit("surya", 1, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(dots["text"], "CITY v. COSME")
+        self.assertEqual(dots["uncovered"], 1)
+
+    def test_a_thing_the_reading_does_not_hold_keeps_it_silent(self):
+        """The other engine read "7" under the box and the dots.mocr
+        text holds no "7": nothing says what else the box hid, so the
+        reading stays out, and the group stays on the clean one."""
+        outside = {"reason": "outside"}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "2\nCITY v. COSME",
+                outside,
+                0.14,
+            ),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "7", outside, 1.0),
+            unit("mistral_ocr", 1, (36, 120, 288, 200), "CITY v. COSME"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertTrue(dots["excluded"])
+        self.assertEqual(dots["uncovered"], 0)
+        self.assertFalse(groups[0]["excluded"])
+
+    def test_a_block_over_a_covered_cell_keeps_its_other_cells(self):
+        """One engine reads two paragraphs as one block, and a
+        redaction covers the first whole in the other engine: the
+        block's reading loses that paragraph and votes on the second."""
+        redaction = {"reason": "redaction"}
+        units = [
+            unit(
+                "mistral_ocr",
+                0,
+                (36, 108, 288, 324),
+                "The first.\nThe second.",
+                redaction,
+                0.5,
+            ),
+            unit(
+                "dots_mocr",
+                0,
+                (36, 108, 288, 200),
+                "The first.",
+                redaction,
+                1.0,
+            ),
+            unit("dots_mocr", 1, (36, 210, 288, 324), "The second."),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        mistral = groups[0]["engines"]["mistral_ocr"]
+        self.assertEqual(mistral["text"], "The second.")
+        self.assertEqual(mistral["uncovered"], 1)
+        read = ensemble.resolve(groups[0])
+        self.assertEqual(read["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(read["text"], "The second.")
+
+    def test_a_reading_the_box_hid_whole_stays_out(self):
+        outside = {"reason": "outside"}
+        units = [
+            unit("dots_mocr", 0, (150, 100, 170, 120), "2", outside, 0.5),
+            unit("mistral_ocr", 0, (150, 108, 170, 118), "2", outside, 1.0),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(groups[0]["excluded"])
+        self.assertEqual(groups[0]["engines"]["dots_mocr"]["uncovered"], 0)
+
+    def test_words_another_engine_read_under_part_of_a_box_stay_out(self):
+        """One engine read the running head as one block, which the box
+        covers just short of whole; the others read the case name as a
+        block covered whole and "Conn. 51" as a block covered in part.
+        The case name is taken out of the long reading, and what is
+        left was read by the others only under a box, so it does not
+        ride out as clean text: the group is dropped."""
+        red = {"reason": "redaction", "rect_type": "PAGE_HEADER"}
+        units = [
+            unit(
+                "surya",
+                0,
+                (150, 40, 510, 54),
+                "MAYER v. BOARD Conn. 51",
+                red,
+                0.89,
+            ),
+            unit(
+                "dots_mocr", 0, (150, 41, 438, 52), "MAYER v. BOARD", red, 1.0
+            ),
+            unit("dots_mocr", 1, (457, 41, 508, 54), "Conn. 51", red, 0.57),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        kept = [g for g in groups if not g["excluded"]]
+        self.assertEqual(kept, [])
+        self.assertEqual(groups[0]["engines"]["surya"]["uncovered"], 0)
+
+    def test_a_speck_two_engines_read_does_not_outvote_a_partial_cover(self):
+        """dots.mocr reads a line a box covers in part; the other two
+        read only a speck there, under part of the same box. The specks
+        are no partial cover and no whole cover either, so the line
+        keeps its card."""
+        red = {"reason": "redaction", "rect_type": "EDITORIAL"}
+        box = (100, 100, 300, 112)
+        units = [
+            unit("dots_mocr", 0, box, "the end of the line", red, 0.6),
+            unit("mistral_ocr", 0, box, "a.", red, 0.6),
+            unit("surya", 0, box, "a.", red, 0.6),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(any(g["partial"] for g in groups))
+
+    def test_two_engines_reading_one_block_under_part_of_a_box_both_uncover(
+        self,
+    ):
+        """Two engines read the block as one, a box covering its first
+        line; the third read that line as a unit covered whole and the
+        rest as clean text. Each long reading is the other's twin, and
+        a twin holds the line the uncover takes out, so it is not a
+        leftover beside the box: both keep what the box did not hide."""
+        red = {"reason": "redaction", "rect_type": "HEADNOTE"}
+        block = (100, 100, 300, 130)
+        units = [
+            unit("mistral_ocr", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit("surya", 0, block, "HIDDEN LINE kept words", red, 0.45),
+            unit(
+                "dots_mocr", 0, (100, 100, 300, 112), "HIDDEN LINE", red, 1.0
+            ),
+            unit("dots_mocr", 1, (100, 116, 300, 130), "kept words"),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        group = next(g for g in groups if not g["excluded"])
+        self.assertEqual(group["engines"]["mistral_ocr"]["text"], "kept words")
+        self.assertEqual(group["engines"]["surya"]["text"], "kept words")
+
+    def test_without_a_partial_reading_the_rest_is_uncovered(self):
+        """The control: no other engine read the rest under a box, so
+        the long reading keeps what the box did not hide."""
+        red = {"reason": "redaction", "rect_type": "PAGE_HEADER"}
+        units = [
+            unit(
+                "surya",
+                0,
+                (150, 40, 510, 54),
+                "MAYER v. BOARD Conn. 51",
+                red,
+                0.89,
+            ),
+            unit(
+                "dots_mocr", 0, (150, 41, 438, 52), "MAYER v. BOARD", red, 1.0
+            ),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(groups[0]["engines"]["surya"]["text"], "Conn. 51")
+
+    def test_uncover_takes_the_run_with_its_whitespace_and_moves_the_marks(
+        self,
+    ):
+        em = {"start": 2, "end": 6, "kind": "em"}
+
+        self.assertEqual(
+            ensemble._uncover("2\nCITY v. COSME", [em], [{"readings": ["2"]}]),
+            ("CITY v. COSME", [{"start": 0, "end": 4, "kind": "em"}], ["2"]),
+        )
+        self.assertEqual(
+            ensemble._uncover(
+                "CITY v. COSME 944", [], [{"readings": ["944"]}]
+            ),
+            ("CITY v. COSME", [], ["944"]),
+        )
+        self.assertEqual(
+            ensemble._uncover("a b c", [], [{"readings": ["b"]}]),
+            ("a c", [], ["b"]),
+        )
+        self.assertIsNone(
+            ensemble._uncover(
+                "a b", [], [{"readings": ["b"]}, {"readings": ["c"]}]
+            )
+        )
+        self.assertIsNone(
+            ensemble._uncover("a b", [], [{"readings": ["a b"]}])
+        )
+
+    def test_a_run_that_occurs_twice_is_taken_by_the_place_of_its_box(self):
+        """The sequence number is a word of the caption too: the thing
+        at the top of the reading's box takes the first run, one at the
+        bottom the last, and with no box the first."""
+        box = [0.0, 0.0, 100.0, 100.0]
+        top = {"readings": ["2"], "box_pt": [40.0, 2.0, 60.0, 10.0]}
+        bottom = {"readings": ["2"], "box_pt": [40.0, 90.0, 60.0, 98.0]}
+
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [top], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("STATE v. 2 BROTHERS 2", [], [bottom], box)[0],
+            "STATE v. 2 BROTHERS",
+        )
+        self.assertEqual(
+            ensemble._uncover("2 STATE v. 2 BROTHERS", [], [bottom])[0],
+            "STATE v. 2 BROTHERS",
+        )
 
 
 # ── the reading order ────────────────────────────────────────────────
@@ -598,6 +920,351 @@ class TestTheVote(TestCase):
                 for index, text in enumerate(texts)
             ]
         )
+
+    def test_a_run_one_engine_alone_read_is_a_warning_gap(self):
+        """The star-page number one engine read: the other two read
+        nothing between ``a`` and ``included``, a majority on the gap.
+        The run stays out, the word after the gap says a gap is there,
+        and the block is a warning, not blocking."""
+        answer = ensemble.resolve(
+            self.read("a included b", "a included c", "a 1490 included b")
+        )
+
+        self.assertEqual(answer["agreement"], ensemble.VOTED)
+        self.assertEqual(answer["text"], "a included b")
+        included = next(t for t in answer["tokens"] if t["text"] == "included")
+        self.assertEqual(included.get("gap"), ensemble.WARNING)
+        self.assertFalse(included.get("low_confidence"))
+        self.assertEqual(answer["n_low_confidence"], 0)
+
+    def test_a_gap_no_two_engines_read_alike_is_blocking(self):
+        """``or`` against ``[c]ontract or`` against ``I contract or``:
+        three readings of the gap before ``or``, none alike. The text
+        keeps the base's, and the gap counts as a place no majority
+        settled, so the block blocks."""
+        group = self.read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+        answer = ensemble.resolve(group)
+
+        self.assertEqual(answer["text"], "two or more")
+        word = next(t for t in answer["tokens"] if t["text"] == "or")
+        self.assertEqual(word.get("gap"), ensemble.BLOCKING)
+        self.assertEqual(answer["n_low_confidence"], 1)
+        self.assertEqual(
+            ensemble.disagreement_level({**group, **answer}, 3),
+            ensemble.BLOCKING,
+        )
+
+    def test_a_word_a_majority_dropped_is_a_warning_gap_too(self):
+        """The other way round: the base read ``1490`` where the other
+        two read nothing. The majority drops it, as before, and now
+        the place is a warning gap, so the drop is shown and the word
+        can be put back."""
+        answer = ensemble.resolve(
+            self.read(
+                "two 1490 or more alpha",
+                "two or more beta",
+                "two or more gamma",
+            )
+        )
+
+        self.assertEqual(answer["text"], "two or more alpha")
+        word = next(t for t in answer["tokens"] if t["text"] == "or")
+        self.assertEqual(word.get("gap"), ensemble.WARNING)
+        # ``alpha`` alone is the no-majority place.
+        self.assertEqual(answer["n_low_confidence"], 1)
+
+    def test_a_word_the_vote_joined_keeps_its_flag_beside_an_answer(self):
+        """``0001065- 2021`` is one word to the vote (``_pairs``), shown
+        with its space. The person answered the card of ``x`` and left
+        it as it was. Aligned on the text split on whitespace it was
+        two words against one token, read as changed, and its card
+        closed unjudged; the carry splits the person's text as the
+        vote does, so the flag and the position stay."""
+        group = self.read(
+            "No. 0001065- 2021 x", "No. 0001065-2O21 y", "No. 0001065, 2021 z"
+        )
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["text"], "No. 0001065- 2021 x")
+        self.assertEqual(answer["n_low_confidence"], 2)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "No. 0001065- 2021 w", "span": [18, 19]},
+            group["engines"],
+        )
+
+        joined = next(
+            t for t in kept["tokens"] if t["text"] == "0001065- 2021"
+        )
+        self.assertTrue(joined.get("low_confidence"))
+        self.assertEqual(joined.get("position"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
+    def test_a_changed_neighbour_leaves_the_gap_open(self):
+        """The person answered the word before the gap, ``b`` to ``z``,
+        and never looked at the gap: it stays, on the same word, with
+        its base position. A replacement is not an insertion."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a z c d", "span": [2, 3]}, group["engines"]
+        )
+
+        c = next(t for t in kept["tokens"] if t["text"] == "c")
+        self.assertEqual(c.get("gap"), ensemble.WARNING)
+        self.assertEqual(c.get("gap_at"), 2)
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+
+    def test_the_word_after_the_gap_rewritten_keeps_the_gap(self):
+        """The gap is before ``or``; the person wrote ``of`` there. The
+        gap is still unjudged, so it lands on ``of`` and still blocks."""
+        group = self.read(
+            "two or more", "two [c]ontract or more", "two I contract or more"
+        )
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "two of more", "span": [4, 6]}, group["engines"]
+        )
+
+        of = next(t for t in kept["tokens"] if t["text"] == "of")
+        self.assertEqual(of.get("gap"), ensemble.BLOCKING)
+        self.assertEqual(of.get("gap_at"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
+    def test_the_last_word_rewritten_keeps_the_gap_after_it(self):
+        group = self.read("a b", "a c", "a b 1490")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a c", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertEqual(kept["tokens"][-1].get("gap_after"), ensemble.WARNING)
+
+    def test_a_word_the_engines_joined_is_no_gap(self):
+        """``con tract`` against ``contract`` twice: the head takes the
+        joined reading and the tail is dropped as its own, but it is
+        in the text inside the joined word, so the place is no gap."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("con tract"),
+            [ensemble._pairs("contract"), ensemble._pairs("contract")],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["contract"])
+        self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_two_answers_the_second_beside_the_gap_hold_together(self):
+        """The gap is filled first, then the word right before it is
+        answered: the gap stays filled, because the insertion is in
+        the text whatever its neighbour became."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        first = ensemble._human_read(
+            answer, {"text": "a b W c d", "span": [4, 4]}, group["engines"]
+        )
+        self.assertFalse(any("gap" in t for t in first["tokens"]))
+        self.assertEqual(
+            [t["text"] for t in first["tokens"] if t.get("majority")], ["b"]
+        )
+
+        second = ensemble._human_read(
+            answer, {"text": "a z W c d", "span": [2, 3]}, group["engines"]
+        )
+        self.assertFalse(any("gap" in t for t in second["tokens"]))
+        self.assertIsNone(ensemble.disagreement_level(second, 3))
+
+    def test_a_run_that_is_only_a_mark_makes_no_gap(self):
+        """A bullet, a section-break line or a rule one engine alone
+        read between two words has no key and reads as nothing, so
+        the place is no gap and no card; a word beside it still is."""
+        for mark in ("\u2022", "* * *", "____"):
+            answer = ensemble.resolve(
+                self.read("a b c x", "a b c y", f"a {mark} b c z")
+            )
+            self.assertFalse(
+                any("gap" in t or "gap_after" in t for t in answer["tokens"]),
+                mark,
+            )
+            self.assertEqual(answer["n_low_confidence"], 1, mark)
+        # Beside a real run the mark still counts as nothing: one engine
+        # read ``Z`` and the others nothing, a warning gap.
+        answer = ensemble.resolve(
+            self.read("a b x", "a Z b y", "a \u2022 b z")
+        )
+        b = next(t for t in answer["tokens"] if t["text"] == "b")
+        self.assertEqual(b.get("gap"), ensemble.WARNING)
+
+    def test_a_typed_fill_holds_when_the_neighbour_is_answered(self):
+        """The person typed a word no engine read into the gap, then
+        answered the word before it: the rewrite grew by a word, so the
+        gap is filled whatever the word is."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        second = ensemble._human_read(
+            answer, {"text": "a z TYPED c d", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertFalse(any("gap" in t for t in second["tokens"]))
+        self.assertIsNone(ensemble.disagreement_level(second, 3))
+
+    def test_a_fill_with_the_neighbour_deleted_is_a_fill(self):
+        """``W`` in the gap and ``b`` taken out in one stroke read as a
+        replacement of the same length: the new word is what an engine
+        read in the gap, so the gap is filled."""
+        group = self.read("a b c d", "a z c d", "a b W c d")
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer, {"text": "a W c d", "span": [2, 3]}, group["engines"]
+        )
+
+        self.assertFalse(any("gap" in t for t in kept["tokens"]))
+
+    def test_a_word_split_beside_a_gap_fills_nothing(self):
+        """``Mayer-Wittmann`` written as ``Mayer- Wittmann`` grew by a
+        word that is the same word split: the gap after it stays."""
+        group = self.read(
+            "a Mayer-Wittmann c d",
+            "a Mayer-Wittmann c e",
+            "a Mayer-Wittmann W c d",
+        )
+        answer = ensemble.resolve(group)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "a Mayer- Wittmann c d", "span": [2, 16]},
+            group["engines"],
+        )
+
+        c = next(t for t in kept["tokens"] if t["text"] == "c")
+        self.assertEqual(c.get("gap"), ensemble.WARNING)
+
+    def test_a_run_with_a_stray_mark_is_the_same_run(self):
+        """Two engines read ``smith`` where the base read nothing, one
+        of them with a bullet beside it: one reading of a majority, so
+        the word goes in and the bullet does not, and no gap."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("a b"),
+            [
+                ensemble._pairs("a smith b"),
+                ensemble._pairs("a smith \u2022 b"),
+            ],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["a", "smith", "b"])
+        self.assertTrue(tokens[1].get("inserted"))
+        self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
+        self.assertEqual(disputed, 1)
+
+    def test_a_run_after_the_last_word_marks_that_word(self):
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("a b"),
+            [ensemble._pairs("a b"), ensemble._pairs("a b 1490")],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["a", "b"])
+        self.assertEqual(tokens[-1].get("gap_after"), ensemble.WARNING)
+        self.assertNotIn("gap", tokens[-1])
+        self.assertEqual(disputed, 0)
+
+    def test_a_run_a_majority_read_goes_in_and_leaves_no_gap(self):
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("a b"),
+            [ensemble._pairs("a x b"), ensemble._pairs("a x b")],
+        )
+
+        self.assertEqual([t["text"] for t in tokens], ["a", "x", "b"])
+        self.assertTrue(tokens[1].get("inserted"))
+        self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
+
+    def test_a_gap_a_person_filled_is_answered_on_every_rebuild(self):
+        """A person put ``1490`` in the gap, or anything at all: the
+        word after it no longer follows the word before it, so the
+        gap is gone from their text whatever the vote says, and no
+        record of the answer is needed. A gap they left is still a
+        gap, and still a warning."""
+        group = self.read("a included b", "a included b", "a 1490 included b")
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+
+        filled = ensemble._human_read(
+            answer,
+            {"text": "a 1490 included b", "span": [2, 2]},
+            group["engines"],
+        )
+        self.assertFalse(
+            any("gap" in t or "gap_after" in t for t in filled["tokens"])
+        )
+        self.assertIsNone(ensemble.disagreement_level(filled, 3))
+
+        kept = ensemble._human_read(
+            answer, {"text": "a included b", "span": [2, 2]}, group["engines"]
+        )
+        included = next(t for t in kept["tokens"] if t["text"] == "included")
+        self.assertEqual(included.get("gap"), ensemble.WARNING)
+        self.assertEqual(
+            ensemble.disagreement_level(kept, 3), ensemble.WARNING
+        )
+
+    def test_two_answers_on_one_block_hold_together(self):
+        """A block with a blocking gap and a word no majority settled:
+        the first answer fills the gap, the second picks the word, and
+        the first stays answered after the second, because the gap
+        is read off the text and not off a record of the answer."""
+        group = self.read(
+            "two or more alpha",
+            "two [c]ontract or more beta",
+            "two I contract or more gamma",
+        )
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["n_low_confidence"], 2)
+
+        first = ensemble._human_read(
+            answer,
+            {"text": "two I contract or more alpha", "span": [4, 4]},
+            group["engines"],
+        )
+        self.assertEqual(
+            [t["text"] for t in first["tokens"] if t.get("low_confidence")],
+            ["alpha"],
+        )
+        self.assertEqual(first["n_low_confidence"], 1)
+
+        second = ensemble._human_read(
+            answer,
+            {"text": "two I contract or more beta", "span": [23, 28]},
+            group["engines"],
+        )
+        self.assertEqual(second["n_low_confidence"], 0)
+        self.assertFalse(any("gap" in t for t in second["tokens"]))
+        self.assertIsNone(ensemble.disagreement_level(second, 3))
+
+    def test_a_majority_read_block_is_voted_from_the_shown_engines_side(self):
+        """Two engines read ``the dog sat`` and the first read ``the
+        sat``: the shown text is the agreeing pair's, so the carry
+        votes from that side and ``dog`` is a word a majority settled
+        over one engine, placed where the shown text has it."""
+        group = self.read("the sat", "the dog sat", "the dog sat")
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["agreement"], ensemble.MAJORITY)
+        self.assertEqual(answer["source"], "mistral_ocr")
+
+        kept = ensemble._human_read(
+            answer, {"text": "the dog sat", "span": [4, 7]}, group["engines"]
+        )
+        self.assertEqual(kept["base"], "mistral_ocr")
+        dog = next(t for t in kept["tokens"] if t["text"] == "dog")
+        self.assertTrue(dog.get("majority"))
+        self.assertEqual(dog.get("position"), 1)
 
     def test_one_engine_alone_is_single(self):
         answer = ensemble.resolve(self.read("the court held"))
@@ -803,6 +1470,154 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
+
+    def test_the_shown_spelling_of_an_agreed_word_has_no_gap(self):
+        """The rank's engine wrote ``CP-1- 2021`` where two others wrote
+        ``CP-1-2021``: one reading by key, and the text shows the
+        spelling without the stray space, at the word (``vote_words``)
+        and for a block read alike (``resolve``), whose ``source``
+        names the engine it took it from."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("No. CP-1- 2021 x"),
+            [
+                ensemble._pairs("No. CP-1-2021 y"),
+                ensemble._pairs("No. CP-1-2021 z"),
+            ],
+        )
+        self.assertEqual(tokens[1]["text"], "CP-1-2021")
+        self.assertFalse(tokens[1].get("low_confidence"))
+
+        answer = ensemble.resolve(
+            self.read("No. CP-1- 2021 x", "No. CP-1-2021 x", "No. CP-1-2021 x")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "No. CP-1-2021 x")
+        self.assertEqual(answer["source"], "mistral_ocr")
+        # Alike to the letter, the rank's own spelling stays.
+        answer = ensemble.resolve(self.read("a - b", "a - b", "a - b"))
+        self.assertEqual(answer["source"], "dots_mocr")
+        # A nested quote the same way: the spelling without the space.
+        answer = ensemble.resolve(
+            self.read(
+                "father \u201c \u2018finally",
+                "father \"'finally",
+                "father \"'finally",
+            )
+        )
+        self.assertEqual(answer["text"], "father \"'finally")
+        self.assertEqual(answer["source"], "mistral_ocr")
+
+    def test_a_quote_inside_a_quote_reads_alike_however_it_is_spaced(self):
+        """Mistral wrote ``father “ ‘finally`` and ``justice’ ” so``
+        where dots.mocr wrote ``father "'finally`` and ``justice'" so``:
+        the same marks at the same ends, with a space between them.
+        The key folds the space, and the pairing joins a lone mark onto
+        its neighbour, an opening one forward and a closing one back,
+        so the two engines read one word alike and are the majority
+        over Surya, which drops the inner mark; the card is a warning,
+        not a block nobody agrees on."""
+        self.assertEqual(
+            ensemble.compare_text("father \u201c \u2018finally have"),
+            ensemble.compare_text("father \"'finally have"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("his justice\u2019 \u201d so"),
+            ensemble.compare_text("his justice'\" so"),
+        )
+        self.assertEqual(
+            ensemble._pairs("father \u201c \u2018finally have"),
+            [
+                ("father", "father"),
+                ("\"'finally", "\u201c \u2018finally"),
+                ("have", "have"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("his justice\u2019 \u201d so"),
+            [
+                ("his", "his"),
+                ("justice'\"", "justice\u2019 \u201d"),
+                ("so", "so"),
+            ],
+        )
+        # A straight mark goes to the neighbour that holds a mark. A
+        # lone mark with no marked neighbour stays a word of its own.
+        self.assertEqual(
+            ensemble._pairs("said ' \"go"),
+            [("said", "said"), ("'\"go", "' \"go")],
+        )
+        self.assertEqual(
+            ensemble._pairs("go' \" now"),
+            [("go'\"", "go' \""), ("now", "now")],
+        )
+        self.assertEqual(
+            ensemble._pairs('a " b'), [("a", "a"), ('"', '"'), ("b", "b")]
+        )
+        self.assertEqual(ensemble._pairs("\u201d"), [('"', "\u201d")])
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("father \"'finally have"),
+            [
+                ensemble._pairs("father \u201c \u2018finally have"),
+                ensemble._pairs("father \u201cfinally have"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["father", "\"'finally", "have"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+    def test_a_hyphen_with_a_space_after_it_is_the_hyphen(self):
+        """Mistral wrote ``CP-23-CR-0001065- 2021`` for the docket
+        number dots.mocr wrote as ``CP-23-CR-0001065-2021``: one
+        reading with a space in it, not two readings. The key folds
+        the space, the pairing reads the two words as one, and the
+        two engines are the majority over Surya's comma; the card is
+        a warning, not a block nobody agrees on. A dash between
+        spaces is a mark of its own and stays."""
+        self.assertEqual(
+            ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
+            "No(s): CP-23-CR-0001065-2021",
+        )
+        self.assertEqual(ensemble.compare_text("a - b"), "a - b")
+        self.assertEqual(
+            ensemble.compare_text("677 -- 679 and - so"), "677 -- 679 and - so"
+        )
+        self.assertEqual(
+            ensemble.compare_text("677- 679", hyphen_gaps=False), "677- 679"
+        )
+        self.assertEqual(
+            ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+            [
+                ("No(s):", "No(s):"),
+                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
+        )
+        self.assertEqual(
+            ensemble._pairs("677 -- 679"),
+            [("677", "677"), ("--", "--"), ("679", "679")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("No(s): CP-23-CR-0001065-2021"),
+            [
+                ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+                ensemble._pairs("No(s): CP-23-CR-0001065, 2021"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["No(s):", "CP-23-CR-0001065-2021"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
 
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
@@ -1141,20 +1956,31 @@ class TestTheDocument(EnsembleTestCase):
         makes the other (#396)."""
         return next(d for d in page["dropped"] if d["reason"] == "redaction")
 
-    def test_a_box_over_one_cell_of_a_block_is_a_partial_drop(self):
+    def test_a_box_over_one_cell_of_a_block_keeps_the_other_cells(self):
         """The daily shape of it: one engine reads the body as one
-        block, a redaction covers one cell of the other engine whole,
-        and the group is dropped whole. The reader loses a clean
-        reading, so the page says ``partial``."""
+        block, and a redaction covers one cell of the other engine
+        whole. The block is out, the covered cell is out, and the clean
+        cell is the text, with the block's engine silent in the group.
+        Nothing is lost that was not under the box, so no partial drop
+        is counted; the one reading left is the card."""
         self.one_body_block()
         self.redact(2, BODY_A_PT)
 
         built = self.run_ensemble()
 
         page = built["pages"][1]
-        self.assertNotIn("body", page["text"])
-        self.assertTrue(self.redaction_drop(page)["partial"])
-        self.assertEqual(page["counts"]["partial"], 1)
+        self.assertEqual(page["text"], "body B 2")
+        group = page["groups"][0]
+        self.assertEqual(group["silent"], ["mistral_ocr"])
+        self.assertEqual(
+            group["engines"]["mistral_ocr"]["excluded"], "redaction"
+        )
+        self.assertEqual(group["engines"]["dots_mocr"]["excluded"], None)
+        self.assertEqual(group["level"], ensemble.BLOCKING)
+        self.assertEqual(
+            [d["reason"] for d in page["dropped"]], [opinion_ocr.PAGE_NUMBER]
+        )
+        self.assertEqual(page["counts"]["partial"], 0)
 
     def test_a_block_only_one_engine_saw_is_a_disagreement(self):
         """The other engine drew no box there. Nothing votes, and the
@@ -1537,6 +2363,24 @@ class TestTheFindings(EnsembleTestCase):
         cards = self.rebuild(partial=1)
 
         self.assertEqual(cards[0].check_name, OpinionCheck.PARTIAL_REDACTION)
+        # A redaction drawn short leaves words on the page: the approval
+        # waits on a person.
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
+
+    def test_blocks_where_the_detections_drew_nothing_are_a_card(self):
+        cards = self.rebuild(undetected=2)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
+        self.assertIn("2 block(s)", cards[0].message)
+
+    def test_an_undetected_block_the_engines_read_alike_says_so(self):
+        """A column the detections missed: the card names it."""
+        cards = self.rebuild(undetected=2, undetected_agreed=1)
+
+        self.assertEqual(cards[0].check_name, OpinionCheck.UNDETECTED_TEXT)
+        self.assertEqual(cards[0].severity, Issue.Severity.ERROR)
+        self.assertIn("1 of them alike", cards[0].message)
 
     def test_a_page_the_engines_agree_on_makes_no_card(self):
         self.assertEqual(self.rebuild(unanimous=4), [])
@@ -4123,9 +4967,96 @@ class TestTheLevel(TestCase):
         self.assertEqual(page["counts"]["differing"], 0)
 
 
+class TestTheUndetectedDrop(TestCase):
+    """A group of units the detections drew nothing under is dropped
+    whole, counted apart, and is no partial drop."""
+
+    def test_an_undetected_group_is_dropped_and_counted(self):
+        box = (36, 500, 288, 700)
+        ghost = {"reason": opinion_ocr.UNDETECTED}
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [
+                        unit(
+                            "dots_mocr", 0, (36, 108, 288, 200), "The court."
+                        ),
+                        unit(
+                            "dots_mocr",
+                            1,
+                            box,
+                            "Section 1921 provides",
+                            ghost,
+                            1.0,
+                        ),
+                    ]
+                ),
+                "mistral_ocr": engine_page(
+                    [
+                        unit(
+                            "mistral_ocr", 0, (36, 108, 288, 200), "The court."
+                        ),
+                        unit(
+                            "mistral_ocr",
+                            1,
+                            box,
+                            "A major business",
+                            ghost,
+                            1.0,
+                        ),
+                    ]
+                ),
+            },
+            0,
+        )
+
+        self.assertEqual(page["text"], "The court.")
+        self.assertEqual(
+            [d["reason"] for d in page["dropped"]], [opinion_ocr.UNDETECTED]
+        )
+        self.assertFalse(page["dropped"][0]["partial"])
+        self.assertEqual(page["counts"]["undetected"], 1)
+        self.assertEqual(page["counts"]["undetected_agreed"], 0)
+        self.assertEqual(page["counts"]["partial"], 0)
+
+    def test_an_undetected_group_the_engines_read_alike_is_counted_apart(
+        self,
+    ):
+        """Two engines reading the same words where the detections drew
+        nothing is the shape of a column they missed."""
+        box = (36, 500, 288, 700)
+        ghost = {"reason": opinion_ocr.UNDETECTED}
+        page = ensemble.build_page(
+            {
+                "dots_mocr": engine_page(
+                    [unit("dots_mocr", 0, box, "The court held.", ghost, 1.0)]
+                ),
+                "mistral_ocr": engine_page(
+                    [
+                        unit(
+                            "mistral_ocr",
+                            0,
+                            box,
+                            "The court held.",
+                            ghost,
+                            1.0,
+                        )
+                    ]
+                ),
+            },
+            0,
+        )
+
+        self.assertEqual(page["counts"]["undetected"], 1)
+        self.assertEqual(page["counts"]["undetected_agreed"], 1)
+        self.assertTrue(page["dropped"][0]["agreed"])
+        self.assertNotIn("held", json.dumps(page))
+
+
 class TestTheBracketDrop(TestCase):
     """A partial drop of a group that lost a bracket token writes no
-    ``PARTIAL_REDACTION`` card (#419)."""
+    ``PARTIAL_REDACTION`` card (#419). Both engines are under the box,
+    or the group would stay on the clean reading and drop nothing."""
 
     def page(self, removed):
         box = (36, 108, 288, 200)
@@ -4139,7 +5070,16 @@ class TestTheBracketDrop(TestCase):
             {
                 "dots_mocr": dots,
                 "mistral_ocr": engine_page(
-                    [unit("mistral_ocr", 0, box, "The court held.")]
+                    [
+                        unit(
+                            "mistral_ocr",
+                            0,
+                            box,
+                            "The court held.",
+                            excluded,
+                            0.3,
+                        )
+                    ]
                 ),
             },
             0,
@@ -4437,3 +5377,74 @@ class TestTheListsTheReviewFound(TestCase):
         self.assertNotIn(
             markup.ITEM, [mark["kind"] for mark in ensemble._marks(entry)]
         )
+
+
+class TestThePartialCoverVote(TestCase):
+    """One engine's box sticking out past a redaction the others read
+    it inside is the engine's geometry, not text the reader loses."""
+
+    @staticmethod
+    def reading(partial: bool, excluded: bool = True) -> dict:
+        return {
+            "partial": partial,
+            "whole": excluded and not partial,
+            "excluded": excluded,
+            "reason": "redaction" if excluded else "",
+            "hidden_key": "words" if excluded else "",
+        }
+
+    def test_an_engine_that_read_a_speck_votes_neither_way(self):
+        """A speck under part of the box is no partial cover, and no
+        whole cover either: it does not outvote the engines that read
+        the place covered in part."""
+        speck = {**self.reading(False), "whole": False}
+        merged = {
+            "dots_mocr": self.reading(True),
+            "mistral_ocr": speck,
+            "surya": {**speck},
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_one_engine_out_of_three_is_no_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "mistral_ocr": self.reading(False),
+            "surya": self.reading(True),
+        }
+
+        self.assertFalse(ensemble._partial_cover(merged))
+
+    def test_two_engines_out_of_three_are_a_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(True),
+            "mistral_ocr": self.reading(False),
+            "surya": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_a_tie_is_a_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "mistral_ocr": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_an_engine_that_read_nothing_there_does_not_vote(self):
+        merged = {
+            "dots_mocr": self.reading(False, excluded=False),
+            "mistral_ocr": self.reading(False, excluded=False),
+            "surya": self.reading(True),
+        }
+
+        self.assertTrue(ensemble._partial_cover(merged))
+
+    def test_no_engine_partly_covered_is_no_partial_cover(self):
+        merged = {
+            "dots_mocr": self.reading(False),
+            "surya": self.reading(False),
+        }
+
+        self.assertFalse(ensemble._partial_cover(merged))

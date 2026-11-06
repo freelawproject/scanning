@@ -66,7 +66,11 @@ PARAGRAPH = "paragraph"
 HEADING = "heading"
 LIST_ITEM = "list_item"
 TABLE = "table"
-BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE)
+#: A picture (#463): the box an engine draws over a photograph, a map
+#: or a diagram. It reads no text; the daemon cuts it from the original
+#: scan and the final XML embeds it.
+FIGURE = "figure"
+BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE, FIGURE)
 
 #: The order the tags nest in :func:`serialize`, outermost first, and
 #: the order :func:`marks_of` sorts marks that start together.
@@ -712,7 +716,9 @@ def project(body: list[dict]) -> Projection:
         offsets.extend([None] * len(tag))
 
     for index, paragraph in enumerate(body):
-        if paragraph.get("kind") == TABLE:
+        if paragraph.get("kind") in (TABLE, FIGURE):
+            # A picture holds no text (#463), and it is left out like a
+            # table, so the index of every other paragraph holds.
             continue
         source = paragraph.get("text") or ""
         # A list group holds one ``li`` mark per item (#428), with a

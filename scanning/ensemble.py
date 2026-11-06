@@ -55,12 +55,22 @@ branch ``extraction_align``, ``pipeline/core/{align,order,consensus}``):
    same way is ``unanimous``; a group a majority reads the same way is
    ``majority``; a group with no majority is voted word by word; a
    group one engine saw is ``single``.
-4. **Exclude.** A group any of whose units carries an ``exclusion`` is
-   dropped, **after** the alignment and never before it. The ensemble
-   experiment of #317 measured that: the engines' boxes differ, so a
-   drop before the alignment leaves one-engine regions behind. The
-   group goes whole, so a reading inside it that no exclusion covers
-   is text the reader loses, and that is what the
+4. **Exclude.** A unit that carries an ``exclusion`` says nothing: it
+   is out of its engine's reading of the group, **after** the
+   alignment and never before it. The ensemble experiment of #317
+   measured that: the engines' boxes differ, so a drop before the
+   alignment leaves one-engine regions behind. A group is dropped
+   when no engine read a clean word in it. **A reading a box covers
+   in part keeps what the box did not hide** when the other engines
+   say what it hid: dots.mocr folds the sequence number above a
+   caption into the caption's block, and the mask of the opinion
+   before, which ends at the caption's top edge, takes a seventh of
+   that block; Mistral and Surya draw the number its own box, covered
+   whole, so the "2" is known, comes out of the dots.mocr reading
+   (:func:`_uncover`), and the three engines vote on the caption. An
+   engine whose covered reading nobody can uncover is silent in the
+   group, and the vote names it. A dropped group a box covered in
+   part is text the reader loses, and that is what the
    ``PARTIAL_REDACTION`` card counts.
 
 **A fifth step, the section (#399).** The ``FOOTNOTES`` detection of a
@@ -142,6 +152,8 @@ button of the review page waive the gate for it.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import time
@@ -153,11 +165,12 @@ from itertools import combinations
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
 from scanning import detections, markup, opinion_ocr, s3_sync
 from scanning.models import (
+    ApplyRun,
     Issue,
     Opinion,
     OpinionCheck,
@@ -166,6 +179,7 @@ from scanning.models import (
     OpinionFindingDismissal,
     OpinionReviewStatus,
     OpinionText,
+    Scan,
     Status,
 )
 
@@ -188,8 +202,12 @@ logger = logging.getLogger(__name__)
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
-#: and the page its list runs (``lists``, #428).
-SCHEMA_VERSION = 11
+#: and the page its list runs (``lists``, #428). 12 writes a picture
+#: as a ``figure`` group with no text, its size under ``figure`` (#463).
+#: 13 counts the positions of a person's kept tokens over the words as
+#: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
+#: split the cards align the engines with (``blocking_review.open_words``).
+SCHEMA_VERSION = 13
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -242,6 +260,12 @@ MAX_BOUNDARY = 0.85
 
 #: A page with fewer body boxes reads as one column.
 MIN_BODY_BOXES = 4
+
+#: The least width, as a fraction of the page width, of a body box that
+#: marks the extent of the text block, whose middle no column box
+#: crosses (#463). A column of a two-column page is about two fifths of
+#: the page; a box in the margin is far narrower.
+EXTENT_WIDTH = 0.15
 
 #: What joins two groups in a page's text.
 PARAGRAPH_GAP = "\n\n"
@@ -304,6 +328,8 @@ WARNING = "warning"
 #: Why a group is not in the text.
 DROP_EXCLUDED = "excluded"
 DROP_EMPTY = "empty"
+#: The reason of a block a person took out of the text (``DROP``).
+DROP_HUMAN = "human"
 
 #: The ``error`` of a page no engine measured. A page nobody read
 #: carries the engine's own reason instead, and both write the one
@@ -318,10 +344,15 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.NO_MAJORITY,
         OpinionCheck.SINGLE_ENGINE,
         OpinionCheck.PARTIAL_REDACTION,
+        OpinionCheck.UNDETECTED_TEXT,
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.UNRESOLVED_EDIT,
+        # No writer since the pictures are review 2's boxes: here so
+        # the rebuild deletes the rows written before.
+        OpinionCheck.FIGURE_ONE_ENGINE,
+        OpinionCheck.FIGURE_TO_CHECK,
     }
 )
 
@@ -370,6 +401,43 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: A run of two periods or more, and a run of spaced periods: one
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
+
+#: A hyphen between a word character and whitespace, with a word after:
+#: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
+#: ``CP-23-CR-0001065-2021``, the same docket number, and the two are
+#: no two engines agreeing on a word. A dash between spaces, or the
+#: second of a double dash (``677 -- 679``), is a mark of its own and
+#: stays.
+_HYPHEN_GAP = re.compile(r"(?<=\w)-\s+(?=\w)")
+
+#: A word that ends in a hyphen after a word character, the head of a
+#: ``_HYPHEN_GAP`` split; ``--`` is not one.
+_HYPHEN_END = re.compile(r"\w-$")
+
+#: Whitespace between two quotation marks: a quote inside a quote.
+#: Mistral writes ``“ ‘finally`` and ``justice’ ”`` where dots.mocr
+#: writes ``"'finally`` and ``justice'"``, the same marks at the same
+#: ends. The fold table has made the curly and the straight marks
+#: alike already; this takes the space out, so the two read as one.
+#: Surya, which drops the inner mark (``“finally``), is then one
+#: engine against two, a warning and not a block.
+_QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
+
+#: The gaps the key folds out. Readings that agree by key and differ
+#: by one of these are one reading spelled two ways, and the shown one
+#: is the spelling with the fewest (:func:`_tidiest`): the rank's
+#: engine wrote ``CP-1- 2021`` once where two others wrote
+#: ``CP-1-2021``, and the approved text took the stray space.
+_GAPS = (_HYPHEN_GAP, _QUOTE_GAP)
+
+#: A word that is quotation marks alone, the half of a nested quote
+#: Mistral sets apart with a space; :func:`_join_lone_quotes` puts it
+#: back onto the neighbour that holds the other mark.
+_LONE_QUOTES = re.compile(
+    r"^[\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e]+$"
+)
+_CLOSING = frozenset("\u2019\u201d\u201b")
+_QUOTE_CHARS = frozenset("\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e")
 
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
@@ -434,6 +502,24 @@ class RevisionMoved(TransientFault):
 # ---------------------------------------------------------------------------
 
 
+def _tidiest(spellings: list[str]) -> str:
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, the
+    first of them when they tie.
+
+    :param spellings: Readings that agree by key, in rank order.
+    :returns: The one to show.
+    :rtype: str
+    """
+
+    def gaps(text: str) -> int:
+        # Counted on the text as the key sees it: a curly mark or an
+        # en dash is folded before a gap pattern can match beside it.
+        folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+        return sum(len(gap.findall(folded)) for gap in _GAPS)
+
+    return min(spellings, key=gaps)
+
+
 def plain(fragment: str | None) -> str:
     """Return one unit's content, its whitespace folded.
 
@@ -467,7 +553,7 @@ def _strip_markup(fragment: str) -> str:
     return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
-def compare_text(text: str) -> str:
+def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """Return the text as the vote compares it, never as it is shown.
 
     **The comparison is not the text.** The engines agree about the
@@ -479,11 +565,19 @@ def compare_text(text: str) -> str:
     text is what a reader sees.
 
     :param text: One engine's read.
+    :param hyphen_gaps: Fold a hyphen with whitespace after it inside a
+        word (``_HYPHEN_GAP``). The page-number reader turns it off
+        (``page_numbers.carries_number``): a ``Cite as`` line that
+        ends ``677- 679`` ends in the page number as the engine wrote
+        it, and folded it would end in a range.
     :returns: The key.
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    if hyphen_gaps:
+        folded = _HYPHEN_GAP.sub("-", folded)
+    folded = _QUOTE_GAP.sub("", folded)
     return _WS.sub(" ", folded).strip()
 
 
@@ -499,7 +593,8 @@ def compare_word(word: str) -> str:
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
-    return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
+    folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    return _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded)).strip()
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -514,18 +609,33 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     writes ``...``, and :func:`compare_text` reads them alike already
     (``_DOT_RUN``). Split on whitespace first, they are three words
     against one, and a block that agrees to the letter goes to a vote.
-    The shown word keeps the engine's own spacing.
+    A word that ends in a hyphen and the word after it are one word
+    the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
+    spacing of ``0001065-2021``, and split it is two words against
+    one. So is a word of quotation marks alone and its neighbour
+    (``_LONE_QUOTES``, :func:`_join_lone_quotes`): ``“ ‘finally`` and
+    ``justice’ ”`` are one engine's spacing of ``"'finally`` and
+    ``justice'"``. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = text.split()
+    words = _join_lone_quotes(text.split())
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
         end = index
         while end < len(words) and _LONE_DOTS.match(words[end]):
+            end += 1
+        if end - index < 2:
+            end = index
+            while (
+                end + 1 < len(words)
+                and _HYPHEN_END.search(words[end])
+                and words[end + 1][:1].isalnum()
+            ):
+                end += 1
             end += 1
         if end - index >= 2:
             shown = " ".join(words[index:end])
@@ -535,6 +645,51 @@ def _pairs(text: str) -> list[tuple[str, str]]:
         pairs.append((compare_word(words[index]), words[index]))
         index += 1
     return pairs
+
+
+def _join_lone_quotes(words: list[str]) -> list[str]:
+    """Join each word of quotation marks alone onto the neighbour that
+    holds the other mark of the pair.
+
+    The word after it when that word starts with a mark, the word
+    before when that one ends with a mark; with both, an opening mark
+    (``“``, ``‘``) goes after and a closing one (``”``, ``’``) before,
+    and a straight mark, which is either, goes after. A lone mark with
+    no marked neighbour is a word of its own, as it was. The joined
+    word keeps the space, which the key folds out (``_QUOTE_GAP``).
+
+    :param words: One read, split on whitespace.
+    :returns: The words, with the lone marks joined on.
+    :rtype: list[str]
+    """
+    if not any(_LONE_QUOTES.match(word) for word in words):
+        return words
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if not _LONE_QUOTES.match(word):
+            out.append(word)
+            index += 1
+            continue
+        before = out[-1] if out else None
+        after = words[index + 1] if index + 1 < len(words) else None
+        can_go_after = (
+            after is not None
+            and after[:1] in _QUOTE_CHARS
+            and not _LONE_QUOTES.match(after)
+        )
+        can_go_before = before is not None and before[-1:] in _QUOTE_CHARS
+        if can_go_after and can_go_before:
+            can_go_after = not any(c in _CLOSING for c in word)
+        if can_go_after:
+            words[index + 1] = f"{word} {after}"
+        elif can_go_before:
+            out[-1] = f"{before} {word}"
+        else:
+            out.append(word)
+        index += 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1014,11 +1169,229 @@ class _Union:
 # ---------------------------------------------------------------------------
 
 
+#: The reasons of ``opinion_ocr.verdict`` that are a box over the unit.
+_BOX_REASONS = frozenset(
+    {
+        "redaction",
+        "outside",
+        opinion_ocr.PAGE_NUMBER,
+        opinion_ocr.PICTURE,
+        opinion_ocr.RUNNING_HEAD,
+    }
+)
+
+
+def _partly_covered(
+    engine: str, by_engine: dict[str, list[dict]]
+) -> list[dict]:
+    """Return the units the other engines read only under part of a box.
+
+    A unit of another engine that a box covers in part (a box verdict
+    below :data:`opinion_ocr.FULL_SHARE`) with words in it. Its words
+    are not clean: the verdict took them for what the box hid. So a
+    reading that holds the place of one (:func:`_merge`) is never
+    uncovered by the things that box covered whole, or the words the
+    other engines dropped for the cover ride out in the one engine
+    that read them inside a larger block: a running head read with its
+    state abbreviation, a name beside a redacted headnote. A picture is
+    not among them: the words under it are not hidden text.
+
+    :param engine: The engine whose reading asks.
+    :param by_engine: ``{engine: its units of this group}``.
+    :returns: The units, each with its ``box_pt``.
+    :rtype: list[dict]
+    """
+    return [
+        unit
+        for other, members in by_engine.items()
+        if other != engine
+        for unit in members
+        if unit["exclusion"]
+        and unit["exclusion"].get("reason") in _BOX_REASONS
+        and unit["exclusion"].get("reason") != opinion_ocr.PICTURE
+        and unit["share"] < opinion_ocr.FULL_SHARE
+        and unit.get("box_pt")
+        and plain(unit["text"])
+    ]
+
+
+def _covered_things(
+    engine: str, by_engine: dict[str, list[dict]]
+) -> list[dict]:
+    """Return what the other engines read under the boxes of a group.
+
+    One entry per thing under a box: a unit of another engine that a
+    box covers whole (``share`` at :data:`opinion_ocr.FULL_SHARE` or
+    more), with the units of the other engines over the same place,
+    which are readings of the same thing. Each entry carries the texts
+    those engines read there, in the order of the engines, without a
+    repeat, and the box of the thing, for its place in a reading that
+    holds the same words twice.
+
+    :param engine: The engine whose reading asks.
+    :param by_engine: ``{engine: its units of this group}``.
+    :returns: The things, each ``{"readings", "box_pt"}``.
+    :rtype: list[dict]
+    """
+    # A thing a box hid, and never a unit the detections drew nothing
+    # under (``opinion_ocr.UNDETECTED``): that is no box, and its text
+    # is what an engine made of the bleed-through.
+    units = [
+        unit
+        for other, members in by_engine.items()
+        if other != engine
+        for unit in members
+        if unit["exclusion"]
+        and unit["exclusion"].get("reason") in _BOX_REASONS
+        and unit["share"] >= opinion_ocr.FULL_SHARE
+        and plain(unit["text"])
+    ]
+    things: list[list[dict]] = []
+    for unit in units:
+        for thing in things:
+            if any(
+                contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+                for other in thing
+            ):
+                thing.append(unit)
+                break
+        else:
+            things.append([unit])
+    return [
+        {
+            "readings": list(
+                dict.fromkeys(plain(unit["text"]) for unit in thing)
+            ),
+            "box_pt": _union_box([unit["box_pt"] for unit in thing]),
+            "reasons": {unit["exclusion"].get("reason") for unit in thing},
+        }
+        for thing in things
+    ]
+
+
+def _things_under(things: list[dict], member: dict) -> list[dict]:
+    """Return the things under the kind of box that covers ``member``.
+
+    A curated picture's words uncover a reading a picture covers in
+    part, and never one a redaction or a mask covers (#463): the words
+    under a picture are known and harmless, the words under a redaction
+    are neither, and a block that spans both must not ride out on the
+    picture's words with the redaction's still in it.
+
+    :param things: :func:`_covered_things`.
+    :param member: The covered reading, with its ``exclusion``.
+    :returns: The things that may uncover it.
+    :rtype: list[dict]
+    """
+    picture = (member["exclusion"] or {}).get("reason") == opinion_ocr.PICTURE
+    return [
+        thing
+        for thing in things
+        if (opinion_ocr.PICTURE in thing.get("reasons", ())) == picture
+    ]
+
+
+def _uncover(
+    text: str,
+    marks: list[dict],
+    things: list[dict],
+    box: list[float] | None = None,
+) -> tuple[str, list[dict], list[str]] | None:
+    """Take what a box hid out of a reading the box covers in part.
+
+    Every thing under the box must be found in the text, as a run of
+    words under one of its readings (compared by :func:`compare_word`,
+    the fold of the vote), and the text must keep a word. Else None,
+    and the reading stays silent: a box that hid a thing nobody named
+    may hide more, and no reader sees the text under a redaction. A
+    run goes with the whitespace after it (before it at the end), and
+    the marks move over the deletions (``markup.shift``).
+
+    **A run that occurs twice is taken by place.** A sequence number
+    above a caption can be a word of the caption too. The thing's box
+    sits at some height of the reading's box, and the run nearest that
+    height in the text is the hidden one: at the top, the first; at
+    the bottom, the last. With no box the first unclaimed run is taken.
+
+    :param text: The reading, as the engine wrote it.
+    :param marks: Its marks.
+    :param things: :func:`_covered_things`.
+    :param box: The reading's box in points, for the place of a thing.
+    :returns: ``(the text, its marks, the readings taken out)``, or
+        None.
+    :rtype: tuple[str, list[dict], list[str]] | None
+    """
+    words = [
+        (match.start(), match.end(), compare_word(match.group()))
+        for match in _WORD.finditer(text)
+    ]
+    keys = [key for _, _, key in words]
+    taken: set[int] = set()
+    removed: list[str] = []
+    for thing in things:
+        at = None
+        place = thing.get("box_pt")
+        if box and place and box[3] > box[1]:
+            centre = (place[1] + place[3]) / 2
+            at = min(1.0, max(0.0, (centre - box[1]) / (box[3] - box[1])))
+        hit = None
+        for reading in thing["readings"]:
+            wanted = [key for key in map(compare_word, reading.split()) if key]
+            if not wanted:
+                continue
+            runs = [
+                range(start, start + len(wanted))
+                for start in range(len(keys) - len(wanted) + 1)
+                if keys[start : start + len(wanted)] == wanted
+                and not any(
+                    index in taken
+                    for index in range(start, start + len(wanted))
+                )
+            ]
+            if not runs:
+                continue
+            if at is None or len(runs) == 1:
+                hit = runs[0]
+            else:
+                hit = min(
+                    runs, key=lambda run: abs(run.start / len(keys) - at)
+                )
+            removed.append(reading)
+            break
+        if hit is None:
+            return None
+        taken.update(hit)
+    if not taken or all(
+        index in taken for index, (_, _, key) in enumerate(words) if key
+    ):
+        return None
+    deleted: list[tuple[int, int]] = []
+    for index in sorted(taken):
+        start, end, _ = words[index]
+        if index + 1 < len(words):
+            deleted.append((start, words[index + 1][0]))
+        else:
+            deleted.append((words[index - 1][1] if index else start, end))
+    gone: set[int] = set()
+    for start, end in deleted:
+        gone.update(range(start, end))
+    kept = "".join(char for at, char in enumerate(text) if at not in gone)
+    moved: list[dict] = []
+    for mark in marks:
+        for shifted in markup.shift(
+            [markup.Mark(mark["start"], mark["end"], mark["kind"])], deleted
+        ):
+            moved.append({**mark, "start": shifted.start, "end": shifted.end})
+    return kept, moved, removed
+
+
 def _merge(
     members: list[dict],
     line_band: float,
     boundary: float | None,
     width: float,
+    things: list[dict] = (),
+    partials: list[dict] = (),
 ) -> dict:
     """Merge one engine's members of a group into one unit.
 
@@ -1033,13 +1406,65 @@ def _merge(
     :param line_band: The height of one line band, in points.
     :param boundary: The column boundary of the page, or None.
     :param width: The page width, in points.
+    :param things: What the other engines read under the boxes of the
+        group (:func:`_covered_things`), for :func:`_uncover`.
+    :param partials: What the other engines read only under part of a
+        box (:func:`_partly_covered`): a member that holds the place of
+        one is never uncovered, unless that one holds a thing the
+        uncover takes out. Then it is another engine's reading of the
+        same merged block, which uncovers the same way, and not a
+        leftover beside the box like "Conn. 51".
     :returns: The merged unit.
     :rtype: dict
     """
     ordered = reading_order(members, line_band, boundary, width)
+    # The verdict is per unit (``opinion_ocr.verdict``), so the reading
+    # is the clean members alone: a member under a redaction, a mask
+    # or the page number says nothing here, and the engine is silent
+    # in the group when it has no other. A member a box covers in
+    # part keeps what the box did not hide when the other engines say
+    # what it hid (``_uncover``); a page-number unit is taken whole.
+    kept: list[dict] = []
+    out: list[dict] = []
+    uncovered = 0
+    for member in ordered:
+        if not member["exclusion"]:
+            kept.append(member)
+            continue
+        found = None
+        under = _things_under(things, member) if things else []
+        if (
+            under
+            and member["share"] < opinion_ocr.FULL_SHARE
+            and not any(
+                contained(unit["box_pt"], member["box_pt"]) >= OVERLAP
+                and not any(
+                    contained(thing["box_pt"], unit["box_pt"]) >= OVERLAP
+                    for thing in under
+                )
+                for unit in partials
+                if member.get("box_pt")
+            )
+        ):
+            found = _uncover(
+                member["text"],
+                member.get("marks") or [],
+                under,
+                member["box_pt"],
+            )
+        if found is None:
+            out.append(member)
+            continue
+        text, marks, removed = found
+        kept.append(
+            {**member, "text": text, "marks": marks, "exclusion": None}
+        )
+        # A count and never the words: a thing under a box is redacted
+        # text, and the document goes to every reader's browser.
+        uncovered += len(removed)
     texts: list[str] = []
     marks: list[dict] = []
-    for member in ordered:
+    for member in kept:
         text = plain(member["text"])
         if not text:
             continue
@@ -1054,41 +1479,109 @@ def _merge(
                 )
             )
         texts.append(text)
-    kind = _kind_of(ordered)
-    excluded = [m for m in ordered if m["exclusion"]]
+    # The kind, the labels and the table are the kept members' too: a
+    # silent engine has no say, and an excluded member of a reading
+    # that goes on without it is a label of text that is not there.
+    judged = kept or ordered
+    kind = _kind_of(judged)
+    excluded = out
+    redacted = [
+        m
+        for m in excluded
+        if (m["exclusion"] or {}).get("reason") == "redaction"
+        and plain(m["text"])
+    ]
     partial = [
         m
         for m in excluded
         if (m["exclusion"] or {}).get("reason") == "redaction"
         and m["share"] < opinion_ocr.FULL_SHARE
+        # A speck an engine read as a character or two under the edge
+        # of a box is no text a reader loses (218 A.3d: one mark in the
+        # margin under the strip), and no card asks about it.
+        and _letters(m["text"]) >= PARTIAL_MIN_LETTERS
     ]
+    # Whether this engine read a word here that no exclusion covers.
+    clean = any(plain(m["text"]) for m in kept)
+    # A member a curated picture took although the box covers only
+    # part of it: the words outside the box may be text (#463).
+    picture_partial = any(
+        (m["exclusion"] or {}).get("reason") == opinion_ocr.PICTURE
+        and m["share"] < opinion_ocr.FULL_SHARE
+        for m in excluded
+    )
     return {
         "ids": [m["id"] for m in ordered],
-        "types": [m["type"] for m in ordered],
+        "types": [m["type"] for m in judged],
+        # The box is the members' union, excluded ones included: the
+        # group is the place the alignment found, and a human edit
+        # lands on it by IoU (``land_edits``).
         "box_pt": _round_box(_union_box([m["box_pt"] for m in ordered])),
         "text": " ".join(texts),
         "marks": marks,
         "kind": kind,
         "table": (
-            [row for m in ordered if m.get("table") for row in m["table"]]
+            [row for m in judged if m.get("table") for row in m["table"]]
             if kind == markup.TABLE
             else None
         ),
-        "excluded": bool(excluded),
+        # The reading is out when the verdict took every word of it.
+        "excluded": bool(excluded) and not clean,
+        # The fold of the words the verdict took (``compare_text``),
+        # for :func:`_dropped_alike`: a key and never the words.
+        "hidden_key": compare_text(" ".join(plain(m["text"]) for m in out)),
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
         "partial": bool(partial),
+        # Whether a box covers every reading of this engine here whole:
+        # the vote of ``_partial_cover`` on the other side. A speck the
+        # partial filter left out is neither, so it votes neither way.
+        "whole": bool(redacted)
+        and all(m["share"] >= opinion_ocr.FULL_SHARE for m in redacted),
+        "picture_partial": picture_partial,
         # Whether the OCR glue deleted a bracket token of a member
         # (``removed``, #373). A drop of such a group writes no
         # ``PARTIAL_REDACTION`` card (#419).
         "bracket": any(m.get("bracket") for m in ordered),
-        # Whether this engine read a word here that no exclusion
-        # covers. A group is dropped whole, so a clean reading beside
-        # an excluded one is text the reader loses, and that is what
-        # the ``PARTIAL_REDACTION`` card counts (#365).
-        "clean": any(plain(m["text"]) for m in ordered if not m["exclusion"]),
+        "clean": clean,
+        # How many things under a box this reading lost (``_uncover``).
+        # Never their words: they are the text under a redaction.
+        "uncovered": uncovered,
     }
+
+
+#: The least letters and digits of a reading a box covers in part for
+#: the ``PARTIAL_REDACTION`` card to count it: fewer is a speck.
+PARTIAL_MIN_LETTERS = 3
+
+
+def _letters(text: str) -> int:
+    """Return how many letters and digits ``text`` holds."""
+    return sum(1 for char in text or "" if char.isalnum())
+
+
+def _partial_cover(merged: dict[str, dict]) -> bool:
+    """Return whether a box covers the group's place only in part.
+
+    An engine whose reading a redaction covers in part says some of
+    the place is outside the box; an engine whose reading a redaction
+    covers whole says none of it is. The engines draw their boxes
+    apart by a few points, so one box that sticks out past a redaction
+    the others read inside it is the engine's geometry and not text
+    the reader loses. The group is a partial cover when the engines
+    that say so are at least as many as the ones that read it covered
+    whole. Only the card follows the vote: the drop does not change.
+
+    :param merged: ``{engine: its merged reading of the group}``.
+    :returns: Whether the ``PARTIAL_REDACTION`` card counts the group.
+    :rtype: bool
+    """
+    partial = sum(1 for unit in merged.values() if unit["partial"])
+    whole = sum(
+        1 for unit in merged.values() if unit["excluded"] and unit.get("whole")
+    )
+    return partial > 0 and partial >= whole
 
 
 def _round_box(box: list[float]) -> list[float]:
@@ -1114,7 +1607,14 @@ def _group(
     :rtype: dict
     """
     merged = {
-        engine: _merge(members, line_band, boundary, width)
+        engine: _merge(
+            members,
+            line_band,
+            boundary,
+            width,
+            _covered_things(engine, by_engine),
+            _partly_covered(engine, by_engine),
+        )
         for engine, members in by_engine.items()
     }
     boxes = [unit["box_pt"] for unit in merged.values()]
@@ -1122,6 +1622,7 @@ def _group(
         min((iou(a, b) for a, b in combinations(boxes, 2)), default=1.0), 3
     )
     excluded = [unit for unit in merged.values() if unit["excluded"]]
+    clean = [unit for unit in merged.values() if unit["clean"]]
     box = _round_box(_union_box(boxes))
     return {
         "engines": merged,
@@ -1130,17 +1631,23 @@ def _group(
         "page_scale": area(box) >= MAX_AREA * page_area,
         "alignment_iou": worst,
         "weak": len(boxes) > 1 and worst < WEAK_IOU,
-        "excluded": bool(excluded),
+        # The group goes when no engine read a clean word in it. The
+        # redaction over one cell of a page-wide block is the daily
+        # shape of it: the block is out, the cell is out, and the
+        # other cells of the engine that drew them are the text, with
+        # the block's engine silent in the group, which the vote
+        # names. The whole group went before, body and all.
+        "excluded": bool(excluded) and not clean,
         "reason": excluded[0]["reason"] if excluded else "",
-        # A group is dropped whole, so a reading no exclusion covers
-        # beside an excluded one is text the reader loses, and the
-        # card must say so (#365). The redaction over one cell of a
-        # page-wide block is the daily shape of it: the cell is
-        # covered whole, so the unit's own ``partial`` is false, and
-        # the page would lose its body with no card at all.
-        "partial": any(unit["partial"] for unit in merged.values())
-        or bool(excluded)
-        and any(unit["clean"] for unit in merged.values()),
+        # A dropped group a box covered in part is text the reader
+        # loses, and the ``PARTIAL_REDACTION`` card says so (#365),
+        # unless more engines read the place covered whole.
+        "partial": _partial_cover(merged),
+        # A dropped group a picture covered in part: the
+        # ``FIGURE_TO_CHECK`` card names it (#463).
+        "picture_partial": any(
+            unit.get("picture_partial") for unit in merged.values()
+        ),
     }
 
 
@@ -1293,8 +1800,13 @@ def align_page(
     # group can span the gutter, and the members inside it read by
     # column like everything else (:func:`reading_order`).
     boundary = column_boundary(units, width, height)
-    speaking, quiet = [], []
+    speaking, quiet, pictures = [], [], []
     for unit in units:
+        if unit.get("kind") == markup.FIGURE:
+            # A picture links with the pictures alone (#463), so it
+            # never takes the text around it into its group.
+            pictures.append(unit)
+            continue
         # :func:`plain` and never ``compare_text``: a lone heading
         # mark is text to a comparison and no reading. A box that
         # reads nothing must not link, whatever it wrote in place of
@@ -1319,7 +1831,107 @@ def align_page(
             )
         groups.append(_group(by_engine, line_band, page_area, boundary, width))
     _attach_quiet(quiet, groups, line_band, page_area, boundary, width)
+    return groups + _figure_groups(
+        pictures, line_band, page_area, boundary, width
+    )
+
+
+def _figure_groups(
+    pictures: list[dict],
+    line_band: float,
+    page_area: float,
+    boundary: float | None,
+    width: float,
+) -> list[dict]:
+    """Return the picture groups of one page (#463).
+
+    The engines' picture boxes link by the rule of the text,
+    :data:`OVERLAP` of the smaller box, and never with a text unit: a
+    picture reads nothing, and a box that reads nothing must not chain
+    the text of a page. The group is flagged ``figure``; its box is the
+    union of the engines' boxes, the rule of every group. A box that
+    would join two pictures the other engines drew apart is left out
+    (:func:`_picture_bridges`), or the union cuts them as one.
+
+    :param pictures: The units of the ``figure`` kind.
+    :param line_band: The height of one line band, in points.
+    :param page_area: The area of the page, in square points.
+    :param boundary: The column boundary of the page, or None.
+    :param width: The page width, in points.
+    :returns: The groups.
+    :rtype: list[dict]
+    """
+    bridges = {id(unit) for unit in _picture_bridges(pictures)}
+    pictures = [unit for unit in pictures if id(unit) not in bridges]
+    union = _link_pictures(pictures)
+    buckets: dict[int, list[int]] = {}
+    for index in range(len(pictures)):
+        buckets.setdefault(union.find(index), []).append(index)
+    groups = []
+    for indices in buckets.values():
+        by_engine: dict[str, list[dict]] = {}
+        for index in indices:
+            by_engine.setdefault(pictures[index]["engine"], []).append(
+                pictures[index]
+            )
+        group = _group(by_engine, line_band, page_area, boundary, width)
+        group["figure"] = True
+        groups.append(group)
     return groups
+
+
+def _link_pictures(pictures: list[dict]) -> _Union:
+    """Return the links of the picture units of a page (#463).
+
+    Two boxes of different engines link when the intersection covers
+    :data:`OVERLAP` of the smaller box, the rule of the text.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The union-find over ``pictures``, by index.
+    :rtype: _Union
+    """
+    union = _Union(len(pictures))
+    for left, right in combinations(range(len(pictures)), 2):
+        if pictures[left]["engine"] == pictures[right]["engine"]:
+            continue
+        share = contained(pictures[left]["box_pt"], pictures[right]["box_pt"])
+        if share >= OVERLAP:
+            union.join(left, right)
+    return union
+
+
+def _picture_bridges(pictures: list[dict]) -> list[dict]:
+    """Return the picture boxes that join pictures drawn apart (#463).
+
+    One engine draws one box over two photographs side by side where
+    the others draw one box each: linked, the four boxes are one
+    group, and the union of their boxes is one cut of both. Each box
+    is judged with the others in place: it is a bridge when the boxes
+    of the other engines it links fall into two groups or more without
+    it. So a box is left out only where another engine still draws
+    the pictures apart, and two engines that drew one box over both
+    keep one picture.
+
+    A bridge reads nothing, so leaving it out loses no text: the
+    picture group of each part names the engines that drew it.
+
+    :param pictures: The units of the ``figure`` kind.
+    :returns: The bridges, in the order of ``pictures``.
+    :rtype: list[dict]
+    """
+    bridges = []
+    for unit in pictures:
+        rest = [other for other in pictures if other is not unit]
+        union = _link_pictures(rest)
+        joined = {
+            union.find(index)
+            for index, other in enumerate(rest)
+            if other["engine"] != unit["engine"]
+            and contained(unit["box_pt"], other["box_pt"]) >= OVERLAP
+        }
+        if len(joined) >= 2:
+            bridges.append(unit)
+    return bridges
 
 
 def _link(speaking: list[dict], zones: list[list[float]] = ()) -> _Union:
@@ -1523,7 +2135,9 @@ def column_boundary(
     """Return the x that separates the two columns, or None.
 
     Only the body boxes vote: a running head and a footer straddle the
-    gutter and would hide it. The boundary is the right cluster's first
+    gutter and would hide it. A body box across the middle of the text
+    block does not vote either (#463): a picture or a centered line is
+    on both sides. The boundary is the right cluster's first
     edge less a pad, not the middle of the gap, because the left
     column's text runs up to the gutter.
 
@@ -1538,7 +2152,34 @@ def column_boundary(
     :rtype: float | None
     """
     _, body, _ = _split_bands(boxes, height)
-    edges = sorted(box["box_pt"][0] for box in body)
+    # A box across the middle of the text is no column's (#463): a
+    # picture or a centered line sits on both sides, and its left edge
+    # would split the left column from its own text. The middle of the
+    # text and not of the page: a scan of a bound book sets the text
+    # off the page's middle, and a column must not cross it there. The
+    # text block is the extent of the wide boxes alone: a narrow box in
+    # the margin (a stamp, a blot, a library label) would move the
+    # middle past the gutter, and the right column would straddle it.
+    # A box wholly outside that extent is no column's either: its left
+    # edge would open the widest gap of the page.
+    wide = [
+        b
+        for b in body
+        if b["box_pt"][2] - b["box_pt"][0] >= EXTENT_WIDTH * width
+    ] or body
+    if wide:
+        left = min(b["box_pt"][0] for b in wide)
+        right = max(b["box_pt"][2] for b in wide)
+    else:
+        left, right = 0.0, width
+    middle = (left + right) / 2
+    edges = sorted(
+        box["box_pt"][0]
+        for box in body
+        if not _straddles(box["box_pt"], middle, width)
+        and box["box_pt"][0] < right
+        and box["box_pt"][2] > left
+    )
     if len(edges) < MIN_BODY_BOXES:
         return None
     gap, right_edge = 0.0, None
@@ -2046,8 +2687,11 @@ def _candidates(
     matcher = SequenceMatcher(None, base_keys, other_keys, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for index in range(i1, i2):
-                at.setdefault(index, []).append(base[index])
+            # The engine's own spelling of the word it read as the
+            # base's: one key, and the shown word may differ by a gap
+            # the key folds (``_tidiest`` picks between them).
+            for offset in range(i2 - i1):
+                at.setdefault(i1 + offset, []).append(other[j1 + offset])
         elif tag == "replace":
             if i2 - i1 == j2 - j1:
                 for offset in range(i2 - i1):
@@ -2110,6 +2754,19 @@ def vote_words(
     tie. A word only a minority read is dropped, which is the reading
     of the majority.
 
+    **A gap is a spot.** Where a run was dropped, what each engine read
+    in the gap is a reading like a word's: the base's is nothing, and
+    so is that of an engine with no run there. Two alike against one is
+    ``"gap": "warning"`` on the word after the gap, the star-page
+    number one engine read; no two alike is ``"gap": "blocking"`` and
+    counts as a position with no majority (``or`` against
+    ``[c]ontract or`` against ``I contract or``). A run after the last
+    word puts the level on that word as ``gap_after``. None of the runs
+    goes in; the card sits on the gap and shows them
+    (``blocking_review.open_words``). The other way round is the same
+    gap: a word the base read where a majority read nothing is dropped,
+    and the place is a warning gap, so the drop is shown too.
+
     :param base: The base engine's ``(key, word)`` pairs.
     :param others: The other engines' pairs.
     :returns: ``(tokens, how many positions had no majority)``.
@@ -2131,6 +2788,17 @@ def vote_words(
     # The key the answer holds at each base position the vote has
     # passed, which a carried reading of a later position reads (#391).
     chosen: dict[int, str] = {}
+    # The level of a gap not yet written on a token: the next token
+    # appended carries it as ``gap``, the last one as ``gap_after``.
+    pending: str | None = None
+
+    def add(token: dict) -> None:
+        nonlocal pending
+        if pending:
+            token["gap"] = pending
+            pending = None
+        tokens.append(token)
+
     for position in range(len(base) + 1):
         runs: list[tuple[tuple[str, ...], tuple[str, ...]]] = [
             (
@@ -2140,8 +2808,19 @@ def vote_words(
             for inserted in inserts
             for run in inserted.get(position, [])
         ]
-        counted = Counter(keys for keys, _ in runs)
+        # A run is counted by its keys with the marks left out: a mark
+        # (``*``, ``•``, ``___``) has no key and reads as nothing, the
+        # rule of a keyless base word, so ``smith`` and ``smith •`` are
+        # one reading, and a run that is only marks is no run at all.
+        # The gap vote below folds the same way, so both judge one
+        # reading.
+        counted = Counter(
+            tuple(key for key in keys if key) for keys, _ in runs
+        )
+        dropped = False
         for keys, count in counted.items():
+            if not keys:
+                continue
             # A run the base does not have: ``count`` engines read it
             # and ``total - count`` did not. A majority of them puts it
             # in; a tie puts it in too, because the same tie on a word
@@ -2149,38 +2828,81 @@ def vote_words(
             # two engines make every difference a tie. A minority is
             # dropped, the reading of the majority.
             if count < quorum and count * 2 != total:
+                dropped = True
                 continue
-            words = next(words for other, words in runs if other == keys)
-            tokens += [
-                {
-                    "text": word,
-                    "low_confidence": True,
-                    "inserted": True,
-                    "position": position,
-                }
-                for word in words
-            ]
+            run_keys, run_words = next(
+                (k, w)
+                for k, w in runs
+                if tuple(key for key in k if key) == keys
+            )
+            for key, word in zip(run_keys, run_words, strict=True):
+                if not key:
+                    continue
+                add(
+                    {
+                        "text": word,
+                        "low_confidence": True,
+                        "inserted": True,
+                        "position": position,
+                    }
+                )
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
-            disputed += len(words)
+            disputed += len(keys)
+        if dropped:
+            # The gap is a spot: each engine's reading of it is the
+            # keys of its run here, and nothing for the base and for
+            # an engine with no run. A majority alike is a warning on
+            # the gap; none is blocking, and counts like a word no
+            # majority settled.
+            in_gap = [""] + [
+                " ".join(
+                    key
+                    for run in inserted.get(position, [])
+                    for key, _ in run
+                    if key
+                )
+                for inserted in inserts
+            ]
+            alike = Counter(in_gap).most_common(1)[0][1]
+            level = WARNING if alike >= quorum else BLOCKING
+            if level == BLOCKING:
+                disputed += 1
+            pending = BLOCKING if BLOCKING in (pending, level) else WARNING
         if position == len(base):
+            if pending and tokens:
+                tokens[-1]["gap_after"] = pending
             break
         readings = [base[position]]
+        # The engines that truly read nothing here, as against the ones
+        # whose reading of this word is inside a span the head took
+        # (#391): those vote to drop the word too, but the word is in
+        # the text, inside the joined reading, and the place is no gap.
+        read_nothing = 0
         for vote in votes:
             for reading in vote.get(position, []):
                 cast = _vote_of(reading, chosen)
                 if cast is not None:
                     readings.append(cast)
+                    if cast == ("", "") and not isinstance(reading, Carried):
+                        read_nothing += 1
         winner, count = Counter(key for key, _ in readings).most_common(1)[0]
         if count >= quorum:
             chosen[position] = winner
+            if not winner and base[position][0] and read_nothing >= quorum:
+                # A majority truly read nothing where the base read a
+                # word: the word is dropped, and the place is a gap
+                # like a run's, the other way round, so the drop is
+                # shown. A mark with no key is not a word, and makes
+                # no gap.
+                pending = pending or WARNING
             if winner:
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
                 token = {
-                    "text": next(
-                        word for key, word in readings if key == winner
+                    "text": _tidiest(
+                        [word for key, word in readings if key == winner]
                     ),
                     "position": position,
                 }
@@ -2190,11 +2912,11 @@ def vote_words(
                     # reading elsewhere (#391) confirmed nothing, so
                     # its silence must not read as one more voice.
                     token["majority"] = True
-                tokens.append(token)
+                add(token)
         else:
             chosen[position] = base[position][0]
             disputed += 1
-            tokens.append(
+            add(
                 {
                     "text": base[position][1],
                     "low_confidence": True,
@@ -2296,12 +3018,19 @@ def resolve(group: dict) -> dict:
         quorum = (len(present) + 2) // 2
         if votes >= quorum:
             agreeing = [name for name in present if keys[name] == winner]
+            # The spelling shown is the tidiest of the agreeing ones,
+            # and ``source`` names its engine, the side the cards vote
+            # from (``blocking_review.open_words``).
+            shown = _tidiest([engines[name]["text"] for name in agreeing])
+            source = next(
+                name for name in agreeing if engines[name]["text"] == shown
+            )
             answer = {
                 "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
-                "source": agreeing[0],
+                "source": source,
                 "agreeing": agreeing,
                 "silent": silent,
-                "text": engines[agreeing[0]]["text"],
+                "text": shown,
                 "tokens": [],
                 "n_low_confidence": 0,
             }
@@ -2348,6 +3077,7 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
     :rtype: tuple[list[dict], list[dict]]
     """
     placed, unplaced = [], []
+    spec = opinion_ocr.ENGINES.get(engine)
     for unit in page.get("units") or []:
         if not isinstance(unit, dict):
             continue
@@ -2370,13 +3100,31 @@ def _units_of(page: dict, engine: str) -> tuple[list[dict], list[dict]]:
             # A document of the glue before #404 has none of these,
             # and reads as plain paragraphs.
             "marks": unit.get("marks") or [],
-            "kind": unit.get("kind") or markup.PARAGRAPH,
+            "kind": _unit_kind(unit, spec),
             "table": unit.get("table"),
             # The glue deleted a bracket token of this unit (#373).
             "bracket": bool(unit.get("removed")),
         }
         (placed if box else unplaced).append(entry)
     return placed, unplaced
+
+
+def _unit_kind(unit: dict, spec) -> str:
+    """Return the kind of one unit, the glue's and never the label's.
+
+    The pictures of a text are the curated ``IMAGE`` boxes of the run,
+    which the OCR glue writes as ``figure`` units of its own
+    (``opinion_ocr.PICTURE``); an engine's own picture label is a
+    paragraph there, so it is one here too. A document glued before
+    that rule keeps the kinds its glue wrote until it is glued again
+    (``reglue_opinion_ocr``), the rule of every transform.
+
+    :param unit: One unit of an opinion document.
+    :param spec: The engine's ``opinion_ocr.EngineSpec``, or None.
+    :returns: A ``markup.BLOCK_KINDS`` value.
+    :rtype: str
+    """
+    return unit.get("kind") or markup.PARAGRAPH
 
 
 def _frame(pages: dict[str, dict]) -> tuple[float, float] | None:
@@ -2430,12 +3178,22 @@ def _counts() -> dict:
         "low_confidence": 0,
         "partial": 0,
         "partial_bracket": 0,
+        # The groups dropped where the detections drew nothing
+        # (``opinion_ocr.UNDETECTED``), the ``UNDETECTED_TEXT`` card.
+        "undetected": 0,
+        # The undetected drops a majority of the engines read alike:
+        # the shape of a column the detections missed, an ERROR card.
+        "undetected_agreed": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
         "blockquotes": 0,
         "blockquote_lists": 0,
         "lists": 0,
         "unresolved_edits": 0,
+        # The pictures of the page (#463), and the blocks a picture
+        # took although it covers only part of them.
+        "figures": 0,
+        "figure_partial": 0,
     }
 
 
@@ -2547,16 +3305,255 @@ def _apply_order(ordered: list[dict], edit: dict) -> int:
     return len(boxes) - len(landed)
 
 
-def _human_read(read_back: dict, edit: dict) -> dict:
+def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
+    """Return the tokens of a person's text, the vote's flags kept on
+    the words the person left as they were.
+
+    **A word answer fixes words and vouches for no other.** A text
+    edit carries the whole block, because that is the one edit there
+    is, but a person who answered one card of the blocking review
+    read one word (the edit's ``span``). So a word the vote left open
+    (``low_confidence``) that stands in the new text as it stood keeps
+    its token, its flag and its base position, and the block is still
+    a card until each such word is chosen, typed or kept; a word the
+    person wrote anew carries nothing, because they judged it. The
+    words are aligned by the keys of :func:`compare_word`, equal runs
+    alone: a changed word at the same place is a judgement, not a
+    carry. A ``majority`` flag carries the same way, for the warnings
+    review, and so does the place of an inserted word in its run
+    (``run_index``), so the card of a run the base did not read shows
+    the engines' word at that place whatever its neighbours became. A
+    block a majority read alike has no tokens of its own, so its words
+    are voted here as the warnings review votes them
+    (``blocking_review.open_words``), or its one answer took its other
+    majority words with it. A whole-block judgement never comes here
+    (:func:`_human_read`).
+
+    A gap (``gap``, ``gap_after``) carries by its place, onto whatever
+    word now stands after it, unless the person put words into it: a
+    pure insertion there; a rewrite of a neighbour that grew by any
+    word, typed or picked, unless it is the same words split or joined
+    another way; or a rewrite of any length that holds a word an
+    engine read in that gap, which is a fill with the word before it
+    deleted. A rewritten neighbour alone is a replacement, not an
+    insertion, so the gap stays open and still a card. So an answer
+    to a gap card holds on every rebuild, with no record of the answer
+    beyond the text, and an answer beside a gap never closes it
+    unseen. The one stroke the text cannot read, a typed fill with
+    its neighbour deleted at once, leaves the card open, the safe way.
+
+    :param read_back: :func:`resolve` of the group, the engines' own.
+    :param text: The text the person wrote, folded.
+    :param engines: The group's ``engines``, for a block the vote left
+        no tokens on.
+    :returns: One token per word of ``text``.
+    :rtype: list[dict]
+    """
+    voted = [t for t in read_back.get("tokens") or [] if t.get("text")]
+    present = (
+        [
+            name
+            for name in _ranked(engines)
+            if compare_text(engines[name]["text"])
+        ]
+        if engines
+        else []
+    )
+    # The engine whose text is shown, the rule of
+    # ``blocking_review.open_words``: the vote of a block a majority
+    # read alike runs from its side, so the positions the tokens carry
+    # count the words of the text a card is placed in.
+    first = read_back.get("source")
+    if first not in present and present:
+        first = present[0]
+    if (
+        not voted
+        and read_back.get("agreement") == MAJORITY
+        and len(present) >= 2
+    ):
+        base = _pairs(engines[first]["text"])
+        others = [
+            _pairs(engines[name]["text"]) for name in present if name != first
+        ]
+        # The vote is from the shown engine's side, so a word the
+        # majority read and that engine missed comes back
+        # ``low_confidence``; the majority settled it, and only the
+        # ``majority`` flag is a card of such a block
+        # (``blocking_review.open_words``). A block two engines read
+        # alike can stay a warning and never become blocking.
+        voted = [
+            {k: v for k, v in t.items() if k != "low_confidence"}
+            for t in vote_words(base, others)[0]
+            if t.get("text")
+        ]
+    if not voted:
+        return []
+    run_index: int | None = None
+    for token in voted:
+        if token.get("inserted"):
+            run_index = 0 if run_index is None else run_index + 1
+            token["run_index"] = run_index
+        else:
+            run_index = None
+    # The person's words, split as the vote splits a read: a run of
+    # dots or a hyphen gap the vote joined is one token with a space
+    # in it, and split on whitespace it is two words that never match
+    # it, so a word the person left as it was read as changed and its
+    # card closed unjudged.
+    person = _pairs(text)
+    words = [shown for _, shown in person]
+    matcher = SequenceMatcher(
+        None,
+        [compare_word(t["text"]) for t in voted],
+        [key for key, _ in person],
+        autojunk=False,
+    )
+    # What the engines read in each gap, by the base position the gap
+    # stands before: the keys of their runs there, and the base's own
+    # words the vote dropped. A person's extra word that is one of
+    # them went into that gap.
+    in_gaps: dict[int, set[str]] = {}
+    base_pairs = _pairs(engines[first]["text"]) if first in present else []
+    for name in present:
+        if name == first:
+            continue
+        _at, inserted = _candidates(base_pairs, _pairs(engines[name]["text"]))
+        for at, runs in inserted.items():
+            in_gaps.setdefault(at, set()).update(
+                key for run in runs for key, _ in run if key
+            )
+    kept_at = sorted(
+        {
+            t["position"]
+            for t in voted
+            if "position" in t and not t.get("inserted")
+        }
+    )
+    for at, (key, _) in enumerate(base_pairs):
+        if key and at not in kept_at:
+            after = next((q for q in kept_at if q > at), len(base_pairs))
+            in_gaps.setdefault(after, set()).add(key)
+
+    def gap_at(boundary: int) -> int | None:
+        """The base position of the gap before voted token
+        ``boundary``; past the last token, the end of the base."""
+        if boundary >= len(voted):
+            return len(base_pairs) if base_pairs else None
+        return voted[boundary].get("position")
+
+    carried: dict[int, dict] = {}
+    # Where each voted token stands in the person's text: its own
+    # place when the word is unchanged, its replacement's when the
+    # person changed it, nowhere when they deleted it. And the voted
+    # positions before which the person put words in: a pure
+    # insertion, or a replacement that grew by a word an engine read
+    # in the gap beside it. A changed neighbour alone is a
+    # replacement, not an insertion, and leaves the gap open.
+    landed: dict[int, int | None] = {}
+    filled: set[int] = set()
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "equal":
+            for offset in range(i2 - i1):
+                carried[j1 + offset] = voted[i1 + offset]
+                landed[i1 + offset] = j1 + offset
+        elif tag == "replace":
+            for offset in range(i2 - i1):
+                landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
+            human_keys = [key for key, _ in person[j1:j2]]
+            voted_keys = [compare_word(t["text"]) for t in voted[i1:i2]]
+            extra = set(human_keys) - set(voted_keys)
+            # More words than were replaced, and not the same words
+            # split or joined another way: the person put words in,
+            # whatever they typed. The gaps the span touches are the
+            # one after it, the walk's order, then the one before it.
+            grown = j2 - j1 > i2 - i1 and "".join(human_keys) != "".join(
+                voted_keys
+            )
+            touched = [b for b in (i2, i1) if _has_gap(voted, b)]
+            # A new word that is what an engine read in the gap fills
+            # it whatever the span's length: a fill with the word
+            # before it deleted is a replacement of the same length.
+            matched = [
+                b for b in touched if extra & in_gaps.get(gap_at(b), set())
+            ]
+            if matched:
+                filled.add(matched[0])
+            elif grown and touched:
+                filled.add(touched[0])
+        elif tag == "insert":
+            filled.add(i1)
+        else:
+            for offset in range(i2 - i1):
+                landed[i1 + offset] = None
+    tokens: list[dict] = []
+    for index, word in enumerate(words):
+        token: dict = {"text": word}
+        old = carried.get(index)
+        if old:
+            for flag in ("low_confidence", "majority", "inserted"):
+                if old.get(flag):
+                    token[flag] = True
+            for key in ("position", "run_index"):
+                if key in old:
+                    token[key] = old[key]
+        tokens.append(token)
+    # A gap lands by its place, on whatever word now stands after it,
+    # unless the person put words in it; the gap after the last word
+    # lands on the person's last word.
+    for i, old in enumerate(voted):
+        if old.get("gap") and i not in filled and landed.get(i) is not None:
+            _land_gap(
+                tokens[landed[i]], "gap", old["gap"], old.get("position")
+            )
+        if old.get("gap_after") and len(voted) not in filled and tokens:
+            _land_gap(tokens[-1], "gap_after", old["gap_after"], None)
+    return tokens
+
+
+def _has_gap(voted: list[dict], boundary: int) -> bool:
+    """Return whether the vote flagged the gap before voted token
+    ``boundary``, or after the last token when ``boundary`` is past
+    it."""
+    if boundary < len(voted):
+        return bool(voted[boundary].get("gap"))
+    return bool(voted) and bool(voted[-1].get("gap_after"))
+
+
+def _land_gap(token: dict, key: str, level: str, position: int | None) -> None:
+    """Put a gap's level on a token of a person's text.
+
+    Blocking over warning when two gaps land on one word. ``gap_at``
+    is the base position the gap stands before, which the cards read
+    when the word itself is not the vote's (``blocking_review.open_words``).
+
+    :param token: The token of the person's word.
+    :param key: ``"gap"`` or ``"gap_after"``.
+    :param level: The gap's level.
+    :param position: The base position of the word after the gap.
+    """
+    token[key] = BLOCKING if BLOCKING in (token.get(key), level) else level
+    if key == "gap" and position is not None:
+        token["gap_at"] = position
+
+
+def _human_read(
+    read_back: dict, edit: dict, engines: dict | None = None
+) -> dict:
     """Return the read of a group whose text a person wrote.
 
     The marks of the engines' text carry to the words of the new text
     that :func:`union_marks` aligns with them, so an italic case name
     the curator did not touch keeps its italic. A table becomes a
-    paragraph: its rows are the engines', and the text is not.
+    paragraph: its rows are the engines', and the text is not. An edit
+    with a ``span`` answered one card, so the open words of the vote
+    the person left as they were carry too (:func:`_kept_open`) and
+    the block stays a card for them; an edit with none judged the
+    whole block (the block card, the edit box), and nothing is open.
 
     :param read_back: :func:`resolve` of the group.
     :param edit: The entry of the ``TEXT`` edit.
+    :param engines: The group's ``engines``, for the carry of a block
+        a majority read alike.
     :returns: The read, in the shape of :func:`resolve`.
     :rtype: dict
     """
@@ -2569,15 +3566,28 @@ def _human_read(read_back: dict, edit: dict) -> dict:
         # The items carry like the marks: a word the curator kept
         # still starts its item (#428).
         marks, kind_of_list = _with_items(text, marks, readings, 1)
+    tokens = (
+        _kept_open(read_back, text, engines or {})
+        if edit.get("span") is not None
+        else []
+    )
     return {
         **read_back,
         "agreement": HUMAN,
         "source": HUMAN,
+        # The engine the tokens' positions count against, for the
+        # cards (``blocking_review.open_words``).
+        "base": read_back.get("source"),
         "agreeing": [],
         "silent": [],
         "text": text,
-        "tokens": [],
-        "n_low_confidence": 0,
+        "tokens": tokens,
+        "n_low_confidence": sum(
+            1
+            for token in tokens
+            if token.get("low_confidence")
+            or BLOCKING in (token.get("gap"), token.get("gap_after"))
+        ),
         "marks": marks,
         "kind": markup.PARAGRAPH if kind == markup.TABLE else kind,
         "list": kind_of_list,
@@ -2718,6 +3728,7 @@ def build_page(
                     or DROP_EXCLUDED,
                     "partial": False,
                     "bracket": unit.get("bracket", False),
+                    "edit": None,
                 }
             )
     if size is None:
@@ -2749,20 +3760,34 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
+    # A picture takes no edit (#463): it is a box of review 2, the views
+    # refuse every edit of it, and a box copy must not land one. So a
+    # drop lands on the text groups alone, and an old drop of the words
+    # under a picture lands on the words, which the box took already,
+    # and never on the picture.
+    texts = [group for group in groups if not group.get("figure")]
     for kind, key in (
         (OpinionEdit.Kind.SECTION, "_section_edit"),
         (OpinionEdit.Kind.TEXT, "_text_edit"),
         (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
+        (OpinionEdit.Kind.DROP, "_drop_edit"),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], groups)
+        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
         for here, edit in enumerate(wanted):
             if here in landed:
-                groups[landed[here]][key] = edit
+                texts[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
+        if group.get("figure"):
+            # A picture is body text in its place (#463): no zone moves
+            # it to the footnotes and none makes it a quote.
+            group["section"], group["footnote_doubt"] = BODY, False
+            group["blockquote"] = group["_zone_blockquote"] = False
+            by_section[BODY].append(group)
+            continue
         group["section"], group["footnote_doubt"] = section(group, zones)
         placed = group.get("_section_edit")
         if placed and placed["section"] in by_section:
@@ -2803,13 +3828,27 @@ def build_page(
     # still parts two quotes.
     sequence: list[dict] = []
     for group in ordered:
+        if group.get("figure") and not group["excluded"]:
+            entry["groups"].append(
+                _figure_entry(group, len(entry["groups"]), offsets[BODY])
+            )
+            sequence.append(entry["groups"][-1])
+            entry["counts"]["figures"] += 1
+            continue
         read_back = resolve(group)
-        if group["excluded"] or not read_back["text"]:
-            # A redaction or a mask took the block, or no engine reads
-            # a word there now: two causes, and the card names the one.
+        # A person said the block is not text: the bleed-through of
+        # the page behind, a stray mark. It goes like a block a box
+        # took, with the edit on the drop, where the page offers its
+        # Undo; the other edits of the block wait on it and are not
+        # unresolved, because the Undo brings them back into effect.
+        # A block a box took goes for the box, whatever a person said.
+        by_hand = None if group["excluded"] else group.get("_drop_edit")
+        if group["excluded"] or by_hand or not read_back["text"]:
+            # A redaction or a mask took the block, a person did, or no
+            # engine reads a word there now: the card names the one.
             gone = EDIT_DROPPED if group["excluded"] else EDIT_EMPTY
             for key in ("_section_edit", "_text_edit", "_quote_edit"):
-                if group.get(key):
+                if group.get(key) and not by_hand:
                     unresolved.append(_unresolved(group[key], gone))
             sequence.append(
                 {
@@ -2837,14 +3876,32 @@ def build_page(
                     },
                     "box_pt": group["box_pt"],
                     "reason": (
-                        group["reason"] or DROP_EXCLUDED
+                        (group["reason"] or DROP_EXCLUDED)
                         if group["excluded"]
-                        else DROP_EMPTY
+                        else (DROP_HUMAN if by_hand else DROP_EMPTY)
                     ),
-                    "partial": group["partial"],
+                    "partial": group["partial"] and not by_hand,
+                    "picture_partial": (
+                        group.get("picture_partial", False) and not by_hand
+                    ),
                     "bracket": any(
                         unit.get("bracket")
                         for unit in group["engines"].values()
+                    ),
+                    # Whether a majority of the engines read the words
+                    # the verdict took alike (``_dropped_alike``): on a
+                    # drop where the detections drew nothing, the sign
+                    # of a column they missed rather than bleed-through.
+                    "agreed": _dropped_alike(group),
+                    # The edit that took the block out, for its Undo.
+                    "edit": (
+                        {
+                            "id": by_hand["id"],
+                            "by": by_hand["by"],
+                            "at": by_hand["at"],
+                        }
+                        if by_hand
+                        else None
                     ),
                 }
             )
@@ -2860,7 +3917,7 @@ def build_page(
             ):
                 unresolved.append(_unresolved(written, EDIT_BASE_CHANGED))
             else:
-                read_back = _human_read(read_back, written)
+                read_back = _human_read(read_back, written, group["engines"])
                 human = {
                     "edit_id": written["id"],
                     "by": written["by"],
@@ -2901,6 +3958,9 @@ def build_page(
                 "end": end,
                 "agreement": read_back["agreement"],
                 "source": read_back["source"],
+                # A person's block: the engine its tokens' positions
+                # count against (``_human_read``), which the cards read.
+                "base": read_back.get("base"),
                 "agreeing": read_back["agreeing"],
                 "alignment_iou": group["alignment_iou"],
                 "weak": group["weak"],
@@ -2923,6 +3983,18 @@ def build_page(
                         "ids": unit["ids"],
                         "box_pt": unit["box_pt"],
                         "text": unit["text"],
+                        # Why a silent engine is silent, when the
+                        # verdict took its reading: the viewer's note
+                        # tells it from an engine that read nothing.
+                        "excluded": (
+                            (unit["reason"] or DROP_EXCLUDED)
+                            if unit["excluded"]
+                            else None
+                        ),
+                        # How many things a box hid in this reading
+                        # were taken out (``_uncover``): a count, never
+                        # the words, which are under a redaction.
+                        "uncovered": unit.get("uncovered") or 0,
                     }
                     for name, unit in group["engines"].items()
                 },
@@ -2942,16 +4014,19 @@ def build_page(
             entry["counts"][level] += 1
         if level == BLOCKING and read_back["agreement"] == SINGLE:
             entry["counts"]["single_engine"] += 1
-        if level == BLOCKING and read_back["agreement"] == VOTED:
+        if level == BLOCKING and read_back["agreement"] in (VOTED, HUMAN):
             entry["counts"]["no_majority"] += 1
         if name == FOOTNOTES:
             entry["counts"]["footnote_groups"] += 1
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
-    for group in entry["groups"]:
+    # A picture never goes to the footnotes (#463), so it is in no
+    # block's ``below`` and has none of its own.
+    texts = [g for g in entry["groups"] if g["kind"] != markup.FIGURE]
+    for group in texts:
         if group["section"] == BODY:
-            group["below"] = blocks_below(entry["groups"], group)
+            group["below"] = blocks_below(texts, group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
     entry["blockquotes"] = blockquote_runs(sequence)
@@ -2975,9 +4050,88 @@ def build_page(
     entry["counts"]["partial_bracket"] = sum(
         1 for drop in entry["dropped"] if drop["partial"] and drop["bracket"]
     )
+    entry["counts"]["figure_partial"] = sum(
+        1 for drop in entry["dropped"] if drop.get("picture_partial")
+    )
+    entry["counts"]["undetected"] = sum(
+        1
+        for drop in entry["dropped"]
+        if drop["reason"] == opinion_ocr.UNDETECTED
+    )
+    entry["counts"]["undetected_agreed"] = sum(
+        1
+        for drop in entry["dropped"]
+        if drop["reason"] == opinion_ocr.UNDETECTED and drop.get("agreed")
+    )
     entry["unresolved_edits"] = unresolved
     entry["counts"]["unresolved_edits"] = len(unresolved)
     return entry
+
+
+def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
+    """Return the document entry of one picture group (#463).
+
+    The shape of a text group, so every reader of the groups reads it,
+    with no text: ``start`` and ``end`` are the place in the body text
+    the picture sits at, and the body text takes no paragraph for it.
+    ``figure`` holds the box and the size the picture has on the page,
+    which the cut and the approved text read. It has no ``level``: the
+    engines vote on no text here.
+
+    :param group: The picture group of :func:`align_page`.
+    :param group_id: Its id in the page.
+    :param offset: The body offset it sits at.
+    :returns: The entry.
+    :rtype: dict
+    """
+    box = group["box_pt"]
+    engines = _ranked(group["engines"])
+    return {
+        "id": group_id,
+        # Body text whatever band it sits in: the approved text reads
+        # the body band alone, and a picture at the head or the foot of
+        # a page is still a picture of the opinion, cut and paid for.
+        "band": "body",
+        "column": group["column"],
+        "section": BODY,
+        "footnote_doubt": False,
+        "footnote_by": [],
+        "blockquote": False,
+        "quote_span": None,
+        "quote_edit": None,
+        "list_by": [],
+        "box_pt": box,
+        "start": offset,
+        "end": offset,
+        "agreement": UNANIMOUS if len(engines) > 1 else SINGLE,
+        "source": engines[0],
+        "agreeing": engines,
+        "alignment_iou": group["alignment_iou"],
+        "weak": group["weak"],
+        "page_scale": group["page_scale"],
+        "silent": [],
+        "n_low_confidence": 0,
+        "level": None,
+        "human": None,
+        "section_edit": None,
+        "tokens": [],
+        "text": "",
+        "kind": markup.FIGURE,
+        "list": None,
+        "marks": [],
+        "figure": {
+            "width_pt": round(box[2] - box[0], 2),
+            "height_pt": round(box[3] - box[1], 2),
+        },
+        "engines": {
+            name: {
+                "ids": unit["ids"],
+                "box_pt": unit["box_pt"],
+                "text": "",
+            }
+            for name, unit in group["engines"].items()
+        },
+    }
 
 
 def _no_group(entry: dict, edits: list[dict]) -> None:
@@ -3005,8 +4159,14 @@ def _differs(group: dict, engines: int) -> bool:
     :rtype: bool
     """
     if group["agreement"] == HUMAN:
-        # A person wrote this text against the page (#376).
-        return False
+        # A person wrote this text against the page (#376), and
+        # vouched for the words they changed: a word the vote left
+        # open, or settled over one engine, that they left as it was
+        # is still that (``_kept_open``).
+        return bool(group.get("n_low_confidence")) or any(
+            token.get("majority") or token.get("gap") or token.get("gap_after")
+            for token in group.get("tokens") or []
+        )
     if group["agreement"] in (MAJORITY, VOTED) or group.get("silent"):
         return True
     return len(group.get("engines") or {}) < engines
@@ -3027,8 +4187,10 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     (``n_low_confidence``): a block of a hundred words that the engines
     split three ways over one spelling and one quote mark is settled
     word for word, and a block whose every word a majority settled is
-    the same fact as a block a majority read whole. Every other place
-    :func:`_differs` answers for is a warning.
+    the same fact as a block a majority read whole. A block a person
+    wrote (``HUMAN``) blocks for the open words they left as they
+    were, warns for the majority words they left, and for nothing
+    else. Every other place :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -3039,7 +4201,7 @@ def disagreement_level(group: dict, engines: int) -> str | None:
         return None
     if group["agreement"] == SINGLE:
         return BLOCKING
-    if group["agreement"] == VOTED and group.get("n_low_confidence"):
+    if group["agreement"] in (VOTED, HUMAN) and group.get("n_low_confidence"):
         return BLOCKING
     return WARNING
 
@@ -3548,13 +4710,34 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
         if counts["partial"]:
+            # A box that covers part of a block is either an engine's
+            # box running past it or a redaction drawn short, and the
+            # second leaves words on the page: the approval waits until
+            # a person has looked at the block and dismissed the card.
             cards.append(
                 _card(
                     opinion,
                     page_number,
                     OpinionCheck.PARTIAL_REDACTION,
-                    Issue.Severity.WARNING,
+                    Issue.Severity.ERROR,
                     _partial_message(page),
+                    standing,
+                )
+            )
+        if counts.get("undetected"):
+            # The glue left text out on the detections' word, and the
+            # approval waits until a person has looked at the page and
+            # dismissed the card: a column the detections missed would
+            # be text lost in silence otherwise. The message says when
+            # a majority of the engines read a dropped block alike,
+            # the shape of such a column rather than of bleed-through.
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.UNDETECTED_TEXT,
+                    Issue.Severity.ERROR,
+                    _undetected_message(page),
                     standing,
                 )
             )
@@ -3580,6 +4763,17 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        if counts.get("figures") or counts.get("figure_partial"):
+            cards.append(
+                _card(
+                    opinion,
+                    page_number,
+                    OpinionCheck.FIGURE_TO_CHECK,
+                    Issue.Severity.WARNING,
+                    _figure_message(page),
+                    standing,
+                )
+            )
     OpinionFinding.objects.bulk_create(cards)
     return len(cards)
 
@@ -3591,7 +4785,93 @@ _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
     opinion_ocr.PAGE_NUMBER: "the page number",
+    opinion_ocr.RUNNING_HEAD: "the running head",
+    opinion_ocr.UNDETECTED: "no detection",
+    DROP_HUMAN: "a person",
 }
+
+
+def _figure_message(page: dict) -> str:
+    """Return the line of one ``FIGURE_TO_CHECK`` card (#463).
+
+    Every page with a picture gets one, because a picture's place is a
+    box and the engines' text is a block: a block a picture covers in
+    part goes whole, and only the PDF shows whether a caption or a line
+    of text went with it.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    counts = page["counts"]
+    figures = counts.get("figures", 0)
+    line = (
+        f"{figures} picture(s) on this page. Check each against the PDF: "
+        "the final text embeds the cut, and the text around it must all "
+        "be in the text."
+    )
+    partial = counts.get("figure_partial", 0)
+    if partial:
+        line += (
+            f" {partial} block(s) the picture covers only in part went "
+            "with it: the words outside the picture box are not in the text."
+        )
+    return line
+
+
+def _undetected_message(page: dict) -> str:
+    """Return the line of one ``UNDETECTED_TEXT`` card.
+
+    The engines read words where the detections drew no column, no
+    footnote band and no picture, and the glue left them out
+    (``opinion_ocr.UNDETECTED``): the bleed-through of the page
+    behind, most days. The card is an ERROR the approval waits on,
+    because a column the detections missed is text lost the same way,
+    and only the page tells the two apart; it says when the engines
+    read a dropped block alike, the sign of such a column.
+
+    :param page: One page of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    count = page["counts"]["undetected"]
+    agreed = page["counts"].get("undetected_agreed", 0)
+    if agreed:
+        return (
+            f"{count} block(s) on this page lie where the detections drew "
+            f"nothing, and were left out; the engines read {agreed} of "
+            "them alike, the shape of a column the detections missed. "
+            "Look at the page before approving: text there is lost."
+        )
+    return (
+        f"{count} block(s) on this page lie where the detections drew "
+        "nothing, and were left out: the bleed-through of the page "
+        "behind, as the engines read it. Check that no column of print "
+        "is among them."
+    )
+
+
+def _dropped_alike(group: dict) -> bool:
+    """Say whether a majority of the engines read a dropped group alike.
+
+    Over the fold of the words the verdict took from each engine's
+    reading (``hidden_key`` of :func:`_merge`), never the words. Two
+    engines inventing the same text from bleed-through is rare; three
+    reading a column the detections missed alike is the rule.
+
+    :param group: The aligned group.
+    :returns: Whether a majority of the readings share one key.
+    :rtype: bool
+    """
+    keys = [
+        unit.get("hidden_key")
+        for unit in group["engines"].values()
+        if unit.get("hidden_key")
+    ]
+    if len(keys) < 2:
+        return False
+    best = max(keys.count(key) for key in set(keys))
+    return best >= 2 and best * 2 > len(keys)
 
 
 def _unread_message(page: dict) -> str:
@@ -3613,9 +4893,9 @@ def _partial_message(page: dict) -> str:
     """Return the line of one ``PARTIAL_REDACTION`` card.
 
     The reason is read off the drops the count came from: a group goes
-    whole, and what took it is a redaction, the mask of the opinion
-    before or the page number (``opinion_ocr.verdict`` writes the
-    three).
+    when no engine read it clean, and what took it is a redaction, the
+    mask of the opinion before or the page number
+    (``opinion_ocr.verdict`` writes the three).
 
     :param page: One page of the document.
     :returns: The message.
@@ -3780,6 +5060,7 @@ _EDIT_KIND_WORDS = {
     OpinionEdit.Kind.SECTION: "the section of a block",
     OpinionEdit.Kind.ORDER: "the order of the blocks",
     OpinionEdit.Kind.BLOCKQUOTE: "the blockquote of a block",
+    OpinionEdit.Kind.DROP: "a block taken out as not text",
 }
 
 
@@ -3874,6 +5155,55 @@ def _read(key: str, code: str = UNREADABLE) -> dict:
         raise TransientFault(f"the read of {key} failed: {exc}") from exc
 
 
+def figures_of(document: dict) -> list[dict]:
+    """Return the pictures of an ensemble document, in reading order (#463).
+
+    **The one reader** of the pictures of a text: the cut, the approval
+    and the review page walk the same list.
+
+    :param document: The ensemble document.
+    :returns: ``{"page_in_opinion", "page_index", "group", "box_pt",
+        "width_pt", "height_pt"}`` per picture.
+    :rtype: list[dict]
+    """
+    figures = []
+    for page in document.get("pages") or []:
+        for group in page.get("groups") or []:
+            if group.get("kind") != markup.FIGURE:
+                continue
+            figures.append(
+                {
+                    "page_in_opinion": page.get("page_in_opinion"),
+                    "page_index": page.get("page_index"),
+                    "group": group.get("id"),
+                    "box_pt": list(group["box_pt"]),
+                    **(group.get("figure") or {}),
+                }
+            )
+    return figures
+
+
+def figure_digest(document: dict) -> str:
+    """Return the digest of the pictures of a document, or blank (#463).
+
+    Over the run and the place of each picture, and nothing else: a
+    rebuild that moves a block, or a glue that reads the same pictures,
+    keeps the digest, so the cut is not paid again.
+
+    :param document: The ensemble document.
+    :returns: A hex digest, or "" when the text holds no picture.
+    :rtype: str
+    """
+    places = sorted(
+        (figure["page_index"], [round(v, 1) for v in figure["box_pt"]])
+        for figure in figures_of(document)
+    )
+    if not places:
+        return ""
+    raw = json.dumps([document.get("apply_run") or "", places])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def read_document(opinion: Opinion) -> dict:
     """Read the stamped ensemble document of one opinion off S3.
 
@@ -3943,6 +5273,9 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
     :raises RevisionMoved: When the OCR glue wrote again during this
         write, which keeps nothing.
     """
+    # A function-level import: ``opinion_figures`` reads this module.
+    from scanning import opinion_figures
+
     # The revision first and the edits second (#376): an edit written
     # between the two reads is in the build and raises the revision, so
     # the swap below fails and the next build holds both.
@@ -3974,6 +5307,7 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
+            digest = opinion_figures.ledger_digest(opinion, document)
             stamped = Opinion.objects.filter(
                 pk=opinion.pk,
                 ocr_glue_revision=opinion.ocr_glue_revision,
@@ -3982,6 +5316,23 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
                 ensemble_revision=opinion.ocr_glue_revision,
                 ensemble_edit_revision=edit_revision,
                 ensemble_attempts=0,
+                # The pictures the text holds (#463): the ledger the
+                # cut of ``opinion_figures`` answers. A new digest is a
+                # new cut, with a clean count of its faults and no
+                # cooldown of the old one; the same digest keeps both,
+                # so a rebuild does not reset a cut that fails.
+                figure_digest=digest,
+                figure_attempts=Case(
+                    When(figure_digest=digest, then=F("figure_attempts")),
+                    default=Value(0),
+                ),
+                figures_attempted_at=Case(
+                    When(
+                        figure_digest=digest,
+                        then=F("figures_attempted_at"),
+                    ),
+                    default=Value(None, output_field=DateTimeField()),
+                ),
             )
             if not stamped:
                 # The glue wrote the documents again while this ran, or
@@ -4102,7 +5453,16 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     """
     if not s3_sync.s3_active():
         return 0
-    rows = list(due(limit).select_related("scan", "apply_run"))
+    # The scan's caches stay on disk (#582), and the run's page map
+    # (#602): the ensemble reads neither.
+    rows = list(
+        due(limit)
+        .select_related("scan", "apply_run")
+        .defer(
+            *Scan.large_fields("scan__"),
+            *(f"apply_run__{name}" for name in ApplyRun.LARGE_FIELDS),
+        )
+    )
     if not rows:
         return 0
     started = time.monotonic()

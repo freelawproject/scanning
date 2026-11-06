@@ -8,6 +8,7 @@ on:
       - 'scanning/runpod-dotsmocr/**'
       - 'scanning/runpod_common.py'
       - 'scanning/layout_json.py'
+      - 'scanning/perpendiculars.py'
       - '.github/workflows/build-runpod-dotsmocr-worker.yml'
   workflow_dispatch:
 

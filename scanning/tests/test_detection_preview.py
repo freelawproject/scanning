@@ -352,6 +352,7 @@ class TestEveryWriteRefuses(ScanningTestCase):
         ("withdraw_stale_edit", {"issue_id": 1}),
         ("rebuild_findings", {}),
         ("delete_detection", {"detection_id": 1}),
+        ("restore_detection", {"detection_id": 1}),
         ("update_detection", {"detection_id": 1}),
         ("approve_detection", {"detection_id": 1}),
         ("bake_redactions", {}),

@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -22,6 +22,7 @@ from django.views.decorators.http import require_POST
 
 from scanning import (
     ensemble,
+    final_xml,
     opinion_ocr,
     opinion_pdf,
     opinions,
@@ -51,7 +52,11 @@ from scanning.models import (
     UploadAction,
     Volume,
 )
-from scanning.opinion_review import MIN_DOCUMENT_SCHEMA, blocking_filter
+from scanning.opinion_review import (
+    MIN_DOCUMENT_SCHEMA,
+    blocking_filter,
+    warning_filter,
+)
 from scanning.opinion_review import blocks as blocks_approval
 from scanning.services import apply_upload_action
 from scanning.utils import get_volume, has_s3_credentials
@@ -118,6 +123,8 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
+        # The row's caches and logs stay on disk: the list prints none.
+        .defer(*Scan.large_fields())
         # The legacy rows, on purpose: ``opinions`` is the new
         # ``Opinion`` table since #335, and this column counts what the
         # legacy pipeline generated. #334 gives the new rows their own
@@ -202,7 +209,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: The primary key of the scan.
     :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -211,26 +218,20 @@ def _filtered_opinions(request: HttpRequest):
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
     and the ``blocking`` switch, in the list's order, for the list and
-    for the blocking review, which reads the same query string.
+    for the blocking review, which reads the same query string. The
+    ``opinion`` filter is the review page's: its two buttons open the
+    blocking and the warnings review of that opinion alone.
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "blocking"})``, the current values as the form shows them.
+        "opinion", "blocking"})``, the current values as the form shows
+        them.
     """
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # each of a page's fifty rows, and no reader of the list needs one.
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
-    ).order_by(
-        "scan__reporter__short_name",
-        "scan__volume",
-        "first_printed_page",
-        "index_in_page",
-        # The last key makes the ordering total. ``Scan`` has no unique
-        # key over (reporter, volume) -- a volume comes in parts -- so
-        # two scans tie on the four keys above, and Postgres may rank
-        # tied rows differently for each page of a LIMIT/OFFSET walk.
-        # An opinion would then show on two pages, or on none.
-        "pk",
-    )
+    ).defer(*Scan.large_fields("scan__"))
 
     scan_filter = request.GET.get("scan")
     if _whole_number(scan_filter) is not None:
@@ -255,16 +256,48 @@ def _filtered_opinions(request: HttpRequest):
         else:
             messages.error(request, "Volume must be a number.")
             volume_filter = ""
+    opinion_filter = request.GET.get("opinion")
+    if _whole_number(opinion_filter) is not None:
+        opinions_qs = opinions_qs.filter(pk=opinion_filter)
+    else:
+        opinion_filter = ""
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The order never crosses a table: ordered by the reporter's name,
+    # the scan's volume and the opinion's page at once, no index served
+    # the sort, and at a hundred thousand rows Postgres joined and
+    # sorted them all for every page. One scan is read in page order
+    # (the unique key over scan, page and index is the index); a
+    # reporter or a volume number scan by scan in page order; the whole
+    # corpus newest first, which is the primary key. The last key makes
+    # every order total, so a LIMIT/OFFSET walk shows each opinion once.
+    if scan_filter or opinion_filter:
+        order = ("first_printed_page", "index_in_page", "pk")
+    elif reporter_filter or volume_filter:
+        order = ("scan_id", "first_printed_page", "index_in_page", "pk")
+    else:
+        order = ("-pk",)
+    opinions_qs = opinions_qs.order_by(*order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
         "status": status_filter or "",
         "volume": volume_filter or "",
+        "opinion": opinion_filter,
         "blocking": blocking_only,
     }
+
+
+def _with_open_card(opinions_qs, open_card: Q):
+    """Keep the opinions that hold an open card of ``open_card``."""
+    return opinions_qs.filter(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                open_card
+            )
+        )
+    )
 
 
 def _with_open_blocking_card(opinions_qs):
@@ -273,13 +306,7 @@ def _with_open_blocking_card(opinions_qs):
     ``opinion_review.blocking_filter`` is the rule, the one the badge
     counts by (#375).
     """
-    return opinions_qs.filter(
-        Exists(
-            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
-                blocking_filter()
-            )
-        )
-    )
+    return _with_open_card(opinions_qs, blocking_filter())
 
 
 #: The blocking review takes one volume at a time.
@@ -289,10 +316,10 @@ BLOCKING_REVIEW_SCOPE_MESSAGE = (
 )
 
 
-def _blocking_review_url(current: dict) -> str | None:
-    """Return the blocking review of the list's current filters, or
-    None when the filters name no volume (the page would walk the
-    corpus)."""
+def _review_url(current: dict, route: str) -> str | None:
+    """Return the blocking or the warnings review of the list's current
+    filters, or None when the filters name no volume (the page would
+    walk the corpus)."""
     if not (current["scan"] or current["volume"]):
         return None
     query = {
@@ -300,8 +327,31 @@ def _blocking_review_url(current: dict) -> str | None:
         for key, value in current.items()
         if key in ("scan", "reporter", "volume") and value
     }
-    address = reverse("opinion_blocking_review")
+    address = reverse(route)
     return f"{address}?{urlencode(query)}" if query else address
+
+
+def _scan_choices() -> list[tuple[str, str]]:
+    """Return the volumes the list's scan filter offers.
+
+    Every scan with an opinion row, in the list's order, named as the
+    rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
+    the scans, with the opinions as a semi-join on their scan index,
+    and the caches of every one of them left on disk (#582).
+
+    :returns: ``(scan pk, label)`` pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    scans = (
+        Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
+        .order_by("reporter__short_name", "volume", "pk")
+    )
+    return [
+        (str(s.pk), f"vol. {s.volume} {s.reporter.cite_name}, scan {s.pk}")
+        for s in scans
+    ]
 
 
 @login_required
@@ -327,12 +377,16 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     page_obj = paginator.get_page(request.GET.get("page"))
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
+    pictures = opinions.picture_counts(page_obj)
     for row in page_obj:
         (
             row.open_findings,
             row.stale_findings,
             row.blocking_findings,
         ) = counts.get(row.pk, (0, 0, 0))
+        row.pictures = pictures.get(row.pk, 0)
+        # The rule of the review page's XML link, read off the row.
+        row.final_xml_ready = final_xml.exportable(row)
 
     return render(
         request,
@@ -344,19 +398,34 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
+            "scan_choices": _scan_choices(),
             "current_scan": current["scan"],
             "current_reporter": current["reporter"],
             "current_status": current["status"],
             "current_volume": current["volume"],
             "current_blocking": current["blocking"],
-            "blocking_review_url": _blocking_review_url(current),
+            "blocking_review_url": _review_url(
+                current, "opinion_blocking_review"
+            ),
+            "warning_review_url": _review_url(
+                current, "opinion_warning_review"
+            ),
         },
     )
 
 
 @login_required
-def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
+def opinion_blocking_review(
+    request: HttpRequest, level: str = "blocking"
+) -> HttpResponse:
     """Review every open blocking card of a filter, one after the next.
+
+    With ``level`` ``"warning"`` (``/opinions/warnings/``), every open
+    warning card instead, in the same format: the words a majority
+    settled over one engine, to bless or to correct, and the cards
+    that point at the page, to dismiss. A warning gates nothing, so
+    the page lists no opinion as ready, and the approval it offers
+    stays behind the gate (``blocking_open`` in the cards' answer).
 
     The opinions of the list's filters (scan, reporter, volume) that
     are in the text review and hold an open blocking card, in the
@@ -370,23 +439,30 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
     :return: The rendered page.
     """
     opinions_qs, current = _filtered_opinions(request)
-    if not (current["scan"] or current["volume"]):
-        # One volume at a time: the page is for finishing a volume,
-        # not for walking the corpus.
+    if not (current["scan"] or current["volume"] or current["opinion"]):
+        # One volume at a time, or one opinion: the page is for
+        # finishing a volume, not for walking the corpus.
         messages.error(request, BLOCKING_REVIEW_SCOPE_MESSAGE)
         return redirect("opinion_list")
     in_review = opinions_qs.filter(
         status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
     )
-    paginator = Paginator(_with_open_blocking_card(in_review), 50)
+    warnings = level == "warning"
+    open_card = warning_filter() if warnings else blocking_filter()
+    paginator = Paginator(_with_open_card(in_review, open_card), 50)
     page_obj = paginator.get_page(request.GET.get("page"))
     # The opinions of the filter with nothing open: every card answered
     # here or on the review page, waiting on the approval alone. A
     # volume holds a few dozen, so the list is whole and not paged.
-    ready = list(
-        in_review.exclude(
-            pk__in=_with_open_blocking_card(in_review).values("pk")
-        )[:200]
+    # The warnings review lists none: a warning holds no approval.
+    ready = (
+        []
+        if warnings
+        else list(
+            in_review.exclude(
+                pk__in=_with_open_blocking_card(in_review).values("pk")
+            )[:200]
+        )
     )
     counts = opinions.finding_counts(
         [row.pk for row in page_obj] + [row.pk for row in ready]
@@ -396,9 +472,12 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
             row.pk, (0, 0, 0)
         )
         kwargs = {"pk": row.scan_id, "opinion_pk": row.pk}
-        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs)
+        row.cards_url = reverse("opinion_blocking_cards", kwargs=kwargs) + (
+            "?level=warning" if warnings else ""
+        )
         row.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
         row.edit_text_url = reverse("edit_opinion_text", kwargs=kwargs)
+        row.edit_drop_url = reverse("edit_opinion_drop", kwargs=kwargs)
         row.approve_url = reverse("approve_opinion_text", kwargs=kwargs)
         row.withdraw_url = reverse("withdraw_opinion_edit", kwargs=kwargs)
         row.review_url = reverse("opinion_review", kwargs={"pk": row.pk})
@@ -407,16 +486,28 @@ def opinion_blocking_review(request: HttpRequest) -> HttpResponse:
         for key, value in current.items()
         if key in ("scan", "reporter", "volume") and value
     }
-    query = urlencode(list_query)
+    # The walk's own pages keep the opinion of the review page's
+    # button; the list the walk goes back to is the volume's whole.
+    query = urlencode(
+        {
+            **list_query,
+            **({"opinion": current["opinion"]} if current["opinion"] else {}),
+        }
+    )
     return render(
         request,
         "scanning/opinion_blocking_review.html",
         {
             "page_obj": page_obj,
             "ready": ready,
+            "level": level,
+            "review_name": "Warnings review"
+            if warnings
+            else "Blocking review",
+            "card_word": "warning" if warnings else "blocking",
             "current_scan": current["scan"],
             "list_url": reverse("opinion_list")
-            + (f"?{query}" if query else ""),
+            + (f"?{urlencode(list_query)}" if list_query else ""),
             "query": query,
         },
     )
@@ -435,9 +526,12 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     """
     # Not ``opinions``: that name holds the module this view's twin
     # calls for its warning badge, and a local would hide it.
-    opinions_qs = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start", "pk")
+    opinions_qs = (
+        OpinionScan.objects.select_related("reporter", "scan")
+        # The scan's caches stay on disk (#582): the list prints none.
+        .defer(*Scan.large_fields("scan__"))
+        .order_by("reporter__short_name", "volume", "page_start", "pk")
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -528,7 +622,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     opinion = get_object_or_404(
         Opinion.objects.select_related(
             "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
-        ),
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
     findings = list(
@@ -580,6 +674,14 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
         else None
     )
 
+    def walk_url(route: str) -> str | None:
+        """Return a card walk of this opinion alone, or None when the
+        opinion is not in the text review."""
+        if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
+            return None
+        query = urlencode({"scan": opinion.scan_id, "opinion": opinion.pk})
+        return f"{reverse(route)}?{query}"
+
     def address(name: str) -> str:
         """Return one route of this opinion, for a ``data-`` attribute."""
         return reverse(
@@ -601,12 +703,21 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "open_warnings": sum(
                 1 for r in warnings if r.dismissal_id is None
             ),
+            # The blocking and the warnings review of this opinion
+            # alone; they walk the opinions of the text review only.
+            "blocking_walk_url": walk_url("opinion_blocking_review"),
+            "warning_walk_url": walk_url("opinion_warning_review"),
+            # The walk buttons count their cards, which the cards
+            # endpoint answers: a finding is one row per page, and a
+            # page makes a card per open word or gap.
+            "cards_url": address("opinion_blocking_cards"),
             # The three addresses the script reads (#365). They are
             # routes and not presigned URLs: each one is minted per
             # request, and a URL signed at render time would die in an
             # open tab.
             "pdf_url_endpoint": address("opinion_pdf_url"),
             "ensemble_url_endpoint": address("opinion_ensemble_url"),
+            "figure_url_endpoint": address("opinion_figure_url"),
             "rerun_url": address("rerun_opinion_ensemble"),
             # What the page draws, and what it says instead.
             "ensemble_written": ensemble.is_written(opinion),
@@ -627,6 +738,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
             "edit_text_url": address("edit_opinion_text"),
             "edit_section_url": address("edit_opinion_section"),
             "edit_blockquote_url": address("edit_opinion_blockquote"),
+            "edit_drop_url": address("edit_opinion_drop"),
             "edit_move_url": address("move_opinion_block"),
             "edit_withdraw_url": address("withdraw_opinion_edit"),
             # The approval (#375): offered where the endpoint takes it,
@@ -713,7 +825,9 @@ def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
-        OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
+        OpinionScan.objects.select_related(
+            "reporter", "scan", "uploaded_by"
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
 
@@ -815,7 +929,17 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
     volumes = (
         Volume.objects.select_related("reporter", "assigned_to")
-        .prefetch_related("scans")
+        # A row per scan under its volume, a badge and a page range: the
+        # caches stay on disk, and the uploader comes in the same query
+        # instead of one more per scan.
+        .prefetch_related(
+            Prefetch(
+                "scans",
+                queryset=Scan.objects.select_related("uploaded_by").defer(
+                    *Scan.large_fields()
+                ),
+            )
+        )
         .order_by("reporter__short_name", "volume_number")
     )
 
@@ -984,7 +1108,11 @@ def queue_detail_view(
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-    scans = volume.scans.select_related("uploaded_by").order_by("start_page")
+    scans = (
+        volume.scans.select_related("uploaded_by")
+        .defer(*Scan.large_fields())
+        .order_by("start_page")
+    )
 
     return render(
         request,

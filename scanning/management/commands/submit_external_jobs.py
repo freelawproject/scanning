@@ -37,8 +37,9 @@ preparation before it: the wave downloads a shard, renders each page
 and uploads each page in sequence, which takes minutes for a full
 shard. The Mistral read also gates nothing until its glue lands, while
 the bitonal conversion gates review 1, where a person waits. The wave
-takes one shard per tick (``mistral_ocr.MAX_SUBMITS_PER_TICK``), so
-every other task waits for one shard at most. The order is the
+takes one shard per tick (``mistral_ocr.submits_per_tick``, unless
+``MISTRAL_SUBMITS_PER_TICK`` says otherwise), so every other task
+waits for one shard at most. The order is the
 insertion order of ``jobs._providers()``.
 
 Examples:

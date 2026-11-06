@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -162,8 +163,18 @@ def model() -> str:
     return settings.MISTRAL_MODEL
 
 
+#: One SDK client per thread, built on the thread's first call and
+#: kept for its life, keyed by the API key it was built with. The SDK's
+#: client holds an HTTP connection pool, so a client per call pays a
+#: TLS handshake per page: an upload thread of the wave now pays one
+#: per shard. Thread-local rather than process-wide, because the SDK
+#: promises nothing about a client shared across threads, and a
+#: forked worker never inherits one from its parent's other threads.
+_local = threading.local()
+
+
 def client():
-    """Return an SDK client bound to the configured key.
+    """Return the SDK client of this thread, bound to the configured key.
 
     Imported here, not at module level: the daemon and the web pod load
     this module through the provider table whether or not the stage is
@@ -173,17 +184,20 @@ def client():
     :returns: A ``mistralai`` client.
     :raises MistralError: If the key is unset.
     """
-    if not settings.MISTRAL_API_KEY:
+    key = settings.MISTRAL_API_KEY
+    if not key:
         raise MistralError(
             "MISTRAL_API_KEY is not set", error_code="NOT_CONFIGURED"
         )
+    if getattr(_local, "key", None) == key:
+        return _local.client
     try:
         from mistralai import Mistral
     except ImportError:  # 2.x namespace layout
         from mistralai.client import Mistral
-    return Mistral(
-        api_key=settings.MISTRAL_API_KEY, timeout_ms=REQUEST_TIMEOUT * 1000
-    )
+    _local.client = Mistral(api_key=key, timeout_ms=REQUEST_TIMEOUT * 1000)
+    _local.key = key
+    return _local.client
 
 
 def classify(exc: Exception) -> MistralError:
@@ -383,13 +397,69 @@ def cancel_batch(job_id: str) -> None:
         logger.warning("could not cancel Mistral batch %s: %s", job_id, exc)
 
 
-def delete_file(file_id: str) -> None:
-    """Delete one file at Mistral. Best effort, never raises.
+def delete_file(file_id: str) -> bool:
+    """Delete one file at Mistral, once. Never sleeps.
+
+    A file already gone counts as deleted. A throttled delete (a 429)
+    is raised, so the caller carries the id for a later try instead of
+    sleeping here (:func:`scanning.mistral_ocr._delete_files`). Any
+    other refusal is logged and swallowed, as a sweep needs.
 
     :param file_id: The file id.
-    :return: None.
+    :returns: Whether the file is gone. The caller carries an id that
+        is not, so a later try deletes it.
+    :rtype: bool
+    :raises MistralBusy: If the delete was throttled.
     """
     try:
         _call(client().files.delete, file_id=file_id)
+        return True
+    except MistralMissing:
+        return True
+    except MistralBusy:
+        raise
     except MistralError as exc:
         logger.warning("could not delete Mistral file %s: %s", file_id, exc)
+        return False
+
+
+#: Files asked for per page of a listing, and the most pages read. A
+#: shard is about a hundred pages plus its manifest, so two pages hold
+#: one attempt's files; the ceiling only bounds a search that matched
+#: more than it should.
+LIST_PAGE_SIZE = 100
+LIST_MAX_PAGES = 10
+
+
+def find_files(prefix: str) -> list[str]:
+    """Return the ids of the files whose name starts with ``prefix``.
+
+    For the files a killed submit uploaded and never named on its row
+    (#534). Mistral's ``search`` narrows the listing, and the prefix is
+    checked here again, so a looser match at Mistral deletes nothing it
+    should not. A listing that fails raises, because a partial list
+    read as the whole would hand the row on with its other files
+    unnamed for good: the caller leaves the row for the next tick.
+
+    :param prefix: The start of the file names.
+    :returns: The ids found, possibly none.
+    :rtype: list[str]
+    :raises MistralError: If a page of the listing could not be read.
+    """
+    found: list[str] = []
+    for page in range(LIST_MAX_PAGES):
+        listing = _call(
+            client().files.list,
+            page=page,
+            page_size=LIST_PAGE_SIZE,
+            search=prefix,
+        )
+        data = list(listing.data or [])
+        found.extend(
+            str(item.id)
+            for item in data
+            if str(item.filename or "").startswith(prefix)
+        )
+        if len(data) < LIST_PAGE_SIZE:
+            break
+    return found

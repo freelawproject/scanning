@@ -66,6 +66,15 @@ LOGGING = {
             "level": BLACKLETTER_LOG_LEVEL,
             "propagate": True,
         },
+        # The worker's own lines (#503): a task received, succeeded or
+        # discarded as expired. Celery configures no logging of its
+        # own here (``scanning.celery_init``), so without this entry
+        # they would fall to the root logger and be dropped.
+        "celery": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "propagate": True,
+        },
     },
 }
 

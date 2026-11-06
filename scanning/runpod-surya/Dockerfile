@@ -186,7 +186,7 @@ assert torch.version.cuda is None, f"the handler venv carries a CUDA torch: {tor
 print(f"handler venv OK: torch {torch.__version__} (cpu), surya-ocr importable")
 PY
 
-COPY runpod_common.py runpod-surya/handler.py ./
+COPY runpod_common.py perpendiculars.py runpod-surya/handler.py ./
 
 # The base image's entrypoint launches the vLLM API server directly;
 # this worker instead boots the RunPod handler, which spawns and

@@ -589,7 +589,8 @@ def upload_bytes_object(key: str, body: bytes, content_type: str) -> bool:
     """Upload bytes to an exact key, bypassing the sync.
 
     The twin of :func:`upload_json_object` for a document that is not
-    JSON: the final XML of an opinion (#408).
+    JSON: the final XML of an opinion (#408), the cut of a picture of
+    one (#463).
 
     :param key: Object key inside the private bucket.
     :param body: The bytes to store.
@@ -668,6 +669,24 @@ def upload_file_object(key: str, path: Path, content_type: str) -> bool:
         logger.warning("Could not upload %s to %s", path, key, exc_info=True)
         return False
     return True
+
+
+def download_bytes_object(key: str) -> bytes:
+    """Download one object by key, as bytes.
+
+    The read-side twin of :func:`upload_bytes_object`, for the cut of a
+    picture of an opinion (#463). Errors are the caller's to classify,
+    the rule of :func:`download_json_object`.
+
+    :param key: Object key inside the private bucket.
+    :returns: The bytes.
+    :rtype: bytes
+    :raises ClientError: If the object is missing or unreadable.
+    """
+    response = _s3_client().get_object(
+        Bucket=settings.AWS_PRIVATE_STORAGE_BUCKET_NAME, Key=key
+    )
+    return response["Body"].read()
 
 
 def download_json_object(key: str) -> dict:

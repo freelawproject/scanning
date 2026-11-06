@@ -75,6 +75,10 @@ PAGE = "page"
 LIST_ITEM = "list_item"
 JOINABLE_KINDS = frozenset({"paragraph", LIST_ITEM})
 
+#: A picture (#463), ``markup.FIGURE``: a paragraph of its own, never
+#: joined, with no text.
+FIGURE = "figure"
+
 #: The mark of one list item (``markup.ITEM``, #428), spelled here to
 #: keep this module free of imports; ``test_paragraphs`` pins it.
 ITEM = "li"
@@ -280,6 +284,13 @@ def _paragraph(item: dict, text: str | None = None, marks=None) -> dict:
         paragraph["table"] = group["table"]
     if paragraph["kind"] == LIST_ITEM:
         paragraph["list"] = group.get("list")
+    if paragraph["kind"] == FIGURE:
+        # The size the picture has on the page, and its box, which the
+        # approval reads to find the cut and then takes away (#463).
+        paragraph["figure"] = {
+            **(group.get("figure") or {}),
+            "box_pt": list(group.get("box_pt") or []),
+        }
     return paragraph
 
 

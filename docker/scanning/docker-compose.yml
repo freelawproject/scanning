@@ -55,11 +55,56 @@ services:
     env_file:
       - ../../.env.dev
     environment:
+      # CELERY_ENABLED=True in the shell switches the clock and the views
+      # (#503), beside the `celery` profile.
+      - CELERY_ENABLED=${CELERY_ENABLED:-False}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
       - AWS_DEV_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_DEV_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+
+  # Celery broker (#503). Only read when CELERY_ENABLED=True.
+  scanning-redis:
+    container_name: scanning-redis
+    image: redis:7-alpine
+    networks:
+      - scanning_net
+    profiles: ["celery"]
+
+  # Celery worker (#503): every queue in one container for dev. In
+  # production each queue is its own deployment (CELERY_QUEUES). The
+  # daemon is the clock: with CELERY_ENABLED=True it sends the ticks
+  # here instead of running them, so start it with this profile too.
+  scanning-celery-worker:
+    container_name: scanning-celery-worker
+    platform: linux/amd64
+    build:
+      context: "${SCANNING_BASE_DIR:-../../}"
+      dockerfile: "./docker/django/Dockerfile"
+      target: dev
+    command: worker
+    depends_on:
+      scanning-postgres:
+        condition: service_healthy
+      scanning-redis:
+        condition: service_started
+    user: root
+    volumes:
+      - ${SCANNING_BASE_DIR:-../../}:/opt/scanning
+    networks:
+      - scanning_net
+    env_file:
+      - ../../.env.dev
+    environment:
+      - CELERY_ENABLED=True
+      - CELERY_CONCURRENCY=2
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      - AWS_DEV_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_DEV_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+    profiles: ["celery"]
 
   # Django dev server
   scanning-django:
@@ -84,6 +129,9 @@ services:
     env_file:
       - ../../.env.dev
     environment:
+      # CELERY_ENABLED=True in the shell switches the clock and the views
+      # (#503), beside the `celery` profile.
+      - CELERY_ENABLED=${CELERY_ENABLED:-False}
       - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
       - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
       - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}

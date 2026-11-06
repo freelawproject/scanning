@@ -40,6 +40,7 @@ described from the curator.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from statistics import median
 
 from django.db import transaction
@@ -82,28 +83,15 @@ def _round(value: float) -> float:
 def strip_content_box(entry: dict) -> tuple[float, float, float, float]:
     """Return the box the margin strips of one page leave, in points.
 
-    The strips are named by the page edge each lies on
-    (``margin_fit._sides``, the one rule), and the box is what the four
-    leave between them. Every page has its four strips
-    (``margin_fit.ensure_strips``, #370); a side the entry still lacks
-    is the page edge.
+    ``margin_fit.content_box``: the strips as measured, before the
+    page-number hold-off moved one, so a pulled strip never widens the
+    box a text rect is held in.
 
     :param entry: One ``compute_margin_rects`` entry, with its
         ``page_width``, ``page_height`` and ``rects`` in points.
     :returns: ``(x0, y0, x1, y1)``, in points.
     """
-    sides = margin_fit._sides(entry)
-    x0, y0 = 0.0, 0.0
-    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
-    if sides["top"] is not None:
-        y0 = float(sides["top"]["y1"])
-    if sides["bottom"] is not None:
-        y1 = float(sides["bottom"]["y0"])
-    if sides["left"] is not None:
-        x0 = float(sides["left"]["x1"])
-    if sides["right"] is not None:
-        x1 = float(sides["right"]["x0"])
-    return x0, y0, x1, y1
+    return margin_fit.content_box(entry)
 
 
 def clip_to_content(
@@ -341,6 +329,46 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
     return landed, stale
 
 
+def dismissed_boxes(
+    scan: Scan, rect_type: str, run: ApplyRun | None, page_indexes
+) -> dict[int, list[list[float]]]:
+    """Return the copied boxes of the standing dismissals of one type.
+
+    The boxes :func:`resolve` will land the dismissals by, keyed by the
+    page index of the space ``run`` names, through each page's address,
+    so a pass that reshapes a computed rect before the write can leave
+    alone the one a curator lifted (``text_fit.widen_running_heads``).
+    A dismiss of another original is left out, as :func:`resolve`
+    leaves it.
+
+    :param scan: The scan.
+    :param rect_type: The computed type the dismissals name.
+    :param run: The apply run of the space, or None for the original's.
+    :param page_indexes: The page indexes of the space to look up.
+    :returns: ``{page_index: [[x0, y0, x1, y1] in points]}``.
+    :rtype: dict[int, list[list[float]]]
+    """
+    by_address: dict[tuple, list[list[float]]] = {}
+    for dismiss in Redaction.objects.human().filter(
+        scan=scan, kind=Redaction.Kind.DISMISS, rect_type=rect_type
+    ):
+        if dismiss.target_bbox is None or is_stale(dismiss, scan):
+            continue
+        by_address.setdefault(
+            (dismiss.source_edit_id, dismiss.source_page), []
+        ).append(dismiss.target_bbox)
+    if not by_address:
+        return {}
+    boxes = {}
+    for page_index in page_indexes:
+        found = by_address.get(
+            detections.source_for_index(scan, page_index, run)
+        )
+        if found:
+            boxes[page_index] = found
+    return boxes
+
+
 def is_stale(row: Redaction, scan: Scan) -> bool:
     """Return whether a row was written against another original.
 
@@ -361,22 +389,24 @@ def is_stale(row: Redaction, scan: Scan) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def visible_by_page(scan: Scan) -> list[dict]:
+def visible_by_page(
+    scan: Scan, pages: Collection[int] | None = None
+) -> list[dict]:
     """Return the boxes to paint, grouped by page, in the viewer's shape.
 
     ``[{"page_index": i, "rects": [{"id", "x0", "y0", "x1", "y1", "fill",
     "rect_type", "origin"}]}]``, points, pages in order.
 
     :param scan: The scan.
+    :param pages: The page indexes to read, or None for every page.
     :returns: The list.
     """
-    pages: dict[int, list[dict]] = {}
-    for row in (
-        Redaction.objects.visible()
-        .filter(scan=scan)
-        .order_by("page_index", "y0", "x0")
-    ):
-        pages.setdefault(row.page_index, []).append(
+    rows = Redaction.objects.visible().filter(scan=scan)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    pages_out: dict[int, list[dict]] = {}
+    for row in rows.order_by("page_index", "y0", "x0"):
+        pages_out.setdefault(row.page_index, []).append(
             {
                 "id": row.pk,
                 "x0": row.x0,
@@ -390,7 +420,7 @@ def visible_by_page(scan: Scan) -> list[dict]:
         )
     return [
         {"page_index": index, "rects": rects}
-        for index, rects in sorted(pages.items())
+        for index, rects in sorted(pages_out.items())
     ]
 
 

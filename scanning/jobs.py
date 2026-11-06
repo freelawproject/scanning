@@ -81,7 +81,7 @@ from datetime import datetime, timedelta
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
 from django.db import IntegrityError, transaction
-from django.db.models import Max, Q
+from django.db.models import Max, Q, Subquery
 from django.utils import timezone
 
 from scanning import doctor_client, runpod_client, s3_sync, sharding
@@ -94,6 +94,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    Scan,
 )
 
 logger = logging.getLogger(__name__)
@@ -527,11 +528,20 @@ def _cancel_provider_job(job: ExternalJob) -> None:
     Best effort and never raises: this runs inside a sweep that must
     still judge every other row on the tick.
 
+    A row with no provider id goes to its provider's cancel too, with
+    an empty id: RunPod has nothing to cancel then, and Mistral deletes
+    the files a row names before its batch exists, the pages a
+    throttled cleanup left (``files_left``, #540).
+
     :param job: The row being written off.
     :return: None.
     """
-    if job.external_id:
-        _cancel_job_id(job, job.external_id)
+    try:
+        spec = _provider(job)
+    except UnknownProvider as exc:
+        logger.warning("cannot cancel job %s: %s", job.pk, exc)
+        return
+    spec.cancel(job, job.external_id or "")
 
 
 def _cancel_job_id(job: ExternalJob, job_id: str) -> None:
@@ -559,9 +569,11 @@ def _cancel_runpod_job_id(job: ExternalJob, job_id: str) -> None:
     """Cancel one RunPod job on ``job``'s engine endpoint.
 
     :param job: A RunPod row; names the endpoint through its engine.
-    :param job_id: RunPod's job id.
+    :param job_id: RunPod's job id; none means nothing to cancel.
     :return: None.
     """
+    if not job_id:
+        return
     try:
         base_url, headers = runpod_client.endpoint_config(
             _runpod_endpoint(job)
@@ -698,17 +710,25 @@ def _write(job: ExternalJob, **fields) -> bool:
     daemon-against-daemon is not the case being handled -- but this is
     also what makes a second replica safe if one is ever deployed.
 
+    The provider id is the second guard (#540): a Mistral wave's thread
+    writes the batch id of a claim up to the moment it ends, and the
+    lost-claim sweep, having judged that claim dead, retries the row
+    with the id it read, none. Matched on the id too, the retry lands
+    only while the row still has none, and a batch written meanwhile
+    is polled on the next tick instead of orphaned and paid for twice.
+
     On success the in-memory instance is updated too, so a caller can
     chain another :func:`_write` against the new status.
 
-    :param job: The row to update; its current ``status`` is the guard.
+    :param job: The row to update; its current ``status`` and
+        ``external_id`` are the guard.
     :param fields: Field values to write.
     :returns: True if this writer won the row.
     :rtype: bool
     """
-    updated = ExternalJob.objects.filter(pk=job.pk, status=job.status).update(
-        **fields
-    )
+    updated = ExternalJob.objects.filter(
+        pk=job.pk, status=job.status, external_id=job.external_id
+    ).update(**fields)
     if not updated:
         logger.info(
             "job %s (%s/%s shard %s) moved out of %s under us; skipping",
@@ -1125,7 +1145,9 @@ def _retry_or_fail(
 
 
 # ── creating the work ───────────────────────────────────────────────
-def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
+def _shard_specs(
+    scan, manifest: dict, identity_extra: dict | None = None
+) -> list[tuple[str, dict]]:
     """Describe the work today's shard set asks for, in page order.
 
     One ``(input_key, identity)`` pair per shard. The identity is what
@@ -1144,9 +1166,16 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
     built from: that is what keeps two edits' shards apart when both
     hold one page of the same size.
 
+    ``identity_extra`` is what an engine adds about its own output
+    rather than about the shard: detection's ``label_set`` (#338),
+    which says that the result holds every class the adapter carries.
+    Two reads of one shard under different values are different work,
+    so the carry refuses a result read under another value.
+
     :param scan: The scan the shards belong to.
     :param manifest: The shard manifest from :mod:`scanning.sharding`,
         or the apply's (:func:`scanning.apply.shard_manifest`).
+    :param identity_extra: Fields to add to every shard's identity.
     :returns: ``(key, identity)`` per shard, ordered by shard index.
     :rtype: list[tuple[str, dict]]
     """
@@ -1166,21 +1195,29 @@ def _shard_specs(scan, manifest: dict) -> list[tuple[str, dict]]:
         }
         if "edit_id" in entry:
             identity["edit_id"] = entry["edit_id"]
+        identity.update(identity_extra or {})
         specs.append(
             (entry.get("key") or f"{prefix}{entry['name']}", identity)
         )
     return specs
 
 
+#: Identity fields a row written before them may lack and still
+#: describe today's shard (:func:`_identity_matches`).
+LENIENT_IDENTITY_KEYS = ("size_bytes", "label_set")
+
+
 def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """Return whether a row's stored identity describes today's spec.
 
-    Exact equality, with one lenient case: a row written before
-    ``size_bytes`` joined the identity has every other field, and
-    demanding the missing field would read every pre-deploy run as
-    stale -- a re-queue would then re-pay work that is plainly the
-    same. The carry path (:func:`_reusable_results`) does **not** get
-    this leniency, because there the missing field is the proof.
+    Exact equality, with one lenient case: a row written before a field
+    of :data:`LENIENT_IDENTITY_KEYS` joined the identity has every other
+    field, and demanding the missing one would read every pre-deploy
+    run as stale -- a re-queue would then re-pay work that is plainly
+    the same, and a detection run read before ``label_set`` (#338)
+    would be re-paid by any tick that asks for it. The carry path
+    (:func:`_reusable_results`) does **not** get this leniency, because
+    there the missing field is the proof.
 
     :param stored: The row's ``input_manifest``.
     :param identity: Today's identity for the same shard position.
@@ -1189,7 +1226,13 @@ def _identity_matches(stored: dict | None, identity: dict) -> bool:
     """
     if stored == identity:
         return True
-    legacy = {k: v for k, v in identity.items() if k != "size_bytes"}
+    if stored is None:
+        return False
+    legacy = {
+        k: v
+        for k, v in identity.items()
+        if k in stored or k not in LENIENT_IDENTITY_KEYS
+    }
     return stored == legacy
 
 
@@ -1357,12 +1400,19 @@ def ready_volume_runs(
             jobs__status=JobStatus.COMPLETED,
             jobs__apply_run__isnull=True,
         )
+        # No ``order_by``: the scan's default ordering would put its
+        # ``date_created`` into the DISTINCT and sort the join.
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
     unfinished = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    # The caches stay on disk (#602): a candidate's run is judged on its
+    # rows, and most candidates are skipped before a glue reads the scan.
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
     ):
         rows = live_rows(scan)
         if not rows:
@@ -1490,11 +1540,13 @@ def ready_apply_runs(
     if not live:
         return
     candidates = {}
+    # The page map stays on disk (#588): the test reads two fields,
+    # and the glue of the one candidate it keeps loads the map.
     for run in ApplyRun.objects.filter(
         scan_id__in=list(live),
         superseded_at__isnull=True,
         built_at__isnull=False,
-    ):
+    ).defer(*ApplyRun.LARGE_FIELDS):
         volume_run = live[run.scan_id]
         if (
             getattr(run, target.key_field)
@@ -1504,8 +1556,11 @@ def ready_apply_runs(
         candidates[run.scan_id] = run
     if not candidates:
         return
-    for scan in Scan.objects.filter(pk__in=list(candidates)).select_related(
-        "reporter"
+    # The caches stay on disk (#602), as in :func:`ready_volume_runs`.
+    for scan in (
+        Scan.objects.filter(pk__in=list(candidates))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
     ):
         volume_rows = live_rows(scan)
         if not volume_rows or any(
@@ -1599,6 +1654,46 @@ def ledger_attempts(rows: list[ExternalJob], key: str) -> int:
     return int(run_ledger(rows, key).get("attempts") or 0)
 
 
+#: How many times a ``provider_meta`` swap is tried before it gives up.
+META_SWAP_ATTEMPTS = 5
+
+
+def swap_provider_meta(row: ExternalJob, mutate) -> dict:
+    """Change a row's ``provider_meta`` by compare-and-swap (#503).
+
+    The ledgers of the passes (the glue counters, the apply state, the
+    tagger's glue count) are keys of one JSON field, and a plain save
+    of the field writes over whatever another pass wrote beside the
+    key since the read. With the passes on several workers that is
+    live, so the write goes as ``UPDATE ... WHERE provider_meta = <what
+    was read>``, read again and tried again on a lost swap, and the
+    last try writes anyway, because a lost counter is better than a
+    pass that never records its failure.
+
+    :param row: The row; its ``provider_meta`` is refreshed in place.
+    :param mutate: ``mutate(meta) -> None``, applied to a copy of the
+        current dict.
+    :returns: The dict written.
+    :rtype: dict
+    """
+    for attempt in range(META_SWAP_ATTEMPTS):
+        current = (
+            ExternalJob.objects.filter(pk=row.pk)
+            .values_list("provider_meta", flat=True)
+            .first()
+        )
+        new = dict(current or {})
+        mutate(new)
+        last = attempt == META_SWAP_ATTEMPTS - 1
+        query = ExternalJob.objects.filter(pk=row.pk)
+        if not last:
+            query = query.filter(provider_meta=current)
+        if query.update(provider_meta=new):
+            row.provider_meta = new
+            return new
+    raise AssertionError("unreachable: the last try is unguarded")
+
+
 def bump_run_ledger(
     rows: list[ExternalJob], key: str, exc: Exception
 ) -> tuple[int, ExternalJob]:
@@ -1621,20 +1716,22 @@ def bump_run_ledger(
     :rtype: tuple[int, ExternalJob]
     """
     head = rows[0]
-    meta = dict(head.provider_meta or {})
-    state = dict(meta.get(key) or {})
-    attempts = int(state.get("attempts") or 0) + 1
-    state.update(
-        {
-            "attempts": attempts,
-            "last_error": str(exc)[:500],
-            "last_attempt_at": timezone.now().isoformat(),
-        }
-    )
-    meta[key] = state
-    head.provider_meta = meta
-    head.save(update_fields=["provider_meta"])
-    return attempts, head
+    written: dict = {}
+
+    def bump(meta: dict) -> None:
+        state = dict(meta.get(key) or {})
+        state.update(
+            {
+                "attempts": int(state.get("attempts") or 0) + 1,
+                "last_error": str(exc)[:500],
+                "last_attempt_at": timezone.now().isoformat(),
+            }
+        )
+        meta[key] = state
+        written.update(state)
+
+    swap_provider_meta(head, bump)
+    return int(written["attempts"]), head
 
 
 @dataclass
@@ -1776,18 +1873,18 @@ def live_run(
         list when the engine has never run for this target.
     :rtype: list[ExternalJob]
     """
-    rows = list(
-        ExternalJob.objects.filter(
-            scan=scan,
-            stage=stage,
-            engine=engine,
-            opinion=opinion,
-            apply_run=apply_run,
-        ).order_by("-run", "shard_index")
+    target = ExternalJob.objects.filter(
+        scan=scan,
+        stage=stage,
+        engine=engine,
+        opinion=opinion,
+        apply_run=apply_run,
     )
-    if not rows:
-        return []
-    return [job for job in rows if job.run == rows[0].run]
+    # The latest run in the query, never in Python: every run before it
+    # is history, a volume holds a row per shard of each, and the
+    # progress poll asks for four engines every second.
+    latest = target.order_by("-run").values("run")[:1]
+    return list(target.filter(run=Subquery(latest)).order_by("shard_index"))
 
 
 def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
@@ -2084,6 +2181,7 @@ def ensure_shard_jobs(
     force_new_run: bool = False,
     carry_stable_holes: bool = True,
     apply_run=None,
+    identity_extra: dict | None = None,
 ) -> list[ExternalJob]:
     """Return the live rows for one engine over ``scan``'s shards,
     creating them if the current run does not describe today's shard set.
@@ -2134,6 +2232,7 @@ def ensure_shard_jobs(
         scoped by it, and the run number still comes from the one
         sequence of :meth:`ExternalJob.next_run`, so the unique key
         holds unchanged.
+    :param identity_extra: See :func:`_shard_specs`.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
@@ -2154,7 +2253,7 @@ def ensure_shard_jobs(
     )
     return ensure_run_jobs(
         scan,
-        _shard_specs(scan, manifest),
+        _shard_specs(scan, manifest, identity_extra),
         stage=stage,
         engine=engine,
         provider=provider,
@@ -2563,13 +2662,35 @@ def _pending_slice(queryset, room: int) -> list[ExternalJob]:
         most ``room`` of them.
     :rtype: list[ExternalJob]
     """
-    return list(
+    # The ids first, off the pending index alone, and the rows after.
+    # The rank's first key is a computed column, so the top ``room``
+    # cannot come off an index; ranked with the joins in place, Postgres
+    # joined every pending row of the engine to its scan (and the scan's
+    # JSON columns), its reporter and its apply run, sorted the lot and
+    # kept ``room``, six times every five seconds: the first statement
+    # on the database's list in the 2026-11-02 outage. The joins now
+    # touch the rows the wave keeps.
+    ids = list(
         queryset.filter(status=JobStatus.PENDING)
-        # ``s3_job_attempt_key`` reads the apply run's number (#224).
-        .select_related("scan", "scan__reporter", "apply_run")
         .annotate(is_apply=Q(apply_run__isnull=False))
-        .order_by("-is_apply", "id")[:room]
+        .order_by("-is_apply", "id")
+        .values_list("id", flat=True)[:room]
     )
+    if not ids:
+        return []
+    # Read again as PENDING: the claim's compare-and-swap (``_write``)
+    # tests the status it read, so a row cancelled or failed between the
+    # two queries must not be read at all, or it would be swapped from
+    # that status into SUBMITTED. ``s3_job_attempt_key`` reads the apply
+    # run's number (#224). The scan's caches stay on disk (#582): no
+    # submit reads one.
+    rows = (
+        queryset.filter(pk__in=ids, status=JobStatus.PENDING)
+        .select_related("scan", "scan__reporter", "apply_run")
+        .defer(*Scan.large_fields("scan__"))
+    )
+    by_id = {row.pk: row for row in rows}
+    return [by_id[pk] for pk in ids if pk in by_id]
 
 
 def _apply_doctor_outcome(
@@ -2826,8 +2947,15 @@ def _submit_runpod_engine_wave(
         setattr(summary, result, getattr(summary, result) + 1)
 
 
-def submit_pending(limit: int | None = None) -> SubmitSummary:
+def submit_pending(
+    limit: int | None = None, providers: tuple[str, ...] | None = None
+) -> SubmitSummary:
     """Submit one wave per provider and record what happened.
+
+    ``providers`` names the waves to run, in the table's order; ``None``
+    runs them all, the daemon's serial tick. A Celery tick task names
+    one (#503), so the doctor wave holding its sockets and the Mistral
+    wave rendering a shard each block only their own queue.
 
     Each provider counts its own in-flight rows against its own cap, so
     one saturated endpoint cannot starve another. Doctor's ceiling is
@@ -2848,18 +2976,23 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
 
     :param limit: Concurrency override applied to **each** wave.
         Defaults to each provider's own setting.
+    :param providers: The ``JobProvider`` values whose waves run, or
+        ``None`` for every one.
     :returns: Counts of what the tick did, summed over the waves.
     :rtype: SubmitSummary
     """
     summary = SubmitSummary()
-    providers = _providers()
+    table = _providers()
+    if providers is None:
+        providers = tuple(table)
+    specs = {name: table[name] for name in providers}
     if not s3_sync.s3_active():
         # Every provider reads its input from the bucket -- through a
         # presigned GET, or downloaded by the daemon -- so without S3
         # the shards were never uploaded: every request would 404 and
         # burn a job's whole retry budget under a misleading code. Say
         # so once instead.
-        if any(spec.is_enabled() for spec in providers.values()):
+        if any(spec.is_enabled() for spec in specs.values()):
             logger.error(
                 "an external stage is enabled but S3 is inactive (no "
                 "credentials, or DEVELOPMENT without them): shards never "
@@ -2871,7 +3004,7 @@ def submit_pending(limit: int | None = None) -> SubmitSummary:
     # The table's insertion order is the wave order (see
     # ``_providers``): what a person waits behind goes first, and the
     # wave nothing waits behind goes last.
-    for spec in providers.values():
+    for spec in specs.values():
         if spec.is_enabled():
             spec.submit_wave(summary, limit)
     return summary
@@ -3142,23 +3275,44 @@ def _record_progress(job: ExternalJob, outcome, now) -> bool:
     return _write(job, **fields)
 
 
-def sweep_jobs(now=None) -> SweepSummary:
+def sweep_jobs(
+    now=None, providers: tuple[str, ...] | None = None
+) -> SweepSummary:
     """Confirm in-flight jobs and write off stranded rows.
 
     The recovery half of the loop. For doctor it is the *only* thing
     that can finish a job whose response we never saw. For RunPod it is
     the normal path: submitting only queues the work.
 
+    ``providers`` names whose rows this pass judges; ``None`` judges
+    every provider's, the daemon's serial tick. A Celery tick task
+    names one, the twin of :func:`submit_pending`: a sweep is as slow
+    as its slowest provider, and Mistral's harvest deletes a finished
+    shard's hundred page files one call at a time, so a volume of
+    batches finishing together held one shared pass for a quarter of
+    an hour while RunPod's finished shards sat uncollected, their caps
+    full and their GPUs idle. One sweep per provider, each its own
+    task on its own queue, and a slow one holds up nothing but itself.
+
     :param now: Comparison time; defaults to ``timezone.now()``.
+    :param providers: The ``JobProvider`` values whose rows are swept,
+        or ``None`` for every one.
     :returns: Counts of what the tick did.
     :rtype: SweepSummary
     """
     summary = SweepSummary()
     now = now or timezone.now()
 
-    in_flight = ExternalJob.objects.filter(
-        status__in=IN_FLIGHT_JOB_STATUSES
-    ).select_related("scan", "scan__reporter")
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # every row of a volume's shards, on every tick of every provider's
+    # sweep, and no sweep reads one.
+    in_flight = (
+        ExternalJob.objects.filter(status__in=IN_FLIGHT_JOB_STATUSES)
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
+    if providers is not None:
+        in_flight = in_flight.filter(provider__in=providers)
     for job in in_flight:
         try:
             spec = _provider(job)
@@ -3176,11 +3330,17 @@ def sweep_jobs(now=None) -> SweepSummary:
     # rows stamped at creation before the move. A row never claimed
     # carries no deadline and waits for its engine instead: our own
     # queue is not a fault, however long it is.
-    stranded = ExternalJob.objects.filter(
-        status=JobStatus.PENDING,
-        deadline__isnull=False,
-        deadline__lt=now,
-    ).select_related("scan", "scan__reporter")
+    stranded = (
+        ExternalJob.objects.filter(
+            status=JobStatus.PENDING,
+            deadline__isnull=False,
+            deadline__lt=now,
+        )
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
+    if providers is not None:
+        stranded = stranded.filter(provider__in=providers)
     for job in stranded:
         if _fail(
             job,
@@ -3189,6 +3349,14 @@ def sweep_jobs(now=None) -> SweepSummary:
         ):
             summary.failed += 1
 
+    # The files a Mistral row still names after its last write (#540):
+    # a provider's own pass, not a row's, so it is called and not in
+    # the table, and only by the sweep that owns Mistral. Imported
+    # here like the table does, for the cycle.
+    if providers is None or JobProvider.MISTRAL in providers:
+        from scanning import mistral_ocr
+
+        mistral_ocr.delete_leftover_files()
     return summary
 
 
@@ -3254,9 +3422,15 @@ def abandon_open(
         # the pipeline, which owns no part of an apply run (#224).
         rows = rows.filter(apply_run__isnull=True)
 
-    # Read the handles before the update: it is the only thing that says
-    # what to cancel, and afterwards the rows no longer read as open.
-    doomed = list(rows.filter(status__in=IN_FLIGHT_JOB_STATUSES))
+    # Read the ids before the update, because afterwards the rows no
+    # longer read as open, and the handles after it: a wave's thread
+    # writes a batch id and its files right up to the swap, and a
+    # cancel from the snapshot would miss what landed in between.
+    doomed = list(
+        rows.filter(status__in=IN_FLIGHT_JOB_STATUSES).values_list(
+            "pk", flat=True
+        )
+    )
     cancelled = rows.update(
         status=JobStatus.CANCELLED,
         error_code="ABANDONED",
@@ -3269,6 +3443,10 @@ def abandon_open(
             getattr(scan, "pk", scan),
             reason,
         )
-    for job in doomed:
+    for job in (
+        ExternalJob.objects.filter(pk__in=doomed)
+        .select_related("scan")
+        .defer(*Scan.large_fields("scan__"))
+    ):
         _cancel_provider_job(job)
     return cancelled

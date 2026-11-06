@@ -337,6 +337,135 @@ class TestFitRects(TestCase):
         self.assertEqual(text_fit.fit_rects(rects, {}, bl_pages(0)), 0)
 
 
+class TestWidenRunningHeads(TestCase):
+    """The running head's whiteout grows across the text width at its
+    own height, and never over the page number."""
+
+    @staticmethod
+    def page(*detections):
+        from blackletter.models import BBox
+
+        page = bl_pages(0)[0]
+        page.detections = [
+            SimpleNamespace(label=label, bbox=BBox(*box))
+            for label, box in detections
+        ]
+        return [page]
+
+    @staticmethod
+    def head(x0, x1):
+        entry = rect(x0, 50, x1, 80, rtype=text_fit.HEAD_RECT_TYPE)
+        entry["rects"][0]["fill"] = "white"
+        return entry
+
+    def test_a_short_head_grows_to_the_columns(self):
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page(
+            (Label.TEXT_COLUMN, (100, 100, 800, 2000)),
+            (Label.TEXT_COLUMN, (900, 100, 1600, 2000)),
+        )
+
+        self.assertEqual(text_fit.widen_running_heads(rects, pages), 1)
+
+        [box] = rects[0]["rects"]
+        self.assertEqual((box["x0"], box["x1"]), (100, 1600))
+        self.assertEqual((box["y0"], box["y1"]), (50, 80))
+
+    def test_the_page_number_on_the_line_stays(self):
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page(
+            (Label.TEXT_COLUMN, (100, 100, 1600, 2000)),
+            (Label.PAGE_NUMBER, (100, 52, 180, 78)),
+            (Label.PAGE_NUMBER, (1500, 300, 1580, 330)),
+        )
+
+        text_fit.widen_running_heads(rects, pages)
+
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in rects[0]["rects"]], [(180, 1600)]
+        )
+
+    def test_a_number_inside_the_line_cuts_it_in_two(self):
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page(
+            (Label.TEXT_COLUMN, (100, 100, 1600, 2000)),
+            (Label.PAGE_NUMBER, (800, 52, 880, 78)),
+        )
+
+        text_fit.widen_running_heads(rects, pages)
+
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in rects[0]["rects"]],
+            [(100, 800), (880, 1600)],
+        )
+
+    def test_a_head_box_in_the_body_keeps_its_width(self):
+        """A ``PAGE_HEADER`` box the model drew in the body: its line is
+        the opinion's, so nothing grows across it."""
+        from blackletter.models import Label
+
+        entry = rect(300, 1000, 1300, 1030, rtype=text_fit.HEAD_RECT_TYPE)
+        pages = self.page((Label.TEXT_COLUMN, (100, 100, 1600, 2000)))
+
+        self.assertEqual(text_fit.widen_running_heads([entry], pages), 0)
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in entry["rects"]], [(300, 1300)]
+        )
+
+    def test_a_head_that_reaches_the_columns_keeps_its_width(self):
+        """The whiteout's bottom passes the top of the columns, so a line
+        of the opinion shares its height: it is left as drawn."""
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page((Label.TEXT_COLUMN, (100, 70, 1600, 2000)))
+
+        self.assertEqual(text_fit.widen_running_heads(rects, pages), 0)
+
+    def test_a_dismissed_head_keeps_its_width(self):
+        """A standing dismiss lands on one row by IoU, so the head it
+        names is not cut into pieces of another size."""
+        from blackletter.models import Label
+
+        rects = [self.head(300, 1300)]
+        pages = self.page((Label.TEXT_COLUMN, (100, 100, 1600, 2000)))
+        sx, sy = POINTS_W / WIDTH, POINTS_H / HEIGHT
+        dismissed = {0: [[300 * sx, 50 * sy, 1300 * sx, 80 * sy]]}
+
+        self.assertEqual(
+            text_fit.widen_running_heads(rects, pages, dismissed), 0
+        )
+        self.assertEqual(
+            [(b["x0"], b["x1"]) for b in rects[0]["rects"]], [(300, 1300)]
+        )
+
+    def test_other_boxes_and_a_page_with_no_column_stay(self):
+        from blackletter.models import Label
+
+        other = rect(300, 50, 1300, 80, rtype="headnote")
+        head = self.head(300, 1300)
+
+        self.assertEqual(
+            text_fit.widen_running_heads(
+                [other], self.page((Label.TEXT_COLUMN, (100, 100, 1600, 2000)))
+            ),
+            0,
+        )
+        self.assertEqual(
+            (other["rects"][0]["x0"], other["rects"][0]["x1"]), (300, 1300)
+        )
+        self.assertEqual(text_fit.widen_running_heads([head], self.page()), 0)
+        self.assertEqual(
+            (head["rects"][0]["x0"], head["rects"][0]["x1"]), (300, 1300)
+        )
+
+
 class TestFitSpanCounts(TestCase):
     """The one rule names why a box did not move."""
 
