@@ -358,6 +358,7 @@ def resolve(scan: Scan) -> tuple[int, list[OpinionBoundary]]:
     taken: set[int] = set()
     landed = 0
     stale: list[OpinionBoundary] = []
+    written: list[OpinionBoundary] = []
     for dismissal in dismissals:
         if is_stale(dismissal, scan):
             stale.append(dismissal)
@@ -380,8 +381,11 @@ def resolve(scan: Scan) -> tuple[int, list[OpinionBoundary]]:
             stale.append(dismissal)
             continue
         taken.add(best.pk)
-        OpinionBoundary.objects.filter(pk=best.pk).update(decision=dismissal)
+        best.decision = dismissal
+        written.append(best)
         landed += 1
+    # One write for every landed dismissal (#603).
+    OpinionBoundary.objects.bulk_update(written, ["decision"], batch_size=1000)
     if stale:
         logger.warning(
             "scan %s: %d opinion dismissal(s) found no boundary to land on: %s",

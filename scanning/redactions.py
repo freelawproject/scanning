@@ -295,6 +295,7 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
     landed = 0
     stale: list[Redaction] = []
     taken: set[int] = set()
+    written: list[Redaction] = []
     for dismiss in dismissals:
         if is_stale(dismiss, scan) or dismiss.target_bbox is None:
             stale.append(dismiss)
@@ -314,8 +315,11 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
             stale.append(dismiss)
             continue
         taken.add(best.pk)
-        Redaction.objects.filter(pk=best.pk).update(decision=dismiss)
+        best.decision = dismiss
+        written.append(best)
         landed += 1
+    # One write for every landed dismissal (#603).
+    Redaction.objects.bulk_update(written, ["decision"], batch_size=1000)
     if stale:
         logger.warning(
             "scan %s: %d redaction dismissal(s) found no box to land on: %s",

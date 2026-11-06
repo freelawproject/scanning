@@ -40,6 +40,7 @@ from blackletter.validate import (
     build_issues,
 )
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
@@ -1892,6 +1893,55 @@ def _import_detections(
     from scanning import detections as decisions
 
     scan = Scan.objects.get(pk=scan_pk)
+    # One transaction from the delete through ``resolve`` (#603): a
+    # reader in between saw a volume with no model boxes, and a crash
+    # in between left the decisions unlanded until the next compute.
+    with transaction.atomic():
+        kept = _replace_model_detections(scan, detections, run, detect_run)
+        rows_written = len(detections)
+        if cells:
+            # The rows the decisions were made on are the shaped rows.
+            columns.separate_rows(scan, cells)
+            columns.trim_feet(scan, cells)
+        landed, stale = decisions.resolve(scan)
+        moved = 0
+        if run is not None and kept:
+            # The kept hand-drawn rows follow the new page space, by
+            # their address; the model rows arrived in it.
+            moved, _unplaced = decisions.relocate_manual_rows(scan, run)
+    logger.info(
+        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
+        "%d moved; %d decision(s) landed, %d stale)",
+        rows_written,
+        scan_pk,
+        kept,
+        moved,
+        landed,
+        len(stale),
+    )
+    return rows_written
+
+
+def _replace_model_detections(
+    scan: Scan,
+    detections: list,
+    run: "ApplyRun | None",
+    detect_run: int | None,
+) -> int:
+    """Delete a scan's model detections and write the new ones.
+
+    The hand-drawn rows (``model_name`` ``MANUAL``) are kept. The
+    caller holds the transaction (#603).
+
+    :param scan: The scan.
+    :param detections: The merged document's ``detections`` list.
+    :param run: The apply run whose space the list is in, or None.
+    :param detect_run: The ``ExternalJob.run`` of the detection run.
+    :return: How many hand-drawn rows were kept.
+    """
+    from scanning import detections as decisions
+
+    scan_pk = scan.pk
     kept = Detection.objects.filter(
         scan_id=scan_pk, model_name=Detection.ModelName.MANUAL
     ).count()
@@ -1934,27 +1984,7 @@ def _import_detections(
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
-    if cells:
-        # The rows the decisions were made on are the shaped rows.
-        columns.separate_rows(scan, cells)
-        columns.trim_feet(scan, cells)
-    landed, stale = decisions.resolve(scan)
-    moved = 0
-    if run is not None and kept:
-        # The kept hand-drawn rows follow the new page space, by their
-        # address; the model rows arrived in it.
-        moved, _unplaced = decisions.relocate_manual_rows(scan, run)
-    logger.info(
-        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
-        "%d moved; %d decision(s) landed, %d stale)",
-        len(rows),
-        scan_pk,
-        kept,
-        moved,
-        landed,
-        len(stale),
-    )
-    return len(rows)
+    return kept
 
 
 _UNSET_RUN = object()
