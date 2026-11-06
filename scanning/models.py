@@ -1657,6 +1657,18 @@ class Detection(AbstractDateTimeModel):
                 fields=["scan", "active"],
                 name="idx_det_scan_active",
             ),
+            # The live rows of one run by page (#599): the opinions
+            # list's Pictures column asks a run's image boxes and then
+            # every live row of their pages (``opinion_ocr
+            # .picture_pages``), and without it Postgres read the whole
+            # label index, of every scan, for the first. The label is
+            # last, so the run's pages are an exact lookup and its image
+            # boxes are a read of that run's entries alone.
+            models.Index(
+                fields=["apply_run", "page_index", "label"],
+                condition=models.Q(active=True),
+                name="idx_det_live_run_page",
+            ),
             # The hand-drawn rows of a scan alone, for the question the
             # step-2 bar and the review-2 approval ask on every render
             # (``detections.changed_since_compute``): was one added or
@@ -3240,6 +3252,13 @@ class Opinion(AbstractDateTimeModel):
         indexes = [
             models.Index(
                 fields=["scan", "status"], name="idx_opinion_review_status"
+            ),
+            # The opinions list filtered by status, newest first (#599):
+            # the filter, the order and the paginator's count off one
+            # index. With ``status`` and the primary key apart, a rare
+            # status walked the table backwards to fill a page.
+            models.Index(
+                fields=["status", "id"], name="idx_opinion_status_id"
             ),
         ]
 
