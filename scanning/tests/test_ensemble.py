@@ -32,6 +32,7 @@ from django.urls import reverse
 from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
+    ApplyRun,
     Issue,
     Opinion,
     OpinionCheck,
@@ -40,6 +41,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionText,
     PageEdit,
+    Scan,
     Status,
 )
 from scanning.tests.test_detections import model_row
@@ -3218,6 +3220,36 @@ class TestTheCommandByOpinion(EnsembleTestCase):
             ensemble.is_written(Opinion.objects.get(pk=row.pk))
             for row in (self.opinion, self.sibling)
         ]
+
+    def test_the_rows_read_leave_the_caches_of_the_scan_and_the_run(self):
+        """Both selectors read the tick's query (#582, #602)."""
+        read = []
+
+        def capture(opinion):
+            read.append(opinion)
+            return rerun(opinion)
+
+        rerun = ensemble.rerun
+        for args in (
+            ("--opinion", str(self.opinion.pk)),
+            (str(self.scan.pk),),
+        ):
+            read.clear()
+            with (
+                self.subTest(args=args),
+                patch.object(ensemble, "rerun", side_effect=capture),
+            ):
+                self.run_command(*args)
+
+                self.assertTrue(read)
+                for row in read:
+                    self.assertLessEqual(
+                        set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+                    )
+                    self.assertLessEqual(
+                        set(ApplyRun.LARGE_FIELDS),
+                        row.apply_run.get_deferred_fields(),
+                    )
 
     def test_the_named_opinion_is_read_alone(self):
         output = self.run_command("--opinion", str(self.opinion.pk))

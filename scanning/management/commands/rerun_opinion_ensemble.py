@@ -60,10 +60,27 @@ Examples:
 from django.core.management.base import BaseCommand, CommandError
 
 from scanning import ensemble, opinion_ocr, s3_sync
-from scanning.models import Opinion, OpinionReviewStatus, Scan
+from scanning.models import ApplyRun, Opinion, OpinionReviewStatus, Scan
 
 #: The least ``ocr_engine_count`` of an opinion ``--all`` reads (#419).
 ALL_MIN_ENGINES = 2
+
+
+def _joined(rows):
+    """Return the rows with the scan and the run joined, their caches left.
+
+    The query of the ensemble tick (#582, #602): ``ensemble.rerun`` reads
+    no cache of the scan and not the run's page map, so a row of a large
+    volume moves neither.
+
+    :param rows: An ``Opinion`` queryset.
+    :returns: The queryset.
+    :rtype: QuerySet
+    """
+    return rows.select_related("scan", "apply_run").defer(
+        *Scan.large_fields("scan__"),
+        *(f"apply_run__{name}" for name in ApplyRun.LARGE_FIELDS),
+    )
 
 
 def readable(least: int):
@@ -80,10 +97,10 @@ def readable(least: int):
     :returns: The queryset of every such opinion, of every scan.
     :rtype: QuerySet
     """
-    return (
-        Opinion.objects.filter(ocr_engine_count__gte=least)
-        .exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
-        .select_related("scan", "apply_run")
+    return _joined(
+        Opinion.objects.filter(ocr_engine_count__gte=least).exclude(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
     )
 
 
@@ -176,7 +193,7 @@ class Command(BaseCommand):
             )
         written = failed = moved = 0
         for pk in pks:
-            scan = Scan.objects.filter(pk=pk).first()
+            scan = Scan.without_caches().filter(pk=pk).first()
             if scan is None:
                 raise CommandError(f"scan {pk} does not exist")
             rows = [
@@ -214,10 +231,7 @@ class Command(BaseCommand):
             or has no OCR documents at its live revision.
         """
         found = {
-            row.pk: row
-            for row in Opinion.objects.filter(pk__in=pks).select_related(
-                "scan", "apply_run"
-            )
+            row.pk: row for row in _joined(Opinion.objects.filter(pk__in=pks))
         }
         missing = [pk for pk in pks if pk not in found]
         if missing:
