@@ -4461,6 +4461,21 @@ def _address(page: dict) -> tuple[int | None, int | None]:
     return detections.source_of_entry(page)
 
 
+#: The fields :func:`write_rows` writes over on a page's row: the cache
+#: of the documents, never ``human_text`` or its stamps.
+WRITTEN_TEXT_FIELDS = (
+    "text",
+    "footnotes",
+    "disagreements",
+    "marks",
+    "source_edit",
+    "source_page",
+    "page_index",
+    "apply_run",
+    "date_modified",
+)
+
+
 def write_rows(opinion: Opinion, document: dict) -> int:
     """Write the ``OpinionText`` rows of one opinion.
 
@@ -4474,24 +4489,33 @@ def write_rows(opinion: Opinion, document: dict) -> int:
     :returns: How many rows were written.
     :rtype: int
     """
-    written = 0
+    rows = []
     for page in document["pages"]:
         source_edit_id, source_page = _address(page)
-        OpinionText.objects.update_or_create(
-            opinion=opinion,
-            page_in_opinion=page["page_in_opinion"],
-            defaults={
-                "text": page["text"],
-                "footnotes": page.get("footnotes") or "",
-                "disagreements": _disagreements(page),
-                "marks": _marks(page),
-                "source_edit_id": source_edit_id,
-                "source_page": source_page,
-                "page_index": page["page_index"],
-                "apply_run_id": opinion.apply_run_id,
-            },
+        rows.append(
+            OpinionText(
+                opinion=opinion,
+                page_in_opinion=page["page_in_opinion"],
+                text=page["text"],
+                footnotes=page.get("footnotes") or "",
+                disagreements=_disagreements(page),
+                marks=_marks(page),
+                source_edit_id=source_edit_id,
+                source_page=source_page,
+                page_index=page["page_index"],
+                apply_run_id=opinion.apply_run_id,
+            )
         )
-        written += 1
+    # One statement for every page, under the opinion's row lock
+    # (#603): a page's row is written over on ``unique_opinion_page``,
+    # and the fields a person writes are not among the ones updated.
+    OpinionText.objects.bulk_create(
+        rows,
+        update_conflicts=True,
+        unique_fields=["opinion", "page_in_opinion"],
+        update_fields=WRITTEN_TEXT_FIELDS,
+    )
+    written = len(rows)
     # A row of a page the opinion no longer has. An opinion does grow
     # shorter: ``opinions.create_rows`` writes ``page_count`` again on
     # a matched row, so a boundary a curator moves up takes a page off

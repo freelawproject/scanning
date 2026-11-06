@@ -173,7 +173,9 @@ def due() -> QuerySet:
     )
 
 
-def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
+def covers(
+    opinion: Opinion, pages: set[int], volume=None
+) -> dict[int, list[dict]]:
     """Return what must never show on a picture, by volume page.
 
     The visible redactions of the scan, each with its ``fill``, and the
@@ -187,6 +189,9 @@ def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
     last character of a neighbour's line on the picture.
 
     :param opinion: The row, with ``boundary``.
+    :param pages: The volume pages of its pictures; the redactions of
+        the other pages are not read (#603), because a cover elsewhere
+        touches no picture.
     :param volume: The run's bitonal copy, open, for the cut; None for
         the ledger, which reads the rows alone.
     :returns: ``{page_index: [{"x0", "y0", "x1", "y1", "fill"}]}``.
@@ -196,7 +201,7 @@ def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
     if opinion.boundary is None:
         raise FigureError("the boundary of this opinion is gone")
     found: dict[int, list[dict]] = {}
-    for entry in redactions.visible_by_page(opinion.scan):
+    for entry in redactions.visible_by_page(opinion.scan, pages=pages):
         found.setdefault(entry["page_index"], []).extend(entry["rects"])
     for rect in boundaries.outside_rects(
         opinion.scan, [opinion.boundary], document=volume
@@ -217,6 +222,11 @@ def _touching(box: list[float], rects: list[dict]) -> list[dict]:
         and rect["y0"] < box[3]
         and rect["y1"] > box[1]
     ]
+
+
+def _picture_pages(document: dict) -> set[int]:
+    """Return the volume pages that hold a picture of the document."""
+    return {figure["page_index"] for figure in ensemble.figures_of(document)}
 
 
 def ledger_digest(opinion: Opinion, document: dict) -> str:
@@ -241,7 +251,7 @@ def ledger_digest(opinion: Opinion, document: dict) -> str:
     if not place:
         return ""
     try:
-        hidden = covers(opinion)
+        hidden = covers(opinion, _picture_pages(document))
     except FigureError:
         # No boundary: the cut refuses the row, and no mask is known.
         hidden = {}
@@ -364,7 +374,7 @@ def cut_one(opinion: Opinion) -> int:
     except apply.ApplyError as exc:
         raise TransientFault(str(exc)) from exc
     with fitz.open(str(bitonal)) as volume:
-        hidden = covers(opinion, volume)
+        hidden = covers(opinion, _picture_pages(document), volume)
     pages = {
         page.get("page_in_opinion"): page.get("frame") or {}
         for page in document.get("pages") or []

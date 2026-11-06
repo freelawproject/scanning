@@ -229,6 +229,24 @@ def standing_decisions(scan: Scan):
     )
 
 
+#: Every field :func:`_effect_fields` may write, for a ``bulk_update``.
+EFFECT_FIELDS = ("decision", "confidence", "active")
+
+
+def _effect_fields(decision: DetectionDecision) -> dict:
+    """Return the fields a decision writes on the model rows it lands on.
+
+    :param decision: The decision.
+    :returns: ``{field: value}``, a subset of :data:`EFFECT_FIELDS`.
+    """
+    fields = {"decision": decision}
+    if decision.kind == DetectionDecision.Kind.APPROVE:
+        fields["confidence"] = 1.0
+    else:
+        fields["active"] = False
+    return fields
+
+
 def _apply_effect(rows, decision: DetectionDecision) -> int:
     """Write a decision's derived read onto ``rows`` and point them at it.
 
@@ -236,12 +254,7 @@ def _apply_effect(rows, decision: DetectionDecision) -> int:
     :param decision: The decision.
     :returns: How many rows were written.
     """
-    fields = {"decision": decision}
-    if decision.kind == DetectionDecision.Kind.APPROVE:
-        fields["confidence"] = 1.0
-    else:
-        fields["active"] = False
-    return rows.update(**fields)
+    return rows.update(**_effect_fields(decision))
 
 
 def _revert_effect(rows, decision: DetectionDecision) -> int:
@@ -735,6 +748,7 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
             (row.source_edit_id, row.source_page, row.label_id), []
         ).append(row)
     taken: set[int] = set()
+    written: list[Detection] = []
     for decision in decisions:
         if is_stale(decision, scan):
             stale.append(decision)
@@ -754,8 +768,13 @@ def resolve(scan: Scan) -> tuple[int, list[DetectionDecision]]:
             stale.append(decision)
             continue
         taken.add(best.pk)
-        _apply_effect(Detection.objects.filter(pk=best.pk), decision)
+        for name, value in _effect_fields(decision).items():
+            setattr(best, name, value)
+        written.append(best)
         landed += 1
+    # One write for every landed decision, on the rows read above
+    # (#603); each row is written once, so the fields are its own.
+    Detection.objects.bulk_update(written, EFFECT_FIELDS, batch_size=1000)
     if stale:
         logger.warning(
             "scan %s: %d detection decision(s) found no box to land on: %s",

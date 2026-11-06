@@ -2175,6 +2175,40 @@ class TestTheRows(EnsembleTestCase):
         self.assertEqual(row.source_page, 1)
         self.assertEqual(row.source_edit_id, self.edit().pk)
 
+    def test_the_pages_are_written_in_one_statement(self):
+        """One upsert for every page under the row lock, and one delete
+        of the pages the opinion lost (#603), however long it is."""
+        ensemble.write_rows(self.opinion, document_of(page_of(0)))
+        pages = [page_of(i, text=f"page {i}") for i in range(4)]
+
+        with self.assertNumQueries(2):
+            self.assertEqual(
+                ensemble.write_rows(self.opinion, document_of(*pages)), 4
+            )
+
+        self.assertEqual(
+            list(
+                OpinionText.objects.filter(opinion=self.opinion).values_list(
+                    "page_in_opinion", "text"
+                )
+            ),
+            [(i, f"page {i}") for i in range(4)],
+        )
+
+    def test_a_written_page_keeps_its_human_text_and_its_birth(self):
+        ensemble.write_rows(self.opinion, document_of(page_of(0)))
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        row.human_text = "what the curator typed"
+        row.save(update_fields=["human_text"])
+
+        ensemble.write_rows(self.opinion, document_of(page_of(0, text="new")))
+
+        again = OpinionText.objects.get(pk=row.pk)
+        self.assertEqual(again.text, "new")
+        self.assertEqual(again.human_text, "what the curator typed")
+        self.assertEqual(again.date_created, row.date_created)
+        self.assertGreater(again.date_modified, row.date_modified)
+
     def test_a_page_the_opinion_lost_keeps_a_curator_s_text(self):
         """An opinion does grow shorter, and ``human_text`` is never
         discarded (#335)."""

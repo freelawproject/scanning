@@ -501,6 +501,25 @@ class TestResolve(TestCase):
 
         self.assertEqual(landed, 1)
 
+    def test_the_landed_rows_are_written_in_one_statement(self):
+        """The queries of a resolve do not grow with the decisions
+        (#603): one read of each kind and one ``bulk_update``."""
+        rows = []
+        for page in range(3):
+            self._decide(page_index=page, source_page=page + 1)
+            rows.append(
+                model_row(self.scan, page_index=page, source_page=page + 1)
+            )
+
+        with self.assertNumQueries(4):
+            landed, stale = detections.resolve(self.scan)
+
+        self.assertEqual((landed, stale), (3, []))
+        for row in rows:
+            row.refresh_from_db()
+            self.assertIsNotNone(row.decision_id)
+            self.assertFalse(row.active)
+
     def test_lands_on_the_same_box(self):
         decision = self._decide()
         new = model_row(self.scan)
