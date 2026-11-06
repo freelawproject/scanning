@@ -610,8 +610,13 @@ def uncovered(
     Rows only: the readings of the measured run and the live detections
     of their pages. No S3 read and no render, so ``findings.rebuild``
     may call it in a request. The measure is the glue's
-    (``opinion_ocr.page_frame``, ``opinion_ocr.undetected``), so a
-    card here is a drop there. A page is judged by its own rows alone,
+    (``opinion_ocr.page_frame``, ``opinion_ocr.undetected``) over the
+    region boxes alone (``opinion_ocr.REGION_LABELS``): a card here is
+    a drop there, or a block that only a box naming text holds (a
+    caption, a headnote, a heading, a blockquote), which the glue keeps
+    and the card still asks a column or footnote box for, because the
+    viewer draws no model box of the last two and the column looked
+    bare (659 S.W.3d 243). A page is judged by its own rows alone,
     so a write on one page rebuilds that page (``pages``); only the
     shape of its cards' ``+ column`` box reads the column boxes of the
     pages beside it (:func:`_column_geometry`), so a column box drawn
@@ -653,7 +658,7 @@ def uncovered(
         # The page size in points, as the rows' render gives it: the
         # space ``opinion_ocr.verdict`` measures in.
         size = boundaries.to_points(width, height, width, height)
-        frame = opinion_ocr.page_frame(rows, size)
+        frame = opinion_ocr.page_frame(rows, size, opinion_ocr.REGION_LABELS)
         # The glue's frame is None on a page with no ``TEXT_COLUMN``
         # box, and its verdict keeps every unit there, so on such a
         # page this card is no drop in review 3. The page is judged
