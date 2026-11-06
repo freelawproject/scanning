@@ -583,6 +583,26 @@ class Scan(AbstractDateTimeModel):
         """
         return [f"{prefix}{name}" for name in cls.LARGE_FIELDS]
 
+    @classmethod
+    def without_caches(cls, *keep: str) -> models.QuerySet:
+        """Return the scans with the caches deferred, but those in ``keep``.
+
+        The query of a view that fetches one scan (#602): a review click
+        or a poll that reads no cache moves none of them, and one that
+        reads a cache through a helper names it here. A deferred field
+        a path does read costs one query, never a wrong answer.
+
+        :param keep: Names of :attr:`LARGE_FIELDS` the caller reads.
+        :returns: The queryset.
+        :rtype: QuerySet
+        """
+        unknown = set(keep) - set(cls.LARGE_FIELDS)
+        if unknown:
+            raise ValueError(f"not a cache of Scan: {sorted(unknown)}")
+        return cls.objects.defer(
+            *(name for name in cls.LARGE_FIELDS if name not in keep)
+        )
+
     volume_obj = models.ForeignKey(
         Volume,
         on_delete=models.PROTECT,
