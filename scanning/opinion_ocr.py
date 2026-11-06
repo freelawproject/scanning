@@ -1099,17 +1099,19 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
     return zones
 
 
-#: The labels whose boxes are the frame of a page (:func:`page_frame`):
-#: the regions print sits in, the columns, the footnote block and the
-#: pictures, with the running head's line and the two marks that sit
-#: between the columns, the key icon and the case sequence. Every other
-#: label names what a piece of text is, a caption, a headnote, a
-#: syllabus, an editor's note, the judges, a heading, a blockquote, and
-#: must sit inside one of these: a model ``BLOCKQUOTE`` box over a whole
-#: column that had no ``TEXT_COLUMN`` box counted as cover, so no text
-#: card asked for the column in review 2 and the column rode into
-#: review 3 as one long quote (659 S.W.3d 243, 2026-11-06).
-FRAME_LABELS = HEAD_LINE_LABELS | frozenset(
+#: The region boxes of a page: the columns, the footnote block and the
+#: pictures, with the running head's line and the two marks between the
+#: columns, the key icon and the case sequence. Every other label names
+#: what a piece of text is (a caption, a headnote, a syllabus, an
+#: editor's note, the judges, a heading, a blockquote) and sits inside
+#: one of these. The text card of review 2 measures against the region
+#: boxes alone (``undetected.uncovered``), so a column with no
+#: ``TEXT_COLUMN`` box is asked for even when a model ``BLOCKQUOTE`` box
+#: lies over it (659 S.W.3d 243, 2026-11-06: the viewer draws no model
+#: box of that label, so the column looked bare and no card said so).
+#: The glue's verdict keeps every box as cover: a line a caption box
+#: alone holds goes into the text, and the card only asks for the box.
+REGION_LABELS = HEAD_LINE_LABELS | frozenset(
     {
         Label.TEXT_COLUMN.name,
         Label.FOOTNOTES.name,
@@ -1120,28 +1122,33 @@ FRAME_LABELS = HEAD_LINE_LABELS | frozenset(
 )
 
 
-def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
+def page_frame(
+    rows: list, size: tuple[float, float], labels: frozenset | None = None
+) -> list[dict] | None:
     """Return the frame of one page, in points, or None.
 
-    The union of the page's detections of :data:`FRAME_LABELS`, in the
-    shape :func:`covered_share` measures: a unit that lies in none of
-    them is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
+    The union of every detection of the page, in the shape
+    :func:`covered_share` measures: a unit that lies in none of them
+    is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
     detection, because the rule needs the detections to have read the
-    page: a page they missed whole keeps every unit, and the vote says
-    what it says.
+    page: a page they missed whole keeps every unit, and the vote
+    says what it says. With ``labels``, the detections of those labels
+    alone: the text card passes :data:`REGION_LABELS`; the glue passes
+    nothing.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
+    :param labels: The labels to keep, or None for every label.
     :returns: The rects, or None.
     :rtype: list[dict] | None
     """
     if not any(row.label == Label.TEXT_COLUMN.name for row in rows):
         return None
+    if labels is not None:
+        rows = [row for row in rows if row.label in labels]
     return [
         {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
-        for box in zones_pt(
-            [row for row in rows if row.label in FRAME_LABELS], size
-        )
+        for box in zones_pt(rows, size)
     ]
 
 

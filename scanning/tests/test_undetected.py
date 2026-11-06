@@ -600,7 +600,7 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(len(self.found()), 1)
 
     def test_a_region_box_covers(self):
-        # The frame is the boxes of ``opinion_ocr.FRAME_LABELS``: the
+        # The card measures against ``opinion_ocr.REGION_LABELS``: the
         # regions print sits in, a footnote block among them.
         column(self.scan)
         make_detection(
