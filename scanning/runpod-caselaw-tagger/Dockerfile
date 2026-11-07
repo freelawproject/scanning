@@ -2,9 +2,10 @@
 #
 # GPU worker image for RunPod Serverless: the case-law block tagger.
 #
-# Runs one step, ``tag``, with freelawproject/caselaw-block-tagger (a
-# ModernBERT-large token classifier). No Django, no AWS credentials, no
-# DB client. The weights are baked in so cold start skips the network.
+# Runs one step, ``tag``, with freelawproject/caselaw-block-tagger-wordlevel
+# (a ModernBERT-large token classifier, decoded per word, #573). No
+# Django, no AWS credentials, no DB client. The weights are baked in so
+# cold start skips the network.
 #
 # Build with the scanning/ directory as context (handler.py imports the
 # shared runpod_common.py that lives there):
@@ -98,15 +99,30 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # transformers release that changed how the argument meets the saved
 # rule would fail here, not on a paid job.
 #
+# The snapshot is pinned to one commit of the repository
+# (TAGGER_MODEL_REVISION), so a push to Hugging Face can never change
+# what a build carries (#564). A new checkpoint is a change of both
+# build args here plus ``tagger.MODEL`` in the portal, which names the
+# same ``repo@revision`` and refuses a result of other weights.
+#
+# The weights are word-level: trained with a label on the first token
+# of each word alone. The check after the download asserts the
+# snapshot's label_maps.json says so and that its label list is the
+# config's, the same check the handler makes before it loads, so the
+# per-token weights can never ship with the word decoder, nor the
+# reverse.
+#
 # Overriding TAGGER_MODEL at run time requires a rebuild with the
-# matching build arg: HF_HUB_OFFLINE below keeps the worker off the
+# matching build args: HF_HUB_OFFLINE below keeps the worker off the
 # network for weights.
-ARG TAGGER_MODEL=freelawproject/caselaw-block-tagger
+ARG TAGGER_MODEL=freelawproject/caselaw-block-tagger-wordlevel
+ARG TAGGER_MODEL_REVISION=00a26dda233db0f77268019020f5ae96a221ba44
 ENV TAGGER_MODEL=${TAGGER_MODEL} \
+    TAGGER_MODEL_REVISION=${TAGGER_MODEL_REVISION} \
     TAGGER_MODEL_DIR=/opt/model
 RUN set -e; \
     for i in 1 2 3; do \
-      python -c "from huggingface_hub import snapshot_download; snapshot_download('${TAGGER_MODEL}', local_dir='/opt/model')" \
+      python -c "from huggingface_hub import snapshot_download; snapshot_download('${TAGGER_MODEL}', revision='${TAGGER_MODEL_REVISION}', local_dir='/opt/model')" \
         && break; \
       echo "snapshot_download attempt $i failed; sleeping 10s"; \
       sleep 10; \
@@ -117,6 +133,14 @@ files = list(pathlib.Path('/opt/model').glob('*.safetensors')); \
 total = sum(f.stat().st_size for f in files); \
 assert total > 1_400_000_000, f'weights missing or truncated: {total} bytes in {len(files)} files'; \
 print(f'weights OK: {total // 1024 // 1024} MB in {len(files)} files')" \
+ && python -c "\
+import json; \
+maps = json.load(open('/opt/model/label_maps.json')); \
+config = json.load(open('/opt/model/config.json')); \
+assert maps.get('word_level') is True, 'label_maps.json does not say word_level: true: these weights need the per-token decoder'; \
+table = [config['id2label'][str(k)] for k in range(len(config['id2label']))]; \
+assert maps.get('block') == table, f'label_maps.json and config.json disagree on the labels: {maps.get(\"block\")} vs {table}'; \
+print(f'word-level OK: {len(table)} labels')" \
  && python -c "\
 from transformers import AutoModelForTokenClassification, AutoTokenizer; \
 tok = AutoTokenizer.from_pretrained('/opt/model'); \
@@ -138,7 +162,10 @@ print('no triton: torch native kernels unavailable, nothing compiles at run time
 # disk and the handler loads it by path.
 ENV HF_HUB_OFFLINE=1
 
-COPY runpod_common.py runpod-caselaw-tagger/handler.py ./
+# wordlevel.py and heal.py are the word decoder and the disposition heal
+# the weights were scored with, copied from ai-research's ``tagger/``.
+COPY runpod_common.py runpod-caselaw-tagger/wordlevel.py \
+     runpod-caselaw-tagger/heal.py runpod-caselaw-tagger/handler.py ./
 
 # RunPod's serverless runtime imports handler.py; running it directly
 # (through ``runpod.serverless.start``) works for both local smoke

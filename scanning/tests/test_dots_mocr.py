@@ -2100,10 +2100,16 @@ class TestKnownEnqueuePaths(ScanningTestCase):
                 # document per opinion rather than a shard set.
                 ("scanning/jobs.py", "ensure_run_jobs"),
                 ("scanning/tagger.py", "ensure_run_jobs"),
-                # The tagger: one approved opinion per row (#272), and
-                # only from the button of the review page. No tick pass
-                # yet, on purpose.
+                # The tagger: one approved opinion per row (#272), from
+                # the button of the review page, and from the backlog
+                # command after a change of the weights (#573), a
+                # staff-run command like reread_failed_pages. No tick
+                # pass, on purpose.
                 ("scanning/views_api.py", "ensure_tag_jobs"),
+                (
+                    "scanning/management/commands/retag_opinions.py",
+                    "ensure_tag_jobs",
+                ),
             },
             "Something new creates external-job rows. Row creation "
             "starts paid GPU work, so update this set only on purpose.",
