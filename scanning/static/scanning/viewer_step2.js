@@ -1869,22 +1869,13 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // The actions on a detection box apply only while the boxes are on, so
-    // that part of the guide waits for them (#299). The panel opens itself
-    // the first time in a session: a reviewer meets the guide once, and
-    // the "?" gives it back at any time.
+    // that part of the guide waits for them (#299). The panel never opens
+    // itself: it covered the page at the first toggle, and the "?" gives
+    // it at any time.
     function _showDetectionHelp(on) {
         var part = document.getElementById('viewer-help-detections');
         if (!part) return;
         part.hidden = !on;
-        if (!on) return;
-        var key = 'viewer-help-seen-' + documentId;
-        try {
-            if (sessionStorage.getItem(key)) return;
-            sessionStorage.setItem(key, '1');
-        } catch (e) {
-            return;
-        }
-        _setHelpOpen(true);
     }
 
     if (_overlayBtn) {
@@ -2723,6 +2714,12 @@ document.addEventListener('DOMContentLoaded', function () {
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
             e.preventDefault();
             toggleOverlays();
+        }
+        // The key "d" is the Detections button of every page label.
+        if ((e.key === 'd' || e.key === 'D') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) return;
+            e.preventDefault();
+            toggleDetections();
         }
     });
 
