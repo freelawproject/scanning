@@ -1056,6 +1056,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
         if (_globalDetections) {
             loadDetections(function () {
+                // A second toggle before the fetch answered turned the
+                // boxes off again: draw nothing.
+                if (!_globalDetections) return;
                 // Show on all rendered pages
                 document.querySelectorAll('.lazy-page').forEach(function(pd) {
                     var pIdx = parseInt(pd.dataset.pdfIndex);
@@ -2715,8 +2718,12 @@ document.addEventListener('DOMContentLoaded', function () {
             e.preventDefault();
             toggleOverlays();
         }
-        // The key "d" is the Detections button of every page label.
+        // The key "d" is the Detections button of every page label, and is
+        // offered only where the page draws that button: step 3 shows an
+        // opinion's PDF and leaves the volume's boxes out.
         if ((e.key === 'd' || e.key === 'D') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+            if (!previewOnly && (viewOnly || opinionEditMode)) return;
+            if (e.repeat) return;
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) return;
             e.preventDefault();
             toggleDetections();
