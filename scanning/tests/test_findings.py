@@ -953,6 +953,42 @@ class TestRebuild(ScanningTestCase):
 
         self.assertFalse(self._low_brackets(scan).exists())
 
+    def test_a_weak_bracket_inside_its_line_is_no_finding(self):
+        """A headnote bracket opens its paragraph: a weak box well in
+        from its column's left edge is a court's ``[a]``, not a
+        headnote bracket, and asks nothing."""
+        scan = self._bracket_scan()
+        make_detection(scan, "TEXT_COLUMN", 1, x0=250.0, x1=850.0, y1=2000.0)
+        make_detection(scan, "TEXT_COLUMN", 1, x0=870.0, x1=1470.0, y1=2000.0)
+        make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.25, x0=700.0, x1=740.0
+        )
+
+        findings.rebuild(scan)
+
+        self.assertFalse(self._low_brackets(scan).exists())
+
+    def test_a_weak_bracket_at_its_columns_left_edge_is_a_finding(self):
+        """The paragraph indent is not the middle of the line: a weak
+        box a few dozen pixels in from either column's edge still
+        asks."""
+        scan = self._bracket_scan()
+        make_detection(scan, "TEXT_COLUMN", 1, x0=250.0, x1=850.0, y1=2000.0)
+        make_detection(scan, "TEXT_COLUMN", 1, x0=870.0, x1=1470.0, y1=2000.0)
+        left = make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.25, x0=285.0, x1=370.0
+        )
+        right = make_detection(
+            scan, "HEADNOTE_BRACKET", 1, confidence=0.25, x0=900.0, x1=985.0
+        )
+
+        findings.rebuild(scan)
+
+        self.assertEqual(
+            {f.metadata["detection_id"] for f in self._low_brackets(scan)},
+            {left.pk, right.pk},
+        )
+
     def test_a_low_confidence_bracket_can_be_dismissed(self):
         scan = self._bracket_scan()
         make_detection(scan, "HEADNOTE_BRACKET", 1, confidence=0.25)
