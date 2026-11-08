@@ -763,8 +763,37 @@
         node.addEventListener('mousedown', function () { setActive(node); });
         wrap._card = card;
         observer.observe(wrap);
+        // The node is in the page by the next frame (``replace``).
+        if (card.full) { requestAnimationFrame(function () { fitFullPage(node); }); }
         return node;
     }
+
+    /** Size an opened card's page to the screen: as wide as the height
+     *  the header, the message and the footer leave allows, so the
+     *  whole page shows with no scroll. The box layer is in percent of
+     *  the wrap, so it follows. */
+    function fitFullPage(node) {
+        var wrap = node.querySelector('.cr-cropwrap.cr-fullpage');
+        if (!wrap || !wrap._card) { return; }
+        var card = wrap._card;
+        var style = getComputedStyle(node);
+        var height = node.clientHeight
+            - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+        var width = node.clientWidth
+            - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        Array.prototype.forEach.call(node.children, function (child) {
+            if (child !== wrap) { height -= child.offsetHeight; }
+        });
+        var wrapStyle = getComputedStyle(wrap);
+        height -= parseFloat(wrapStyle.marginBottom) + 2;
+        var fit = Math.min(width, height * card.img_width / card.img_height);
+        wrap.style.width = Math.max(200, Math.floor(fit)) + 'px';
+    }
+
+    window.addEventListener('resize', function () {
+        if (!root) { return; }
+        root.querySelectorAll('.bk-card.cr-expanded').forEach(fitFullPage);
+    });
 
     /** Draw a card again in its place, after an answer, a skip or an
      *  Undo. */
@@ -799,7 +828,7 @@
 
     function add(card, node, as) {
         as = as || {};
-        write(card, node, cfg.urls.add_single_detection, {
+        return write(card, node, cfg.urls.add_single_detection, {
             page_index: card.page_index,
             label: as.label || card.label,
             label_id: as.labelId || card.label_id,
@@ -816,7 +845,7 @@
     }
 
     function dismiss(card, node) {
-        write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
+        return write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
             // The finding's pk dies at the next rebuild, which any later
             // write runs; the dismissal row outlives every rebuild.
             return { url: cfg.urls.restore_finding, body: { dismissal_id: data.dismissal_id } };
@@ -824,7 +853,7 @@
     }
 
     function keep(card, node) {
-        write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
+        return write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
         });
     }
@@ -883,7 +912,7 @@
     }
 
     function resize(card, node) {
-        write(card, node, cfg.urls.update_detection, {
+        return write(card, node, cfg.urls.update_detection, {
             detection_id: card.detection_id, new_bbox: card.box
         }, 'resized', function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
@@ -891,9 +920,78 @@
     }
 
     function takeOut(card, node) {
-        write(card, node, cfg.urls.delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
+        return write(card, node, cfg.urls.delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
             return { url: cfg.urls.restore_detection, body: { detection_id: card.detection_id } };
         });
+    }
+
+    // ── the bracket section's bulk answers ───────────────────────────
+    /** The bracket cards nobody touched: not answered, not skipped,
+     *  and not a link card, which has no box to answer here. A box a
+     *  person moved and did not save counts: the bulk answer saves it
+     *  where they put it. */
+    function untouchedBrackets() {
+        return cards.filter(function (card) {
+            return card.group === 'bracket' && (card.kind === 'bracket' || card.kind === 'faint') &&
+                !answers[card.key] && !skipped[card.key];
+        });
+    }
+
+    /** Answer every untouched bracket card as its own button would,
+     *  one write after the next (``postJson`` keeps them in turn), so
+     *  each card keeps its own Undo: ``approve`` adds a missed bracket
+     *  at its box and approves a faint one (or saves it where it was
+     *  moved); ``out`` says No bracket to a missed one and takes a
+     *  faint one out. */
+    var bulkRunning = false;
+    function bulkBrackets(mode, btn) {
+        var list = untouchedBrackets();
+        if (!list.length || bulkRunning) { return; }
+        var verb = mode === 'approve' ? 'Approve' : 'Take out';
+        if (!window.confirm(verb + ' the ' + list.length + ' bracket card(s) not answered yet?')) { return; }
+        bulkRunning = true;
+        root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) { b.disabled = true; });
+        var done = 0;
+        var sent = list.map(function (card) {
+            var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
+            if (!node) { return Promise.resolve(); }
+            var answer;
+            if (mode === 'approve') {
+                if (card.kind === 'faint') {
+                    answer = moved(card) ? resize(card, node) : keep(card, node);
+                } else {
+                    answer = add(card, node);
+                }
+            } else {
+                answer = card.kind === 'faint' ? takeOut(card, node) : dismiss(card, node);
+            }
+            return answer.then(function () {
+                done += 1;
+                btn.textContent = verb + '… ' + done + ' of ' + list.length;
+            });
+        });
+        Promise.all(sent).then(function () {
+            bulkRunning = false;
+            countAll();
+        });
+    }
+
+    /** The left and right arrows: the selected bracket card's box one
+     *  step sideways (a bigger step with Shift), as a drag would move
+     *  it, so the first button saves it where it lands. */
+    var NUDGE_PX = 3;
+    var NUDGE_BIG_PX = 15;
+    function nudge(node, dx) {
+        var card = node && node.querySelector('.bk-cropwrap') && node.querySelector('.bk-cropwrap')._card;
+        if (!card || card.group !== 'bracket' || !card.box) { return false; }
+        if (answers[card.key] || skipped[card.key] || card.edit || card.kind === 'link') { return false; }
+        var b = card.box.slice();
+        b[0] += dx;
+        b[2] += dx;
+        card.box = clampBox(b, cropOf(card), true);
+        placeBox(card, node.querySelector('.cr-box'));
+        markMoved(card, node);
+        return true;
     }
 
     /** Write the box under edit through the resize endpoint. The
@@ -1003,6 +1101,13 @@
         root.querySelector('[data-role="total"]').textContent = String(cards.length);
         root.querySelector('[data-role="done"]').textContent = String(done);
         root.querySelector('[data-role="skipped"]').textContent = String(skips);
+        var rest = untouchedBrackets().length;
+        if (!bulkRunning) {
+            root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) {
+                b.textContent = (b.dataset.role === 'bulk-approve' ? 'Approve the rest' : 'Take out the rest') + ' (' + rest + ')';
+                b.disabled = !rest || !cfg.review_open;
+            });
+        }
         refreshUndoEdit();
     }
 
@@ -1193,6 +1298,13 @@
             opened.querySelector('.cr-full-btn').click();
             return;
         }
+        if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            var by = event.shiftKey ? NUDGE_BIG_PX : NUDGE_PX;
+            if (nudge(opened || keyCard(), event.key === 'ArrowLeft' ? -by : by)) {
+                event.preventDefault();
+            }
+            return;
+        }
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             // From the selected card, never from the one in view.
@@ -1255,6 +1367,11 @@
             if (card) { setActive(card); }
         });
         root.querySelector('[data-role="reload"]').addEventListener('click', function () { load(); });
+        root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) {
+            b.addEventListener('click', function () {
+                bulkBrackets(b.dataset.role === 'bulk-approve' ? 'approve' : 'out', b);
+            });
+        });
         root.querySelector('[data-role="undo-edit"]').addEventListener('click', function () { undoEdit(); });
         root.querySelector('[data-role="recompute"]').addEventListener('click', function (event) {
             recompute(event.currentTarget);
