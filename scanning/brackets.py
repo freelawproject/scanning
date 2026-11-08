@@ -484,6 +484,49 @@ REFERENCE_WIDTH = 1700.0
 DEFAULT_SHAPE = (32.0, 0.0, 12.75, 30.0)
 
 
+#: How far in from its column's left edge a headnote bracket may start,
+#: in the pixels of :data:`REFERENCE_WIDTH`: the bracket opens its
+#: paragraph, so at most the first-line indent (32 px on 722 S.W.3d,
+#: :data:`DEFAULT_SHAPE`) and a column box drawn loose of the text lie
+#: before it. A bracketed letter or word further in (a court's ``[a]``)
+#: is no headnote bracket.
+LEFT_EDGE_PX = 120.0
+
+
+def at_column_left(row: Detection, column_rows: list[Detection]) -> bool:
+    """Say whether a bracket box sits at the left edge of its column.
+
+    The column is the group of ``TEXT_COLUMN`` boxes of the page
+    (``columns.column_groups``) whose extent holds the middle of the
+    box, and its left edge is that group's least ``x0``. A box no
+    column holds, or a page with no column box, is not judged and
+    answers True: only a box that a column holds and that starts more
+    than :data:`LEFT_EDGE_PX` in from that column's edge answers False.
+
+    :param row: The bracket box.
+    :param column_rows: The live ``TEXT_COLUMN`` rows of its page.
+    :returns: Whether the box may be a headnote bracket by its place.
+    :rtype: bool
+    """
+    from scanning import columns
+
+    width = float(row.img_width or REFERENCE_WIDTH)
+    spans = [
+        (
+            c.x0 * width / float(c.img_width or width),
+            c.x1 * width / float(c.img_width or width),
+        )
+        for c in column_rows
+    ]
+    middle = (row.x0 + row.x1) / 2.0
+    for group in columns.column_groups(spans):
+        left = min(spans[i][0] for i in group)
+        right = max(spans[i][1] for i in group)
+        if left <= middle <= right:
+            return row.x0 - left <= LEFT_EDGE_PX * width / REFERENCE_WIDTH
+    return True
+
+
 def _shape_sample(row: Detection, reading: BracketReading) -> tuple:
     """Return where ``row`` sits in ``reading``'s cell, in reference pixels.
 

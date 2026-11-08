@@ -1352,8 +1352,23 @@ def _low_confidence_bracket_findings(scan: Scan):
     if not weak:
         return
     gate = gates[model_rows_are_bl_warm(scan)]
+    # A bracket opens its paragraph, so a weak box away from its
+    # column's left edge (a court's ``[a]`` inside a line) is no
+    # headnote bracket and asks nothing (``brackets.at_column_left``).
+    column_rows: dict[tuple, list[Detection]] = {}
+    for row in Detection.objects.live().filter(
+        scan=scan,
+        label=Label.TEXT_COLUMN.name,
+        page_index__in={det.page_index for det in weak},
+    ):
+        column_rows.setdefault((row.page_index, row.apply_run_id), []).append(
+            row
+        )
     for det in weak:
         if det.confidence >= gate:
+            continue
+        page_columns = column_rows.get((det.page_index, det.apply_run_id), [])
+        if not brackets.at_column_left(det, page_columns):
             continue
         yield _detection_finding(
             CheckName.LOW_CONFIDENCE_HEADNOTE_BRACKET,
