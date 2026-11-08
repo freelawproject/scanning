@@ -42,6 +42,11 @@
     /** A box a person moved and has not saved, by card key, so a
      *  reload of the cards keeps it. */
     var drafts = {};
+    /** The cards a bulk answer has queued and not written yet, by card
+     *  key: their own buttons, keys, nudge, open and skip refuse them,
+     *  so no card is written twice and no node the bulk writes to is
+     *  swapped under it. */
+    var pending = {};
     var pdf = null;
     var observer = null;
     var DPR = Math.min(2, window.devicePixelRatio || 1);
@@ -115,7 +120,7 @@
 
     function parse(response) {
         return response.json().catch(function () { return {}; }).then(function (data) {
-            return { ok: response.ok, data: data };
+            return { ok: response.ok, status: response.status, data: data };
         });
     }
 
@@ -333,7 +338,7 @@
             tag.addEventListener('mousedown', function (event) { event.stopPropagation(); });
             tag.addEventListener('click', function (event) {
                 event.stopPropagation();
-                if (answers[card.key] || skipped[card.key]) { return; }
+                if (answers[card.key] || skipped[card.key] || pending[card.key]) { return; }
                 card.edit = { id: other.id, label: other.label, own: other.own, box: other.box.slice(), original: other.box.slice() };
                 card.drawing = false;
                 replace(card, node);
@@ -344,6 +349,7 @@
                 x.type = 'button';
                 x.title = 'Withdraw this box';
                 x.addEventListener('mousedown', function (event) { event.stopPropagation(); });
+                x.disabled = Boolean(pending[card.key]);
                 x.addEventListener('click', function (event) {
                     event.stopPropagation();
                     x.disabled = true;
@@ -559,8 +565,9 @@
     function footer(card, node) {
         var foot = el('footer');
         var answer = answers[card.key];
-        var label = answer ? answer.label : (skipped[card.key] ? 'skipped' : 'not yet decided');
+        var label = answer ? answer.label : (pending[card.key] ? 'queued…' : (skipped[card.key] ? 'skipped' : 'not yet decided'));
         foot.appendChild(el('span', 'bk-state', label));
+        if (pending[card.key] && !answer) { return foot; }
         foot.appendChild(el('span', 'bk-grow'));
         // Step 2 at the card's page, with the box flashed: the viewer
         // reads the hash (``jumpToHashTarget`` in viewer_sidebar.js).
@@ -720,6 +727,7 @@
         // the wrong column, or a picture the crop cut.
         var full = el('button', 'cr-full-btn', card.full ? 'Back to the crop (Esc)' : 'Full page');
         full.type = 'button';
+        full.disabled = Boolean(pending[card.key]);
         full.dataset.key = 'f';
         full.title = 'Key: f';
         full.addEventListener('click', function (event) {
@@ -743,6 +751,7 @@
         // on the whole page.
         var draw = el('button', 'cr-full-btn' + (card.drawing ? ' cr-on' : ''), card.drawing ? 'Drawing… (Esc stops)' : 'Draw');
         draw.type = 'button';
+        draw.disabled = Boolean(pending[card.key]);
         draw.dataset.key = 'd';
         draw.title = 'Key: d. Drag a box on the scan, then pick its label.';
         draw.addEventListener('click', function (event) {
@@ -757,7 +766,7 @@
         var wrap = el('div', 'bk-cropwrap cr-cropwrap' + (card.full ? ' cr-fullpage' : ''));
         wrap.appendChild(blankCanvas(card));
         node.appendChild(wrap);
-        boxLayer(card, wrap, node, Boolean(answer) || Boolean(skipped[card.key]));
+        boxLayer(card, wrap, node, Boolean(answer) || Boolean(skipped[card.key]) || Boolean(pending[card.key]));
         node.appendChild(note(card.message));
         node.appendChild(footer(card, node));
         node.addEventListener('mousedown', function () { setActive(node); });
@@ -808,21 +817,34 @@
     }
 
     // ── the answers ──────────────────────────────────────────────────
-    function write(card, node, url, body, label, undoOf) {
+    /** Write one answer and draw its card again. Resolves to whether
+     *  the server took it. The card's node is looked up when the answer
+     *  comes back, never the one it was sent from: a reload meanwhile
+     *  draws every card again. ``onGone`` answers a 404 in place of the
+     *  error, once (a finding a rebuild renewed). */
+    function write(card, node, url, body, label, undoOf, onGone) {
+        function live() {
+            return root.querySelector('.bk-card[data-key="' + card.key + '"]') || node;
+        }
         return postJson(url, body).then(function (answer) {
+            if (onGone && answer.status === 404) { return onGone(); }
+            delete pending[card.key];
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
-                replace(card, node);
-                return;
+                replace(card, live());
+                return false;
             }
             answers[card.key] = { label: label, undo: undoOf(answer.data) };
             history.push(card.key);
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
-            replace(card, node);
+            replace(card, live());
+            return true;
         }).catch(function (error) {
+            delete pending[card.key];
             toast('The request failed: ' + error.message, 'error');
-            replace(card, node);
+            replace(card, live());
+            return false;
         });
     }
 
@@ -844,12 +866,29 @@
         });
     }
 
-    function dismiss(card, node) {
+    function dismiss(card, node, retried) {
+        // The finding's pk dies at the next rebuild, which every bracket
+        // or box write runs: a 404 reads the cards' ids again, finds this
+        // card by its address (its key), and sends once more.
+        var onGone = retried ? null : function () {
+            return freshIssueIds().then(function () { return dismiss(card, node, true); });
+        };
         return write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
-            // The finding's pk dies at the next rebuild, which any later
-            // write runs; the dismissal row outlives every rebuild.
+            // The dismissal row outlives every rebuild.
             return { url: cfg.urls.restore_finding, body: { dismissal_id: data.dismissal_id } };
-        });
+        }, onGone);
+    }
+
+    /** Read the server's cards and give each card here the finding pk
+     *  its address holds now, drawing nothing. */
+    function freshIssueIds() {
+        return getJson(cfg.cards_url).then(function (answer) {
+            var byKey = {};
+            ((answer.data && answer.data.cards) || []).forEach(function (c) { byKey[c.key] = c; });
+            cards.forEach(function (card) {
+                if (byKey[card.key] && byKey[card.key].issue_id) { card.issue_id = byKey[card.key].issue_id; }
+            });
+        }).catch(function () {});
     }
 
     function keep(card, node) {
@@ -933,45 +972,69 @@
     function untouchedBrackets() {
         return cards.filter(function (card) {
             return card.group === 'bracket' && (card.kind === 'bracket' || card.kind === 'faint') &&
-                !answers[card.key] && !skipped[card.key];
+                !answers[card.key] && !skipped[card.key] && !card.edit && !card.drawing;
         });
     }
 
     /** Answer every untouched bracket card as its own button would,
-     *  one write after the next (``postJson`` keeps them in turn), so
-     *  each card keeps its own Undo: ``approve`` adds a missed bracket
-     *  at its box and approves a faint one (or saves it where it was
-     *  moved); ``out`` says No bracket to a missed one and takes a
-     *  faint one out. */
+     *  one card after the next, so each card keeps its own Undo:
+     *  ``approve`` adds a missed bracket at its box and approves a faint
+     *  one (or saves it where it was moved); ``out`` says No bracket to
+     *  a missed one and takes a faint one out. The run stops at the
+     *  first answer the server refuses (a closed review, an approval in
+     *  flight): one toast, and the cards not sent are open again.
+     *
+     *  In ``out``, the dismissals go first, with the finding pks read
+     *  fresh: a dismissal rebuilds nothing, and every box write renews
+     *  the pks of the bracket findings. */
     var bulkRunning = false;
     function bulkBrackets(mode, btn) {
         var list = untouchedBrackets();
         if (!list.length || bulkRunning) { return; }
         var verb = mode === 'approve' ? 'Approve' : 'Take out';
         if (!window.confirm(verb + ' the ' + list.length + ' bracket card(s) not answered yet?')) { return; }
+        if (mode === 'out') {
+            list.sort(function (a, b) { return (a.kind === 'faint') - (b.kind === 'faint'); });
+        }
         bulkRunning = true;
         root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) { b.disabled = true; });
-        var done = 0;
-        var sent = list.map(function (card) {
+        // Each queued card drawn again in its place: never ``render``,
+        // which takes a moved box for the card's own.
+        function redraw(card) {
             var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
-            if (!node) { return Promise.resolve(); }
-            var answer;
+            if (node) { replace(card, node); }
+        }
+        list.forEach(function (card) {
+            pending[card.key] = true;
+            card.full = false;
+            redraw(card);
+        });
+        var done = 0;
+        function answerOf(card) {
+            var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
             if (mode === 'approve') {
                 if (card.kind === 'faint') {
-                    answer = moved(card) ? resize(card, node) : keep(card, node);
-                } else {
-                    answer = add(card, node);
+                    return moved(card) ? resize(card, node) : keep(card, node);
                 }
-            } else {
-                answer = card.kind === 'faint' ? takeOut(card, node) : dismiss(card, node);
+                return add(card, node);
             }
-            return answer.then(function () {
+            return card.kind === 'faint' ? takeOut(card, node) : dismiss(card, node);
+        }
+        function next(at) {
+            if (at >= list.length) { return Promise.resolve(); }
+            return answerOf(list[at]).then(function (ok) {
+                if (!ok) { return; }
                 done += 1;
                 btn.textContent = verb + '… ' + done + ' of ' + list.length;
+                return next(at + 1);
             });
-        });
-        Promise.all(sent).then(function () {
+        }
+        var ready = mode === 'out' ? freshIssueIds() : Promise.resolve();
+        ready.then(function () { return next(0); }).then(function () {
             bulkRunning = false;
+            var left = list.filter(function (card) { return pending[card.key]; });
+            pending = {};
+            left.forEach(redraw);
             countAll();
         });
     }
@@ -984,7 +1047,7 @@
     function nudge(node, dx) {
         var card = node && node.querySelector('.bk-cropwrap') && node.querySelector('.bk-cropwrap')._card;
         if (!card || card.group !== 'bracket' || !card.box) { return false; }
-        if (answers[card.key] || skipped[card.key] || card.edit || card.kind === 'link') { return false; }
+        if (answers[card.key] || skipped[card.key] || pending[card.key] || card.edit || card.kind === 'link') { return false; }
         var b = card.box.slice();
         b[0] += dx;
         b[2] += dx;
@@ -1334,6 +1397,7 @@
         }
         if (!card) { return; }
         setActive(card);
+        if (pending[card.dataset.key]) { return; }
         var btn = card.querySelector('[data-key="' + key + '"]');
         if (btn && !btn.disabled && !btn.hidden) {
             event.preventDefault();
