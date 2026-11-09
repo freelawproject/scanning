@@ -228,7 +228,7 @@ def _filtered_opinions(request: HttpRequest):
         them.
     """
     # The scan's caches stay on disk (#582): the join repeats them on
-    # each of a page's fifty rows, and no reader of the list needs one.
+    # each of a page's rows, and no reader of the list needs one.
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
     ).defer(*Scan.large_fields("scan__"))
@@ -354,6 +354,12 @@ def _scan_choices() -> list[tuple[str, str]]:
     ]
 
 
+#: The rows of one page of ``/opinions/`` (#598). Each row costs its
+#: share of the page's picture and finding counts, and a corpus-wide
+#: status filter timed out at fifty.
+OPINIONS_PER_PAGE = 20
+
+
 @login_required
 def opinion_list(request: HttpRequest) -> HttpResponse:
     """List the opinions of the third review (#334).
@@ -363,7 +369,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     of the scan list, and the step-3 tab of a volume sends ``scan``.
 
     The warning count is stamped after the pagination, so one grouped
-    query answers the 50 rows of this page and the size of the corpus
+    query answers the rows of this page and the size of the corpus
     never reaches it. This is the badge rule of the scan list (#266).
 
     The opinions of the legacy pipeline are on their own page
@@ -373,7 +379,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :return: The rendered opinion list page.
     """
     opinions_qs, current = _filtered_opinions(request)
-    paginator = Paginator(opinions_qs, 50)
+    paginator = Paginator(opinions_qs, OPINIONS_PER_PAGE)
     page_obj = paginator.get_page(request.GET.get("page"))
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
