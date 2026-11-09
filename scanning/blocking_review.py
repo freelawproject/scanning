@@ -191,7 +191,8 @@ def _span_reading(at: dict, first: int, last: int) -> str:
 #: word joined earlier in the block would shift every later card onto
 #: the readings of the wrong word: those tokens open no word card
 #: until the document is written again (``rerun_opinion_ensemble``).
-POSITIONS_SCHEMA = 13
+#: 14: the join takes the halves of an empty bracket too (#610).
+POSITIONS_SCHEMA = 14
 
 
 def open_words(

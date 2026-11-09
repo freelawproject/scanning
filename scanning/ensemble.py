@@ -207,7 +207,9 @@ logger = logging.getLogger(__name__)
 #: 13 counts the positions of a person's kept tokens over the words as
 #: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
 #: split the cards align the engines with (``blocking_review.open_words``).
-SCHEMA_VERSION = 13
+#: 14 joins the halves of an empty bracket the same way (``express[ ]``,
+#: #610), which moves those positions again.
+SCHEMA_VERSION = 14
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -423,6 +425,15 @@ _HYPHEN_END = re.compile(r"\w-$")
 #: engine against two, a warning and not a block.
 _QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
 
+#: Whitespace inside an empty bracket (#610): Mistral writes the
+#: court's alteration ``express[ ]`` where Surya writes ``express[]``,
+#: one mark spelled two ways, and with the space it is two words to the
+#: vote against one. The key folds the space out, and :func:`_pairs`
+#: reads ``express[`` and ``]'`` as one word. Not one of :data:`_GAPS`:
+#: those pick the spelling a reader sees, and this rule changes the
+#: comparison alone, so the shown text is the winning engine's own.
+_BRACKET_GAP = re.compile(r"\[\s+\]")
+
 #: The gaps the key folds out. Readings that agree by key and differ
 #: by one of these are one reading spelled two ways, and the shown one
 #: is the spelling with the fewest (:func:`_tidiest`): the rank's
@@ -578,6 +589,7 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     if hyphen_gaps:
         folded = _HYPHEN_GAP.sub("-", folded)
     folded = _QUOTE_GAP.sub("", folded)
+    folded = _BRACKET_GAP.sub("[]", folded)
     return _WS.sub(" ", folded).strip()
 
 
@@ -594,7 +606,8 @@ def compare_word(word: str) -> str:
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
-    return _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded)).strip()
+    folded = _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded))
+    return _BRACKET_GAP.sub("[]", folded).strip()
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -615,7 +628,9 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     one. So is a word of quotation marks alone and its neighbour
     (``_LONE_QUOTES``, :func:`_join_lone_quotes`): ``“ ‘finally`` and
     ``justice’ ”`` are one engine's spacing of ``"'finally`` and
-    ``justice'"``. The shown word keeps the engine's own spacing.
+    ``justice'"``. So are the two halves of an empty bracket
+    (``_BRACKET_GAP``): ``express[ ]'`` is one engine's spacing of
+    ``express[]'``. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
@@ -630,10 +645,12 @@ def _pairs(text: str) -> list[tuple[str, str]]:
             end += 1
         if end - index < 2:
             end = index
-            while (
-                end + 1 < len(words)
-                and _HYPHEN_END.search(words[end])
-                and words[end + 1][:1].isalnum()
+            while end + 1 < len(words) and (
+                (
+                    _HYPHEN_END.search(words[end])
+                    and words[end + 1][:1].isalnum()
+                )
+                or (words[end].endswith("[") and words[end + 1][:1] == "]")
             ):
                 end += 1
             end += 1

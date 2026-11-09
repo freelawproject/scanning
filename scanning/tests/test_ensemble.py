@@ -1621,6 +1621,60 @@ class TestTheVote(TestCase):
         self.assertFalse(tokens[1].get("low_confidence"))
         self.assertEqual(disputed, 0)
 
+    def test_an_empty_bracket_reads_alike_however_it_is_spaced(self):
+        """#610: the court's alteration ``'express[ ]'`` (2129, p. 79).
+        Mistral wrote ``'express[ ]'``, Surya ``'express[]'`` and
+        dots.mocr dropped the bracket: three readings, a block nobody
+        agrees on. The key folds the space inside the bracket and the
+        pairing reads the two halves as one word, so Mistral and Surya
+        are the majority over dots.mocr, a warning. The text is the
+        engines' own: no spelling is rewritten."""
+        self.assertEqual(
+            ensemble.compare_text("an 'express[ ]' choice"),
+            ensemble.compare_text("an 'express[]' choice"),
+        )
+        self.assertEqual(ensemble.compare_word("[  ]"), "[]")
+        # A filled bracket keeps its spaces, and two words stay two.
+        self.assertEqual(ensemble.compare_text("[ a ]"), "[ a ]")
+        self.assertEqual(
+            ensemble._pairs("an 'express[ ]' choice"),
+            [
+                ("an", "an"),
+                ("'express[]'", "'express[ ]'"),
+                ("choice", "choice"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("use [ ] it"),
+            [("use", "use"), ("[]", "[ ]"), ("it", "it")],
+        )
+        self.assertEqual(
+            ensemble._pairs("a [b] c"),
+            [("a", "a"), ("[b]", "[b]"), ("c", "c")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("must make an 'express' choice"),
+            [
+                ensemble._pairs("must make an 'express[ ]' choice"),
+                ensemble._pairs("must make an 'express[]' choice"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["must", "make", "an", "'express[ ]'", "choice"],
+        )
+        self.assertTrue(tokens[3].get("majority"))
+        self.assertFalse(tokens[3].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+        # Spaced alike or not, the three agree: no card.
+        answer = ensemble.resolve(
+            self.read("a 'waive[]' b", "a 'waive[ ]' b", "a 'waive[ ]' b")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
         a word the base does have is marked. So the word goes in,
