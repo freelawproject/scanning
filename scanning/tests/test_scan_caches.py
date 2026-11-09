@@ -294,6 +294,24 @@ class TestProgressPoll(_CacheColumns):
 
         self.assertEqual(queries(), before)
 
+    def test_the_poll_reads_no_job_json(self):
+        """The engine summaries leave the rows' JSON on disk (#612)."""
+        ExternalJobFactory(scan=self.scan, status=JobStatus.COMPLETED)
+
+        with CaptureQueriesContext(connection) as captured:
+            data = self.client.get(self.url).json()
+
+        self.assertEqual(data["yolo_run"]["done"], 1)
+        job_queries = [
+            query["sql"]
+            for query in captured
+            if 'FROM "scanning_externaljob"' in query["sql"]
+        ]
+        self.assertTrue(job_queries)
+        for sql in job_queries:
+            self.assertNotIn('"input_manifest"', sql)
+            self.assertNotIn('"provider_meta"', sql)
+
 
 class TestLiveRun(ScanningTestCase):
     """``jobs.live_run`` reads the latest run in the query (#586)."""
@@ -319,6 +337,31 @@ class TestLiveRun(ScanningTestCase):
         self.assertEqual(len(captured), 1)
         # The database picks the run: the old runs never leave it.
         self.assertIn('"run" = (SELECT', captured[0]["sql"])
+
+    def test_the_named_fields_alone(self):
+        """A caller that names its fields reads no other column (#612)."""
+        from scanning import jobs
+
+        scan = ScanFactory()
+        ExternalJobFactory(scan=scan, error_code="x")
+
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs.live_run(
+                scan,
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                fields=jobs.SUMMARY_FIELDS,
+            )
+            summary = jobs.run_summary(
+                scan, JobStage.DETECT, JobEngine.BLACKLETTER
+            )
+
+        self.assertEqual([row.error_code for row in rows], ["x"])
+        self.assertEqual(summary["total"], 1)
+        # One query each: no deferred column was loaded row by row.
+        self.assertEqual(len(captured), 2)
+        for query in captured:
+            self.assertNotIn('"provider_meta"', query["sql"])
 
     def test_a_target_with_no_run_has_no_rows(self):
         from scanning import jobs
@@ -805,6 +848,82 @@ class TestApplyPrefilter(ScanningTestCase):
         )
 
         self.assertEqual(self._run(), {scan.pk})
+
+
+class TestVolumeGluePrefilter(ScanningTestCase):
+    """The volume glues read only a live run they may glue (#612)."""
+
+    def _walk(self):
+        from scanning import jobs
+
+        read = []
+
+        def live_rows(scan):
+            read.append(scan.pk)
+            return jobs.live_run(scan, JobStage.DETECT, JobEngine.BLACKLETTER)
+
+        yielded = [
+            scan.pk
+            for scan, _rows in jobs.ready_volume_runs(
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                JobProvider.RUNPOD,
+                live_rows,
+                lambda rows: 0,
+                3,
+            )
+        ]
+        return set(yielded), set(read)
+
+    def _row(self, scan, run, status, shard=0, count=1):
+        return ExternalJobFactory(
+            scan=scan,
+            run=run,
+            status=status,
+            shard_index=shard,
+            shard_count=count,
+        )
+
+    def test_a_finished_live_run_is_glued(self):
+        scan = ScanFactory()
+        self._row(scan, 1, JobStatus.COMPLETED, 0, 2)
+        self._row(scan, 1, JobStatus.CONSUMED, 1, 2)
+
+        self.assertEqual(self._walk(), ({scan.pk}, {scan.pk}))
+
+    def test_an_older_runs_completed_row_reads_no_rows(self):
+        """The case that read a scan on every tick, forever."""
+        glued = ScanFactory()
+        self._row(glued, 1, JobStatus.COMPLETED)
+        self._row(glued, 2, JobStatus.CONSUMED)
+        waiting = ScanFactory()
+        self._row(waiting, 1, JobStatus.COMPLETED)
+        self._row(waiting, 2, JobStatus.IN_PROGRESS)
+
+        self.assertEqual(self._walk(), (set(), set()))
+
+    def test_an_unfinished_or_dead_live_run_reads_no_rows(self):
+        for status in (JobStatus.PENDING, JobStatus.FAILED):
+            scan = ScanFactory()
+            self._row(scan, 1, JobStatus.COMPLETED, 0, 2)
+            self._row(scan, 1, status, 1, 2)
+
+        self.assertEqual(self._walk(), (set(), set()))
+
+    def test_another_targets_rows_do_not_count(self):
+        """An apply run's rows are not the volume's live run."""
+        from scanning.models import ApplyRun
+
+        scan = ScanFactory()
+        self._row(scan, 1, JobStatus.COMPLETED)
+        ExternalJobFactory(
+            scan=scan,
+            run=7,
+            status=JobStatus.PENDING,
+            apply_run=ApplyRun.objects.create(scan=scan, number=1),
+        )
+
+        self.assertEqual(self._walk(), ({scan.pk}, {scan.pk}))
 
 
 class TestOpinionListIndexes(ScanningTestCase):
