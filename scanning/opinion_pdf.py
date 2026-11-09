@@ -99,6 +99,9 @@ from django.utils import timezone
 
 from scanning import apply, boundaries, review_states, s3_sync, sharding
 from scanning.models import (
+    OPINION_PASS_ORDER,
+    OPINION_PDF_MAX_ATTEMPTS,
+    OPINION_PDF_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -115,7 +118,7 @@ logger = logging.getLogger(__name__)
 PDFS_PER_TICK = 1
 
 #: Counted faults a row may spend at one revision before it is ``ERROR``.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_PDF_MAX_ATTEMPTS
 
 #: The scan statuses whose rows the pass writes. One value today: the
 #: approval of review 2 wrote the rows. Review 3 (#334) moves a scan
@@ -269,15 +272,12 @@ def owed() -> QuerySet:
     """
     return (
         Opinion.objects.filter(
-            scan__status__in=OPINION_PDF_STATUSES,
-            pdf_attempts__lt=MAX_ATTEMPTS,
+            OPINION_PDF_OWED, scan__status__in=OPINION_PDF_STATUSES
         )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .exclude(redacted_pdf_revision=F("glue_revision"))
         .select_related("scan", "scan__reporter", "boundary")
         # The scan's caches stay on disk (#582): the PDF reads none.
         .defer(*Scan.large_fields("scan__"))
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
+        .order_by(*OPINION_PASS_ORDER)
     )
 
 

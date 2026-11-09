@@ -2872,6 +2872,97 @@ DISMISSABLE_OPINION_CHECKS = (
     frozenset(OpinionCheck) - UNDISMISSABLE_OPINION_CHECKS
 )
 
+# ── What the opinion passes owe (#604) ───────────────────────────────
+# Each pass asks every tick which rows still owe its output, and the
+# answer compares two columns of the row, which no plain index serves.
+# Each question is one ``Q`` here, read by the pass's query and by a
+# partial index of ``Opinion.Meta`` whose condition is that ``Q``: the
+# two compile to the same SQL, so the planner matches them, and neither
+# changes without the other. A change of a ``Q`` or of a cap below is a
+# migration. What depends on the clock, a setting or another table (the
+# scan's status, a cooldown, the ensemble's engine count) stays in the
+# pass's query.
+
+#: Failed ticks of a pass on a row before the pass leaves it alone.
+#: ``opinion_pdf``, ``opinion_figures``, ``opinion_ocr`` and
+#: ``ensemble`` read theirs as ``MAX_ATTEMPTS``.
+OPINION_PDF_MAX_ATTEMPTS = 3
+OPINION_FIGURES_MAX_ATTEMPTS = 3
+OPINION_OCR_MAX_ATTEMPTS = 3
+OPINION_ENSEMBLE_MAX_ATTEMPTS = 3
+
+#: The redacted PDF is not written at the live revision
+#: (``opinion_pdf.owed``).
+OPINION_PDF_OWED = (
+    models.Q(pdf_attempts__lt=OPINION_PDF_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & ~models.Q(redacted_pdf_revision=models.F("glue_revision"))
+)
+
+#: The pictures of the live text are not all cut
+#: (``opinion_figures.owed``).
+OPINION_FIGURES_OWED = (
+    models.Q(
+        figure_attempts__lt=OPINION_FIGURES_MAX_ATTEMPTS,
+        ocr_glue_revision=models.F("glue_revision"),
+        ensemble_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(figure_digest="")
+    & ~models.Q(figures_cut_digest=models.F("figure_digest"))
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+            OpinionReviewStatus.ERROR,
+        )
+    )
+)
+
+#: The OCR documents are not written at the live revision
+#: (``opinion_ocr.due``).
+OPINION_OCR_OWED = (
+    models.Q(ocr_glue_attempts__lt=OPINION_OCR_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & (
+        models.Q(ocr_glue_revision__isnull=True)
+        | ~models.Q(ocr_glue_revision=models.F("glue_revision"))
+    )
+)
+
+#: The ensemble text is not built over the live OCR documents and the
+#: standing edits (``ensemble.due``, which adds the engine count).
+OPINION_ENSEMBLE_OWED = (
+    models.Q(
+        ensemble_attempts__lt=OPINION_ENSEMBLE_MAX_ATTEMPTS,
+        ocr_glue_revision__isnull=False,
+        ocr_glue_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.ERROR,
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+        )
+    )
+    & (
+        models.Q(ensemble_revision__isnull=True)
+        | ~models.Q(ensemble_revision=models.F("ocr_glue_revision"))
+        # A human edit the text does not hold yet (#376): the request
+        # that wrote it builds the text, and a build that failed there
+        # is built here.
+        | ~models.Q(ensemble_edit_revision=models.F("edit_revision"))
+    )
+)
+
+#: A stored final XML whose text review is no longer done
+#: (``final_xml.withdrawn_rows``).
+OPINION_FINAL_XML_WITHDRAWN = ~models.Q(final_xml_tag_key="") & ~models.Q(
+    status=OpinionReviewStatus.TEXT_REVIEW_DONE
+)
+
+#: The order every opinion pass walks its rows in, newest scan first
+#: and then reading order: the columns of the four indexes above and
+#: the ``order_by`` of the four queries.
+OPINION_PASS_ORDER = ["-scan_id", "first_printed_page", "index_in_page"]
+
 
 class Opinion(AbstractDateTimeModel):
     """One opinion of a volume, for the third human review (#335).
@@ -3259,6 +3350,33 @@ class Opinion(AbstractDateTimeModel):
             # status walked the table backwards to fill a page.
             models.Index(
                 fields=["status", "id"], name="idx_opinion_status_id"
+            ),
+            # The "owes work" question of each opinion pass (#604): the
+            # rows a pass still owes, in the order it walks them.
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_PDF_OWED,
+                name="idx_opinion_pdf_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_FIGURES_OWED,
+                name="idx_opinion_figures_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_OCR_OWED,
+                name="idx_opinion_ocr_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_ENSEMBLE_OWED,
+                name="idx_opinion_ensemble_owed",
+            ),
+            models.Index(
+                fields=["id"],
+                condition=OPINION_FINAL_XML_WITHDRAWN,
+                name="idx_opinion_xml_withdrawn",
             ),
         ]
 

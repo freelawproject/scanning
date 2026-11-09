@@ -158,6 +158,8 @@ from scanning import (
 )
 from scanning.models import (
     DEAD_JOB_STATUSES,
+    OPINION_OCR_MAX_ATTEMPTS,
+    OPINION_OCR_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -349,7 +351,7 @@ SEAM_PT = EDGE_PT
 OPINIONS_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_OCR_MAX_ATTEMPTS
 
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
@@ -676,16 +678,8 @@ def due():
 
     :returns: The queryset, unordered.
     """
-    return (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ocr_glue_attempts__lt=MAX_ATTEMPTS,
-        )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .filter(
-            Q(ocr_glue_revision__isnull=True)
-            | ~Q(ocr_glue_revision=F("glue_revision"))
-        )
+    return Opinion.objects.filter(
+        OPINION_OCR_OWED, scan__status=Status.REDACTION_REVIEW_DONE
     )
 
 
