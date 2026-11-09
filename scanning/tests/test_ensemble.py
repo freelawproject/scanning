@@ -1675,6 +1675,45 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
 
+    def test_a_reporter_reads_alike_however_it_is_spaced(self):
+        """#610: ``131 L. Ed. 2d 490`` (dots.mocr), ``131 L.Ed.2d 490``
+        (Mistral), ``181 L.Ed.2d 490`` (Surya, a misread digit). The
+        spacing inside a reporter of the allowlist is no difference, so
+        dots.mocr and Mistral are the majority over Surya's digit. A
+        name off the list, and a word that only looks like one, keep
+        their spaces."""
+        self.assertEqual(
+            ensemble.compare_text("115 S. Ct. 1555, 131 L. Ed. 2d 490"),
+            ensemble.compare_text("115 S.Ct. 1555, 131 L.Ed.2d 490"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("N. Y. S. 3d,"),
+            ensemble.compare_text("N.Y.S.3d,"),
+        )
+        self.assertNotEqual(
+            ensemble.compare_text("A. B. Smith"),
+            ensemble.compare_text("A.B. Smith"),
+        )
+        self.assertEqual(
+            ensemble._pairs("131 L. Ed. 2d 490"),
+            [("131", "131"), ("L.Ed.2d", "L. Ed. 2d"), ("490", "490")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("1555, 131 L. Ed. 2d 490"),
+            [
+                ensemble._pairs("1555, 131 L.Ed.2d 490"),
+                ensemble._pairs("1555, 181 L.Ed.2d 490"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["1555,", "131", "L. Ed. 2d", "490"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
         a word the base does have is marked. So the word goes in,

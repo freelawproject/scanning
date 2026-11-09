@@ -434,6 +434,78 @@ _QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
 #: comparison alone, so the shown text is the winning engine's own.
 _BRACKET_GAP = re.compile(r"\[\s+\]")
 
+#: The reporters whose abbreviation the vote reads alike however it is
+#: spaced (#610): ``L. Ed. 2d`` and ``L.Ed.2d`` are one reporter, and
+#: one engine's spacing against another's was a block nobody agrees on.
+#: An allowlist and never all of reporters-db, whose short and old
+#: abbreviations (``A.``, ``F.``, ``P.``) are words of the text as
+#: well. Written without spaces; a trailing comma or semicolon is no
+#: part of the name.
+REPORTERS = frozenset(
+    {
+        "U.S.",
+        "S.Ct.",
+        "L.Ed.",
+        "L.Ed.2d",
+        "F.2d",
+        "F.3d",
+        "F.4th",
+        "F.Supp.",
+        "F.Supp.2d",
+        "F.Supp.3d",
+        "F.App'x",
+        "A.2d",
+        "A.3d",
+        "N.E.2d",
+        "N.E.3d",
+        "N.W.2d",
+        "S.E.2d",
+        "S.W.2d",
+        "S.W.3d",
+        "P.2d",
+        "P.3d",
+        "So.2d",
+        "So.3d",
+        "N.Y.S.2d",
+        "N.Y.S.3d",
+        "Cal.Rptr.2d",
+        "Cal.Rptr.3d",
+    }
+)
+
+#: The most words a spaced :data:`REPORTERS` name takes (``N. Y. S. 3d``).
+_REPORTER_WORDS = 4
+
+#: What may close a reporter's word and is no part of its name.
+_AFTER_REPORTER = ",;:)"
+
+
+def _reporter(text: str) -> str | None:
+    """Return a reporter name of :data:`REPORTERS` spelled without its
+    spaces, with what follows it, or None when ``text`` is none."""
+    joined = "".join(text.split()).translate(_SAME_CHARACTER)
+    name = joined.rstrip(_AFTER_REPORTER)
+    return joined if name in REPORTERS else None
+
+
+def _join_reporters(words: list[str]) -> list[str]:
+    """Join the words of a spaced reporter name into one word, its
+    spacing kept: ``131 L. Ed. 2d 490`` is three words, as an engine
+    that writes ``L.Ed.2d`` reads it."""
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        for size in range(min(_REPORTER_WORDS, len(words) - index), 1, -1):
+            if _reporter(" ".join(words[index : index + size])):
+                out.append(" ".join(words[index : index + size]))
+                index += size
+                break
+        else:
+            out.append(words[index])
+            index += 1
+    return out
+
+
 #: The gaps the key folds out. Readings that agree by key and differ
 #: by one of these are one reading spelled two ways, and the shown one
 #: is the spelling with the fewest (:func:`_tidiest`): the rank's
@@ -590,6 +662,9 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
         folded = _HYPHEN_GAP.sub("-", folded)
     folded = _QUOTE_GAP.sub("", folded)
     folded = _BRACKET_GAP.sub("[]", folded)
+    folded = " ".join(
+        _reporter(word) or word for word in _join_reporters(folded.split())
+    )
     return _WS.sub(" ", folded).strip()
 
 
@@ -607,7 +682,8 @@ def compare_word(word: str) -> str:
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
     folded = _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded))
-    return _BRACKET_GAP.sub("[]", folded).strip()
+    folded = _BRACKET_GAP.sub("[]", folded).strip()
+    return _reporter(folded) or folded
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
@@ -630,13 +706,15 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     ``justice’ ”`` are one engine's spacing of ``"'finally`` and
     ``justice'"``. So are the two halves of an empty bracket
     (``_BRACKET_GAP``): ``express[ ]'`` is one engine's spacing of
-    ``express[]'``. The shown word keeps the engine's own spacing.
+    ``express[]'``. So are the words of a spaced reporter name of
+    :data:`REPORTERS` (``L. Ed. 2d``), one engine's spacing of
+    ``L.Ed.2d``. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = _join_lone_quotes(text.split())
+    words = _join_reporters(_join_lone_quotes(text.split()))
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
