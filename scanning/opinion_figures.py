@@ -57,7 +57,14 @@ from scanning import (
     redactions,
     s3_sync,
 )
-from scanning.models import Opinion, OpinionReviewStatus, Scan
+from scanning.models import (
+    OPINION_FIGURES_MAX_ATTEMPTS,
+    OPINION_FIGURES_OWED,
+    OPINION_PASS_ORDER,
+    Opinion,
+    OpinionReviewStatus,
+    Scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +74,7 @@ logger = logging.getLogger(__name__)
 FIGURES_PER_TICK = 1
 
 #: Failed cuts of one row at one digest before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_FIGURES_MAX_ATTEMPTS
 
 #: The content type of a cut, the format ``image_source`` answers.
 CONTENT_TYPE = "image/jpeg"
@@ -138,23 +145,13 @@ def owed() -> QuerySet:
     """
     return (
         Opinion.objects.filter(
+            OPINION_FIGURES_OWED,
             scan__status__in=opinion_pdf.OPINION_PDF_STATUSES,
-            figure_attempts__lt=MAX_ATTEMPTS,
-            ocr_glue_revision=F("glue_revision"),
-            ensemble_revision=F("glue_revision"),
-        )
-        .exclude(figure_digest="")
-        .exclude(figures_cut_digest=F("figure_digest"))
-        .exclude(
-            status__in=(
-                OpinionReviewStatus.TEXT_REVIEW_DONE,
-                OpinionReviewStatus.ERROR,
-            )
         )
         .select_related("scan", "scan__reporter", "apply_run", "boundary")
         # The scan's caches stay on disk (#582): the cut reads none.
         .defer(*Scan.large_fields("scan__"))
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
+        .order_by(*OPINION_PASS_ORDER)
     )
 
 

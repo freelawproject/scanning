@@ -170,6 +170,9 @@ from django.utils import timezone
 
 from scanning import detections, markup, opinion_ocr, s3_sync
 from scanning.models import (
+    OPINION_ENSEMBLE_MAX_ATTEMPTS,
+    OPINION_ENSEMBLE_OWED,
+    OPINION_PASS_ORDER,
     ApplyRun,
     Issue,
     Opinion,
@@ -361,7 +364,7 @@ ENSEMBLE_CHECKS = frozenset(
 ENSEMBLE_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_ENSEMBLE_MAX_ATTEMPTS
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's.
@@ -4368,30 +4371,11 @@ def due(limit: int | None = None):
     :param limit: How many rows to take, newest scan first.
     :returns: The queryset.
     """
-    rows = (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ensemble_attempts__lt=MAX_ATTEMPTS,
-            ocr_glue_revision__isnull=False,
-            ocr_glue_revision=F("glue_revision"),
-            ocr_engine_count__gte=min_engines(),
-        )
-        .exclude(
-            status__in=(
-                OpinionReviewStatus.ERROR,
-                OpinionReviewStatus.TEXT_REVIEW_DONE,
-            )
-        )
-        .filter(
-            Q(ensemble_revision__isnull=True)
-            | ~Q(ensemble_revision=F("ocr_glue_revision"))
-            # A human edit the text does not hold yet (#376): the
-            # request that wrote it builds the text, and a build that
-            # failed there is built here.
-            | ~Q(ensemble_edit_revision=F("edit_revision"))
-        )
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
-    )
+    rows = Opinion.objects.filter(
+        OPINION_ENSEMBLE_OWED,
+        scan__status=Status.REDACTION_REVIEW_DONE,
+        ocr_engine_count__gte=min_engines(),
+    ).order_by(*OPINION_PASS_ORDER)
     return rows[:limit] if limit else rows
 
 
