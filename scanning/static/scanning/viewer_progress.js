@@ -13,6 +13,15 @@
 
     var apiUrl = cfg.progressUrl;
     var lastPageCount = 0;
+    // How long to wait before the next poll (#612). Each poll reads the
+    // live run of four engines, so a slow scan state and a tab nobody
+    // looks at ask less often. A tab shown again polls at once.
+    var POLL_MS = 1000; // queued, processing: the progress bar moves
+    var AWAITING_POLL_MS = 5000; // awaiting: shard reads take minutes
+    var HIDDEN_POLL_MS = 30000; // the tab is in the background
+    var RETRY_MS = 2000; // the last poll failed
+    var timer = null;
+    var stopped = false;
     // The stored size of the OCR cache the last answer carried: the
     // server sends the cache again only when its size moved.
     var ocrSize = null;
@@ -114,6 +123,9 @@
     }
 
     function poll() {
+        // No timer is pending while a poll is in flight, so a tab shown
+        // during one does not send a second.
+        timer = null;
         var url =
             typeof ocrSize === "number"
                 ? apiUrl + "?ocr_size=" + encodeURIComponent(ocrSize)
@@ -147,17 +159,39 @@
                     data.status === "redaction_review_done"
                 ) {
                     window.location.reload();
-                } else if (data.status === "error") {
+                } else if (
+                    String(data.status).indexOf("error") === 0 ||
+                    data.status === "cancelled"
+                ) {
+                    // Every error status and a cancel are terminal: the
+                    // way back is the admin re-queue, so stop polling.
+                    stopped = true;
                     if (sstatus)
                         sstatus.textContent = "Error: " + data.message;
                     if (sbar) sbar.style.background = "#ef4444";
                 } else {
-                    setTimeout(poll, 1000);
+                    schedule(
+                        data.status === "awaiting" ? AWAITING_POLL_MS : POLL_MS
+                    );
                 }
             })
             .catch(function () {
-                setTimeout(poll, 2000);
+                schedule(RETRY_MS);
             });
     }
+
+    function schedule(ms) {
+        if (stopped) return;
+        clearTimeout(timer);
+        timer = setTimeout(poll, document.hidden ? HIDDEN_POLL_MS : ms);
+    }
+
+    document.addEventListener("visibilitychange", function () {
+        if (!document.hidden && !stopped && timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+            poll();
+        }
+    });
     poll();
 })();

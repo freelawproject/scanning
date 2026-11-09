@@ -1380,6 +1380,12 @@ def ready_volume_runs(
     the candidate query. The candidate query therefore asks for one
     ``COMPLETED`` row, and the exact test follows on the live run.
 
+    A ``COMPLETED`` row of a superseded run stays one for good, so the
+    candidates are judged first on the run number and status of their
+    rows (:func:`_finished_unglued`, #612), and only a survivor's live
+    run is read whole. Without it every such scan was read and skipped
+    on every tick.
+
     :param stage: A :class:`~scanning.models.JobStage` value.
     :param engine: A :class:`~scanning.models.JobEngine` value.
     :param provider: A :class:`~scanning.models.JobProvider` value.
@@ -1410,7 +1416,9 @@ def ready_volume_runs(
     # The caches stay on disk (#602): a candidate's run is judged on its
     # rows, and most candidates are skipped before a glue reads the scan.
     for scan in (
-        Scan.objects.filter(pk__in=list(scan_ids))
+        Scan.objects.filter(
+            pk__in=_finished_unglued(stage, engine, list(scan_ids))
+        )
         .select_related("reporter")
         .defer(*Scan.large_fields())
     ):
@@ -1428,6 +1436,47 @@ def ready_volume_runs(
         if attempts(rows) >= max_attempts:
             continue
         yield scan, rows
+
+
+def _finished_unglued(stage: str, engine: str, scan_ids) -> list[int]:
+    """Return the scans, among ``scan_ids``, whose live run may be glued.
+
+    The pre-filter of :func:`ready_volume_runs` (#612), in one query
+    that reads the run number and the status of each row and no JSON:
+    the loop judges every survivor again on its live run, and this only
+    drops the scans that loop would skip. A live run is the rows at the
+    highest run number of the volume target, the rows
+    :func:`live_run` reads; it may be glued when one row is
+    ``COMPLETED`` and none waits, is in flight or is dead. The glue
+    attempt limit stays with the loop, because each stage keeps its
+    ledger in its own place.
+
+    :param stage: A :class:`~scanning.models.JobStage` value.
+    :param engine: A :class:`~scanning.models.JobEngine` value.
+    :param scan_ids: The candidates.
+    :returns: The scan ids the loop must judge.
+    :rtype: list[int]
+    """
+    runs: dict[int, dict[int, set[str]]] = {}
+    for scan_id, run, status in (
+        ExternalJob.objects.filter(
+            scan_id__in=scan_ids,
+            stage=stage,
+            engine=engine,
+            opinion=None,
+            apply_run=None,
+        )
+        .order_by()
+        .values_list("scan_id", "run", "status")
+    ):
+        runs.setdefault(scan_id, {}).setdefault(run, set()).add(status)
+    blocking = {JobStatus.PENDING} | IN_FLIGHT_JOB_STATUSES | DEAD_JOB_STATUSES
+    return [
+        scan_id
+        for scan_id, by_run in runs.items()
+        if JobStatus.COMPLETED in (live := by_run[max(by_run)])
+        and not live & blocking
+    ]
 
 
 def glue_ledger_key(run=None) -> str:
@@ -1849,7 +1898,12 @@ def shard_entry(job: ExternalJob, index: int, tuning_keys: tuple = ()) -> dict:
 
 
 def live_run(
-    scan, stage: str, engine: str, apply_run=None, opinion=None
+    scan,
+    stage: str,
+    engine: str,
+    apply_run=None,
+    opinion=None,
+    fields: tuple[str, ...] = (),
 ) -> list[ExternalJob]:
     """Return a target's current-run rows for one engine, in page order.
 
@@ -1869,6 +1923,10 @@ def live_run(
         the volume run.
     :param opinion: The opinion whose rows are wanted, for an
         opinion-level stage (the tagger, #272), or None for the volume.
+    :param fields: The columns to read, for a caller that reads only
+        these (#612); every column when empty. A deferred column read
+        later costs a query per row, so name every field the caller
+        touches.
     :returns: The live run's rows ordered by shard index, or an empty
         list when the engine has never run for this target.
     :rtype: list[ExternalJob]
@@ -1884,7 +1942,23 @@ def live_run(
     # is history, a volume holds a row per shard of each, and the
     # progress poll asks for four engines every second.
     latest = target.order_by("-run").values("run")[:1]
-    return list(target.filter(run=Subquery(latest)).order_by("shard_index"))
+    rows = target.filter(run=Subquery(latest)).order_by("shard_index")
+    if fields:
+        rows = rows.only(*fields)
+    return list(rows)
+
+
+#: The columns :func:`run_summary` reads (#612). Not the JSON of
+#: ``input_manifest`` or ``provider_meta``: the progress poll asks for
+#: four engines every second, and those values are stored out of line,
+#: so reading them costs a page read each.
+SUMMARY_FIELDS = (
+    "run",
+    "shard_index",
+    "status",
+    "error_code",
+    "error_message",
+)
 
 
 def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
@@ -1916,7 +1990,7 @@ def run_summary(scan, stage: str, engine: str, apply_run=None) -> dict | None:
         engine has never run for this target.
     :rtype: dict | None
     """
-    rows = live_run(scan, stage, engine, apply_run)
+    rows = live_run(scan, stage, engine, apply_run, fields=SUMMARY_FIELDS)
     if not rows:
         return None
 
