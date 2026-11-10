@@ -212,7 +212,11 @@ logger = logging.getLogger(__name__)
 #: split the cards align the engines with (``blocking_review.open_words``).
 #: 14 joins the halves of an empty bracket the same way (``express[ ]``,
 #: #610), which moves those positions again.
-SCHEMA_VERSION = 14
+#: 15 splits a mark off its word where 14 joined it (an ellipsis, a run
+#: of dashes, a paragraph or section sign, an empty bracket), and a
+#: voted token printed against the one before it carries ``attach``
+#: (:func:`_pairs`), which moves the positions once more.
+SCHEMA_VERSION = 15
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -407,19 +411,32 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
 
-#: Whitespace before an ellipsis (#610): dots.mocr writes ``another...``
-#: where Mistral writes ``another . . .``, the same ellipsis set apart.
-#: The key takes the space out, and :func:`_pairs` reads the dots as
-#: part of the word before them.
-_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+(?=[,;:])")
+#: Whitespace around an ellipsis (#610): dots.mocr writes ``another...``
+#: where Mistral writes ``another . . .``, and Mistral ``...it`` where
+#: Surya writes ``... it``, the same ellipsis spaced two ways. The key
+#: takes the space out, and :func:`_pairs` splits the dots off as a
+#: word of their own.
+_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+")
 
 #: Whitespace around a single dash between two words (#610): dots.mocr
 #: writes ``municipality' - that`` where Mistral writes
 #: ``municipality'-that``, one dash spaced two ways. A double dash
 #: (``677 -- 679``) is a mark of its own and keeps its spaces.
 _DASH_GAP = re.compile(r"(?<=[^\s-])\s+-\s+(?=[^\s-])")
-_LONE_DASH = re.compile(r"^[-\u2013\u2014\u2212]$")
-_PUNCTUATION_ONLY = re.compile(r"^[,;:]+$")
+
+#: The dashes that are no hyphen: en, em and minus. :func:`compare_text`
+#: holds them apart from the hyphen until the hyphen folds are done, so
+#: ``restriction—it`` never reads as ``restrictionit``
+#: (``_WORD_HYPHEN`` joins a word a line end broke, not two words).
+_DASHES = re.compile(r"[\u2013\u2014\u2212]")
+_HELD_DASH = "\ue002"
+
+#: A run of dashes and the whitespace around it, one mark however it
+#: is spelled: ``—``, ``--``, ``---`` and ``– –`` are one dash.
+_DASH_RUN = re.compile(r"\s*[-\ue002](?:\s*[-\ue002])+\s*|\s*\ue002\s*")
+
+#: A key that is dashes alone: one dash, however many an engine wrote.
+_DASHES_ONLY = re.compile(r"-[-\s]*")
 
 #: Whitespace inside an abbreviation of single letters (#610): dots.mocr
 #: writes ``S.D.N. Y.`` where Surya writes ``S.D.N.Y.``, one court. A
@@ -433,7 +450,6 @@ _INITIAL_NEXT = re.compile(r"^[A-Z](?![A-Za-z])")
 #: Whitespace after a paragraph or section sign (#610): ``¶ 8`` and
 #: ``¶8``, ``§ 1983`` and ``§1983``, one reference spaced two ways.
 _SIGN_GAP = re.compile(r"(?<=[¶§])\s+")
-_LONE_SIGN = re.compile(r"^[¶§]+$")
 
 #: A hyphen between a word character and whitespace, with a word after:
 #: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
@@ -710,7 +726,8 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     :returns: The key.
     :rtype: str
     """
-    folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+    folded = _DASHES.sub(_HELD_DASH, unicodedata.normalize("NFKC", text))
+    folded = folded.translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
     folded = _ELLIPSIS_GAP.sub("", folded)
     folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
@@ -719,6 +736,8 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
         # too, so the page-number reader keeps the text as written.
         folded = _DASH_GAP.sub("-", folded)
         folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
+        folded = _DASH_RUN.sub("-", folded)
+    folded = folded.replace(_HELD_DASH, "-")
     folded = _QUOTE_GAP.sub("", folded)
     folded = _BRACKET_GAP.sub("[]", folded)
     folded = " ".join(
@@ -746,108 +765,156 @@ def compare_word(word: str) -> str:
     folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
     folded = _QUOTE_GAP.sub("", folded)
     folded = _BRACKET_GAP.sub("[]", folded).strip()
+    if _DASHES_ONLY.fullmatch(folded):
+        return "-"
     return _reporter(folded) or folded
 
 
-#: A word that is dots alone: one of a spaced ellipsis.
-_LONE_DOTS = re.compile(r"^\.+$")
+class Glued(str):
+    """A word printed against the one before it, with no space between.
 
-#: Dots with a comma, a semicolon or a colon on them: the last word of
-#: an ellipsis (``...,``, #610).
-_DOTS_THEN_MARK = re.compile(r"^\.+[,;:]+$")
+    :func:`_pairs` splits a mark off its word (``restriction—it`` is
+    ``restriction``, ``—``, ``it``), and the pieces after the first are
+    this: the vote reads them as words, and the text keeps the page's
+    spacing, because a token of one carries ``attach`` and
+    :func:`join_tokens` writes no space before it.
+    """
+
+    __slots__ = ()
+
+
+def join_words(words: list[str]) -> str:
+    """Return the words as one text, a :class:`Glued` word with no
+    space before it; :class:`Glued` itself when the first one is."""
+    out = "".join(
+        (word if not index or isinstance(word, Glued) else f" {word}")
+        for index, word in enumerate(words)
+    )
+    return Glued(out) if words and isinstance(words[0], Glued) else out
+
+
+def join_tokens(tokens: list[dict]) -> str:
+    """Return the text of voted tokens: one space between two, and none
+    before a token that carries ``attach`` (:class:`Glued`). The first
+    token's ``attach`` is no space at the start."""
+    shown = [token for token in tokens if token.get("text")]
+    return "".join(
+        token["text"]
+        if not index or token.get("attach")
+        else " " + token["text"]
+        for index, token in enumerate(shown)
+    )
+
+
+def _attach(tokens: list[dict]) -> list[dict]:
+    """Turn the :class:`Glued` text of each token into ``attach``, so
+    the document holds plain strings."""
+    for token in tokens:
+        if isinstance(token.get("text"), Glued):
+            token["text"] = str(token["text"])
+            token["attach"] = True
+    return tokens
+
+
+#: What stands for a space inside one mark while a read is split on
+#: whitespace: a spaced ellipsis (``. . .``), a spaced run of dashes
+#: (``– –``) and a spaced empty bracket (``[ ]``) are one mark each.
+_HELD_SPACE = "\ue001"
+_SPACED_MARK = re.compile(
+    r"\.(?:[ \t]*\.)+"
+    r"|(?<!\S)[-\u2013\u2014\u2212]+(?:\s+[-\u2013\u2014\u2212]+)+(?!\S)"
+    r"|\[\s+\]"
+)
+
+#: A mark inside a word, split off as a word of its own: an ellipsis
+#: (two dots or more, ``…``), a run of dashes, an empty bracket, and a
+#: paragraph or section sign at the start.
+_MARK = re.compile(
+    r"\.(?:\ue001?\.)+|…+"
+    r"|[-\u2013\u2014\u2212]+(?:\ue001[-\u2013\u2014\u2212]+)*"
+    r"|\[\ue001?\]|^[¶§]+"
+)
+
+
+def _keeps_dash(word: str, match: re.Match) -> bool:
+    """Return whether a dash stays inside its word: a hyphen after a
+    letter or a digit (``self-defense``, ``CP-23``, the ``0001065-`` of
+    a hyphen gap), and one dash between two digits (``17–19``)."""
+    mark = match.group()
+    before = word[match.start() - 1] if match.start() else ""
+    after = word[match.end()] if match.end() < len(word) else ""
+    if mark == "-" and before.isalnum():
+        return True
+    return len(mark) == 1 and before.isdigit() and after.isdigit()
+
+
+def _pieces(word: str) -> list[str]:
+    """Return one word with its marks split off, the pieces after the
+    first :class:`Glued`, every held space a space again."""
+    cuts = [0]
+    for match in _MARK.finditer(word):
+        if match.group()[0] in "-\u2013\u2014\u2212" and _keeps_dash(
+            word, match
+        ):
+            continue
+        cuts += [match.start(), match.end()]
+    cuts.append(len(word))
+    parts = [word[a:b] for a, b in zip(cuts, cuts[1:], strict=False) if b > a]
+    return [
+        Glued(part.replace(_HELD_SPACE, " "))
+        if index
+        else part.replace(_HELD_SPACE, " ")
+        for index, part in enumerate(parts)
+    ]
 
 
 def _pairs(text: str) -> list[tuple[str, str]]:
     """Return ``[(key, the word as it is shown)]`` for one read.
 
-    A run of two or more words that are dots alone is one word: Surya
-    writes the spaced ellipsis of the page (``. . .``) where Mistral
-    writes ``...``, and :func:`compare_text` reads them alike already
-    (``_DOT_RUN``), and it goes with the word before it
-    (``_ELLIPSIS_GAP``). So are the pieces of an abbreviation of single
-    letters (``S.D.N. Y.``, ``_INITIALS_GAP``) and a paragraph or section
-    sign and its number (``¶ 8``, ``_SIGN_GAP``). Split on whitespace
-    first, they are three words
-    against one, and a block that agrees to the letter goes to a vote.
-    A word that ends in a hyphen and the word after it are one word
-    the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
-    spacing of ``0001065-2021``, and split it is two words against
-    one. So is a word of quotation marks alone and its neighbour
-    (``_LONE_QUOTES``, :func:`_join_lone_quotes`): ``“ ‘finally`` and
-    ``justice’ ”`` are one engine's spacing of ``"'finally`` and
-    ``justice'"``. So are the two halves of an empty bracket
-    (``_BRACKET_GAP``): ``express[ ]'`` is one engine's spacing of
-    ``express[]'``. So are the words of a spaced reporter name of
-    :data:`REPORTERS` (``L. Ed. 2d``), one engine's spacing of
-    ``L.Ed.2d``. The shown word keeps the engine's own spacing.
+    **A mark is a word of its own** (#610): an ellipsis however it is
+    spaced (``another...``, ``another . . .``, ``...it``), a run of
+    dashes (``—``, ``--``, ``– –``), an empty bracket (``[ ]``) and a
+    paragraph or section sign (``¶8``) are split off the words around
+    them. The engines agree about the words and set the marks against
+    them each their own way: joined to a neighbour, a mark made every
+    engine's word a different word, and a block that agrees to the
+    letter went to a vote nobody wins. A piece printed against the one
+    before it is :class:`Glued`, so the text keeps its spacing. A
+    hyphen inside a word stays (``self-defense``), and so does a dash
+    between two digits (``17–19``).
+
+    The words an engine spaces apart are still one word: a word that
+    ends in a hyphen and the word after it (``0001065- 2021``,
+    ``_HYPHEN_GAP``), the pieces of an abbreviation of single letters
+    (``S.D.N. Y.``, ``_INITIALS_GAP``), a word of quotation marks alone
+    and its neighbour (``_LONE_QUOTES``, :func:`_join_lone_quotes`) and
+    the words of a spaced reporter name of :data:`REPORTERS`
+    (``L. Ed. 2d``). The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = _join_reporters(_join_dashes(_join_lone_quotes(text.split())))
+    held = _SPACED_MARK.sub(
+        lambda match: re.sub(r"\s+", _HELD_SPACE, match.group()), text
+    )
+    words = _join_reporters(_join_lone_quotes(held.split()))
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
         end = index
-        while end < len(words) and _LONE_DOTS.match(words[end]):
+        while end + 1 < len(words) and (
+            (_HYPHEN_END.search(words[end]) and words[end + 1][:1].isalnum())
+            or (
+                _INITIAL_END.search(words[end])
+                and _INITIAL_NEXT.match(words[end + 1])
+            )
+        ):
             end += 1
-        if end < len(words) and _DOTS_THEN_MARK.match(words[end]):
-            end += 1
-        if pairs and "".join(words[index:end]).count(".") >= 3:
-            # An ellipsis goes with the word before it, however it is
-            # spaced (``_ELLIPSIS_GAP``): ``another . . .`` is one word,
-            # as an engine that writes ``another...`` reads it; so does
-            # a comma set apart after it (``face . . . ,``).
-            if end < len(words) and _PUNCTUATION_ONLY.match(words[end]):
-                end += 1
-            shown = f"{pairs[-1][1]} {' '.join(words[index:end])}"
-            pairs[-1] = (compare_word(shown), shown)
-            index = end
-            continue
-        if end - index < 2:
-            end = index
-            while end + 1 < len(words) and (
-                (
-                    _HYPHEN_END.search(words[end])
-                    and words[end + 1][:1].isalnum()
-                )
-                or (words[end].endswith("[") and words[end + 1][:1] == "]")
-                or (
-                    _INITIAL_END.search(words[end])
-                    and _INITIAL_NEXT.match(words[end + 1])
-                )
-                or _LONE_SIGN.match(words[end])
-            ):
-                end += 1
-            end += 1
-        if end - index >= 2:
-            shown = " ".join(words[index:end])
-            pairs.append((compare_word(shown), shown))
-            index = end
-            continue
-        pairs.append((compare_word(words[index]), words[index]))
-        index += 1
+        for piece in _pieces(" ".join(words[index : end + 1])):
+            pairs.append((compare_word(piece), piece))
+        index = end + 1
     return pairs
-
-
-def _join_dashes(words: list[str]) -> list[str]:
-    """Join a single dash set apart between two words onto both
-    (``_DASH_GAP``): ``municipality' - that`` is one word, as an engine
-    that writes ``municipality'-that`` reads it."""
-    if not any(_LONE_DASH.match(word) for word in words):
-        return words
-    out: list[str] = []
-    index = 0
-    while index < len(words):
-        word = words[index]
-        if _LONE_DASH.match(word) and out and index + 1 < len(words):
-            out[-1] = f"{out[-1]} {word} {words[index + 1]}"
-            index += 2
-            continue
-        out.append(word)
-        index += 1
-    return out
 
 
 def _join_lone_quotes(words: list[str]) -> list[str]:
@@ -2903,7 +2970,7 @@ def _candidates(
                 span = other[j1:j2]
                 joined = (
                     " ".join(key for key, _ in span),
-                    " ".join(word for _, word in span),
+                    join_words([word for _, word in span]),
                 )
                 at.setdefault(i1, []).append(joined)
                 for index in range(i1 + 1, i2):
@@ -3133,7 +3200,7 @@ def vote_words(
                     "position": position,
                 }
             )
-    return tokens, disputed
+    return _attach(tokens), disputed
 
 
 def _vote_of(
@@ -3258,9 +3325,7 @@ def resolve(group: dict) -> dict:
                 "source": base,
                 "agreeing": [],
                 "silent": silent,
-                "text": " ".join(
-                    token["text"] for token in tokens if token["text"]
-                ),
+                "text": join_tokens(tokens),
                 "tokens": tokens,
                 "n_low_confidence": disputed,
             }
@@ -3697,7 +3762,9 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
                 landed[i1 + offset] = None
     tokens: list[dict] = []
     for index, word in enumerate(words):
-        token: dict = {"text": word}
+        token: dict = {"text": str(word)}
+        if index and isinstance(word, Glued):
+            token["attach"] = True
         old = carried.get(index)
         if old:
             for flag in ("low_confidence", "majority", "inserted"):

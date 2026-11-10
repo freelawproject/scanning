@@ -1585,12 +1585,11 @@ class TestTheVote(TestCase):
             ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
             "No(s): CP-23-CR-0001065-2021",
         )
-        # A single dash set apart is one word with its neighbours since
-        # #610 (``_DASH_GAP``); a double dash keeps its spaces.
+        # A run of dashes is one dash however it is spaced (#610).
         self.assertEqual(
             ensemble.compare_text("a - b"), ensemble.compare_text("a-b")
         )
-        self.assertEqual(ensemble.compare_text("677 -- 679"), "677 -- 679")
+        self.assertEqual(ensemble.compare_text("677 -- 679"), "677-679")
         self.assertEqual(
             ensemble.compare_text("677 - 679", hyphen_gaps=False), "677 - 679"
         )
@@ -1604,12 +1603,14 @@ class TestTheVote(TestCase):
                 ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
             ],
         )
+        # The dash is a word of its own, and any run of dashes keys
+        # as one.
         self.assertEqual(
-            ensemble._pairs("a - b"), [(ensemble.compare_word("a-b"), "a - b")]
+            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
         )
         self.assertEqual(
             ensemble._pairs("677 -- 679"),
-            [("677", "677"), ("--", "--"), ("679", "679")],
+            [("677", "677"), ("-", "--"), ("679", "679")],
         )
 
         tokens, disputed = ensemble.vote_words(
@@ -1632,7 +1633,7 @@ class TestTheVote(TestCase):
         Mistral wrote ``'express[ ]'``, Surya ``'express[]'`` and
         dots.mocr dropped the bracket: three readings, a block nobody
         agrees on. The key folds the space inside the bracket and the
-        pairing reads the two halves as one word, so Mistral and Surya
+        pairing splits the bracket off the word, so Mistral and Surya
         are the majority over dots.mocr, a warning. The text is the
         engines' own: no spelling is rewritten."""
         self.assertEqual(
@@ -1646,7 +1647,9 @@ class TestTheVote(TestCase):
             ensemble._pairs("an 'express[ ]' choice"),
             [
                 ("an", "an"),
-                ("'express[]'", "'express[ ]'"),
+                ("'express", "'express"),
+                ("[]", "[ ]"),
+                ("'", "'"),
                 ("choice", "choice"),
             ],
         )
@@ -1769,13 +1772,14 @@ class TestTheVote(TestCase):
         self.assertFalse(any(t.get("low_confidence") for t in tokens))
         self.assertEqual(disputed, 0)
 
-    def test_an_ellipsis_belongs_to_the_word_before_it(self):
+    def test_an_ellipsis_is_a_word_of_its_own(self):
         """#610: ``through another... source`` (dots.mocr), ``through
         another . . . source`` (Mistral), ``through another source``
         (Surya, which dropped it). The dots read alike already
-        (``_DOT_RUN``); attached or set apart, they are now one word
-        with the word before them, so dots.mocr and Mistral are the
-        majority over Surya. A lone period stays a word of its own."""
+        (``_DOT_RUN``); attached or set apart, they are a word of their
+        own, so every engine reads ``another`` and dots.mocr and Mistral
+        are the majority over Surya on the ellipsis. A lone period
+        stays a word of its own."""
         self.assertEqual(
             ensemble.compare_text("through another... source"),
             ensemble.compare_text("through another . . . source"),
@@ -1784,7 +1788,8 @@ class TestTheVote(TestCase):
             ensemble._pairs("through another . . . source"),
             [
                 ("through", "through"),
-                ("another...", "another . . ."),
+                ("another", "another"),
+                ("...", ". . ."),
                 ("source", "source"),
             ],
         )
@@ -1802,9 +1807,12 @@ class TestTheVote(TestCase):
 
         self.assertEqual(
             [t["text"] for t in tokens],
-            ["through", "another...", 'source."4'],
+            ["through", "another", "...", 'source."4'],
         )
-        self.assertTrue(tokens[1].get("majority"))
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(
+            ensemble.join_tokens(tokens), 'through another... source."4'
+        )
         self.assertFalse(any(t.get("low_confidence") for t in tokens))
         self.assertEqual(disputed, 0)
 
@@ -1854,10 +1862,12 @@ class TestTheVote(TestCase):
             ensemble.compare_text("42 U.S.C. §§ 1983"),
             ensemble.compare_text("42 U.S.C. §§1983"),
         )
-        self.assertEqual(
-            ensemble._pairs("Comp. ¶ 8);"),
-            [("Comp.", "Comp."), ("¶8);", "¶ 8);")],
-        )
+        # The sign is a word of its own, attached or set apart.
+        for text in ("Comp. ¶ 8);", "Comp. ¶8);"):
+            self.assertEqual(
+                ensemble._pairs(text),
+                [("Comp.", "Comp."), ("¶", "¶"), ("8);", "8);")],
+            )
 
     def test_words_the_base_missed_that_a_majority_read_are_settled(self):
         """#610: dots.mocr, the base, read nothing of ``the alleged
@@ -1897,15 +1907,19 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(disputed, 2)
 
-    def test_a_comma_after_an_ellipsis_goes_with_it(self):
+    def test_a_comma_after_an_ellipsis_is_a_word_of_its_own(self):
         """#610: ``face ..., be`` (dots.mocr), ``face . . . , be``
-        (Mistral), ``face . . . be`` (Surya, no comma)."""
+        (Mistral), ``face . . . be`` (Surya, no comma). The ellipsis
+        and the comma are split off the word, so every engine reads
+        ``face`` and the ellipsis, and the comma is a majority's."""
         self.assertEqual(
             ensemble._pairs("on their face . . . , be"),
             [
                 ("on", "on"),
                 ("their", "their"),
-                ("face...,", "face . . . ,"),
+                ("face", "face"),
+                ("...", ". . ."),
+                (",", ","),
                 ("be", "be"),
             ],
         )
@@ -1916,8 +1930,112 @@ class TestTheVote(TestCase):
                 ensemble._pairs("on their face . . . be"),
             ],
         )
-        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(tokens[4]["text"], ",")
+        self.assertTrue(tokens[4].get("majority"))
+        self.assertTrue(tokens[4].get("attach"))
         self.assertEqual(disputed, 0)
+
+    def test_a_mark_split_off_its_word_lines_up_the_words(self):
+        """#610: the engines set an ellipsis, a dash, a sign or an empty
+        bracket against their words each their own way. Joined to a
+        neighbour, the mark made every engine's word a different word,
+        and the block went to a vote nobody wins; split off, the words
+        line up and the mark is a word of its own. Cards of 2677, 2129
+        and the corpus sample, each blocking before."""
+        cases = [
+            # Mistral wrote no space after the ellipsis.
+            (
+                "no restriction—it would",
+                "no restriction—...it would",
+                "no restriction—... it would",
+            ),
+            (
+                "they wanted... like, they",
+                "they wanted...like, they",
+                "they wanted . . like, they",
+            ),
+            # One dash, spelled three ways.
+            (
+                "robbery with – – for the",
+                "robbery with -- for the",
+                "robbery with — for the",
+            ),
+            (
+                "the conversation . . . —have it",
+                "the conversation ...—have it",
+                "the conversation—have it",
+            ),
+            ("(§ 13.3).)", "(¶ 13,3).)", "(¶ 13.3).)"),
+            (
+                "generally accepted",
+                "generally[ ]accepted",
+                "generally [accepted",
+            ),
+            ("adverse[ ] to", "adverse[ ]' to", "adverse ['] to"),
+            ("said....” He", "said.” He", "said. . . .” He"),
+        ]
+        for base, *others in cases:
+            with self.subTest(base=base):
+                tokens, disputed = ensemble.vote_words(
+                    ensemble._pairs(base),
+                    [ensemble._pairs(other) for other in others],
+                )
+                self.assertEqual(disputed, 0)
+                self.assertFalse(any(t.get("low_confidence") for t in tokens))
+
+    def test_a_split_mark_keeps_the_spacing_of_the_page(self):
+        """A piece printed against the word before it is ``attach``, so
+        the text of the tokens is the engine's own: no space goes in."""
+        for text in (
+            "no restriction—it would",
+            "they wanted...like, they",
+            "the court's alteration 'express[ ]' and ¶8);",
+            "said....” He",
+        ):
+            with self.subTest(text=text):
+                tokens, _ = ensemble.vote_words(
+                    ensemble._pairs(text), [ensemble._pairs(text)]
+                )
+                self.assertEqual(ensemble.join_tokens(tokens), text)
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("no restriction—it would"),
+            [ensemble._pairs("no restriction—it would")],
+        )
+        self.assertEqual(
+            [(t["text"], bool(t.get("attach"))) for t in tokens],
+            [
+                ("no", False),
+                ("restriction", False),
+                ("—", True),
+                ("it", True),
+                ("would", False),
+            ],
+        )
+
+    def test_a_dash_inside_a_word_or_a_range_stays(self):
+        """A hyphen after a letter or a digit is part of the word
+        (``self-defense``, ``CP-23``), and so is one dash between two
+        digits (``17–19``): split, a range would read as three words
+        against one engine's ``17-19``."""
+        for text, words in (
+            ("self-defense", ["self-defense"]),
+            ("CP-23-CR-0001065-2021", ["CP-23-CR-0001065-2021"]),
+            ("pages 17–19, and", ["pages", "17–19,", "and"]),
+            ("a 'quote'-that", ["a", "'quote'", "-", "that"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    [shown for _, shown in ensemble._pairs(text)], words
+                )
+        self.assertEqual(
+            ensemble.compare_text("pages 17–19"),
+            ensemble.compare_text("pages 17-19"),
+        )
+        # An em dash between two words is no hyphen a line end broke.
+        self.assertNotEqual(
+            ensemble.compare_text("restriction—it"),
+            ensemble.compare_text("restrictionit"),
+        )
 
     def test_a_dash_between_words_reads_alike_spaced(self):
         """#610: ``municipality' - that`` (dots.mocr),
@@ -1934,12 +2052,16 @@ class TestTheVote(TestCase):
                 ensemble._pairs("the municipality' that is,"),
             ],
         )
+        # The dash is a word of its own, attached or set apart.
         self.assertEqual(
             [t["text"] for t in tokens],
-            ["the", "municipality' - that", "is,"],
+            ["the", "municipality'", "-", "that", "is,"],
         )
-        self.assertTrue(tokens[1].get("majority"))
+        self.assertTrue(tokens[2].get("majority"))
         self.assertEqual(disputed, 0)
+        self.assertEqual(
+            ensemble.join_tokens(tokens), "the municipality' - that is,"
+        )
 
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
@@ -1981,13 +2103,12 @@ class TestTheVote(TestCase):
         )
 
         self.assertEqual(
-            " ".join(token["text"] for token in tokens),
-            "La.), \u00b6 235-236. No one",
+            ensemble.join_tokens(tokens), "La.), \u00b6 235-236. No one"
         )
-        # The sign and its number are one word since #610 (``_SIGN_GAP``).
-        marked = [t["text"] for t in tokens if t.get("low_confidence")]
-        self.assertEqual(marked, ["\u00b6 235-236."])
-        self.assertEqual(disputed, 1)
+        # The sign is a word of its own (#610), so the number lines up
+        # in all three reads and a majority settles both.
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
 
     def test_a_join_two_engines_agree_on_writes_the_tail_once(self):
         """The other side of #391: both engines joined the two base
@@ -2117,10 +2238,10 @@ class TestTheVote(TestCase):
         """Surya writes the ``. . .`` of the page where Mistral writes
         ``...``, and the block key reads them alike; the word vote must
         too, or a block that agrees to the letter goes to a vote. The
-        ellipsis is one word with the word before it (#610)."""
+        ellipsis is one word of its own (#610)."""
         self.assertEqual(
             ensemble._pairs("sentence . . . must"),
-            [("sentence...", "sentence . . ."), ("must", "must")],
+            [("sentence", "sentence"), ("...", ". . ."), ("must", "must")],
         )
         self.assertEqual(
             ensemble._pairs("end ."), [("end", "end"), (".", ".")]
@@ -2140,7 +2261,7 @@ class TestTheVote(TestCase):
         self.assertEqual(answer["n_low_confidence"], 0)
         self.assertEqual(
             [token.get("majority", False) for token in answer["tokens"]],
-            [True, False, True],
+            [True, False, False, True],
         )
         self.assertEqual(answer["text"], "sentence ... must be")
 
