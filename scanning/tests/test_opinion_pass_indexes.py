@@ -4,11 +4,15 @@ Each pass asks every tick which opinions still owe its output, and the
 question compares two columns of the row. Each is one ``Q`` of
 ``scanning.models``, read by the pass's query and by a partial index
 whose condition is that ``Q``. These tests pin the index and that the
-planner can read it for the pass's query: with sequential scans off, a
-query whose filter does not imply the index condition cannot use it.
+planner can read it for the pass's query: with sequential scans off and
+the table's other indexes dropped, a query whose filter does not imply
+the index condition cannot use it. The drop is what makes the answer
+"usable", never "cheapest": on the near-empty test table a plain index
+of the same columns costs about the same, and the stats earlier tests
+leave behind decided which one won.
 """
 
-from django.db import connection
+from django.db import connection, transaction
 
 from scanning import (
     ensemble,
@@ -17,6 +21,7 @@ from scanning import (
     opinion_ocr,
     opinion_pdf,
 )
+from scanning.models import Opinion
 from scanning.tests.test_views import ScanningTestCase
 
 #: The columns the four passes order by: newest scan, reading order.
@@ -55,6 +60,50 @@ def _queries():
             ("withdrawn", final_xml.withdrawn_rows()[:50])
         ],
     }
+
+
+def _drop_other_indexes(cursor, keep):
+    """Drop every index of the opinion table but ``keep``, a constraint's
+    with its constraint. Run it inside a savepoint that rolls back.
+
+    The deferred foreign-key checks of the rows a test wrote fire first:
+    a table with pending trigger events refuses ``ALTER TABLE``.
+    """
+    cursor.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    cursor.execute(
+        """
+        SELECT index.relname, con.conname
+        FROM pg_index AS x
+        JOIN pg_class AS index ON index.oid = x.indexrelid
+        LEFT JOIN pg_constraint AS con
+            ON con.conindid = x.indexrelid AND con.conrelid = x.indrelid
+        WHERE x.indrelid = 'scanning_opinion'::regclass
+            AND index.relname <> %s
+        """,
+        [keep],
+    )
+    quote = connection.ops.quote_name
+    for index, constraint in cursor.fetchall():
+        if constraint:
+            cursor.execute(
+                f"ALTER TABLE scanning_opinion DROP CONSTRAINT"
+                f" {quote(constraint)} CASCADE"
+            )
+        else:
+            cursor.execute(f"DROP INDEX {quote(index)}")
+
+
+def _plan(name, queryset):
+    """Return the plan of ``queryset`` with ``name`` the one index of the
+    opinion table and sequential scans off; nothing outlives the call."""
+    sql, params = queryset.query.sql_with_params()
+    with transaction.atomic(), connection.cursor() as cursor:
+        _drop_other_indexes(cursor, name)
+        cursor.execute("SET LOCAL enable_seqscan = off")
+        cursor.execute("EXPLAIN " + sql, params)
+        plan = "\n".join(row[0] for row in cursor.fetchall())
+        transaction.set_rollback(True)
+    return plan
 
 
 class TestOpinionPassIndexes(ScanningTestCase):
@@ -102,12 +151,15 @@ class TestOpinionPassIndexes(ScanningTestCase):
     def test_each_pass_query_can_read_its_index(self):
         """The planner matches the query's filter to the condition only
         when the filter implies it: the model's ``Q`` in both."""
-        with connection.cursor() as cursor:
-            cursor.execute("SET LOCAL enable_seqscan = off")
-            for name, queries in _queries().items():
-                for label, queryset in queries:
-                    with self.subTest(f"{name} {label}"):
-                        sql, params = queryset.query.sql_with_params()
-                        cursor.execute("EXPLAIN " + sql, params)
-                        plan = "\n".join(row[0] for row in cursor.fetchall())
-                        self.assertIn(name, plan)
+        for name, queries in _queries().items():
+            for label, queryset in queries:
+                with self.subTest(f"{name} {label}"):
+                    self.assertIn(name, _plan(name, queryset))
+
+    def test_a_filter_that_does_not_imply_the_condition_misses(self):
+        """The check above can fail: a filter short of the ``Q`` reads
+        the table, never the index."""
+        queryset = Opinion.objects.filter(ocr_glue_attempts__lt=3)
+        self.assertNotIn(
+            "idx_opinion_ocr_owed", _plan("idx_opinion_ocr_owed", queryset)
+        )
