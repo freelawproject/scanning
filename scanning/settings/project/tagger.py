@@ -18,12 +18,12 @@ env = environ.FileAwareEnv()
 
 # Master switch for **dispatching** tagger jobs to RunPod. Like the
 # dots.mocr switch it gates the submit of rows that already exist; it
-# enqueues nothing. Nothing auto-enqueues this stage yet: the only
-# creator of TAG rows is ``tagger.ensure_tag_jobs`` and its one caller
-# is the button of the opinion review page
-# (``views_api.start_caselaw_tagger``), pinned by
-# ``TestKnownEnqueuePaths``. A tick pass comes after the stage has been
-# watched on a few volumes.
+# enqueues nothing. No tick pass creates this stage: the only creator
+# of TAG rows is ``tagger.ensure_tag_jobs`` and its one caller is
+# ``views_api._tag_approved_text``, the start the approval of the text
+# (#499) and the button of the opinion review page share, pinned by
+# ``TestKnownEnqueuePaths``. Off, the approval writes the approved text
+# and starts no run, and its confirm says nothing of a cost.
 TAGGER_ENABLED = env.bool("TAGGER_ENABLED", default=True)
 
 # The engine's own RunPod serverless endpoint id (from the RunPod

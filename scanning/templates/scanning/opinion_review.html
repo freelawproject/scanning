@@ -67,7 +67,10 @@
       viewer must never offer. The script holds it on a document older
       than data-min-schema, a fact of the bucket this render never reads. A warning card asks
       for a confirm. The script sends the revisions of the text it
-      drew, so the curator approves the text they saw.
+      drew, so the curator approves the text they saw. The approval
+      sends the approved text to the tagger (#499), a paid RunPod job,
+      so the confirm names the cost where the stage is on, the rule of
+      the paid buttons of step 1.
     {% endcomment %}
     {% comment %}
       The two card walks of this opinion alone: the blocking review
@@ -90,8 +93,9 @@
     <button type="button" id="approve-text" class="btn-primary text-sm"
             data-open-warnings="{{ open_warnings }}"
             data-min-schema="{{ min_document_schema }}"
-            {% if approve_not_built %}disabled title="The last edit is not in the text yet: press Read the OCR documents again"{% elif blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
-      <i class="fa-solid fa-check"></i>
+            data-tagger-on-approval="{% if tags_on_approval %}1{% else %}0{% endif %}"
+            {% if approve_not_built %}disabled title="The last edit is not in the text yet: press Read the OCR documents again"{% elif blocking_count %}disabled title="Resolve the blocking findings first: dismiss each one, or edit its block"{% elif tags_on_approval %}title="Approve the text of this opinion, write the approved text and send it to the case-law block tagger on RunPod (incurs costs $$$)"{% else %}title="Approve the text of this opinion and write the approved text"{% endif %}>
+      {% if tags_on_approval %}{% include "scanning/_runpod_icon.html" %}{% else %}<i class="fa-solid fa-check"></i>{% endif %}
       {% if approve_not_built %}The last edit is not in the text yet{% elif blocking_count %}{{ blocking_count }} blocking finding{{ blocking_count|pluralize }} to resolve{% else %}Approve the text{% endif %}
     </button>
     {% endif %}
@@ -105,14 +109,18 @@
     </button>
     {% endif %}
     {% comment %}
-      The tagger (#272): on an approved text, where a press can move
-      its state. A run in progress or a text already tagged shows the
-      state and offers no button, because the endpoint refuses both.
+      The tagger (#272): the retry since #499, because the approval
+      starts the run. On an approved text, where a press can move its
+      state: a dead run, a run over an earlier approved text, or an
+      opinion approved before the approval did. A run in progress or a
+      text already tagged shows the state and offers no button, because
+      the endpoint refuses both. A press is a paid job, so its confirm
+      names the cost.
     {% endcomment %}
     {% if can_tag %}
     <button type="button" id="start-tagger" class="btn-outline text-sm"
-            title="Send the approved text to the case-law block tagger">
-      <i class="fa-solid fa-tags"></i>
+            title="Send the approved text to the case-law block tagger on RunPod (incurs costs $$$)">
+      {% include "scanning/_runpod_icon.html" %}
       {% if tag_state == "none" %}Tag the text{% else %}Tag the text again{% endif %}
     </button>
     {% elif tag_state == "running" %}
