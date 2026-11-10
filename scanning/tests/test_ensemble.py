@@ -2031,10 +2031,40 @@ class TestTheVote(TestCase):
             ensemble.compare_text("pages 17–19"),
             ensemble.compare_text("pages 17-19"),
         )
-        # An em dash between two words is no hyphen a line end broke.
-        self.assertNotEqual(
-            ensemble.compare_text("restriction—it"),
-            ensemble.compare_text("restrictionit"),
+        # A block that differs only by how a dash between two words is
+        # written reads alike, however it is spelled or spaced.
+        keys = {
+            ensemble.compare_text(text)
+            for text in (
+                "restriction—it",
+                "restriction-it",
+                "restriction - it",
+                "restriction — it",
+                "restriction--it",
+            )
+        }
+        self.assertEqual(len(keys), 1)
+
+    def test_a_dropped_mark_gives_the_word_after_it_its_space(self):
+        """Two engines read ``restriction it`` where dots.mocr read
+        ``restriction—it``: the dash loses the vote, and ``it``, glued
+        to it in dots.mocr's read, must not run into ``restriction``."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("no restriction—it would"),
+            [
+                ensemble._pairs("no restriction it would"),
+                ensemble._pairs("no restriction it would"),
+            ],
+        )
+        self.assertEqual(
+            ensemble.join_tokens(tokens), "no restriction it would"
+        )
+
+    def test_the_page_number_reader_keeps_the_space_after_leader_dots(self):
+        """``carries_number`` reads the last word of a line as written: a
+        number after leader dots stays a word of its own."""
+        self.assertEqual(
+            ensemble.compare_text(". . . 677", hyphen_gaps=False), "... 677"
         )
 
     def test_a_dash_between_words_reads_alike_spaced(self):

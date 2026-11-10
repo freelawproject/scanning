@@ -130,12 +130,14 @@ def _run_words(inserted: dict, position: int, put_in: dict) -> str:
     inserted tokens already (``put_in``, by position), and a row that
     showed it would write it twice."""
     runs = inserted.get(position) or []
-    return " ".join(
-        word
-        for run in runs
-        if any(key for key, _ in run)
-        and tuple(key for key, _ in run if key) != put_in.get(position)
-        for _, word in run
+    return ensemble.join_words(
+        [
+            word
+            for run in runs
+            if any(key for key, _ in run)
+            and tuple(key for key, _ in run if key) != put_in.get(position)
+            for _, word in run
+        ]
     )
 
 
@@ -181,7 +183,7 @@ def _span_reading(at: dict, first: int, last: int) -> str:
                 continue
             if entry[1]:
                 words.append(entry[1])
-    return " ".join(words)
+    return str(ensemble.join_words(words))
 
 
 #: The first document schema whose kept tokens of a person's block
@@ -356,9 +358,24 @@ def open_words(
         offset = start + len(token["text"])
 
     def context(first_index: int, last_index: int) -> tuple[str, str]:
+        # Spaced as the text is: a mark attached to its word gets none.
         return (
-            " ".join(shown[max(0, first_index - CONTEXT_WORDS) : first_index]),
-            " ".join(shown[last_index + 1 : last_index + 1 + CONTEXT_WORDS]),
+            ensemble.join_tokens(
+                [
+                    e["token"]
+                    for e in placed[
+                        max(0, first_index - CONTEXT_WORDS) : first_index
+                    ]
+                ]
+            ),
+            ensemble.join_tokens(
+                [
+                    e["token"]
+                    for e in placed[
+                        last_index + 1 : last_index + 1 + CONTEXT_WORDS
+                    ]
+                ]
+            ),
         )
 
     words: list[dict] = []
@@ -397,10 +414,14 @@ def open_words(
         readings = [
             {
                 "engine": base,
-                "word": " ".join(
-                    base_pairs[p][1]
-                    for p in range(first, last + 1)
-                    if p < len(base_pairs)
+                "word": str(
+                    ensemble.join_words(
+                        [
+                            base_pairs[p][1]
+                            for p in range(first, last + 1)
+                            if p < len(base_pairs)
+                        ]
+                    )
                 ),
             }
         ]
@@ -412,7 +433,9 @@ def open_words(
             {
                 "start": covered[0]["start"],
                 "length": covered[-1]["end"] - covered[0]["start"],
-                "token": " ".join(e["token"]["text"] for e in covered),
+                # The words as the text holds them, so an answer that
+                # keeps them changes no space.
+                "token": text[covered[0]["start"] : covered[-1]["end"]],
                 "before": before,
                 "after": after,
                 "readings": readings,
@@ -490,7 +513,11 @@ def open_words(
             readings = [
                 {
                     "engine": base,
-                    "word": " ".join(base_pairs[p][1] for p in dropped),
+                    "word": str(
+                        ensemble.join_words(
+                            [base_pairs[p][1] for p in dropped]
+                        )
+                    ),
                 }
             ]
             for name, (at, inserted) in candidates.items():
@@ -507,7 +534,12 @@ def open_words(
                     run = _run_words(inserted, p, put_in)
                     if run:
                         read_there.append(run)
-                readings.append({"engine": name, "word": " ".join(read_there)})
+                readings.append(
+                    {
+                        "engine": name,
+                        "word": str(ensemble.join_words(read_there)),
+                    }
+                )
             words.append(
                 {
                     "start": entry["end"] if after_word else entry["start"],

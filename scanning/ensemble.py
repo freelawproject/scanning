@@ -411,12 +411,17 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
 
-#: Whitespace around an ellipsis (#610): dots.mocr writes ``another...``
-#: where Mistral writes ``another . . .``, and Mistral ``...it`` where
-#: Surya writes ``... it``, the same ellipsis spaced two ways. The key
-#: takes the space out, and :func:`_pairs` splits the dots off as a
-#: word of their own.
-_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+")
+#: Whitespace before an ellipsis (#610): dots.mocr writes ``another...``
+#: where Mistral writes ``another . . .``, the same ellipsis set apart.
+#: The key takes the space out, and :func:`_pairs` splits the dots off
+#: as a word of their own.
+_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+(?=[,;:])")
+
+#: Whitespace after an ellipsis: Mistral writes ``...it`` where Surya
+#: writes ``... it``. Folded in the block key alone, and never for the
+#: page-number reader (``hyphen_gaps=False``), whose line ends in the
+#: number after a run of leader dots.
+_ELLIPSIS_AFTER = re.compile(r"(?<=\.\.\.)\s+")
 
 #: Whitespace around a single dash between two words (#610): dots.mocr
 #: writes ``municipality' - that`` where Mistral writes
@@ -424,16 +429,10 @@ _ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+")
 #: (``677 -- 679``) is a mark of its own and keeps its spaces.
 _DASH_GAP = re.compile(r"(?<=[^\s-])\s+-\s+(?=[^\s-])")
 
-#: The dashes that are no hyphen: en, em and minus. :func:`compare_text`
-#: holds them apart from the hyphen until the hyphen folds are done, so
-#: ``restriction—it`` never reads as ``restrictionit``
-#: (``_WORD_HYPHEN`` joins a word a line end broke, not two words).
-_DASHES = re.compile(r"[\u2013\u2014\u2212]")
-_HELD_DASH = "\ue002"
-
-#: A run of dashes and the whitespace around it, one mark however it
-#: is spelled: ``—``, ``--``, ``---`` and ``– –`` are one dash.
-_DASH_RUN = re.compile(r"\s*[-\ue002](?:\s*[-\ue002])+\s*|\s*\ue002\s*")
+#: A run of two dashes or more and the whitespace around it, one mark
+#: however it is spelled: ``--``, ``---`` and ``– –`` read as the ``—``
+#: of another engine, whose spaces ``_DASH_GAP`` folds the same way.
+_DASH_RUN = re.compile(r"\s*-(?:\s*-)+\s*")
 
 #: A key that is dashes alone: one dash, however many an engine wrote.
 _DASHES_ONLY = re.compile(r"-[-\s]*")
@@ -726,18 +725,16 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     :returns: The key.
     :rtype: str
     """
-    folded = _DASHES.sub(_HELD_DASH, unicodedata.normalize("NFKC", text))
-    folded = folded.translate(_SAME_CHARACTER)
+    folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
     folded = _ELLIPSIS_GAP.sub("", folded)
     folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
     if hyphen_gaps:
         # The dash and the hyphen folds read a range out of ``677 - 679``
         # too, so the page-number reader keeps the text as written.
-        folded = _DASH_GAP.sub("-", folded)
+        folded = _ELLIPSIS_AFTER.sub("", folded)
+        folded = _DASH_GAP.sub("-", _DASH_RUN.sub("-", folded))
         folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
-        folded = _DASH_RUN.sub("-", folded)
-    folded = folded.replace(_HELD_DASH, "-")
     folded = _QUOTE_GAP.sub("", folded)
     folded = _BRACKET_GAP.sub("[]", folded)
     folded = " ".join(
@@ -808,11 +805,32 @@ def join_tokens(tokens: list[dict]) -> str:
 
 def _attach(tokens: list[dict]) -> list[dict]:
     """Turn the :class:`Glued` text of each token into ``attach``, so
-    the document holds plain strings."""
+    the document holds plain strings.
+
+    A piece is glued to the word before it in its engine's read, so it
+    stays attached only beside that word: the token kept just before it
+    stands at the base position before its own, or is a word the vote
+    put in at its own position. When the vote dropped what stood
+    between (``restriction—it`` against two engines' ``restriction
+    it``, the dash dropped), the piece takes its space back, or two
+    words would run together.
+    """
+    previous: dict | None = None
     for token in tokens:
-        if isinstance(token.get("text"), Glued):
-            token["text"] = str(token["text"])
-            token["attach"] = True
+        glued = isinstance(token.get("text"), Glued)
+        token["text"] = str(token["text"])
+        if glued and previous is not None:
+            here, there = token.get("position"), previous.get("position")
+            beside = (
+                there == here
+                if previous.get("inserted")
+                else there is not None
+                and here is not None
+                and there == here - 1
+            )
+            if beside:
+                token["attach"] = True
+        previous = token
     return tokens
 
 
