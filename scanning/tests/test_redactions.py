@@ -418,6 +418,22 @@ class TestResolve(TestCase):
             ],
         )
 
+    def test_the_landed_rows_are_written_in_one_statement(self):
+        """One ``bulk_update`` for every landed dismissal (#603)."""
+        rows = []
+        for page in range(2):
+            self._dismiss(page_index=page, source_page=page + 1)
+            rows.append(
+                computed(self.scan, page_index=page, source_page=page + 1)
+            )
+
+        with self.assertNumQueries(4):
+            self.assertEqual(redactions.resolve(self.scan), (2, []))
+
+        for row in rows:
+            row.refresh_from_db()
+            self.assertIsNotNone(row.decision_id)
+
     def test_lands_on_a_box_that_moved_a_little(self):
         self._dismiss()
         new = computed(self.scan, x0=48.0, x1=152.0)

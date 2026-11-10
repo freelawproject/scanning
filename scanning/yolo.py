@@ -375,6 +375,8 @@ def enqueue_missing_runs() -> int:
         .exclude(pk__in=skipped)
         .annotate(detected=Exists(detected))
         .filter(detected=False)
+        # The caches stay on disk (#582): the enqueue reads none.
+        .defer(*Scan.large_fields())
         .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
     )
 
@@ -1064,21 +1066,30 @@ def queue_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
+    # The status first and no ``order_by``, for the reason
+    # ``dots_mocr.apply_glued_runs`` gives: the join drives from the
+    # scans in an apply status, and the scan's default ordering stays
+    # out of the DISTINCT.
     scan_ids = (
         Scan.objects.filter(
+            status__in=APPLY_STATUSES,
             jobs__stage=JobStage.DETECT,
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
             jobs__apply_run__isnull=True,
         )
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
     queued = 0
-    for scan in Scan.objects.filter(
-        pk__in=list(scan_ids), status__in=APPLY_STATUSES
-    ).select_related("reporter"):
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids), status__in=APPLY_STATUSES)
+        .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
+    ):
         rows = live_detect_jobs(scan)
         if not rows:
             continue

@@ -54,6 +54,9 @@ import logging
 
 from botocore.exceptions import BotoCoreError, ClientError
 from django.conf import settings
+from django.db.models import IntegerField
+from django.db.models.fields.json import KT
+from django.db.models.functions import Cast, Coalesce
 from django.utils import timezone
 
 from scanning import jobs, markup, paragraphs, runpod_client, s3_sync
@@ -67,6 +70,7 @@ from scanning.models import (
     JobStatus,
     Opinion,
     OpinionReviewStatus,
+    Scan,
 )
 
 logger = logging.getLogger(__name__)
@@ -680,19 +684,23 @@ def finish_ready_runs(limit: int = GLUES_PER_TICK) -> int:
             status=JobStatus.COMPLETED,
             opinion__isnull=False,
         )
+        # The cap in SQL (#604): a row past it stays COMPLETED for good,
+        # so a filter in Python read every one of them on every tick.
+        # The twin of :func:`_glue_attempts`: a missing ``glue`` key, or
+        # a missing count, is no attempt.
+        .alias(
+            glue_attempts=Coalesce(
+                Cast(KT("provider_meta__glue__attempts"), IntegerField()), 0
+            )
+        )
+        .filter(glue_attempts__lt=GLUE_MAX_ATTEMPTS)
         .select_related("opinion", "opinion__scan")
+        # The caches stay on disk (#582): the glue reads the scan's keys.
+        .defer(*Scan.large_fields("opinion__scan__"))
         .order_by("completed_at", "pk")
     )
     glued = 0
-    tried = 0
-    for row in rows:
-        # In Python and not in the query: a row with no ``glue`` key is
-        # NULL to a JSON lookup, and an ``exclude`` would drop it too.
-        if _glue_attempts(row) >= GLUE_MAX_ATTEMPTS:
-            continue
-        if tried >= limit:
-            break
-        tried += 1
+    for row in rows[:limit]:
         live = live_tag_jobs(row.opinion)
         if not live or live[0].pk != row.pk or live[0].status in unfinished:
             continue

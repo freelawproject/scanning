@@ -338,8 +338,11 @@ def finish_ready_scans() -> int:
         .distinct()
     )
     finished = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)).select_related(
-        "reporter"
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids))
+        .select_related("reporter")
+        # The caches stay on disk (#582): the merge reads none of them.
+        .defer(*Scan.large_fields())
     ):
         convert_jobs = live_convert_jobs(scan)
         if not convert_jobs:

@@ -296,6 +296,28 @@ class TestTheCard(ScanningTestCase):
         findings.rebuild(self.scan, run=None)
         self.assertEqual(self.cards().count(), 1)
 
+    def test_the_sidebar_card_adds_the_box_at_the_band(self):
+        """The card carries the band as the box to add, and offers the
+        add: an EDITORIAL row there covers the reading at the next
+        rebuild, the same write as a missed bracket's +."""
+        from django.urls import reverse
+
+        findings.rebuild(self.scan, run=None)
+        card = self.cards().get()
+        self.client.force_login(self.make_user())
+
+        response = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        )
+
+        html = response.json()["html"]
+        box = card.metadata["bbox"]
+        self.assertIn(
+            f'data-guess="{box[0]},{box[1]},{box[2]},{box[3]}"', html
+        )
+        self.assertIn("+ editor's note", html)
+        self.assertIn(f'data-label-id="{card.metadata["label_id"]}"', html)
+
     def test_no_computed_boundary_writes_no_card(self):
         # The rule of every measured finding: a volume the compute has
         # not reached has no redactions, so every note would read as

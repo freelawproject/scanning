@@ -40,6 +40,7 @@ described from the curator.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection
 from statistics import median
 
 from django.db import transaction
@@ -82,28 +83,15 @@ def _round(value: float) -> float:
 def strip_content_box(entry: dict) -> tuple[float, float, float, float]:
     """Return the box the margin strips of one page leave, in points.
 
-    The strips are named by the page edge each lies on
-    (``margin_fit._sides``, the one rule), and the box is what the four
-    leave between them. Every page has its four strips
-    (``margin_fit.ensure_strips``, #370); a side the entry still lacks
-    is the page edge.
+    ``margin_fit.content_box``: the strips as measured, before the
+    page-number hold-off moved one, so a pulled strip never widens the
+    box a text rect is held in.
 
     :param entry: One ``compute_margin_rects`` entry, with its
         ``page_width``, ``page_height`` and ``rects`` in points.
     :returns: ``(x0, y0, x1, y1)``, in points.
     """
-    sides = margin_fit._sides(entry)
-    x0, y0 = 0.0, 0.0
-    x1, y1 = float(entry["page_width"]), float(entry["page_height"])
-    if sides["top"] is not None:
-        y0 = float(sides["top"]["y1"])
-    if sides["bottom"] is not None:
-        y1 = float(sides["bottom"]["y0"])
-    if sides["left"] is not None:
-        x0 = float(sides["left"]["x1"])
-    if sides["right"] is not None:
-        x1 = float(sides["right"]["x0"])
-    return x0, y0, x1, y1
+    return margin_fit.content_box(entry)
 
 
 def clip_to_content(
@@ -307,6 +295,7 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
     landed = 0
     stale: list[Redaction] = []
     taken: set[int] = set()
+    written: list[Redaction] = []
     for dismiss in dismissals:
         if is_stale(dismiss, scan) or dismiss.target_bbox is None:
             stale.append(dismiss)
@@ -326,8 +315,11 @@ def resolve(scan: Scan) -> tuple[int, list[Redaction]]:
             stale.append(dismiss)
             continue
         taken.add(best.pk)
-        Redaction.objects.filter(pk=best.pk).update(decision=dismiss)
+        best.decision = dismiss
+        written.append(best)
         landed += 1
+    # One write for every landed dismissal (#603).
+    Redaction.objects.bulk_update(written, ["decision"], batch_size=1000)
     if stale:
         logger.warning(
             "scan %s: %d redaction dismissal(s) found no box to land on: %s",
@@ -401,22 +393,24 @@ def is_stale(row: Redaction, scan: Scan) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def visible_by_page(scan: Scan) -> list[dict]:
+def visible_by_page(
+    scan: Scan, pages: Collection[int] | None = None
+) -> list[dict]:
     """Return the boxes to paint, grouped by page, in the viewer's shape.
 
     ``[{"page_index": i, "rects": [{"id", "x0", "y0", "x1", "y1", "fill",
     "rect_type", "origin"}]}]``, points, pages in order.
 
     :param scan: The scan.
+    :param pages: The page indexes to read, or None for every page.
     :returns: The list.
     """
-    pages: dict[int, list[dict]] = {}
-    for row in (
-        Redaction.objects.visible()
-        .filter(scan=scan)
-        .order_by("page_index", "y0", "x0")
-    ):
-        pages.setdefault(row.page_index, []).append(
+    rows = Redaction.objects.visible().filter(scan=scan)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    pages_out: dict[int, list[dict]] = {}
+    for row in rows.order_by("page_index", "y0", "x0"):
+        pages_out.setdefault(row.page_index, []).append(
             {
                 "id": row.pk,
                 "x0": row.x0,
@@ -430,7 +424,7 @@ def visible_by_page(scan: Scan) -> list[dict]:
         )
     return [
         {"page_index": index, "rects": rects}
-        for index, rects in sorted(pages.items())
+        for index, rects in sorted(pages_out.items())
     ]
 
 

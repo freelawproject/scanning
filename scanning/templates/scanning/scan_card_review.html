@@ -3,11 +3,12 @@
 
 {% comment %}
   The card review of review 2 (card_review.py): the missed headnote
-  brackets, the missed captions and the image boxes of one volume, one
-  after the next. The cards come from scan_review_cards, the crops from
-  the PDF step 2 draws through pdf.js, and every write goes to step 2's
-  own endpoints (the add, the approval, the resize, the dismissal), so
-  the viewer and this page hold one set of rules.
+  brackets, the missed captions, the image boxes and the editor's note
+  boxes of one volume, one after the next. The cards come from
+  scan_review_cards, the crops from the PDF step 2 draws through
+  pdf.js, and every write goes to step 2's own endpoints (the add, the
+  approval, the resize, the dismissal), so the viewer and this page
+  hold one set of rules.
 {% endcomment %}
 
 {% block title %}Card review · {{ scan.volume }} {{ scan.reporter.cite_name }} - FLP Scanning Portal{% endblock %}
@@ -32,9 +33,9 @@
     </span>
   </div>
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
-    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards.
+    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>e</kbd> an editor's note box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards, <kbd>←</kbd> and <kbd>→</kbd> move a bracket's box sideways.
     Drag a box at its edges to resize it, inside it to move it. Click the label of any other box on the crop to move or resize that one instead (<kbd>Return</kbd> saves it, <kbd>Esc</kbd> leaves it): a card is often answered by pulling a box of the page out to the text.
-    A bracket, a caption or a column box is added where its box lies; a faint bracket box is approved or taken out; an image box is kept, pulled in to the picture, or taken out; a block of text in no box is covered by the column box added over it, by a footnote box added over it, or by the page's own column box pulled over it.
+    A bracket, a caption or a column box is added where its box lies; a faint bracket box is approved or taken out; an image box is kept, pulled in to the picture, or taken out; an editor's note box is kept, pulled in to the note, or taken out; a block of text in no box is covered by a column box or an editor's note box added over it, by the footnote box beside it grown over it (or one added when none is near), or by the page's own column box pulled over it.
     Every answer is step 2's own write, with its Undo. A box added here reaches the redactions at the next recompute.
   </p>
   <p class="bk-note" data-role="compute-note"></p>
@@ -54,7 +55,13 @@
   <section class="card mb-6" data-group="bracket">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">Headnote brackets <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
-      <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either.</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either. <kbd>←</kbd> <kbd>→</kbd> move the selected box sideways (<kbd>Shift</kbd> for a bigger step).</span>
+      <span class="flex gap-2">
+        <button type="button" class="btn-primary text-xs" data-role="bulk-approve" disabled
+                title="Answer every bracket card not answered or skipped yet as its first button would: add the missed ones, approve the faint ones, at their boxes as they stand now">Approve the rest</button>
+        <button type="button" class="btn-outline text-xs" data-role="bulk-out" disabled
+                title="Answer every bracket card not answered or skipped yet with No bracket, or take the faint box out">Take out the rest</button>
+      </span>
     </header>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
@@ -62,7 +69,7 @@
   <section class="card mb-6" data-group="text">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">Text in no box <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
-      <span class="text-xs text-gray-500 dark:text-gray-400">A block of print the reader saw that no box covers, a footnote line outside the footnote box included. The opinion text leaves out what the boxes miss: add a column box over the block (resize it first if it is short), or pull the page's own column box over it (click the box's label on the crop and drag its edge); or say it is not text (the print of the leaf behind, a stray mark).</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A block of print the reader saw that no box covers, a footnote line outside the footnote box included. The opinion text leaves out what the boxes miss: add a column box over the block (resize it first if it is short), grow the footnote box beside the block over it (one box, no seam; one is added when none is near), or pull the page's own column box over it (click the box's label on the crop and drag its edge); box it as an editor's note when it is the publisher's text (a Words and Phrases line), which the redaction then blacks out; or say it is not text (the print of the leaf behind, a stray mark).</span>
     </header>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>
@@ -70,7 +77,15 @@
   <section class="card mb-6" data-group="image">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">Images <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
-      <span class="text-xs text-gray-500 dark:text-gray-400">An image box the model drew and nobody has judged. The opinion PDF pastes the original scan of the box over the page, so a box over text pastes a photograph of the text.</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">An image box the model drew and nobody has judged, and a picture or a table the readers (dots.mocr, Mistral, Surya) saw that no image box covers. The opinion PDF pastes the original scan of an image box over the page, so a box over text pastes a photograph of the text, and a picture with no box is read as words. Keep a box, pull it in, or take it out; where the readers draw the picture differently, Refine image box pulls the box to theirs (hover the button to see where); add an image box at the readers' box, or say it is not an image.</span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading…</p></div>
+  </section>
+
+  <section class="card mb-6" data-group="editorial">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">Editor's notes <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400">An editor's note box the model drew and nobody has judged, outside the head matter's blackout, where a box is black either way. A box under blackletter's gate redacts nothing yet, and its card says so: Keep blacks it out at the next recompute. Keep it over an editor's note or a Words and Phrases line, pull it in to that text, or take it out when it holds the court's own words.</span>
     </header>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>

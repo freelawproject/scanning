@@ -16,6 +16,7 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db import IntegrityError, transaction
+from django.db.models import F, Func, IntegerField
 from django.http import (
     FileResponse,
     Http404,
@@ -1128,26 +1129,55 @@ def scan_process_view(request: HttpRequest, pk: int) -> HttpResponse:
     )
 
 
+#: The stored size of a scan's OCR cache, the progress poll's test of
+#: "changed since the last poll". ``pg_column_size`` reads the size off
+#: the stored value's header, so the cache is never read to answer it,
+#: which a count of its pages would do on every poll.
+OCR_SIZE = Func(
+    F("ocr_results"), function="pg_column_size", output_field=IntegerField()
+)
+
+
 @login_required
 def progress_api(request: HttpRequest, pk: int) -> JsonResponse:
     """Return current processing progress for a scan.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
-    :return: JSON response with status, progress, and log fields.
+    :return: JSON response with the status and the progress, and the
+        OCR cache when it changed since the size the browser sent.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    # Every open tab on a busy scan asks this every second, so it reads
+    # the columns it answers and no cache (#586): the OCR cache is
+    # megabytes, and it was read and sent on every poll.
+    scan = get_object_or_404(
+        Scan.objects.only(
+            "pk",
+            "status",
+            "progress_current",
+            "progress_total",
+            "progress_message",
+        ).annotate(ocr_size=OCR_SIZE),
+        pk=pk,
+    )
     data = {
         "status": scan.status,
         "current": scan.progress_current,
         "total": scan.progress_total,
         "message": scan.progress_message,
-        "log": scan.progress_log,
+        "ocr_size": scan.ocr_size,
     }
-    # Include ocr_results when available so the frontend can render
-    # the pages sidebar live without a full page reload.
-    if scan.ocr_results:
-        data["ocr_results"] = scan.ocr_results
+    # The pages sidebar renders live without a reload, and the browser
+    # sends the size of the cache it holds: the cache is sent only when
+    # it changed since.
+    if str(scan.ocr_size) != request.GET.get("ocr_size"):
+        ocr_results = (
+            Scan.objects.filter(pk=pk)
+            .values_list("ocr_results", flat=True)
+            .first()
+        )
+        if ocr_results:
+            data["ocr_results"] = ocr_results
     # Neither GPU stage moves a scan status, so a viewer polling this
     # would otherwise see nothing happen for a whole run (#190, #195).
     dots_run = dots_mocr.run_summary(scan)
@@ -1242,7 +1272,7 @@ def serve_scan_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     :return: File response streaming the preview PDF, or a 202/409 JSON
         response when there is none.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # Breadcrumb (issue #115): serving may pull from S3; mark the start
     # so a stall here is attributable in the trail.
     logger.info("serve_scan_pdf: resolving pdf for scan=%s", scan.pk)
@@ -1347,7 +1377,7 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
     :return: JSON with ``url`` and ``embedded_whole``, or a 404 when
         the scan has no original file.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if not (scan.original_pdf and scan.original_pdf.name):
         return JsonResponse(
             {"error": "This scan has no original PDF."}, status=404
@@ -1418,7 +1448,7 @@ def scan_ocr_text_url(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import opinion_ocr
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     name = request.GET.get("engine") or opinion_ocr.DEFAULT_ENGINE
     spec = opinion_ocr.ENGINES.get(name)
     if spec is None:
@@ -1514,7 +1544,7 @@ def serve_scan_original(request: HttpRequest, pk: int) -> FileResponse:
     :raises Http404: When S3 is active, or when no local copy can be
         made available.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
 
     if s3_sync.s3_active():
         raise Http404("The original PDF is read from storage, not from here.")
@@ -1552,7 +1582,7 @@ def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
     """
     from scanning import apply, review_states
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     original_available = bool(scan.original_pdf and scan.original_pdf.name)
 
     def refuse(message: str) -> JsonResponse:
@@ -1831,7 +1861,7 @@ def glued_output_index(
     if spec is None:
         return _unknown_output(output)
     stage, engine, _key_fn = spec
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # The volume runs only: the one-page shards of a page edit apply
     # (#224) share the stage and the engine, and their run numbers, but
     # no glued volume document is written for them.
@@ -1893,7 +1923,7 @@ def serve_glued_volume(
     if spec is None:
         return _unknown_output(output)
     stage, engine, key_fn = spec
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     rows = _glued_run_rows(scan, stage, engine, run)
     if not rows:
         return _json_404(f"Run {run} does not exist for this scan.", run=run)
@@ -2003,7 +2033,7 @@ def opinion_pdf_url(
     :param opinion_pk: The ``Opinion`` primary key; it must be of that scan.
     :return: JSON with ``url`` and ``revision``, or a 404.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if not opinion_pdf.is_written(opinion):
         return _json_404(
@@ -2045,11 +2075,14 @@ def opinion_blocking_cards(
     """
     from scanning import blocking_review, ensemble, opinion_review, s3_sync
 
-    scan = get_object_or_404(Scan, pk=pk)
+    # One read for both (#602): the join brings the scan, and an
+    # opinion of another scan is a 404 like a missing one.
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan", "apply_run"),
+        Opinion.objects.select_related("scan", "apply_run").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
-        scan=scan,
+        scan_id=pk,
     )
     if not ensemble.is_written(opinion):
         return JsonResponse(
@@ -2131,7 +2164,12 @@ def opinion_blocking_cards(
         {
             "status": "ok",
             "level": level,
-            "blocking_open": opinion_review.blocking_findings(opinion).count(),
+            # The list above is that set on the blocking level (#602).
+            "blocking_open": (
+                len(findings)
+                if open_findings is opinion_review.blocking_findings
+                else opinion_review.blocking_findings(opinion).count()
+            ),
             "opinion": {
                 "pk": opinion.pk,
                 "label": str(opinion),
@@ -2167,7 +2205,7 @@ def opinion_ensemble_url(
     """
     from scanning import ensemble
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if not ensemble.is_written(opinion):
         return _json_404(
@@ -2210,7 +2248,7 @@ def opinion_figure_url(
     """
     from scanning import opinion_figures
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(
         Opinion.objects.select_related("apply_run"), pk=opinion_pk, scan=scan
     )
@@ -2321,7 +2359,7 @@ def serve_opinion_pdf(
     :param opinion_pk: The opinion's primary key; it must be of that scan.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     label = f"r{opinion.glue_revision}"
     if not opinion_pdf.is_written(opinion):
@@ -2373,7 +2411,7 @@ def serve_opinion_ocr(
     from scanning import ensemble as ensemble_module
     from scanning import opinion_ocr
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if (
         engine not in EXTRA_OPINION_OBJECTS
@@ -2433,7 +2471,7 @@ def serve_opinion_approved_text(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if not opinion.approved_text_key:
         return _json_404(
@@ -2472,7 +2510,7 @@ def serve_opinion_tags(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if not tagger.is_written(opinion):
         return _json_404(
@@ -2582,9 +2620,11 @@ def serve_opinion_final_xml(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: The XML, or a JSON 404 or 409.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.objects.defer(*Scan.large_fields()), pk=pk)
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan__reporter"),
+        Opinion.objects.select_related("scan__reporter").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
         scan=scan,
     )
@@ -2617,7 +2657,7 @@ def serve_opinion_exported_xml(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if not final_xml.is_stored(opinion):
         return _json_404(
@@ -2654,9 +2694,11 @@ def opinion_final_xml(
     :param opinion_pk: The ``Opinion`` primary key.
     :return: The page, or a JSON 404 or 409.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.objects.defer(*Scan.large_fields()), pk=pk)
     opinion = get_object_or_404(
-        Opinion.objects.select_related("scan__reporter"),
+        Opinion.objects.select_related("scan__reporter").defer(
+            *Scan.large_fields("scan__")
+        ),
         pk=opinion_pk,
         scan=scan,
     )
@@ -2733,7 +2775,7 @@ def opinion_file_index(
     """
     from scanning import ensemble, opinion_ocr
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     files = [
         {
@@ -2879,7 +2921,7 @@ def serve_glued_shard(
     if spec is None:
         return _unknown_output(output)
     stage, engine, _key_fn = spec
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     rows = _glued_run_rows(scan, stage, engine, run)
     if not rows:
         return _json_404(f"Run {run} does not exist for this scan.", run=run)
@@ -3024,7 +3066,7 @@ def apply_output_index(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning.models import ApplyRun
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     runs = list(ApplyRun.objects.filter(scan=scan).order_by("-number"))
     rows_by_run: dict[int, list] = {}
     for row in ExternalJob.objects.filter(scan=scan, apply_run__isnull=False):
@@ -3064,7 +3106,7 @@ def serve_apply_output(
             f"Unknown apply output {output!r}. "
             f"Known: {', '.join(sorted(APPLY_OUTPUTS))}."
         )
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     run = ApplyRun.objects.filter(scan=scan, number=number).first()
     if run is None:
         return _json_404(
@@ -3107,7 +3149,7 @@ def serve_apply_shard(
     :param row_pk: The ``ExternalJob`` pk.
     :return: A 302 to a presigned GET, or a 404 JSON response.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     row = ExternalJob.objects.filter(
         scan=scan, pk=row_pk, apply_run__number=number
     ).first()
@@ -3143,7 +3185,7 @@ def serve_original_crop(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: PNG image response of the cropped region.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     try:
         page = int(request.GET.get("page", 0))
         x0 = float(request.GET.get("x0", 0))
@@ -3515,7 +3557,9 @@ def process_actions(request: HttpRequest, pk: int) -> JsonResponse:
         ``has_pending_changes`` flag.
     :rtype: JsonResponse
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(
+        Scan.without_caches("ocr_results", "missing_pages"), pk=pk
+    )
     try:
         step = int(request.GET.get("step", 1))
     except ValueError:
@@ -3584,7 +3628,7 @@ def start_validate(request: HttpRequest, pk: int) -> HttpResponse:
     """
     from scanning import services
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     if services.has_legacy_ocr(scan):
         messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     else:
@@ -3614,7 +3658,7 @@ def start_detect(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page (step 2).
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # The approval first, then the pending edits: a scan already
     # approved with an open edit must hear about the edit, not be
     # asked to approve again (#232).
@@ -3766,7 +3810,7 @@ def _start_shard_read(
     """
     from scanning import sharding
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     back = redirect("scan_process", pk=scan.pk)
 
     if not request.user.is_staff:
@@ -3905,7 +3949,9 @@ def recalculate(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(
+        Scan.without_caches("ocr_results", "page_scores"), pk=pk
+    )
     if not scan.ocr_results:
         return redirect("scan_process", pk=pk)
     from scanning import services
@@ -3995,7 +4041,7 @@ def approve_page_completeness(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to step 1 of the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     # The two gates speak for the status that offers the button, and
     # for no other. A volume already approved has its pages locked, so
     # "type the number" would name work nobody can do; the
@@ -4067,7 +4113,7 @@ def reopen_page_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to step 1 of the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if not request.user.is_staff:
         messages.warning(request, "Only a staff member can reopen a review.")
         return redirect(
@@ -4124,7 +4170,7 @@ def reopen_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to step 2 of the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     step_two = reverse("scan_process", kwargs={"pk": scan.pk}) + "?step=2"
     if not request.user.is_staff:
         messages.warning(request, "Only a staff member can reopen a review.")
@@ -4184,7 +4230,7 @@ def approve_redaction_review(request: HttpRequest, pk: int) -> HttpResponse:
     """
     from scanning import opinions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     action = opinions.queue_create_opinions(scan)
     if action:
         logger.info(
@@ -4235,7 +4281,7 @@ def reprocess(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     messages.warning(request, PIPELINE_PAUSED_MESSAGE)
     return redirect("scan_process", pk=scan.pk)
 
@@ -4280,7 +4326,7 @@ def _page_number_value(raw) -> str | None:
     """
     if raw is None:
         return ""
-    text = str(raw).strip().replace("–", "-").replace("—", "-")
+    text = page_numbers.fold_dashes(str(raw).strip())
     if not text:
         return ""
     if page_numbers.number_type(text) == page_numbers.SUFFIXED:
@@ -4321,7 +4367,9 @@ def assign_page(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the stored value and duplicate flag.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(
+        Scan.without_caches("ocr_results", "page_map"), pk=pk
+    )
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4582,7 +4630,7 @@ def _page_label(raw: str) -> str | None:
         inserted page need not carry a printed number.
     :rtype: str | None
     """
-    label = (raw or "").strip()
+    label = page_numbers.fold_dashes((raw or "").strip())
     if not label:
         return ""
     if len(label) > 32 or not _PAGE_LABEL_RE.match(label):
@@ -4643,7 +4691,7 @@ def delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :return: JSON response confirming the deletion record, with the
         pages it marked.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4700,7 +4748,7 @@ def move_page(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the move record.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4748,7 +4796,7 @@ def undo_move_page(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the undo.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4781,7 +4829,7 @@ def undo_delete_page(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the undo.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4827,7 +4875,7 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the insert URL and page number.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("page_map"), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4901,7 +4949,7 @@ def remove_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the removal.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -4952,7 +5000,7 @@ def replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the edit id and the file URL.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -5016,7 +5064,7 @@ def undo_replace_page(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the undo.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -5053,7 +5101,7 @@ def page_edit_file(
     :param edit_id: The ``PageEdit`` whose file is wanted.
     :return: A redirect to the file.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     edit = get_object_or_404(PageEdit, pk=edit_id, scan=scan)
     if not edit.image:
         raise Http404("This page edit carries no file.")
@@ -5077,7 +5125,7 @@ def rotate_page(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the rotation.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     locked = _refuse_locked_edits(scan)
     if locked is not None:
         return locked
@@ -5135,7 +5183,7 @@ def dismiss_issue(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming dismissal.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # Not locked with the page edits (#224): a dismissal is built into
     # nothing, and the recompute button stays reachable after the
     # approval, so a curator must be able to answer the cards it raises.
@@ -5227,7 +5275,9 @@ def request_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the request, and whether it is new.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(
+        Scan.without_caches("ocr_results", "page_scores"), pk=pk
+    )
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -5302,7 +5352,9 @@ def dismiss_page_repair(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response confirming the dismissal.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(
+        Scan.without_caches("ocr_results", "page_scores"), pk=pk
+    )
     try:
         data = json.loads(request.body)
     except json.JSONDecodeError:
@@ -5360,8 +5412,8 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Review the boxes of a volume one after the next (``card_review``).
 
     The brackets the reader saw, the captions the model missed and the
-    image boxes it drew, each a crop of the page with the box on it
-    and two or three buttons. **The page writes nothing of its own**:
+    image and editor's note boxes it drew, each a crop of the page with
+    the box on it and two or three buttons. **The page writes nothing of its own**:
     the browser asks :func:`scan_review_cards` for the cards and
     answers them through the step-2 endpoints of ``CARD_REVIEW_WRITES``,
     so the viewer and this page hold one set of rules. The crops are
@@ -5373,7 +5425,7 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered page.
     """
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     flags = _review_flags(scan)
     kwargs = {"pk": scan.pk}
     pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
@@ -5408,11 +5460,11 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
     """Return the cards of the card review of one volume.
 
     ``card_review.cards`` over the open findings and the live model
-    image rows: rows alone, no S3 read and no render.
+    image and editor's note rows: rows alone, no S3 read and no render.
 
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: ``{status, cards}``.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})

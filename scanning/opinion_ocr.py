@@ -158,6 +158,8 @@ from scanning import (
 )
 from scanning.models import (
     DEAD_JOB_STATUSES,
+    OPINION_OCR_MAX_ATTEMPTS,
+    OPINION_OCR_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -270,6 +272,16 @@ HEAD_LINE_LABELS = frozenset(
     }
 )
 HEAD_LINE_SHARE = 0.5
+#: A unit that holds a head line whole is the line's too, when it is no
+#: taller than this many times the line: an engine draws the page
+#: number's box with air above it. A block an engine merged from the
+#: head into the body is far taller, and the other rules judge it.
+HEAD_LINE_MAX_SCALE = 2.0
+#: The share of a head line a unit must hold for that: the whole line,
+#: with a little tolerance for the engine's edge. Half of it is not
+#: holding it: a body unit that clips the bottom of the head line and
+#: runs a line below is the opinion's, and the other rules judge it.
+HEAD_LINE_HELD = 0.9
 
 #: The verdict of a unit where the detections drew nothing: the
 #: bleed-through of the page behind, which the engines read as words.
@@ -339,7 +351,7 @@ SEAM_PT = EDGE_PT
 OPINIONS_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_OCR_MAX_ATTEMPTS
 
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
@@ -666,16 +678,8 @@ def due():
 
     :returns: The queryset, unordered.
     """
-    return (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ocr_glue_attempts__lt=MAX_ATTEMPTS,
-        )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .filter(
-            Q(ocr_glue_revision__isnull=True)
-            | ~Q(ocr_glue_revision=F("glue_revision"))
-        )
+    return Opinion.objects.filter(
+        OPINION_OCR_OWED, scan__status=Status.REDACTION_REVIEW_DONE
     )
 
 
@@ -962,8 +966,9 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     """Return the page of every curated picture of some runs.
 
     :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
-    two queries, the image boxes and then every live row of their pages,
-    which the junk rule judges them against.
+    two queries whatever the number of runs, the image boxes and then
+    every live row of their pages, which the junk rule judges them
+    against.
 
     :param run_ids: The ``ApplyRun`` ids.
     :returns: ``{run id: [page_index, ...]}``, one entry per picture;
@@ -978,16 +983,21 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     )
     if not pairs:
         return {}
-    by_run: dict[int, dict[int, list]] = {}
+    # One query for every run, never one per run (#599): a page of the
+    # opinions list spans many volumes. Each run's own pages, an exact
+    # lookup on ``idx_det_live_run_page``.
+    of_their_pages = Q()
     for run_id, pages in _pages_by_run(pairs).items():
-        for row in (
-            Detection.objects.live()
-            .filter(apply_run_id=run_id, page_index__in=pages)
-            .only(*PICTURE_FIELDS)
-        ):
-            by_run.setdefault(run_id, {}).setdefault(
-                row.page_index, []
-            ).append(row)
+        of_their_pages |= Q(apply_run_id=run_id, page_index__in=pages)
+    by_run: dict[int, dict[int, list]] = {}
+    for row in (
+        Detection.objects.live()
+        .filter(of_their_pages)
+        .only("apply_run_id", *PICTURE_FIELDS)
+    ):
+        by_run.setdefault(row.apply_run_id, {}).setdefault(
+            row.page_index, []
+        ).append(row)
     out: dict[int, list[int]] = {}
     for run_id, rows_by_page in by_run.items():
         for page_index, pictures in kept_pictures(rows_by_page).items():
@@ -1089,7 +1099,32 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
     return zones
 
 
-def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
+#: The region boxes of a page: the columns, the footnote block and the
+#: pictures, with the running head's line and the two marks between the
+#: columns, the key icon and the case sequence. Every other label names
+#: what a piece of text is (a caption, a headnote, a syllabus, an
+#: editor's note, the judges, a heading, a blockquote) and sits inside
+#: one of these. The text card of review 2 measures against the region
+#: boxes alone (``undetected.uncovered``), so a column with no
+#: ``TEXT_COLUMN`` box is asked for even when a model ``BLOCKQUOTE`` box
+#: lies over it (659 S.W.3d 243, 2026-11-06: the viewer draws no model
+#: box of that label, so the column looked bare and no card said so).
+#: The glue's verdict keeps every box as cover: a line a caption box
+#: alone holds goes into the text, and the card only asks for the box.
+REGION_LABELS = HEAD_LINE_LABELS | frozenset(
+    {
+        Label.TEXT_COLUMN.name,
+        Label.FOOTNOTES.name,
+        Label.IMAGE.name,
+        Label.KEY_ICON.name,
+        Label.CASE_SEQUENCE.name,
+    }
+)
+
+
+def page_frame(
+    rows: list, size: tuple[float, float], labels: frozenset | None = None
+) -> list[dict] | None:
     """Return the frame of one page, in points, or None.
 
     The union of every detection of the page, in the shape
@@ -1097,15 +1132,20 @@ def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
     is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
     detection, because the rule needs the detections to have read the
     page: a page they missed whole keeps every unit, and the vote
-    says what it says.
+    says what it says. With ``labels``, the detections of those labels
+    alone: the text card passes :data:`REGION_LABELS`; the glue passes
+    nothing.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
+    :param labels: The labels to keep, or None for every label.
     :returns: The rects, or None.
     :rtype: list[dict] | None
     """
     if not any(row.label == Label.TEXT_COLUMN.name for row in rows):
         return None
+    if labels is not None:
+        rows = [row for row in rows if row.label in labels]
     return [
         {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
         for box in zones_pt(rows, size)
@@ -1496,7 +1536,10 @@ def verdict(
     A redaction that covers :data:`EXCLUDE_SHARE` or more of the unit
     names itself; else a neighbour's mask that does; else the printed
     page number, when the unit sits in the head or the foot zone and
-    one of its lines ends in the approved number of its page (#396);
+    one of its lines ends in the approved number of its page (#396).
+    A cover below :data:`FULL_SHARE` on the page number's unit is the
+    page number's verdict, whole, and never a partial cover: the
+    running head's whiteout cuts the number out on purpose;
     else the frame, when the detections of the page cover less than
     :data:`UNDETECTED_SHARE` of the unit (:data:`UNDETECTED`); else
     nothing. The share is the larger of the two boxes' shares, so a
@@ -1534,6 +1577,14 @@ def verdict(
     red_share, hit = covered_share(box_pt, rects)
     out_share, _ = covered_share(box_pt, masks)
     share = max(red_share, out_share)
+    page_number = is_page_number(box_pt, text, printed, height_pt, label)
+    if page_number and share < FULL_SHARE:
+        # A cover that is only partial on the page number's unit: the
+        # running head's whiteout stops at the number on purpose, and
+        # an engine that read the abbreviation and the number as one
+        # unit has half of it under the box. The unit is furniture
+        # whole, never words a reader loses to a box drawn short.
+        return {"reason": PAGE_NUMBER, "printed": printed}, 1.0
     if (
         hit is not None
         and red_share >= EXCLUDE_SHARE
@@ -1547,7 +1598,7 @@ def verdict(
         }
     elif out_share >= EXCLUDE_SHARE:
         exclusion = {"reason": "outside"}
-    elif is_page_number(box_pt, text, printed, height_pt, label):
+    elif page_number:
         exclusion = {"reason": PAGE_NUMBER, "printed": printed}
         share = 1.0
     elif undetected(box_pt, frame):
@@ -1590,7 +1641,9 @@ def on_head_line(
     """Return whether a unit lies on the running head's line.
 
     :data:`HEAD_LINE_SHARE` of the unit's height or more inside one of
-    the spans of :func:`head_lines`.
+    the spans of :func:`head_lines`; or the span held whole
+    (:data:`HEAD_LINE_HELD` of it inside the unit), when the unit is no
+    taller than :data:`HEAD_LINE_MAX_SCALE` times the span.
 
     :param box_pt: The unit's box in points.
     :param spans: The page's head-line spans, or None.
@@ -1600,11 +1653,18 @@ def on_head_line(
     height = box_pt[3] - box_pt[1]
     if not spans or height <= 0:
         return False
-    return any(
-        min(box_pt[3], bottom) - max(box_pt[1], top)
-        >= HEAD_LINE_SHARE * height
-        for top, bottom in spans
-    )
+    for top, bottom in spans:
+        overlap = min(box_pt[3], bottom) - max(box_pt[1], top)
+        if overlap >= HEAD_LINE_SHARE * height:
+            return True
+        line = bottom - top
+        if (
+            line > 0
+            and overlap >= HEAD_LINE_HELD * line
+            and height <= HEAD_LINE_MAX_SCALE * line
+        ):
+            return True
+    return False
 
 
 def undetected(box_pt: list[float], frame: list[dict] | None) -> bool:
@@ -2122,7 +2182,9 @@ def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
         due().order_by("-scan_id").values_list("scan_id", flat=True).distinct()
     )
     for scan_id in scan_ids:
-        scan = Scan.objects.get(pk=scan_id)
+        # The caches stay on disk (#582): a held scan is read again on
+        # every tick, and the glue reads none of them.
+        scan = Scan.objects.defer(*Scan.large_fields()).get(pk=scan_id)
         try:
             inputs = load_inputs(scan)
         except ScanHeld as exc:
@@ -2149,6 +2211,7 @@ def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
         due()
         .filter(scan=scan)
         .select_related("boundary", "scan")
+        .defer(*Scan.large_fields("scan__"))
         .order_by("first_printed_page", "index_in_page")[:limit]
     )
     started = time.monotonic()
@@ -2219,9 +2282,11 @@ def reglue_rows(scan: Scan | None = None) -> QuerySet:
     :returns: The rows.
     :rtype: QuerySet
     """
-    rows = Opinion.objects.exclude(
-        status=OpinionReviewStatus.TEXT_REVIEW_DONE
-    ).select_related("scan", "scan__reporter")
+    rows = (
+        Opinion.objects.exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if scan is not None:
         rows = rows.filter(scan=scan)
     return rows.order_by("scan_id", "first_printed_page", "index_in_page")

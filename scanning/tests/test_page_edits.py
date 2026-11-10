@@ -932,6 +932,18 @@ class TestPageInsertEndpoints(ScanningTestCase):
             data={"image": self.make_image(), **fields},
         )
 
+    def test_a_label_with_a_dash_is_stored_with_one_hyphen(self):
+        """A reporter prints a range with an en dash and the form
+        accepts it; the stored label holds the one hyphen the number
+        typer reads, so a file filed under ``1125\u20131381`` is a range
+        to the apply."""
+        response = self._upload(
+            anchor_pdf_page=1, page_number="1125\u20131381"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.scan.page_edits.get().logical_page, "1125-1381")
+
     def test_the_anchor_the_viewer_sends_is_stored(self):
         response = self._upload(anchor_pdf_page=1, page_number=2)
 

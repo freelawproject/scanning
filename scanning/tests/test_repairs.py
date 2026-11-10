@@ -1079,6 +1079,48 @@ class TestRepairQueue(RepairTestCase):
         self.assertEqual(response.context["waiting_repairs_count"], 2)
         self.assertEqual(repairs.waiting_count(), 2)
 
+    @override_settings(TESTING=False)
+    def test_the_header_count_is_cached_until_a_write_moves_it(self):
+        """The count runs the fulfilled rule over every open request,
+        so it is counted once and kept until a request or a page edit
+        is written, whose pk or stamp moves the key. Off the test flag,
+        which counts every time for the query-count pins."""
+        from django.core.cache import cache
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        cache.clear()
+        self.assertEqual(repairs.waiting_count(), 1)
+        with CaptureQueriesContext(connection) as ctx:
+            self.assertEqual(repairs.waiting_count(), 1)
+        self.assertFalse(
+            [q for q in ctx.captured_queries if "COUNT(*)" in q["sql"]],
+            "the second call counted again",
+        )
+        self._replace(pdf_page=2)
+        self.assertEqual(repairs.waiting_count(), 2)
+        repairs.dismiss(PageRepairRequest.objects.all(), self.user)
+        self.assertEqual(repairs.waiting_count(), 0)
+
+    @override_settings(TESTING=False)
+    def test_one_recount_at_a_time_and_the_last_count_meanwhile(self):
+        """A caller that misses while another recounts serves the last
+        count stored instead of counting again; a cold cache counts."""
+        from django.core.cache import cache
+
+        cache.clear()
+        self.assertEqual(repairs.waiting_count(), 1)
+        self._replace(pdf_page=2)
+        # Another caller holds the lock: the last count is served.
+        cache.add(repairs.WAITING_COUNT_LOCK, 1, 30)
+        self.assertEqual(repairs.waiting_count(), 1)
+        cache.delete(repairs.WAITING_COUNT_LOCK)
+        self.assertEqual(repairs.waiting_count(), 2)
+        # A cold cache under a held lock still answers.
+        cache.clear()
+        cache.add(repairs.WAITING_COUNT_LOCK, 1, 30)
+        self.assertEqual(repairs.waiting_count(), 2)
+
     def test_login_is_required(self):
         self.client.logout()
         self.assertEqual(self._queue().status_code, 302)

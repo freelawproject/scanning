@@ -334,12 +334,16 @@ def submit_doctor() -> int:
 @app.task(name="scanning.tasks.submit_mistral", queue=QUEUE_HEAVY)
 @locked("submit_mistral")
 def submit_mistral() -> int:
-    """Render and submit one shard to Mistral: minutes, on the heavy queue.
+    """Render and submit a wave of shards to Mistral: minutes, on the
+    heavy queue.
 
-    Locked like the other waves: one render at a time keeps the batch
-    cap (``mistral_ocr.MAX_CONCURRENCY``, counted before the claim)
+    The wave takes one shard (``mistral_ocr.submits_per_tick``), so
+    the task is minutes and not a quarter of an hour: the merges and
+    the glues share this queue, and a spot pod goes with little
+    warning. Locked like the other waves: one wave at a time keeps the batch
+    cap (``mistral_ocr.max_concurrency``, counted before the claim)
     exact, and two workers never pay for two renders when one was
-    wanted. Lifting it is a measured decision, not a default.
+    wanted.
 
     :returns: The submitted count.
     :rtype: int
@@ -349,21 +353,90 @@ def submit_mistral() -> int:
     return _submit(JobProvider.MISTRAL)
 
 
-@app.task(name="scanning.tasks.sweep_jobs", queue=QUEUE_FAST)
-@locked("sweep_jobs")
-def sweep_jobs() -> int:
-    """Poll every in-flight external job, and send the passes that
-    read a completion.
+def _sweep(provider: str | None) -> int:
+    """Run one provider's sweep, and send the passes that read a
+    completion.
 
+    :param provider: A ``JobProvider`` value, or ``None`` for every one.
     :returns: How many completed.
     :rtype: int
     """
     from scanning import ticks
 
-    completed = ticks.sweep().completed
+    completed = ticks.sweep(
+        providers=None if provider is None else (provider,)
+    ).completed
     if completed:
         nudge(merge_conversions, glue_runs)
     return completed
+
+
+@app.task(name="scanning.tasks.sweep_runpod", queue=QUEUE_FAST)
+@locked("sweep_runpod")
+def sweep_runpod() -> int:
+    """Poll the in-flight RunPod jobs of every engine: a status call
+    each, seconds for a wave.
+
+    One sweep per provider, the twin of the waves: a sweep is as slow
+    as its slowest provider, and one shared pass that met a volume of
+    finished Mistral batches ran for a quarter of an hour while the
+    finished Surya shards behind it sat uncollected, their cap full
+    and their GPUs idle. Here nothing waits behind a RunPod poll but
+    RunPod polls.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.RUNPOD)
+
+
+@app.task(name="scanning.tasks.sweep_doctor", queue=QUEUE_IO)
+@locked("sweep_doctor")
+def sweep_doctor() -> int:
+    """Confirm the in-flight doctor jobs by an S3 HEAD each, on the
+    queue that already holds doctor's blocking wave.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.DOCTOR)
+
+
+@app.task(name="scanning.tasks.sweep_mistral", queue=QUEUE_IO)
+@locked("sweep_mistral")
+def sweep_mistral() -> int:
+    """Poll the Mistral batches, harvest the finished ones and delete
+    their files, then the leftover files: minutes when a volume's
+    batches finish together, on the io queue, where a long call holds
+    up nothing but its own kind.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    from scanning.models import JobProvider
+
+    return _sweep(JobProvider.MISTRAL)
+
+
+@app.task(name="scanning.tasks.sweep_jobs", queue=QUEUE_FAST)
+@locked("sweep_jobs")
+def sweep_jobs() -> int:
+    """Poll every provider's in-flight jobs in one pass: the sweep as
+    it was before it was split by provider.
+
+    Registered for the rollout alone, not in ``TICKS``: a clock from
+    the release before sends this name until its pod restarts, and a
+    worker that did not know it would log an unregistered task every
+    collect interval. Delete once that release has rolled out.
+
+    :returns: How many completed.
+    :rtype: int
+    """
+    return _sweep(None)
 
 
 @app.task(name="scanning.tasks.merge_conversions", queue=QUEUE_HEAVY)
@@ -382,7 +455,7 @@ def merge_conversions() -> int:
     return finished
 
 
-@app.task(name="scanning.tasks.glue_runs", queue=QUEUE_FAST)
+@app.task(name="scanning.tasks.glue_runs", queue=QUEUE_HEAVY)
 @locked("glue_runs")
 def glue_runs() -> int:
     """Glue the volume runs and move the review states.
@@ -390,6 +463,14 @@ def glue_runs() -> int:
     Locked, because the apply trigger counts the applies in flight
     against ``apply.MAX_SCANS_IN_FLIGHT`` before it queues, and the
     ledgers of the glues are read and written here.
+
+    On the heavy queue, not the fast one, although every pass here is
+    seconds of JSON: a volume glue holds every shard result of a
+    volume as Python objects while it writes the document, gigabytes
+    for a long volume, and the fast pod is sized for ticks that send
+    HTTP calls. Its first day on that pod it was killed at the memory
+    limit on the same glue at every restart, and the RunPod waves and
+    the sweep died with it. The heavy pods are sized for an apply.
 
     :returns: The sum of what the passes did.
     :rtype: int
@@ -536,20 +617,22 @@ class Tick:
 #: them; the order matters nothing to the workers.
 TICKS: tuple[Tick, ...] = (
     Tick("claim_scans", claim_scans, "DAEMON_POLL_INTERVAL", QUEUE_HEAVY),
-    Tick("enqueue_runs", enqueue_runs, "DAEMON_SUBMIT_INTERVAL", QUEUE_FAST),
+    Tick("enqueue_runs", enqueue_runs, "DAEMON_ENQUEUE_INTERVAL", QUEUE_FAST),
     Tick("submit_runpod", submit_runpod, "DAEMON_SUBMIT_INTERVAL", QUEUE_FAST),
     Tick("submit_doctor", submit_doctor, "DAEMON_SUBMIT_INTERVAL", QUEUE_IO),
     Tick(
         "submit_mistral", submit_mistral, "DAEMON_SUBMIT_INTERVAL", QUEUE_HEAVY
     ),
-    Tick("sweep_jobs", sweep_jobs, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("sweep_runpod", sweep_runpod, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("sweep_doctor", sweep_doctor, "DAEMON_COLLECT_INTERVAL", QUEUE_IO),
+    Tick("sweep_mistral", sweep_mistral, "DAEMON_COLLECT_INTERVAL", QUEUE_IO),
     Tick(
         "merge_conversions",
         merge_conversions,
         "DAEMON_COLLECT_INTERVAL",
         QUEUE_HEAVY,
     ),
-    Tick("glue_runs", glue_runs, "DAEMON_COLLECT_INTERVAL", QUEUE_FAST),
+    Tick("glue_runs", glue_runs, "DAEMON_COLLECT_INTERVAL", QUEUE_HEAVY),
     Tick(
         "prepare_opinions",
         prepare_opinions,

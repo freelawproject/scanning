@@ -28,8 +28,16 @@
 <!-- Filters -->
 <div class="card mb-6">
   <form method="get">
-    {% if current_scan %}<input type="hidden" name="scan" value="{{ current_scan }}">{% endif %}
     <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-scan" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Scanned volume</label>
+        <select id="filter-scan" name="scan" class="input-text w-full" title="One scanned volume: the opinions of that scan alone">
+          <option value="">All volumes</option>
+          {% for value, label in scan_choices %}
+          <option value="{{ value }}" {% if current_scan == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div class="flex-1">
         <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
         <select id="filter-reporter" name="reporter" class="input-text w-full">

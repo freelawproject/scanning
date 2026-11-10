@@ -1,9 +1,10 @@
 """The blocking review: the cards, the crop estimate, the two views."""
 
 import pathlib
+import re
 from types import SimpleNamespace
 
-from django.test import TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 
 from scanning import blocking_review, ensemble
@@ -18,13 +19,6 @@ from scanning.tests.test_opinion_edits import EditTestCase
 from scanning.tests.test_tagger import TAGGER
 from scanning.tests.test_views import ScanningTestCase
 
-SCRIPT = (
-    pathlib.Path(__file__).resolve().parent.parent
-    / "static"
-    / "scanning"
-    / "blocking_review.js"
-)
-
 ENGINES = ("dots_mocr", "mistral_ocr", "surya")
 
 
@@ -35,6 +29,69 @@ def read(*texts) -> dict:
     )
     group.update(ensemble.resolve(group))
     return group
+
+
+SCRIPT = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "static"
+    / "scanning"
+    / "blocking_review.js"
+)
+
+
+class TestTheScriptKeysAKeptCardByItsPlace(SimpleTestCase):
+    """A kept card is browser state until the page's dismissal is
+    sent, and an answer elsewhere rebuilds the opinion in between:
+    the finding rows are written again with new pks, an edit before
+    the word moves its offset, and a "Not text" drop moves every
+    later block's id down by one. The key reads the block's box and
+    the position the server writes for that, never the finding pk or
+    the group id."""
+
+    def test_the_key_reads_the_box_and_the_position_alone(self):
+        source = SCRIPT.read_text()
+        body = re.search(
+            r"function keyOf\(card\) \{(.*?)\n    \}", source, re.S
+        ).group(1)
+        self.assertIn("card.position", body)
+        self.assertIn("card.box_pt", body)
+        self.assertNotIn("finding_pk", body)
+        self.assertNotIn("group_id", body)
+        self.assertNotIn("card.start", body.split("else")[0])
+
+    def test_a_reload_settles_the_findings_whose_cards_are_all_kept(self):
+        source = SCRIPT.read_text()
+        self.assertIn("return self.settle(cause);", source)
+        self.assertIn("Section.prototype.settle = function (cause)", source)
+
+    def test_a_sent_dismissal_leaves_kept_and_is_undone_with_its_cause(
+        self,
+    ):
+        """Once sent, a dismissal's marks leave ``kept``, or a card a
+        curator restores elsewhere is dismissed again with no click;
+        and a dismissal settle sent on an edit's reload is listed
+        under that edit, whose Undo restores it first."""
+        source = SCRIPT.read_text()
+        dismiss = re.search(
+            r"Section\.prototype\.dismiss = function(.*?)\n    \};",
+            source,
+            re.S,
+        ).group(1)
+        self.assertIn("delete self.kept[key]", dismiss)
+        self.assertIn("cause.settled = cause.settled || []", dismiss)
+        self.assertIn("return self.reload(cause);", dismiss)
+        undo = re.search(
+            r"Section\.prototype\.undo = function(.*?)\n    \};", source, re.S
+        ).group(1)
+        self.assertIn("entry.settled", undo)
+        self.assertIn("self.undoOne(d)", undo)
+        for write in ("write", "drop"):
+            body = re.search(
+                rf"Section\.prototype\.{write} = function(.*?)\n    \}};",
+                source,
+                re.S,
+            ).group(1)
+            self.assertIn("return self.reload(entry);", body)
 
 
 # ── the open words ───────────────────────────────────────────────────
@@ -61,6 +118,47 @@ class TestOpenWords(TestCase):
         # The word a majority settled over one engine is its own card.
         self.assertEqual([c["token"] for c in cards[1:]], ["b"])
         self.assertEqual(blocking_review.open_words(voted), [])
+
+    def test_a_card_keeps_its_position_when_a_word_before_it_is_rewritten(
+        self,
+    ):
+        """The browser keys a kept card by ``position``: the finding pk
+        is new on every rebuild and the offset moves with an edit
+        before the word, so a word kept as shown must still match its
+        card after an answer elsewhere in the block rebuilt the
+        opinion."""
+        voted = read(
+            "one two three four", "uno two tres four", "ein two drei four"
+        )
+
+        before = blocking_review.open_words(voted)
+        kept = ensemble._human_read(
+            voted,
+            {"text": "unoxx two three four", "span": [0, 3]},
+            voted["engines"],
+        )
+        after = blocking_review.open_words(kept)
+
+        self.assertEqual(
+            [(c["token"], c["start"], c["position"]) for c in before],
+            [("one", 0, 0), ("three", 8, 2)],
+        )
+        # The rewritten word is judged; the kept one moved by two
+        # characters and kept its position.
+        self.assertEqual(
+            [(c["token"], c["start"], c["position"]) for c in after],
+            [("three", 10, 2)],
+        )
+
+    def test_a_gap_card_carries_the_position_of_the_word_after_it(self):
+        voted = read("a included b", "a included c", "a 1490 included b")
+
+        cards = blocking_review.open_words(voted, blocking_review.MAJORITY)
+
+        self.assertEqual(
+            [(c.get("gap"), c["position"]) for c in cards],
+            [(True, 1), (None, 2)],
+        )
 
     def test_a_gap_no_two_engines_read_alike_is_a_blocking_card(self):
         voted = read(
@@ -123,6 +221,57 @@ class TestOpenWords(TestCase):
         self.assertEqual(
             [r["word"] for r in cards[0]["readings"]],
             ["", "[c]ontract", "I contract"],
+        )
+
+    def test_a_persons_block_of_an_older_document_opens_no_word_card(self):
+        """A document from before the join rules (schema 12) counted a
+        kept token's position over the text split on whitespace; the
+        cards align the engines with the join, so the positions may
+        name other words. Those tokens open no card until the document
+        is written again; one of this schema opens them as before."""
+        from scanning.tests.test_ensemble import engine_page
+
+        texts = {
+            "dots_mocr": "a sat x",
+            "mistral_ocr": "a dog sat y",
+            "surya": "a dog sat y",
+        }
+        pages = {
+            name: engine_page([unit(name, 0, BODY_A_PT, text)])
+            for name, text in texts.items()
+        }
+        edit = {
+            "id": 1,
+            "kind": "text",
+            "source_edit_id": None,
+            "source_page": 2,
+            "page_in_opinion": 0,
+            "box_pt": BODY_A_PT,
+            "section": ensemble.BODY,
+            "base_text": "a dog sat y",
+            "text": "a dog sat z",
+            "order": [],
+            "quoted": None,
+            "span": [10, 11],
+            "by": "curator",
+            "at": "",
+        }
+        group = ensemble.build_page(pages, 0, edits=[edit])["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.HUMAN)
+
+        fresh = blocking_review.open_words(
+            group, blocking_review.MAJORITY, schema=ensemble.SCHEMA_VERSION
+        )
+        stale = blocking_review.open_words(
+            group,
+            blocking_review.MAJORITY,
+            schema=blocking_review.POSITIONS_SCHEMA - 1,
+        )
+
+        self.assertEqual([c["token"] for c in fresh], ["dog"])
+        self.assertEqual(stale, [])
+        self.assertGreaterEqual(
+            ensemble.SCHEMA_VERSION, blocking_review.POSITIONS_SCHEMA
         )
 
     def test_the_stored_block_of_a_person_names_the_engine_of_its_positions(
@@ -343,7 +492,14 @@ class TestOpenWords(TestCase):
             "the court plainly and held todey",
         )
         self.assertEqual(voted["agreement"], ensemble.VOTED)
-        cards = blocking_review.open_words(voted)
+        # A majority's run: the warnings review's cards (#610).
+        cards = [
+            c
+            for c in blocking_review.open_words(
+                voted, blocking_review.MAJORITY
+            )
+            if c["token"] != "today"
+        ]
         self.assertEqual([c["token"] for c in cards], ["plainly", "and"])
         self.assertEqual(
             [r["word"] for r in cards[1]["readings"]],
@@ -365,7 +521,11 @@ class TestOpenWords(TestCase):
             },
             voted["engines"],
         )
-        cards = blocking_review.open_words(kept)
+        cards = [
+            c
+            for c in blocking_review.open_words(kept, blocking_review.MAJORITY)
+            if c["token"] != "today"
+        ]
 
         self.assertEqual(kept["text"], "the court clearly and held today")
         self.assertEqual([c["token"] for c in cards], ["and"])
@@ -453,9 +613,10 @@ class TestOpenWords(TestCase):
 
     def test_each_word_of_an_inserted_run_is_its_own_card(self):
         """Two engines read two words the base did not. The run goes in
-        as two low-confidence tokens, and each card shows the engine's
-        word at that place of the run, never the run whole: the answer
-        goes into one word's place of the text."""
+        as two tokens a majority settled (#610), so they are the cards
+        of the warnings review, and each card shows the engine's word at
+        that place of the run, never the run whole: the answer goes into
+        one word's place of the text."""
         words = blocking_review.open_words(
             # The third reading differs at the end too, or two readings
             # alike would be a majority and no vote.
@@ -463,8 +624,11 @@ class TestOpenWords(TestCase):
                 "the court held today",
                 "the court plainly and held today",
                 "the court plainly and held todey",
-            )
+            ),
+            blocking_review.MAJORITY,
         )
+        # The run's cards; ``today`` is a majority word of its own.
+        words = [w for w in words if w["token"] != "today"]
 
         self.assertEqual([w["token"] for w in words], ["plainly", "and"])
         self.assertEqual(
@@ -593,6 +757,64 @@ class TestCards(TestCase):
         self.assertTrue(cards[0]["gap"])
         self.assertIsNotNone(cards[0]["crop"]["highlight"])
         self.assertEqual(cards[0]["finding_pk"], 9)
+
+    def test_a_persons_block_of_an_older_document_is_a_block_card(self):
+        """The stale gate keeps its open word off the word cards; with
+        no card at all, an answer elsewhere on the page would settle
+        the page's finding with this block unseen. So the block is the
+        card, with its open count, until the document is written
+        again; at this schema the word card is back."""
+        from scanning.tests.test_ensemble import engine_page
+
+        texts = {
+            "dots_mocr": "a dog sat x",
+            "mistral_ocr": "a dig sat x",
+            "surya": "a dug sat x",
+        }
+        pages = {
+            name: engine_page([unit(name, 0, BODY_A_PT, text)])
+            for name, text in texts.items()
+        }
+        edit = {
+            "id": 1,
+            "kind": "text",
+            "source_edit_id": None,
+            "source_page": 2,
+            "page_in_opinion": 0,
+            "box_pt": BODY_A_PT,
+            "section": ensemble.BODY,
+            "base_text": "a dog sat x",
+            "text": "a dog sat z",
+            "order": [],
+            "quoted": None,
+            "span": [10, 11],
+            "by": "curator",
+            "at": "",
+        }
+        group = ensemble.build_page(pages, 0, edits=[edit])["groups"][0]
+        self.assertEqual(group["agreement"], ensemble.HUMAN)
+        self.assertEqual(group["n_low_confidence"], 1)
+        group.update({"id": 3, "column": "L"})
+        findings = [finding(0, OpinionCheck.NO_MAJORITY, 5)]
+
+        def built(schema):
+            document = {
+                "schema_version": schema,
+                "pages": [{"page_in_opinion": 0, "groups": [group]}],
+            }
+            return blocking_review.cards(document, findings)
+
+        stale = built(blocking_review.POSITIONS_SCHEMA - 1)
+        fresh = built(ensemble.SCHEMA_VERSION)
+
+        self.assertEqual(
+            [(c["kind"], c["open"], c["finding_pk"]) for c in stale],
+            [("block", 1, 5)],
+        )
+        self.assertEqual(
+            [(c["kind"], c["token"], c["finding_pk"]) for c in fresh],
+            [("word", "dog", 5)],
+        )
 
     def test_a_word_a_single_block_and_a_finding_of_another_check(self):
         split = read(

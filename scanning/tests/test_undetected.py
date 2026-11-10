@@ -7,9 +7,14 @@ with the OCR glue's own measure (``opinion_ocr.page_frame``,
 over the block, or a dismissal.
 """
 
+import json
+from unittest.mock import patch
+
 from blackletter.models import Label
+from django.urls import reverse
 
 from scanning import findings, opinion_ocr, undetected
+from scanning.factories import UserFactory
 from scanning.models import (
     ApplyRun,
     CheckName,
@@ -314,6 +319,229 @@ class TestTheRule(ScanningTestCase):
             other["metadata"]["guess"], [100.0, 200.0, 900.0, 600.0]
         )
 
+    def test_on_a_page_with_no_column_the_guess_leaves_the_picture_out(self):
+        # An addendum page: a table in an image box under a heading in
+        # no box. The column the + adds covers the heading and never
+        # the table, whose cells overlap the heading sideways; a column
+        # over both was resized by hand on every such page.
+        make_detection(
+            self.scan,
+            "IMAGE",
+            page_index=0,
+            x0=1000.0,
+            y0=700.0,
+            x1=1600.0,
+            y1=2000.0,
+        )
+        self.write(
+            cell("ADDENDUM A"),
+            cell("A row of the table", [1050.0, 800.0, 1550.0, 900.0]),
+            cell("Another row", [1050.0, 1500.0, 1550.0, 1600.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        card = found[0]
+        self.assertTrue(card["metadata"]["no_column"])
+        self.assertEqual(card["metadata"]["guess"], OUTSIDE)
+
+    def test_on_a_page_with_no_column_the_guess_is_as_wide_as_the_volumes_column(
+        self,
+    ):
+        # The page beside has two column boxes: the block in the right
+        # column gets that column's width, and the cell under it in the
+        # same column stretches the box down to it.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(
+            cell("A heading in the right column"),
+            cell("Under it", [1000.0, 700.0, 1600.0, 900.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertTrue(meta["no_column"])
+        self.assertEqual(meta["guess"], [880.0, 200.0, 1600.0, 900.0])
+
+    def test_a_line_merged_across_the_gutter_is_a_card_per_column(self):
+        # The reader drew one cell across both columns: each half is
+        # its own card, with its own column's box.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = {f["metadata"]["half"]: f for f in self.found()}
+        self.assertEqual(set(found), {"left", "right"})
+        left, right = found["left"]["metadata"], found["right"]["metadata"]
+        self.assertEqual(left["bbox"], [150.0, 200.0, 820.0, 600.0])
+        self.assertEqual(left["guess"], [100.0, 200.0, 820.0, 600.0])
+        self.assertEqual(right["bbox"], [880.0, 200.0, 1550.0, 600.0])
+        self.assertEqual(right["guess"], [880.0, 200.0, 1600.0, 600.0])
+        self.assertIn("left half of a line", found["left"]["message"])
+        self.assertIn("keeps the line", found["left"]["message"])
+
+    def test_the_half_with_no_box_is_a_card_once_the_other_has_one(self):
+        # One column box drawn, or one of two taken away: the cell is
+        # half covered, which the glue keeps, and the other column
+        # still asks for its box.
+        column(self.scan, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertEqual(meta["half"], "right")
+        self.assertFalse(meta["no_column"])
+        self.assertEqual(meta["bbox"], [880.0, 200.0, 1550.0, 600.0])
+        self.assertEqual(meta["guess"], [880.0, 200.0, 1600.0, 600.0])
+        self.assertIn("that column has no box", found[0]["message"])
+
+    def test_a_wide_cell_of_a_one_column_volume_is_one_card(self):
+        # No page with two column boxes nearby: nothing says where the
+        # gutter is, so the cell is judged whole.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        self.assertIsNone(found[0]["metadata"]["half"])
+        self.assertEqual(
+            found[0]["metadata"]["guess"], [150.0, 200.0, 1550.0, 600.0]
+        )
+
+    def test_a_block_that_straddles_the_gutter_goes_to_one_column(self):
+        # A heading in the left column and, on the next line, a line
+        # that reaches across the gutter but lies mostly in the right
+        # column: two blocks, one per column, and no box wider than a
+        # column.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(
+            cell("ATTACHMENT", [150.0, 200.0, 500.0, 260.0]),
+            cell("983 FEDERAL REPORTER", [700.0, 250.0, 1200.0, 300.0]),
+        )
+        found = {tuple(f["metadata"]["bbox"]): f for f in self.found()}
+        self.assertEqual(
+            set(found),
+            {(150.0, 200.0, 500.0, 260.0), (700.0, 250.0, 1200.0, 300.0)},
+        )
+        self.assertEqual(
+            found[(150.0, 200.0, 500.0, 260.0)]["metadata"]["guess"],
+            [100.0, 200.0, 820.0, 260.0],
+        )
+        self.assertEqual(
+            found[(700.0, 250.0, 1200.0, 300.0)]["metadata"]["guess"],
+            [880.0, 250.0, 1600.0, 300.0],
+        )
+
+    def test_a_merged_footnote_line_stays_whole_and_grows_the_box(self):
+        # A footnote line the reader merged across the gutter, under
+        # the page's footnote box: never cut, one card, and the grown
+        # box runs across the columns as the footnotes do.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=100.0,
+            y0=1500.0,
+            x1=820.0,
+            y1=1700.0,
+        )
+        self.write(cell("A footnote across", [150.0, 1750.0, 1550.0, 1800.0]))
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertIsNone(meta["half"])
+        self.assertEqual(meta["bbox"], [150.0, 1750.0, 1550.0, 1800.0])
+        self.assertEqual(meta["grow"]["id"], foot.pk)
+        self.assertEqual(
+            meta["grow"]["grown"], [100.0, 1500.0, 1550.0, 1800.0]
+        )
+
+    def test_a_footnote_box_under_the_left_half_of_a_wide_block_grows(self):
+        # The block starts to the right of the footnote box's left edge
+        # and runs across the gutter: the two share the box's width, so
+        # the box is in the block's column.
+        grow = undetected.neighbour_box(
+            [300.0, 1750.0, 1550.0, 1800.0],
+            [
+                {
+                    "id": 7,
+                    "label": "FOOTNOTES",
+                    "box": [100.0, 1500.0, 820.0, 1700.0],
+                }
+            ],
+            "FOOTNOTES",
+        )
+        self.assertEqual(grow["id"], 7)
+        self.assertEqual(grow["grown"], [100.0, 1500.0, 1550.0, 1800.0])
+
+    def test_a_columns_lines_near_the_footnote_box_stay_one_card(self):
+        # Two missed lines of the left column, the lower one within the
+        # grow gap of the footnote box: one block, one card, as on the
+        # base branch, and the grow answer on it.
+        column(self.scan, page_index=1, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=100.0,
+            y0=1500.0,
+            x1=820.0,
+            y1=1700.0,
+        )
+        self.write(
+            cell("A line", [150.0, 1200.0, 800.0, 1300.0]),
+            cell("The line under it", [150.0, 1320.0, 800.0, 1450.0]),
+        )
+        found = self.found()
+        self.assertEqual(len(found), 1)
+        meta = found[0]["metadata"]
+        self.assertEqual(meta["bbox"], [150.0, 1200.0, 800.0, 1450.0])
+        self.assertEqual(meta["grow"]["id"], foot.pk)
+
+    def test_the_geometry_prefers_the_page_of_the_same_parity(self):
+        # The facing page's columns sit a margin's width over; the page
+        # two away is laid out like this one.
+        column(self.scan, page_index=1, bbox=[150.0, 100.0, 870.0, 2000.0])
+        column(self.scan, page_index=1, bbox=[930.0, 100.0, 1650.0, 2000.0])
+        column(self.scan, page_index=2, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=2, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        self.write(cell("Across the page", [150.0, 200.0, 1550.0, 600.0]))
+        found = {f["metadata"]["half"]: f for f in self.found()}
+        self.assertEqual(
+            found["left"]["metadata"]["guess"], [100.0, 200.0, 820.0, 600.0]
+        )
+        self.assertEqual(
+            found["right"]["metadata"]["guess"],
+            [880.0, 200.0, 1600.0, 600.0],
+        )
+
+    def test_the_guess_never_crosses_a_picture(self):
+        # A figure across the page with text above it and below it: the
+        # block above keeps its own box, and so does the block below.
+        make_detection(
+            self.scan,
+            "IMAGE",
+            page_index=0,
+            x0=200.0,
+            y0=700.0,
+            x1=1500.0,
+            y1=1500.0,
+        )
+        self.write(
+            cell("Above the figure"),
+            cell("Below the figure", [1000.0, 1600.0, 1600.0, 1900.0]),
+        )
+        found = {tuple(f["metadata"]["bbox"]): f for f in self.found()}
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found[tuple(OUTSIDE)]["metadata"]["guess"], OUTSIDE)
+        self.assertEqual(
+            found[(1000.0, 1600.0, 1600.0, 1900.0)]["metadata"]["guess"],
+            [1000.0, 1600.0, 1600.0, 1900.0],
+        )
+
     def test_on_a_page_with_a_column_the_guess_is_the_block(self):
         # A page with a column box: the guess is the block alone, and a
         # cell inside the column is covered.
@@ -371,19 +599,43 @@ class TestTheRule(ScanningTestCase):
         self.write(cell("A sliver inside", [850.0, 200.0, 1650.0, 600.0]))
         self.assertEqual(len(self.found()), 1)
 
-    def test_any_live_box_covers(self):
+    def test_a_region_box_covers(self):
+        # The card measures against ``opinion_ocr.REGION_LABELS``: the
+        # regions print sits in, a footnote block among them.
         column(self.scan)
         make_detection(
             self.scan,
-            "HEADNOTE",
+            "FOOTNOTES",
             page_index=0,
             x0=OUTSIDE[0],
             y0=OUTSIDE[1],
             x1=OUTSIDE[2],
             y1=OUTSIDE[3],
         )
-        self.write(cell("Under a headnote box"))
+        self.write(cell("Under a footnote box"))
         self.assertEqual(self.found(), [])
+
+    def test_a_box_that_names_text_does_not_cover(self):
+        # A headnote, a caption, a syllabus, a heading or a blockquote
+        # says what a piece of text is and must sit inside a region
+        # box: a model BLOCKQUOTE box over a whole column with no
+        # TEXT_COLUMN box hid the column from this card (659 S.W.3d
+        # 243). Outside every region, such a box is no cover.
+        for label in ("HEADNOTE", "BLOCKQUOTE", "HEADING", "CASE_CAPTION"):
+            with self.subTest(label=label):
+                column(self.scan)
+                row = make_detection(
+                    self.scan,
+                    label,
+                    page_index=0,
+                    x0=OUTSIDE[0],
+                    y0=OUTSIDE[1],
+                    x1=OUTSIDE[2],
+                    y1=OUTSIDE[3],
+                )
+                self.write(cell(f"Under a {label.lower()} box"))
+                self.assertEqual(len(self.found()), 1)
+                row.delete()
 
     def test_a_visible_redaction_is_cover(self):
         # The verdict reads the redactions first: a unit a redaction
@@ -413,12 +665,12 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(len(self.found()), 1)
 
     def test_a_row_with_no_render_size_still_covers(self):
-        # The glue's frame is every live row of the run, a row with no
-        # render size mapped at the render density.
+        # The glue's frame is every live region row of the run, a row
+        # with no render size mapped at the render density.
         column(self.scan)
         make_detection(
             self.scan,
-            "HEADNOTE",
+            "FOOTNOTES",
             page_index=0,
             x0=OUTSIDE[0],
             y0=OUTSIDE[1],
@@ -621,6 +873,98 @@ class TestTheCard(ScanningTestCase):
         self.assertEqual(card.severity, Issue.Severity.WARNING)
         self.assertEqual(card.metadata["guess"], OUTSIDE)
 
+    def test_a_line_merged_across_the_gutter_makes_two_sidebar_rows(self):
+        # A page with no column box, a line the reader merged across
+        # the gutter, and a page beside with two column boxes: one row
+        # per column, each with its own column's box.
+        column(self.scan, page_index=3, bbox=[100.0, 100.0, 820.0, 2000.0])
+        column(self.scan, page_index=3, bbox=[880.0, 100.0, 1600.0, 2000.0])
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left outside")),
+                page(
+                    2, cell("Across the page", [150.0, 200.0, 1550.0, 600.0])
+                ),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+        cards = self.cards().filter(page_number=3)
+        self.assertEqual(
+            sorted(c.metadata["guess"] for c in cards),
+            [[100.0, 200.0, 820.0, 600.0], [880.0, 200.0, 1600.0, 600.0]],
+        )
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn('data-guess="100.0,200.0,820.0,600.0"', html)
+        self.assertIn('data-guess="880.0,200.0,1600.0,600.0"', html)
+
+    def test_the_card_names_the_footnote_box_beside_its_block(self):
+        """A footnote box that ends just above the block is the box the
+        sidebar's footnote answer grows, and the card says so: its id
+        and the union the resize writes (``undetected.neighbour_box``,
+        the rule the cards page reads too)."""
+        from django.urls import reverse
+
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=1000.0,
+            y0=40.0,
+            x1=1600.0,
+            y1=120.0,
+        )
+        findings.rebuild(self.scan, run=None)
+        grow = self.cards().get().metadata["grow"]
+        self.assertEqual(grow["id"], foot.pk)
+        self.assertEqual(grow["box"], [1000.0, 40.0, 1600.0, 120.0])
+        self.assertEqual(grow["grown"], [1000.0, 40.0, 1600.0, 600.0])
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("Grow footnote", html)
+        self.assertIn(f'data-grow-id="{foot.pk}"', html)
+        self.assertIn('data-grow-bbox="1000.0,40.0,1600.0,600.0"', html)
+        self.assertNotIn("+ footnote", html)
+
+    def test_the_grow_is_written_in_the_footnote_rows_own_render(self):
+        """A footnote row of another render size (half the page's) is
+        measured in the card's pixels and answered in its own, the
+        space a resize of it is stored in."""
+        foot = make_detection(
+            self.scan,
+            Label.FOOTNOTES.name,
+            label_id=int(Label.FOOTNOTES),
+            x0=500.0,
+            y0=20.0,
+            x1=800.0,
+            y1=60.0,
+            img_width=850,
+            img_height=1100,
+        )
+        findings.rebuild(self.scan, run=None)
+        grow = self.cards().get().metadata["grow"]
+        self.assertEqual(grow["id"], foot.pk)
+        self.assertEqual(grow["box"], [500.0, 20.0, 800.0, 60.0])
+        self.assertEqual(grow["grown"], [500.0, 20.0, 800.0, 300.0])
+
+    def test_a_card_with_no_footnote_box_near_offers_the_add(self):
+        from django.urls import reverse
+
+        findings.rebuild(self.scan, run=None)
+        self.assertIsNone(self.cards().get().metadata["grow"])
+        self.client.force_login(self.make_user())
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("+ footnote", html)
+        self.assertNotIn("Grow footnote", html)
+
     def test_drawing_the_column_takes_the_card_away(self):
         findings.rebuild(self.scan, run=None)
         column(
@@ -709,9 +1053,9 @@ class TestTheCutLine(ScanningTestCase):
         self.assertEqual(self.found(), [])
 
     def test_a_glyphs_box_and_a_white_box_make_no_card(self):
-        """A bracket, a key and a divider cover a symbol; a white box is
-        a margin or the running head."""
-        for rect_type in ("HEADNOTE_BRACKET", "KEY_ICON", "DIVIDER"):
+        """A bracket, a key, a divider and a case number cover a symbol;
+        a white box is a margin or the running head."""
+        for rect_type in undetected.GLYPH_RECT_TYPES:
             make_redaction(
                 self.scan,
                 rect_type=rect_type,
@@ -732,6 +1076,26 @@ class TestTheCutLine(ScanningTestCase):
         self.write(cell("the words of the line", LINE))
 
         self.assertEqual(self.found(), [])
+
+    def test_a_case_number_merged_into_its_caption_is_no_card(self):
+        """West prints a small number over each caption, and the reader
+        often reads it into the caption's first line. blackletter's
+        box holds the digit alone, so the line beside it stays: no
+        card asks to cover it."""
+        make_redaction(
+            self.scan,
+            rect_type="CASE_SEQUENCE",
+            x0=106.0,
+            y0=358.0,
+            x1=122.0,
+            y1=380.0,
+        )
+        self.write(
+            cell("4 Joseph R. BIDEN, Jr.", [300.0, 1000.0, 500.0, 1050.0])
+        )
+
+        self.assertEqual(self.found(), [])
+        self.assertIn("CASE_SEQUENCE", undetected.GLYPH_RECT_TYPES)
 
     def test_a_white_box_over_the_rest_of_the_line_makes_it_covered(self):
         """Review 3 measures every visible box: a headnote box over the
@@ -824,3 +1188,169 @@ class TestTheCutLine(ScanningTestCase):
                 scan=self.scan, check_name=CheckName.REDACTION_CUTS_TEXT
             ).exists()
         )
+
+
+class TestThePageScopedRebuild(ScanningTestCase):
+    """A write on one page rebuilds the page passes for that page alone
+    (``findings.rebuild`` with ``pages``, ``findings.PAGE_CHECKS``)."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = make_scan()
+        caption = make_detection(self.scan, "CASE_CAPTION", page_index=0)
+        key = make_detection(self.scan, "KEY_ICON", page_index=2)
+        make_boundary(self.scan, caption, key)
+        column(self.scan, page_index=0)
+        column(self.scan, page_index=1)
+        # A block outside the column on each of two pages.
+        undetected.write_rows(
+            self.scan,
+            document(
+                page(0, cell("Inside", INSIDE), cell("Left out on one")),
+                page(1, cell("Inside", INSIDE), cell("Left out on two")),
+            ),
+            None,
+        )
+        findings.rebuild(self.scan, run=None)
+
+    def cards(self):
+        return Issue.objects.filter(
+            scan=self.scan, check_name=CheckName.UNDETECTED_TEXT
+        ).order_by("page_number")
+
+    def test_the_whole_rebuild_writes_a_card_per_page(self):
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1, 2]
+        )
+
+    def test_a_page_rebuild_replaces_that_pages_cards_and_keeps_the_rest(self):
+        kept = self.cards().get(page_number=2)
+        # The write: a column box over the block of page one.
+        column(self.scan, page_index=0, bbox=OUTSIDE)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+
+        cards = list(self.cards())
+        self.assertEqual([c.page_number for c in cards], [2])
+        # Untouched, not rewritten: the row is the same.
+        self.assertEqual(cards[0].pk, kept.pk)
+
+    def test_a_page_rebuild_does_not_judge_the_other_pages(self):
+        """The box went on page two, but the write named page one, so
+        page two's card stands until a write names page two."""
+        column(self.scan, page_index=1, bbox=OUTSIDE)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1, 2]
+        )
+
+        findings.rebuild(self.scan, run=None, pages={1})
+        self.assertEqual(
+            list(self.cards().values_list("page_number", flat=True)), [1]
+        )
+
+    def test_a_page_rebuild_writes_the_whole_volume_checks(self):
+        """The checks that cross pages are rewritten by every rebuild:
+        a key icon no boundary names, on a page the write did not
+        touch, gets its card from a rebuild of page one."""
+        make_detection(self.scan, "KEY_ICON", page_index=3, x0=300.0, x1=540.0)
+        self.assertFalse(
+            self.scan.issues.filter(
+                check_name=CheckName.UNMATCHED_KEY_ICON
+            ).exists()
+        )
+
+        open_count = findings.rebuild(self.scan, run=None, pages={0})
+
+        self.assertTrue(
+            self.scan.issues.filter(
+                check_name=CheckName.UNMATCHED_KEY_ICON
+            ).exists()
+        )
+        # The count answered is the volume's: both text cards, the key
+        # icon's and whatever else the volume checks wrote.
+        standing = self.scan.issues.filter(
+            check_name__in=findings.REVIEW2_CHECKS, dismissal__isnull=True
+        ).count()
+        self.assertGreater(standing, 2)
+        self.assertEqual(open_count, standing)
+
+    def test_a_page_rebuild_lands_a_dismissal_like_the_whole_one(self):
+        card = self.cards().get(page_number=1)
+        self.client.force_login(UserFactory())
+        response = self.client.post(
+            reverse("dismiss_finding", kwargs={"pk": self.scan.pk}),
+            data=json.dumps({"issue_id": card.pk}),
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        findings.rebuild(self.scan, run=None, pages={0})
+
+        self.assertIsNotNone(self.cards().get(page_number=1).dismissal_id)
+        self.assertIsNone(self.cards().get(page_number=2).dismissal_id)
+
+    def test_the_page_checks_are_the_passes_that_take_pages(self):
+        """Every check of ``PAGE_CHECKS`` is written by a pass that
+        takes ``pages``, and no other review-2 pass does: the delete of
+        a page rebuild must name exactly the checks it rewrote."""
+        import inspect
+
+        from scanning import editorial, pictures
+        from scanning.models import REVIEW2_CHECKS
+
+        takers = {
+            editorial.uncovered: CheckName.UNCOVERED_EDITORS_NOTE,
+            undetected.uncovered: CheckName.UNDETECTED_TEXT,
+            undetected.cut_lines: CheckName.REDACTION_CUTS_TEXT,
+            pictures.uncovered: CheckName.UNBOXED_PICTURE,
+            findings._uncovered_headnote_findings: CheckName.UNCOVERED_HEADNOTE,
+        }
+        for fn in takers:
+            self.assertIn("pages", inspect.signature(fn).parameters, fn)
+        self.assertEqual(set(takers.values()), set(findings.PAGE_CHECKS))
+        self.assertTrue(findings.PAGE_CHECKS < REVIEW2_CHECKS)
+
+
+class TestTheWritesPassTheirPage(ScanningTestCase):
+    """A write that names a page rebuilds that page; a boundary write
+    rebuilds the volume."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = make_scan()
+        self.client.force_login(UserFactory())
+
+    def test_an_added_box_rebuilds_its_page(self):
+        with patch("scanning.findings.rebuild") as rebuild:
+            response = self.client.post(
+                reverse("add_single_detection", kwargs={"pk": self.scan.pk}),
+                data=json.dumps(
+                    {
+                        "page_index": 2,
+                        "label_id": int(Label.TEXT_COLUMN),
+                        "bbox": [100, 100, 140, 140],
+                        "img_width": WIDTH,
+                        "img_height": HEIGHT,
+                    }
+                ),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(
+            self.scan, pages={2}, labels={"TEXT_COLUMN"}
+        )
+
+    def test_a_dismissed_boundary_rebuilds_the_volume(self):
+        caption = make_detection(self.scan, "CASE_CAPTION", page_index=0)
+        key = make_detection(self.scan, "KEY_ICON", page_index=1)
+        boundary = make_boundary(self.scan, caption, key)
+        with patch("scanning.findings.rebuild") as rebuild:
+            response = self.client.post(
+                reverse("dismiss_boundary", kwargs={"pk": self.scan.pk}),
+                data=json.dumps({"boundary_id": boundary.pk}),
+                content_type="application/json",
+            )
+        self.assertEqual(response.status_code, 200, response.content)
+        rebuild.assert_called_once_with(self.scan, pages=None, labels=None)

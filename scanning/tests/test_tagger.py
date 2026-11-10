@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 from django.contrib import messages
 from django.contrib.messages import get_messages
+from django.db import transaction
 from django.test import override_settings
 from django.urls import reverse
 
@@ -39,7 +40,7 @@ TAGGER = {
     "RUNPOD_REQUEST_TIMEOUT": 600,
     "TAGGER_ENABLED": True,
     "RUNPOD_TAGGER_ENDPOINT_ID": "ep-tagger",
-    "TAGGER_MAX_CONCURRENCY": 3,
+    "TAGGER_MAX_CONCURRENCY": 8,
     "TAGGER_MAX_ATTEMPTS": 3,
     "TAGGER_SECONDS_PER_PAGE": 1.0,
     "DOCTOR_ENABLED": False,
@@ -494,6 +495,49 @@ class TestGlue(_S3Case):
         row.refresh_from_db()
         self.assertEqual(row.status, JobStatus.COMPLETED)
         self.assertEqual(tagger.state(self.opinion), tagger.FAILED)
+
+    def test_a_row_out_of_tries_is_not_read(self):
+        """The cap is in the query (#604): such a row stays COMPLETED for
+        good, and the tick must not load it again."""
+        row = self.completed_row()
+        row.provider_meta = {"glue": {"attempts": tagger.GLUE_MAX_ATTEMPTS}}
+        row.save(update_fields=["provider_meta"])
+
+        loaded = []
+        from_db = ExternalJob.from_db.__func__
+
+        def record(cls, db, field_names, values):
+            instance = from_db(cls, db, field_names, values)
+            loaded.append(instance.pk)
+            return instance
+
+        with patch.object(ExternalJob, "from_db", classmethod(record)):
+            self.assertEqual(tagger.finish_ready_runs(), 0)
+
+        self.assertNotIn(row.pk, loaded)
+
+    def test_a_row_with_no_count_is_glued(self):
+        """A missing ``glue`` key, or a missing count, is no attempt: it
+        is NULL to a JSON lookup, and the query must keep the row."""
+        row = self.finished_row()
+        for meta in ({}, {"glue": {}}, {"glue": None}, {"glue": {"x": 1}}):
+            with self.subTest(meta=meta), transaction.atomic():
+                ExternalJob.objects.filter(pk=row.pk).update(
+                    provider_meta=meta
+                )
+
+                self.assertEqual(tagger.finish_ready_runs(), 1)
+
+                transaction.set_rollback(True)
+
+    def test_a_row_under_the_cap_is_glued(self):
+        row = self.finished_row()
+        row.provider_meta = {
+            "glue": {"attempts": tagger.GLUE_MAX_ATTEMPTS - 1}
+        }
+        row.save(update_fields=["provider_meta"])
+
+        self.assertEqual(tagger.finish_ready_runs(), 1)
 
     def test_a_pending_row_is_not_glued(self):
         tagger.ensure_tag_jobs(self.opinion)

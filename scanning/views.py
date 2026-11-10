@@ -12,7 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -123,6 +123,8 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
+        # The row's caches and logs stay on disk: the list prints none.
+        .defer(*Scan.large_fields())
         # The legacy rows, on purpose: ``opinions`` is the new
         # ``Opinion`` table since #335, and this column counts what the
         # legacy pipeline generated. #334 gives the new rows their own
@@ -207,7 +209,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: The primary key of the scan.
     :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -225,20 +227,11 @@ def _filtered_opinions(request: HttpRequest):
         "opinion", "blocking"})``, the current values as the form shows
         them.
     """
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # each of a page's rows, and no reader of the list needs one.
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
-    ).order_by(
-        "scan__reporter__short_name",
-        "scan__volume",
-        "first_printed_page",
-        "index_in_page",
-        # The last key makes the ordering total. ``Scan`` has no unique
-        # key over (reporter, volume) -- a volume comes in parts -- so
-        # two scans tie on the four keys above, and Postgres may rank
-        # tied rows differently for each page of a LIMIT/OFFSET walk.
-        # An opinion would then show on two pages, or on none.
-        "pk",
-    )
+    ).defer(*Scan.large_fields("scan__"))
 
     scan_filter = request.GET.get("scan")
     if _whole_number(scan_filter) is not None:
@@ -271,6 +264,21 @@ def _filtered_opinions(request: HttpRequest):
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The order never crosses a table: ordered by the reporter's name,
+    # the scan's volume and the opinion's page at once, no index served
+    # the sort, and at a hundred thousand rows Postgres joined and
+    # sorted them all for every page. One scan is read in page order
+    # (the unique key over scan, page and index is the index); a
+    # reporter or a volume number scan by scan in page order; the whole
+    # corpus newest first, which is the primary key. The last key makes
+    # every order total, so a LIMIT/OFFSET walk shows each opinion once.
+    if scan_filter or opinion_filter:
+        order = ("first_printed_page", "index_in_page", "pk")
+    elif reporter_filter or volume_filter:
+        order = ("scan_id", "first_printed_page", "index_in_page", "pk")
+    else:
+        order = ("-pk",)
+    opinions_qs = opinions_qs.order_by(*order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
@@ -323,6 +331,35 @@ def _review_url(current: dict, route: str) -> str | None:
     return f"{address}?{urlencode(query)}" if query else address
 
 
+def _scan_choices() -> list[tuple[str, str]]:
+    """Return the volumes the list's scan filter offers.
+
+    Every scan with an opinion row, in the list's order, named as the
+    rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
+    the scans, with the opinions as a semi-join on their scan index,
+    and the caches of every one of them left on disk (#582).
+
+    :returns: ``(scan pk, label)`` pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    scans = (
+        Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
+        .order_by("reporter__short_name", "volume", "pk")
+    )
+    return [
+        (str(s.pk), f"vol. {s.volume} {s.reporter.cite_name}, scan {s.pk}")
+        for s in scans
+    ]
+
+
+#: The rows of one page of ``/opinions/`` (#598). Each row costs its
+#: share of the page's picture and finding counts, and a corpus-wide
+#: status filter timed out at fifty.
+OPINIONS_PER_PAGE = 20
+
+
 @login_required
 def opinion_list(request: HttpRequest) -> HttpResponse:
     """List the opinions of the third review (#334).
@@ -332,7 +369,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     of the scan list, and the step-3 tab of a volume sends ``scan``.
 
     The warning count is stamped after the pagination, so one grouped
-    query answers the 50 rows of this page and the size of the corpus
+    query answers the rows of this page and the size of the corpus
     never reaches it. This is the badge rule of the scan list (#266).
 
     The opinions of the legacy pipeline are on their own page
@@ -342,7 +379,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :return: The rendered opinion list page.
     """
     opinions_qs, current = _filtered_opinions(request)
-    paginator = Paginator(opinions_qs, 50)
+    paginator = Paginator(opinions_qs, OPINIONS_PER_PAGE)
     page_obj = paginator.get_page(request.GET.get("page"))
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
@@ -367,6 +404,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
+            "scan_choices": _scan_choices(),
             "current_scan": current["scan"],
             "current_reporter": current["reporter"],
             "current_status": current["status"],
@@ -497,9 +535,12 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     """
     # Not ``opinions``: that name holds the module this view's twin
     # calls for its warning badge, and a local would hide it.
-    opinions_qs = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start", "pk")
+    opinions_qs = (
+        OpinionScan.objects.select_related("reporter", "scan")
+        # The scan's caches stay on disk (#582): the list prints none.
+        .defer(*Scan.large_fields("scan__"))
+        .order_by("reporter__short_name", "volume", "page_start", "pk")
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -590,7 +631,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     opinion = get_object_or_404(
         Opinion.objects.select_related(
             "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
-        ),
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
     findings = list(
@@ -797,7 +838,9 @@ def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
-        OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
+        OpinionScan.objects.select_related(
+            "reporter", "scan", "uploaded_by"
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
 
@@ -899,7 +942,17 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
     volumes = (
         Volume.objects.select_related("reporter", "assigned_to")
-        .prefetch_related("scans")
+        # A row per scan under its volume, a badge and a page range: the
+        # caches stay on disk, and the uploader comes in the same query
+        # instead of one more per scan.
+        .prefetch_related(
+            Prefetch(
+                "scans",
+                queryset=Scan.objects.select_related("uploaded_by").defer(
+                    *Scan.large_fields()
+                ),
+            )
+        )
         .order_by("reporter__short_name", "volume_number")
     )
 
@@ -1068,7 +1121,11 @@ def queue_detail_view(
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-    scans = volume.scans.select_related("uploaded_by").order_by("start_page")
+    scans = (
+        volume.scans.select_related("uploaded_by")
+        .defer(*Scan.large_fields())
+        .order_by("start_page")
+    )
 
     return render(
         request,

@@ -555,6 +555,54 @@ class opinion_pdf_path:
 
 
 class Scan(AbstractDateTimeModel):
+    #: The columns that hold a volume's caches and logs, kilobytes to
+    #: megabytes a row. A list of scans defers them (``views.scan_list``):
+    #: a page of twenty-five that read them pulled every volume's OCR
+    #: cache off disk (2026-11-02). So does a query that joins the scan
+    #: (:meth:`large_fields`, #582): the join repeats the scan's columns
+    #: on every row it returns. A reader that needs one loads it on
+    #: access.
+    LARGE_FIELDS = (
+        "process_output",
+        "progress_log",
+        "ocr_results",
+        "page_map",
+        "missing_pages",
+        "page_scores",
+    )
+
+    @classmethod
+    def large_fields(cls, prefix: str = "") -> list[str]:
+        """Return :attr:`LARGE_FIELDS` as ``defer()`` names.
+
+        :param prefix: The path to the scan from the queried model, such
+            as ``"scan__"`` for a query that joins it with
+            ``select_related("scan")``; empty for a query of scans.
+        :returns: The names, in the order of :attr:`LARGE_FIELDS`.
+        :rtype: list[str]
+        """
+        return [f"{prefix}{name}" for name in cls.LARGE_FIELDS]
+
+    @classmethod
+    def without_caches(cls, *keep: str) -> models.QuerySet:
+        """Return the scans with the caches deferred, but those in ``keep``.
+
+        The query of a view that fetches one scan (#602): a review click
+        or a poll that reads no cache moves none of them, and one that
+        reads a cache through a helper names it here. A deferred field
+        a path does read costs one query, never a wrong answer.
+
+        :param keep: Names of :attr:`LARGE_FIELDS` the caller reads.
+        :returns: The queryset.
+        :rtype: QuerySet
+        """
+        unknown = set(keep) - set(cls.LARGE_FIELDS)
+        if unknown:
+            raise ValueError(f"not a cache of Scan: {sorted(unknown)}")
+        return cls.objects.defer(
+            *(name for name in cls.LARGE_FIELDS if name not in keep)
+        )
+
     volume_obj = models.ForeignKey(
         Volume,
         on_delete=models.PROTECT,
@@ -1122,6 +1170,10 @@ class CheckName(models.TextChoices):
         "redaction_cuts_text",
         "Redaction covers part of a line of text",
     )
+    UNBOXED_PICTURE = (
+        "unboxed_picture",
+        "Picture or table in no image box",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1196,6 +1248,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_EDITORS_NOTE,
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
+        CheckName.UNBOXED_PICTURE,
     }
 )
 
@@ -1603,6 +1656,30 @@ class Detection(AbstractDateTimeModel):
             models.Index(
                 fields=["scan", "active"],
                 name="idx_det_scan_active",
+            ),
+            # The live rows of one run by page (#599): the opinions
+            # list's Pictures column asks a run's image boxes and then
+            # every live row of their pages (``opinion_ocr
+            # .picture_pages``), and without it Postgres read the whole
+            # label index, of every scan, for the first. The label is
+            # last, so the run's pages are an exact lookup and its image
+            # boxes are a read of that run's entries alone.
+            models.Index(
+                fields=["apply_run", "page_index", "label"],
+                condition=models.Q(active=True),
+                name="idx_det_live_run_page",
+            ),
+            # The hand-drawn rows of a scan alone, for the question the
+            # step-2 bar and the review-2 approval ask on every render
+            # (``detections.changed_since_compute``): was one added or
+            # withdrawn since the last compute. Without it the planner
+            # walks every detection of the volume to find the few
+            # manual ones, which on a large volume is a minute of disk
+            # reads per page load.
+            models.Index(
+                fields=["scan", "date_created", "withdrawn_at"],
+                condition=models.Q(model_name="manual"),
+                name="idx_det_manual_by_scan",
             ),
         ]
 
@@ -2626,6 +2703,98 @@ class TextReading(AbstractDateTimeModel):
         return f"{len(self.cells or [])} cell(s) p.{self.page_index + 1}"
 
 
+class PictureReading(AbstractDateTimeModel):
+    """The pictures and tables of one page, as the readers saw them
+    (``pictures``).
+
+    Every OCR engine labels a picture and a table beside its text
+    (dots.mocr a ``Picture`` cell, Mistral an ``image`` block, Surya a
+    ``Picture`` or ``Figure``), and the three agree with each other to
+    within a few percent, where the model's ``IMAGE`` box misses a
+    picture or runs over the text around it. This row is their measure
+    of the page, stored so that ``findings.rebuild`` and the card review
+    can compare it with the ``Detection`` rows without an S3 read
+    (``pictures.uncovered``, ``pictures.fit_for``).
+
+    **One row per page, not per mark.** ``marks`` is the list: one
+    ``{"engine", "kind", "box"}`` per picture or table a reader marked,
+    the engine a key of ``opinion_ocr.ENGINES``, the kind ``picture``
+    or ``table``, the box in the pixels of the row's render
+    (``img_width`` by ``img_height``, the first reader's), whatever
+    render the reader drew it in.
+
+    A disposable row, the rule of ``TextReading``: every compute
+    replaces the scan's set (``pictures.write_rows``), and a curator
+    never writes one. The address is the source page, the rule of
+    ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="picture_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The page edit whose one-page shard this page is. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+    page_index = models.PositiveIntegerField(db_index=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    marks = models.JSONField(
+        default=list,
+        help_text=(
+            "The pictures and tables of the page: "
+            "``[{engine, kind, box}, ...]``, the box in the pixels of "
+            "the row's render."
+        ),
+    )
+
+    class Meta:
+        ordering = ["page_index"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_picread_scan_run_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{len(self.marks or [])} mark(s) p.{self.page_index + 1}"
+
+
 class OpinionReviewStatus(models.TextChoices):
     """The state of one opinion in the third review (#335).
 
@@ -2702,6 +2871,97 @@ UNDISMISSABLE_OPINION_CHECKS = STALE_OPINION_CHECKS | frozenset(
 DISMISSABLE_OPINION_CHECKS = (
     frozenset(OpinionCheck) - UNDISMISSABLE_OPINION_CHECKS
 )
+
+# ── What the opinion passes owe (#604) ───────────────────────────────
+# Each pass asks every tick which rows still owe its output, and the
+# answer compares two columns of the row, which no plain index serves.
+# Each question is one ``Q`` here, read by the pass's query and by a
+# partial index of ``Opinion.Meta`` whose condition is that ``Q``: the
+# two compile to the same SQL, so the planner matches them, and neither
+# changes without the other. A change of a ``Q`` or of a cap below is a
+# migration. What depends on the clock, a setting or another table (the
+# scan's status, a cooldown, the ensemble's engine count) stays in the
+# pass's query.
+
+#: Failed ticks of a pass on a row before the pass leaves it alone.
+#: ``opinion_pdf``, ``opinion_figures``, ``opinion_ocr`` and
+#: ``ensemble`` read theirs as ``MAX_ATTEMPTS``.
+OPINION_PDF_MAX_ATTEMPTS = 3
+OPINION_FIGURES_MAX_ATTEMPTS = 3
+OPINION_OCR_MAX_ATTEMPTS = 3
+OPINION_ENSEMBLE_MAX_ATTEMPTS = 3
+
+#: The redacted PDF is not written at the live revision
+#: (``opinion_pdf.owed``).
+OPINION_PDF_OWED = (
+    models.Q(pdf_attempts__lt=OPINION_PDF_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & ~models.Q(redacted_pdf_revision=models.F("glue_revision"))
+)
+
+#: The pictures of the live text are not all cut
+#: (``opinion_figures.owed``).
+OPINION_FIGURES_OWED = (
+    models.Q(
+        figure_attempts__lt=OPINION_FIGURES_MAX_ATTEMPTS,
+        ocr_glue_revision=models.F("glue_revision"),
+        ensemble_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(figure_digest="")
+    & ~models.Q(figures_cut_digest=models.F("figure_digest"))
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+            OpinionReviewStatus.ERROR,
+        )
+    )
+)
+
+#: The OCR documents are not written at the live revision
+#: (``opinion_ocr.due``).
+OPINION_OCR_OWED = (
+    models.Q(ocr_glue_attempts__lt=OPINION_OCR_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & (
+        models.Q(ocr_glue_revision__isnull=True)
+        | ~models.Q(ocr_glue_revision=models.F("glue_revision"))
+    )
+)
+
+#: The ensemble text is not built over the live OCR documents and the
+#: standing edits (``ensemble.due``, which adds the engine count).
+OPINION_ENSEMBLE_OWED = (
+    models.Q(
+        ensemble_attempts__lt=OPINION_ENSEMBLE_MAX_ATTEMPTS,
+        ocr_glue_revision__isnull=False,
+        ocr_glue_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.ERROR,
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+        )
+    )
+    & (
+        models.Q(ensemble_revision__isnull=True)
+        | ~models.Q(ensemble_revision=models.F("ocr_glue_revision"))
+        # A human edit the text does not hold yet (#376): the request
+        # that wrote it builds the text, and a build that failed there
+        # is built here.
+        | ~models.Q(ensemble_edit_revision=models.F("edit_revision"))
+    )
+)
+
+#: A stored final XML whose text review is no longer done
+#: (``final_xml.withdrawn_rows``).
+OPINION_FINAL_XML_WITHDRAWN = ~models.Q(final_xml_tag_key="") & ~models.Q(
+    status=OpinionReviewStatus.TEXT_REVIEW_DONE
+)
+
+#: The order every opinion pass walks its rows in, newest scan first
+#: and then reading order: the columns of the four indexes above and
+#: the ``order_by`` of the four queries.
+OPINION_PASS_ORDER = ["-scan_id", "first_printed_page", "index_in_page"]
 
 
 class Opinion(AbstractDateTimeModel):
@@ -3083,6 +3343,40 @@ class Opinion(AbstractDateTimeModel):
         indexes = [
             models.Index(
                 fields=["scan", "status"], name="idx_opinion_review_status"
+            ),
+            # The opinions list filtered by status, newest first (#599):
+            # the filter, the order and the paginator's count off one
+            # index. With ``status`` and the primary key apart, a rare
+            # status walked the table backwards to fill a page.
+            models.Index(
+                fields=["status", "id"], name="idx_opinion_status_id"
+            ),
+            # The "owes work" question of each opinion pass (#604): the
+            # rows a pass still owes, in the order it walks them.
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_PDF_OWED,
+                name="idx_opinion_pdf_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_FIGURES_OWED,
+                name="idx_opinion_figures_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_OCR_OWED,
+                name="idx_opinion_ocr_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_ENSEMBLE_OWED,
+                name="idx_opinion_ensemble_owed",
+            ),
+            models.Index(
+                fields=["id"],
+                condition=OPINION_FINAL_XML_WITHDRAWN,
+                name="idx_opinion_xml_withdrawn",
             ),
         ]
 
@@ -4033,6 +4327,13 @@ class ApplyRun(AbstractDateTimeModel):
     the volume ``bitonal.pdf``, with no copy. The printed-page map is
     written for every run, because it is a product.
     """
+
+    #: The column that holds a whole volume's page map, kilobytes to
+    #: hundreds of kilobytes a row (#588). The tick checks read a run's
+    #: keys and stamps alone, so the readers of the standing run defer
+    #: it (:func:`apply.current_run`), and a reader that needs it loads
+    #: it on access, one run at a time.
+    LARGE_FIELDS = ("page_map",)
 
     scan = models.ForeignKey(
         Scan,
@@ -5014,11 +5315,66 @@ class ExternalJob(AbstractDateTimeModel):
             ),
         ]
         indexes = [
+            # The rows that still name a file at Mistral (#540): the
+            # sweep asks every tick, and a row names one rarely, so the
+            # index holds a handful of rows and the ask reads no other.
+            models.Index(
+                fields=["id"],
+                name="idx_externaljob_files_left",
+                condition=models.Q(provider_meta__has_key="files_left"),
+            ),
             # The daemon's hot query: everything still open, and which
             # of those is past its deadline.
             models.Index(
                 fields=["status", "deadline"],
                 name="idx_job_status_deadline",
+            ),
+            # The submit wave's slice (``jobs._pending_slice``): one
+            # engine's pending rows ranked apply-run-first, then by id,
+            # off the index alone. The pending rows are few against the
+            # table and a row leaves the index when it is sent.
+            models.Index(
+                fields=["provider", "stage", "engine", "apply_run", "id"],
+                condition=models.Q(status="pending"),
+                name="idx_job_pending_wave",
+            ),
+            # The missing-run sweeps' probe (``yolo`` and ``dots_mocr
+            # .enqueue_missing_runs``): "has this volume a detect (an
+            # analyze) run for this fingerprint", asked once per volume
+            # in the sweep statuses every time the sweep runs, answered
+            # off the index without the row. Both conditions spell the
+            # probe's filter, or the planner cannot use them.
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="detect",
+                    engine="blackletter",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_detect_probe",
+            ),
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="analyze",
+                    engine="dots_mocr",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_analyze_probe",
+            ),
+            # The volume runs of one engine, scan by scan
+            # (``jobs.ready_apply_runs`` and ``ready_volume_runs``): the
+            # live run of every scan and the runs not yet consumed, asked
+            # every collect tick for each engine. Without it each ask
+            # read the whole table, seconds of disk a tick (#588); with
+            # the status carried, the index answers both alone.
+            models.Index(
+                fields=["stage", "engine", "provider", "scan", "run"],
+                include=["status"],
+                condition=models.Q(apply_run__isnull=True),
+                name="idx_job_volume_runs",
             ),
             models.Index(
                 fields=["scan", "stage", "run"],
