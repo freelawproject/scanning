@@ -1165,7 +1165,8 @@ class TestTheVote(TestCase):
         self.assertEqual([t["text"] for t in tokens], ["a", "smith", "b"])
         self.assertTrue(tokens[1].get("inserted"))
         self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
-        self.assertEqual(disputed, 1)
+        # A majority's run is settled (#610), so nothing is counted.
+        self.assertEqual(disputed, 0)
 
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
@@ -1338,9 +1339,9 @@ class TestTheVote(TestCase):
         self.assertEqual(marked, ["beta", "delta"])
 
     def test_a_word_the_base_never_read_says_so(self):
-        """#380: a run the engines put in and a word no majority
-        settled are both marked, and they read differently. The viewer
-        names one of them, so the token must say which it is."""
+        """#380: a run the engines put in says so (``inserted``), apart
+        from a word the base read. A majority's run is settled (#610);
+        a tie's is marked, which the two-engine test checks."""
         answer = ensemble.resolve(
             self.read(
                 "the court held today",
@@ -1354,7 +1355,7 @@ class TestTheVote(TestCase):
         self.assertEqual(put_in, ["plainly"])
         for token in answer["tokens"]:
             if token.get("inserted"):
-                self.assertTrue(token.get("low_confidence"), token)
+                self.assertTrue(token.get("majority"), token)
 
     def test_a_word_no_majority_settles_is_not_an_inserted_word(self):
         answer = ensemble.resolve(
@@ -1842,6 +1843,44 @@ class TestTheVote(TestCase):
             [("Comp.", "Comp."), ("¶8);", "¶ 8);")],
         )
 
+    def test_words_the_base_missed_that_a_majority_read_are_settled(self):
+        """#610: dots.mocr, the base, read nothing of ``the alleged
+        conspirators.”``, and Mistral and Surya read it alike: two of
+        three, a majority, as on a word the base read otherwise. The
+        words go in as ``majority`` (a warning), not marked for a
+        person; a tie of two engines still is."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("minds among Lawrence"),
+            [
+                ensemble._pairs(
+                    "minds among the alleged conspirators. Lawrence"
+                ),
+                ensemble._pairs(
+                    "minds among the alleged conspirators. Lawrence"
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["minds", "among", "the", "alleged", "conspirators.", "Lawrence"],
+        )
+        put_in = [t for t in tokens if t.get("inserted")]
+        self.assertEqual(len(put_in), 3)
+        self.assertTrue(all(t.get("majority") for t in put_in))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+        # Two engines: the other's words are a tie, still marked.
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("minds among Lawrence"),
+            [ensemble._pairs("minds among the alleged Lawrence")],
+        )
+        self.assertTrue(
+            all(t.get("low_confidence") for t in tokens if t.get("inserted"))
+        )
+        self.assertEqual(disputed, 2)
+
     def test_a_comma_after_an_ellipsis_goes_with_it(self):
         """#610: ``face ..., be`` (dots.mocr), ``face . . . , be``
         (Mistral), ``face . . . be`` (Surya, no comma)."""
@@ -2006,7 +2045,9 @@ class TestTheVote(TestCase):
         self.assertEqual([t["text"] for t in tokens], ["alpha", "gamma"])
         self.assertEqual(disputed, 0)
 
-    def test_a_word_a_majority_read_goes_in_marked_and_counted(self):
+    def test_a_word_a_majority_read_goes_in_settled(self):
+        """A word the base missed and a majority read goes in, settled
+        as a majority's word, not counted for a person (#610)."""
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("the quick fox"),
             [
@@ -2018,7 +2059,8 @@ class TestTheVote(TestCase):
         self.assertEqual(
             [t["text"] for t in tokens], ["the", "quick", "brown", "fox"]
         )
-        self.assertEqual(disputed, 1)
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(disputed, 0)
 
     def test_an_engine_that_read_nothing_does_not_vote(self):
         """One engine calls a region a picture and reads no word of it

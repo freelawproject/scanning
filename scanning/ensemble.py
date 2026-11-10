@@ -2925,11 +2925,13 @@ def vote_words(
       majority as a whole (#380).
     - ``"low_confidence": True``: a person must read it. Either no
       majority settled the word, and the base engine's own word is
-      kept, or the base never read it and the engines that did put it
-      in.
-    - ``"inserted": True``, beside the flag above: the second of those
-      two. They are different faults and they read differently, so the
-      viewer must not name one of them for both (#380).
+      kept, or the base never read it and a tie of the engines that
+      did put it in.
+    - ``"inserted": True``, beside either flag: a word the base never
+      read. Beside ``low_confidence`` it is a tie's word, a different
+      fault from a word no majority settled, and the viewer must not
+      name one of them for both (#380); beside ``majority`` a majority
+      read it alike, and it is settled (#610).
 
     Every token carries ``position``, the base position it answers for,
     or the one an inserted run was put in before: the blocking review
@@ -2937,12 +2939,12 @@ def vote_words(
     over :func:`_candidates`), and a token answers for one position of
     the base read alone.
 
-    A word the base engine did not read is put in, marked and counted
-    when the engines that read it are a majority or a tie: the base is
-    the engine this module believes, so a word it did not read is a
-    question for a person, and with two engines every difference is a
-    tie. A word only a minority read is dropped, which is the reading
-    of the majority.
+    A word the base engine did not read is put in when the engines that
+    read it are a majority or a tie. A majority's word is ``majority``,
+    settled as a word the base read otherwise is (#610); a tie's is
+    marked and counted, a question for a person, and with two engines
+    every difference is a tie. A word only a minority read is dropped,
+    which is the reading of the majority.
 
     **A gap is a spot.** Where a run was dropped, what each engine read
     in the gap is a reading like a word's: the base's is nothing, and
@@ -3025,13 +3027,17 @@ def vote_words(
                 for k, w in runs
                 if tuple(key for key in k if key) == keys
             )
+            # A majority that read the run alike settles it, as it settles
+            # a word the base read otherwise (#610): ``majority``, a
+            # warning. A tie is still a question for a person.
+            settled = count >= quorum
             for key, word in zip(run_keys, run_words, strict=True):
                 if not key:
                     continue
                 add(
                     {
                         "text": word,
-                        "low_confidence": True,
+                        ("majority" if settled else "low_confidence"): True,
                         "inserted": True,
                         "position": position,
                     }
@@ -3039,7 +3045,8 @@ def vote_words(
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
-            disputed += len(keys)
+            if not settled:
+                disputed += len(keys)
         if dropped:
             # The gap is a spot: each engine's reading of it is the
             # keys of its run here, and nothing for the base and for
