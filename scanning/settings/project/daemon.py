@@ -14,6 +14,16 @@ DAEMON_POLL_INTERVAL = env.int("DAEMON_POLL_INTERVAL", default=5)
 # expiry of the scan task's message.
 DAEMON_PROCESSING_TIMEOUT = env.int("DAEMON_PROCESSING_TIMEOUT", default=600)
 
+# How long (in seconds) a scan action may keep the serial daemon's
+# heartbeat fresh from its own heartbeat thread (``daemon_heartbeat``).
+# Past it the thread still stamps the scan but no longer the clock, so a
+# hung action reads as a stale daemon after this plus
+# DAEMON_PROCESSING_TIMEOUT. The default is the bound the Celery
+# visibility timeout already sets on the longest action.
+DAEMON_MAX_ACTION_SECONDS = env.int(
+    "DAEMON_MAX_ACTION_SECONDS", default=4 * 60 * 60
+)
+
 # How many times the daemon may re-queue a single scan after being killed or
 # timing out mid-pipeline before giving up and flagging it ERROR_INTERRUPTED.
 # Guards against a churning daemon pod re-queueing the same scan forever
