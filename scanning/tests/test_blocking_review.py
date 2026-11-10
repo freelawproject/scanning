@@ -491,7 +491,14 @@ class TestOpenWords(TestCase):
             "the court plainly and held todey",
         )
         self.assertEqual(voted["agreement"], ensemble.VOTED)
-        cards = blocking_review.open_words(voted)
+        # A majority's run: the warnings review's cards (#610).
+        cards = [
+            c
+            for c in blocking_review.open_words(
+                voted, blocking_review.MAJORITY
+            )
+            if c["token"] != "today"
+        ]
         self.assertEqual([c["token"] for c in cards], ["plainly", "and"])
         self.assertEqual(
             [r["word"] for r in cards[1]["readings"]],
@@ -513,7 +520,11 @@ class TestOpenWords(TestCase):
             },
             voted["engines"],
         )
-        cards = blocking_review.open_words(kept)
+        cards = [
+            c
+            for c in blocking_review.open_words(kept, blocking_review.MAJORITY)
+            if c["token"] != "today"
+        ]
 
         self.assertEqual(kept["text"], "the court clearly and held today")
         self.assertEqual([c["token"] for c in cards], ["and"])
@@ -601,9 +612,10 @@ class TestOpenWords(TestCase):
 
     def test_each_word_of_an_inserted_run_is_its_own_card(self):
         """Two engines read two words the base did not. The run goes in
-        as two low-confidence tokens, and each card shows the engine's
-        word at that place of the run, never the run whole: the answer
-        goes into one word's place of the text."""
+        as two tokens a majority settled (#610), so they are the cards
+        of the warnings review, and each card shows the engine's word at
+        that place of the run, never the run whole: the answer goes into
+        one word's place of the text."""
         words = blocking_review.open_words(
             # The third reading differs at the end too, or two readings
             # alike would be a majority and no vote.
@@ -611,8 +623,11 @@ class TestOpenWords(TestCase):
                 "the court held today",
                 "the court plainly and held today",
                 "the court plainly and held todey",
-            )
+            ),
+            blocking_review.MAJORITY,
         )
+        # The run's cards; ``today`` is a majority word of its own.
+        words = [w for w in words if w["token"] != "today"]
 
         self.assertEqual([w["token"] for w in words], ["plainly", "and"])
         self.assertEqual(

@@ -599,19 +599,43 @@ class TestTheRule(ScanningTestCase):
         self.write(cell("A sliver inside", [850.0, 200.0, 1650.0, 600.0]))
         self.assertEqual(len(self.found()), 1)
 
-    def test_any_live_box_covers(self):
+    def test_a_region_box_covers(self):
+        # The card measures against ``opinion_ocr.REGION_LABELS``: the
+        # regions print sits in, a footnote block among them.
         column(self.scan)
         make_detection(
             self.scan,
-            "HEADNOTE",
+            "FOOTNOTES",
             page_index=0,
             x0=OUTSIDE[0],
             y0=OUTSIDE[1],
             x1=OUTSIDE[2],
             y1=OUTSIDE[3],
         )
-        self.write(cell("Under a headnote box"))
+        self.write(cell("Under a footnote box"))
         self.assertEqual(self.found(), [])
+
+    def test_a_box_that_names_text_does_not_cover(self):
+        # A headnote, a caption, a syllabus, a heading or a blockquote
+        # says what a piece of text is and must sit inside a region
+        # box: a model BLOCKQUOTE box over a whole column with no
+        # TEXT_COLUMN box hid the column from this card (659 S.W.3d
+        # 243). Outside every region, such a box is no cover.
+        for label in ("HEADNOTE", "BLOCKQUOTE", "HEADING", "CASE_CAPTION"):
+            with self.subTest(label=label):
+                column(self.scan)
+                row = make_detection(
+                    self.scan,
+                    label,
+                    page_index=0,
+                    x0=OUTSIDE[0],
+                    y0=OUTSIDE[1],
+                    x1=OUTSIDE[2],
+                    y1=OUTSIDE[3],
+                )
+                self.write(cell(f"Under a {label.lower()} box"))
+                self.assertEqual(len(self.found()), 1)
+                row.delete()
 
     def test_a_visible_redaction_is_cover(self):
         # The verdict reads the redactions first: a unit a redaction
@@ -641,12 +665,12 @@ class TestTheRule(ScanningTestCase):
         self.assertEqual(len(self.found()), 1)
 
     def test_a_row_with_no_render_size_still_covers(self):
-        # The glue's frame is every live row of the run, a row with no
-        # render size mapped at the render density.
+        # The glue's frame is every live region row of the run, a row
+        # with no render size mapped at the render density.
         column(self.scan)
         make_detection(
             self.scan,
-            "HEADNOTE",
+            "FOOTNOTES",
             page_index=0,
             x0=OUTSIDE[0],
             y0=OUTSIDE[1],

@@ -158,6 +158,8 @@ from scanning import (
 )
 from scanning.models import (
     DEAD_JOB_STATUSES,
+    OPINION_OCR_MAX_ATTEMPTS,
+    OPINION_OCR_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -349,7 +351,7 @@ SEAM_PT = EDGE_PT
 OPINIONS_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_OCR_MAX_ATTEMPTS
 
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
@@ -676,16 +678,8 @@ def due():
 
     :returns: The queryset, unordered.
     """
-    return (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ocr_glue_attempts__lt=MAX_ATTEMPTS,
-        )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .filter(
-            Q(ocr_glue_revision__isnull=True)
-            | ~Q(ocr_glue_revision=F("glue_revision"))
-        )
+    return Opinion.objects.filter(
+        OPINION_OCR_OWED, scan__status=Status.REDACTION_REVIEW_DONE
     )
 
 
@@ -972,8 +966,9 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     """Return the page of every curated picture of some runs.
 
     :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
-    two queries, the image boxes and then every live row of their pages,
-    which the junk rule judges them against.
+    two queries whatever the number of runs, the image boxes and then
+    every live row of their pages, which the junk rule judges them
+    against.
 
     :param run_ids: The ``ApplyRun`` ids.
     :returns: ``{run id: [page_index, ...]}``, one entry per picture;
@@ -988,16 +983,21 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     )
     if not pairs:
         return {}
-    by_run: dict[int, dict[int, list]] = {}
+    # One query for every run, never one per run (#599): a page of the
+    # opinions list spans many volumes. Each run's own pages, an exact
+    # lookup on ``idx_det_live_run_page``.
+    of_their_pages = Q()
     for run_id, pages in _pages_by_run(pairs).items():
-        for row in (
-            Detection.objects.live()
-            .filter(apply_run_id=run_id, page_index__in=pages)
-            .only(*PICTURE_FIELDS)
-        ):
-            by_run.setdefault(run_id, {}).setdefault(
-                row.page_index, []
-            ).append(row)
+        of_their_pages |= Q(apply_run_id=run_id, page_index__in=pages)
+    by_run: dict[int, dict[int, list]] = {}
+    for row in (
+        Detection.objects.live()
+        .filter(of_their_pages)
+        .only("apply_run_id", *PICTURE_FIELDS)
+    ):
+        by_run.setdefault(row.apply_run_id, {}).setdefault(
+            row.page_index, []
+        ).append(row)
     out: dict[int, list[int]] = {}
     for run_id, rows_by_page in by_run.items():
         for page_index, pictures in kept_pictures(rows_by_page).items():
@@ -1099,7 +1099,32 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
     return zones
 
 
-def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
+#: The region boxes of a page: the columns, the footnote block and the
+#: pictures, with the running head's line and the two marks between the
+#: columns, the key icon and the case sequence. Every other label names
+#: what a piece of text is (a caption, a headnote, a syllabus, an
+#: editor's note, the judges, a heading, a blockquote) and sits inside
+#: one of these. The text card of review 2 measures against the region
+#: boxes alone (``undetected.uncovered``), so a column with no
+#: ``TEXT_COLUMN`` box is asked for even when a model ``BLOCKQUOTE`` box
+#: lies over it (659 S.W.3d 243, 2026-11-06: the viewer draws no model
+#: box of that label, so the column looked bare and no card said so).
+#: The glue's verdict keeps every box as cover: a line a caption box
+#: alone holds goes into the text, and the card only asks for the box.
+REGION_LABELS = HEAD_LINE_LABELS | frozenset(
+    {
+        Label.TEXT_COLUMN.name,
+        Label.FOOTNOTES.name,
+        Label.IMAGE.name,
+        Label.KEY_ICON.name,
+        Label.CASE_SEQUENCE.name,
+    }
+)
+
+
+def page_frame(
+    rows: list, size: tuple[float, float], labels: frozenset | None = None
+) -> list[dict] | None:
     """Return the frame of one page, in points, or None.
 
     The union of every detection of the page, in the shape
@@ -1107,15 +1132,20 @@ def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
     is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
     detection, because the rule needs the detections to have read the
     page: a page they missed whole keeps every unit, and the vote
-    says what it says.
+    says what it says. With ``labels``, the detections of those labels
+    alone: the text card passes :data:`REGION_LABELS`; the glue passes
+    nothing.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
+    :param labels: The labels to keep, or None for every label.
     :returns: The rects, or None.
     :rtype: list[dict] | None
     """
     if not any(row.label == Label.TEXT_COLUMN.name for row in rows):
         return None
+    if labels is not None:
+        rows = [row for row in rows if row.label in labels]
     return [
         {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
         for box in zones_pt(rows, size)

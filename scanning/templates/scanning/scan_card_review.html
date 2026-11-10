@@ -33,7 +33,7 @@
     </span>
   </div>
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
-    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>e</kbd> an editor's note box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards.
+    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>e</kbd> an editor's note box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards, <kbd>←</kbd> and <kbd>→</kbd> move a bracket's box sideways.
     Drag a box at its edges to resize it, inside it to move it. Click the label of any other box on the crop to move or resize that one instead (<kbd>Return</kbd> saves it, <kbd>Esc</kbd> leaves it): a card is often answered by pulling a box of the page out to the text.
     A bracket, a caption or a column box is added where its box lies; a faint bracket box is approved or taken out; an image box is kept, pulled in to the picture, or taken out; an editor's note box is kept, pulled in to the note, or taken out; a block of text in no box is covered by a column box or an editor's note box added over it, by the footnote box beside it grown over it (or one added when none is near), or by the page's own column box pulled over it.
     Every answer is step 2's own write, with its Undo. A box added here reaches the redactions at the next recompute.
@@ -55,7 +55,13 @@
   <section class="card mb-6" data-group="bracket">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">Headnote brackets <span class="text-sm font-normal text-gray-500 dark:text-gray-400">(<span data-role="count">…</span>)</span></h2>
-      <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either.</span>
+      <span class="text-xs text-gray-500 dark:text-gray-400">A bracket the reader saw at the start of a paragraph and the model did not box (green, the guess: add it), or one the model boxed too faintly to redact (amber, the model's box: approve it). The next recompute redacts either. <kbd>←</kbd> <kbd>→</kbd> move the selected box sideways (<kbd>Shift</kbd> for a bigger step).</span>
+      <span class="flex gap-2">
+        <button type="button" class="btn-primary text-xs" data-role="bulk-approve" disabled
+                title="Answer every bracket card not answered or skipped yet as its first button would: add the missed ones, approve the faint ones, at their boxes as they stand now">Approve the rest</button>
+        <button type="button" class="btn-outline text-xs" data-role="bulk-out" disabled
+                title="Answer every bracket card not answered or skipped yet with No bracket, or take the faint box out">Take out the rest</button>
+      </span>
     </header>
     <div data-role="cards"><p class="bk-note">Loading…</p></div>
   </section>

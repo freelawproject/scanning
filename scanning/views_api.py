@@ -591,7 +591,7 @@ def serve_detections(request: HttpRequest, pk: int) -> JsonResponse:
     from scanning import review_states, yolo
     from scanning.services import drop_junk_entries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if review_states.preview_only(scan):
         try:
             return JsonResponse(yolo.preview_entries(scan), safe=False)
@@ -662,7 +662,7 @@ def serve_opinions(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries, review_states
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     if review_states.preview_only(scan):
         # The pairing is the compute's own output (#388): a row here
         # belongs to a run the preview does not show.
@@ -716,7 +716,7 @@ def dismiss_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -764,7 +764,7 @@ def restore_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -847,7 +847,7 @@ def add_boundary(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import boundaries, detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -936,7 +936,7 @@ def serve_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import redactions, review_states
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if review_states.preview_only(scan):
         # A preview shows the model's boxes and no measured geometry
         # (#388), including the rows a reopened volume left behind.
@@ -1012,7 +1012,7 @@ def add_redaction(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -1064,7 +1064,7 @@ def move_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -1119,7 +1119,7 @@ def dismiss_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     row = _redaction_of(scan, redaction_id)
@@ -1154,7 +1154,7 @@ def restore_redaction(
     """
     from scanning import redactions
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     row = _redaction_of(scan, redaction_id)
@@ -1235,7 +1235,7 @@ def compute_redactions_api(request: HttpRequest, pk: int) -> JsonResponse:
         takes no compute (``services.REDACTION_COMPUTE_STATUSES``: a
         closed review 2 is one, and the way back is the re-queue).
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if not Detection.objects.filter(scan=scan, active=True).exists():
         return JsonResponse(
             {"status": "error", "message": NO_DETECTIONS_MESSAGE}, status=400
@@ -1283,7 +1283,7 @@ def rerun_opinion_ensemble(
     from scanning import ensemble, opinion_ocr, s3_sync
     from scanning.models import OpinionReviewStatus
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     if opinion.status == OpinionReviewStatus.TEXT_REVIEW_DONE:
         return JsonResponse(
@@ -1378,7 +1378,7 @@ def _opinion_finding_or_refusal(
     """
     from scanning.models import OpinionFinding, OpinionReviewStatus
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
     finding = get_object_or_404(OpinionFinding, pk=finding_pk, opinion=opinion)
     if opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
@@ -2355,7 +2355,7 @@ def generate_files(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: Scan primary key.
     :return: Redirect to the scan processing page.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if scan.status not in (
         Status.REDACTION_REVIEW_DONE,
         Status.PENDING_REVIEW,
@@ -2385,7 +2385,7 @@ def approve_scan(request: HttpRequest, pk: int) -> HttpResponse:
     """
     from scanning.services import refresh_volume_queue_status_for_scan
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
 
     if scan.stage != Stage.APPROVED:
         messages.error(
@@ -2545,7 +2545,7 @@ def apply_rect_to_opinion(
     :param opinion_pk: OpinionScan primary key.
     :return: JSON response confirming the operation.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     opinion = get_object_or_404(OpinionScan, pk=opinion_pk, scan=scan)
@@ -2581,7 +2581,7 @@ def serve_redacted_pdf(
     :param pk: Scan primary key.
     :return: File response streaming the PDF.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
 
     # 1. Try the explicit redacted PDF path
     if scan.redacted_pdf_path and os.path.isfile(scan.redacted_pdf_path):
@@ -2637,7 +2637,7 @@ def serve_ocr_results(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with a list of OCR result dicts.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     if scan.ocr_results:
         return JsonResponse(scan.ocr_results, safe=False)
     return JsonResponse([], safe=False)
@@ -2700,7 +2700,7 @@ def dismiss_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2748,7 +2748,7 @@ def restore_finding(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2798,7 +2798,7 @@ def withdraw_stale_edit(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -2866,7 +2866,7 @@ def review_findings(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: ``{html, open, stale}``.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return JsonResponse(_findings_payload(scan, request))
 
 
@@ -2906,7 +2906,7 @@ def rebuild_findings(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import findings
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan, approved_ok=True)) is not None:
         return refusal
     if scan.status in BUSY_STATUSES:
@@ -2945,7 +2945,7 @@ def delete_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -3000,7 +3000,7 @@ def restore_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -3073,7 +3073,7 @@ def update_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -3164,7 +3164,7 @@ def add_single_detection(request: HttpRequest, pk: int) -> JsonResponse:
 
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     det = _parse_json_body(request)
@@ -3296,7 +3296,7 @@ def approve_detection(request: HttpRequest, pk: int) -> JsonResponse:
     """
     from scanning import detections
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     data = _parse_json_body(request)
@@ -3335,7 +3335,7 @@ def bake_redactions(request: HttpRequest, pk: int) -> JsonResponse:
     :param pk: Scan primary key.
     :return: JSON response with the bake result.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     if (refusal := _refuse_closed_review(scan)) is not None:
         return refusal
     if not Path(scan.output_dir).is_dir():
@@ -3389,7 +3389,7 @@ def export_pdf(
     """
     from scanning import apply
 
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     # Resolve the source PDF before the temp file exists, so a missing
     # original is a clean 404 rather than a leaked temp file.
     original = local_original_pdf(scan)

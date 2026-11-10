@@ -1091,8 +1091,10 @@
      *
      * The part is ``[from, to)`` of the group's ``text``. A voted group
      * draws its tokens with their flags; the words join with one space,
-     * the rule the document's own ``text`` follows, so a token starts
-     * where the one before it ends plus one, and a part cut at word
+     * none before a token that carries ``attach`` (a mark printed
+     * against its word, ``ensemble.join_tokens``), the rule the
+     * document's own ``text`` follows, so a token starts where the one
+     * before it ends, plus one unless it is attached, and a part cut at word
      * edges (``opinion_edits.snap_span``) never cuts a token. Every
      * other group draws its text with its marks cut to the part.
      *
@@ -1115,10 +1117,13 @@
             return;
         }
         var at = 0;
+        var seen = false;
         var first = true;
         tokens.forEach(function (token) {
+            if (seen && !token.attach) { at += 1; }
+            seen = true;
             var start = at;
-            at += token.text.length + 1;
+            at += token.text.length;
             if (start < from || start >= to) { return; }
             var span = document.createElement('span');
             markedNodes(
@@ -1153,7 +1158,7 @@
                         : '; the other engines read nothing there.')
                     + ' None of them is in the text; the readings show them.';
             }
-            if (!first) {
+            if (!first && !token.attach) {
                 // The separator the text holds there: a line break a
                 // person kept (``opinion_edits.fold``) stays one.
                 var between = (group.text || '').charAt(start - 1);

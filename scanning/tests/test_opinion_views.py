@@ -67,6 +67,29 @@ class TestOpinionList(ScanningTestCase):
 
         self.assertContains(response, reverse("legacy_opinion_list"))
 
+    def test_a_page_holds_twenty_rows(self):
+        """A corpus-wide status filter timed out at fifty rows a page
+        (#598)."""
+        from scanning.views import OPINIONS_PER_PAGE
+
+        self.assertEqual(OPINIONS_PER_PAGE, 20)
+        for page in range(500, 500 + 4 * OPINIONS_PER_PAGE, 4):
+            OpinionFactory(
+                scan=self.scan,
+                first_printed_page=page,
+                last_printed_page=page + 3,
+                page_count=4,
+                status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+            )
+        query = {"status": OpinionReviewStatus.READY_FOR_TEXT_REVIEW}
+
+        first = self.client.get(reverse("opinion_list"), query)
+        second = self.client.get(reverse("opinion_list"), {**query, "page": 2})
+
+        self.assertEqual(len(first.context["page_obj"]), OPINIONS_PER_PAGE)
+        self.assertEqual(len(second.context["page_obj"]), 1)
+        self.assertEqual(first.context["page_obj"].paginator.num_pages, 2)
+
     def test_the_list_leaves_the_volumes_caches_on_disk(self):
         """The join repeated the scan's OCR cache on each of fifty rows,
         and a page of one volume's opinions took minutes on a starved

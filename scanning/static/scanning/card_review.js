@@ -42,6 +42,11 @@
     /** A box a person moved and has not saved, by card key, so a
      *  reload of the cards keeps it. */
     var drafts = {};
+    /** The cards a bulk answer has queued and not written yet, by card
+     *  key: their own buttons, keys, nudge, open and skip refuse them,
+     *  so no card is written twice and no node the bulk writes to is
+     *  swapped under it. */
+    var pending = {};
     var pdf = null;
     var observer = null;
     var DPR = Math.min(2, window.devicePixelRatio || 1);
@@ -115,7 +120,7 @@
 
     function parse(response) {
         return response.json().catch(function () { return {}; }).then(function (data) {
-            return { ok: response.ok, data: data };
+            return { ok: response.ok, status: response.status, data: data };
         });
     }
 
@@ -333,7 +338,7 @@
             tag.addEventListener('mousedown', function (event) { event.stopPropagation(); });
             tag.addEventListener('click', function (event) {
                 event.stopPropagation();
-                if (answers[card.key] || skipped[card.key]) { return; }
+                if (answers[card.key] || skipped[card.key] || pending[card.key]) { return; }
                 card.edit = { id: other.id, label: other.label, own: other.own, box: other.box.slice(), original: other.box.slice() };
                 card.drawing = false;
                 replace(card, node);
@@ -344,6 +349,7 @@
                 x.type = 'button';
                 x.title = 'Withdraw this box';
                 x.addEventListener('mousedown', function (event) { event.stopPropagation(); });
+                x.disabled = Boolean(pending[card.key]);
                 x.addEventListener('click', function (event) {
                     event.stopPropagation();
                     x.disabled = true;
@@ -559,8 +565,9 @@
     function footer(card, node) {
         var foot = el('footer');
         var answer = answers[card.key];
-        var label = answer ? answer.label : (skipped[card.key] ? 'skipped' : 'not yet decided');
+        var label = answer ? answer.label : (pending[card.key] ? 'queued…' : (skipped[card.key] ? 'skipped' : 'not yet decided'));
         foot.appendChild(el('span', 'bk-state', label));
+        if (pending[card.key] && !answer) { return foot; }
         foot.appendChild(el('span', 'bk-grow'));
         // Step 2 at the card's page, with the box flashed: the viewer
         // reads the hash (``jumpToHashTarget`` in viewer_sidebar.js).
@@ -720,6 +727,7 @@
         // the wrong column, or a picture the crop cut.
         var full = el('button', 'cr-full-btn', card.full ? 'Back to the crop (Esc)' : 'Full page');
         full.type = 'button';
+        full.disabled = Boolean(pending[card.key]);
         full.dataset.key = 'f';
         full.title = 'Key: f';
         full.addEventListener('click', function (event) {
@@ -743,6 +751,7 @@
         // on the whole page.
         var draw = el('button', 'cr-full-btn' + (card.drawing ? ' cr-on' : ''), card.drawing ? 'Drawing… (Esc stops)' : 'Draw');
         draw.type = 'button';
+        draw.disabled = Boolean(pending[card.key]);
         draw.dataset.key = 'd';
         draw.title = 'Key: d. Drag a box on the scan, then pick its label.';
         draw.addEventListener('click', function (event) {
@@ -757,14 +766,43 @@
         var wrap = el('div', 'bk-cropwrap cr-cropwrap' + (card.full ? ' cr-fullpage' : ''));
         wrap.appendChild(blankCanvas(card));
         node.appendChild(wrap);
-        boxLayer(card, wrap, node, Boolean(answer) || Boolean(skipped[card.key]));
+        boxLayer(card, wrap, node, Boolean(answer) || Boolean(skipped[card.key]) || Boolean(pending[card.key]));
         node.appendChild(note(card.message));
         node.appendChild(footer(card, node));
         node.addEventListener('mousedown', function () { setActive(node); });
         wrap._card = card;
         observer.observe(wrap);
+        // The node is in the page by the next frame (``replace``).
+        if (card.full) { requestAnimationFrame(function () { fitFullPage(node); }); }
         return node;
     }
+
+    /** Size an opened card's page to the screen: as wide as the height
+     *  the header, the message and the footer leave allows, so the
+     *  whole page shows with no scroll. The box layer is in percent of
+     *  the wrap, so it follows. */
+    function fitFullPage(node) {
+        var wrap = node.querySelector('.cr-cropwrap.cr-fullpage');
+        if (!wrap || !wrap._card) { return; }
+        var card = wrap._card;
+        var style = getComputedStyle(node);
+        var height = node.clientHeight
+            - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+        var width = node.clientWidth
+            - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+        Array.prototype.forEach.call(node.children, function (child) {
+            if (child !== wrap) { height -= child.offsetHeight; }
+        });
+        var wrapStyle = getComputedStyle(wrap);
+        height -= parseFloat(wrapStyle.marginBottom) + 2;
+        var fit = Math.min(width, height * card.img_width / card.img_height);
+        wrap.style.width = Math.max(200, Math.floor(fit)) + 'px';
+    }
+
+    window.addEventListener('resize', function () {
+        if (!root) { return; }
+        root.querySelectorAll('.bk-card.cr-expanded').forEach(fitFullPage);
+    });
 
     /** Draw a card again in its place, after an answer, a skip or an
      *  Undo. */
@@ -779,27 +817,40 @@
     }
 
     // ── the answers ──────────────────────────────────────────────────
-    function write(card, node, url, body, label, undoOf) {
+    /** Write one answer and draw its card again. Resolves to whether
+     *  the server took it. The card's node is looked up when the answer
+     *  comes back, never the one it was sent from: a reload meanwhile
+     *  draws every card again. ``onGone`` answers a 404 in place of the
+     *  error, once (a finding a rebuild renewed). */
+    function write(card, node, url, body, label, undoOf, onGone) {
+        function live() {
+            return root.querySelector('.bk-card[data-key="' + card.key + '"]') || node;
+        }
         return postJson(url, body).then(function (answer) {
+            if (onGone && answer.status === 404) { return onGone(); }
+            delete pending[card.key];
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
-                replace(card, node);
-                return;
+                replace(card, live());
+                return false;
             }
             answers[card.key] = { label: label, undo: undoOf(answer.data) };
             history.push(card.key);
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
-            replace(card, node);
+            replace(card, live());
+            return true;
         }).catch(function (error) {
+            delete pending[card.key];
             toast('The request failed: ' + error.message, 'error');
-            replace(card, node);
+            replace(card, live());
+            return false;
         });
     }
 
     function add(card, node, as) {
         as = as || {};
-        write(card, node, cfg.urls.add_single_detection, {
+        return write(card, node, cfg.urls.add_single_detection, {
             page_index: card.page_index,
             label: as.label || card.label,
             label_id: as.labelId || card.label_id,
@@ -815,16 +866,33 @@
         });
     }
 
-    function dismiss(card, node) {
-        write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
-            // The finding's pk dies at the next rebuild, which any later
-            // write runs; the dismissal row outlives every rebuild.
+    function dismiss(card, node, retried) {
+        // The finding's pk dies at the next rebuild, which every bracket
+        // or box write runs: a 404 reads the cards' ids again, finds this
+        // card by its address (its key), and sends once more.
+        var onGone = retried ? null : function () {
+            return freshIssueIds().then(function () { return dismiss(card, node, true); });
+        };
+        return write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
+            // The dismissal row outlives every rebuild.
             return { url: cfg.urls.restore_finding, body: { dismissal_id: data.dismissal_id } };
-        });
+        }, onGone);
+    }
+
+    /** Read the server's cards and give each card here the finding pk
+     *  its address holds now, drawing nothing. */
+    function freshIssueIds() {
+        return getJson(cfg.cards_url).then(function (answer) {
+            var byKey = {};
+            ((answer.data && answer.data.cards) || []).forEach(function (c) { byKey[c.key] = c; });
+            cards.forEach(function (card) {
+                if (byKey[card.key] && byKey[card.key].issue_id) { card.issue_id = byKey[card.key].issue_id; }
+            });
+        }).catch(function () {});
     }
 
     function keep(card, node) {
-        write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
+        return write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
         });
     }
@@ -883,7 +951,7 @@
     }
 
     function resize(card, node) {
-        write(card, node, cfg.urls.update_detection, {
+        return write(card, node, cfg.urls.update_detection, {
             detection_id: card.detection_id, new_bbox: card.box
         }, 'resized', function (data) {
             return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
@@ -891,9 +959,102 @@
     }
 
     function takeOut(card, node) {
-        write(card, node, cfg.urls.delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
+        return write(card, node, cfg.urls.delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
             return { url: cfg.urls.restore_detection, body: { detection_id: card.detection_id } };
         });
+    }
+
+    // ── the bracket section's bulk answers ───────────────────────────
+    /** The bracket cards nobody touched: not answered, not skipped,
+     *  and not a link card, which has no box to answer here. A box a
+     *  person moved and did not save counts: the bulk answer saves it
+     *  where they put it. */
+    function untouchedBrackets() {
+        return cards.filter(function (card) {
+            return card.group === 'bracket' && (card.kind === 'bracket' || card.kind === 'faint') &&
+                !answers[card.key] && !skipped[card.key] && !card.edit && !card.drawing;
+        });
+    }
+
+    /** Answer every untouched bracket card as its own button would,
+     *  one card after the next, so each card keeps its own Undo:
+     *  ``approve`` adds a missed bracket at its box and approves a faint
+     *  one (or saves it where it was moved); ``out`` says No bracket to
+     *  a missed one and takes a faint one out. The run stops at the
+     *  first answer the server refuses (a closed review, an approval in
+     *  flight): one toast, and the cards not sent are open again.
+     *
+     *  In ``out``, the dismissals go first, with the finding pks read
+     *  fresh: a dismissal rebuilds nothing, and every box write renews
+     *  the pks of the bracket findings. */
+    var bulkRunning = false;
+    function bulkBrackets(mode, btn) {
+        var list = untouchedBrackets();
+        if (!list.length || bulkRunning) { return; }
+        var verb = mode === 'approve' ? 'Approve' : 'Take out';
+        if (!window.confirm(verb + ' the ' + list.length + ' bracket card(s) not answered yet?')) { return; }
+        if (mode === 'out') {
+            list.sort(function (a, b) { return (a.kind === 'faint') - (b.kind === 'faint'); });
+        }
+        bulkRunning = true;
+        root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) { b.disabled = true; });
+        // Each queued card drawn again in its place: never ``render``,
+        // which takes a moved box for the card's own.
+        function redraw(card) {
+            var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
+            if (node) { replace(card, node); }
+        }
+        list.forEach(function (card) {
+            pending[card.key] = true;
+            card.full = false;
+            redraw(card);
+        });
+        var done = 0;
+        function answerOf(card) {
+            var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
+            if (mode === 'approve') {
+                if (card.kind === 'faint') {
+                    return moved(card) ? resize(card, node) : keep(card, node);
+                }
+                return add(card, node);
+            }
+            return card.kind === 'faint' ? takeOut(card, node) : dismiss(card, node);
+        }
+        function next(at) {
+            if (at >= list.length) { return Promise.resolve(); }
+            return answerOf(list[at]).then(function (ok) {
+                if (!ok) { return; }
+                done += 1;
+                btn.textContent = verb + '… ' + done + ' of ' + list.length;
+                return next(at + 1);
+            });
+        }
+        var ready = mode === 'out' ? freshIssueIds() : Promise.resolve();
+        ready.then(function () { return next(0); }).then(function () {
+            bulkRunning = false;
+            var left = list.filter(function (card) { return pending[card.key]; });
+            pending = {};
+            left.forEach(redraw);
+            countAll();
+        });
+    }
+
+    /** The left and right arrows: the selected bracket card's box one
+     *  step sideways (a bigger step with Shift), as a drag would move
+     *  it, so the first button saves it where it lands. */
+    var NUDGE_PX = 3;
+    var NUDGE_BIG_PX = 15;
+    function nudge(node, dx) {
+        var card = node && node.querySelector('.bk-cropwrap') && node.querySelector('.bk-cropwrap')._card;
+        if (!card || card.group !== 'bracket' || !card.box) { return false; }
+        if (answers[card.key] || skipped[card.key] || pending[card.key] || card.edit || card.kind === 'link') { return false; }
+        var b = card.box.slice();
+        b[0] += dx;
+        b[2] += dx;
+        card.box = clampBox(b, cropOf(card), true);
+        placeBox(card, node.querySelector('.cr-box'));
+        markMoved(card, node);
+        return true;
     }
 
     /** Write the box under edit through the resize endpoint. The
@@ -1003,6 +1164,13 @@
         root.querySelector('[data-role="total"]').textContent = String(cards.length);
         root.querySelector('[data-role="done"]').textContent = String(done);
         root.querySelector('[data-role="skipped"]').textContent = String(skips);
+        var rest = untouchedBrackets().length;
+        if (!bulkRunning) {
+            root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) {
+                b.textContent = (b.dataset.role === 'bulk-approve' ? 'Approve the rest' : 'Take out the rest') + ' (' + rest + ')';
+                b.disabled = !rest || !cfg.review_open;
+            });
+        }
         refreshUndoEdit();
     }
 
@@ -1193,6 +1361,13 @@
             opened.querySelector('.cr-full-btn').click();
             return;
         }
+        if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') {
+            var by = event.shiftKey ? NUDGE_BIG_PX : NUDGE_PX;
+            if (nudge(opened || keyCard(), event.key === 'ArrowLeft' ? -by : by)) {
+                event.preventDefault();
+            }
+            return;
+        }
         if (opened && (event.key === 'ArrowDown' || event.key === 'ArrowUp')) { return; }
         if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
             // From the selected card, never from the one in view.
@@ -1222,6 +1397,7 @@
         }
         if (!card) { return; }
         setActive(card);
+        if (pending[card.dataset.key]) { return; }
         var btn = card.querySelector('[data-key="' + key + '"]');
         if (btn && !btn.disabled && !btn.hidden) {
             event.preventDefault();
@@ -1255,6 +1431,11 @@
             if (card) { setActive(card); }
         });
         root.querySelector('[data-role="reload"]').addEventListener('click', function () { load(); });
+        root.querySelectorAll('[data-role^="bulk-"]').forEach(function (b) {
+            b.addEventListener('click', function () {
+                bulkBrackets(b.dataset.role === 'bulk-approve' ? 'approve' : 'out', b);
+            });
+        });
         root.querySelector('[data-role="undo-edit"]').addEventListener('click', function () { undoEdit(); });
         root.querySelector('[data-role="recompute"]').addEventListener('click', function (event) {
             recompute(event.currentTarget);

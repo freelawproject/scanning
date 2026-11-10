@@ -57,7 +57,14 @@ from scanning import (
     redactions,
     s3_sync,
 )
-from scanning.models import Opinion, OpinionReviewStatus, Scan
+from scanning.models import (
+    OPINION_FIGURES_MAX_ATTEMPTS,
+    OPINION_FIGURES_OWED,
+    OPINION_PASS_ORDER,
+    Opinion,
+    OpinionReviewStatus,
+    Scan,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +74,7 @@ logger = logging.getLogger(__name__)
 FIGURES_PER_TICK = 1
 
 #: Failed cuts of one row at one digest before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_FIGURES_MAX_ATTEMPTS
 
 #: The content type of a cut, the format ``image_source`` answers.
 CONTENT_TYPE = "image/jpeg"
@@ -138,23 +145,13 @@ def owed() -> QuerySet:
     """
     return (
         Opinion.objects.filter(
+            OPINION_FIGURES_OWED,
             scan__status__in=opinion_pdf.OPINION_PDF_STATUSES,
-            figure_attempts__lt=MAX_ATTEMPTS,
-            ocr_glue_revision=F("glue_revision"),
-            ensemble_revision=F("glue_revision"),
-        )
-        .exclude(figure_digest="")
-        .exclude(figures_cut_digest=F("figure_digest"))
-        .exclude(
-            status__in=(
-                OpinionReviewStatus.TEXT_REVIEW_DONE,
-                OpinionReviewStatus.ERROR,
-            )
         )
         .select_related("scan", "scan__reporter", "apply_run", "boundary")
         # The scan's caches stay on disk (#582): the cut reads none.
         .defer(*Scan.large_fields("scan__"))
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
+        .order_by(*OPINION_PASS_ORDER)
     )
 
 
@@ -173,7 +170,9 @@ def due() -> QuerySet:
     )
 
 
-def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
+def covers(
+    opinion: Opinion, pages: set[int], volume=None
+) -> dict[int, list[dict]]:
     """Return what must never show on a picture, by volume page.
 
     The visible redactions of the scan, each with its ``fill``, and the
@@ -187,6 +186,9 @@ def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
     last character of a neighbour's line on the picture.
 
     :param opinion: The row, with ``boundary``.
+    :param pages: The volume pages of its pictures; the redactions of
+        the other pages are not read (#603), because a cover elsewhere
+        touches no picture.
     :param volume: The run's bitonal copy, open, for the cut; None for
         the ledger, which reads the rows alone.
     :returns: ``{page_index: [{"x0", "y0", "x1", "y1", "fill"}]}``.
@@ -196,7 +198,7 @@ def covers(opinion: Opinion, volume=None) -> dict[int, list[dict]]:
     if opinion.boundary is None:
         raise FigureError("the boundary of this opinion is gone")
     found: dict[int, list[dict]] = {}
-    for entry in redactions.visible_by_page(opinion.scan):
+    for entry in redactions.visible_by_page(opinion.scan, pages=pages):
         found.setdefault(entry["page_index"], []).extend(entry["rects"])
     for rect in boundaries.outside_rects(
         opinion.scan, [opinion.boundary], document=volume
@@ -217,6 +219,11 @@ def _touching(box: list[float], rects: list[dict]) -> list[dict]:
         and rect["y0"] < box[3]
         and rect["y1"] > box[1]
     ]
+
+
+def _picture_pages(document: dict) -> set[int]:
+    """Return the volume pages that hold a picture of the document."""
+    return {figure["page_index"] for figure in ensemble.figures_of(document)}
 
 
 def ledger_digest(opinion: Opinion, document: dict) -> str:
@@ -241,7 +248,7 @@ def ledger_digest(opinion: Opinion, document: dict) -> str:
     if not place:
         return ""
     try:
-        hidden = covers(opinion)
+        hidden = covers(opinion, _picture_pages(document))
     except FigureError:
         # No boundary: the cut refuses the row, and no mask is known.
         hidden = {}
@@ -364,7 +371,7 @@ def cut_one(opinion: Opinion) -> int:
     except apply.ApplyError as exc:
         raise TransientFault(str(exc)) from exc
     with fitz.open(str(bitonal)) as volume:
-        hidden = covers(opinion, volume)
+        hidden = covers(opinion, _picture_pages(document), volume)
     pages = {
         page.get("page_in_opinion"): page.get("frame") or {}
         for page in document.get("pages") or []

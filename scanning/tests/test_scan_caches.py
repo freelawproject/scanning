@@ -39,6 +39,7 @@ from scanning.models import (
     JobProvider,
     JobStage,
     JobStatus,
+    OpinionReviewStatus,
     PageRepairRequest,
     Scan,
     Status,
@@ -293,6 +294,24 @@ class TestProgressPoll(_CacheColumns):
 
         self.assertEqual(queries(), before)
 
+    def test_the_poll_reads_no_job_json(self):
+        """The engine summaries leave the rows' JSON on disk (#612)."""
+        ExternalJobFactory(scan=self.scan, status=JobStatus.COMPLETED)
+
+        with CaptureQueriesContext(connection) as captured:
+            data = self.client.get(self.url).json()
+
+        self.assertEqual(data["yolo_run"]["done"], 1)
+        job_queries = [
+            query["sql"]
+            for query in captured
+            if 'FROM "scanning_externaljob"' in query["sql"]
+        ]
+        self.assertTrue(job_queries)
+        for sql in job_queries:
+            self.assertNotIn('"input_manifest"', sql)
+            self.assertNotIn('"provider_meta"', sql)
+
 
 class TestLiveRun(ScanningTestCase):
     """``jobs.live_run`` reads the latest run in the query (#586)."""
@@ -318,6 +337,31 @@ class TestLiveRun(ScanningTestCase):
         self.assertEqual(len(captured), 1)
         # The database picks the run: the old runs never leave it.
         self.assertIn('"run" = (SELECT', captured[0]["sql"])
+
+    def test_the_named_fields_alone(self):
+        """A caller that names its fields reads no other column (#612)."""
+        from scanning import jobs
+
+        scan = ScanFactory()
+        ExternalJobFactory(scan=scan, error_code="x")
+
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs.live_run(
+                scan,
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                fields=jobs.SUMMARY_FIELDS,
+            )
+            summary = jobs.run_summary(
+                scan, JobStage.DETECT, JobEngine.BLACKLETTER
+            )
+
+        self.assertEqual([row.error_code for row in rows], ["x"])
+        self.assertEqual(summary["total"], 1)
+        # One query each: no deferred column was loaded row by row.
+        self.assertEqual(len(captured), 2)
+        for query in captured:
+            self.assertNotIn('"provider_meta"', query["sql"])
 
     def test_a_target_with_no_run_has_no_rows(self):
         from scanning import jobs
@@ -624,3 +668,347 @@ class TestVolumeRunsIndex(ScanningTestCase):
                 self.assertIn(
                     '"scanning_externaljob"."apply_run_id" IS NULL', sql
                 )
+
+
+class TestScanFetches(_CacheColumns):
+    """The views that fetch one scan, and the daemon reads of #602."""
+
+    def setUp(self):
+        self.client.force_login(self.make_staff_user())
+
+    def test_no_view_fetches_the_whole_scan(self):
+        """Every one-scan fetch of a view names what it keeps."""
+        import inspect
+        import re
+
+        from scanning import views, views_api, views_process
+
+        for module in (views, views_api, views_process):
+            with self.subTest(module.__name__):
+                self.assertEqual(
+                    re.findall(
+                        r"get_object_or_404\(\s*Scan\s*,\s*pk=pk\s*\)",
+                        inspect.getsource(module),
+                    ),
+                    [],
+                )
+
+    def test_a_keep_must_name_a_cache(self):
+        with self.assertRaises(ValueError):
+            Scan.without_caches("status")
+
+    def test_the_review_and_the_preview_reads(self):
+        scan = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
+        for name in (
+            "serve_detections",
+            "serve_redactions",
+            "review_findings",
+            "serve_scan_pdf",
+        ):
+            with self.subTest(name):
+                response = self.assert_caches_stay_on_disk(
+                    lambda: self.client.get(
+                        reverse(name, kwargs={"pk": scan.pk})
+                    )
+                )
+                self.assertLess(response.status_code, 500)
+
+    def test_the_opinion_urls(self):
+        opinion = OpinionFactory()
+        kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
+        for name in ("opinion_pdf_url", "opinion_blocking_cards"):
+            with self.subTest(name):
+                response = self.assert_caches_stay_on_disk(
+                    lambda: self.client.get(reverse(name, kwargs=kwargs))
+                )
+                self.assertLess(response.status_code, 500)
+
+    def test_the_blocking_cards_read_the_scan_in_the_join(self):
+        opinion = OpinionFactory()
+        url = reverse(
+            "opinion_blocking_cards",
+            kwargs={"pk": opinion.scan_id, "opinion_pk": opinion.pk},
+        )
+
+        with CaptureQueriesContext(connection) as captured:
+            self.client.get(url)
+
+        self.assertEqual(
+            [q["sql"] for q in captured if 'FROM "scanning_scan"' in q["sql"]],
+            [],
+        )
+
+    def test_the_blocking_cards_of_another_scan_are_not_found(self):
+        opinion = OpinionFactory()
+        other = ScanFactory()
+
+        response = self.client.get(
+            reverse(
+                "opinion_blocking_cards",
+                kwargs={"pk": other.pk, "opinion_pk": opinion.pk},
+            )
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_the_claim(self):
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(status=Status.QUEUED)
+
+        claimed = self.assert_caches_stay_on_disk(process_next_scan.claim_next)
+
+        self.assertEqual(claimed[0].pk, scan.pk)
+
+    def test_the_stale_sweep(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from scanning.management.commands import process_next_scan
+
+        scan = ScanFactory(status=Status.PROCESSING)
+        Scan.objects.filter(pk=scan.pk).update(
+            processed_at=timezone.now() - timedelta(days=1)
+        )
+
+        self.assert_caches_stay_on_disk(process_next_scan.recover_stale)
+
+    def test_the_volume_glue_candidates(self):
+        from scanning import jobs
+
+        ExternalJobFactory(status=JobStatus.COMPLETED)
+
+        def walk():
+            return list(
+                jobs.ready_volume_runs(
+                    JobStage.DETECT,
+                    JobEngine.BLACKLETTER,
+                    JobProvider.RUNPOD,
+                    lambda scan: jobs.live_run(
+                        scan, JobStage.DETECT, JobEngine.BLACKLETTER
+                    ),
+                    lambda rows: 0,
+                    3,
+                )
+            )
+
+        self.assertEqual(len(self.assert_caches_stay_on_disk(walk)), 1)
+
+
+class TestApplyPrefilter(ScanningTestCase):
+    """The page-number apply judges only a run that owes it (#602)."""
+
+    def _scan(self, apply_state=None, status=JobStatus.CONSUMED):
+        scan = ScanFactory(status=Status.READY_FOR_PAGE_COMPLETENESS_REVIEW)
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.ANALYZE,
+            engine=JobEngine.DOTS_MOCR,
+            status=status,
+            provider_meta={"apply": apply_state} if apply_state else {},
+        )
+        return scan
+
+    def _run(self):
+        from scanning import dots_mocr
+
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch(
+                "scanning.services.run_compute_issues", return_value=True
+            ) as compute,
+        ):
+            dots_mocr.apply_ready_runs()
+        return {call.args[0].pk for call in compute.call_args_list}
+
+    def test_an_unapplied_run_is_applied(self):
+        scan = self._scan()
+
+        self.assertEqual(self._run(), {scan.pk})
+
+    def test_an_applied_run_reads_no_scan(self):
+        self._scan({"applied_at": "2026-11-01T00:00:00+00:00"})
+        self._scan({"attempts": 3})
+
+        with patch("scanning.dots_mocr.live_analyze_jobs") as live:
+            self.assertEqual(self._run(), set())
+
+        live.assert_not_called()
+
+    def test_the_ledger_is_the_live_runs(self):
+        """An older run's applied stamp does not hold a new run back."""
+        scan = self._scan({"applied_at": "2026-11-01T00:00:00+00:00"})
+        ExternalJobFactory(
+            scan=scan,
+            stage=JobStage.ANALYZE,
+            engine=JobEngine.DOTS_MOCR,
+            status=JobStatus.CONSUMED,
+            run=2,
+        )
+
+        self.assertEqual(self._run(), {scan.pk})
+
+
+class TestVolumeGluePrefilter(ScanningTestCase):
+    """The volume glues read only a live run they may glue (#612)."""
+
+    def _walk(self):
+        from scanning import jobs
+
+        read = []
+
+        def live_rows(scan):
+            read.append(scan.pk)
+            return jobs.live_run(scan, JobStage.DETECT, JobEngine.BLACKLETTER)
+
+        yielded = [
+            scan.pk
+            for scan, _rows in jobs.ready_volume_runs(
+                JobStage.DETECT,
+                JobEngine.BLACKLETTER,
+                JobProvider.RUNPOD,
+                live_rows,
+                lambda rows: 0,
+                3,
+            )
+        ]
+        return set(yielded), set(read)
+
+    def _row(self, scan, run, status, shard=0, count=1):
+        return ExternalJobFactory(
+            scan=scan,
+            run=run,
+            status=status,
+            shard_index=shard,
+            shard_count=count,
+        )
+
+    def test_a_finished_live_run_is_glued(self):
+        scan = ScanFactory()
+        self._row(scan, 1, JobStatus.COMPLETED, 0, 2)
+        self._row(scan, 1, JobStatus.CONSUMED, 1, 2)
+
+        self.assertEqual(self._walk(), ({scan.pk}, {scan.pk}))
+
+    def test_an_older_runs_completed_row_reads_no_rows(self):
+        """The case that read a scan on every tick, forever."""
+        glued = ScanFactory()
+        self._row(glued, 1, JobStatus.COMPLETED)
+        self._row(glued, 2, JobStatus.CONSUMED)
+        waiting = ScanFactory()
+        self._row(waiting, 1, JobStatus.COMPLETED)
+        self._row(waiting, 2, JobStatus.IN_PROGRESS)
+
+        self.assertEqual(self._walk(), (set(), set()))
+
+    def test_an_unfinished_or_dead_live_run_reads_no_rows(self):
+        for status in (JobStatus.PENDING, JobStatus.FAILED):
+            scan = ScanFactory()
+            self._row(scan, 1, JobStatus.COMPLETED, 0, 2)
+            self._row(scan, 1, status, 1, 2)
+
+        self.assertEqual(self._walk(), (set(), set()))
+
+    def test_another_targets_rows_do_not_count(self):
+        """An apply run's rows are not the volume's live run."""
+        from scanning.models import ApplyRun
+
+        scan = ScanFactory()
+        self._row(scan, 1, JobStatus.COMPLETED)
+        ExternalJobFactory(
+            scan=scan,
+            run=7,
+            status=JobStatus.PENDING,
+            apply_run=ApplyRun.objects.create(scan=scan, number=1),
+        )
+
+        self.assertEqual(self._walk(), ({scan.pk}, {scan.pk}))
+
+
+class TestOpinionListIndexes(ScanningTestCase):
+    """The opinions list's Pictures column and status filter (#599).
+
+    Each index is pinned by its definition, and each query by the
+    columns it filters, so the planner can read the index. The plan is
+    not asserted: a test table is too small to measure its choice.
+    """
+
+    def _definition(self, name):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT indexdef FROM pg_indexes WHERE indexname = %s", [name]
+            )
+            (definition,) = cursor.fetchone()
+        return definition
+
+    def test_the_live_detections_of_a_run_by_page(self):
+        definition = self._definition("idx_det_live_run_page")
+
+        self.assertIn("(apply_run_id, page_index, label)", definition)
+        self.assertIn("WHERE active", definition)
+
+    def test_the_opinions_by_status(self):
+        self.assertIn(
+            "(status, id)", self._definition("idx_opinion_status_id")
+        )
+
+    def test_the_picture_count_reads_every_run_live_in_two_queries(self):
+        """A page that spans several volumes costs two reads, not 1 + N."""
+        from scanning import opinions
+        from scanning.models import ApplyRun, Detection
+
+        rows = []
+        for page_index in (0, 1):
+            scan = ScanFactory()
+            run = ApplyRun.objects.create(scan=scan, number=1)
+            rows.append(OpinionFactory(scan=scan, apply_run=run))
+            Detection.objects.create(
+                scan=scan,
+                apply_run=run,
+                page_index=page_index,
+                label="IMAGE",
+                label_id=0,
+                confidence=0.9,
+                x0=100.0,
+                y0=100.0,
+                x1=900.0,
+                y1=900.0,
+                img_width=1700,
+                img_height=2200,
+                source_page=page_index + 1,
+            )
+
+        with CaptureQueriesContext(connection) as captured:
+            counts = opinions.picture_counts(rows)
+
+        self.assertEqual(counts, {rows[0].pk: 1, rows[1].pk: 1})
+        reads = [
+            q["sql"] for q in captured if '"scanning_detection"' in q["sql"]
+        ]
+        self.assertEqual(len(reads), 2, reads)
+        for sql in reads:
+            with self.subTest(sql[:60]):
+                self.assertIn('"scanning_detection"."active"', sql)
+                self.assertIn('"scanning_detection"."apply_run_id"', sql)
+        self.assertIn('"scanning_detection"."page_index" IN', reads[1])
+
+    def test_a_status_filter_pages_newest_first(self):
+        self.client.force_login(self.make_user())
+        OpinionFactory(status=OpinionReviewStatus.ERROR)
+
+        with CaptureQueriesContext(connection) as captured:
+            response = self.client.get(
+                reverse("opinion_list"), {"status": "error"}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        page = [
+            q["sql"]
+            for q in captured
+            if q["sql"].startswith('SELECT "scanning_opinion"."id"')
+            and "LIMIT" in q["sql"]
+        ]
+        self.assertEqual(len(page), 1, page)
+        self.assertIn(""""scanning_opinion"."status" = 'error'""", page[0])
+        self.assertIn('ORDER BY "scanning_opinion"."id" DESC', page[0])
