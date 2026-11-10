@@ -1582,11 +1582,16 @@ class TestTheVote(TestCase):
         spaces is a mark of its own and stays."""
         self.assertEqual(
             ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
-            "No(s): CP-23-CR-0001065-2021",
+            ensemble.compare_text("No(s): CP-23-CR-0001065-2021"),
         )
-        self.assertEqual(ensemble.compare_text("a - b"), "a - b")
+        # A single dash set apart is one word with its neighbours since
+        # #610 (``_DASH_GAP``); a double dash keeps its spaces.
         self.assertEqual(
-            ensemble.compare_text("677 -- 679 and - so"), "677 -- 679 and - so"
+            ensemble.compare_text("a - b"), ensemble.compare_text("a-b")
+        )
+        self.assertEqual(ensemble.compare_text("677 -- 679"), "677 -- 679")
+        self.assertEqual(
+            ensemble.compare_text("677 - 679", hyphen_gaps=False), "677 - 679"
         )
         self.assertEqual(
             ensemble.compare_text("677- 679", hyphen_gaps=False), "677- 679"
@@ -1595,11 +1600,14 @@ class TestTheVote(TestCase):
             ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
             [
                 ("No(s):", "No(s):"),
-                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
+                (
+                    ensemble.compare_word("CP-23-CR-0001065-2021"),
+                    "CP-23-CR-0001065- 2021",
+                ),
             ],
         )
         self.assertEqual(
-            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
+            ensemble._pairs("a - b"), [(ensemble.compare_word("a-b"), "a - b")]
         )
         self.assertEqual(
             ensemble._pairs("677 -- 679"),
@@ -1675,6 +1683,36 @@ class TestTheVote(TestCase):
         )
         self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
 
+    def test_a_hyphen_between_letters_reads_as_the_joined_word(self):
+        """#610: a name broken at a line end (2129). dots.mocr kept the
+        hyphen (``Mohort-er``), Surya joined the halves (``Mohorter``),
+        Mistral left a space (``Mohort er``): a block nobody agrees on.
+        The key drops a hyphen inside a word, so dots.mocr and Surya are
+        the majority, and the shown spelling is the one without it."""
+        self.assertEqual(
+            ensemble.compare_word("Mohort-er"),
+            ensemble.compare_word("Mohorter"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("a Mohort- er b"),
+            ensemble.compare_text("a Mohorter b"),
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("Diane Mohort-er filed"),
+            [
+                ensemble._pairs("Diane Mohort er filed"),
+                ensemble._pairs("Diane Mohorter filed"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["Diane", "Mohorter", "filed"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
     def test_a_reporter_reads_alike_however_it_is_spaced(self):
         """#610: ``131 L. Ed. 2d 490`` (dots.mocr), ``131 L.Ed.2d 490``
         (Mistral), ``181 L.Ed.2d 490`` (Surya, a misread digit). The
@@ -1691,8 +1729,8 @@ class TestTheVote(TestCase):
             ensemble.compare_text("N.Y.S.3d,"),
         )
         self.assertNotEqual(
-            ensemble.compare_text("A. B. Smith"),
-            ensemble.compare_text("A.B. Smith"),
+            ensemble.compare_text("Ill. App. 3d"),
+            ensemble.compare_text("Ill.App.3d"),
         )
         self.assertEqual(
             ensemble._pairs("131 L. Ed. 2d 490"),
@@ -1712,6 +1750,140 @@ class TestTheVote(TestCase):
         )
         self.assertTrue(tokens[1].get("majority"))
         self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_an_ellipsis_belongs_to_the_word_before_it(self):
+        """#610: ``through another... source`` (dots.mocr), ``through
+        another . . . source`` (Mistral), ``through another source``
+        (Surya, which dropped it). The dots read alike already
+        (``_DOT_RUN``); attached or set apart, they are now one word
+        with the word before them, so dots.mocr and Mistral are the
+        majority over Surya. A lone period stays a word of its own."""
+        self.assertEqual(
+            ensemble.compare_text("through another... source"),
+            ensemble.compare_text("through another . . . source"),
+        )
+        self.assertEqual(
+            ensemble._pairs("through another . . . source"),
+            [
+                ("through", "through"),
+                ("another...", "another . . ."),
+                ("source", "source"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("a . b"), [("a", "a"), (".", "."), ("b", "b")]
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs('through another... source."4'),
+            [
+                ensemble._pairs('through another . . . source."4'),
+                ensemble._pairs('through another source."4'),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["through", "another...", 'source."4'],
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_an_abbreviation_of_single_letters_reads_alike_spaced(self):
+        """#610: ``(S.D.N. Y. 2005)`` (dots.mocr), ``(S.D.N. Y 2005)``
+        (Mistral, the period lost), ``(S.D.N.Y. 2005)`` (Surya). The
+        space inside the court's abbreviation closes up, so dots.mocr
+        and Surya are the majority over Mistral's missing period. A
+        name after an initial keeps its space."""
+        self.assertEqual(
+            ensemble.compare_text("477 (S.D.N. Y. 2005)."),
+            ensemble.compare_text("477 (S.D.N.Y. 2005)."),
+        )
+        self.assertNotEqual(
+            ensemble.compare_text("John A. Smith"),
+            ensemble.compare_text("John A.Smith"),
+        )
+        self.assertEqual(
+            ensemble._pairs("477 (S.D.N. Y. 2005)."),
+            [
+                ("477", "477"),
+                ("(S.D.N.Y.", "(S.D.N. Y."),
+                ("2005).", "2005)."),
+            ],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("477 (S.D.N. Y. 2005)."),
+            [
+                ensemble._pairs("477 (S.D.N. Y 2005)."),
+                ensemble._pairs("477 (S.D.N.Y. 2005)."),
+            ],
+        )
+
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_a_paragraph_or_section_sign_reads_alike_spaced(self):
+        """#610: ``Comp. ¶ 8);`` and ``Comp. ¶8);``, ``§ 1983`` and
+        ``§1983``: one reference spaced two ways."""
+        self.assertEqual(
+            ensemble.compare_text("Comp. ¶ 8);"),
+            ensemble.compare_text("Comp. ¶8);"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("42 U.S.C. §§ 1983"),
+            ensemble.compare_text("42 U.S.C. §§1983"),
+        )
+        self.assertEqual(
+            ensemble._pairs("Comp. ¶ 8);"),
+            [("Comp.", "Comp."), ("¶8);", "¶ 8);")],
+        )
+
+    def test_a_comma_after_an_ellipsis_goes_with_it(self):
+        """#610: ``face ..., be`` (dots.mocr), ``face . . . , be``
+        (Mistral), ``face . . . be`` (Surya, no comma)."""
+        self.assertEqual(
+            ensemble._pairs("on their face . . . , be"),
+            [
+                ("on", "on"),
+                ("their", "their"),
+                ("face...,", "face . . . ,"),
+                ("be", "be"),
+            ],
+        )
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("on their face ..., be"),
+            [
+                ensemble._pairs("on their face . . . , be"),
+                ensemble._pairs("on their face . . . be"),
+            ],
+        )
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(disputed, 0)
+
+    def test_a_dash_between_words_reads_alike_spaced(self):
+        """#610: ``municipality' - that`` (dots.mocr),
+        ``municipality'-that`` (Mistral), ``municipality' that``
+        (Surya, no dash)."""
+        self.assertEqual(
+            ensemble.compare_text("the municipality' - that is,"),
+            ensemble.compare_text("the municipality'-that is,"),
+        )
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("the municipality' - that is,"),
+            [
+                ensemble._pairs("the municipality'-that is,"),
+                ensemble._pairs("the municipality' that is,"),
+            ],
+        )
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["the", "municipality' - that", "is,"],
+        )
+        self.assertTrue(tokens[1].get("majority"))
         self.assertEqual(disputed, 0)
 
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
@@ -1757,9 +1929,10 @@ class TestTheVote(TestCase):
             " ".join(token["text"] for token in tokens),
             "La.), \u00b6 235-236. No one",
         )
+        # The sign and its number are one word since #610 (``_SIGN_GAP``).
         marked = [t["text"] for t in tokens if t.get("low_confidence")]
-        self.assertEqual(marked, ["\u00b6", "235-236."])
-        self.assertEqual(disputed, 2)
+        self.assertEqual(marked, ["\u00b6 235-236."])
+        self.assertEqual(disputed, 1)
 
     def test_a_join_two_engines_agree_on_writes_the_tail_once(self):
         """The other side of #391: both engines joined the two base
@@ -1885,10 +2058,11 @@ class TestTheVote(TestCase):
     def test_a_spaced_ellipsis_is_one_word(self):
         """Surya writes the ``. . .`` of the page where Mistral writes
         ``...``, and the block key reads them alike; the word vote must
-        too, or a block that agrees to the letter goes to a vote."""
+        too, or a block that agrees to the letter goes to a vote. The
+        ellipsis is one word with the word before it (#610)."""
         self.assertEqual(
             ensemble._pairs("sentence . . . must"),
-            [("sentence", "sentence"), ("...", ". . ."), ("must", "must")],
+            [("sentence...", "sentence . . ."), ("must", "must")],
         )
         self.assertEqual(
             ensemble._pairs("end ."), [("end", "end"), (".", ".")]
@@ -1908,7 +2082,7 @@ class TestTheVote(TestCase):
         self.assertEqual(answer["n_low_confidence"], 0)
         self.assertEqual(
             [token.get("majority", False) for token in answer["tokens"]],
-            [True, False, False, True],
+            [True, False, True],
         )
         self.assertEqual(answer["text"], "sentence ... must be")
 
