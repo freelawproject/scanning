@@ -1583,7 +1583,7 @@ class TestTheVote(TestCase):
         spaces is a mark of its own and stays."""
         self.assertEqual(
             ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
-            ensemble.compare_text("No(s): CP-23-CR-0001065-2021"),
+            "No(s): CP-23-CR-0001065-2021",
         )
         # A single dash set apart is one word with its neighbours since
         # #610 (``_DASH_GAP``); a double dash keeps its spaces.
@@ -1601,10 +1601,7 @@ class TestTheVote(TestCase):
             ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
             [
                 ("No(s):", "No(s):"),
-                (
-                    ensemble.compare_word("CP-23-CR-0001065-2021"),
-                    "CP-23-CR-0001065- 2021",
-                ),
+                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
             ],
         )
         self.assertEqual(
@@ -1699,6 +1696,23 @@ class TestTheVote(TestCase):
             ensemble.compare_text("a Mohorter b"),
         )
 
+        # Between digits the hyphen counts: two numbers, not one.
+        self.assertNotEqual(
+            ensemble.compare_word("12-345"), ensemble.compare_word("123-45")
+        )
+        self.assertNotEqual(
+            ensemble.compare_word("1-3"), ensemble.compare_word("13")
+        )
+        # Two engines' hyphen shows over one engine that lost it.
+        self.assertEqual(
+            ensemble._tidiest(["self-defense", "selfdefense", "self-defense"]),
+            "self-defense",
+        )
+        self.assertEqual(
+            ensemble._tidiest(["selfdefense", "self-defense", "self-defense"]),
+            "self-defense",
+        )
+
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("Diane Mohort-er filed"),
             [
@@ -1747,7 +1761,9 @@ class TestTheVote(TestCase):
         )
 
         self.assertEqual(
-            [t["text"] for t in tokens], ["1555,", "131", "L. Ed. 2d", "490"]
+            # The spelling two engines wrote shows (``_tidiest``).
+            [t["text"] for t in tokens],
+            ["1555,", "131", "L.Ed.2d", "490"],
         )
         self.assertTrue(tokens[1].get("majority"))
         self.assertFalse(any(t.get("low_confidence") for t in tokens))

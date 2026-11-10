@@ -462,13 +462,14 @@ _QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
 #: comparison alone, so the shown text is the winning engine's own.
 _BRACKET_GAP = re.compile(r"\[\s+\]")
 
-#: A hyphen inside a word (#610): a word a line end broke. One engine
-#: keeps the hyphen (``Mohort-er``) where another joins the halves
-#: (``Mohorter``), the same word. The key drops it, so the two agree
-#: only where another engine read the joined word, and of two spellings
-#: that agree the shown one has the fewest (:func:`_tidiest`), so the
-#: joined word is shown.
-_WORD_HYPHEN = re.compile(r"(?<=\w)-(?=\w)")
+#: A hyphen between two letters (#610): a word a line end broke. One
+#: engine keeps the hyphen (``Mohort-er``) where another joins the
+#: halves (``Mohorter``), the same word. The key drops it, so the two
+#: agree only where another engine read the joined word. Between digits
+#: it stays: ``12-345`` and ``123-45`` are two numbers, ``1-3`` is no
+#: ``13``. Of two spellings that agree, :func:`_tidiest` shows the one
+#: more engines wrote, and the one with fewer only when they tie.
+_WORD_HYPHEN = re.compile(r"(?<=[^\W\d_])-(?=[^\W\d_])")
 
 #: The reporters whose abbreviation the vote reads alike however it is
 #: spaced (#610): ``L. Ed. 2d`` and ``L.Ed.2d`` are one reporter, and
@@ -622,26 +623,35 @@ class RevisionMoved(TransientFault):
 
 
 def _tidiest(spellings: list[str]) -> str:
-    """Return the spelling with the fewest gaps of :data:`_GAPS`, the
-    first of them when they tie.
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, then
+    the one most engines wrote, then the one with the fewest hyphens
+    between letters, the first of them when they tie.
 
-    :param spellings: Readings that agree by key, in rank order.
+    A hyphen is never a reason on its own: two engines that wrote
+    ``self-defense`` show it over one that lost the hyphen
+    (``selfdefense``), and only one engine against one, a word a line
+    end broke (``Mohort-er``, ``Mohorter``), shows the joined word
+    (#610).
+
+    :param spellings: Readings that agree by key, in rank order, one
+        per engine.
     :returns: The one to show.
     :rtype: str
     """
+    written = Counter(spellings)
 
-    def gaps(text: str) -> tuple[int, int]:
+    def rank(text: str) -> tuple[int, int, int]:
         # Counted on the text as the key sees it: a curly mark or an
         # en dash is folded before a gap pattern can match beside it.
-        # A stray space first, then a hyphen inside a word (#610).
         folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
         spaced = _HYPHEN_GAP.sub("-", folded)
         return (
             sum(len(gap.findall(folded)) for gap in _GAPS),
+            -written[text],
             len(_WORD_HYPHEN.findall(spaced)),
         )
 
-    return min(spellings, key=gaps)
+    return min(spellings, key=rank)
 
 
 def plain(fragment: str | None) -> str:
