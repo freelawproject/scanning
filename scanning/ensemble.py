@@ -210,7 +210,9 @@ logger = logging.getLogger(__name__)
 #: 13 counts the positions of a person's kept tokens over the words as
 #: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
 #: split the cards align the engines with (``blocking_review.open_words``).
-SCHEMA_VERSION = 13
+#: 14 joins the halves of an empty bracket the same way (``express[ ]``,
+#: #610), which moves those positions again.
+SCHEMA_VERSION = 14
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -405,6 +407,34 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
 
+#: Whitespace before an ellipsis (#610): dots.mocr writes ``another...``
+#: where Mistral writes ``another . . .``, the same ellipsis set apart.
+#: The key takes the space out, and :func:`_pairs` reads the dots as
+#: part of the word before them.
+_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+(?=[,;:])")
+
+#: Whitespace around a single dash between two words (#610): dots.mocr
+#: writes ``municipality' - that`` where Mistral writes
+#: ``municipality'-that``, one dash spaced two ways. A double dash
+#: (``677 -- 679``) is a mark of its own and keeps its spaces.
+_DASH_GAP = re.compile(r"(?<=[^\s-])\s+-\s+(?=[^\s-])")
+_LONE_DASH = re.compile(r"^[-\u2013\u2014\u2212]$")
+_PUNCTUATION_ONLY = re.compile(r"^[,;:]+$")
+
+#: Whitespace inside an abbreviation of single letters (#610): dots.mocr
+#: writes ``S.D.N. Y.`` where Surya writes ``S.D.N.Y.``, one court. A
+#: space after a capital and its period closes up when a single capital
+#: follows (``Y.``, or ``Y`` with the period lost), so ``A. Smith`` and
+#: ``Mr. Jones`` keep theirs.
+_INITIALS_GAP = re.compile(r"(?<=\b[A-Z]\.)\s+(?=[A-Z](?![A-Za-z]))")
+_INITIAL_END = re.compile(r"\b[A-Z]\.$")
+_INITIAL_NEXT = re.compile(r"^[A-Z](?![A-Za-z])")
+
+#: Whitespace after a paragraph or section sign (#610): ``¶ 8`` and
+#: ``¶8``, ``§ 1983`` and ``§1983``, one reference spaced two ways.
+_SIGN_GAP = re.compile(r"(?<=[¶§])\s+")
+_LONE_SIGN = re.compile(r"^[¶§]+$")
+
 #: A hyphen between a word character and whitespace, with a word after:
 #: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
 #: ``CP-23-CR-0001065-2021``, the same docket number, and the two are
@@ -425,6 +455,96 @@ _HYPHEN_END = re.compile(r"\w-$")
 #: Surya, which drops the inner mark (``“finally``), is then one
 #: engine against two, a warning and not a block.
 _QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
+
+#: Whitespace inside an empty bracket (#610): Mistral writes the
+#: court's alteration ``express[ ]`` where Surya writes ``express[]``,
+#: one mark spelled two ways, and with the space it is two words to the
+#: vote against one. The key folds the space out, and :func:`_pairs`
+#: reads ``express[`` and ``]'`` as one word. Not one of :data:`_GAPS`:
+#: those pick the spelling a reader sees, and this rule changes the
+#: comparison alone, so the shown text is the winning engine's own.
+_BRACKET_GAP = re.compile(r"\[\s+\]")
+
+#: A hyphen between two letters (#610): a word a line end broke. One
+#: engine keeps the hyphen (``Mohort-er``) where another joins the
+#: halves (``Mohorter``), the same word. The key drops it, so the two
+#: agree only where another engine read the joined word. Between digits
+#: it stays: ``12-345`` and ``123-45`` are two numbers, ``1-3`` is no
+#: ``13``. Of two spellings that agree, :func:`_tidiest` shows the one
+#: more engines wrote, and the one with fewer only when they tie.
+_WORD_HYPHEN = re.compile(r"(?<=[^\W\d_])-(?=[^\W\d_])")
+
+#: The reporters whose abbreviation the vote reads alike however it is
+#: spaced (#610): ``L. Ed. 2d`` and ``L.Ed.2d`` are one reporter, and
+#: one engine's spacing against another's was a block nobody agrees on.
+#: An allowlist and never all of reporters-db, whose short and old
+#: abbreviations (``A.``, ``F.``, ``P.``) are words of the text as
+#: well. Written without spaces; a trailing comma or semicolon is no
+#: part of the name.
+REPORTERS = frozenset(
+    {
+        "U.S.",
+        "S.Ct.",
+        "L.Ed.",
+        "L.Ed.2d",
+        "F.2d",
+        "F.3d",
+        "F.4th",
+        "F.Supp.",
+        "F.Supp.2d",
+        "F.Supp.3d",
+        "F.App'x",
+        "A.2d",
+        "A.3d",
+        "N.E.2d",
+        "N.E.3d",
+        "N.W.2d",
+        "S.E.2d",
+        "S.W.2d",
+        "S.W.3d",
+        "P.2d",
+        "P.3d",
+        "So.2d",
+        "So.3d",
+        "N.Y.S.2d",
+        "N.Y.S.3d",
+        "Cal.Rptr.2d",
+        "Cal.Rptr.3d",
+    }
+)
+
+#: The most words a spaced :data:`REPORTERS` name takes (``N. Y. S. 3d``).
+_REPORTER_WORDS = 4
+
+#: What may close a reporter's word and is no part of its name.
+_AFTER_REPORTER = ",;:)"
+
+
+def _reporter(text: str) -> str | None:
+    """Return a reporter name of :data:`REPORTERS` spelled without its
+    spaces, with what follows it, or None when ``text`` is none."""
+    joined = "".join(text.split()).translate(_SAME_CHARACTER)
+    name = joined.rstrip(_AFTER_REPORTER)
+    return joined if name in REPORTERS else None
+
+
+def _join_reporters(words: list[str]) -> list[str]:
+    """Join the words of a spaced reporter name into one word, its
+    spacing kept: ``131 L. Ed. 2d 490`` is three words, as an engine
+    that writes ``L.Ed.2d`` reads it."""
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        for size in range(min(_REPORTER_WORDS, len(words) - index), 1, -1):
+            if _reporter(" ".join(words[index : index + size])):
+                out.append(" ".join(words[index : index + size]))
+                index += size
+                break
+        else:
+            out.append(words[index])
+            index += 1
+    return out
+
 
 #: The gaps the key folds out. Readings that agree by key and differ
 #: by one of these are one reading spelled two ways, and the shown one
@@ -506,21 +626,35 @@ class RevisionMoved(TransientFault):
 
 
 def _tidiest(spellings: list[str]) -> str:
-    """Return the spelling with the fewest gaps of :data:`_GAPS`, the
-    first of them when they tie.
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, then
+    the one most engines wrote, then the one with the fewest hyphens
+    between letters, the first of them when they tie.
 
-    :param spellings: Readings that agree by key, in rank order.
+    A hyphen is never a reason on its own: two engines that wrote
+    ``self-defense`` show it over one that lost the hyphen
+    (``selfdefense``), and only one engine against one, a word a line
+    end broke (``Mohort-er``, ``Mohorter``), shows the joined word
+    (#610).
+
+    :param spellings: Readings that agree by key, in rank order, one
+        per engine.
     :returns: The one to show.
     :rtype: str
     """
+    written = Counter(spellings)
 
-    def gaps(text: str) -> int:
+    def rank(text: str) -> tuple[int, int, int]:
         # Counted on the text as the key sees it: a curly mark or an
         # en dash is folded before a gap pattern can match beside it.
         folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
-        return sum(len(gap.findall(folded)) for gap in _GAPS)
+        spaced = _HYPHEN_GAP.sub("-", folded)
+        return (
+            sum(len(gap.findall(folded)) for gap in _GAPS),
+            -written[text],
+            len(_WORD_HYPHEN.findall(spaced)),
+        )
 
-    return min(spellings, key=gaps)
+    return min(spellings, key=rank)
 
 
 def plain(fragment: str | None) -> str:
@@ -578,9 +712,18 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    folded = _ELLIPSIS_GAP.sub("", folded)
+    folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
     if hyphen_gaps:
-        folded = _HYPHEN_GAP.sub("-", folded)
+        # The dash and the hyphen folds read a range out of ``677 - 679``
+        # too, so the page-number reader keeps the text as written.
+        folded = _DASH_GAP.sub("-", folded)
+        folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
     folded = _QUOTE_GAP.sub("", folded)
+    folded = _BRACKET_GAP.sub("[]", folded)
+    folded = " ".join(
+        _reporter(word) or word for word in _join_reporters(folded.split())
+    )
     return _WS.sub(" ", folded).strip()
 
 
@@ -597,11 +740,21 @@ def compare_word(word: str) -> str:
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
-    return _QUOTE_GAP.sub("", _HYPHEN_GAP.sub("-", folded)).strip()
+    folded = _ELLIPSIS_GAP.sub("", folded)
+    folded = _DASH_GAP.sub("-", folded)
+    folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
+    folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
+    folded = _QUOTE_GAP.sub("", folded)
+    folded = _BRACKET_GAP.sub("[]", folded).strip()
+    return _reporter(folded) or folded
 
 
 #: A word that is dots alone: one of a spaced ellipsis.
 _LONE_DOTS = re.compile(r"^\.+$")
+
+#: Dots with a comma, a semicolon or a colon on them: the last word of
+#: an ellipsis (``...,``, #610).
+_DOTS_THEN_MARK = re.compile(r"^\.+[,;:]+$")
 
 
 def _pairs(text: str) -> list[tuple[str, str]]:
@@ -610,7 +763,11 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     A run of two or more words that are dots alone is one word: Surya
     writes the spaced ellipsis of the page (``. . .``) where Mistral
     writes ``...``, and :func:`compare_text` reads them alike already
-    (``_DOT_RUN``). Split on whitespace first, they are three words
+    (``_DOT_RUN``), and it goes with the word before it
+    (``_ELLIPSIS_GAP``). So are the pieces of an abbreviation of single
+    letters (``S.D.N. Y.``, ``_INITIALS_GAP``) and a paragraph or section
+    sign and its number (``¶ 8``, ``_SIGN_GAP``). Split on whitespace
+    first, they are three words
     against one, and a block that agrees to the letter goes to a vote.
     A word that ends in a hyphen and the word after it are one word
     the same way (``_HYPHEN_GAP``): ``0001065- 2021`` is one engine's
@@ -618,25 +775,49 @@ def _pairs(text: str) -> list[tuple[str, str]]:
     one. So is a word of quotation marks alone and its neighbour
     (``_LONE_QUOTES``, :func:`_join_lone_quotes`): ``“ ‘finally`` and
     ``justice’ ”`` are one engine's spacing of ``"'finally`` and
-    ``justice'"``. The shown word keeps the engine's own spacing.
+    ``justice'"``. So are the two halves of an empty bracket
+    (``_BRACKET_GAP``): ``express[ ]'`` is one engine's spacing of
+    ``express[]'``. So are the words of a spaced reporter name of
+    :data:`REPORTERS` (``L. Ed. 2d``), one engine's spacing of
+    ``L.Ed.2d``. The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = _join_lone_quotes(text.split())
+    words = _join_reporters(_join_dashes(_join_lone_quotes(text.split())))
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
         end = index
         while end < len(words) and _LONE_DOTS.match(words[end]):
             end += 1
+        if end < len(words) and _DOTS_THEN_MARK.match(words[end]):
+            end += 1
+        if pairs and "".join(words[index:end]).count(".") >= 3:
+            # An ellipsis goes with the word before it, however it is
+            # spaced (``_ELLIPSIS_GAP``): ``another . . .`` is one word,
+            # as an engine that writes ``another...`` reads it; so does
+            # a comma set apart after it (``face . . . ,``).
+            if end < len(words) and _PUNCTUATION_ONLY.match(words[end]):
+                end += 1
+            shown = f"{pairs[-1][1]} {' '.join(words[index:end])}"
+            pairs[-1] = (compare_word(shown), shown)
+            index = end
+            continue
         if end - index < 2:
             end = index
-            while (
-                end + 1 < len(words)
-                and _HYPHEN_END.search(words[end])
-                and words[end + 1][:1].isalnum()
+            while end + 1 < len(words) and (
+                (
+                    _HYPHEN_END.search(words[end])
+                    and words[end + 1][:1].isalnum()
+                )
+                or (words[end].endswith("[") and words[end + 1][:1] == "]")
+                or (
+                    _INITIAL_END.search(words[end])
+                    and _INITIAL_NEXT.match(words[end + 1])
+                )
+                or _LONE_SIGN.match(words[end])
             ):
                 end += 1
             end += 1
@@ -648,6 +829,25 @@ def _pairs(text: str) -> list[tuple[str, str]]:
         pairs.append((compare_word(words[index]), words[index]))
         index += 1
     return pairs
+
+
+def _join_dashes(words: list[str]) -> list[str]:
+    """Join a single dash set apart between two words onto both
+    (``_DASH_GAP``): ``municipality' - that`` is one word, as an engine
+    that writes ``municipality'-that`` reads it."""
+    if not any(_LONE_DASH.match(word) for word in words):
+        return words
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if _LONE_DASH.match(word) and out and index + 1 < len(words):
+            out[-1] = f"{out[-1]} {word} {words[index + 1]}"
+            index += 2
+            continue
+        out.append(word)
+        index += 1
+    return out
 
 
 def _join_lone_quotes(words: list[str]) -> list[str]:
@@ -2738,11 +2938,13 @@ def vote_words(
       majority as a whole (#380).
     - ``"low_confidence": True``: a person must read it. Either no
       majority settled the word, and the base engine's own word is
-      kept, or the base never read it and the engines that did put it
-      in.
-    - ``"inserted": True``, beside the flag above: the second of those
-      two. They are different faults and they read differently, so the
-      viewer must not name one of them for both (#380).
+      kept, or the base never read it and a tie of the engines that
+      did put it in.
+    - ``"inserted": True``, beside either flag: a word the base never
+      read. Beside ``low_confidence`` it is a tie's word, a different
+      fault from a word no majority settled, and the viewer must not
+      name one of them for both (#380); beside ``majority`` a majority
+      read it alike, and it is settled (#610).
 
     Every token carries ``position``, the base position it answers for,
     or the one an inserted run was put in before: the blocking review
@@ -2750,12 +2952,12 @@ def vote_words(
     over :func:`_candidates`), and a token answers for one position of
     the base read alone.
 
-    A word the base engine did not read is put in, marked and counted
-    when the engines that read it are a majority or a tie: the base is
-    the engine this module believes, so a word it did not read is a
-    question for a person, and with two engines every difference is a
-    tie. A word only a minority read is dropped, which is the reading
-    of the majority.
+    A word the base engine did not read is put in when the engines that
+    read it are a majority or a tie. A majority's word is ``majority``,
+    settled as a word the base read otherwise is (#610); a tie's is
+    marked and counted, a question for a person, and with two engines
+    every difference is a tie. A word only a minority read is dropped,
+    which is the reading of the majority.
 
     **A gap is a spot.** Where a run was dropped, what each engine read
     in the gap is a reading like a word's: the base's is nothing, and
@@ -2838,13 +3040,17 @@ def vote_words(
                 for k, w in runs
                 if tuple(key for key in k if key) == keys
             )
+            # A majority that read the run alike settles it, as it settles
+            # a word the base read otherwise (#610): ``majority``, a
+            # warning. A tie is still a question for a person.
+            settled = count >= quorum
             for key, word in zip(run_keys, run_words, strict=True):
                 if not key:
                     continue
                 add(
                     {
                         "text": word,
-                        "low_confidence": True,
+                        ("majority" if settled else "low_confidence"): True,
                         "inserted": True,
                         "position": position,
                     }
@@ -2852,7 +3058,8 @@ def vote_words(
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
-            disputed += len(keys)
+            if not settled:
+                disputed += len(keys)
         if dropped:
             # The gap is a spot: each engine's reading of it is the
             # keys of its run here, and nothing for the base and for
