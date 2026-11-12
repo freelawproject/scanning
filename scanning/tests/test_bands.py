@@ -10,8 +10,8 @@ pixels of a 1700 by 2200 render.
 from blackletter.models import Label
 from django.test import TestCase
 
-from scanning import bands
-from scanning.factories import ScanFactory
+from scanning import bands, boundaries
+from scanning.factories import OpinionBoundaryFactory, ScanFactory
 from scanning.models import Detection
 from scanning.tests.test_detections import model_row
 from scanning.text_fit import PageCells
@@ -380,3 +380,198 @@ class TestTrimRows(TestCase):
         bands.trim_rows(scan, {3: page})
 
         self.assertEqual(bands.trim_rows(scan, {3: page}), 0)
+
+
+class TestOutsideRects(TestCase):
+    """``boundaries.outside_rects`` over a page with a picture across it."""
+
+    def _boundary(self, scan, **fields):
+        return OpinionBoundaryFactory(scan=scan, **fields)
+
+    def _masks(self, scan, boundary, page_index):
+        rects = boundaries.outside_rects(scan, [boundary])[boundary.pk]
+        return [r for r in rects if r["page_index"] == page_index]
+
+    def test_a_page_with_no_column_box_gets_its_masks(self):
+        # The picture and the key alone, and the volume's columns two
+        # pages before: the ending opinion masks the right column under
+        # the picture, where the next caption is.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 1)
+        row(scan, Label.IMAGE, 3, (278, 172, 1417, 1574))
+        row(scan, Label.KEY_ICON, 3, (439, 1658, 661, 1747))
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1747 * PT,
+        )
+
+        masks = self._masks(scan, ending, 3)
+
+        self.assertEqual(len(masks), 2)
+        left, right = sorted(masks, key=lambda r: r["x0"])
+        self.assertAlmostEqual(left["y0"], 1747 * PT, places=0)
+        self.assertAlmostEqual(right["y0"], 1574 * PT, places=0)
+        self.assertGreater(right["x0"], 300)
+
+    def test_the_next_opinion_masks_the_whole_picture(self):
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        row(scan, Label.IMAGE, 3, (228, 172, 1450, 1153))
+        row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322))
+        starting = self._boundary(
+            scan,
+            start_page_index=3,
+            start_x=242 * PT,
+            start_y=1453 * PT,
+            end_page_index=5,
+        )
+
+        masks = self._masks(scan, starting, 3)
+
+        wide, left = sorted(masks, key=lambda r: r["y0"])
+        # Both columns over the picture, then the left column down to
+        # the caption: the key of the opinion before.
+        self.assertLess(wide["x0"], 90)
+        self.assertGreater(wide["x1"], 520)
+        self.assertAlmostEqual(wide["y1"], 1153 * PT, places=0)
+        self.assertLess(left["x1"], 310)
+        self.assertAlmostEqual(left["y1"], 1453 * PT, places=0)
+
+    def test_the_ending_opinion_keeps_the_whole_picture(self):
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        row(scan, Label.IMAGE, 3, (228, 172, 1450, 1153))
+        row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322))
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1322 * PT,
+        )
+
+        masks = self._masks(scan, ending, 3)
+
+        self.assertEqual(len(masks), 2)
+        for mask in masks:
+            self.assertGreaterEqual(mask["y0"], 1153 * PT - 0.1)
+
+    def test_a_box_over_the_anchor_keeps_the_masks_of_the_columns(self):
+        # A box a curator drew over the key, which the trim never
+        # writes: the page is answered by blackletter's rule, as
+        # before.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        row(scan, Label.IMAGE, 3, (228, 172, 1450, 2009))
+        Detection.objects.filter(scan=scan, label="IMAGE").update(
+            model_name=Detection.ModelName.MANUAL
+        )
+        row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322))
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1322 * PT,
+        )
+
+        masks = self._masks(scan, ending, 3)
+
+        # The key is in the left column, so the whole right column is
+        # masked from the running head down, through the picture: the
+        # masks of a page with no picture, and the card's reason.
+        right = max(masks, key=lambda r: r["x0"])
+        self.assertLess(right["y0"], 100)
+
+    def test_a_one_column_page_gets_no_mask(self):
+        # A picture over one full-measure column: blackletter gives no
+        # mask for fewer than two columns, and a mask over half a line
+        # would cut it.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 1)
+        row(scan, Label.TEXT_COLUMN, 3, (235, 180, 1455, 2000))
+        row(scan, Label.IMAGE, 3, (278, 172, 1417, 1153))
+        row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322))
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1322 * PT,
+        )
+
+        self.assertEqual(self._masks(scan, ending, 3), [])
+
+    def test_one_boundary_on_one_page_is_masked_on_both_sides(self):
+        # An opinion that starts and ends under the picture, in the
+        # left column: the picture above it, and the columns after its
+        # key.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        row(scan, Label.IMAGE, 3, (228, 172, 1450, 1153))
+        short = self._boundary(
+            scan,
+            start_page_index=3,
+            start_x=242 * PT,
+            start_y=1300 * PT,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1700 * PT,
+        )
+
+        masks = self._masks(scan, short, 3)
+
+        self.assertEqual(len(masks), 4)
+        wide = min(masks, key=lambda r: r["y0"])
+        self.assertAlmostEqual(wide["y1"], 1153 * PT, places=0)
+        # After the key: the left column under it and the right one
+        # from the picture's foot, both to the foot of the page.
+        after = [r for r in masks if r["y1"] > 1900 * PT]
+        self.assertEqual(len(after), 2)
+        self.assertEqual(
+            sorted(round(r["y0"]) for r in after),
+            [round(1153 * PT), round(1700 * PT)],
+        )
+
+    def test_a_borrowed_gutter_is_held_off_the_caption(self):
+        # The volume's gutter is at 850 px, this page's caption starts
+        # at 830: the mask over the right column starts at the caption,
+        # and a running head set across the page moves nothing.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 1)
+        row(scan, Label.PAGE_HEADER, 3, (500, 100, 1200, 140))
+        row(scan, Label.IMAGE, 3, (278, 172, 1417, 1574))
+        row(scan, Label.KEY_ICON, 3, (439, 1658, 661, 1747))
+        row(scan, Label.CASE_CAPTION, 3, (830, 1650, 1470, 1900))
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1747 * PT,
+        )
+
+        masks = self._masks(scan, ending, 3)
+
+        right = max(masks, key=lambda r: r["x0"])
+        self.assertAlmostEqual(right["x0"], 830 * PT, places=0)
+        self.assertAlmostEqual(right["x1"], 1470 * PT, places=0)
+
+    def test_a_page_with_no_picture_is_blackletter_s(self):
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        ending = self._boundary(
+            scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=661 * PT,
+            end_y=1322 * PT,
+        )
+
+        masks = self._masks(scan, ending, 3)
+
+        right = max(masks, key=lambda r: r["x0"])
+        self.assertLess(right["y0"], 100)

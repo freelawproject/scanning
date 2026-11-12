@@ -865,6 +865,193 @@ def _page_bounds(
     return first, last
 
 
+def _band_layouts(scan: Scan, pages: dict) -> dict:
+    """Return the layout of each page that holds a full-width picture.
+
+    The pages of ``pages`` with a live ``IMAGE`` box across both
+    columns (``bands.is_full_width``), in PDF points. The columns are
+    the page's own when its boxes make two, the volume's otherwise, in
+    one more query, and only for a page with a box wide enough to ask.
+
+    :param scan: The scan.
+    :param pages: ``{page_index: blackletter Page}``, with the live
+        detections of each.
+    :returns: ``{page_index: bands.Layout}``.
+    """
+    from blackletter.models import Label
+    from blackletter.scanner import _margin_bounds
+
+    from scanning import bands
+
+    wide: dict[int, list] = {}
+    for page_index, page in pages.items():
+        boxes = [
+            (d.bbox.x1, d.bbox.y1, d.bbox.x2, d.bbox.y2)
+            for d in page.detections
+            if d.label == Label.IMAGE
+        ]
+        boxes = [b for b in boxes if bands.may_span(b, page.img_width)]
+        if boxes:
+            wide[page_index] = boxes
+    if not wide:
+        return {}
+    spans = {
+        page_index: [
+            (d.bbox.x1, d.bbox.x2)
+            for d in pages[page_index].detections
+            if d.label == Label.TEXT_COLUMN
+        ]
+        for page_index in wide
+    }
+    lacking = {i for i in wide if bands.own_columns(spans[i]) is None}
+    neighbours = bands.neighbour_rows(scan, lacking) if lacking else {}
+    layouts = {}
+    for page_index, boxes in wide.items():
+        page = pages[page_index]
+        found = bands.page_columns(
+            spans[page_index], boxes, page_index, page.img_width, neighbours
+        )
+        if found is None:
+            continue
+        left, right = found
+        if page_index in lacking:
+            left, right = _held_by_boxes(page, left, right)
+        full = sorted(
+            (b for b in boxes if bands.is_full_width(b, left, right)),
+            key=lambda b: b[1],
+        )
+        if not full:
+            continue
+        sx, sy = page.scale_x, page.scale_y
+        top, bottom = _margin_bounds(page)
+        divide = (left[1] + right[0]) / 2 * sx
+        layouts[page_index] = bands.Layout(
+            left=(min([left[0]] + [b[0] for b in full]) * sx, divide),
+            right=(divide, max([right[1]] + [b[2] for b in full]) * sx),
+            top=top,
+            bottom=bottom,
+            bands=tuple(
+                (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in full
+            ),
+        )
+    return layouts
+
+
+#: A box with more than this share of its width on each side of the
+#: gutter is set across it, and is in neither column.
+_ACROSS_SHARE = 0.25
+
+
+def _across_labels() -> frozenset:
+    """The labels of a box set across the page, which says nothing of
+    a column: the picture, the running head's line and the footnotes."""
+    from blackletter.models import Label
+
+    return frozenset(
+        {
+            Label.IMAGE,
+            Label.PAGE_HEADER,
+            Label.PAGE_NUMBER,
+            Label.STATE_ABBREVIATION,
+            Label.FOOTNOTES,
+        }
+    )
+
+
+def _held_by_boxes(page, left, right):
+    """Hold another page's columns off the boxes of this one.
+
+    The columns of a page with no column box are the volume's, a few
+    points off where this page was scanned. A box of the text (never
+    the running head's line or the footnotes, which are set across the
+    page, nor a box across the gutter) that lies in one
+    column and reaches past the gutter edge the neighbour gave moves
+    that edge, and a box that reaches past a column's outer edge moves
+    that one, so a mask over the right column covers the whole caption
+    and the redaction drawn on it, never all but a sliver.
+
+    :param page: The blackletter page, with its detections.
+    :param left: The left column's ``(x0, x1)``, in render pixels.
+    :param right: The right column's.
+    :returns: ``(left, right)``, the edges moved.
+    """
+
+    from scanning import bands
+
+    across = _across_labels()
+    divide = (left[1] + right[0]) / 2
+    left_edge, right_edge = left[1], right[0]
+    left_out, right_out = left[0], right[1]
+    for det in page.detections:
+        box = (det.bbox.x1, det.bbox.y1, det.bbox.x2, det.bbox.y2)
+        if det.label in across or bands.may_span(box, page.img_width):
+            continue
+        # A box set across the gutter (a centred line) is no column's;
+        # one that only reaches a little past the borrowed divide is
+        # the very box that corrects it.
+        over = min(divide - box[0], box[2] - divide)
+        if over > (box[2] - box[0]) * _ACROSS_SHARE:
+            continue
+        if (box[0] + box[2]) / 2 > divide:
+            right_edge = min(right_edge, box[0])
+            right_out = max(right_out, box[2])
+        else:
+            left_edge = max(left_edge, box[2])
+            left_out = min(left_out, box[0])
+    if left_edge > right_edge:
+        # A box of this page reaches past the borrowed edge of the
+        # facing column: the page's own box is the fact, so the edge
+        # only another page gave follows it. Two boxes of this page
+        # that cross each other say nothing, and the borrowed edges
+        # stand.
+        if left_edge == left[1]:
+            left_edge = right_edge
+        elif right_edge == right[0]:
+            right_edge = left_edge
+        else:
+            left_edge, right_edge = left[1], right[0]
+    return (left_out, left_edge), (right_edge, right_out)
+
+
+def _banded_rects(layout, page, row, is_first, is_last, fitz_page):
+    """Return one boundary's masks on a page with a full-width picture.
+
+    ``bands.outside`` for the rects, then the ink growth blackletter
+    gives its own masks when the caller has the page, a mask over one
+    column held at the gutter where the page has column boxes for
+    ``clamp_to_gutters`` to read. A page with none is held by the
+    growth's own stop at the first blank, which the gutter is.
+
+    :returns: The rects as ``fitz.Rect``, or None when the page is to
+        keep blackletter's masks.
+    """
+    import fitz
+    from blackletter import ink
+    from blackletter.scanner import clamp_to_gutters
+
+    from scanning import bands
+
+    masks = bands.outside(
+        layout,
+        row.start_x,
+        row.start_y,
+        is_first,
+        is_last,
+        end=(row.end_x, row.end_y),
+    )
+    if masks is None:
+        return None
+    rects = []
+    for mask in masks:
+        rect = fitz.Rect(*mask.box)
+        if fitz_page is not None:
+            rect = ink.grow_to_ink(fitz_page, rect, margin_y=0.0)
+            if mask.column:
+                rect = clamp_to_gutters(page, rect)
+        rects.append(rect)
+    return rects
+
+
 def outside_rects(
     scan: Scan,
     rows: list[OpinionBoundary],
@@ -883,6 +1070,11 @@ def outside_rects(
     then grows over the ink that continues past its side edges and is
     clamped to the gutters, so a column box a little inside the printed
     text leaves no first or last character of a masked line behind.
+
+    A page that holds a picture across both columns is read in another
+    order (``bands.outside``, #620): the columns above the picture, the
+    picture, the columns under it, so the picture goes whole to one
+    opinion and a page with no column box still gets its masks.
 
     :param scan: The scan.
     :param rows: The boundaries to answer for.
@@ -932,6 +1124,7 @@ def outside_rects(
                 )
             )
         pages[page_index] = page
+    layouts = _band_layouts(scan, pages)
 
     def _marker(page: Page, x: float, y: float, which: str) -> BLDetection:
         """A one-pixel detection at the anchor, in the page's pixels."""
@@ -962,15 +1155,27 @@ def outside_rects(
             fitz_page = None
             if document is not None and page_index < document.page_count:
                 fitz_page = document[page_index]
-            for rect in _outside_opinion_rects(
-                page,
-                page.pdf_width,
-                caption,
-                key,
-                is_first,
-                is_last,
-                fitz_page=fitz_page,
-            ):
+            banded = None
+            if page_index in layouts:
+                banded = _banded_rects(
+                    layouts[page_index],
+                    page,
+                    row,
+                    is_first,
+                    is_last,
+                    fitz_page,
+                )
+            if banded is None:
+                banded = _outside_opinion_rects(
+                    page,
+                    page.pdf_width,
+                    caption,
+                    key,
+                    is_first,
+                    is_last,
+                    fitz_page=fitz_page,
+                )
+            for rect in banded:
                 rects.append(
                     {
                         "page_index": page_index,

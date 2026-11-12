@@ -272,7 +272,7 @@ def keyed(
 #: what the OCR glue or the redacted PDF reads off the rows, and every
 #: opinion is rebuilt at its volume's next approval, as every approval
 #: did before the digest.
-DIGEST_RULES = 1
+DIGEST_RULES = 2
 
 
 @dataclass
