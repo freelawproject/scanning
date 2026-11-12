@@ -1889,7 +1889,7 @@ def _import_detections(
         come back.
     :return: How many rows were created.
     """
-    from scanning import columns
+    from scanning import bands, columns
     from scanning import detections as decisions
 
     scan = Scan.objects.get(pk=scan_pk)
@@ -1903,6 +1903,7 @@ def _import_detections(
             # The rows the decisions were made on are the shaped rows.
             columns.separate_rows(scan, cells)
             columns.trim_feet(scan, cells)
+            bands.trim_rows(scan, cells)
         landed, stale = decisions.resolve(scan)
         moved = 0
         if run is not None and kept:
@@ -2077,6 +2078,7 @@ def run_compute_redactions(
     """
     from scanning import (
         apply,
+        bands,
         brackets,
         columns,
         editorial,
@@ -2254,6 +2256,7 @@ def run_compute_redactions(
             # A column box the model ran to the foot of the facing
             # column ends at its own last line of print.
             columns.trim_feet(scan, cells)
+            bands.trim_rows(scan, cells)
 
         # The brackets the reader saw, stored as rows so that the
         # findings can be rebuilt from the rows alone (#328). It reads
@@ -2287,6 +2290,7 @@ def run_compute_redactions(
             with _log_stage("Column gutter"):
                 columns.separate_rows(scan, cells)
                 columns.trim_feet(scan, cells)
+                bands.trim_rows(scan, cells)
 
         # One corrected document for the pairing and the geometry, and
         # one pairing (#240 PR C): the boundaries are rows written from
