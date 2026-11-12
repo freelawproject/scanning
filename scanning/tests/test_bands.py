@@ -10,9 +10,9 @@ pixels of a 1700 by 2200 render.
 from blackletter.models import Label
 from django.test import TestCase
 
-from scanning import bands, boundaries
+from scanning import bands, boundaries, findings
 from scanning.factories import OpinionBoundaryFactory, ScanFactory
-from scanning.models import Detection
+from scanning.models import CheckName, Detection, Issue
 from scanning.tests.test_detections import model_row
 from scanning.text_fit import PageCells
 
@@ -341,6 +341,7 @@ class TestTrimRows(TestCase):
         self.assertEqual(bands.trim_rows(scan, {}), 0)
         picture.refresh_from_db()
         self.assertEqual(picture.y1, 2009.0)
+        self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
 
     def test_a_caption_alone_is_left_for_the_card(self):
         scan = ScanFactory(page_count=6)
@@ -351,6 +352,7 @@ class TestTrimRows(TestCase):
         self.assertEqual(bands.trim_rows(scan, {}), 0)
         picture.refresh_from_db()
         self.assertEqual(picture.y1, 1500.0)
+        self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
 
     def test_a_box_a_curator_drew_is_not_written(self):
         scan = ScanFactory(page_count=6)
@@ -485,6 +487,7 @@ class TestOutsideRects(TestCase):
         # masks of a page with no picture, and the card's reason.
         right = max(masks, key=lambda r: r["x0"])
         self.assertLess(right["y0"], 100)
+        self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
 
     def test_a_one_column_page_gets_no_mask(self):
         # A picture over one full-measure column: blackletter gives no
@@ -575,3 +578,80 @@ class TestOutsideRects(TestCase):
 
         right = max(masks, key=lambda r: r["x0"])
         self.assertLess(right["y0"], 100)
+
+
+class TestOverBoundary(TestCase):
+    """The step-2 card of a picture box the trim left over a boundary."""
+
+    def _page(self, scan, **fields):
+        columns(scan, 3)
+        picture = row(
+            scan, Label.IMAGE, 3, (232, 172, 1450, 2009), confidence=0.7
+        )
+        row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322), **fields)
+        return picture
+
+    def test_a_box_over_a_key_icon_is_a_card(self):
+        scan = ScanFactory(page_count=6)
+        picture = self._page(scan)
+
+        found = list(bands.over_boundary(scan, None))
+
+        self.assertEqual(len(found), 1)
+        finding = found[0]
+        self.assertEqual(finding["check_name"], CheckName.IMAGE_OVER_BOUNDARY)
+        self.assertEqual(finding["severity"], Issue.Severity.ERROR)
+        self.assertEqual(finding["page_number"], 4)
+        self.assertEqual(finding["metadata"]["detection_id"], picture.pk)
+        self.assertEqual(
+            finding["metadata"]["bbox"], [232.0, 172.0, 1450.0, 2009.0]
+        )
+
+    def test_the_trim_answers_the_card(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        bands.trim_rows(scan, {})
+
+        self.assertEqual(list(bands.over_boundary(scan, None)), [])
+
+    def test_a_box_a_curator_drew_is_asked_about(self):
+        # The trim never writes a hand-drawn box, so the card is the
+        # one thing that says it is over the key.
+        scan = ScanFactory(page_count=6)
+        picture = self._page(scan)
+        Detection.objects.filter(pk=picture.pk).update(
+            model_name=Detection.ModelName.MANUAL, confidence=1.0
+        )
+        bands.trim_rows(scan, {})
+
+        self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
+
+    def test_a_key_icon_under_the_gate_is_no_anchor(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan, confidence=0.05)
+
+        self.assertEqual(list(bands.over_boundary(scan, None)), [])
+
+    def test_another_page_is_not_read(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+
+        self.assertEqual(list(bands.over_boundary(scan, None, {1})), [])
+        self.assertEqual(len(list(bands.over_boundary(scan, None, {3}))), 1)
+
+    def test_the_rebuild_writes_the_card_with_a_dismissal_address(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        OpinionBoundaryFactory(scan=scan, end_page_index=3)
+
+        findings.rebuild(scan, None)
+
+        card = scan.issues.get(check_name=CheckName.IMAGE_OVER_BOUNDARY)
+        self.assertEqual(card.page_number, 4)
+        self.assertIn(CheckName.IMAGE_OVER_BOUNDARY, findings.PAGE_CHECKS)
+        # The address a dismissal is keyed by is the box's.
+        address = findings.address_of(
+            {"check_name": card.check_name, "metadata": card.metadata}
+        )
+        self.assertEqual(address["label"], "IMAGE")
+        self.assertEqual(address["source_page"], 4)

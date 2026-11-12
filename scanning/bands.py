@@ -659,3 +659,54 @@ def trim_rows(scan, cells: dict[int, PageCells]) -> int:
             len(changed),
         )
     return len(changed)
+
+
+# ---------------------------------------------------------------------------
+# The card of a box the trim left
+# ---------------------------------------------------------------------------
+
+
+def over_boundary(scan, run, pages=None):
+    """Yield one finding per picture box still drawn over a boundary.
+
+    The safety net of the trim: a box a curator drew, a box that holds
+    a caption and no key icon, a box whose trim would leave nothing of
+    the picture. Such a page keeps blackletter's masks, which cut the picture
+    at the gutter or mask nothing, and the opinion text drops the
+    caption the box covers, so a person has to move the box. The card
+    goes at the rebuild after the box no longer holds the anchor.
+
+    :param scan: The scan.
+    :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
+    :yields: The finding dicts ``findings.rebuild`` writes.
+    """
+    from scanning.models import CheckName, Issue
+
+    for entry in held_pictures(scan, pages, run=run):
+        row = entry.row
+        yield {
+            "check_name": CheckName.IMAGE_OVER_BOUNDARY,
+            "target": Issue.Target.DETECTION,
+            "page_number": row.page_index + 1,
+            "severity": Issue.Severity.ERROR,
+            "message": (
+                "This image box runs over a key icon or a caption: the end "
+                "of one opinion or the start of the next is under it. Pull "
+                "the foot of the box up to where the picture ends. Until "
+                "then the opinion text drops the caption the box covers, "
+                "and the picture is cut between the two opinions or shown "
+                "in both."
+            ),
+            "metadata": {
+                "detection_id": row.pk,
+                "page_index": row.page_index,
+                "label": row.label,
+                "label_id": row.label_id,
+                "bbox": [row.x0, row.y0, row.x1, row.y1],
+                "img_width": row.img_width,
+                "img_height": row.img_height,
+                "source_edit": row.source_edit_id,
+                "source_page": row.source_page,
+            },
+        }
