@@ -11,8 +11,15 @@ from blackletter.models import Label
 from django.test import TestCase
 
 from scanning import bands, boundaries, findings
-from scanning.factories import OpinionBoundaryFactory, ScanFactory
-from scanning.models import CheckName, Detection, Issue
+from scanning.factories import (
+    OpinionBoundaryFactory,
+    ScanFactory,
+)
+from scanning.models import (
+    CheckName,
+    Detection,
+    Issue,
+)
 from scanning.tests.test_detections import model_row
 from scanning.text_fit import PageCells
 
@@ -268,6 +275,17 @@ class TestTrimmedFoot(TestCase):
         self.assertIsNone(
             bands.trimmed_foot(self.BOX, [caption], [], self.DIVIDE)
         )
+
+    def test_a_caption_above_the_key_does_not_move_the_trim(self):
+        # The heading of a form the picture reproduces, read as a
+        # caption, well above the key: the box ends at the key.
+        heading = ((500.0, 600.0, 1200.0, 760.0), bands.CAPTION)
+
+        foot = bands.trimmed_foot(
+            self.BOX, [heading, self.KEY], [], self.DIVIDE
+        )
+
+        self.assertEqual(foot, 1233 - bands.FOOT_GAP_PX)
 
     def test_a_trim_that_leaves_no_picture_is_refused(self):
         key = ((411.0, 190.0, 661.0, 215.0), bands.KEY)

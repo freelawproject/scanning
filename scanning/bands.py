@@ -470,7 +470,8 @@ def trimmed_foot(
     Only a box that holds a key icon is trimmed: the key ends the
     opinion the picture belongs to, so what follows it is the next
     one's. A caption alone inside a box may be the caption of a form
-    the picture reproduces, and that box is left for the card.
+    the picture reproduces, and that box is left for the card; a
+    caption above the key never moves the trim, for the same reason.
 
     :param box: The model's box, in render pixels.
     :param anchors: The key icon and caption boxes of the page.
@@ -480,10 +481,13 @@ def trimmed_foot(
     :returns: The new ``y1``, or None when the box holds no key icon
         or the trim is not worth a write.
     """
-    held = held_anchors(box, anchors)
-    if not any(label == KEY for _box, label in held):
+    keys = [a for a, label in held_anchors(box, anchors) if label == KEY]
+    if not keys:
         return None
-    highest = min((a for a, _label in held), key=lambda a: a[1])
+    # The highest key, never a caption above it: a caption over the key
+    # is the picture's own (a form's heading), and the next opinion's
+    # caption beside the key is found by the walk of the facing column.
+    highest = min(keys, key=lambda a: a[1])
     top, foot = column_top(box, highest, cells, divide)
     new = (foot + top) / 2 if foot is not None else top - FOOT_GAP_PX
     if box[3] - new < MIN_TRIM_PX or new - box[1] < MIN_KEPT_PX:
