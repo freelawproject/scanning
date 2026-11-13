@@ -434,28 +434,36 @@ KEY = Label.KEY_ICON.name
 CAPTION = Label.CASE_CAPTION.name
 
 
-def held_anchors(box: Box, anchors: list[Anchor]) -> list[Anchor]:
+def held_anchors(
+    box: Box, anchors: list[Anchor], under: bool = False
+) -> list[Anchor]:
     """Return the anchors a picture box is drawn over.
 
     The point is the one a boundary is anchored at, the test of
     :func:`outside`: the top of a caption, the foot of a key icon,
     more than :data:`ANCHOR_SLACK_PX` inside the box. So a box the
     masks cannot answer for is a box this names, whatever share of the
-    caption it covers.
+    caption it covers, and wherever across the page the anchor is: the
+    masks refuse a page by the height of the anchor alone, so the card
+    does. The trim asks for more, ``under``: the anchor's centre inside
+    the box's width, because a key beside a picture says nothing of
+    where the picture ends.
 
     :param box: A picture's box.
     :param anchors: The key icon and caption boxes of its page, in the
         same render pixels.
+    :param under: Keep only the anchors the box is drawn over, the
+        trim's test.
     """
     held = []
     for anchor in anchors:
         a, label = anchor
         at = a[3] if label == KEY else a[1]
-        if (
-            box[0] <= (a[0] + a[2]) / 2 <= box[2]
-            and box[1] + ANCHOR_SLACK_PX < at < box[3] - ANCHOR_SLACK_PX
-        ):
-            held.append(anchor)
+        if not box[1] + ANCHOR_SLACK_PX < at < box[3] - ANCHOR_SLACK_PX:
+            continue
+        if under and not box[0] <= (a[0] + a[2]) / 2 <= box[2]:
+            continue
+        held.append(anchor)
     return held
 
 
@@ -481,7 +489,11 @@ def trimmed_foot(
     :returns: The new ``y1``, or None when the box holds no key icon
         or the trim is not worth a write.
     """
-    keys = [a for a, label in held_anchors(box, anchors) if label == KEY]
+    keys = [
+        a
+        for a, label in held_anchors(box, anchors, under=True)
+        if label == KEY
+    ]
     if not keys:
         return None
     # The highest key, never a caption above it: a caption over the key

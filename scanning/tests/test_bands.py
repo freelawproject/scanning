@@ -203,10 +203,14 @@ class TestHeldAnchors(TestCase):
             bands.held_anchors(self.BOX, [above, inside]), [inside]
         )
 
-    def test_an_anchor_beside_the_box_is_not_held(self):
+    def test_an_anchor_beside_the_box_is_held_but_not_under_it(self):
+        # At the picture's height and outside its width: the masks
+        # refuse the page by the height alone, so the card asks; the
+        # trim does not, because the key says nothing of the picture.
         key = ((100.0, 1233.0, 200.0, 1322.0), bands.KEY)
 
-        self.assertEqual(bands.held_anchors(self.BOX, [key]), [])
+        self.assertEqual(bands.held_anchors(self.BOX, [key]), [key])
+        self.assertEqual(bands.held_anchors(self.BOX, [key], under=True), [])
 
 
 class TestTrimmedFoot(TestCase):
@@ -286,6 +290,11 @@ class TestTrimmedFoot(TestCase):
         )
 
         self.assertEqual(foot, 1233 - bands.FOOT_GAP_PX)
+
+    def test_a_key_beside_the_box_trims_nothing(self):
+        key = ((100.0, 1233.0, 200.0, 1322.0), bands.KEY)
+
+        self.assertIsNone(bands.trimmed_foot(self.BOX, [key], [], self.DIVIDE))
 
     def test_a_trim_that_leaves_no_picture_is_refused(self):
         key = ((411.0, 190.0, 661.0, 215.0), bands.KEY)
@@ -649,6 +658,18 @@ class TestOverBoundary(TestCase):
         self._page(scan, confidence=0.05)
 
         self.assertEqual(list(bands.over_boundary(scan, None)), [])
+
+    def test_an_anchor_beside_the_box_is_a_card(self):
+        # A key at the picture's height, left of a box that covers
+        # most of both columns: the masks refuse the page, so the card
+        # says why.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        row(scan, Label.IMAGE, 3, (500, 172, 1450, 2009))
+        row(scan, Label.KEY_ICON, 3, (250, 1233, 450, 1322))
+
+        self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
+        self.assertEqual(bands.trim_rows(scan, {}), 0)
 
     def test_another_page_is_not_read(self):
         scan = ScanFactory(page_count=6)
