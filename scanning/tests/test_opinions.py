@@ -801,6 +801,31 @@ class TestTheInputDigest(TestCase):
             self.assertEqual(self.a.input_digest, "")
             self.assertIn("not in step 3", err.getvalue())
 
+    def test_the_backfill_leaves_a_digest_of_other_inputs(self):
+        """``stamp_opinion_digests`` writes a blank digest alone: a row
+        stamped under an older ``DIGEST_RULES`` owes a rebuild, and a
+        stamp over it would cancel the rebuild the raise asks for
+        (#620)."""
+        Opinion.objects.filter(scan=self.scan).update(input_digest="older")
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        out = StringIO()
+
+        with (
+            patch.object(
+                apply, "load_printed_pages", return_value=self.printed
+            ),
+            patch.object(
+                review_states, "final_run", return_value=self.apply_run
+            ),
+        ):
+            call_command("stamp_opinion_digests", stdout=out)
+
+        self.a.refresh_from_db()
+        self.assertEqual(self.a.input_digest, "older")
+        self.assertIn("stamped 0", out.getvalue())
+        self.assertIn("2 left for the next approval", out.getvalue())
+
     def test_the_digest_does_not_read_the_order_of_the_rows(self):
         boundary = OpinionBoundary.objects.get(
             scan=self.scan, start_page_index=0

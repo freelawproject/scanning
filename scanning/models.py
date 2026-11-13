@@ -1174,6 +1174,10 @@ class CheckName(models.TextChoices):
         "unboxed_picture",
         "Picture or table in no image box",
     )
+    IMAGE_OVER_BOUNDARY = (
+        "image_over_boundary",
+        "Image box over a key icon or a caption",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1249,6 +1253,7 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
         CheckName.UNBOXED_PICTURE,
+        CheckName.IMAGE_OVER_BOUNDARY,
     }
 )
 

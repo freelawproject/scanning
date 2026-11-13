@@ -67,6 +67,7 @@ from django.db.models.expressions import RawSQL
 from django.utils import timezone
 
 from scanning import (
+    bands,
     boundaries,
     brackets,
     detections,
@@ -165,6 +166,9 @@ PAGE_CHECKS = frozenset(
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
         CheckName.UNBOXED_PICTURE,
+        # An image box is judged against the key icons and captions of
+        # its own page (``bands.held_pictures``).
+        CheckName.IMAGE_OVER_BOUNDARY,
         # A headnote box is judged against the black boxes of its own
         # page, so a write on a page rebuilds that page's cards alone.
         CheckName.UNCOVERED_HEADNOTE,
@@ -293,6 +297,7 @@ def rebuild(
             found.extend(undetected.uncovered(scan, run, scoped))
             found.extend(undetected.cut_lines(scan, run, scoped))
             found.extend(pictures.uncovered(scan, run, scoped))
+            found.extend(bands.over_boundary(scan, run, scoped))
         resolve(scan, found)
         stale = Issue.objects.filter(scan=scan, check_name__in=REVIEW2_CHECKS)
         if scoped is not None:

@@ -1297,7 +1297,7 @@ class TestThePageScopedRebuild(ScanningTestCase):
         a page rebuild must name exactly the checks it rewrote."""
         import inspect
 
-        from scanning import editorial, pictures
+        from scanning import bands, editorial, pictures
         from scanning.models import REVIEW2_CHECKS
 
         takers = {
@@ -1305,6 +1305,7 @@ class TestThePageScopedRebuild(ScanningTestCase):
             undetected.uncovered: CheckName.UNDETECTED_TEXT,
             undetected.cut_lines: CheckName.REDACTION_CUTS_TEXT,
             pictures.uncovered: CheckName.UNBOXED_PICTURE,
+            bands.over_boundary: CheckName.IMAGE_OVER_BOUNDARY,
             findings._uncovered_headnote_findings: CheckName.UNCOVERED_HEADNOTE,
         }
         for fn in takers:
