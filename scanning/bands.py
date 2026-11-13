@@ -597,6 +597,8 @@ def held_pictures(
         from scanning import boundaries
 
         volume = Detection.objects.live().filter(scan=scan, label=KEY)
+        if run is not _ANY_RUN:
+            volume = volume.filter(apply_run=run)
         sized = {
             row.pk for row in boundaries.key_icon_rows(list(volume), bl_warm)
         }
@@ -675,7 +677,7 @@ def _less_dismissed(scan, rows: list) -> list:
     return [row for row in rows if not _dismissed(row)]
 
 
-def trim_rows(scan, cells: dict[int, PageCells]) -> int:
+def trim_rows(scan, cells: dict[int, PageCells], run=_ANY_RUN) -> int:
     """Trim the full-width ``IMAGE`` rows of a scan off the next opinion.
 
     Model rows only, smaller only: a box a curator drew reaches the
@@ -684,12 +686,17 @@ def trim_rows(scan, cells: dict[int, PageCells]) -> int:
 
     :param scan: The scan.
     :param cells: The cells of each page, ``text_fit.page_cells``.
+    :param run: The apply run whose rows are read, or nothing for
+        every live row. The import names its run: the hand-drawn rows
+        it kept are still at their page of the run before, until
+        ``relocate_manual_rows`` moves them, and a key drawn on another
+        page must not cut a picture of this one.
     :returns: How many rows were written.
     :rtype: int
     """
     from scanning.models import Detection
 
-    held = held_pictures(scan, model_only=True, sized_keys=True)
+    held = held_pictures(scan, run=run, model_only=True, sized_keys=True)
     changed = []
     for entry in held:
         row = entry.row

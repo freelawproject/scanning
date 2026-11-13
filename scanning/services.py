@@ -1903,7 +1903,9 @@ def _import_detections(
             # The rows the decisions were made on are the shaped rows.
             columns.separate_rows(scan, cells)
             columns.trim_feet(scan, cells)
-            bands.trim_rows(scan, cells)
+            # Its own run alone: the hand-drawn rows kept above are
+            # still at their page of the run before.
+            bands.trim_rows(scan, cells, run=run)
         landed, stale = decisions.resolve(scan)
         moved = 0
         if run is not None and kept:

@@ -17,6 +17,7 @@ from scanning.factories import (
     UserFactory,
 )
 from scanning.models import (
+    ApplyRun,
     CheckName,
     Detection,
     DetectionDecision,
@@ -389,6 +390,32 @@ class TestTrimRows(TestCase):
         self.assertEqual(bands.trim_rows(scan, {}), 0)
         picture.refresh_from_db()
         self.assertEqual(picture.y1, 2009.0)
+
+    def test_the_import_reads_the_rows_of_its_own_run(self):
+        # A key a curator drew under the run before sits at its old
+        # page until the relocation: it is no anchor of this run's
+        # picture.
+        scan = ScanFactory(page_count=6)
+        run = ApplyRun.objects.create(scan=scan, number=1, page_map={})
+        columns(scan, 3)
+        Detection.objects.filter(scan=scan).update(apply_run=run)
+        picture = row(
+            scan, Label.IMAGE, 3, (232, 172, 1450, 2009), apply_run=run
+        )
+        row(
+            scan,
+            Label.KEY_ICON,
+            3,
+            (411, 1233, 661, 1322),
+            model_name=Detection.ModelName.MANUAL,
+            confidence=1.0,
+        )
+
+        self.assertEqual(bands.trim_rows(scan, {}, run=run), 0)
+        picture.refresh_from_db()
+        self.assertEqual(picture.y1, 2009.0)
+        # The compute's own trim, after the relocation, reads it.
+        self.assertEqual(bands.trim_rows(scan, {}), 1)
 
     def test_a_caption_alone_is_left_for_the_card(self):
         scan = ScanFactory(page_count=6)
