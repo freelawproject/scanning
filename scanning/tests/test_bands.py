@@ -10,14 +10,16 @@ pixels of a 1700 by 2200 render.
 from blackletter.models import Label
 from django.test import TestCase
 
-from scanning import bands, boundaries, findings
+from scanning import bands, boundaries, detections, findings
 from scanning.factories import (
     OpinionBoundaryFactory,
     ScanFactory,
+    UserFactory,
 )
 from scanning.models import (
     CheckName,
     Detection,
+    DetectionDecision,
     Issue,
 )
 from scanning.tests.test_detections import model_row
@@ -369,6 +371,24 @@ class TestTrimRows(TestCase):
         picture.refresh_from_db()
         self.assertEqual(picture.y1, 2009.0)
         self.assertEqual(len(list(bands.over_boundary(scan, None))), 1)
+
+    def test_a_key_a_curator_dismissed_cuts_no_picture(self):
+        # The import shapes the rows before the decisions land, so the
+        # dismissed key is live again: the standing dismissal answers
+        # for it.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 3)
+        picture = row(scan, Label.IMAGE, 3, (232, 172, 1450, 2009))
+        key = row(scan, Label.KEY_ICON, 3, (411, 1233, 661, 1322))
+        detections.decide(
+            scan, key, DetectionDecision.Kind.DEACTIVATE, UserFactory()
+        )
+        # The next import writes the key again, live.
+        Detection.objects.filter(pk=key.pk).update(active=True, decision=None)
+
+        self.assertEqual(bands.trim_rows(scan, {}), 0)
+        picture.refresh_from_db()
+        self.assertEqual(picture.y1, 2009.0)
 
     def test_a_caption_alone_is_left_for_the_card(self):
         scan = ScanFactory(page_count=6)

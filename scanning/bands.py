@@ -601,6 +601,7 @@ def held_pictures(
             row.pk for row in boundaries.key_icon_rows(list(volume), bl_warm)
         }
         kept = [row for row in kept if row.label != KEY or row.pk in sized]
+    kept = _less_dismissed(scan, kept)
     for row in kept:
         anchors.setdefault(row.page_index, []).append(
             ((row.x0, row.y0, row.x1, row.y1), row.label)
@@ -630,6 +631,48 @@ def held_pictures(
                     Held(row, anchors[page_index], (left[1] + right[0]) / 2)
                 )
     return found
+
+
+def _less_dismissed(scan, rows: list) -> list:
+    """Return the anchor rows no standing dismissal names.
+
+    The import shapes the new model rows before the decisions land
+    (``services._import_detections``), so a key icon a curator
+    dismissed is live again when the trim reads it, and would cut the
+    picture at every import. The test is the landing's own
+    (``detections.resolve``): the decision's address and label, and
+    its copy of the box at ``IOU_THRESHOLD``. One query, and none for
+    a page with no anchor.
+
+    :param scan: The scan.
+    :param rows: Key icon and caption rows.
+    """
+    from scanning import detections
+    from scanning.models import DetectionDecision
+
+    if not rows:
+        return rows
+    dismissals = list(
+        detections.standing_decisions(scan).filter(
+            kind=DetectionDecision.Kind.DEACTIVATE,
+            source_page__in={row.source_page for row in rows},
+            label_id__in={row.label_id for row in rows},
+        )
+    )
+    if not dismissals:
+        return rows
+
+    def _dismissed(row) -> bool:
+        return any(
+            d.source_edit_id == row.source_edit_id
+            and d.source_page == row.source_page
+            and d.label_id == row.label_id
+            and detections.iou([row.x0, row.y0, row.x1, row.y1], d.target_bbox)
+            >= detections.IOU_THRESHOLD
+            for d in dismissals
+        )
+
+    return [row for row in rows if not _dismissed(row)]
 
 
 def trim_rows(scan, cells: dict[int, PageCells]) -> int:
