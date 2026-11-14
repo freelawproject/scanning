@@ -5405,6 +5405,13 @@ CARD_REVIEW_WRITES = (
     "restore_finding",
     "compute_redactions_api",
 )
+#: The step-2 writes of a redaction row the card review answers with,
+#: by the name its script reads: the margin pull of a text card and its
+#: Undo.
+CARD_REVIEW_REDACTION_WRITES = {
+    "move": "move_redaction",
+    "restore": "restore_redaction",
+}
 
 
 @login_required
@@ -5441,6 +5448,13 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
         "review_open": review_open,
         "urls": {
             name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
+        },
+        # The margin answer of a text card moves a strip, and its Undo
+        # gives a computed strip back: two step-2 writes addressed by
+        # the row, sent with the row 0 for the script to fill in.
+        "redaction_urls": {
+            short: reverse(name, kwargs={**kwargs, "redaction_id": 0})
+            for short, name in CARD_REVIEW_REDACTION_WRITES.items()
         },
     }
     return render(

@@ -36,6 +36,9 @@
      *  write that takes it back. */
     var answers = {};
     var skipped = {};
+    /** The text cards another card's write answered (a strip or a box
+     *  that took their block too), by card key: nothing left to write. */
+    var covered = {};
     /** The keys of the answers in the order they were made, so u
      *  takes back the last one wherever the cursor has moved on to. */
     var history = [];
@@ -53,7 +56,8 @@
     var MIN_BOX_PX = 8;
     var HANDLES = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
     var GROUPS = ['caption', 'bracket', 'text', 'image', 'editorial'];
-    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e' };
+    var KEY_NAMES = { enter: 'Return', x: 'x', s: 's', u: 'u', r: 'r', f: 'f', d: 'd', n: 'n', e: 'e', m: 'm' };
+    var SIDE_NAMES = { top: 'top', bottom: 'bottom', left: 'left', right: 'right' };
     var MIN_DRAW_PX = 8;
     var KINDS = {
         caption: 'caption the model missed',
@@ -565,9 +569,10 @@
     function footer(card, node) {
         var foot = el('footer');
         var answer = answers[card.key];
-        var label = answer ? answer.label : (pending[card.key] ? 'queued…' : (skipped[card.key] ? 'skipped' : 'not yet decided'));
+        var label = answer ? answer.label : (pending[card.key] ? 'queued…' : (skipped[card.key] ? 'skipped' : (covered[card.key] ? 'covered by another answer' : 'not yet decided')));
         foot.appendChild(el('span', 'bk-state', label));
         if (pending[card.key] && !answer) { return foot; }
+        if (covered[card.key] && !answer) { return foot; }
         foot.appendChild(el('span', 'bk-grow'));
         // Step 2 at the card's page, with the box flashed: the viewer
         // reads the hash (``jumpToHashTarget`` in viewer_sidebar.js).
@@ -685,6 +690,17 @@
                     });
                 }));
             }
+            if (card.kind === 'text' && card.margin) {
+                // The block is bleed-through or a stray mark at the
+                // page's edge: the strip of that edge is pulled over
+                // it, white, the drag a curator does in step 2. The
+                // server offers it only where the pull reaches no box.
+                var side = SIDE_NAMES[card.margin.side] || card.margin.side;
+                foot.appendChild(button('Pull ' + side + ' margin over it', 'm', 'btn-primary text-xs', function (btn) {
+                    btn.disabled = true;
+                    pullMargin(card, node);
+                }));
+            }
             var editorialLabel = labelNamed('EDITORIAL');
             if (card.kind === 'text' && editorialLabel) {
                 // The text card's third answer: the block is the
@@ -718,7 +734,7 @@
         var node = el('article', 'bk-card cr-card cr-' + card.kind + (card.full ? ' cr-expanded' : ''));
         node.dataset.key = card.key;
         var answer = answers[card.key];
-        if (answer) { node.classList.add('bk-done'); }
+        if (answer || covered[card.key]) { node.classList.add('bk-done'); }
         if (skipped[card.key]) { node.classList.add('cr-skipped'); }
         var header = el('header');
         header.appendChild(el('span', 'bk-step', card.step + ' of ' + card.total));
@@ -839,6 +855,7 @@
             delete drafts[card.key];
             if (window.showSaved) { showSaved(answer.data); }
             replace(card, live());
+            if (card.kind === 'text') { refreshPage(card.page_index); }
             return true;
         }).catch(function (error) {
             delete pending[card.key];
@@ -921,6 +938,61 @@
                 ? { url: cfg.urls.update_detection, body: { detection_id: target.id, new_bbox: target.box } }
                 : { url: cfg.urls.delete_detection, body: { detection_id: holder } };
         });
+    }
+
+    /** The address of a per-row redaction endpoint: the server sends
+     *  each with the row 0 in its path. */
+    function redactionUrl(name, id) {
+        return cfg.redaction_urls[name].replace('/redactions/0/', '/redactions/' + id + '/');
+    }
+
+    /** Pull the strip the server named over the text card's block,
+     *  through the step-2 move. A computed strip is dismissed and a
+     *  hand-drawn one takes its place, so the Undo gives the computed
+     *  strip back (``restore_redaction`` withdraws the two); a strip a
+     *  curator moved already is moved back where it was. */
+    function pullMargin(card, node) {
+        var pull = card.margin;
+        write(card, node, redactionUrl('move', pull.id), {
+            x0: pull.grown[0], y0: pull.grown[1], x1: pull.grown[2], y1: pull.grown[3]
+        }, (SIDE_NAMES[pull.side] || pull.side) + ' margin pulled over it', function (data) {
+            return data.id === pull.id
+                ? { url: redactionUrl('move', pull.id), body: { x0: pull.box[0], y0: pull.box[1], x1: pull.box[2], y1: pull.box[3] } }
+                : { url: redactionUrl('restore', pull.id), body: {} };
+        });
+    }
+
+    /** Read the server's cards again after a text card's write, and draw
+     *  the other open text cards of its page with what the write changed:
+     *  a footnote box added or grown in one column is the box the other
+     *  column's card grows (``neighbour_box``), and a strip pulled or a
+     *  box drawn may cover another card's block, whose finding is then
+     *  gone. The rule stays the server's; nothing here measures a box. */
+    function refreshPage(pageIndex) {
+        return getJson(cfg.cards_url).then(function (answer) {
+            if (!answer.ok || !answer.data || !answer.data.cards) { return; }
+            var byKey = {};
+            answer.data.cards.forEach(function (c) { byKey[c.key] = c; });
+            cards.forEach(function (card) {
+                if (card.kind !== 'text' || card.page_index !== pageIndex) { return; }
+                if (answers[card.key] || pending[card.key] || card.edit) { return; }
+                var node = root.querySelector('.bk-card[data-key="' + card.key + '"]');
+                if (!node) { return; }
+                var fresh = byKey[card.key];
+                if (fresh) {
+                    card.issue_id = fresh.issue_id;
+                    card.grow = fresh.grow;
+                    card.margin = fresh.margin;
+                    card.others = fresh.others;
+                    delete covered[card.key];
+                } else {
+                    // The write covered this block too: its finding is
+                    // gone, and the card has nothing left to answer.
+                    covered[card.key] = true;
+                }
+                replace(card, node);
+            });
+        }).catch(function () {});
     }
 
     /** Draw the readers' box on the crop, dashed and tagged, while the
@@ -1159,7 +1231,8 @@
     function countAll() {
         var keys = {};
         cards.forEach(function (card) { keys[card.key] = true; });
-        var done = Object.keys(answers).filter(function (key) { return keys[key]; }).length;
+        var done = Object.keys(answers).concat(Object.keys(covered).filter(function (key) { return !answers[key]; }))
+            .filter(function (key) { return keys[key]; }).length;
         var skips = Object.keys(skipped).filter(function (key) { return keys[key]; }).length;
         root.querySelector('[data-role="total"]').textContent = String(cards.length);
         root.querySelector('[data-role="done"]').textContent = String(done);
@@ -1199,9 +1272,11 @@
      *  page is left. */
     function merge(fresh) {
         var keys = {};
-        fresh.forEach(function (card) { keys[card.key] = true; });
+        // A card the server lists again has a finding to answer again
+        // (an Undo gave its block back), whatever covered it before.
+        fresh.forEach(function (card) { keys[card.key] = true; delete covered[card.key]; });
         cards.forEach(function (card) {
-            if (answers[card.key] && !keys[card.key]) { fresh.push(card); }
+            if ((answers[card.key] || covered[card.key]) && !keys[card.key]) { fresh.push(card); }
         });
         var order = {};
         GROUPS.forEach(function (group, i) { order[group] = i; });

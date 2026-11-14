@@ -46,6 +46,7 @@ from scanning import (
     boundaries,
     detections,
     findings,
+    margin_fit,
     opinion_ocr,
     pictures,
     redactions,
@@ -371,7 +372,9 @@ def text_card(issue: Issue) -> dict | None:
     beside the block instead, when there is one (``neighbour_box``);
     the column and the editor's note answers always add, because a
     page has two column boxes by design and a second box in a column
-    joins it, and a grown note box blacks out whatever it reaches.
+    joins it, and a grown note box blacks out whatever it reaches. A
+    fourth answer pulls the page's margin strip over a block of
+    bleed-through at its edge (``margin``, :func:`margin_pull`).
 
     :param issue: The finding.
     :returns: The card, or None when the finding names no page.
@@ -411,6 +414,119 @@ def text_card(issue: Issue) -> dict | None:
     # wider guess so the curator sees what that answer takes.
     card["block"] = block
     return card
+
+
+#: How far past the block's edge, in points, a margin strip pulled over
+#: a text card's block reaches: the reader's box sits on the ink, and a
+#: strip that stops on it leaves the edge of the bleed-through.
+MARGIN_PAD_PT = 2.0
+
+
+def margin_pull(
+    block: Box,
+    width: float,
+    height: float,
+    strips: list[dict],
+    others: list[dict],
+) -> dict | None:
+    """Return the margin strip a text card pulls over its block, or None.
+
+    The fourth answer of a text card: the block is the bleed-through of
+    the page behind, or a stray mark the reader read as words, at the
+    edge of the page, and the curator whites it out by pulling the
+    strip of that edge over it, the drag a curator does in step 2. The
+    strip is the one whose pull covers the least new area, the union of
+    its box and the block (padded by :data:`MARGIN_PAD_PT`); a strip
+    whose pull would reach any live box of the page is never offered,
+    because a white strip takes whatever it covers out of the page, and
+    a page number, a column or a footnote box is print the curator
+    kept. So a block between a strip and the text gets the offer, and a
+    block inside the text gets none.
+
+    :param block: The card's block, ``[x0, y0, x1, y1]`` in render
+        pixels.
+    :param width: The render width in pixels.
+    :param height: The render height in pixels.
+    :param strips: The page's visible margin strips, in points
+        (``redactions.visible_by_page``, ``rect_type`` ``margin``).
+    :param others: The page's live boxes, ``{"id", "label", "box"}`` in
+        render pixels (``attach_others``).
+    :returns: ``{"id", "side", "box", "grown"}``, the boxes in points:
+        ``grown`` is what the move writes, ``box`` the Undo of a strip
+        a curator already moved. None when no strip may reach it.
+    :rtype: dict | None
+    """
+    page_w, page_h = boundaries.to_points(width, height, width, height)
+    sx, sy = page_w / width, page_h / height
+    bx0, by0, bx1, by1 = block
+    take = [
+        max(0.0, bx0 * sx - MARGIN_PAD_PT),
+        max(0.0, by0 * sy - MARGIN_PAD_PT),
+        min(page_w, bx1 * sx + MARGIN_PAD_PT),
+        min(page_h, by1 * sy + MARGIN_PAD_PT),
+    ]
+    sides = margin_fit._sides(
+        {"page_width": page_w, "page_height": page_h, "rects": strips}
+    )
+    best: tuple[float, dict] | None = None
+    for side, rect in sides.items():
+        if rect is None:
+            continue
+        box = [rect["x0"], rect["y0"], rect["x1"], rect["y1"]]
+        grown = [
+            round(min(box[0], take[0]), 1),
+            round(min(box[1], take[1]), 1),
+            round(max(box[2], take[2]), 1),
+            round(max(box[3], take[3]), 1),
+        ]
+        in_px = [grown[0] / sx, grown[1] / sy, grown[2] / sx, grown[3] / sy]
+        if any(
+            opinion_ocr.intersection(in_px, other["box"]) > 0
+            for other in others
+        ):
+            continue
+        cost = (grown[2] - grown[0]) * (grown[3] - grown[1]) - (
+            box[2] - box[0]
+        ) * (box[3] - box[1])
+        if best is None or cost < best[0]:
+            best = (
+                cost,
+                {"id": rect["id"], "side": side, "box": box, "grown": grown},
+            )
+    return best[1] if best else None
+
+
+def attach_margin_pulls(built: list[dict], scan: Scan) -> None:
+    """Put the margin strip each text card may pull on the card, in place.
+
+    ``margin`` is :func:`margin_pull` over the page's visible strips,
+    or None. One query over the text cards' pages. Run after
+    :func:`attach_others`, whose boxes the pull may not reach.
+
+    :param built: The cards.
+    :param scan: The scan.
+    """
+    text = [c for c in built if c["kind"] == TEXT]
+    if not text:
+        return
+    strips = {
+        entry["page_index"]: [
+            r
+            for r in entry["rects"]
+            if r["rect_type"] == Redaction.MARGIN_TYPE
+        ]
+        for entry in redactions.visible_by_page(
+            scan, {c["page_index"] for c in text}
+        )
+    }
+    for card in text:
+        card["margin"] = margin_pull(
+            card["block"],
+            card["img_width"],
+            card["img_height"],
+            strips.get(card["page_index"], []),
+            card["others"],
+        )
 
 
 def picture_card(issue: Issue) -> dict | None:
@@ -824,6 +940,7 @@ def cards(scan: Scan) -> list[dict]:
                     block, card["others"], Label.FOOTNOTES.name
                 ),
             }
+    attach_margin_pulls(built, scan)
     order = {group: i for i, group in enumerate(GROUPS)}
     built.sort(key=lambda c: (order[c["group"]], c["page_index"], c["key"]))
     return built

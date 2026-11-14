@@ -710,3 +710,173 @@ class TestTheEndpoints(ScanningTestCase):
         answer = self._post("restore_detection", {"detection_id": row.pk})
         self.assertEqual(answer.status_code, 200)
         self.assertEqual(answer.json()["restored"], 0)
+
+
+class TestMarginPull(ScanningTestCase):
+    """``margin_pull``: the strip a text card pulls over bleed-through.
+
+    The render is 1700 by 2200 pixels, the page 612 by 792 points.
+    """
+
+    BLOCK = [200.0, 2050.0, 800.0, 2100.0]
+
+    def strip(self, box, pk):
+        return {
+            "id": pk,
+            "x0": box[0],
+            "y0": box[1],
+            "x1": box[2],
+            "y1": box[3],
+            "rect_type": "margin",
+        }
+
+    def pull(self, strips, others=()):
+        return card_review.margin_pull(
+            self.BLOCK, 1700, 2200, strips, list(others)
+        )
+
+    def test_the_nearest_strip_is_pulled_over_the_block(self):
+        """Bleed-through under the last line of print, above the bottom
+        strip: the bottom strip grows up over it, two points past it,
+        and the top strip, which would cover the page, is not taken."""
+        top = self.strip([0.0, 0.0, 612.0, 20.0], 1)
+        bottom = self.strip([0.0, 770.0, 612.0, 792.0], 2)
+
+        found = self.pull([top, bottom])
+
+        self.assertEqual(found["id"], 2)
+        self.assertEqual(found["side"], "bottom")
+        self.assertEqual(found["box"], [0.0, 770.0, 612.0, 792.0])
+        self.assertEqual(found["grown"], [0.0, 736.0, 612.0, 792.0])
+
+    def test_a_pull_that_reaches_a_box_is_never_offered(self):
+        """A white strip takes out what it covers: the page number in
+        the foot band is print the curator kept."""
+        bottom = self.strip([0.0, 770.0, 612.0, 792.0], 2)
+        number = {
+            "id": 9,
+            "label": "PAGE_NUMBER",
+            "box": [380.0, 2110.0, 420.0, 2140.0],
+        }
+        self.assertIsNone(self.pull([bottom], [number]))
+
+    def test_no_strip_no_pull(self):
+        self.assertIsNone(self.pull([]))
+
+    def test_the_card_carries_the_pull_of_its_page(self):
+        scan = make_scan()
+        make_redaction(
+            scan, rect_type="headnote", x0=0.0, y0=760.0, x1=612.0, y1=792.0
+        )
+        strip = make_redaction(
+            scan,
+            rect_type="margin",
+            fill="white",
+            x0=0.0,
+            y0=770.0,
+            x1=612.0,
+            y1=792.0,
+        )
+        finding(
+            scan,
+            CheckName.UNDETECTED_TEXT,
+            {
+                "bbox": self.BLOCK,
+                "guess": self.BLOCK,
+                "label": "TEXT_COLUMN",
+                "label_id": int(Label.TEXT_COLUMN),
+            },
+        )
+
+        (card,) = card_review.cards(scan)
+
+        self.assertEqual(card["margin"]["id"], strip.pk)
+        self.assertEqual(card["margin"]["side"], "bottom")
+
+
+class TestTheMarginPullWrites(ScanningTestCase):
+    """The pull is step 2's move of the strip, and its Undo gives the
+    computed strip back."""
+
+    def setUp(self):
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.scan = make_scan()
+
+    def test_the_page_sends_the_two_strip_endpoints(self):
+        page = self.client.get(
+            reverse("scan_card_review", kwargs={"pk": self.scan.pk})
+        )
+        config = page.context["config"]
+        self.assertEqual(
+            config["redaction_urls"]["move"],
+            f"/scans/{self.scan.pk}/redactions/0/move/",
+        )
+        self.assertEqual(
+            config["redaction_urls"]["restore"],
+            f"/scans/{self.scan.pk}/redactions/0/restore/",
+        )
+
+    def test_a_pulled_computed_strip_comes_back_on_undo(self):
+        from scanning.models import Redaction
+
+        strip = make_redaction(
+            self.scan,
+            rect_type="margin",
+            fill="white",
+            x0=0.0,
+            y0=770.0,
+            x1=612.0,
+            y1=792.0,
+        )
+        moved = self.client.post(
+            reverse(
+                "move_redaction",
+                kwargs={"pk": self.scan.pk, "redaction_id": strip.pk},
+            ),
+            data=json.dumps(
+                {"x0": 0.0, "y0": 736.0, "x1": 612.0, "y1": 792.0}
+            ),
+            content_type="application/json",
+        )
+        self.assertEqual(moved.status_code, 200)
+        holder = Redaction.objects.get(pk=moved.json()["id"])
+        self.assertNotEqual(holder.pk, strip.pk)
+        self.assertEqual(holder.rect_type, "margin")
+        self.assertEqual(holder.fill, "white")
+
+        back = self.client.post(
+            reverse(
+                "restore_redaction",
+                kwargs={"pk": self.scan.pk, "redaction_id": strip.pk},
+            ),
+            data="{}",
+            content_type="application/json",
+        )
+
+        self.assertEqual(back.status_code, 200)
+        self.assertTrue(back.json()["restored"])
+        visible = list(
+            Redaction.objects.visible()
+            .filter(scan=self.scan, rect_type="margin")
+            .values_list("pk", "y0")
+        )
+        self.assertEqual(visible, [(strip.pk, 770.0)])
+
+
+class TestTheScriptRefreshesThePage(ScanningTestCase):
+    """A text card's write reads the cards again for its page, so the
+    other column's card offers Grow footnote box at once."""
+
+    def test_a_text_write_refreshes_its_page(self):
+        source = SCRIPT.read_text()
+        self.assertIn(
+            "if (card.kind === 'text') { refreshPage(card.page_index); }",
+            source,
+        )
+        self.assertIn("card.grow = fresh.grow;", source)
+        self.assertIn("card.margin = fresh.margin;", source)
+
+    def test_the_margin_key_is_on_the_page(self):
+        self.assertIn("m: 'm'", SCRIPT.read_text())
+        self.assertIn("<kbd>m</kbd>", TEMPLATE.read_text())
