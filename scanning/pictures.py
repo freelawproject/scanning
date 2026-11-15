@@ -31,6 +31,7 @@ with dots alone gets dots' boxes; a later recompute reads the others.
 """
 
 import logging
+import re
 import statistics
 from collections.abc import Collection, Iterator
 
@@ -45,6 +46,7 @@ from scanning.models import (
     Issue,
     PictureReading,
     Scan,
+    TextReading,
 )
 
 logger = logging.getLogger(__name__)
@@ -99,6 +101,19 @@ LONE_TABLE_WIDTH = 0.5
 FIT_IOU = 0.9
 
 IMAGE_LABEL = Label.IMAGE.name
+
+#: How far, in the row's render pixels, a caption may sit above or below a
+#: picture and still be its caption: about a line of body type. 1955's
+#: "Figure 18: EIA Hypothetical Dispatch Curve" sat 11 px above its chart;
+#: the court's paragraphs over a table sat 33 px and more above it and are
+#: no caption by their category.
+CAPTION_GAP_PX = 40
+
+#: A reader cell that opens with one of these words is a picture's title
+#: whatever category the reader gave it ("Table 2: ...", "Exhibit A").
+CAPTION_START = re.compile(
+    r"^\s*(?:figure|fig\.|table|exhibit|chart|graph|appendix)\b", re.I
+)
 
 Box = list[float]
 
@@ -531,7 +546,7 @@ def _finding(
 def fit_for(
     scan: Scan, run: ApplyRun | None, rows: list[Detection]
 ) -> dict[int, dict]:
-    """Return the readers' box for every model image row they draw differently.
+    """Return the readers' boxes for every model image row they draw differently.
 
     For each row, the union of the readers' boxes the row covers by
     :data:`COVERED_SHARE` (a box the model drew over two photographs
@@ -544,22 +559,51 @@ def fit_for(
     A row no reader marked a picture or table under, on a page the
     readers read, gets an entry with no box, so the card can say so.
 
+    **The options** (``options``) are what Refine cycles through: the
+    union (``box``); the union over the caption right above or below
+    (:func:`with_captions`); and, when the readers see two pictures or
+    more under the row that do not touch (:func:`separate`), one box
+    per picture, with and without their captions. A split keeps the
+    text between two pictures out of the image, which the union takes
+    in (1963's page 196: the court's paragraph between two figures). A
+    row whose union the readers agree with still gets an entry when it
+    has a split or a caption to offer.
+
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
     :param rows: The live model ``IMAGE`` rows.
-    :returns: ``{row pk: {"box", "readers", "kinds", "iou"}}``.
+    :returns: ``{row pk: {"box", "readers", "kinds", "iou", "options"}}``;
+        each option ``{"label", "boxes"}``.
     :rtype: dict[int, dict]
     """
     if not rows:
         return {}
+    pages = {r.page_index for r in rows}
     readings = {
         r.page_index: r
         for r in PictureReading.objects.filter(
-            scan=scan,
-            apply_run=run,
-            page_index__in={r.page_index for r in rows},
+            scan=scan, apply_run=run, page_index__in=pages
         )
     }
+    texts = {
+        t.page_index: t
+        for t in TextReading.objects.filter(
+            scan=scan, apply_run=run, page_index__in=pages
+        )
+    }
+    # Every live box of those pages, each in its own render: what already
+    # covers a block of text the refined box gives up.
+    page_boxes: dict[int, list[tuple[int, Box, int, int]]] = {}
+    for d in Detection.objects.live().filter(scan=scan, page_index__in=pages):
+        page_boxes.setdefault(d.page_index, []).append(
+            (
+                d.pk,
+                [d.x0, d.y0, d.x1, d.y1],
+                d.img_width or 0,
+                d.img_height or 0,
+                d.label,
+            )
+        )
     out: dict[int, dict] = {}
     for row in rows:
         reading = readings.get(row.page_index)
@@ -584,17 +628,42 @@ def fit_for(
             if score > 0 and (best is None or score > best[0]):
                 best = (score, box, cluster)
         if best is None:
-            out[row.pk] = {"box": None, "readers": [], "kinds": [], "iou": 0.0}
+            out[row.pk] = {
+                "box": None,
+                "readers": [],
+                "kinds": [],
+                "iou": 0.0,
+                "options": [],
+            }
             continue
         chosen = inside or [(best[1], best[2])]
-        fit = [
-            min(b[0] for b, _ in chosen),
-            min(b[1] for b, _ in chosen),
-            max(b[2] for b, _ in chosen),
-            max(b[3] for b, _ in chosen),
+        fit = _union([b for b, _ in chosen])
+        captions = caption_cells(texts.get(row.page_index), row)
+        options = refine_options(
+            fit, [(b, c["readers"]) for b, c in chosen], captions
+        )
+        cells = text_cells(texts.get(row.page_index), row)
+        others = [
+            (
+                _scaled(b, row.img_width / w, row.img_height / h)
+                if w and h
+                else b,
+                label,
+            )
+            for pk, b, w, h, label in page_boxes.get(row.page_index, [])
+            if pk != row.pk
         ]
+        gutter = page_gutter(others, row.img_width)
+        for option in options:
+            option["boxes"] = [
+                [round(v, 1) for v in b]
+                for b in absorb_sideways(own, option["boxes"], cells)
+            ]
+            option["fill"] = freed_text(
+                own, option["boxes"], cells, others, gutter
+            )
         score = _iou(own, fit)
-        if score < FIT_IOU:
+        if score < FIT_IOU or len(options) > 1:
             out[row.pk] = {
                 "box": [round(v, 1) for v in fit],
                 "readers": sorted(
@@ -602,5 +671,345 @@ def fit_for(
                 ),
                 "kinds": sorted({k for _, c in chosen for k in c["kinds"]}),
                 "iou": round(score, 2),
+                "options": options,
             }
+    return out
+
+
+def _union(boxes: list[Box]) -> Box:
+    return [
+        min(b[0] for b in boxes),
+        min(b[1] for b in boxes),
+        max(b[2] for b in boxes),
+        max(b[3] for b in boxes),
+    ]
+
+
+def separate(boxes: list[Box]) -> list[Box]:
+    """Return the pictures of ``boxes``: the boxes that touch joined into one.
+
+    Two readers' boxes that overlap or touch are one picture (a photograph
+    the readers cut in two, two photographs printed edge to edge); boxes
+    with a gap between them are separate pictures, whatever lies in the
+    gap. Top to bottom, then left to right.
+    """
+    groups: list[Box] = []
+    for box in sorted(boxes, key=lambda b: (b[1], b[0])):
+        for i, g in enumerate(groups):
+            if (
+                box[0] <= g[2]
+                and g[0] <= box[2]
+                and box[1] <= g[3]
+                and g[1] <= box[3]
+            ):
+                groups[i] = _union([g, box])
+                break
+        else:
+            groups.append(list(box))
+    # A join can make a group touch one placed before it: join until none do.
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(groups)):
+            for j in range(i + 1, len(groups)):
+                a, b = groups[i], groups[j]
+                if (
+                    a[0] <= b[2]
+                    and b[0] <= a[2]
+                    and a[1] <= b[3]
+                    and b[1] <= a[3]
+                ):
+                    groups[i] = _union([a, b])
+                    del groups[j]
+                    merged = True
+                    break
+            if merged:
+                break
+    return sorted(groups, key=lambda b: (b[1], b[0]))
+
+
+def caption_cells(text: TextReading | None, row: Detection) -> list[Box]:
+    """Return the boxes of the reader cells of a page that are a caption,
+    in the row's render: the reader's ``Caption`` category, or a cell that
+    opens with "Figure", "Table", "Exhibit" and the like
+    (:data:`CAPTION_START`). A court's paragraph is no caption, whatever
+    its place."""
+    if text is None or not text.img_width or not text.img_height:
+        return []
+    sx = row.img_width / text.img_width
+    sy = row.img_height / text.img_height
+    out = []
+    for cell in text.cells or []:
+        if (
+            cell.get("kind") or ""
+        ).lower() == "caption" or CAPTION_START.match(cell.get("text") or ""):
+            out.append(_scaled(cell["box"], sx, sy))
+    return out
+
+
+def with_captions(box: Box, captions: list[Box]) -> Box:
+    """Return ``box`` grown over the caption right above or below it: a caption
+    cell within :data:`CAPTION_GAP_PX` of the box's top or bottom that shares
+    half the narrower one's width with it. The nearest above and the nearest
+    below, never one further out."""
+    above = below = None
+    for cap in captions:
+        shared = min(box[2], cap[2]) - max(box[0], cap[0])
+        if shared < 0.5 * min(box[2] - box[0], cap[2] - cap[0]):
+            continue
+        gap_above = box[1] - cap[3]
+        gap_below = cap[1] - box[3]
+        if 0 <= gap_above <= CAPTION_GAP_PX and (
+            above is None or gap_above < above[0]
+        ):
+            above = (gap_above, cap)
+        if 0 <= gap_below <= CAPTION_GAP_PX and (
+            below is None or gap_below < below[0]
+        ):
+            below = (gap_below, cap)
+    parts = [box] + [hit[1] for hit in (above, below) if hit is not None]
+    return _union(parts)
+
+
+def refine_options(
+    fit: Box, chosen: list[tuple[Box, list[str]]], captions: list[Box]
+) -> list[dict]:
+    """Return what Refine cycles through, the likeliest first.
+
+    ``chosen`` is each picture under the row with the readers that marked
+    it. When some of them only one reader saw (Surya calling the court's
+    bulleted list a table over 432 F.Supp.3d's page 892, above a map all
+    three readers marked), the options built from what two readers or
+    more agree on come first: a lone reader is where a wrong mark comes
+    from. Then the readers' box over everything, with its caption, and a
+    split into one box per picture when they see two or more.
+
+    Each option is ``{"label", "boxes"}``, the boxes rounded. An option that
+    gives the same boxes as one before it is left out.
+    """
+
+    def rounded(boxes):
+        return [[round(v, 1) for v in b] for b in boxes]
+
+    def build(name, boxes):
+        out = [
+            (name, [_union(boxes)]),
+            (
+                name + ", with the caption",
+                [with_captions(_union(boxes), captions)],
+            ),
+        ]
+        parts = separate(boxes)
+        if len(parts) >= 2:
+            out.append(
+                (
+                    f"Split into {len(parts)} boxes"
+                    + name[len("Refine to") :].replace(
+                        " the readers' box", ""
+                    ),
+                    parts,
+                )
+            )
+            out.append(
+                (
+                    f"Split into {len(parts)} boxes, with captions"
+                    + name[len("Refine to") :].replace(
+                        " the readers' box", ""
+                    ),
+                    [with_captions(p, captions) for p in parts],
+                )
+            )
+        return out
+
+    boxes = [b for b, _ in chosen]
+    agreed = [b for b, readers in chosen if len(readers) >= 2]
+    candidates = []
+    if agreed and len(agreed) < len(boxes):
+        candidates += build("Refine to what the readers agree on", agreed)
+    candidates += build("Refine to the readers' box", boxes)
+    options, seen = [], []
+    for label, bs in candidates:
+        label = label.replace(
+            "Refine to the readers' box, with the caption",
+            "Refine with the caption",
+        )
+        r = rounded(bs)
+        if r in seen:
+            continue
+        seen.append(r)
+        options.append({"label": label, "boxes": r})
+    return options
+
+
+#: A text cell counts as under a box when this share of it lies inside.
+CELL_SHARE = 0.5
+
+#: Two freed text cells of one column this close (row-render pixels) are
+#: one block, so a paragraph's cells get one box and not one each.
+BLOCK_GAP_PX = 40
+
+#: The reader categories that are a footnote, given a footnote box; every
+#: other category of text (a paragraph, a heading, a list item) a column box.
+FOOTNOTE_KINDS = frozenset({"footnote"})
+
+
+def text_cells(
+    text: TextReading | None, row: Detection
+) -> list[tuple[Box, str]]:
+    """Return the reader's text cells of a page, ``(box, kind)``, in the row's render."""
+    if text is None or not text.img_width or not text.img_height:
+        return []
+    sx = row.img_width / text.img_width
+    sy = row.img_height / text.img_height
+    return [
+        (_scaled(c["box"], sx, sy), (c.get("kind") or "").lower())
+        for c in text.cells or []
+        if c.get("box")
+    ]
+
+
+def freed_text(
+    own: Box,
+    boxes: list[Box],
+    cells: list[tuple[Box, str]],
+    others: list[tuple[Box, str]],
+    gutter: float | None = None,
+) -> list[dict]:
+    """Return the blocks of text a refine would leave in no box, with the box
+    each needs.
+
+    A cell is freed when the model's box covered it (:data:`CELL_SHARE`)
+    and neither a box of the option nor another live box of the page does:
+    the court's paragraph between two figures a split takes the union off,
+    the lines above a table the refine pulls the box down from. Freed cells
+    of one column within :data:`BLOCK_GAP_PX` of each other are one block;
+    a block of footnote cells gets a ``FOOTNOTES`` box, any other a
+    ``TEXT_COLUMN`` box, which joins the column it lies in
+    (``columns.column_groups``). A cell is a footnote when the reader
+    says so, or when it starts at or below the top of a footnote box of
+    its column: a reader labels a footnote ``Text`` as often as not.
+    A column box is one column wide: a block that crosses the ``gutter``
+    (a cell the reader merged across both columns) is cut there into a
+    box for each side.
+
+    :returns: ``[{"label", "box"}]`` in the row's render, top to bottom.
+    """
+
+    def under(cell, box):
+        return _inter(cell, box) >= CELL_SHARE * max(_area(cell), 1e-9)
+
+    freed: list[tuple[Box, str]] = []
+    for cell, kind in cells:
+        if not under(cell, own):
+            continue
+        if any(under(cell, b) for b in boxes) or any(
+            under(cell, o) for o, _ in others
+        ):
+            continue
+        in_notes = any(
+            lab == Label.FOOTNOTES.name
+            and min(o[2], cell[2]) - max(o[0], cell[0]) > 0
+            and cell[1] >= o[1] - 5
+            for o, lab in others
+        )
+        label = (
+            Label.FOOTNOTES.name
+            if kind in FOOTNOTE_KINDS or in_notes
+            else Label.TEXT_COLUMN.name
+        )
+        freed.append((cell, label))
+    blocks: list[list] = []
+    for cell, label in sorted(freed, key=lambda c: (c[0][1], c[0][0])):
+        for block in blocks:
+            b, lab = block
+            same_column = min(b[2], cell[2]) - max(b[0], cell[0]) > 0
+            if lab == label and same_column and cell[1] - b[3] <= BLOCK_GAP_PX:
+                block[0] = _union([b, cell])
+                break
+        else:
+            blocks.append([list(cell), label])
+    out = []
+    for box, label in sorted(blocks, key=lambda b: (b[0][1], b[0][0])):
+        if (
+            gutter is not None
+            and box[0] < gutter - GUTTER_REACH_PX
+            and box[2] > gutter + GUTTER_REACH_PX
+        ):
+            pieces = [
+                [box[0], box[1], gutter - GUTTER_GAP_PX, box[3]],
+                [gutter + GUTTER_GAP_PX, box[1], box[2], box[3]],
+            ]
+        else:
+            pieces = [box]
+        out.extend(
+            {"label": label, "box": [round(v, 1) for v in piece]}
+            for piece in pieces
+        )
+    return out
+
+
+#: A block crosses the gutter when it reaches this far into both columns.
+GUTTER_REACH_PX = 40
+
+#: Each half of a block cut at the gutter stops this far from its middle.
+GUTTER_GAP_PX = 8
+
+
+def page_gutter(others: list[tuple[Box, str]], width: float) -> float | None:
+    """Return the x of the page's gutter, in the row's render: midway between
+    its two column boxes when it has two side by side, else the middle of the
+    page. None on a page too narrow to have two columns."""
+    cols = sorted(
+        (b for b, lab in others if lab == Label.TEXT_COLUMN.name),
+        key=lambda b: b[0],
+    )
+    for left, right in zip(cols, cols[1:]):
+        if left[2] <= right[0] + 10:
+            return (left[2] + right[0]) / 2
+    return width / 2 if width else None
+
+
+#: A reader cell this many times taller than it is wide is a line of text
+#: set sideways: a chart's axis label, a landscape table's headings. Text of
+#: the court runs across the page, never down it.
+SIDEWAYS_RATIO = 2.5
+
+#: How far, in row-render pixels, a sideways cell may stand from an image box
+#: of the option and still be part of that picture: 1963's page 704 set
+#: each sideways table title 61-62 px left of its table.
+SIDEWAYS_GAP_PX = 90
+
+
+def absorb_sideways(
+    own: Box, boxes: list[Box], cells: list[tuple[Box, str]]
+) -> list[Box]:
+    """Return ``boxes`` grown over the sideways text beside them.
+
+    A cell inside the model's box (:data:`CELL_SHARE`) that is
+    :data:`SIDEWAYS_RATIO` times taller than wide and within
+    :data:`SIDEWAYS_GAP_PX` of an image box is part of that picture (a
+    rotated label), so the box grows over it rather than the cell being
+    given a text column box. Repeated until no box grows, so a run of
+    rotated labels joins one after the other.
+    """
+    out = [list(b) for b in boxes]
+    sideways = [
+        c
+        for c, _ in cells
+        if (c[3] - c[1]) >= SIDEWAYS_RATIO * max(c[2] - c[0], 1e-9)
+        and _inter(c, own) >= CELL_SHARE * max(_area(c), 1e-9)
+    ]
+    grew = True
+    while grew:
+        grew = False
+        for c in sideways:
+            for i, b in enumerate(out):
+                if _inter(c, b) >= CELL_SHARE * _area(c):
+                    continue
+                gap_x = max(b[0] - c[2], c[0] - b[2], 0)
+                gap_y = max(b[1] - c[3], c[1] - b[3], 0)
+                if gap_x <= SIDEWAYS_GAP_PX and gap_y <= SIDEWAYS_GAP_PX:
+                    out[i] = _union([b, c])
+                    grew = True
+                    break
     return out

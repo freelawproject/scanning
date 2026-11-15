@@ -818,10 +818,26 @@ def _finding(
             for o in others or []
             if o["label"] == Label.IMAGE.name
         ]
+        # A footnote is no part of the column the guess asks for: a cell the
+        # reader calls one, or one a footnote box already holds, keeps its
+        # own box (1963's pages 20 and 21: the guess ran over footnotes 9
+        # and 10, boxed already, under an editor's note).
+        notes = [
+            [
+                o["box"][0] / sx,
+                o["box"][1] / sy,
+                o["box"][2] / sx,
+                o["box"][3] / sy,
+            ]
+            for o in others or []
+            if o["label"] == Label.FOOTNOTES.name
+        ]
         beside = []
         for cell in reading.cells or []:
             other = _box(cell.get("box"))
             if other is None or cell.get("kind") in _NOT_COLUMN_KINDS:
+                continue
+            if cell.get("kind") == "Footnote" or _in_a_picture(other, notes):
                 continue
             if other[2] <= box[0] or other[0] >= box[2]:
                 continue
