@@ -793,10 +793,15 @@ class TestTheRefineScript(ScanningTestCase):
         """A drag during a split keeps "Save 2 image boxes ..." and Reset; a
         reload of the cards draws the option whole; Reset clears both drafts."""
         source = self.SCRIPT.read_text()
-        self.assertIn("if (primary) { primary.textContent = saveLabel(card); }", source)
+        self.assertIn(
+            "if (primary) { primary.textContent = saveLabel(card); }", source
+        )
         self.assertIn("var refineDrafts = {};", source)
         self.assertIn("var refined = refineDrafts[card.key];", source)
-        self.assertIn("delete drafts[card.key];\n                delete refineDrafts[card.key];", source)
+        self.assertIn(
+            "delete drafts[card.key];\n                delete refineDrafts[card.key];",
+            source,
+        )
 
 
 class TestFreedText(ScanningTestCase):
