@@ -618,35 +618,47 @@
         }
         var verbs = MODEL_VERBS[card.kind];
         if (verbs) {
-            var primary = button(moved(card) ? verbs.move : verbs.keep, 'enter', 'btn-primary text-xs', function (btn) {
+            var extras = (card.split || []).length + (card.fill || []).length;
+            var splitting = extras > 0;
+            var primary = button(splitting ? saveLabel(card) : (moved(card) ? verbs.move : verbs.keep), 'enter', 'btn-primary text-xs', function (btn) {
                 btn.disabled = true;
-                if (moved(card)) { resize(card, node); } else { keep(card, node); }
+                if (splitting) { saveSplit(card, node); } else if (moved(card)) { resize(card, node); } else { keep(card, node); }
             });
             primary.dataset.role = 'primary';
             foot.appendChild(primary);
             var reset = button('Reset', 'r', 'btn-ghost text-xs', function () {
                 card.box = card.original.slice();
-                placeBox(card, node.querySelector('.cr-box'));
-                markMoved(card, node);
+                card.split = null;
+                card.fill = null;
+                delete card.refineIdx;
+                replace(card, node);
             });
             reset.dataset.role = 'reset';
-            reset.hidden = !moved(card);
+            reset.hidden = !moved(card) && !splitting;
             foot.appendChild(reset);
             if (card.kind === 'image' && card.fit && card.fit.box) {
-                // The readers' box for a picture the model boxed
-                // loosely: one click moves the card's box to theirs,
-                // handles and all, so the curator adjusts it if need
-                // be and saves it with Save size (Reset puts the
-                // model's box back). Hovering the button draws their
-                // box on the crop first, so the eye checks it before
-                // the click.
-                var refine = button('Refine image box', 'n', 'btn-primary text-xs', function () {
+                // The readers' boxes for a picture the model boxed
+                // loosely. Each press moves the card to the next option
+                // the server offers (``pictures.refine_options``): the
+                // readers' box, the box with its caption, and one box
+                // per picture when they see two or more. A split's other
+                // boxes are drawn dashed; the primary button saves them
+                // all, Reset puts the model's box back. Hovering draws
+                // the next option first, so the eye checks it before the
+                // click.
+                var options = refineOptions(card);
+                var next = options[((card.refineIdx === undefined ? -1 : card.refineIdx) + 1) % options.length];
+                var refine = button(card.refineIdx === undefined ? 'Refine image box' : 'Next: ' + next.label, 'n', 'btn-primary text-xs', function () {
                     hideFit(node);
                     refineBox(card, node);
                 });
-                refine.addEventListener('mouseenter', function () { showFit(card, node); });
+                refine.dataset.role = 'refine';
+                refine.addEventListener('mouseenter', function () { showFit(card, node, next); });
                 refine.addEventListener('mouseleave', function () { hideFit(node); });
                 foot.appendChild(refine);
+                if (card.refineIdx !== undefined) {
+                    foot.appendChild(el('span', 'text-xs text-gray-500', 'showing: ' + options[card.refineIdx].label));
+                }
             }
             foot.appendChild(button(verbs.out, 'x', 'btn-outline text-xs', function (btn) {
                 btn.disabled = true;
@@ -767,6 +779,7 @@
         wrap.appendChild(blankCanvas(card));
         node.appendChild(wrap);
         boxLayer(card, wrap, node, Boolean(answer) || Boolean(skipped[card.key]) || Boolean(pending[card.key]));
+        if ((card.split || card.fill) && !answer) { drawSplit(card, node); }
         node.appendChild(note(card.message));
         node.appendChild(footer(card, node));
         node.addEventListener('mousedown', function () { setActive(node); });
@@ -923,31 +936,133 @@
         });
     }
 
-    /** Draw the readers' box on the crop, dashed and tagged, while the
+    /** The options Refine cycles through, the server's (``fit.options``),
+     *  or the readers' box alone from a server that sends none. */
+    function refineOptions(card) {
+        var opts = (card.fit && card.fit.options) || [];
+        return opts.length ? opts : [{ label: "Refine to the readers' box", boxes: [card.fit.box] }];
+    }
+
+    /** Draw an option's boxes on the crop, dashed and tagged, while the
      *  pointer is on Refine image box. */
-    function showFit(card, node) {
+    function showFit(card, node, option) {
         var layer = node.querySelector('.cr-layer');
         if (!layer || layer.querySelector('.cr-fit')) { return; }
-        var ghost = el('div', 'cr-fit');
-        ghost.appendChild(el('span', 'cr-other-tag', "image (the readers' box)"));
-        layer.appendChild(ghost);
-        placeBox(card, ghost, card.fit.box);
+        option = option || refineOptions(card)[0];
+        option.boxes.forEach(function (b, i) {
+            var ghost = el('div', 'cr-fit');
+            ghost.appendChild(el('span', 'cr-other-tag', option.boxes.length > 1 ? 'image ' + (i + 1) + ' of ' + option.boxes.length : "image (the readers' box)"));
+            layer.appendChild(ghost);
+            placeBox(card, ghost, b);
+        });
+        drawFill(card, layer, option.fill || [], 'cr-fit');
+    }
+
+    /** Draw the text an option leaves in no box, dashed, each block tagged
+     *  with the box it gets: "text column" or "footnote". */
+    function drawFill(card, layer, fill, cls) {
+        fill.forEach(function (f) {
+            var ghost = el('div', cls + ' cr-fill');
+            ghost.appendChild(el('span', 'cr-other-tag', f.label === 'FOOTNOTES' ? 'footnote' : 'text column'));
+            layer.appendChild(ghost);
+            placeBox(card, ghost, f.box);
+        });
     }
 
     function hideFit(node) {
-        node.querySelectorAll('.cr-fit').forEach(function (ghost) { ghost.remove(); });
+        // The hover's own boxes only: a split's chosen boxes stay drawn.
+        node.querySelectorAll('.cr-fit:not(.cr-split)').forEach(function (ghost) { ghost.remove(); });
     }
 
-    /** Move the card's box to the readers' box (``card.fit``). Nothing
-     *  is written: the box is now a moved box, so the primary button
-     *  reads Save size and writes it through the resize endpoint, Reset
-     *  puts the model's box back, and the handles let the curator
-     *  adjust it first. */
+    /** Draw the other boxes of a split, dashed, beside the card's own. */
+    function drawSplit(card, node) {
+        var layer = node.querySelector('.cr-layer');
+        if (!layer) { return; }
+        layer.querySelectorAll('.cr-split').forEach(function (g) { g.remove(); });
+        drawFill(card, layer, card.fill || [], 'cr-fit cr-split');
+        (card.split || []).forEach(function (b, i) {
+            var ghost = el('div', 'cr-fit cr-split');
+            ghost.appendChild(el('span', 'cr-other-tag', 'image ' + (i + 2) + ' of ' + (card.split.length + 1)));
+            layer.appendChild(ghost);
+            placeBox(card, ghost, b);
+        });
+    }
+
+    /** Move the card to the next option. Nothing is written: the first
+     *  box becomes the card's own (handles and all), the others of a
+     *  split are drawn beside it, and the primary button saves them. */
     function refineBox(card, node) {
-        card.box = card.fit.box.slice();
+        var options = refineOptions(card);
+        card.refineIdx = card.refineIdx === undefined ? 0 : (card.refineIdx + 1) % options.length;
+        var boxes = options[card.refineIdx].boxes;
+        card.box = boxes[0].slice();
+        card.split = boxes.length > 1 ? boxes.slice(1).map(function (b) { return b.slice(); }) : null;
+        card.fill = (options[card.refineIdx].fill || []).map(function (f) { return { label: f.label, box: f.box.slice() }; });
         drafts[card.key] = card.box.slice();
-        placeBox(card, node.querySelector('.cr-box'));
-        markMoved(card, node);
+        replace(card, node);
+    }
+
+    /** "Save 2 image boxes + 1 text box": what the primary button writes. */
+    function saveLabel(card) {
+        var images = 1 + (card.split || []).length;
+        var fill = card.fill || [];
+        var text = fill.filter(function (f) { return f.label !== 'FOOTNOTES'; }).length;
+        var notes = fill.length - text;
+        var parts = [images + ' image box' + (images > 1 ? 'es' : '')];
+        if (text) { parts.push(text + ' text column box' + (text > 1 ? 'es' : '')); }
+        if (notes) { parts.push(notes + ' footnote box' + (notes > 1 ? 'es' : '')); }
+        return 'Save ' + parts.join(' + ');
+    }
+
+    /** Save a split: the model's box resized to the first picture, then
+     *  an image box added for each other one, one after the next. The
+     *  card's Undo takes back every box it wrote, the resize last, which
+     *  gives the model's box back. */
+    function saveSplit(card, node) {
+        function live() { return root.querySelector('.bk-card[data-key="' + card.key + '"]') || node; }
+        var undos = [];
+        var extra = (card.split || []).map(function (b) { return { label: card.label, labelId: card.label_id, box: b }; })
+            .concat((card.fill || []).map(function (f) {
+                var l = labelNamed(f.label);
+                return l ? { label: l.name, labelId: l.id, box: f.box } : null;
+            }).filter(Boolean));
+        function fail(answer) {
+            delete pending[card.key];
+            toast(failed(answer), 'error');
+            if (undos.length) { answers[card.key] = { label: 'split saved in part', undo: undos }; history.push(card.key); }
+            replace(card, live());
+        }
+        postJson(cfg.urls.update_detection, { detection_id: card.detection_id, new_bbox: card.box }).then(function (answer) {
+            if (!answer.ok || !answer.data || answer.data.status !== 'ok') { return fail(answer); }
+            undos.push({ url: cfg.urls.delete_detection, body: { detection_id: answer.data.detection_id } });
+            var chain = Promise.resolve(true);
+            extra.forEach(function (x) {
+                chain = chain.then(function (ok) {
+                    if (!ok) { return false; }
+                    return postJson(cfg.urls.add_single_detection, {
+                        page_index: card.page_index, label: x.label, label_id: x.labelId,
+                        confidence: 1.0, bbox: x.box, img_width: card.img_width, img_height: card.img_height
+                    }).then(function (added) {
+                        if (!added.ok || !added.data || added.data.status !== 'ok') { fail(added); return false; }
+                        undos.unshift({ url: cfg.urls.delete_detection, body: { detection_id: added.data.detection_id } });
+                        return true;
+                    });
+                });
+            });
+            return chain.then(function (ok) {
+                if (!ok) { return; }
+                delete pending[card.key];
+                answers[card.key] = { label: saveLabel(card).replace('Save', 'saved'), undo: undos };
+                history.push(card.key);
+                delete drafts[card.key];
+                card.split = null;
+                card.fill = null;
+                replace(card, live());
+            });
+        }).catch(function (error) {
+            toast('The request failed: ' + error.message, 'error');
+            replace(card, live());
+        });
     }
 
     function resize(card, node) {
@@ -1134,7 +1249,15 @@
     function undo(card, node) {
         var answer = answers[card.key];
         if (!answer) { return; }
-        postJson(answer.undo.url, answer.undo.body).then(function (reply) {
+        var steps = Array.isArray(answer.undo) ? answer.undo : [answer.undo];
+        var chain = Promise.resolve({ ok: true, data: { status: 'ok' } });
+        steps.forEach(function (step) {
+            chain = chain.then(function (prev) {
+                if (!prev.ok || !prev.data || prev.data.status !== 'ok') { return prev; }
+                return postJson(step.url, step.body);
+            });
+        });
+        chain.then(function (reply) {
             if (!reply.ok || !reply.data || reply.data.status !== 'ok') {
                 toast(failed(reply), 'error');
                 replace(card, node);

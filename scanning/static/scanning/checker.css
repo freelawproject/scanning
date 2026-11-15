@@ -1856,6 +1856,8 @@ div.ensemble-group[data-kind="list_item"] {
 .cr-box.cr-frozen { cursor: default; opacity: 0.6; }
 /* The readers' box: dashed, so it reads as a reading and not as a row. A picture card's own box is one; .cr-fit is the hover of Refine image box. */
 .cr-box.cr-picture { border-style: dashed; border-color: #d97706; background: rgba(217, 119, 6, 0.10); color: #d97706; }
+/* A block of text a refine gives up, and the box it gets with the save. */
+.cr-fit.cr-fill { border-color: #2563eb; background: rgba(37, 99, 235, 0.08); }
 .cr-fit { position: absolute; box-sizing: border-box; border: 2px dashed #d97706; background: rgba(217, 119, 6, 0.10); pointer-events: none; }
 .cr-anchor { position: absolute; box-sizing: border-box; border: 2px dashed #6b7280; pointer-events: none; }
 /* The block a text card's footnote answer takes, inside a wider guess. */

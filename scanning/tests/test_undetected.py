@@ -277,12 +277,13 @@ class TestTheRule(ScanningTestCase):
         self.assertTrue(found[0]["metadata"]["no_column"])
 
     def test_on_a_page_with_no_column_the_guess_is_the_blocks_column(self):
-        # The + adds the column the block sits in: the footnote under
-        # it is inside, the running head above it is not, and a cell in
-        # the other column is not. The address stays the block. The
-        # running head sits in its header box, so it is covered and no
-        # card of its own; the footnote is a card of its own, far
-        # enough down to be its own block.
+        # The + adds the column the block sits in: the running head
+        # above it is not inside, a cell in the other column is not,
+        # and neither is the footnote under it, which is a card of its
+        # own, far enough down to be its own block, whose answer is a
+        # footnote box (1963's pages 20 and 21: a column over footnotes
+        # already boxed). The address stays the block. The running head
+        # sits in its header box, so it is covered and no card of its own.
         make_detection(
             self.scan,
             "PAGE_HEADER",
@@ -311,12 +312,35 @@ class TestTheRule(ScanningTestCase):
         card = cards[tuple(OUTSIDE)]
         self.assertTrue(card["metadata"]["no_column"])
         self.assertEqual(
-            card["metadata"]["guess"], [1000.0, 200.0, 1600.0, 1900.0]
+            card["metadata"]["guess"], [1000.0, 200.0, 1600.0, 600.0]
         )
         # The other column's card keeps its own column.
         other = cards[(100.0, 200.0, 900.0, 600.0)]
         self.assertEqual(
             other["metadata"]["guess"], [100.0, 200.0, 900.0, 600.0]
+        )
+
+    def test_a_cell_in_a_footnote_box_stays_out_of_the_column(self):
+        make_detection(
+            self.scan,
+            "FOOTNOTES",
+            page_index=0,
+            x0=1000.0,
+            y0=1780.0,
+            x1=1600.0,
+            y1=1920.0,
+        )
+        self.write(
+            cell("Left outside"),
+            cell(
+                "9. On March 12, 2019, Ramos", [1050.0, 1800.0, 1550.0, 1900.0]
+            ),
+        )
+        card = {tuple(f["metadata"]["bbox"]): f for f in self.found()}[
+            tuple(OUTSIDE)
+        ]
+        self.assertEqual(
+            card["metadata"]["guess"], [1000.0, 200.0, 1600.0, 600.0]
         )
 
     def test_on_a_page_with_no_column_the_guess_leaves_the_picture_out(self):

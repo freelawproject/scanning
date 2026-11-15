@@ -1,13 +1,20 @@
 """The pictures and tables the readers saw (``pictures``): the rows, the
 cards and the fit of the model's image boxes."""
 
+import pathlib
 from unittest import mock
 
 from blackletter.models import Label
 from django.urls import reverse
 
 from scanning import card_review, findings, opinion_ocr, pictures
-from scanning.models import CheckName, Detection, Issue, PictureReading
+from scanning.models import (
+    CheckName,
+    Detection,
+    Issue,
+    PictureReading,
+    TextReading,
+)
 from scanning.tests.test_findings import (
     make_boundary,
     make_detection,
@@ -467,7 +474,13 @@ class TestFitFor(ScanningTestCase):
         row = image_row(self.scan, [250.0, 450.0, 900.0, 800.0])
         self.assertEqual(
             pictures.fit_for(self.scan, None, [row])[row.pk],
-            {"box": None, "readers": [], "kinds": [], "iou": 0.0},
+            {
+                "box": None,
+                "readers": [],
+                "kinds": [],
+                "iou": 0.0,
+                "options": [],
+            },
         )
 
     def test_a_box_the_readers_agree_with_gets_nothing(self):
@@ -480,7 +493,13 @@ class TestFitFor(ScanningTestCase):
         row = image_row(self.scan, [300.0, 200.0, 1400.0, 900.0])
         self.assertEqual(
             pictures.fit_for(self.scan, None, [row])[row.pk],
-            {"box": None, "readers": [], "kinds": [], "iou": 0.0},
+            {
+                "box": None,
+                "readers": [],
+                "kinds": [],
+                "iou": 0.0,
+                "options": [],
+            },
         )
 
     def test_a_page_the_readers_did_not_read_gets_nothing(self):
@@ -570,3 +589,283 @@ class TestTheCards(ScanningTestCase):
         self.assertIn("'Add image box'", text)
         self.assertIn("'Refine image box'", text)
         self.assertIn("function refineBox", text)
+
+
+def text_reading(scan, cells, page_index=0, width=WIDTH, height=HEIGHT):
+    return TextReading.objects.create(
+        scan=scan,
+        page_index=page_index,
+        source_page=page_index + 1,
+        img_width=width,
+        img_height=height,
+        cells=[{"box": list(b), "kind": k, "text": t} for b, k, t in cells],
+    )
+
+
+def labels_of(fit):
+    return [o["label"] for o in fit["options"]]
+
+
+ALL = ("dots_mocr", "mistral_ocr", "surya")
+
+
+class TestRefineOptions(ScanningTestCase):
+    """What Refine cycles through: what the readers agree on, the readers'
+    box, the box with its caption, and one box per picture."""
+
+    def setUp(self):
+        self.scan = make_scan()
+
+    def test_two_figures_with_the_courts_text_between_split_into_two(self):
+        """1963's page 196: two patent figures, the court's paragraph
+        between them; the union swallows the paragraph, the split keeps
+        it out."""
+        top = [345.0, 772.0, 1410.0, 1117.0]
+        bottom = [345.0, 1317.0, 1416.0, 1616.0]
+        reading(
+            self.scan,
+            [mark(e, top) for e in ALL] + [mark(e, bottom) for e in ALL],
+        )
+        row = image_row(self.scan, [290.0, 167.0, 1466.0, 1790.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(
+            labels_of(fit),
+            ["Refine to the readers' box", "Split into 2 boxes"],
+        )
+        self.assertEqual(
+            fit["options"][0]["boxes"], [[345.0, 772.0, 1416.0, 1616.0]]
+        )
+        self.assertEqual(fit["options"][1]["boxes"], [top, bottom])
+
+    def test_what_the_readers_agree_on_comes_before_a_lone_readers_mark(self):
+        """432 F.Supp.3d's page 892: Surya alone calls the court's list a
+        table over a map all three readers marked; the map alone first."""
+        listed = [362.0, 488.0, 1431.0, 1058.0]
+        map_ = [369.0, 1181.0, 1422.0, 1992.0]
+        reading(
+            self.scan,
+            [mark("surya", listed, kind="table")]
+            + [mark(e, map_) for e in ALL],
+        )
+        row = image_row(self.scan, [305.0, 188.0, 1478.0, 2042.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(
+            labels_of(fit)[0], "Refine to what the readers agree on"
+        )
+        self.assertEqual(fit["options"][0]["boxes"][0][1], 1181.0)
+
+    def test_the_caption_right_above_a_figure_is_an_option(self):
+        """1955's page 877: "Figure 18: ..." 11 px above the chart."""
+        chart = [328.0, 533.0, 1387.0, 1021.0]
+        reading(self.scan, [mark("dots_mocr", chart), mark("surya", chart)])
+        text_reading(
+            self.scan,
+            [
+                (
+                    [400.0, 490.0, 1300.0, 522.0],
+                    "Caption",
+                    "Figure 18: EIA Hypothetical Dispatch Curve",
+                )
+            ],
+        )
+        row = image_row(self.scan, [290.0, 167.0, 1466.0, 1500.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(
+            labels_of(fit),
+            ["Refine to the readers' box", "Refine with the caption"],
+        )
+        self.assertEqual(
+            fit["options"][1]["boxes"], [[328.0, 490.0, 1387.0, 1021.0]]
+        )
+
+    def test_the_courts_paragraph_above_a_table_is_no_caption(self):
+        """1955's page 1245: the court's text 33 px above a table."""
+        table = [309.0, 966.0, 1375.0, 1428.0]
+        reading(
+            self.scan,
+            [
+                mark("dots_mocr", table, kind="table"),
+                mark("surya", table, kind="table"),
+            ],
+        )
+        text_reading(
+            self.scan,
+            [
+                (
+                    [309.0, 800.0, 1375.0, 933.0],
+                    "Text",
+                    "The Court finds that a preponderance of the",
+                )
+            ],
+        )
+        row = image_row(self.scan, [290.0, 700.0, 1466.0, 1600.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(labels_of(fit), ["Refine to the readers' box"])
+
+    def test_a_cell_that_opens_with_table_is_a_caption_whatever_its_category(
+        self,
+    ):
+        table = [309.0, 966.0, 1375.0, 1428.0]
+        reading(
+            self.scan,
+            [
+                mark("dots_mocr", table, kind="table"),
+                mark("surya", table, kind="table"),
+            ],
+        )
+        text_reading(
+            self.scan,
+            [
+                (
+                    [309.0, 930.0, 1000.0, 955.0],
+                    "Text",
+                    "Table 2: Damages by year",
+                )
+            ],
+        )
+        row = image_row(self.scan, [290.0, 700.0, 1466.0, 1600.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(
+            fit["options"][1]["boxes"], [[309.0, 930.0, 1375.0, 1428.0]]
+        )
+
+    def test_marks_that_touch_are_one_picture(self):
+        """A photograph two readers cut in two halves that touch is no split."""
+        reading(
+            self.scan,
+            [
+                mark("dots_mocr", [300.0, 500.0, 1400.0, 900.0]),
+                mark("surya", [300.0, 900.0, 1400.0, 1300.0]),
+            ],
+        )
+        row = image_row(self.scan, [100.0, 300.0, 1600.0, 1500.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertNotIn("Split into 2 boxes", labels_of(fit))
+
+    def test_a_row_the_readers_agree_with_still_offers_a_split(self):
+        """The union fits the model's box, but two pictures lie under it."""
+        top, bottom = (
+            [300.0, 500.0, 1400.0, 800.0],
+            [300.0, 1000.0, 1400.0, 1300.0],
+        )
+        reading(
+            self.scan,
+            [
+                mark("dots_mocr", top),
+                mark("surya", top),
+                mark("dots_mocr", bottom),
+                mark("surya", bottom),
+            ],
+        )
+        row = image_row(self.scan, [300.0, 500.0, 1400.0, 1300.0])
+        fit = pictures.fit_for(self.scan, None, [row])[row.pk]
+        self.assertEqual(
+            labels_of(fit),
+            ["Refine to the readers' box", "Split into 2 boxes"],
+        )
+
+    def test_separate_joins_only_the_boxes_that_touch(self):
+        a, b, c = [0, 0, 10, 10], [10, 0, 20, 10], [0, 30, 10, 40]
+        self.assertEqual(
+            pictures.separate([c, a, b]), [[0, 0, 20, 10], [0, 30, 10, 40]]
+        )
+
+
+class TestTheRefineScript(ScanningTestCase):
+    """The card cycles the server's options and saves a split whole."""
+
+    SCRIPT = (
+        pathlib.Path(__file__).resolve().parent.parent
+        / "static"
+        / "scanning"
+        / "card_review.js"
+    )
+
+    def test_the_script_cycles_the_options_and_saves_a_split(self):
+        source = self.SCRIPT.read_text()
+        self.assertIn("function refineOptions(card)", source)
+        self.assertIn("(card.fit && card.fit.options)", source)
+        self.assertIn("function saveSplit(card, node)", source)
+        self.assertIn("cfg.urls.add_single_detection", source)
+        self.assertIn("Array.isArray(answer.undo)", source)
+
+
+class TestFreedText(ScanningTestCase):
+    """The text a refine gives up gets a box with the save."""
+
+    OWN = [290.0, 167.0, 1466.0, 1790.0]
+    TOP = [345.0, 772.0, 1410.0, 1117.0]
+    BOTTOM = [345.0, 1317.0, 1416.0, 1616.0]
+
+    def test_the_paragraph_between_two_figures_gets_a_column_box(self):
+        between = [289.0, 1163.0, 850.0, 1279.0]
+        fill = pictures.freed_text(
+            self.OWN, [self.TOP, self.BOTTOM], [(between, "text")], []
+        )
+        self.assertEqual(fill, [{"label": "TEXT_COLUMN", "box": between}])
+
+    def test_a_cell_the_new_box_still_covers_is_not_freed(self):
+        inside = [400.0, 800.0, 1300.0, 900.0]
+        self.assertEqual(
+            pictures.freed_text(self.OWN, [self.TOP], [(inside, "text")], []),
+            [],
+        )
+
+    def test_a_cell_another_box_covers_is_not_freed(self):
+        cell = [289.0, 1163.0, 850.0, 1279.0]
+        column = ([250.0, 150.0, 860.0, 2000.0], "TEXT_COLUMN")
+        self.assertEqual(
+            pictures.freed_text(
+                self.OWN, [self.TOP], [(cell, "text")], [column]
+            ),
+            [],
+        )
+
+    def test_a_footnote_cell_gets_a_footnote_box(self):
+        note = [300.0, 1700.0, 850.0, 1760.0]
+        fill = pictures.freed_text(
+            self.OWN, [self.TOP], [(note, "footnote")], []
+        )
+        self.assertEqual(fill[0]["label"], "FOOTNOTES")
+
+    def test_a_cell_below_the_top_of_a_footnote_box_is_a_footnote(self):
+        """The reader called it Text; its place says footnote."""
+        note = [300.0, 1700.0, 850.0, 1760.0]
+        notes_box = ([280.0, 1650.0, 860.0, 1690.0], "FOOTNOTES")
+        fill = pictures.freed_text(
+            self.OWN, [self.TOP], [(note, "text")], [notes_box]
+        )
+        self.assertEqual(fill[0]["label"], "FOOTNOTES")
+
+    def test_the_cells_of_one_paragraph_are_one_block(self):
+        a, b = [300.0, 1163.0, 850.0, 1200.0], [300.0, 1210.0, 850.0, 1279.0]
+        fill = pictures.freed_text(
+            self.OWN, [self.TOP], [(a, "text"), (b, "text")], []
+        )
+        self.assertEqual(
+            fill,
+            [{"label": "TEXT_COLUMN", "box": [300.0, 1163.0, 850.0, 1279.0]}],
+        )
+
+    def test_a_sideways_title_beside_the_picture_joins_it(self):
+        """1963's page 704: a landscape table's rotated title, 62 px left of
+        the table, is part of the picture, never a text column."""
+        own = [244.0, 196.0, 1630.0, 2027.0]
+        table = [470.0, 430.0, 729.0, 1997.0]
+        title = [375.0, 976.0, 408.0, 1462.0]
+        boxes = pictures.absorb_sideways(
+            own, [table], [(title, "section-header")]
+        )
+        self.assertEqual(boxes, [[375.0, 430.0, 729.0, 1997.0]])
+        self.assertEqual(
+            pictures.freed_text(own, boxes, [(title, "section-header")], []),
+            [],
+        )
+
+    def test_a_line_across_the_page_is_never_pulled_in(self):
+        own = [244.0, 196.0, 1630.0, 2027.0]
+        table = [470.0, 430.0, 729.0, 1997.0]
+        prose = [289.0, 282.0, 846.0, 393.0]
+        self.assertEqual(
+            pictures.absorb_sideways(own, [table], [(prose, "text")]), [table]
+        )
