@@ -42,6 +42,10 @@
     /** A box a person moved and has not saved, by card key, so a
      *  reload of the cards keeps it. */
     var drafts = {};
+    /** The Refine option a card is showing, by card key, beside its draft box:
+     *  the option's index, the split's other boxes and the text it boxes, so a
+     *  reload of the cards draws the option whole and not its first box alone. */
+    var refineDrafts = {};
     /** The cards a bulk answer has queued and not written yet, by card
      *  key: their own buttons, keys, nudge, open and skip refuse them,
      *  so no card is written twice and no node the bulk writes to is
@@ -257,6 +261,14 @@
         var primary = node.querySelector('[data-role="primary"]');
         var reset = node.querySelector('[data-role="reset"]');
         var verbs = MODEL_VERBS[card.kind];
+        if ((card.split || []).length || (card.fill || []).length) {
+            // A split or a fill is pending: the button still saves all of
+            // it, so it says so, and Reset stays to take the option back.
+            if (primary) { primary.textContent = saveLabel(card); }
+            if (reset) { reset.hidden = false; }
+            drafts[card.key] = card.box.slice();
+            return;
+        }
         if (primary && verbs) {
             primary.textContent = moved(card) ? verbs.move : verbs.keep;
         }
@@ -631,6 +643,8 @@
                 card.split = null;
                 card.fill = null;
                 delete card.refineIdx;
+                delete drafts[card.key];
+                delete refineDrafts[card.key];
                 replace(card, node);
             });
             reset.dataset.role = 'reset';
@@ -999,6 +1013,7 @@
         card.split = boxes.length > 1 ? boxes.slice(1).map(function (b) { return b.slice(); }) : null;
         card.fill = (options[card.refineIdx].fill || []).map(function (f) { return { label: f.label, box: f.box.slice() }; });
         drafts[card.key] = card.box.slice();
+        refineDrafts[card.key] = { idx: card.refineIdx, split: card.split, fill: card.fill };
         replace(card, node);
     }
 
@@ -1055,6 +1070,7 @@
                 answers[card.key] = { label: saveLabel(card).replace('Save', 'saved'), undo: undos };
                 history.push(card.key);
                 delete drafts[card.key];
+                delete refineDrafts[card.key];
                 card.split = null;
                 card.fill = null;
                 replace(card, live());
@@ -1310,6 +1326,12 @@
                 card.total = list.length;
                 card.original = card.box ? card.box.slice() : null;
                 if (card.box && drafts[card.key] && !answers[card.key]) { card.box = drafts[card.key].slice(); }
+                var refined = refineDrafts[card.key];
+                if (refined && !answers[card.key]) {
+                    card.refineIdx = refined.idx;
+                    card.split = refined.split;
+                    card.fill = refined.fill;
+                }
                 holder.appendChild(cardNode(card));
             });
         });

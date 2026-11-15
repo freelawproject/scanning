@@ -789,6 +789,15 @@ class TestTheRefineScript(ScanningTestCase):
         self.assertIn("cfg.urls.add_single_detection", source)
         self.assertIn("Array.isArray(answer.undo)", source)
 
+    def test_a_pending_split_keeps_its_label_its_reset_and_its_draft(self):
+        """A drag during a split keeps "Save 2 image boxes ..." and Reset; a
+        reload of the cards draws the option whole; Reset clears both drafts."""
+        source = self.SCRIPT.read_text()
+        self.assertIn("if (primary) { primary.textContent = saveLabel(card); }", source)
+        self.assertIn("var refineDrafts = {};", source)
+        self.assertIn("var refined = refineDrafts[card.key];", source)
+        self.assertIn("delete drafts[card.key];\n                delete refineDrafts[card.key];", source)
+
 
 class TestFreedText(ScanningTestCase):
     """The text a refine gives up gets a box with the save."""
