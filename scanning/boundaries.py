@@ -1275,6 +1275,26 @@ def _live() -> Q:
     )
 
 
+def live_ends(scan: Scan) -> dict[int, list[tuple[float, float]]]:
+    """Return the end anchor of every live boundary, by its last page.
+
+    What the masks of a page read of the opinions that end on it
+    (:func:`ending_keys`, #624), for the digest of an opinion's inputs
+    (``opinions.read_rows``). One query.
+
+    :param scan: The scan.
+    :returns: ``{end_page_index: [(end_x, end_y), ...]}``, in points.
+    """
+    ends: dict[int, list[tuple[float, float]]] = {}
+    for page_index, x, y in (
+        OpinionBoundary.objects.filter(scan=scan)
+        .filter(_live())
+        .values_list("end_page_index", "end_x", "end_y")
+    ):
+        ends.setdefault(page_index, []).append((x, y))
+    return ends
+
+
 def has_live(scan: Scan) -> bool:
     """Return whether the volume has a boundary a reader would draw.
 
