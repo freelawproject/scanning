@@ -238,6 +238,7 @@ def _card_of(row: OpinionCard, scan_pk: int) -> dict:
         # A stale answer waits for a new one: the card is open again,
         # and its note says why.
         "stored": None if stale or row.answer is None else row.answer,
+        "applied": row.status == OpinionCard.Status.APPLIED,
         "note": row.note if stale else "",
         "answer_url": reverse(
             "answer_opinion_card",
@@ -257,7 +258,17 @@ def opinion_card_rows(
     """
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan_id=pk)
     filters = _filters(request)
-    rows = _rows(filters, request.user).filter(opinion=opinion)
+    rows = list(_rows(filters, request.user).filter(opinion=opinion))
+    if filters["status"] == "open":
+        # The viewer's own answers stay on the page with their Undo,
+        # until the apply writes them: the open filter alone would drop
+        # a card the moment it is answered.
+        rows += list(
+            _rows({**filters, "status": "answered"}, request.user).filter(
+                opinion=opinion, answered_by=request.user
+            )
+        )
+        rows.sort(key=lambda row: row.pk)
     return JsonResponse(
         {
             "status": "ok",
@@ -421,8 +432,8 @@ def opinion_card_answers(request: HttpRequest) -> HttpResponse:
             reverse("opinion_review", kwargs={"pk": row.opinion_id})
             + f"#op-page-{row.page_in_opinion}"
         )
-        row.answer_url = reverse(
-            "answer_opinion_card",
+        row.send_back_url = reverse(
+            "send_back_opinion_card",
             kwargs={"pk": row.opinion.scan_id, "card_pk": row.pk},
         )
     volunteers = (
@@ -464,3 +475,24 @@ def opinion_card_answers(request: HttpRequest) -> HttpResponse:
             "query": query,
         },
     )
+
+
+SENT_BACK_MESSAGE = "Sent back. The card is open again for a new answer."
+
+
+@login_required
+@require_POST
+def send_back_opinion_card(
+    request: HttpRequest, pk: int, card_pk: int
+) -> JsonResponse:
+    """Send one answer back, for staff (``opinion_cards.send_back``)."""
+    if not request.user.is_staff:
+        raise PermissionDenied
+    row = get_object_or_404(OpinionCard, pk=card_pk, opinion__scan_id=pk)
+    try:
+        opinion_cards.send_back(row, request.user)
+    except (opinion_cards.CardClosed, OpinionCard.DoesNotExist):
+        return JsonResponse(
+            {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
+        )
+    return JsonResponse({"status": "ok", "message": SENT_BACK_MESSAGE})

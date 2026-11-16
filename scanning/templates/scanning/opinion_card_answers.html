@@ -2,8 +2,8 @@
 
 {% comment %}
   The stored answers of the card rows, for staff: who answered what,
-  against which readings, and what became of it. "Send back" clears an
-  answer the apply has not written (the answer endpoint, no answer).
+  against which readings, and what became of it. "Send back" marks an
+  answer the apply has not written for a new one, and keeps it listed.
 {% endcomment %}
 
 {% block title %}Card answers - FLP Scanning Portal{% endblock %}
@@ -53,7 +53,7 @@
       </thead>
       <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
         {% for row in page_obj %}
-        <tr class="align-top" data-answer-url="{{ row.answer_url }}">
+        <tr class="align-top" data-send-back-url="{{ row.send_back_url }}">
           <td class="py-2 pr-3 whitespace-nowrap">
             <b>{{ row.answered_by.username|default:"?" }}</b><br>
             <span class="text-xs text-gray-500 dark:text-gray-400">{{ row.answered_at|date:"M j, H:i" }}</span>
@@ -83,7 +83,7 @@
           </td>
           <td class="py-2 text-right">
             {% if row.status == "answered" %}
-            <button type="button" class="btn-outline text-xs" data-role="send-back" title="Clear this answer: the card is open again for a new one">Send back</button>
+            <button type="button" class="btn-outline text-xs" data-role="send-back" title="Send this answer back: the card is open again for a new answer, and this one stays listed">Send back</button>
             {% endif %}
           </td>
         </tr>
@@ -115,11 +115,11 @@
       if (!button) { return; }
       var row = button.closest('tr');
       button.disabled = true;
-      fetch(row.dataset.answerUrl, {
+      fetch(row.dataset.sendBackUrl, {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': token },
-        body: JSON.stringify({ answer: null })
+        body: '{}'
       }).then(function (response) {
         return response.json().then(function (data) { return { ok: response.ok, data: data }; });
       }).then(function (answer) {

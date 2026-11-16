@@ -250,6 +250,26 @@ def answer(row: OpinionCard, user, value: str | None) -> OpinionCard:
     return row
 
 
+def send_back(row: OpinionCard, user) -> OpinionCard:
+    """Send an answer back for a new one: staff, before the apply.
+
+    The row is ``STALE``, its answer and its volunteer kept, so the
+    answers list shows who answered what and why it went back, and the
+    cards page offers the card again with the note. A volunteer's own
+    Undo is :func:`answer` with ``None``, which opens the card clean.
+
+    :raises CardClosed: for a row that is not waiting for the apply.
+    """
+    with transaction.atomic():
+        row = OpinionCard.objects.select_for_update().get(pk=row.pk)
+        if row.status != OpinionCard.Status.ANSWERED:
+            raise CardClosed(row.pk)
+        row.status = OpinionCard.Status.STALE
+        row.note = f"Sent back by {user}: answer it again."
+        row.save(update_fields=["status", "note", "date_modified"])
+    return row
+
+
 def compose(card: dict, value: str, text: str | None = None) -> str:
     """Return the block text one answer makes, the review page's rule.
 
@@ -287,7 +307,14 @@ def _all_answers(group_text: str, rows: list[OpinionCard]) -> str:
     before it; each card's span is in the same text, the group's.
     """
     text = group_text
-    for row in sorted(rows, key=lambda r: r.card["start"], reverse=True):
+    # At one offset the word is replaced before the gap's words go in
+    # before it, or the replacement would cut into the inserted words.
+    ordered = sorted(
+        rows,
+        key=lambda r: (r.card["start"], not r.card.get("gap")),
+        reverse=True,
+    )
+    for row in ordered:
         card = row.card
         start = card["start"]
         if card.get("gap"):

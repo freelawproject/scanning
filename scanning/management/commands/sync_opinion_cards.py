@@ -46,6 +46,7 @@ class Command(BaseCommand):
             if not ensemble.is_written(opinion):
                 total["not written"] += 1
                 continue
+            read_at = (opinion.ensemble_revision, opinion.ensemble_edit_revision)
             try:
                 document = ensemble.read_document(opinion)
             except (ensemble.EnsembleError, ensemble.TransientFault) as exc:
@@ -53,6 +54,18 @@ class Command(BaseCommand):
                 self.stderr.write(f"{opinion} (#{opinion.pk}): {exc}")
                 continue
             with transaction.atomic():
+                # The lock ``ensemble.write`` takes: a build that stamped
+                # a newer document since the read wrote the rows from it,
+                # and these would be the older document's.
+                now = (
+                    Opinion.objects.select_for_update()
+                    .filter(pk=opinion.pk)
+                    .values_list("ensemble_revision", "ensemble_edit_revision")
+                    .first()
+                )
+                if now != read_at:
+                    total["moved, skipped"] += 1
+                    continue
                 total.update(opinion_cards.sync(opinion, document))
             total["opinions"] += 1
         summary = ", ".join(f"{k} {v}" for k, v in sorted(total.items()))

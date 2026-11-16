@@ -166,8 +166,8 @@
                     .map(function (card) {
                         return {
                             card: card,
-                            label: 'answered: "' + shorten(card.stored) + '"',
-                            undo: { url: card.answer_url, body: { answer: null } }
+                            label: (card.applied ? 'applied: "' : 'answered: "') + shorten(card.stored) + '"',
+                            undo: card.applied ? null : { url: card.answer_url, body: { answer: null } }
                         };
                     });
                 self.cards = self.cards.filter(function (card) { return card.stored === null; });
@@ -193,7 +193,10 @@
         var nodes = [];
         if (this.approved) {
             nodes.push(note('Approved.', 'ok'));
-        } else if (!this.cards.length) {
+        } else if (rowsMode && !this.cards.length && !this.answers.length) {
+            // No approval is offered here: the cards page stores answers.
+            nodes.push(note('No card of this filter is left in this opinion.', 'ok'));
+        } else if (!rowsMode && !this.cards.length) {
             nodes.push(note('No blocking card is open. The text can be approved.', 'ok'));
         } else {
             // The open cards and the answered ones together, in the
@@ -693,13 +696,19 @@
         open.href = section.reviewUrl + '#op-page-' + card.page_in_opinion;
         footer.appendChild(open);
         if (answer) {
-            var back = el('button', 'btn-outline text-xs', 'Undo');
-            back.type = 'button';
-            back.title = answer.finding_pk
-                ? 'Reopen the card of this page'
-                : 'Withdraw the edit: the block reads as the engines left it';
-            back.addEventListener('click', function () { back.disabled = true; section.undo(answer); });
-            footer.appendChild(back);
+            // An applied row's answer is an edit now: its Undo is the
+            // review page's, so the cards page offers none.
+            if (answer.undo) {
+                var back = el('button', 'btn-outline text-xs', 'Undo');
+                back.type = 'button';
+                back.title = rowsMode
+                    ? 'Take the answer back: the card is open again'
+                    : (answer.finding_pk
+                        ? 'Reopen the card of this page'
+                        : 'Withdraw the edit: the block reads as the engines left it');
+                back.addEventListener('click', function () { back.disabled = true; section.undo(answer); });
+                footer.appendChild(back);
+            }
         } else if (kept || skipped) {
             var release = el('button', 'btn-outline text-xs', 'Undo');
             release.type = 'button';

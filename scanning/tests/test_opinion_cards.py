@@ -488,3 +488,134 @@ class TestTheAnswersPage(CardTestCase):
         answer = self.client.get(reverse("opinion_card_answers"))
 
         self.assertEqual(answer.status_code, 403)
+
+
+class TestTheFixesOfTheReview(CardTestCase):
+    def test_a_word_and_a_gap_at_one_offset_both_land(self):
+        """The word is replaced first, then the gap's words go in
+        before it: never a cut into the inserted words."""
+        gap = OpinionCard(
+            pk=1,
+            answer="very",
+            card={"kind": "word", "gap": True, "start": 2, "length": 0},
+        )
+        word = OpinionCard(
+            pk=2,
+            answer="big",
+            card={"kind": "word", "start": 2, "length": 3},
+        )
+
+        self.assertEqual(
+            opinion_cards._all_answers("a dog sat", [gap, word]),
+            "a very big sat",
+        )
+        self.assertEqual(
+            opinion_cards._all_answers("a dog sat", [word, gap]),
+            "a very big sat",
+        )
+
+    def test_send_back_keeps_the_answer_and_who_gave_it(self):
+        opinion_cards.sync(self.opinion, document(self.held()))
+        volunteer = self.make_user()
+        opinion_cards.answer(self.row(), volunteer, "holds")
+        staff = self.make_staff_user()
+        self.client.force_login(staff)
+        url = reverse(
+            "send_back_opinion_card",
+            kwargs={"pk": self.opinion.scan_id, "card_pk": self.row().pk},
+        )
+
+        answer = self.client.post(url)
+
+        self.assertEqual(answer.json()["status"], "ok")
+        row = self.row()
+        self.assertEqual(row.status, OpinionCard.Status.STALE)
+        self.assertEqual((row.answer, row.answered_by), ("holds", volunteer))
+        self.assertIn(staff.username, row.note)
+        listed = self.client.get(
+            reverse("opinion_card_answers") + "?status=stale"
+        )
+        self.assertContains(listed, "holds")
+        # A second press finds nothing waiting for the apply.
+        self.assertEqual(self.client.post(url).status_code, 409)
+
+    def test_send_back_is_for_staff(self):
+        opinion_cards.sync(self.opinion, document(self.held()))
+        opinion_cards.answer(self.row(), self.make_user(), "holds")
+        self.client.force_login(self.make_user())
+
+        answer = self.client.post(
+            reverse(
+                "send_back_opinion_card",
+                kwargs={"pk": self.opinion.scan_id, "card_pk": self.row().pk},
+            )
+        )
+
+        self.assertEqual(answer.status_code, 403)
+
+    def test_the_open_filter_keeps_the_viewers_own_answers(self):
+        other = blocking(
+            read("a dog sat", "a dig sat", "a dug sat"),
+            gid=4,
+            box=(36, 200, 288, 220),
+        )
+        opinion_cards.sync(self.opinion, document(self.held(), other))
+        viewer = self.make_user()
+        rows = {r.card["token"]: r for r in OpinionCard.objects.all()}
+        opinion_cards.answer(rows["held"], viewer, "holds")
+        opinion_cards.answer(rows["dog"], self.make_user(), "dug")
+        self.client.force_login(viewer)
+        kwargs = {"pk": self.opinion.scan_id, "opinion_pk": self.opinion.pk}
+
+        cards = self.client.get(reverse("opinion_card_rows", kwargs=kwargs)).json()[
+            "cards"
+        ]
+
+        # Their own answer, with its Undo; another volunteer's is no
+        # longer open and is not theirs to undo.
+        self.assertEqual(
+            [(c["token"], c["stored"]) for c in cards], [("held", "holds")]
+        )
+
+    def test_the_sync_command_skips_an_opinion_a_build_stamped_since(self):
+        from django.core.management import call_command
+
+        from scanning.models import Opinion
+
+        doc = document(self.held())
+
+        def read_and_race(opinion):
+            # A build stamps a newer document between the read and the
+            # write of the rows.
+            Opinion.objects.filter(pk=opinion.pk).update(
+                ensemble_edit_revision=opinion.ensemble_edit_revision + 1
+            )
+            return doc
+
+        with (
+            patch("scanning.ensemble.is_written", return_value=True),
+            patch("scanning.ensemble.read_document", side_effect=read_and_race),
+        ):
+            call_command("sync_opinion_cards", str(self.opinion.scan_id))
+
+        self.assertFalse(OpinionCard.objects.exists())
+
+
+class TestTheRowsScript(ScanningTestCase):
+    def test_answered_rows_are_drawn_and_an_applied_one_has_no_undo(self):
+        import pathlib
+        import re
+
+        source = (
+            pathlib.Path(__file__).resolve().parent.parent
+            / "static"
+            / "scanning"
+            / "blocking_review.js"
+        ).read_text()
+        render = re.search(
+            r"Section\.prototype\.render = function(.*?)\n    \};", source, re.S
+        ).group(1)
+        self.assertIn("rowsMode && !this.cards.length && !this.answers.length", render)
+        self.assertIn("!rowsMode && !this.cards.length", render)
+        self.assertIn("undo: card.applied ? null", source)
+        self.assertIn("if (answer.undo)", source)
