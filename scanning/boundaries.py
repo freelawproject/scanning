@@ -977,8 +977,11 @@ def ending_keys(scan: Scan, pages: dict, centred: dict) -> dict:
 
     A key icon across the gutter divides its page only when an opinion
     ends at it: a key-shaped mark in an exhibit, or a key the pairing
-    left out, says nothing of the reading order. One query, and none
-    for a volume with no centred key on the pages asked about.
+    left out, says nothing of the reading order. The boundary is a live
+    one (:func:`_live`): a computed end a curator dismissed or moved
+    away keeps its row and its old anchor, and is no end any more. One
+    query, and none for a volume with no centred key on the pages asked
+    about.
 
     :param scan: The scan.
     :param pages: ``{page_index: blackletter Page}``.
@@ -989,10 +992,8 @@ def ending_keys(scan: Scan, pages: dict, centred: dict) -> dict:
         return {}
     ends: dict[int, list[tuple[float, float]]] = {}
     for page_index, x, y in (
-        OpinionBoundary.objects.filter(
-            scan=scan, end_page_index__in=centred, withdrawn_at__isnull=True
-        )
-        .exclude(kind=OpinionBoundary.Kind.DISMISS)
+        OpinionBoundary.objects.filter(scan=scan, end_page_index__in=centred)
+        .filter(_live())
         .values_list("end_page_index", "end_x", "end_y")
     ):
         ends.setdefault(page_index, []).append((x, y))
@@ -1262,6 +1263,18 @@ def outside_rects(
     return result
 
 
+def _live() -> Q:
+    """The boundaries a reader would draw: a computed row under no
+    dismissal, or a curator's addition not withdrawn."""
+    return Q(
+        origin=OpinionBoundary.Origin.COMPUTED, decision__isnull=True
+    ) | Q(
+        origin=OpinionBoundary.Origin.HUMAN,
+        kind=OpinionBoundary.Kind.ADD,
+        withdrawn_at__isnull=True,
+    )
+
+
 def has_live(scan: Scan) -> bool:
     """Return whether the volume has a boundary a reader would draw.
 
@@ -1272,18 +1285,7 @@ def has_live(scan: Scan) -> bool:
     :param scan: The scan.
     :returns: Whether one exists.
     """
-    return (
-        OpinionBoundary.objects.filter(scan=scan)
-        .filter(
-            Q(origin=OpinionBoundary.Origin.COMPUTED, decision__isnull=True)
-            | Q(
-                origin=OpinionBoundary.Origin.HUMAN,
-                kind=OpinionBoundary.Kind.ADD,
-                withdrawn_at__isnull=True,
-            )
-        )
-        .exists()
-    )
+    return OpinionBoundary.objects.filter(scan=scan).filter(_live()).exists()
 
 
 def viewer_payload(

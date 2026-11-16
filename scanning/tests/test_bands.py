@@ -839,6 +839,20 @@ class TestTheCentredKey(TestCase):
         self.assertEqual(len(masks), 1)
         self.assertLess(masks[0]["x1"], 310)
 
+    def test_a_dismissed_end_at_the_key_divides_nothing(self):
+        # The computed row keeps its anchor at the key under a
+        # dismissal, and is no end any more: the column order stands.
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        ending = self._ending(scan)
+        boundaries.dismiss(scan, ending, UserFactory())
+        starting = self._starting(scan)
+
+        masks = self._masks(scan, starting)
+
+        self.assertEqual(len(masks), 1)
+        self.assertLess(masks[0]["x1"], 310)
+
     def test_a_key_at_the_end_of_a_column_keeps_the_column_order(self):
         scan = ScanFactory(page_count=6)
         key = (500, 455, 751, 550)
