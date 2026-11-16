@@ -567,9 +567,9 @@ class TestTheFixesOfTheReview(CardTestCase):
         self.client.force_login(viewer)
         kwargs = {"pk": self.opinion.scan_id, "opinion_pk": self.opinion.pk}
 
-        cards = self.client.get(reverse("opinion_card_rows", kwargs=kwargs)).json()[
-            "cards"
-        ]
+        cards = self.client.get(
+            reverse("opinion_card_rows", kwargs=kwargs)
+        ).json()["cards"]
 
         # Their own answer, with its Undo; another volunteer's is no
         # longer open and is not theirs to undo.
@@ -594,7 +594,9 @@ class TestTheFixesOfTheReview(CardTestCase):
 
         with (
             patch("scanning.ensemble.is_written", return_value=True),
-            patch("scanning.ensemble.read_document", side_effect=read_and_race),
+            patch(
+                "scanning.ensemble.read_document", side_effect=read_and_race
+            ),
         ):
             call_command("sync_opinion_cards", str(self.opinion.scan_id))
 
@@ -613,9 +615,13 @@ class TestTheRowsScript(ScanningTestCase):
             / "blocking_review.js"
         ).read_text()
         render = re.search(
-            r"Section\.prototype\.render = function(.*?)\n    \};", source, re.S
+            r"Section\.prototype\.render = function(.*?)\n    \};",
+            source,
+            re.S,
         ).group(1)
-        self.assertIn("rowsMode && !this.cards.length && !this.answers.length", render)
+        self.assertIn(
+            "rowsMode && !this.cards.length && !this.answers.length", render
+        )
         self.assertIn("!rowsMode && !this.cards.length", render)
         self.assertIn("undo: card.applied ? null", source)
         self.assertIn("if (answer.undo)", source)

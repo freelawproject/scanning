@@ -46,7 +46,10 @@ class Command(BaseCommand):
             if not ensemble.is_written(opinion):
                 total["not written"] += 1
                 continue
-            read_at = (opinion.ensemble_revision, opinion.ensemble_edit_revision)
+            read_at = (
+                opinion.ensemble_revision,
+                opinion.ensemble_edit_revision,
+            )
             try:
                 document = ensemble.read_document(opinion)
             except (ensemble.EnsembleError, ensemble.TransientFault) as exc:
