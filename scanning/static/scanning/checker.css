@@ -1787,6 +1787,9 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-card.bk-active { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.18); }
 .bk-card > header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12.5px; color: #6b7280; margin-bottom: 8px; }
 .bk-card > header .bk-step { font-weight: 600; color: #b3261e; }
+.bk-card > header .bk-type { font-size: 11px; padding: 1px 6px; border-radius: 9999px; background: #eef2ff; color: #3730a3; }
+.bk-card > header .bk-note-line { flex-basis: 100%; color: #b45309; }
+@media (prefers-color-scheme: dark) { .bk-card > header .bk-type { background: #312e81; color: #e0e7ff; } .bk-card > header .bk-note-line { color: #fbbf24; } }
 .bk-cropwrap { position: relative; border: 1px solid #e5e7eb; background: #fff; overflow: hidden; border-radius: 4px; max-width: 760px; margin-bottom: 8px; }
 .bk-cropwrap canvas { width: 100%; height: auto; display: block; }
 .bk-hl { position: absolute; border: 2px solid #b3261e; background: rgba(179, 38, 30, 0.14); border-radius: 3px; box-sizing: border-box; pointer-events: none; }

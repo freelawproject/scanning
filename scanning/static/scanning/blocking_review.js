@@ -30,6 +30,11 @@
     /** The level the page walks: 'blocking', or 'warning' for the
      *  warnings review, which gates nothing (``data-level``). */
     var level = 'blocking';
+    /** The card rows (``data-mode="rows"``, the volunteers' page): an
+     *  answer is stored on its ``OpinionCard`` row and written later by
+     *  ``apply_card_answers``, so nothing here edits the text, settles a
+     *  page or approves. */
+    var rowsMode = false;
     var sections = [];
 
     function el(tag, className, text) {
@@ -154,6 +159,19 @@
             }
             self.opinion = answer.data.opinion;
             self.cards = answer.data.cards;
+            if (rowsMode) {
+                // A stored answer is an answered card, with its Undo:
+                // the row's answer taken back.
+                self.answers = self.cards.filter(function (card) { return card.stored !== null; })
+                    .map(function (card) {
+                        return {
+                            card: card,
+                            label: 'answered: "' + shorten(card.stored) + '"',
+                            undo: { url: card.answer_url, body: { answer: null } }
+                        };
+                    });
+                self.cards = self.cards.filter(function (card) { return card.stored === null; });
+            }
             // The open blocking cards, whatever this page walks: the
             // approval stays behind the gate.
             self.blockingOpen = answer.data.blocking_open || 0;
@@ -206,6 +224,23 @@
     };
 
     /** Write the text of a block, the edit "Edit text" writes. */
+    /** Store an answer on a card's row (the rows mode): the words for
+     *  the card's place, written into the text later by the apply. */
+    Section.prototype.store = function (card, value, node) {
+        var self = this;
+        var state = node.querySelector('.bk-state');
+        state.textContent = 'saving…';
+        return postJson(card.answer_url, { answer: value }).then(function (answer) {
+            if (!answer.ok) {
+                state.textContent = answer.data.message || 'The answer was refused.';
+                state.classList.add('bk-error');
+                return;
+            }
+            self.answered += 1;
+            return self.reload();
+        });
+    };
+
     Section.prototype.write = function (card, text, node) {
         var self = this;
         var state = node.querySelector('.bk-state');
@@ -324,6 +359,8 @@
      *  kept is closed here, once. */
     Section.prototype.settle = function (cause) {
         var self = this;
+        // A row's answer settles nothing until the apply writes it.
+        if (rowsMode) { return Promise.resolve(); }
         var byFinding = {};
         this.cards.forEach(function (card) {
             if (!card.finding_pk) { return; }
@@ -405,6 +442,7 @@
      *  before: a dismissal closes them all. */
     Section.prototype.keep = function (card, node) {
         var self = this;
+        if (rowsMode) { return this.store(card, shownValue(card), node); }
         this.kept[keyOf(card)] = true;
         node.classList.add('bk-done');
         node.querySelector('.bk-state').textContent = 'kept as shown';
@@ -592,6 +630,8 @@
         var header = el('header');
         header.appendChild(el('span', 'bk-step', 'Fix ' + index + ' of ' + total));
         header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
+        if (card.reason_label) { header.appendChild(el('span', 'bk-type', card.reason_label)); }
+        if (card.note) { header.appendChild(el('span', 'bk-note-line', card.note)); }
         if (card.kind !== 'link' && card.crop) {
             // The whole page and back, as the step-2 card review has it
             // (f, Esc back): a crop is a guess at the line, and the
@@ -702,6 +742,8 @@
                 section.keep(card, node);
             });
             footer.appendChild(right);
+        }
+        if (card.kind !== 'link' && card.kind !== 'cover' && !answer && !kept && !skipped && !rowsMode) {
             var junk = el('button', 'btn-outline text-xs', 'Not text');
             junk.type = 'button';
             junk.title = 'Take the whole block out of the text: it is not'
@@ -715,6 +757,8 @@
                 section.drop(card, node);
             });
             footer.appendChild(junk);
+        }
+        if (card.kind !== 'link' && card.kind !== 'cover' && !answer && !kept && !skipped) {
             var skip = el('button', 'btn-outline text-xs', 'Skip');
             skip.type = 'button';
             skip.addEventListener('click', function () {
@@ -884,7 +928,19 @@
     /** Apply a value to a card: the block's text with the word replaced
      *  (a word card), or the typed text (a single block). A value that
      *  leaves the text as shown keeps the card. */
+    /** What a card's place reads as shown: its word, nothing in a gap,
+     *  or the whole block. Kept as shown, it is the row's answer. */
+    function shownValue(card) {
+        if (card.kind === 'word' && card.gap) { return ''; }
+        if (card.kind === 'word') { return card.token; }
+        return card.text;
+    }
+
     function choose(section, card, node, value) {
+        if (rowsMode) {
+            section.store(card, value, node);
+            return;
+        }
         var text;
         if (card.kind === 'word' && card.gap) {
             // The words go into the gap; the text around it stays.
@@ -1039,6 +1095,7 @@
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('blocking-review');
         level = (root && root.dataset.level) || 'blocking';
+        rowsMode = !!root && root.dataset.mode === 'rows';
         if (!root) { return; }
         if (window.pdfjsLib) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =

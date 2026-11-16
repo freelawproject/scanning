@@ -3931,6 +3931,116 @@ class OpinionEdit(AbstractDateTimeModel):
         )
 
 
+class OpinionCard(AbstractDateTimeModel):
+    """One blocking card of the text review, as a row.
+
+    The cards of ``blocking_review.group_cards``, written by the
+    ensemble build (``opinion_cards.sync``) beside the findings: one row
+    per word no two engines agree on, per block one engine alone read,
+    per block too garbled for a card per word. Each carries its reason
+    (``blocking_types``), so the cards can be handed out and walked by
+    reason across the corpus without a read of any document.
+
+    **An answer is stored, not applied.** A volunteer picks a reading
+    or types the text, and the row keeps it; ``opinion_cards.apply``
+    writes the answers later as the review page's own text edits
+    (``OpinionEdit``), the one writer of the text, and dismisses a
+    page's finding whose every card was kept as shown.
+
+    **The address is the key**, never a group id: the page, a copy of
+    the block's box and the word's base position (``key``). Every build
+    writes the rows again by that key, so an answer outlives a rerun; a
+    card the engines now agree on goes, and an answered card whose
+    readings moved is ``STALE``, its answer kept for a new look.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        ANSWERED = "answered", "Answered"
+        STALE = "stale", "Needs a new answer"
+        APPLIED = "applied", "Applied"
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="cards",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField()
+    key = models.CharField(
+        max_length=200,
+        help_text="The address: page, block box, kind and base position.",
+    )
+    check_name = models.CharField(
+        max_length=50,
+        choices=OpinionCheck.choices,
+        help_text="The finding of the page the card answers.",
+    )
+    kind = models.CharField(max_length=10)
+    reason = models.CharField(max_length=32, db_index=True)
+    card = models.JSONField(
+        help_text=(
+            "The card as the review shows it: the block text, the "
+            "word's offsets, each engine's reading, the crop."
+        ),
+    )
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.OPEN
+    )
+    answer = models.TextField(
+        null=True,
+        blank=True,
+        help_text="The words chosen for the card; null while unanswered.",
+    )
+    answered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="answered_cards",
+    )
+    answered_at = models.DateTimeField(null=True, blank=True)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_cards",
+    )
+    edit = models.ForeignKey(
+        OpinionEdit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cards",
+        help_text="The text edit the apply wrote for the answer.",
+    )
+    applied_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Why the card needs a new answer, or what the apply did.",
+    )
+
+    class Meta:
+        ordering = ["opinion_id", "page_in_opinion", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["opinion", "key"], name="uniq_opinion_card_key"
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["reason", "status"], name="idx_opinion_card_reason"
+            ),
+            models.Index(
+                fields=["opinion", "status"], name="idx_opinion_card_status"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.reason} card on {self.opinion}"
+
+
 class PageEdit(AbstractDateTimeModel):
     """One decision a person made about one page of a scan (issue #214).
 

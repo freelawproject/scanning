@@ -5607,6 +5607,11 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
+            # The blocking cards as rows, after the findings they hang
+            # on. Imported here: ``opinion_cards`` reads this module.
+            from scanning import opinion_cards
+
+            opinion_cards.sync(opinion, document)
             digest = opinion_figures.ledger_digest(opinion, document)
             stamped = Opinion.objects.filter(
                 pk=opinion.pk,
