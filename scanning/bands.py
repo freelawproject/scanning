@@ -32,6 +32,15 @@ that still holds the anchor of a boundary (a hand-drawn box, a picture
 under its caption) keeps blackletter's masks on its page and is the
 ``image_over_boundary`` card of step 2 (:func:`over_boundary`), so a
 person moves the box.
+
+A key icon printed across the gutter is the same reading with no
+picture (#624): an opinion whose last lines are set as two balanced
+columns ends with its key centred under them, and the next opinion
+starts under the key. Both columns above the key are the ending
+opinion's and everything under it is the next one's
+(:func:`is_centred`, the ``dividers`` of a :class:`Layout`), and the
+headnote rect blackletter runs down the right column from its top
+starts at the key's foot (:func:`clip_headnotes`).
 """
 
 from __future__ import annotations
@@ -81,6 +90,15 @@ ANCHOR_SLACK_PX = 8.0
 #: above it.
 PAINT_INSET_PT = 3.0
 
+#: How far past the columns' outer edges, in points, the mask under a
+#: centred key reaches: into the margin, which is white already.
+ACROSS_PAD_PT = 4.0
+
+#: How far above the foot of a centred key, in points, the paint of the
+#: mask under it starts: a mask that starts on the top edge of a black
+#: box leaves that edge as a hairline.
+HAIRLINE_PT = 1.5
+
 #: The widest blank, in render pixels, between two blocks of one
 #: column. The column under a picture is walked upwards from the key
 #: icon or the caption by its cells, and a wider blank than this is the
@@ -104,6 +122,11 @@ MIN_KEPT_PX = 60.0
 #: The gap left between a trimmed box and the column under it when no
 #: cell says where the picture's own matter ends, in render pixels.
 FOOT_GAP_PX = 2.0
+
+#: A key icon is centred when at least this share of its width lies on
+#: each side of the gutter. A key at the end of a column's last line
+#: reaches the facing column by a sliver at most.
+CENTRED_SHARE = 0.25
 
 IMAGE = Label.IMAGE.name
 
@@ -131,6 +154,25 @@ def is_full_width(box: Box, left: Span, right: Span) -> bool:
         if min(box[2], x1) - max(box[0], x0) < width * FULL_WIDTH_SHARE:
             return False
     return True
+
+
+def is_centred(box: Box, left: Span, right: Span) -> bool:
+    """Return whether a key icon is printed across the gutter (#624).
+
+    An opinion whose last lines are set as two balanced columns ends
+    with its key icon centred under them, so the page is read as the
+    columns above the key, the key, the columns under it.
+
+    :param box: The key icon's ``(x0, y0, x1, y1)``.
+    :param left: The left column's ``(x0, x1)``, in the same space.
+    :param right: The right column's, the same way.
+    """
+    divide = (left[1] + right[0]) / 2
+    width = box[2] - box[0]
+    return (
+        width > 0
+        and min(divide - box[0], box[2] - divide) >= width * CENTRED_SHARE
+    )
 
 
 def own_columns(spans: list[Span]) -> tuple[Span, Span] | None:
@@ -175,6 +217,9 @@ class Layout:
     :param top: Where the text starts, under the running head.
     :param bottom: Where it ends, above the footnotes.
     :param bands: The full-width pictures, top to bottom.
+    :param dividers: The centred key icons that end an opinion
+        (:func:`is_centred`, #624), top to bottom. Each divides the page
+        like a picture, and belongs to the opinion it ends.
     """
 
     left: Span
@@ -182,6 +227,7 @@ class Layout:
     top: float
     bottom: float
     bands: tuple[Box, ...]
+    dividers: tuple[Box, ...] = ()
 
     @property
     def divide(self) -> float:
@@ -230,14 +276,17 @@ def outside(
     masks: list[Mask] = []
     x0 = min([layout.left[0]] + [b[0] for b in layout.bands])
     x1 = max([layout.right[1]] + [b[2] for b in layout.bands])
+    # A centred key icon divides the page as a picture does, and a
+    # boundary is anchored at its foot, never inside it.
+    every = sorted(layout.bands + layout.dividers, key=lambda b: b[1])
 
     def _region(at: float) -> tuple[float, float, bool, bool] | None:
         """The column region that holds ``at``, and what lies beside."""
         for band in layout.bands:
             if band[1] + ANCHOR_SLACK_PT < at < band[3] - ANCHOR_SLACK_PT:
                 return None
-        above = [b for b in layout.bands if (b[1] + b[3]) / 2 < at]
-        below = [b for b in layout.bands if (b[1] + b[3]) / 2 >= at]
+        above = [b for b in every if (b[1] + b[3]) / 2 < at]
+        below = [b for b in every if (b[1] + b[3]) / 2 >= at]
         top = max([layout.top] + [b[3] for b in above])
         bottom = min([layout.bottom] + [b[1] for b in below])
         return top, bottom, bool(above), bool(below)
@@ -249,16 +298,23 @@ def outside(
         top, bottom, above, _below = region
         if above:
             masks.append(Mask((x0, layout.top, x1, top)))
+        # Under a centred key the column masks start where the mask
+        # across the page ends, less the three points blackletter
+        # paints a mask under its top, so no line of the key's black
+        # box shows between the two.
+        under = top
+        if any(abs(box[3] - top) < 0.01 for box in layout.dividers):
+            under = top - PAINT_INSET_PT
         if x + ANCHOR_INSET_PT < layout.divide:
             masks.append(
-                Mask((layout.left[0], top, layout.left[1], y), "left")
+                Mask((layout.left[0], under, layout.left[1], y), "left")
             )
         else:
             masks.append(
-                Mask((layout.left[0], top, layout.left[1], bottom), "left")
+                Mask((layout.left[0], under, layout.left[1], bottom), "left")
             )
             masks.append(
-                Mask((layout.right[0], top, layout.right[1], y), "right")
+                Mask((layout.right[0], under, layout.right[1], y), "right")
             )
     if is_last and end is not None:
         end_x, end_y = end
@@ -266,6 +322,27 @@ def outside(
         if region is None:
             return None
         top, bottom, _above, below = region
+        if _ends_at(layout.dividers, end_x, end_y):
+            # The opinion's own key is centred under its last lines:
+            # both columns above it are the opinion's, and everything
+            # under it is the next one's, whatever side of the gutter
+            # the key's corner falls on.
+            # blackletter paints a mask three points under its top and
+            # over the black boxes of the page, so the mask starts that
+            # much above the key's foot and reaches past the columns'
+            # edges: the next opinion's headnote box starts at the foot
+            # and ends on the column's edge, and a line of it showed.
+            masks.append(
+                Mask(
+                    (
+                        x0 - ACROSS_PAD_PT,
+                        end_y - PAINT_INSET_PT - HAIRLINE_PT,
+                        x1 + ACROSS_PAD_PT,
+                        layout.bottom,
+                    )
+                )
+            )
+            return _with_area(masks)
         if end_x - ANCHOR_INSET_PT >= layout.divide:
             masks.append(
                 Mask(
@@ -292,7 +369,89 @@ def outside(
                     )
                 )
             )
+    return _with_area(masks)
+
+
+def _with_area(masks: list[Mask]) -> list[Mask]:
+    """Return the masks that cover something."""
     return [m for m in masks if m.box[0] < m.box[2] and m.box[1] < m.box[3]]
+
+
+def _ends_at(dividers: tuple[Box, ...], x: float, y: float) -> bool:
+    """Return whether an end anchor is the corner of a centred key."""
+    return any(
+        abs(box[2] - x) <= ANCHOR_INSET_PT
+        and abs(box[3] - y) <= ANCHOR_INSET_PT
+        for box in dividers
+    )
+
+
+def clip_headnotes(scan, rects: list[dict], pages) -> int:
+    """End each headnote rect at the centred key it runs through (#624).
+
+    blackletter reads a page as the left column, then the right one, so
+    the headnote rect of an opinion that starts under a centred key
+    takes the right column from its top: over the last lines of the
+    opinion before, which are set above the key in both columns. No
+    headnote runs through the end of an opinion, so a ``headnote`` rect
+    that starts above such a key and ends under it starts at the key's
+    foot instead. Smaller only, and only on a page whose own column
+    boxes make two columns.
+
+    :param scan: The scan, whose boundaries say which keys end an
+        opinion (``boundaries.ending_keys``).
+    :param rects: blackletter's rects of the compute, in render pixels,
+        mutated in place (``text_fit.fit_rects``'s input).
+    :param pages: The blackletter ``Page`` objects.
+    :returns: How many rects changed.
+    :rtype: int
+    """
+    from scanning import boundaries
+
+    by_index = {page.index: page for page in pages}
+    centred: dict[int, list[Box]] = {}
+    for entry in rects:
+        page = by_index.get(entry["page_index"])
+        if page is None or not any(
+            rect.get("type") == "headnote" for rect in entry["rects"]
+        ):
+            continue
+        found = getattr(page, "detections", None) or []
+        columns = own_columns(
+            [
+                (d.bbox.x1, d.bbox.x2)
+                for d in found
+                if d.label == Label.TEXT_COLUMN
+            ]
+        )
+        if columns is None:
+            continue
+        keys = [
+            (d.bbox.x1, d.bbox.y1, d.bbox.x2, d.bbox.y2)
+            for d in found
+            if d.label == Label.KEY_ICON
+        ]
+        keys = [box for box in keys if is_centred(box, *columns)]
+        if keys:
+            centred[page.index] = keys
+    centred = boundaries.ending_keys(scan, by_index, centred)
+    changed = 0
+    for entry in rects:
+        for key in centred.get(entry["page_index"], []):
+            for rect in entry["rects"]:
+                if (
+                    rect.get("type") == "headnote"
+                    and rect["y0"] < key[1]
+                    and rect["y1"] > key[3]
+                ):
+                    rect["y0"] = key[3]
+                    changed += 1
+    if changed:
+        logger.info(
+            "centred key icons: %d headnote rect(s) start under the key",
+            changed,
+        )
+    return changed
 
 
 # ---------------------------------------------------------------------------

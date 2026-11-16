@@ -866,12 +866,15 @@ def _page_bounds(
 
 
 def _band_layouts(scan: Scan, pages: dict) -> dict:
-    """Return the layout of each page that holds a full-width picture.
+    """Return the layout of each page a band divides.
 
     The pages of ``pages`` with a live ``IMAGE`` box across both
-    columns (``bands.is_full_width``), in PDF points. The columns are
-    the page's own when its boxes make two, the volume's otherwise, in
-    one more query, and only for a page with a box wide enough to ask.
+    columns (``bands.is_full_width``, #620) or a key icon centred
+    across the gutter that ends an opinion (``bands.is_centred``,
+    #624), in PDF points. The columns are the page's own when its
+    boxes make two, the volume's otherwise, in one more query, and
+    only for a page with a picture wide enough to ask; a centred key
+    is read on a page that has its columns already.
 
     :param scan: The scan.
     :param pages: ``{page_index: blackletter Page}``, with the live
@@ -883,58 +886,128 @@ def _band_layouts(scan: Scan, pages: dict) -> dict:
 
     from scanning import bands
 
-    wide: dict[int, list] = {}
-    for page_index, page in pages.items():
-        boxes = [
+    def _boxes(page, label):
+        return [
             (d.bbox.x1, d.bbox.y1, d.bbox.x2, d.bbox.y2)
             for d in page.detections
-            if d.label == Label.IMAGE
+            if d.label == label
         ]
-        boxes = [b for b in boxes if bands.may_span(b, page.img_width)]
+
+    spans = {
+        page_index: [(b[0], b[2]) for b in _boxes(page, Label.TEXT_COLUMN)]
+        for page_index, page in pages.items()
+    }
+    wide: dict[int, list] = {}
+    keyed: dict[int, list] = {}
+    for page_index, page in pages.items():
+        boxes = [
+            b
+            for b in _boxes(page, Label.IMAGE)
+            if bands.may_span(b, page.img_width)
+        ]
         if boxes:
             wide[page_index] = boxes
-    if not wide:
+        keys = _boxes(page, Label.KEY_ICON)
+        own = bands.own_columns(spans[page_index])
+        if keys and (boxes or own is not None):
+            keyed[page_index] = keys
+    if not wide and not keyed:
         return {}
-    spans = {
-        page_index: [
-            (d.bbox.x1, d.bbox.x2)
-            for d in pages[page_index].detections
-            if d.label == Label.TEXT_COLUMN
-        ]
-        for page_index in wide
-    }
     lacking = {i for i in wide if bands.own_columns(spans[i]) is None}
     neighbours = bands.neighbour_rows(scan, lacking) if lacking else {}
-    layouts = {}
-    for page_index, boxes in wide.items():
+    columns = {}
+    for page_index in set(wide) | set(keyed):
         page = pages[page_index]
         found = bands.page_columns(
-            spans[page_index], boxes, page_index, page.img_width, neighbours
+            spans[page_index],
+            wide.get(page_index, []),
+            page_index,
+            page.img_width,
+            neighbours,
         )
         if found is None:
             continue
-        left, right = found
         if page_index in lacking:
-            left, right = _held_by_boxes(page, left, right)
+            found = _held_by_boxes(page, *found)
+        columns[page_index] = found
+    centred = {
+        page_index: [
+            b for b in keys if bands.is_centred(b, *columns[page_index])
+        ]
+        for page_index, keys in keyed.items()
+        if page_index in columns
+    }
+    centred = ending_keys(scan, pages, {i: k for i, k in centred.items() if k})
+    layouts = {}
+    for page_index, (left, right) in columns.items():
+        page = pages[page_index]
         full = sorted(
-            (b for b in boxes if bands.is_full_width(b, left, right)),
+            (
+                b
+                for b in wide.get(page_index, [])
+                if bands.is_full_width(b, left, right)
+            ),
             key=lambda b: b[1],
         )
-        if not full:
+        dividers = sorted(centred.get(page_index, []), key=lambda b: b[1])
+        if not full and not dividers:
             continue
         sx, sy = page.scale_x, page.scale_y
         top, bottom = _margin_bounds(page)
         divide = (left[1] + right[0]) / 2 * sx
+
+        def _points(boxes, sx=sx, sy=sy):
+            return tuple(
+                (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in boxes
+            )
+
         layouts[page_index] = bands.Layout(
             left=(min([left[0]] + [b[0] for b in full]) * sx, divide),
             right=(divide, max([right[1]] + [b[2] for b in full]) * sx),
             top=top,
             bottom=bottom,
-            bands=tuple(
-                (b[0] * sx, b[1] * sy, b[2] * sx, b[3] * sy) for b in full
-            ),
+            bands=_points(full),
+            dividers=_points(dividers),
         )
     return layouts
+
+
+def ending_keys(scan: Scan, pages: dict, centred: dict) -> dict:
+    """Return the centred key icons a boundary ends at, by page.
+
+    A key icon across the gutter divides its page only when an opinion
+    ends at it: a key-shaped mark in an exhibit, or a key the pairing
+    left out, says nothing of the reading order. One query, and none
+    for a volume with no centred key on the pages asked about.
+
+    :param scan: The scan.
+    :param pages: ``{page_index: blackletter Page}``.
+    :param centred: ``{page_index: [key box, ...]}``, in render pixels.
+    :returns: The same shape, less the keys no boundary ends at.
+    """
+    if not centred:
+        return {}
+    ends: dict[int, list[tuple[float, float]]] = {}
+    for page_index, x, y in (
+        OpinionBoundary.objects.filter(
+            scan=scan, end_page_index__in=centred, withdrawn_at__isnull=True
+        )
+        .exclude(kind=OpinionBoundary.Kind.DISMISS)
+        .values_list("end_page_index", "end_x", "end_y")
+    ):
+        ends.setdefault(page_index, []).append((x, y))
+    kept: dict[int, list] = {}
+    for page_index, keys in centred.items():
+        page = pages[page_index]
+        for box in keys:
+            corner = (box[2] * page.scale_x, box[3] * page.scale_y)
+            if any(
+                abs(corner[0] - x) <= ANCHOR_TOLERANCE_PT
+                and abs(corner[1] - y) <= ANCHOR_TOLERANCE_PT
+                for x, y in ends.get(page_index, [])
+            ):
+                kept.setdefault(page_index, []).append(box)
+    return kept
 
 
 #: A box with more than this share of its width on each side of the
