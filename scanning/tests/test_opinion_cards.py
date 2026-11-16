@@ -164,11 +164,24 @@ class TestAnswer(CardTestCase):
             opinion_cards.answer(self.row(), self.make_user(), "held")
 
     def test_compose_is_the_review_pages_rule(self):
-        word = {"kind": "word", "text": "the court heId that", "start": 10, "length": 4}
-        gap = {"kind": "word", "gap": True, "text": "a b", "start": 2, "length": 0}
+        word = {
+            "kind": "word",
+            "text": "the court heId that",
+            "start": 10,
+            "length": 4,
+        }
+        gap = {
+            "kind": "word",
+            "gap": True,
+            "text": "a b",
+            "start": 2,
+            "length": 0,
+        }
         block = {"kind": "block", "text": "x"}
 
-        self.assertEqual(opinion_cards.compose(word, "held"), "the court held that")
+        self.assertEqual(
+            opinion_cards.compose(word, "held"), "the court held that"
+        )
         self.assertEqual(opinion_cards.compose(gap, "z"), "a z b")
         self.assertEqual(opinion_cards.compose(gap, ""), "a b")
         self.assertEqual(opinion_cards.compose(block, " y  z "), "y z")
@@ -267,7 +280,9 @@ class TestThePage(CardTestCase):
         tabs = {t["slug"]: t["count"] for t in answer.context["tabs"]}
         self.assertEqual(tabs, {"": 1, "characters": 1})
 
-        other = self.client.get(reverse("opinion_card_review") + "?reason=name")
+        other = self.client.get(
+            reverse("opinion_card_review") + "?reason=name"
+        )
         self.assertNotContains(other, f'id="opinion-{self.opinion.pk}"')
 
     def test_the_rows_of_an_opinion(self):
@@ -290,7 +305,9 @@ class TestThePage(CardTestCase):
         )
 
         answer = self.client.post(
-            url, json.dumps({"answer": "held"}), content_type="application/json"
+            url,
+            json.dumps({"answer": "held"}),
+            content_type="application/json",
         )
 
         self.assertEqual(answer.json()["status"], "ok")

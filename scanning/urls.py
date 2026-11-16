@@ -28,12 +28,6 @@ from scanning.views import (
     stats_view,
     update_scan_status,
 )
-from scanning.views_cards import (
-    answer_opinion_card,
-    opinion_card_answers,
-    opinion_card_review,
-    opinion_card_rows,
-)
 from scanning.views_api import (
     add_boundary,
     add_redaction,
@@ -76,6 +70,12 @@ from scanning.views_api import (
     update_detection,
     withdraw_opinion_edit,
     withdraw_stale_edit,
+)
+from scanning.views_cards import (
+    answer_opinion_card,
+    opinion_card_answers,
+    opinion_card_review,
+    opinion_card_rows,
 )
 from scanning.views_process import (
     add_page_insert,

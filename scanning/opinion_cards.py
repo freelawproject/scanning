@@ -81,9 +81,7 @@ def key_of(card: dict) -> str:
 
 def _readings_of(card: dict) -> str:
     """Return what the engines read at a card, the test of a stale answer."""
-    return json.dumps(
-        card.get("readings") or card.get("text"), sort_keys=True
-    )
+    return json.dumps(card.get("readings") or card.get("text"), sort_keys=True)
 
 
 def _open_pages(opinion: Opinion) -> dict[tuple[int, str], int]:
@@ -397,7 +395,8 @@ def _dismiss_kept(opinion: Opinion, dry_run: bool, counts: Counter) -> None:
         if finding is None:
             continue
         if not all(
-            r.status == OpinionCard.Status.ANSWERED and is_keep(r) for r in rows
+            r.status == OpinionCard.Status.ANSWERED and is_keep(r)
+            for r in rows
         ):
             continue
         counts["pages_dismissed"] += 1
@@ -449,7 +448,9 @@ def apply(opinion: Opinion, dry_run: bool = False) -> Counter:
         document = ensemble.read_document(opinion)
         pages = {p["page_in_opinion"]: p for p in document.get("pages") or []}
         blocks = defaultdict(list)
-        for row in OpinionCard.objects.filter(opinion=opinion, status__in=LIVE):
+        for row in OpinionCard.objects.filter(
+            opinion=opinion, status__in=LIVE
+        ):
             blocks[(row.page_in_opinion, row.card["group_id"])].append(row)
         by_block = defaultdict(list)
         for row in answered:

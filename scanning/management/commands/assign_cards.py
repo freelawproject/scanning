@@ -45,9 +45,11 @@ class Command(BaseCommand):
         parser.add_argument("--dry-run", action="store_true")
 
     def handle(self, *args, **options):
-        user = get_user_model().objects.filter(
-            username=options["username"]
-        ).first()
+        user = (
+            get_user_model()
+            .objects.filter(username=options["username"])
+            .first()
+        )
         if user is None:
             raise CommandError(f"No user {options['username']!r}.")
         if options["release"]:

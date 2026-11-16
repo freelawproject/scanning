@@ -12,8 +12,8 @@ import json
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
-from django.core.exceptions import PermissionDenied
 from django.core.cache import cache
+from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db.models import Count, Exists, OuterRef
 from django.http import HttpRequest, HttpResponse, JsonResponse
@@ -49,7 +49,9 @@ CARD_GONE_MESSAGE = (
     "or the engines read its place again. Reload the page."
 )
 ANSWER_BAD_REQUEST_MESSAGE = "The answer could not be read."
-ANSWER_SAVED_MESSAGE = "Answer saved. It goes into the text when the answers are applied."
+ANSWER_SAVED_MESSAGE = (
+    "Answer saved. It goes into the text when the answers are applied."
+)
 ANSWER_CLEARED_MESSAGE = "Answer taken back. The card is open again."
 
 
@@ -194,10 +196,7 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
         .order_by()
     )
     card_query = _query(
-        {
-            key: filters[key]
-            for key in ("reason", "status", "mine")
-        }
+        {key: filters[key] for key in ("reason", "status", "mine")}
     )
     for opinion in page_obj:
         kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
@@ -206,7 +205,9 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
             reverse("opinion_card_rows", kwargs=kwargs) + f"?{card_query}"
         )
         opinion.pdf_url_endpoint = reverse("opinion_pdf_url", kwargs=kwargs)
-        opinion.review_url = reverse("opinion_review", kwargs={"pk": opinion.pk})
+        opinion.review_url = reverse(
+            "opinion_review", kwargs={"pk": opinion.pk}
+        )
     return render(
         request,
         "scanning/opinion_card_review.html",
@@ -409,7 +410,12 @@ def opinion_card_answers(request: HttpRequest) -> HttpResponse:
                 "words": reading.get("word", reading.get("text", "")),
             }
             for reading in row.card.get("readings")
-            or [{"engine": row.card.get("engine"), "text": row.card.get("text")}]
+            or [
+                {
+                    "engine": row.card.get("engine"),
+                    "text": row.card.get("text"),
+                }
+            ]
         ]
         row.review_url = (
             reverse("opinion_review", kwargs={"pk": row.opinion_id})

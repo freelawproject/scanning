@@ -85,9 +85,7 @@ STAR_LEAD = re.compile(
 
 #: A headnote bracket opening a line, ``[9]`` or ``[4, 5]``: the OCR
 #: glue deletes it from the text whoever read it.
-BRACKET_LEAD = re.compile(
-    r"^\s*\[\s*\d{1,3}\s*(?:[,\-–—]\s*\d{1,3}\s*)*\]\s*"
-)
+BRACKET_LEAD = re.compile(r"^\s*\[\s*\d{1,3}\s*(?:[,\-–—]\s*\d{1,3}\s*)*\]\s*")
 
 #: A reading of this many words or more is a block, judged as one.
 BLOCK_WORDS = 4
@@ -168,11 +166,15 @@ def type_of(readings: list[str]) -> str:
         return _missing(readings, texts)
     lowered = [bare(t).lower() for t in texts]
     longest = max(len(_words(t)) for t in texts)
-    if longest >= BLOCK_WORDS and min(
-        SequenceMatcher(None, a, b).ratio()
-        for i, a in enumerate(lowered)
-        for b in lowered[i + 1 :]
-    ) < 0.5:
+    if (
+        longest >= BLOCK_WORDS
+        and min(
+            SequenceMatcher(None, a, b).ratio()
+            for i, a in enumerate(lowered)
+            for b in lowered[i + 1 :]
+        )
+        < 0.5
+    ):
         return "different_text"
     texts = [strip_star(t) for t in texts]
     return _words_differ(texts)

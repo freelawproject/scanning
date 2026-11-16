@@ -82,7 +82,9 @@ class Command(BaseCommand):
         total: Counter = Counter()
         for opinion in opinions:
             try:
-                counts = opinion_cards.apply(opinion, dry_run=options["dry_run"])
+                counts = opinion_cards.apply(
+                    opinion, dry_run=options["dry_run"]
+                )
             except (ensemble.EnsembleError, ensemble.TransientFault) as exc:
                 total["failed"] += 1
                 self.stderr.write(f"{opinion} (#{opinion.pk}): {exc}")
@@ -90,7 +92,9 @@ class Command(BaseCommand):
             total.update(counts)
             total["opinions"] += 1
             line = ", ".join(f"{k} {v}" for k, v in sorted(counts.items()))
-            self.stdout.write(f"{opinion} (#{opinion.pk}): {line or 'nothing'}")
+            self.stdout.write(
+                f"{opinion} (#{opinion.pk}): {line or 'nothing'}"
+            )
         summary = ", ".join(f"{k} {v}" for k, v in sorted(total.items()))
         self.stdout.write(
             self.style.SUCCESS(f"{verb}: {summary or 'no answered card'}")
