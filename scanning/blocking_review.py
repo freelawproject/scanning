@@ -20,7 +20,7 @@ the guess, and the card says so.
 
 from __future__ import annotations
 
-from scanning import ensemble, markup
+from scanning import blocking_types, ensemble, markup
 
 #: The height of one printed line, in points: the estimate every crop
 #: is cut by. 9-point type on 11-point leading is the body of a
@@ -717,6 +717,89 @@ def _place(page: dict, group: dict) -> str:
     )
 
 
+def group_cards(page: dict, number: int, group: dict, schema) -> list[dict]:
+    """Return the blocking cards of one group, each with its ``type``.
+
+    One ``single`` card for a block one engine alone read; one ``block``
+    card for a table, a block with more than :data:`MANY_OPEN_WORDS`
+    open, or a person's block of an older document; otherwise one
+    ``word`` card per open word. The ``type`` is
+    ``blocking_types.type_of`` over the card's readings. ``cards`` and
+    ``opinion_cards.sync``, which stores them as rows, both read it.
+
+    :param page: One page of the document.
+    :param number: Its ``page_in_opinion``.
+    :param group: One group of it.
+    :param schema: The document's ``schema_version``.
+    :returns: The cards, with no ``finding_pk``; none for a group that
+        does not block.
+    :rtype: list[dict]
+    """
+    if group.get("level") != ensemble.BLOCKING:
+        return []
+    common = {
+        "page_in_opinion": number,
+        "group_id": group["id"],
+        "where": _place(page, group),
+        "box_pt": group["box_pt"],
+        "text": group["text"],
+    }
+    if group.get("agreement") == ensemble.SINGLE:
+        return [
+            {
+                **common,
+                "kind": SINGLE,
+                "type": blocking_types.type_of([group["text"]]),
+                "engine": group.get("source"),
+                # A table takes no text edit (the review page's
+                # rule), so the card offers none.
+                "table": group.get("kind") == markup.TABLE,
+                "crop": block_crop(group["box_pt"]),
+            }
+        ]
+    words = open_words(group, schema=schema)
+    # A person's block of an older document: its open words cannot be
+    # placed, so the whole block is the card, and the page's finding
+    # waits on it.
+    stale = _stale_open(group, schema) if not words else 0
+    if (
+        group.get("kind") == markup.TABLE
+        or len(words) > MANY_OPEN_WORDS
+        or stale
+    ):
+        readings = [
+            {"engine": name, "text": group["engines"][name]["text"]}
+            for name in _present(group)
+        ]
+        return [
+            {
+                **common,
+                "kind": BLOCK,
+                "type": blocking_types.type_of([r["text"] for r in readings]),
+                "table": group.get("kind") == markup.TABLE,
+                "open": len(words) or stale,
+                "readings": readings,
+                "crop": block_crop(group["box_pt"]),
+            }
+        ]
+    return [
+        {
+            **common,
+            "kind": WORD,
+            **word,
+            "type": blocking_types.type_of(
+                [reading["word"] for reading in word["readings"]]
+            ),
+            "crop": crop_of(
+                group["box_pt"],
+                len(group["text"]),
+                *(word.get("crop_span") or (word["start"], word["length"])),
+            ),
+        }
+        for word in words
+    ]
+
+
 def cards(
     document: dict, findings: list, level: str = ensemble.BLOCKING
 ) -> list[dict]:
@@ -774,83 +857,17 @@ def cards(
             None,
         )
         for group in page.get("groups") or []:
-            if group.get("level") != ensemble.BLOCKING:
-                continue
-            common = {
-                "page_in_opinion": number,
-                "group_id": group["id"],
-                "where": _place(page, group),
-                "box_pt": group["box_pt"],
-                "text": group["text"],
-            }
+            single = group.get("agreement") == ensemble.SINGLE
+            finding = single_card if single else word_card
             # A block is a card only while the finding of its page is
             # open: the finding is what the approval waits on, and a
             # dismissed one leaves its blocks in the document as they
             # were. A card with no finding would offer an answer with
             # nothing to close.
-            if group.get("agreement") == ensemble.SINGLE:
-                if single_card is None:
-                    continue
-                out.append(
-                    {
-                        **common,
-                        "kind": SINGLE,
-                        "engine": group.get("source"),
-                        # A table takes no text edit (the review page's
-                        # rule), so the card offers none.
-                        "table": group.get("kind") == markup.TABLE,
-                        "crop": block_crop(group["box_pt"]),
-                        "finding_pk": single_card.pk if single_card else None,
-                    }
-                )
+            if finding is None:
                 continue
-            if word_card is None:
-                continue
-            words = open_words(group, schema=schema)
-            # A person's block of an older document: its open words
-            # cannot be placed, so the whole block is the card, and
-            # the page's finding waits on it.
-            stale = _stale_open(group, schema) if not words else 0
-            if (
-                group.get("kind") == markup.TABLE
-                or len(words) > MANY_OPEN_WORDS
-                or stale
-            ):
-                out.append(
-                    {
-                        **common,
-                        "kind": BLOCK,
-                        "table": group.get("kind") == markup.TABLE,
-                        "open": len(words) or stale,
-                        "readings": [
-                            {
-                                "engine": name,
-                                "text": group["engines"][name]["text"],
-                            }
-                            for name in _present(group)
-                        ],
-                        "crop": block_crop(group["box_pt"]),
-                        "finding_pk": word_card.pk if word_card else None,
-                    }
-                )
-                continue
-            for word in words:
-                out.append(
-                    {
-                        **common,
-                        "kind": WORD,
-                        **word,
-                        "finding_pk": word_card.pk if word_card else None,
-                        "crop": crop_of(
-                            group["box_pt"],
-                            len(group["text"]),
-                            *(
-                                word.get("crop_span")
-                                or (word["start"], word["length"])
-                            ),
-                        ),
-                    }
-                )
+            for card in group_cards(page, number, group, schema):
+                out.append({**card, "finding_pk": finding.pk})
         answered = {
             card["finding_pk"] for card in out if card.get("finding_pk")
         }
@@ -860,7 +877,7 @@ def cards(
             if finding.check_name == OpinionCheck.PARTIAL_REDACTION:
                 cover = _cover_card(page, finding)
                 if cover is not None:
-                    out.append(cover)
+                    out.append({**cover, "type": finding.check_name})
                     continue
             # A card the groups did not answer, the ``NO_MAJORITY`` card
             # of a page whose blocks hold no open word included: a text
@@ -972,6 +989,8 @@ def _link_card(finding) -> dict:
     """Return the card of a finding the document alone answers."""
     return {
         "kind": LINK,
+        # A card of another check is its own type: its check.
+        "type": finding.check_name,
         "page_in_opinion": finding.page_in_opinion,
         "where": f"page {finding.page_in_opinion + 1}",
         "check": finding.check_name,

@@ -1,0 +1,133 @@
+{% extends "base.html" %}
+
+{% comment %}
+  The stored answers of the card rows, for staff: who answered what,
+  against which readings, and what became of it. "Send back" marks an
+  answer the apply has not written for a new one, and keeps it listed.
+{% endcomment %}
+
+{% block title %}Card answers - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div id="card-answers">
+  {% csrf_token %}
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
+    <h1 class="text-2xl font-bold">Card answers</h1>
+    <span class="text-sm text-gray-500 dark:text-gray-400">{{ page_obj.paginator.count }} answer(s) · <a href="{% url 'opinion_card_review' %}" class="text-blue-600 dark:text-blue-400 hover:underline">Cards by reason</a></span>
+  </div>
+
+  <form method="get" class="flex flex-wrap items-center gap-2 mb-4 text-sm">
+    <label>Status
+      <select name="status" class="input-text text-sm">
+        {% for value, label in statuses %}<option value="{{ value }}"{% if value == status %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Volunteer
+      <select name="user" class="input-text text-sm">
+        <option value="">Everyone</option>
+        {% for name in volunteers %}<option value="{{ name }}"{% if name == username %} selected{% endif %}>{{ name }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Reason
+      <select name="reason" class="input-text text-sm">
+        <option value="">Every reason</option>
+        {% for slug, label in reasons %}<option value="{{ slug }}"{% if slug == reason %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Scan <input type="text" name="scan" value="{{ scan }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    <button type="submit" class="btn-outline text-sm">Filter</button>
+  </form>
+
+  <div class="card overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="text-left text-xs text-gray-500 dark:text-gray-400 border-b border-gray-200 dark:border-gray-700">
+          <th class="py-2 pr-3">Answered</th>
+          <th class="py-2 pr-3">Opinion</th>
+          <th class="py-2 pr-3">Reason</th>
+          <th class="py-2 pr-3">The engines read</th>
+          <th class="py-2 pr-3">Shown → answer</th>
+          <th class="py-2 pr-3">Status</th>
+          <th class="py-2"></th>
+        </tr>
+      </thead>
+      <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
+        {% for row in page_obj %}
+        <tr class="align-top" data-send-back-url="{{ row.send_back_url }}">
+          <td class="py-2 pr-3 whitespace-nowrap">
+            <b>{{ row.answered_by.username|default:"?" }}</b><br>
+            <span class="text-xs text-gray-500 dark:text-gray-400">{{ row.answered_at|date:"M j, H:i" }}</span>
+          </td>
+          <td class="py-2 pr-3 whitespace-nowrap">
+            <a href="{{ row.review_url }}" class="text-blue-600 dark:text-blue-400 hover:underline">{{ row.opinion }}</a><br>
+            <span class="text-xs text-gray-500 dark:text-gray-400">scan {{ row.opinion.scan_id }} · page {{ row.page_in_opinion|add:1 }}</span>
+          </td>
+          <td class="py-2 pr-3"><span class="text-xs px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-100">{{ row.reason_label }}</span></td>
+          <td class="py-2 pr-3 font-mono text-xs">
+            {% for reading in row.readings %}<div><span class="text-gray-500 dark:text-gray-400">{{ reading.engine }}:</span> {{ reading.words|default:"(nothing)" }}</div>{% endfor %}
+          </td>
+          <td class="py-2 pr-3 font-serif">
+            {% if row.shown.keep %}
+            <span class="text-gray-500 dark:text-gray-400">kept as shown:</span> {{ row.shown.before }} <b>{{ row.shown.old|default:"(nothing)" }}</b> {{ row.shown.after }}
+            {% else %}
+            {{ row.shown.before }}
+            <del class="text-red-700 dark:text-red-400">{{ row.shown.old|default:"(nothing)" }}</del>
+            <ins class="text-green-700 dark:text-green-400 no-underline font-bold">{{ row.shown.new|default:"(nothing)" }}</ins>
+            {{ row.shown.after }}
+            {% endif %}
+          </td>
+          <td class="py-2 pr-3 whitespace-nowrap">
+            {{ row.get_status_display }}
+            {% if row.edit_id %}<br><span class="text-xs text-gray-500 dark:text-gray-400">edit #{{ row.edit_id }}{% if row.applied_at %} · {{ row.applied_at|date:"M j, H:i" }}{% endif %}</span>{% endif %}
+            {% if row.note %}<br><span class="text-xs text-amber-700 dark:text-amber-400">{{ row.note }}</span>{% endif %}
+          </td>
+          <td class="py-2 text-right">
+            {% if row.status == "answered" %}
+            <button type="button" class="btn-outline text-xs" data-role="send-back" title="Send this answer back: the card is open again for a new answer, and this one stays listed">Send back</button>
+            {% endif %}
+          </td>
+        </tr>
+        {% empty %}
+        <tr><td colspan="7" class="py-4 text-gray-600 dark:text-gray-300">No answer matches these filters.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  {% if page_obj.has_other_pages %}
+  <div class="flex items-center justify-between mt-6 text-sm">
+    {% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Previous</a>{% else %}<span></span>{% endif %}
+    <span class="text-gray-500 dark:text-gray-400">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
+    {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Next</a>{% else %}<span></span>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script>
+  (function () {
+    'use strict';
+    var root = document.getElementById('card-answers');
+    var token = root.querySelector('[name="csrfmiddlewaretoken"]').value;
+    root.addEventListener('click', function (event) {
+      var button = event.target.closest('[data-role="send-back"]');
+      if (!button) { return; }
+      var row = button.closest('tr');
+      button.disabled = true;
+      fetch(row.dataset.sendBackUrl, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': token },
+        body: '{}'
+      }).then(function (response) {
+        return response.json().then(function (data) { return { ok: response.ok, data: data }; });
+      }).then(function (answer) {
+        var cell = button.parentNode;
+        cell.textContent = answer.ok ? 'sent back' : (answer.data.message || 'refused');
+        if (answer.ok) { row.classList.add('opacity-50'); }
+      }).catch(function () { button.disabled = false; });
+    });
+  })();
+</script>
+{% endblock %}

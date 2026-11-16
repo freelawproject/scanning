@@ -71,6 +71,13 @@ from scanning.views_api import (
     withdraw_opinion_edit,
     withdraw_stale_edit,
 )
+from scanning.views_cards import (
+    answer_opinion_card,
+    opinion_card_answers,
+    opinion_card_review,
+    opinion_card_rows,
+    send_back_opinion_card,
+)
 from scanning.views_process import (
     add_page_insert,
     apply_output_index,
@@ -139,6 +146,31 @@ urlpatterns = [
         "opinions/blocking/",
         opinion_blocking_review,
         name="opinion_blocking_review",
+    ),
+    path(
+        "opinions/cards/",
+        opinion_card_review,
+        name="opinion_card_review",
+    ),
+    path(
+        "opinions/cards/answers/",
+        opinion_card_answers,
+        name="opinion_card_answers",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/card-rows/",
+        opinion_card_rows,
+        name="opinion_card_rows",
+    ),
+    path(
+        "scans/<int:pk>/cards/<int:card_pk>/answer/",
+        answer_opinion_card,
+        name="answer_opinion_card",
+    ),
+    path(
+        "scans/<int:pk>/cards/<int:card_pk>/send-back/",
+        send_back_opinion_card,
+        name="send_back_opinion_card",
     ),
     path(
         "opinions/warnings/",

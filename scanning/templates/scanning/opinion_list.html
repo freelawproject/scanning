@@ -76,6 +76,7 @@
         {% else %}
         <span class="btn-primary text-sm opacity-50 cursor-not-allowed" title="Filter to one scan or one volume first: the blocking review takes one volume at a time"><i class="fa-solid fa-list-check"></i> Review all blocking</span>
         {% endif %}
+        <a href="{% url 'opinion_card_review' %}" class="btn-outline text-sm" title="The open blocking cards of every volume, walked by reason; an answer is saved and applied later"><i class="fa-solid fa-layer-group"></i> Cards by reason</a>
         {% if warning_review_url %}
         <a href="{{ warning_review_url }}" class="btn-outline text-sm" title="Walk every open warning card of this volume, one after the next; a warning gates nothing"><i class="fa-solid fa-list-check"></i> Review all warnings</a>
         {% endif %}
