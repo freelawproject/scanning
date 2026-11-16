@@ -874,7 +874,7 @@ def _band_layouts(scan: Scan, pages: dict) -> dict:
     #624), in PDF points. The columns are the page's own when its
     boxes make two, the volume's otherwise, in one more query, and
     only for a page with a picture wide enough to ask; a centred key
-    is read on a page that has its columns already.
+    is read only on a page whose own boxes make two columns.
 
     :param scan: The scan.
     :param pages: ``{page_index: blackletter Page}``, with the live
@@ -909,7 +909,10 @@ def _band_layouts(scan: Scan, pages: dict) -> dict:
             wide[page_index] = boxes
         keys = _boxes(page, Label.KEY_ICON)
         own = bands.own_columns(spans[page_index])
-        if keys and (boxes or own is not None):
+        # The page's own columns alone, the condition of the headnote
+        # cut (``bands.clip_headnotes``): with borrowed columns the
+        # masks would divide a page whose headnote rect stays whole.
+        if keys and own is not None:
             keyed[page_index] = keys
     if not wide and not keyed:
         return {}

@@ -853,6 +853,21 @@ class TestTheCentredKey(TestCase):
         self.assertEqual(len(masks), 1)
         self.assertLess(masks[0]["x1"], 310)
 
+    def test_a_page_with_borrowed_columns_reads_no_centred_key(self):
+        # No column box on the page, and a wide picture that borrows
+        # the volume's columns: the headnote cut reads the page's own
+        # columns alone, so the masks do the same.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 1)
+        row(scan, Label.IMAGE, 3, (235, 1200, 1100, 1900))
+        row(scan, Label.KEY_ICON, 3, self.KEY)
+        ending = self._ending(scan)
+
+        masks = self._masks(scan, ending)
+
+        # No mask across both columns under the key.
+        self.assertFalse([m for m in masks if m["x0"] < 100 and m["x1"] > 500])
+
     def test_a_key_at_the_end_of_a_column_keeps_the_column_order(self):
         scan = ScanFactory(page_count=6)
         key = (500, 455, 751, 550)
