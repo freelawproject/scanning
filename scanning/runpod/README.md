@@ -352,8 +352,8 @@ failure.
 ## Releasing a new image version
 
 Pushing a new image tag to the registry alone does **not** update the
-running endpoint. The RunPod template that backs the endpoint has to be
-told about the new tag. There are two ways.
+running endpoint. The endpoint has to be told about the new tag. There
+are two ways.
 
 ### Automated release (default)
 
@@ -364,27 +364,30 @@ On any push to `main` that touches `scanning/runpod/**` or
 
 1. Builds `freelawproject/blackletter-gpu-worker` and pushes both
    `:<sha_short>` and `:latest` to Docker Hub.
-2. Calls `PATCH https://rest.runpod.io/v1/templates/<id>` to move the
-   endpoint's backing template `imageName` to the SHA-pinned tag.
-3. With `Min Workers = 0`, warm workers drain on the idle timeout and
-   the next job cold-starts on the new image.
+2. Calls `PATCH https://api.runpod.io/v2/serverless/<id>` to move the
+   endpoint's `image` to the SHA-pinned tag
+   (`.github/scripts/runpod-release.sh`, shared by the four worker
+   workflows). The script stores no endpoint id: it lists the
+   account's endpoints and moves every one whose image is a tag of
+   `freelawproject/blackletter-gpu-worker`, so an endpoint moved by
+   hand to an image of another repository is left alone, and a build
+   that finds no endpoint fails.
+   The endpoint is patched and never its template: since
+   RunPod's REST API v2 (v1 was retired on 2026-11-15) a template is a
+   snapshot applied when an endpoint is created, and an edit of it
+   reaches no endpoint that exists.
+3. The change is a new release of the endpoint, which rolls out as its
+   workers cycle. With `Min Workers = 0`, warm workers drain on the
+   idle timeout and the next job cold-starts on the new image.
 
-The workflow needs two repository secrets:
+The workflow needs one repository secret:
 
-- `RUNPOD_API_KEY` — a RunPod API key with **Restricted** permission
-  set to **GraphQL: Read/Write**. That is the tightest scope RunPod
-  offers. There is no per-template scope, so the key manages every
-  template, endpoint and pod on the account; treat it as a production
-  credential.
-- `RUNPOD_TEMPLATE_ID` — the ID of the endpoint's backing template.
-  An endpoint created without an explicit template still has one,
-  hidden from the default listing. Surface it with:
-  ```bash
-  curl -sS -H "Authorization: Bearer <API_KEY>" \
-    "https://rest.runpod.io/v1/templates?includeEndpointBoundTemplates=true"
-  ```
-  Find the entry where `isServerless: true` and the name matches the
-  endpoint, then copy its `id`.
+- `RUNPOD_API_KEY` — a RunPod API key that grants the two v2 scopes
+  the script uses: `serverless:read` (the list of endpoints) and
+  `serverless:write` (the image change). It needs no template scope.
+  The scope is not per endpoint, so the key can change every endpoint
+  on the account; treat it as a production credential. A key without
+  them fails the step with `403` and `access denied`.
 
 ### Manual release (the RunPod console)
 
