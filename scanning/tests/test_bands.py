@@ -741,3 +741,206 @@ class TestOverBoundary(TestCase):
         )
         self.assertEqual(address["label"], "IMAGE")
         self.assertEqual(address["source_page"], 4)
+
+
+class TestTheCentredKey(TestCase):
+    """A key icon centred under balanced columns divides its page (#624).
+
+    The page of the issue: the opinion before ends in both columns
+    above a key set across the gutter, and the next one starts under
+    it in the left column.
+    """
+
+    #: The key icon, across the gutter of ``columns``.
+    KEY = (695, 455, 946, 550)
+
+    def _page(self, scan, key=KEY):
+        columns(scan, 3)
+        row(scan, Label.KEY_ICON, 3, key)
+        row(scan, Label.CASE_CAPTION, 3, (264, 716, 766, 1070))
+
+    def _ending(self, scan, key=KEY):
+        return OpinionBoundaryFactory(
+            scan=scan,
+            start_page_index=0,
+            end_page_index=3,
+            end_x=key[2] * PT,
+            end_y=key[3] * PT,
+        )
+
+    def _starting(self, scan):
+        return OpinionBoundaryFactory(
+            scan=scan,
+            start_page_index=3,
+            start_x=264 * PT,
+            start_y=716 * PT,
+            end_page_index=5,
+        )
+
+    def _masks(self, scan, boundary):
+        rects = boundaries.outside_rects(scan, [boundary])[boundary.pk]
+        return [r for r in rects if r["page_index"] == 3]
+
+    def test_a_key_across_the_gutter_is_centred(self):
+        self.assertTrue(bands.is_centred((250, 0, 340, 10), LEFT, RIGHT))
+        # The end of the left column's last line, a sliver past it.
+        self.assertFalse(bands.is_centred((215, 0, 310, 10), LEFT, RIGHT))
+        self.assertFalse(bands.is_centred((400, 0, 490, 10), LEFT, RIGHT))
+
+    def test_the_ending_opinion_masks_both_columns_under_its_key(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        ending = self._ending(scan)
+
+        masks = self._masks(scan, ending)
+
+        self.assertEqual(len(masks), 1)
+        (mask,) = masks
+        # blackletter paints a mask three points under its top: the
+        # paint starts at the key's foot, over the black headnote box
+        # of the next opinion, and reaches past the columns' edges.
+        self.assertAlmostEqual(
+            mask["y0"],
+            550 * PT - bands.PAINT_INSET_PT - bands.HAIRLINE_PT,
+            places=1,
+        )
+        self.assertLess(mask["x0"], 235 * PT)
+        self.assertGreater(mask["x1"], 1455 * PT)
+
+    def test_the_next_opinion_masks_both_columns_above_the_key(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        self._ending(scan)
+        starting = self._starting(scan)
+
+        masks = self._masks(scan, starting)
+
+        wide, left = sorted(masks, key=lambda r: r["y0"])
+        self.assertLess(wide["x0"], 90)
+        self.assertGreater(wide["x1"], 520)
+        self.assertAlmostEqual(wide["y1"], 550 * PT, places=0)
+        self.assertLess(left["x1"], 310)
+        self.assertAlmostEqual(left["y1"], 716 * PT, places=0)
+        # The paint of the column's mask starts where the mask across
+        # the page ends.
+        self.assertAlmostEqual(
+            left["y0"], wide["y1"] - bands.PAINT_INSET_PT, places=1
+        )
+
+    def test_a_centred_key_no_opinion_ends_at_divides_nothing(self):
+        # A key-shaped mark across the gutter: the page keeps the
+        # column order, and the right column above the caption stays.
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        starting = self._starting(scan)
+
+        masks = self._masks(scan, starting)
+
+        self.assertEqual(len(masks), 1)
+        self.assertLess(masks[0]["x1"], 310)
+
+    def test_a_dismissed_end_at_the_key_divides_nothing(self):
+        # The computed row keeps its anchor at the key under a
+        # dismissal, and is no end any more: the column order stands.
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        ending = self._ending(scan)
+        boundaries.dismiss(scan, ending, UserFactory())
+        starting = self._starting(scan)
+
+        masks = self._masks(scan, starting)
+
+        self.assertEqual(len(masks), 1)
+        self.assertLess(masks[0]["x1"], 310)
+
+    def test_a_page_with_borrowed_columns_reads_no_centred_key(self):
+        # No column box on the page, and a wide picture that borrows
+        # the volume's columns: the headnote cut reads the page's own
+        # columns alone, so the masks do the same.
+        scan = ScanFactory(page_count=6)
+        columns(scan, 1)
+        row(scan, Label.IMAGE, 3, (235, 1200, 1100, 1900))
+        row(scan, Label.KEY_ICON, 3, self.KEY)
+        ending = self._ending(scan)
+
+        masks = self._masks(scan, ending)
+
+        # No mask across both columns under the key.
+        self.assertFalse([m for m in masks if m["x0"] < 100 and m["x1"] > 500])
+
+    def test_a_key_at_the_end_of_a_column_keeps_the_column_order(self):
+        scan = ScanFactory(page_count=6)
+        key = (500, 455, 751, 550)
+        self._page(scan, key=key)
+        ending = self._ending(scan, key=key)
+
+        masks = self._masks(scan, ending)
+
+        # The left column under the key and the whole right column.
+        self.assertEqual(len(masks), 2)
+
+    def _rects(self, *rects):
+        return [
+            {
+                "page_index": 3,
+                "rects": [
+                    {"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3], "type": t}
+                    for b, t in rects
+                ],
+            }
+        ]
+
+    def _pages(self, scan):
+        """Return the page as the compute holds it, from its rows."""
+        from blackletter.models import BBox, Page
+        from blackletter.models import Detection as BLDetection
+
+        page = Page(
+            index=3,
+            pdf_width=IMG_W * PT,
+            pdf_height=IMG_H * PT,
+            img_width=IMG_W,
+            img_height=IMG_H,
+        )
+        for det in Detection.objects.filter(scan=scan, page_index=3):
+            page.detections.append(
+                BLDetection(
+                    bbox=BBox(x1=det.x0, y1=det.y0, x2=det.x1, y2=det.y1),
+                    label=Label(det.label_id),
+                    confidence=det.confidence,
+                    page_index=3,
+                )
+            )
+        return [page]
+
+    def test_the_headnote_rect_starts_under_the_key(self):
+        scan = ScanFactory(page_count=6)
+        self._page(scan)
+        self._ending(scan)
+        rects = self._rects(
+            ((855, 156, 1455, 2000), "headnote"),
+            ((264, 1078, 845, 2000), "headnote"),
+            ((855, 156, 1455, 2000), "EDITORIAL"),
+        )
+
+        changed = bands.clip_headnotes(scan, rects, self._pages(scan))
+
+        self.assertEqual(changed, 1)
+        right, left, note = rects[0]["rects"]
+        self.assertEqual(right["y0"], 550)
+        self.assertEqual(left["y0"], 1078)
+        self.assertEqual(note["y0"], 156)
+
+    def test_a_key_in_one_column_cuts_no_headnote_rect(self):
+        # The plain page: an opinion ends in the left column and the
+        # next one's headnotes take the right column from its top.
+        scan = ScanFactory(page_count=6)
+        key = (500, 455, 751, 550)
+        self._page(scan, key=key)
+        self._ending(scan, key=key)
+        rects = self._rects(((855, 156, 1455, 2000), "headnote"))
+
+        self.assertEqual(
+            bands.clip_headnotes(scan, rects, self._pages(scan)), 0
+        )
+        self.assertEqual(rects[0]["rects"][0]["y0"], 156)

@@ -758,6 +758,25 @@ class TestTheInputDigest(TestCase):
         self.assertEqual(summary.rebuilt, 1)
         self.assertEqual(self.revisions(), (a_before + 1, b_before))
 
+    def test_a_neighbours_end_on_the_first_page_counts(self):
+        """The masks of an opinion's first page read where the opinion
+        before ends on it (a key icon centred across the gutter divides
+        the page, #624): that end moved rebuilds the next opinion too."""
+        before = OpinionBoundary.objects.filter(
+            scan=self.scan, start_page_index=0
+        )
+        before.update(end_page_index=3, end_x=300.0, end_y=200.0)
+        self._create()
+        _a, b_before = self.revisions()
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+        before.update(end_x=120.0, end_y=400.0)
+
+        self._create()
+
+        self.assertEqual(self.revisions()[1], b_before + 1)
+
     def test_the_backfill_stamps_step_three_alone(self):
         """``stamp_opinion_digests``: a blank digest is written on a
         step-3 volume and no revision moves; a volume sent back to step
