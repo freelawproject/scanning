@@ -532,8 +532,8 @@ the RunPod endpoint to the SHA-pinned tag.
 
 Repo secret used: `RUNPOD_API_KEY` (shared with the other workers).
 The endpoint is found by its image, `freelawproject/surya-gpu-worker`,
-and the step only warns while no endpoint runs it, so the image can be
-published before the endpoint exists.
+and a build that finds none fails, so an endpoint moved to an image of
+another repository is noticed at the next build.
 
 ## Updating Python deps
 
