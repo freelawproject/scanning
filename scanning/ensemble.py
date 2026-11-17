@@ -161,6 +161,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from itertools import combinations
 
 from django.conf import settings
@@ -535,6 +536,15 @@ _REPORTER_WORDS = 4
 _AFTER_REPORTER = ",;:)"
 
 
+#: Every leading part of every :data:`REPORTERS` name, the name itself
+#: included: a run of words whose spaceless join is none of these, and
+#: no name followed by :data:`_AFTER_REPORTER`, starts no name, so
+#: :func:`_join_reporters` stops there.
+_REPORTER_PREFIXES = frozenset(
+    name[:end] for name in REPORTERS for end in range(1, len(name) + 1)
+)
+
+
 def _reporter(text: str) -> str | None:
     """Return a reporter name of :data:`REPORTERS` spelled without its
     spaces, with what follows it, or None when ``text`` is none."""
@@ -546,15 +556,35 @@ def _reporter(text: str) -> str | None:
 def _join_reporters(words: list[str]) -> list[str]:
     """Join the words of a spaced reporter name into one word, its
     spacing kept: ``131 L. Ed. 2d 490`` is three words, as an engine
-    that writes ``L.Ed.2d`` reads it."""
+    that writes ``L.Ed.2d`` reads it.
+
+    The longest run of two to :data:`_REPORTER_WORDS` words that
+    :func:`_reporter` reads as a name wins. The run grows one word at a
+    time and stops at the first join that neither starts a name
+    (:data:`_REPORTER_PREFIXES`) nor is one with what may follow it,
+    because no longer run can then be a name: almost every word of a
+    text stops at itself, where trying every window of every word made
+    this the cost of a rebuild (half a million joins for one opinion).
+    """
     out: list[str] = []
     index = 0
-    while index < len(words):
-        for size in range(min(_REPORTER_WORDS, len(words) - index), 1, -1):
-            if _reporter(" ".join(words[index : index + size])):
-                out.append(" ".join(words[index : index + size]))
-                index += size
+    count = len(words)
+    while index < count:
+        joined = ""
+        best = 0
+        for size in range(1, min(_REPORTER_WORDS, count - index) + 1):
+            # A word may hold a space (a lone quote joined back onto it):
+            # the join is spaceless, as :func:`_reporter` makes it.
+            word = words[index + size - 1]
+            joined += "".join(word.split()).translate(_SAME_CHARACTER)
+            is_name = joined.rstrip(_AFTER_REPORTER) in REPORTERS
+            if size >= 2 and is_name:
+                best = size
+            if not (is_name or joined in _REPORTER_PREFIXES):
                 break
+        if best:
+            out.append(" ".join(words[index : index + best]))
+            index += best
         else:
             out.append(words[index])
             index += 1
@@ -705,6 +735,7 @@ def _strip_markup(fragment: str) -> str:
     return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
+@lru_cache(maxsize=8192)
 def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """Return the text as the vote compares it, never as it is shown.
 
@@ -724,6 +755,10 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
         it, and folded it would end in a range.
     :returns: The key.
     :rtype: str
+
+    Cached: a pure function of its two arguments, and a rebuild keys
+    the same texts again and again (the alignment, the vote and every
+    card of a group).
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
@@ -737,8 +772,11 @@ def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
         folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
     folded = _QUOTE_GAP.sub("", folded)
     folded = _BRACKET_GAP.sub("[]", folded)
+    # Every name of :data:`REPORTERS` holds a period, and no fold of
+    # ``_SAME_CHARACTER`` makes one, so a word with none is no name.
     folded = " ".join(
-        _reporter(word) or word for word in _join_reporters(folded.split())
+        (_reporter(word) if "." in word else None) or word
+        for word in _join_reporters(folded.split())
     )
     return _WS.sub(" ", folded).strip()
 
