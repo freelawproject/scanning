@@ -1,11 +1,12 @@
 # blackletter-gpu-worker
 
 GPU worker image for [RunPod Serverless] that runs one step: YOLO
-detection over every page of a PDF, with the `bl_warm` weight from
-[blackletter]. It answers the merged detection list in blackletter's
-own `Label` taxonomy.
+detection over every page of a PDF, with a weight from [blackletter]:
+`bl_warm` for our own scans, or `bl_hein` for the bitonal Hein scans
+(#628), whichever the job names. It answers the merged detection list
+in blackletter's own `Label` taxonomy.
 
-The image contains only inference code and one model weight. No Django,
+The image contains only inference code and two model weights. No Django,
 no database client, no AWS credentials. All sensitive configuration
 lives in RunPod endpoint env vars, never in the image.
 
@@ -28,7 +29,7 @@ documented here and applies to both.
 │                     ├───────▶│ handler.py                         │
 │  - presign GET URL  │  /run  │  - downloads one original shard    │
 │  - presign PUT URL  │        │  - renders pages at 200 dpi        │
-│  - submit job       │◀───────│  - runs bl_warm over every page    │
+│  - submit job       │◀───────│  - runs bl_warm or bl_hein on it   │
 │  - poll /status     │  JSON  │  - merges and returns the rows     │
 │  - read the object  │        │  - PUTs the payload to S3          │
 └─────────────────────┘        └────────────────────────────────────┘
@@ -39,11 +40,17 @@ that reads its output is #196. The image ships first, so a fresh deploy
 has no automatic caller: submit a job by hand (see
 [Manual testing](#manual-testing-with-curl)) until #195 lands.
 
-Detection reads the **original** shard, never the bitonal copy. bl-warm
-was trained on greyscale renders, and its large region classes collapse
-on 1-bit pages: caption F1 measured 0.99 against 0.25. Volumes arrive
-already cut into shards (#164), and both GPU stages fan out over that
-one shard set.
+Detection of our own scans reads the **original** shard, never the
+bitonal copy. bl-warm was trained on greyscale renders, and its large
+region classes collapse on 1-bit pages: caption F1 measured 0.99
+against 0.25. Volumes arrive already cut into shards (#164), and both
+GPU stages fan out over that one shard set.
+
+A Hein volume is 1-bit as it arrives, so it has no greyscale original
+to read. `bl_hein` is the same 18-class model trained on 1-bit pages,
+and the caller names it in `models` for such a volume. The worker
+checks nothing about the pages: which model a volume gets is the
+caller's rule.
 
 ## What's in the image
 
@@ -55,19 +62,25 @@ one shard set.
   went with the `analyze` step (#173).
 - PyTorch `cu126` wheels plus ultralytics, installed into `/opt/venv`
   by uv from `uv.lock`.
-- `blackletter[detect]` from PyPI, floor 0.3.0 — the release that
-  carries the `bl_warm` adapter, its weight source and its confidence
-  gates (blackletter #73).
-- `bl_warm.pt` baked into blackletter's own weights directory, so cold
-  start never touches the network (`HF_HUB_OFFLINE=1` at run time). It
-  is downloaded at build from the public HF repo
-  `freelawproject/blackletter-weights`, at the commit blackletter pins.
+- `blackletter[detect]` from PyPI, floor 0.4.5 — 0.3.0 carries the
+  `bl_warm` adapter, its weight source and its confidence gates
+  (blackletter #73), and 0.4.5 adds the `bl_hein` weight source, counts
+  it in the bl-warm family for the gates and trusts its captions and
+  key icons in the merge (blackletter #90).
+- `bl_warm.pt` and `bl_hein.pt` baked into blackletter's own weights
+  directory, so cold start never touches the network
+  (`HF_HUB_OFFLINE=1` at run time). Each is downloaded at build from
+  the public HF repo `freelawproject/blackletter-weights`, at the
+  commit blackletter pins, and the build opens both and checks their
+  class names. Each is about 52 MB.
 - No PaddleOCR, no tesseract, no Ghostscript. Page numbers now come
   from dots.mocr (#149), so the whole `analyze` stack is gone.
 
 ### The legacy trio needs a rebuild, not an input
 
-Only `bl_warm.pt` is baked. `api.detect` calls `ensure_weights` itself
+Only `bl_warm.pt` and `bl_hein.pt` are baked (`handler.BAKED_MODELS`,
+which a test pins to the Dockerfile's bake). `api.detect` calls
+`ensure_weights` itself
 and would reach Hugging Face at run time for any other name, so the
 handler refuses a weight that is not in the image
 (`handler._missing_weights`). Running `small`/`medium`/`large` again
@@ -82,7 +95,8 @@ of its own defaults, which name no `imgsz`. `bl_warm.pt` carries
 `imgsz = 1024`, so that is what it predicts at. Nothing in the handler
 passes the value, because passing the library default of 640 would
 quietly cost accuracy on the small classes (the key icon, the page
-number, the state abbreviation).
+number, the state abbreviation). `bl_hein.pt` carries its own value the
+same way; the build and the preload print it for both.
 
 The preload logs the value it found. A checkpoint that lost its training
 arguments falls back to 640 with no error, and that log line is the only
@@ -176,7 +190,9 @@ is `detect`:
 ```
 
 Everything but `pdf_url` is optional. `models` accepts a bare string as
-well as a list, and every name must be baked into the image. An absent
+well as a list, and every name must be baked into the image: `bl_warm`
+(the default) or `bl_hein`, the one a Hein volume's job names. Naming
+both runs both and merges them, which no caller does. An absent
 key or JSON `null` means the default; an empty list is refused as
 `BAD_INPUT`, because it is indistinguishable from a caller bug that
 filtered every model away.
@@ -226,11 +242,12 @@ Notes on the rows:
 - `found_by` is the provenance blackletter's merge writes in place of
   the per-model `model` key. Keep it: `blackletter.bl_warm
   .rows_are_bl_warm` reads it to pick the bl-warm confidence gates, and
-  #196 depends on that.
+  #196 depends on that. A `bl_hein` row names `bl_hein` there, and
+  blackletter 0.4.5 reads it as the same family.
 - `label` is a `Label` name, not a bl-warm class name. The adapter maps
   the 18 classes onto the taxonomy, splits the whole-page `body` box
-  into two `TEXT_COLUMN` boxes, and drops `heading` and `blockquote`,
-  which have no `Label`.
+  into two `TEXT_COLUMN` boxes, and carries `heading` and `blockquote`
+  as `HEADING` and `BLOCKQUOTE` (since blackletter 0.4.1).
 
 ### Result delivery
 
@@ -309,6 +326,7 @@ RESP=$(curl -sX POST https://api.runpod.ai/v2/${ENDPOINT_ID}/run \
   -H "Authorization: Bearer ${API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{"input":{"action":"detect","scan_pk":0,"pdf_url":"https://arxiv.org/pdf/1706.03762.pdf"}}')
+# For the Hein model, add  "models":["bl_hein"]  to the input.
 JOB_ID=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin)["id"])')
 
 while true; do
@@ -545,8 +563,8 @@ The endpoint's **Workers** tab shows each worker's state:
 ### What the image contains
 
 - Open-source code: blackletter, ultralytics, torch.
-- One publicly distributed model weight: `bl_warm.pt` from the HF repo
-  `freelawproject/blackletter-weights`.
+- Two publicly distributed model weights: `bl_warm.pt` and
+  `bl_hein.pt` from the HF repo `freelawproject/blackletter-weights`.
 - No secrets. No AWS keys, no database credentials, no Django
   `SECRET_KEY`, no Sentry DSN (read from the environment at run time).
 
@@ -585,6 +603,10 @@ no shell access and no state between jobs. Harden it if you ever run it
 in a long-lived multi-tenant environment.
 
 ## Troubleshooting
+
+**`lacks the bl-warm class names` at build time** — a checkpoint whose
+classes blackletter's adapter does not know. The rows would come out
+untranslated, so the build stops. Fix the weight, not the check.
 
 **`weight missing or truncated` at build time** — the Hugging Face
 download failed on all three attempts, or the file arrived short.

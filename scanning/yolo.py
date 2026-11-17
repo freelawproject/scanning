@@ -68,12 +68,13 @@ logger = logging.getLogger(__name__)
 #: Handler action on the worker image. Its only one.
 ACTION = "detect"
 
-#: Weights the worker loads. Only ``bl_warm.pt`` is baked into the
-#: image, and ``api.detect`` calls ``ensure_weights`` itself, so any
-#: other name would reach Hugging Face from inside a paid job. The
-#: worker refuses an unbaked name up front
+#: Weights the worker loads. The image bakes ``bl_warm.pt`` and
+#: ``bl_hein.pt`` (#628), and ``api.detect`` calls ``ensure_weights``
+#: itself, so any other name would reach Hugging Face from inside a
+#: paid job. The worker refuses an unbaked name up front
 #: (``handler._missing_weights``); running the legacy small/medium/large
-#: trio again is a rebuild, not a changed input.
+#: trio again is a rebuild, not a changed input. No run names
+#: ``bl_hein`` yet: which volume gets it is #629.
 MODELS = ["bl_warm"]
 
 #: Score below which a detection is dropped. blackletter's own
