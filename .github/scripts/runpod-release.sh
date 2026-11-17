@@ -13,9 +13,9 @@
 # image of another repository is never touched.
 #
 # Reads RUNPOD_API_KEY and IMAGE (`repository:tag`) from the
-# environment. With ALLOW_NO_ENDPOINT=1 an account with no endpoint on
-# the repository is a warning, for an image published before its
-# endpoint exists; otherwise it fails the build.
+# environment. An account with no endpoint on the repository fails the
+# build: a step that passes without a release is how the Surya
+# endpoint stayed on its first image through three builds.
 set -euo pipefail
 
 : "${RUNPOD_API_KEY:?RUNPOD_API_KEY is not set}"
@@ -59,10 +59,6 @@ while :; do
 done
 
 if [ -z "$ids" ]; then
-  if [ "${ALLOW_NO_ENDPOINT:-}" = "1" ]; then
-    echo "::warning::No RunPod endpoint runs an image of $repository; nothing to update"
-    exit 0
-  fi
   echo "::error::No RunPod endpoint runs an image of $repository"
   exit 1
 fi
