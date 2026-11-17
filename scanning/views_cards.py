@@ -227,10 +227,7 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
         .order_by()
     )
     card_query = _query(
-        {
-            key: filters[key]
-            for key in ("reason", "level", "status", "mine")
-        }
+        {key: filters[key] for key in ("reason", "level", "status", "mine")}
     )
     for opinion in page_obj:
         kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}

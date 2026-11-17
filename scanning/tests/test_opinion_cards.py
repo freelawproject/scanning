@@ -763,7 +763,11 @@ class TestTheLevelFilter(CardTestCase):
     def setUp(self):
         super().setUp()
         comma = blocking(
-            read("the court held, that x", "the court held. that x", "the court held; that x"),
+            read(
+                "the court held, that x",
+                "the court held. that x",
+                "the court held; that x",
+            ),
             gid=4,
             box=(36, 200, 288, 220),
         )
@@ -783,7 +787,9 @@ class TestTheLevelFilter(CardTestCase):
         blocking = self.client.get(url + "?level=blocking")
         minor = self.client.get(url + "?level=minor")
 
-        self.assertEqual(everything.context["levels"], {"blocking": 1, "minor": 1})
+        self.assertEqual(
+            everything.context["levels"], {"blocking": 1, "minor": 1}
+        )
         self.assertEqual(everything.context["card_total"], 2)
         self.assertEqual(blocking.context["card_total"], 1)
         self.assertEqual(
