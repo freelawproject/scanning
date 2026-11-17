@@ -918,7 +918,9 @@ class TestMinorWarningCards(CardTestCase):
         self.assertTrue(all(r.kind == "word" and r.minor for r in rows))
 
     def test_a_kept_minor_card_stays_closed_while_its_readings_hold(self):
-        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.sync(
+            self.opinion, document(self.comma(ensemble.WARNING))
+        )
         opinion_cards.answer(OpinionCard.objects.get(), self.user, "held,")
         doc = document(self.comma(ensemble.WARNING))
         with (
@@ -927,7 +929,9 @@ class TestMinorWarningCards(CardTestCase):
         ):
             opinion_cards.apply(self.opinion)
 
-        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.sync(
+            self.opinion, document(self.comma(ensemble.WARNING))
+        )
         self.assertEqual(
             OpinionCard.objects.get().status, OpinionCard.Status.APPLIED
         )
@@ -941,4 +945,6 @@ class TestMinorWarningCards(CardTestCase):
         moved["level"] = ensemble.WARNING
         opinion_cards.sync(self.opinion, document(moved))
         row = OpinionCard.objects.get()
-        self.assertEqual((row.status, row.answer), (OpinionCard.Status.OPEN, None))
+        self.assertEqual(
+            (row.status, row.answer), (OpinionCard.Status.OPEN, None)
+        )
