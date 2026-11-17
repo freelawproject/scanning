@@ -45,10 +45,13 @@ CARD_CHECKS = (OpinionCheck.NO_MAJORITY, OpinionCheck.SINGLE_ENGINE)
 WAITING = (OpinionCard.Status.OPEN, OpinionCard.Status.STALE)
 
 #: A row the next build still knows: everything but an applied answer.
+#: A set-aside card is live: its page is not fine, so no kept page around
+#: it is dismissed, and its block is not answered whole.
 LIVE = (
     OpinionCard.Status.OPEN,
     OpinionCard.Status.ANSWERED,
     OpinionCard.Status.STALE,
+    OpinionCard.Status.FLAGGED,
 )
 
 #: How many rounds of edits and builds one opinion's apply runs. A
@@ -131,6 +134,8 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             ):
                 if (number, _check_of(card)) not in open_pages:
                     continue
+                # The page's durable address, for a rescan request.
+                card["address"] = list(ensemble._address(page))
                 fresh[key_of(card)] = card
     # Locked to the end of the build's transaction: an answer stored
     # between this read and the write below would be written back as
@@ -161,6 +166,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
                     check_name=_check_of(card),
                     kind=card["kind"],
                     reason=card["type"],
+                    minor=bool(card.get("minor")),
                     card=card,
                 )
             )
@@ -180,6 +186,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             row.note = "The written answer did not settle this place."
         row.card = card
         row.reason = card["type"]
+        row.minor = bool(card.get("minor"))
         row.check_name = _check_of(card)
         updated.append(row)
     if created:
@@ -191,6 +198,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             [
                 "card",
                 "reason",
+                "minor",
                 "check_name",
                 "status",
                 "answer",
@@ -212,13 +220,26 @@ class CardClosed(Exception):
     """The card was applied or is gone: no answer goes on it."""
 
 
-def answer(row: OpinionCard, user, value: str | None) -> OpinionCard:
+#: The answer a "Not text" card stores beside ``Action.DROP``.
+NOT_TEXT = "(not text)"
+
+
+def answer(
+    row: OpinionCard,
+    user,
+    value: str | None,
+    action: str = OpinionCard.Action.TEXT,
+) -> OpinionCard:
     """Store an answer on one row, or take it back with ``None``.
 
     The value is what the card's place should read: a word card's
     words, a gap's words ("" for nothing), a block's whole text. The
     text it makes is :func:`compose`, run by the apply against the text
-    of that day. An applied row takes no answer: its Undo is the edit's.
+    of that day. ``Action.DROP`` says the block is not text (the
+    bleed-through of the page behind, a stray mark): the apply takes the
+    whole block out, the review page's "Not text". ``None`` opens the
+    card again, set aside or answered. An applied row takes no answer:
+    its Undo is the edit's.
 
     :raises CardClosed: for an applied row.
     """
@@ -226,6 +247,8 @@ def answer(row: OpinionCard, user, value: str | None) -> OpinionCard:
         row = OpinionCard.objects.select_for_update().get(pk=row.pk)
         if row.status == OpinionCard.Status.APPLIED:
             raise CardClosed(row.pk)
+        row.action = OpinionCard.Action.TEXT
+        row.flag = ""
         if value is None:
             row.status = OpinionCard.Status.OPEN
             row.answer = None
@@ -233,6 +256,9 @@ def answer(row: OpinionCard, user, value: str | None) -> OpinionCard:
             row.answered_at = None
         else:
             row.status = OpinionCard.Status.ANSWERED
+            if action == OpinionCard.Action.DROP:
+                row.action = action
+                value = NOT_TEXT
             row.answer = value
             row.answered_by = user
             row.answered_at = timezone.now()
@@ -241,6 +267,50 @@ def answer(row: OpinionCard, user, value: str | None) -> OpinionCard:
             update_fields=[
                 "status",
                 "answer",
+                "action",
+                "flag",
+                "answered_by",
+                "answered_at",
+                "note",
+                "date_modified",
+            ]
+        )
+    return row
+
+
+def set_aside(
+    row: OpinionCard, user, flag: str, repair=None, note: str = ""
+) -> OpinionCard:
+    """Set a card aside for staff: the page needs a new scan, or the
+    redaction over it needs a fix in review 2.
+
+    The row leaves the volunteers' queue (``FLAGGED`` is not
+    :data:`WAITING`) and the apply passes it by; the build keeps the
+    status. ``repair`` is the rescan request the flag filed. Its Undo is
+    :func:`answer` with ``None``; the request stays in the repair queue,
+    which has its own dismissal.
+
+    :raises CardClosed: for an applied row.
+    """
+    with transaction.atomic():
+        row = OpinionCard.objects.select_for_update().get(pk=row.pk)
+        if row.status == OpinionCard.Status.APPLIED:
+            raise CardClosed(row.pk)
+        row.status = OpinionCard.Status.FLAGGED
+        row.flag = flag
+        row.repair = repair or row.repair
+        row.answer = None
+        row.action = OpinionCard.Action.TEXT
+        row.answered_by = user
+        row.answered_at = timezone.now()
+        row.note = note
+        row.save(
+            update_fields=[
+                "status",
+                "flag",
+                "repair",
+                "answer",
+                "action",
                 "answered_by",
                 "answered_at",
                 "note",
@@ -295,6 +365,8 @@ def compose(card: dict, value: str, text: str | None = None) -> str:
 
 def is_keep(row: OpinionCard) -> bool:
     """Return whether an answer leaves the text as the card shows it."""
+    if row.action == OpinionCard.Action.DROP:
+        return False
     return compose(row.card, row.answer or "") == opinion_edits.fold(
         row.card["text"]
     )
@@ -387,6 +459,24 @@ def _write_edit(
     )
 
 
+def _write_drop(
+    opinion: Opinion, page: dict, group: dict, user
+) -> OpinionEdit:
+    """Write one ``DROP`` edit as ``edit_opinion_drop`` writes it."""
+    address = ensemble._address(page)
+    return opinion_edits.supersede(
+        opinion,
+        user,
+        kind=OpinionEdit.Kind.DROP,
+        source_edit_id=address[0],
+        source_page=address[1],
+        page_in_opinion=page["page_in_opinion"],
+        box_pt=group["box_pt"],
+        section=group.get("section") or ensemble.BODY,
+        glue_revision=opinion.glue_revision,
+    )
+
+
 def _refusal(group: dict | None, text: str) -> str:
     """Return why the review page would refuse this edit, or ``""``."""
     from scanning import markup
@@ -448,7 +538,7 @@ def apply(opinion: Opinion, dry_run: bool = False) -> Counter:
 
     :param opinion: The row.
     :param dry_run: Count what would be written and write nothing.
-    :returns: Counts: ``edits``, ``answers``, ``pages_dismissed``,
+    :returns: Counts: ``edits``, ``drops``, ``answers``, ``pages_dismissed``,
         ``stale``, ``rounds``, and ``skipped`` with the reason.
     :rtype: Counter
     """
@@ -496,6 +586,29 @@ def apply(opinion: Opinion, dry_run: bool = False) -> Counter:
             if group is None:
                 counts["stale"] += len(rows)
                 _stale(rows, _refusal(None, ""), dry_run)
+                continue
+            drops = [r for r in rows if r.action == OpinionCard.Action.DROP]
+            if drops:
+                # Not text: the whole block goes, and every answer of it
+                # with it; the build deletes the block's other cards.
+                from scanning import markup
+
+                if group.get("kind") == markup.FIGURE:
+                    counts["stale"] += len(drops)
+                    _stale(drops, "A picture is not taken out here.", dry_run)
+                    continue
+                counts["drops"] += 1
+                counts["answers"] += len(rows)
+                if dry_run:
+                    continue
+                edit = _write_drop(opinion, page, group, drops[0].answered_by)
+                OpinionCard.objects.filter(pk__in=[r.pk for r in rows]).update(
+                    status=OpinionCard.Status.APPLIED,
+                    edit=edit,
+                    applied_at=timezone.now(),
+                    note="The block was taken out as not text.",
+                )
+                wrote += 1
                 continue
             planned = _edit_for(rows, blocks[(number, group_id)], group)
             if planned is None:

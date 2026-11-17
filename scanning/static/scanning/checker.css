@@ -1787,6 +1787,8 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-card.bk-active { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.18); }
 .bk-card > header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 12.5px; color: #6b7280; margin-bottom: 8px; }
 .bk-card > header .bk-step { font-weight: 600; color: #b3261e; }
+.bk-kbd { display: inline-block; min-width: 1.4em; margin-right: 6px; padding: 0 4px; border: 1px solid #d1d5db; border-bottom-width: 2px; border-radius: 4px; font: 600 11px/1.5 ui-monospace, monospace; text-align: center; color: #4b5563; background: #f9fafb; }
+@media (prefers-color-scheme: dark) { .bk-kbd { border-color: #4b5563; color: #d1d5db; background: #1f2937; } }
 .bk-card > header .bk-type { font-size: 11px; padding: 1px 6px; border-radius: 9999px; background: #eef2ff; color: #3730a3; }
 .bk-card > header .bk-note-line { flex-basis: 100%; color: #b45309; }
 @media (prefers-color-scheme: dark) { .bk-card > header .bk-type { background: #312e81; color: #e0e7ff; } .bk-card > header .bk-note-line { color: #fbbf24; } }
@@ -1805,6 +1807,7 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-opt.r0 { border-left-color: #2f5d8a; }
 .bk-opt.r1 { border-left-color: #b7791f; }
 .bk-opt.r2 { border-left-color: #7a5c99; }
+.bk-opt.bk-blank { border-left-color: #9ca3af; border-style: dashed; }
 .bk-opt.bk-chosen { border-color: #2e7d32; box-shadow: inset 0 0 0 2px #2e7d32; }
 /* The reading that is in the text now: a tint and a check mark, so
    the reviewer sees what was selected before blessing or correcting
@@ -1823,8 +1826,21 @@ div.ensemble-group[data-kind="list_item"] {
 }
 .bk-opt.bk-focus { border-color: #2f5d8a; box-shadow: 0 0 0 3px rgba(47, 93, 138, 0.25); }
 .bk-opt.bk-typed { cursor: text; border-left-color: #d6d3cd; }
+.bk-opt.bk-frozen { cursor: default; opacity: 0.55; }
+.bk-opt.bk-frozen.bk-chosen { opacity: 1; }
+.bk-cropwrap[style*="aspect-ratio"] canvas { width: 100%; height: 100%; }
 .bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }
 .bk-card > footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
+.bk-card > footer { flex-wrap: wrap; justify-content: flex-start; }
+.bk-card > footer .bk-state { min-width: 8em; }
+.bk-card > footer button, .bk-card > footer a { white-space: nowrap; }
+.bk-card > footer .bk-flags { order: 2; flex-basis: 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding-top: 6px; border-top: 1px dashed #e5e7eb; }
+.bk-flags-label { font-size: 11px; color: #9ca3af; text-transform: uppercase; letter-spacing: 0.04em; }
+.bk-flag { font-size: 12px; padding: 2px 8px; border: 1px solid #e5e7eb; border-radius: 4px; background: transparent; color: #6b7280; cursor: pointer; white-space: nowrap; }
+.bk-flag:hover { border-color: #b3261e; color: #b3261e; }
+.bk-kbd-btn { margin: 0 0 0 6px; min-width: 1.2em; font-size: 10px; line-height: 1.4; }
+.bk-opt .bk-who .bk-kbd { margin-right: 8px; }
+@media (prefers-color-scheme: dark) { .bk-card > footer .bk-flags { border-top-color: #374151; } .bk-flag { border-color: #4b5563; color: #9ca3af; } }
 .bk-state { font-size: 12.5px; color: #6b7280; }
 .bk-card.bk-done .bk-state { color: #2e7d32; font-weight: 600; }
 .bk-grow { flex: 1; }
@@ -1846,6 +1862,10 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-card.cr-expanded { position: fixed; inset: 0; z-index: 90; margin: 0; overflow: auto; border-radius: 0; background: #fff; padding: 12px 24px 24px; }
 .bk-card.cr-expanded > header { position: sticky; top: 0; background: #fff; padding: 6px 0; z-index: 1; }
 .bk-card.cr-expanded > footer { position: sticky; bottom: 0; background: #fff; padding: 8px 0; }
+/* The whole page fits the screen: its height, not the window's width,
+   so the foot of a tall page is never under the sticky footer. */
+.bk-card.cr-expanded .bk-cropwrap.cr-fullpage { display: flex; justify-content: center; border: 0; background: transparent; }
+.bk-card.cr-expanded .bk-cropwrap.cr-fullpage canvas { width: auto; height: auto; max-width: 100%; max-height: calc(100vh - 200px); }
 @media (prefers-color-scheme: dark) {
   .bk-card.cr-expanded, .bk-card.cr-expanded > header, .bk-card.cr-expanded > footer { background: #1f2937; }
 }

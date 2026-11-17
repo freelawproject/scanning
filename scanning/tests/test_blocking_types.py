@@ -60,3 +60,40 @@ class TestTypeOf(SimpleTestCase):
             blocking_types.hardest(["quotes", "numbers", "spacing"]), "numbers"
         )
         self.assertIsNone(blocking_types.hardest([]))
+
+
+class TestSettlesMinor(SimpleTestCase):
+    """A minor reason settles a place only while the text holds one of
+    the agreeing readings."""
+
+    def test_the_text_holds_a_reading_of_the_pair(self):
+        self.assertTrue(
+            blocking_types.settles_minor(["held,", "held.", "hold;"], "held,")
+        )
+        self.assertTrue(
+            blocking_types.settles_minor(
+                ["\u00b610 x", "\u00b60 x", "\u00b6 10 x"], "\u00b610 x"
+            )
+        )
+        self.assertTrue(
+            blocking_types.settles_minor(
+                ["anti-trust", "antitrust", "anti trust"], "anti-trust"
+            )
+        )
+
+    def test_the_text_holds_the_odd_engines_word(self):
+        """Two engines read held; the text reads hold: a wrong word
+        must not pass as punctuation."""
+        self.assertFalse(
+            blocking_types.settles_minor(["held,", "held.", "hold;"], "hold;")
+        )
+        self.assertFalse(
+            blocking_types.settles_minor(
+                ["\u00b610 x", "\u00b60 x", "\u00b6 10 x"], "\u00b60 x"
+            )
+        )
+
+    def test_a_reason_that_is_not_minor_settles_nothing(self):
+        self.assertFalse(
+            blocking_types.settles_minor(["held", "heId", "hold"], "held")
+        )

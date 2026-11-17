@@ -776,6 +776,9 @@ def group_cards(page: dict, number: int, group: dict, schema) -> list[dict]:
                 **common,
                 "kind": BLOCK,
                 "type": blocking_types.type_of([r["text"] for r in readings]),
+                "minor": blocking_types.settles_minor(
+                    [r["text"] for r in readings], group["text"]
+                ),
                 "table": group.get("kind") == markup.TABLE,
                 "open": len(words) or stale,
                 "readings": readings,
@@ -789,6 +792,10 @@ def group_cards(page: dict, number: int, group: dict, schema) -> list[dict]:
             **word,
             "type": blocking_types.type_of(
                 [reading["word"] for reading in word["readings"]]
+            ),
+            "minor": blocking_types.settles_minor(
+                [reading["word"] for reading in word["readings"]],
+                "" if word.get("gap") else word.get("token") or "",
             ),
             "crop": crop_of(
                 group["box_pt"],

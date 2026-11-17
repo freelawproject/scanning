@@ -31,6 +31,13 @@
     {% if filters.reason %}<input type="hidden" name="reason" value="{{ filters.reason }}">{% endif %}
     <label>Scan <input type="text" name="scan" value="{{ filters.scan }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
     <label>Volume <input type="text" name="volume" value="{{ filters.volume }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    <label>Level
+      <select name="level" class="input-text text-sm">
+        {% for value, label in level_choices %}
+        <option value="{{ value }}"{% if value == filters.level %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>Status
       <select name="status" class="input-text text-sm">
         {% for value, label in status_choices %}
@@ -42,6 +49,10 @@
     <button type="submit" class="btn-outline text-sm">Filter</button>
   </form>
 
+  <p class="text-sm mb-2">
+    <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking
+    · <b class="text-gray-600 dark:text-gray-300">{{ levels.minor }}</b> minor (warnings at the next build)
+  </p>
   <nav class="flex flex-wrap gap-1 mb-3 text-xs" aria-label="Reasons">
     {% for tab in tabs %}
     <a href="{{ tab.url }}" class="{% if tab.current %}btn-primary{% else %}btn-outline{% endif %} text-xs"{% if tab.current %} aria-current="page"{% endif %}>{{ tab.label }} <span class="opacity-75">{{ tab.count }}</span></a>
@@ -49,8 +60,8 @@
   </nav>
 
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
-    Pick the reading that matches the page, type the right words, or press "Looks good" to keep the text as shown. An answer is saved on the card and goes into the text later, when the answers are applied; Undo takes it back until then.
-    ↓ and ↑ move down and up the rows of the card in view, Return chooses. f opens the card to the whole page, and f or Esc comes back.
+    Pick the reading that matches the page, or type the right words. An answer is saved on the card and goes into the text later, when the answers are applied; Undo takes it back until then.
+    ↓ and ↑ move between cards, and the card in the middle of the screen is the selected one. → and ← move down and up its options, and Return chooses the outlined one (Esc leaves the typed box). 1, 2, 3 choose a reading, 0 leaves it blank (the word goes, a gap stays empty), e types the words, s skips (here only, nothing is saved), u undoes, f opens the card to the whole page (f or Esc comes back). Under Problem: t the whole block is not text (bleed-through from the page behind, a stamp: every word of the block goes), r the page is a bad scan and needs scanning again, x a redaction box here is wrong. A stray mark inside the text, such as a West perpendicular read as "1" or "la", is not a problem: pick the reading without it, or "read nothing here" in a gap.
   </p>
 
   {% for opinion in page_obj %}

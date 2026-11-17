@@ -3959,6 +3959,15 @@ class OpinionCard(AbstractDateTimeModel):
         ANSWERED = "answered", "Answered"
         STALE = "stale", "Needs a new answer"
         APPLIED = "applied", "Applied"
+        FLAGGED = "flagged", "Set aside"
+
+    class Action(models.TextChoices):
+        TEXT = "text", "Words for the place"
+        DROP = "drop", "Not text: take the block out"
+
+    class Flag(models.TextChoices):
+        RESCAN = "rescan", "Bad scan: rescan asked for"
+        REDACTION = "redaction", "Redaction wrong: fix in review 2"
 
     opinion = models.ForeignKey(
         Opinion,
@@ -3977,6 +3986,14 @@ class OpinionCard(AbstractDateTimeModel):
     )
     kind = models.CharField(max_length=10)
     reason = models.CharField(max_length=32, db_index=True)
+    minor = models.BooleanField(
+        default=False,
+        help_text=(
+            "The card needs no person: a minor reason, and the text holds "
+            "one of the agreeing readings (blocking_types.settles_minor). "
+            "The next build makes its block a warning."
+        ),
+    )
     card = models.JSONField(
         help_text=(
             "The card as the review shows it: the block text, the "
@@ -3990,6 +4007,27 @@ class OpinionCard(AbstractDateTimeModel):
         null=True,
         blank=True,
         help_text="The words chosen for the card; null while unanswered.",
+    )
+    action = models.CharField(
+        max_length=10,
+        choices=Action.choices,
+        default=Action.TEXT,
+        help_text="What the apply writes: the answer's words, or a drop.",
+    )
+    flag = models.CharField(
+        max_length=10,
+        choices=Flag.choices,
+        blank=True,
+        default="",
+        help_text="Why a set-aside card waits on staff, not a volunteer.",
+    )
+    repair = models.ForeignKey(
+        "PageRepairRequest",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cards",
+        help_text="The rescan request a flag filed in the repair queue.",
     )
     answered_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,

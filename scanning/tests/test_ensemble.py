@@ -5398,6 +5398,60 @@ class TestTheLevel(TestCase):
             ensemble.BLOCKING,
         )
 
+    def test_an_open_word_of_punctuation_or_capitals_alone_warns(self):
+        """The letters of the three readings agree; only the mark after
+        the word, or its capitals, differ (``blocking_types.MINOR``)."""
+        from scanning.tests.test_blocking_review import read
+
+        for texts in (
+            (
+                "the court held, that x",
+                "the court held. that x",
+                "the court held; that x",
+            ),
+            ("a COURT b", "a Court b", "a court b"),
+        ):
+            group = read(*texts)
+            self.assertEqual(group["n_low_confidence"], 1, texts)
+            self.assertEqual(
+                ensemble.disagreement_level(group, 3), ensemble.WARNING, texts
+            )
+
+    def test_a_minor_word_blocks_while_the_text_holds_the_odd_reading(self):
+        """dots.mocr, whose reading the text shows, read hold; the other
+        two read held: the reason is punctuation, but the text's word is
+        the odd one, so a person still picks."""
+        from scanning.tests.test_blocking_review import read
+
+        odd = read(
+            "the court hold; that x",
+            "the court held, that x",
+            "the court held. that x",
+        )
+        shown = read(
+            "the court held, that x",
+            "the court held. that x",
+            "the court hold; that x",
+        )
+
+        self.assertEqual(
+            ensemble.disagreement_level(odd, 3), ensemble.BLOCKING
+        )
+        self.assertEqual(
+            ensemble.disagreement_level(shown, 3), ensemble.WARNING
+        )
+
+    def test_an_open_word_of_other_letters_still_blocks(self):
+        from scanning.tests.test_blocking_review import read
+
+        group = read(
+            "the court held that", "the court heId that", "the court hold that"
+        )
+
+        self.assertEqual(
+            ensemble.disagreement_level(group, 3), ensemble.BLOCKING
+        )
+
     def test_a_voted_group_every_word_settled_is_a_warning(self):
         """The full readings split three ways, and two engines agreed
         on every word: the word is the unit, and no word is open."""

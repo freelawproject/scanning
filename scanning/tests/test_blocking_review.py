@@ -93,6 +93,20 @@ class TestTheScriptKeysAKeptCardByItsPlace(SimpleTestCase):
             self.assertIn("return self.reload(entry);", body)
 
 
+class TestTheScriptNumbersEveryCard(SimpleTestCase):
+    def test_a_table_cards_readings_are_numbered_before_it_returns(self):
+        """A table card returns before its typed row; its readings take
+        their number keys first."""
+        body = re.search(
+            r"function stack\(section, card, node\) \{(.*?)\n    \}\n",
+            SCRIPT.read_text(),
+            re.S,
+        ).group(1)
+        for returned in re.finditer(r"return list;", body):
+            before = body[: returned.start()].rstrip()
+            self.assertTrue(before.endswith("numberRows(list);"), before[-80:])
+
+
 # ── the open words ───────────────────────────────────────────────────
 class TestOpenWords(TestCase):
     def test_a_run_one_engine_alone_read_is_a_warning_card_on_the_gap(self):
