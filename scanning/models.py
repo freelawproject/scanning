@@ -1526,13 +1526,15 @@ class Detection(AbstractDateTimeModel):
         say which family found it is read with the legacy gates. The
         row's ``found_by`` carries the same fact per detection, and
         ``blackletter.bl_warm.rows_are_bl_warm`` is the one reader of
-        it.
+        it. ``BL_HEIN`` is the same family read with the weight trained
+        on Hein's bitonal pages (#633), and takes the same gates.
         """
 
         SMALL = "small", "Small"
         MEDIUM = "medium", "Medium"
         LARGE = "large", "Large"
         BL_WARM = "bl_warm", "bl-warm"
+        BL_HEIN = "bl_hein", "bl-hein"
         MANUAL = "manual", "Manual"
 
     page_index = models.PositiveIntegerField(db_index=True)

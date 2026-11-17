@@ -1925,6 +1925,34 @@ def _import_detections(
     return rows_written
 
 
+def _run_model_name(detections: list) -> str:
+    """Return the ``Detection.model_name`` of a merged run's rows.
+
+    One decision for the whole run, off blackletter's own reader,
+    rather than a guess per row: the run either came from the bl-warm
+    family or it did not. Inside the family the name is the weight's
+    own when one weight drew every row (``bl_hein``, #633), so the
+    admin can tell a Hein volume's rows apart; the gates never read
+    this column, only ``found_by``.
+
+    :param detections: The merged document's ``detections`` list.
+    :returns: A ``Detection.ModelName`` value, or blank for a run
+        outside the family.
+    :rtype: str
+    """
+    if not rows_are_bl_warm(detections):
+        return ""
+    names = {
+        found.get("model")
+        for entry in detections
+        for found in entry.get("found_by") or []
+        if isinstance(found, dict)
+    }
+    if names == {Detection.ModelName.BL_HEIN.value}:
+        return Detection.ModelName.BL_HEIN
+    return Detection.ModelName.BL_WARM
+
+
 def _replace_model_detections(
     scan: Scan,
     detections: list,
@@ -1952,12 +1980,7 @@ def _replace_model_detections(
         model_name=Detection.ModelName.MANUAL
     ).delete()
 
-    # One decision for the whole run, off blackletter's own reader,
-    # rather than a guess per row: the run either came from bl-warm or
-    # it did not.
-    model_name = (
-        Detection.ModelName.BL_WARM if rows_are_bl_warm(detections) else ""
-    )
+    model_name = _run_model_name(detections)
     rows = []
     for entry in detections:
         bbox = entry.get("bbox") or [0, 0, 1, 1]

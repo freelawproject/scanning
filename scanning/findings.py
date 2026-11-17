@@ -59,6 +59,7 @@ import logging
 from collections.abc import Collection
 from typing import Any
 
+from blackletter.bl_warm import BL_WARM_MODELS
 from blackletter.models import Label
 from blackletter.scanner import HEAD_MATTER_LABELS, label_confidence
 from django.db import connection, transaction
@@ -897,8 +898,9 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
     and the editor's note cards (``card_review.cards``).
 
     The rule is blackletter's own (``bl_warm.rows_are_bl_warm``): every
-    row with provenance in ``found_by`` came from bl-warm, and a set
-    with none, or a mixed one, keeps the legacy gates. It is asked of
+    row with provenance in ``found_by`` came from the bl-warm family
+    (``bl_warm.BL_WARM_MODELS``, which holds ``bl_hein`` since #633),
+    and a set with none, or a mixed one, keeps the legacy gates. It is asked of
     the database as two EXISTS over the live model rows, one for a
     bl-warm entry and one for an entry of any other model, so no row
     comes back. It used to stream every row's ``found_by`` into Python
@@ -907,8 +909,8 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
     pod's threads for minutes each while the database sat idle.
 
     :param scan: The scan.
-    :returns: Whether a bl-warm row exists and no row names another
-        model.
+    :returns: Whether a row of the bl-warm family exists and no row
+        names a model outside it.
     """
     rows = (
         Detection.objects.live()
@@ -916,13 +918,17 @@ def model_rows_are_bl_warm(scan: Scan) -> bool:
         .exclude(model_name=Detection.ModelName.MANUAL)
         .exclude(found_by=[])
     )
-    if not rows.filter(found_by__contains=[{"model": "bl_warm"}]).exists():
+    family = sorted(BL_WARM_MODELS)
+    drawn = Q()
+    for name in family:
+        drawn |= Q(found_by__contains=[{"model": name}])
+    if not rows.filter(drawn).exists():
         return False
     other = rows.annotate(
         other_model=RawSQL(
             "EXISTS (SELECT 1 FROM jsonb_array_elements(found_by) AS e "
-            "WHERE coalesce(e->>'model', '') <> %s)",
-            ("bl_warm",),
+            "WHERE coalesce(e->>'model', '') <> ALL(%s))",
+            (family,),
             output_field=BooleanField(),
         )
     ).filter(other_model=True)
