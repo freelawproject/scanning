@@ -456,7 +456,9 @@ def _write_edit(
     )
 
 
-def _write_drop(opinion: Opinion, page: dict, group: dict, user) -> OpinionEdit:
+def _write_drop(
+    opinion: Opinion, page: dict, group: dict, user
+) -> OpinionEdit:
     """Write one ``DROP`` edit as ``edit_opinion_drop`` writes it."""
     address = ensemble._address(page)
     return opinion_edits.supersede(

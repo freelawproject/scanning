@@ -5404,7 +5404,11 @@ class TestTheLevel(TestCase):
         from scanning.tests.test_blocking_review import read
 
         for texts in (
-            ("the court held, that x", "the court held. that x", "the court held; that x"),
+            (
+                "the court held, that x",
+                "the court held. that x",
+                "the court held; that x",
+            ),
             ("a COURT b", "a Court b", "a court b"),
         ):
             group = read(*texts)
