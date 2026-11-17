@@ -737,6 +737,38 @@ def group_cards(page: dict, number: int, group: dict, schema) -> list[dict]:
     """
     if group.get("level") != ensemble.BLOCKING:
         return []
+    return _cards_of(page, number, group, schema)
+
+
+def minor_cards(page: dict, number: int, group: dict, schema) -> list[dict]:
+    """Return the minor warning cards of one group.
+
+    A voted block the minor rule made a warning (``ensemble``'s
+    ``_open_words_minor``): ``WARNING`` though words no two engines
+    agree on are left open, each settled only in its letters. Its open
+    words are cards of their own kind, apart from the warnings a
+    majority settled outright, which no row holds; each card carries
+    ``minor_warning``. Nothing blocks on them.
+
+    :returns: The cards, or none for any other group.
+    :rtype: list[dict]
+    """
+    if (
+        group.get("level") != ensemble.WARNING
+        or group.get("agreement") not in (ensemble.VOTED, ensemble.HUMAN)
+        or not group.get("n_low_confidence")
+    ):
+        return []
+    return [
+        {**card, "minor_warning": True}
+        for card in _cards_of(page, number, group, schema)
+        if card["kind"] == WORD
+    ]
+
+
+def _cards_of(page: dict, number: int, group: dict, schema) -> list[dict]:
+    """Return the cards of one group's open words: the walk of
+    :func:`group_cards` and :func:`minor_cards`."""
     common = {
         "page_in_opinion": number,
         "group_id": group["id"],

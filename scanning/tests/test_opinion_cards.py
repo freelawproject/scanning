@@ -787,12 +787,108 @@ class TestTheLevelFilter(CardTestCase):
         blocking = self.client.get(url + "?level=blocking")
         minor = self.client.get(url + "?level=minor")
 
+        # Before the rebuild both block; one of them is minor and becomes
+        # a minor warning at the next build.
         self.assertEqual(
-            everything.context["levels"], {"blocking": 1, "minor": 1}
+            everything.context["levels"],
+            {"blocking": 2, "pending": 1, "minor": 0},
         )
         self.assertEqual(everything.context["card_total"], 2)
-        self.assertEqual(blocking.context["card_total"], 1)
+        self.assertEqual(blocking.context["card_total"], 2)
         self.assertEqual(
             {t["slug"]: t["count"] for t in minor.context["tabs"]},
             {"": 1, "punctuation": 1},
         )
+
+
+
+class TestMinorWarningCards(CardTestCase):
+    """A block the minor rule made a warning keeps its open words as
+    minor warning cards, apart from the warnings a majority settled."""
+
+    def setUp(self):
+        super().setUp()
+        OpinionFindingFactory(
+            opinion=self.opinion,
+            check_name=OpinionCheck.ENGINES_DISAGREE,
+            severity=Issue.Severity.WARNING,
+        )
+        self.user = self.make_user()
+
+    def comma(self, level):
+        group = read(
+            "the court held, that x",
+            "the court held. that x",
+            "the court held; that x",
+        )
+        blocking(group, gid=4, box=(36, 200, 288, 220))
+        group["level"] = level
+        return group
+
+    def settled(self):
+        """Two engines read dug alike: a warning a majority settled."""
+        group = read("a dug sat", "a dug sat", "a dig sat")
+        blocking(group, gid=5, box=(36, 300, 288, 320))
+        group["level"] = ensemble.WARNING
+        return group
+
+    def test_a_demoted_word_is_a_minor_warning_card(self):
+        opinion_cards.sync(
+            self.opinion,
+            document(self.comma(ensemble.WARNING), self.settled()),
+        )
+
+        (row,) = OpinionCard.objects.all()
+        self.assertEqual(row.card["token"], "held,")
+        self.assertEqual(row.check_name, OpinionCheck.ENGINES_DISAGREE)
+        self.assertTrue(row.minor)
+        self.assertEqual(row.reason, "punctuation")
+
+    def test_an_answer_outlives_the_rebuild_that_demotes_its_card(self):
+        opinion_cards.sync(self.opinion, document(self.comma(ensemble.BLOCKING)))
+        row = OpinionCard.objects.get()
+        self.assertEqual(row.check_name, OpinionCheck.NO_MAJORITY)
+        opinion_cards.answer(row, self.user, "held.")
+
+        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+
+        row = OpinionCard.objects.get()
+        self.assertEqual(row.check_name, OpinionCheck.ENGINES_DISAGREE)
+        self.assertEqual(
+            (row.status, row.answer), (OpinionCard.Status.ANSWERED, "held.")
+        )
+
+    def test_a_kept_minor_card_closes_with_no_edit(self):
+        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.answer(OpinionCard.objects.get(), self.user, "held,")
+        doc = document(self.comma(ensemble.WARNING))
+
+        with (
+            patch("scanning.ensemble.read_document", return_value=doc),
+            patch("scanning.ensemble.is_written", return_value=True),
+        ):
+            counts = opinion_cards.apply(self.opinion)
+
+        self.assertEqual(counts["minor_kept"], 1)
+        self.assertFalse(OpinionEdit.objects.exists())
+        self.assertEqual(
+            OpinionCard.objects.get().status, OpinionCard.Status.APPLIED
+        )
+
+    def test_the_page_counts_minor_warnings_apart(self):
+        opinion_cards.sync(
+            self.opinion, document(self.held(), self.comma(ensemble.WARNING))
+        )
+        self.client.force_login(self.user)
+
+        answer = self.client.get(reverse("opinion_card_review"))
+        minor = self.client.get(reverse("opinion_card_review") + "?level=minor")
+        blocking = self.client.get(
+            reverse("opinion_card_review") + "?level=blocking"
+        )
+
+        self.assertEqual(
+            answer.context["levels"], {"blocking": 1, "pending": 0, "minor": 1}
+        )
+        self.assertEqual(minor.context["card_total"], 1)
+        self.assertEqual(blocking.context["card_total"], 1)

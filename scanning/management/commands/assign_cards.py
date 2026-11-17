@@ -36,6 +36,12 @@ class Command(BaseCommand):
             "--reason", choices=[slug for slug, _ in blocking_types.TYPES]
         )
         parser.add_argument("--count", type=int, default=200)
+        parser.add_argument(
+            "--level",
+            choices=("blocking", "minor"),
+            default="blocking",
+            help="Blocking cards (the default), or the minor warnings.",
+        )
         parser.add_argument("--scan", nargs="+", type=int, default=[])
         parser.add_argument(
             "--release",
@@ -70,6 +76,10 @@ class Command(BaseCommand):
             assigned_to__isnull=True,
             opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
         )
+        if options["level"] == "minor":
+            rows = rows.filter(check_name=opinion_cards.MINOR_CHECK)
+        else:
+            rows = rows.filter(check_name__in=opinion_cards.CARD_CHECKS)
         if options["scan"]:
             rows = rows.filter(opinion__scan_id__in=options["scan"])
         # Whole opinions, in the order of the volumes, until the count.

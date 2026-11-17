@@ -48,7 +48,13 @@ STATUS_FILTERS = {
 
 #: Which cards the level filter keeps: the ones a person must answer,
 #: or the minor ones the next build makes warnings (``OpinionCard.minor``).
-LEVEL_FILTERS = {"blocking": False, "minor": True}
+LEVEL_FILTERS = {
+    # What holds an approval now: the word and one-engine cards.
+    "blocking": Q(check_name__in=opinion_cards.CARD_CHECKS),
+    # The minor warnings, and the blocking cards the next build makes
+    # minor warnings (``OpinionCard.minor``).
+    "minor": Q(minor=True),
+}
 
 CARD_GONE_MESSAGE = (
     "This card is no longer open: its answer was written into the text, "
@@ -130,7 +136,7 @@ def _rows(
     if with_reason and filters["reason"]:
         rows = rows.filter(reason=filters["reason"])
     if with_level and filters["level"]:
-        rows = rows.filter(minor=LEVEL_FILTERS[filters["level"]])
+        rows = rows.filter(LEVEL_FILTERS[filters["level"]])
     return rows
 
 
@@ -141,13 +147,26 @@ def _level_counts(filters: dict, user) -> dict:
     key = "card-levels:" + _query(filters, level="")
     counts = None if scoped else cache.get(key)
     if counts is None:
-        by = dict(
-            _rows(filters, user, with_level=False)
-            .values_list("minor")
+        by = {
+            (check, minor): n
+            for check, minor, n in _rows(filters, user, with_level=False)
+            .values_list("check_name", "minor")
             .annotate(n=Count("id"))
             .order_by()
-        )
-        counts = {"blocking": by.get(False, 0), "minor": by.get(True, 0)}
+        }
+        blocking = {
+            key: n for key, n in by.items() if key[0] in opinion_cards.CARD_CHECKS
+        }
+        counts = {
+            "blocking": sum(blocking.values()),
+            # Blocking now, a minor warning after the next build.
+            "pending": sum(n for (_, minor), n in blocking.items() if minor),
+            "minor": sum(
+                n
+                for (check, _), n in by.items()
+                if check == opinion_cards.MINOR_CHECK
+            ),
+        }
         if not scoped:
             cache.set(key, counts, COUNTS_TTL)
     return counts
@@ -250,8 +269,8 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
             "levels": _level_counts(filters, request.user),
             "level_choices": [
                 ("", "All"),
-                ("blocking", "Blocking: a person must answer"),
-                ("minor", "Minor: become warnings at the next build"),
+                ("blocking", "Blocking: holds the approval"),
+                ("minor", "Minor: letters agree, only spacing or marks differ"),
             ],
             "card_total": rows.count(),
             "status_choices": [
@@ -276,6 +295,7 @@ def _card_of(row: OpinionCard, scan_pk: int) -> dict:
         "reason_label": blocking_types.LABELS.get(row.reason, row.reason),
         # A stale answer waits for a new one: the card is open again,
         # and its note says why.
+        "minor_warning": row.check_name == opinion_cards.MINOR_CHECK,
         "stored": (
             row.get_flag_display()
             if flagged

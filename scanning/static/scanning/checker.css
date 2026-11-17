@@ -1791,6 +1791,8 @@ div.ensemble-group[data-kind="list_item"] {
 @media (prefers-color-scheme: dark) { .bk-kbd { border-color: #4b5563; color: #d1d5db; background: #1f2937; } }
 .bk-card > header .bk-type { font-size: 11px; padding: 1px 6px; border-radius: 9999px; background: #eef2ff; color: #3730a3; }
 .bk-card > header .bk-note-line { flex-basis: 100%; color: #b45309; }
+.bk-card > header .bk-type.bk-minor { background: #fef3c7; color: #92400e; }
+@media (prefers-color-scheme: dark) { .bk-card > header .bk-type.bk-minor { background: #78350f; color: #fef3c7; } }
 @media (prefers-color-scheme: dark) { .bk-card > header .bk-type { background: #312e81; color: #e0e7ff; } .bk-card > header .bk-note-line { color: #fbbf24; } }
 .bk-cropwrap { position: relative; border: 1px solid #e5e7eb; background: #fff; overflow: hidden; border-radius: 4px; max-width: 760px; margin-bottom: 8px; }
 .bk-cropwrap canvas { width: 100%; height: auto; display: block; }
