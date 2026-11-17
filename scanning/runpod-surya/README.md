@@ -530,9 +530,9 @@ builds on any push to `main` touching `scanning/runpod-surya/**` or
 `freelawproject/surya-gpu-worker:<sha_short>` + `:latest`, and PATCHes
 the RunPod endpoint to the SHA-pinned tag.
 
-Repo secrets used: `RUNPOD_API_KEY` (shared with the other workers) and
-`RUNPOD_SURYA_ENDPOINT_ID` (this endpoint's id). The
-PATCH step is skipped while the second is unset, so the image can be
+Repo secret used: `RUNPOD_API_KEY` (shared with the other workers).
+The endpoint is found by its image, `freelawproject/surya-gpu-worker`,
+and the step only warns while no endpoint runs it, so the image can be
 published before the endpoint exists.
 
 ## Updating Python deps

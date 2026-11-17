@@ -367,7 +367,12 @@ On any push to `main` that touches `scanning/runpod/**` or
 2. Calls `PATCH https://api.runpod.io/v2/serverless/<id>` to move the
    endpoint's `image` to the SHA-pinned tag
    (`.github/scripts/runpod-release.sh`, shared by the four worker
-   workflows). The endpoint is patched and never its template: since
+   workflows). The script stores no endpoint id: it lists the
+   account's endpoints and moves every one whose image is a tag of
+   `freelawproject/blackletter-gpu-worker`, so an endpoint moved by
+   hand to an image of another repository is left alone, and a build
+   that finds no endpoint fails.
+   The endpoint is patched and never its template: since
    RunPod's REST API v2 (v1 was retired on 2026-11-15) a template is a
    snapshot applied when an endpoint is created, and an edit of it
    reaches no endpoint that exists.
@@ -375,20 +380,13 @@ On any push to `main` that touches `scanning/runpod/**` or
    workers cycle. With `Min Workers = 0`, warm workers drain on the
    idle timeout and the next job cold-starts on the new image.
 
-The workflow needs two repository secrets:
+The workflow needs one repository secret:
 
 - `RUNPOD_API_KEY` — a RunPod API key with **Restricted** permission
   set to **GraphQL: Read/Write**. That is the tightest scope RunPod
   offers. There is no per-template scope, so the key manages every
   template, endpoint and pod on the account; treat it as a production
   credential.
-- `RUNPOD_ENDPOINT_ID` — the ID of the endpoint, the value the portal
-  reads as `RUNPOD_YOLO_ENDPOINT_ID`. It is on the endpoint's page in
-  the RunPod console, or in the list of:
-  ```bash
-  curl -sS -H "Authorization: Bearer <API_KEY>" \
-    "https://api.runpod.io/v2/serverless"
-  ```
 
 ### Manual release (the RunPod console)
 

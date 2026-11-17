@@ -364,8 +364,9 @@ on any push to `main` touching `scanning/runpod-dotsmocr/**`, pushes
 `freelawproject/dotsmocr-gpu-worker:<sha_short>` + `:latest`, and
 PATCHes the RunPod endpoint to the SHA-pinned tag.
 
-Repo secrets used: `RUNPOD_API_KEY` (shared with the blackletter
-worker) and `RUNPOD_DOTSMOCR_ENDPOINT_ID` (this endpoint's id).
+Repo secret used: `RUNPOD_API_KEY` (shared with the blackletter
+worker). The endpoint is found by its image,
+`freelawproject/dotsmocr-gpu-worker`.
 
 ## Updating Python deps
 
