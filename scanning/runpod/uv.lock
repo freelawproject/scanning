@@ -281,7 +281,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.4.1"
+version = "0.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -290,9 +290,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ea/d6/388835ac8ef8009583879293bdde406a11790930b606426f82596a602cf9/blackletter-0.4.1.tar.gz", hash = "sha256:e272d6a6e8fb90cb847dec8e2b9a93efb51f2c5174b0c66af206815ebe5fe3bc", size = 188470, upload-time = "2026-09-16T13:40:15.101Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/94/91bd6fdf51f0666a8073e2f9a18ba6553d3bad080b8f91bd38202d9fe08c/blackletter-0.4.5.tar.gz", hash = "sha256:5ed0987c0b86d14375d3c34c67d345b1d04085024b04abc784502b3f58e8022d", size = 209475, upload-time = "2026-11-17T14:19:05.46Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/7e/6af4161dac23a44986bc966bf08f118190c3e188f56bc3cb6fb3cce71ba5/blackletter-0.4.1-py3-none-any.whl", hash = "sha256:57c8f7e2c072b6844d6ea533e0af4cd88b598f2cb6e549f72b7573465e7a2129", size = 138922, upload-time = "2026-09-16T13:40:13.554Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/11/34d45e03cce9f2def227e92f1b235f011e0137fa4b68615788cc2eaa4a1e/blackletter-0.4.5-py3-none-any.whl", hash = "sha256:623005c789581d0a5cf8b94393d404a86b109a40ed1e3e81f0a1660e1a199144", size = 150234, upload-time = "2026-11-17T14:19:03.896Z" },
 ]
 
 [package.optional-dependencies]
@@ -316,7 +316,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", extras = ["detect"], specifier = ">=0.3.1" },
+    { name = "blackletter", extras = ["detect"], specifier = ">=0.4.5" },
     { name = "requests", specifier = ">=2.33,<3" },
     { name = "runpod", specifier = ">=1.9,<2" },
     { name = "sentry-sdk", specifier = ">=2,<3" },

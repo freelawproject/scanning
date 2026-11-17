@@ -5,12 +5,18 @@ Dispatches on ``job["input"]["action"]``. There is one action:
 - ``detect``: fetch a PDF through a presigned GET URL, run YOLO over
   every page, and return the merged detection list.
 
-The model is ``bl_warm``, one 18-class checkpoint that replaced the
-small/medium/large trio (blackletter #73). Its weight file is the only
-one baked into the image, so a run of the legacy trio needs a rebuild,
-not an input change. Input reads the **original** shard, never the
-bitonal copy: the large region classes of bl-warm collapse on 1-bit
-pages.
+The default model is ``bl_warm``, one 18-class checkpoint that replaced
+the small/medium/large trio (blackletter #73). ``bl_hein`` is its twin
+for the Hein scans (#628): the same class set, trained on 1-bit pages,
+and run only when the job's ``models`` names it. Those two weight files
+are the only ones baked into the image (:data:`BAKED_MODELS`), so a run
+of the legacy trio needs a rebuild, not an input change.
+
+The caller picks the model by the kind of volume, and this worker
+checks nothing about the pages. For our own scans the input is the
+**original** shard, never the bitonal copy: the large region classes of
+bl-warm collapse on 1-bit pages. A Hein volume is 1-bit as it arrives,
+which is what bl_hein was trained on.
 
 The ``analyze`` action of the previous image is gone with the legacy
 pipeline (#173). Page numbers now come from dots.mocr (#149), so this
@@ -76,9 +82,17 @@ sentry_sdk = runpod_common.init_sentry(logger)
 MAX_PAGES = int(os.environ.get("HANDLER_MAX_PAGES", "5000"))
 # Download tunables (HANDLER_DOWNLOAD_*) live in runpod_common.
 
-# Weights this worker runs when the input names none. A tuple, and the
-# only name baked into the image; see ``_missing_weights``.
+# Weights this worker runs when the input names none. bl_hein is never
+# a default: a job with no ``models`` is a job from a caller that knows
+# one model, and it must get the answer it got before #628.
 DEFAULT_MODELS = ("bl_warm",)
+
+# Every weight the Dockerfile bakes, which is every name a job may ask
+# for (``_missing_weights`` refuses the rest) and every weight the
+# preload opens. bl_hein reads the bitonal Hein scans (#628). The bake
+# and its check in the Dockerfile name the same two; a test pins the
+# two lists together.
+BAKED_MODELS = ("bl_warm", "bl_hein")
 
 # Detection floor, matching ``blackletter.scanner.CONFIDENCE_THRESHOLD``.
 # The per-label gates that actually shape the redactions live in
@@ -97,6 +111,7 @@ DEFAULT_CONFIDENCE = 0.20
 # ahead of its own defaults, which name no ``imgsz``. bl_warm was
 # trained at 1024, so that is what it predicts at. Passing 640 -- the
 # library default -- would quietly cost accuracy on the small classes.
+# bl_hein carries its own value the same way, and the preload logs both.
 
 
 # ── Weights ─────────────────────────────────────────────────────────
@@ -132,14 +147,16 @@ def _missing_weights(models: list[str]) -> list[str]:
 def _preload() -> None:
     """Pay the import and weight-read cost at module import.
 
-    Logs CUDA availability, then opens each default weight once so the
-    first job pays neither the ultralytics import nor the file read.
+    Logs CUDA availability, then opens each baked weight once
+    (:data:`BAKED_MODELS`) so the first job of either kind pays neither
+    the ultralytics import nor the file read.
     blackletter builds its own model instance per call, so this warms
     the process rather than handing anything over.
 
-    Every phase is wrapped, so a preload failure cannot stop the worker
-    from starting; the first real job retries the load and surfaces the
-    real error.
+    Every phase is wrapped, and each weight on its own, so a preload
+    failure cannot stop the worker from starting or cost the other
+    weight its warm start; the first real job retries the load and
+    surfaces the real error.
     """
     global _CUDA_AVAILABLE
 
@@ -179,7 +196,14 @@ def _preload() -> None:
         from ultralytics import YOLO
 
         weights_dir = _weights_dir()
-        for name in DEFAULT_MODELS:
+    except Exception:
+        logger.exception("YOLO preload failed (the first job will be slower)")
+        return
+
+    for name in BAKED_MODELS:
+        # One guard per weight: a file that will not open must not cost
+        # the other model its warm start.
+        try:
             path = weights_dir / f"{name}.pt"
             if not path.is_file():
                 # The build bakes this file and verifies it, so a miss
@@ -200,8 +224,11 @@ def _preload() -> None:
                 model.overrides.get("imgsz"),
                 len(model.names or {}),
             )
-    except Exception:
-        logger.exception("YOLO preload failed (the first job will be slower)")
+        except Exception:
+            logger.exception(
+                "YOLO preload of %s failed (its first job will be slower)",
+                name,
+            )
 
 
 _preload()
@@ -296,7 +323,8 @@ def _action_detect(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     :param inputs: Handler input payload. Required: ``pdf_url``.
         Result delivery (handled by :func:`_deliver`, not here):
         ``result_url`` and ``result_key``. Optional: ``models``
-        (default ``["bl_warm"]``) and ``confidence`` (default 0.20).
+        (default ``["bl_warm"]``; ``["bl_hein"]`` for a Hein volume)
+        and ``confidence`` (default 0.20).
         There is deliberately no ``max_pages``: a partial detection
         merged as a whole volume is worse than a failure. An input over
         the env-level ``MAX_PAGES`` is rejected.
