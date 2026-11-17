@@ -57,6 +57,5 @@ jobs:
       - name: Update RunPod endpoint image
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          RUNPOD_ENDPOINT_ID: ${{ secrets.RUNPOD_DOTSMOCR_ENDPOINT_ID }}
           IMAGE: freelawproject/dotsmocr-gpu-worker:${{ steps.vars.outputs.sha_short }}
         run: .github/scripts/runpod-release.sh
