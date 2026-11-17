@@ -625,3 +625,115 @@ class TestTheRowsScript(ScanningTestCase):
         self.assertIn("!rowsMode && !this.cards.length", render)
         self.assertIn("undo: card.applied ? null", source)
         self.assertIn("if (answer.undo)", source)
+
+
+class TestNotTextAndSetAside(CardTestCase):
+    def setUp(self):
+        super().setUp()
+        opinion_cards.sync(self.opinion, document(self.held()))
+        self.user = self.make_user()
+        self.client.force_login(self.user)
+        self.url = reverse(
+            "answer_opinion_card",
+            kwargs={"pk": self.opinion.scan_id, "card_pk": self.row().pk},
+        )
+
+    def post(self, body):
+        return self.client.post(
+            self.url, json.dumps(body), content_type="application/json"
+        )
+
+    def test_not_text_is_a_drop_answer(self):
+        answer = self.post({"drop": True})
+
+        self.assertEqual(answer.json()["status"], "ok")
+        row = self.row()
+        self.assertEqual(row.status, OpinionCard.Status.ANSWERED)
+        self.assertEqual(row.action, OpinionCard.Action.DROP)
+        self.assertFalse(opinion_cards.is_keep(row))
+
+    def test_the_apply_writes_a_drop_of_the_block(self):
+        self.post({"drop": True})
+        doc = document(self.held())
+        with (
+            patch("scanning.ensemble.read_document", return_value=doc),
+            patch("scanning.ensemble.is_written", return_value=True),
+            patch("scanning.ensemble.rerun", side_effect=self.settle),
+        ):
+            counts = opinion_cards.apply(self.opinion)
+
+        edit = OpinionEdit.objects.get(opinion=self.opinion)
+        self.assertEqual(edit.kind, OpinionEdit.Kind.DROP)
+        self.assertEqual(edit.box_pt, doc["pages"][0]["groups"][0]["box_pt"])
+        self.assertEqual(counts["drops"], 1)
+        self.assertEqual(self.row().status, OpinionCard.Status.APPLIED)
+
+    def settle(self, opinion):
+        from django.db.models import F
+
+        from scanning.models import Opinion
+
+        Opinion.objects.filter(pk=opinion.pk).update(
+            ensemble_edit_revision=F("edit_revision")
+        )
+        opinion_cards.sync(opinion, document())
+
+    def test_a_rescan_files_a_repair_request_and_sets_the_card_aside(self):
+        from scanning.models import PageRepairRequest
+
+        answer = self.post({"flag": "rescan"})
+
+        self.assertEqual(answer.json()["status"], "ok")
+        repair = PageRepairRequest.objects.get(scan_id=self.opinion.scan_id)
+        self.assertEqual(repair.action, PageRepairRequest.Action.REPLACE)
+        # page_of's page sits on page 2 of the original.
+        self.assertEqual(repair.pdf_page, 2)
+        row = self.row()
+        self.assertEqual(row.status, OpinionCard.Status.FLAGGED)
+        self.assertEqual((row.flag, row.repair), ("rescan", repair))
+        # A second card of the page answers the same request.
+        self.post({"flag": "rescan"})
+        self.assertEqual(PageRepairRequest.objects.count(), 1)
+        # It waits in the repair queue like a review-1 request: the queue
+        # lists it, and the header counts it.
+        from scanning import repairs
+
+        queue = self.client.get(reverse("repair_queue"))
+        self.assertEqual(queue.status_code, 200)
+        self.assertIn(
+            repair.pk,
+            [r.pk for g in queue.context["groups"] for r in g["requests"]],
+        )
+        self.assertEqual(repairs.waiting_count(), 1)
+
+    def test_a_set_aside_card_holds_its_page(self):
+        """No kept page around it is dismissed, the build keeps the
+        status, and Undo opens it again."""
+        self.post({"flag": "redaction"})
+        opinion_cards.sync(self.opinion, document(self.held()))
+        self.assertEqual(self.row().status, OpinionCard.Status.FLAGGED)
+
+        self.post({"answer": None})
+
+        row = self.row()
+        self.assertEqual((row.status, row.flag), (OpinionCard.Status.OPEN, ""))
+
+    def test_an_inserted_page_has_no_page_to_rescan(self):
+        OpinionCard.objects.filter(pk=self.row().pk).update(
+            card={**self.row().card, "address": [7, 1]}
+        )
+
+        answer = self.post({"flag": "rescan"})
+
+        self.assertEqual(answer.status_code, 409)
+        self.assertEqual(self.row().status, OpinionCard.Status.OPEN)
+
+    def test_staff_see_a_set_aside_card(self):
+        self.post({"flag": "redaction"})
+        self.client.force_login(self.make_staff_user())
+
+        answer = self.client.get(
+            reverse("opinion_card_answers") + "?status=flagged"
+        )
+
+        self.assertContains(answer, "Redaction wrong")

@@ -4485,7 +4485,10 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     the same fact as a block a majority read whole. A block a person
     wrote (``HUMAN``) blocks for the open words they left as they
     were, warns for the majority words they left, and for nothing
-    else. Every other place :func:`_differs` answers for is a warning.
+    else. An open word whose readings differ only in spacing,
+    punctuation, quote marks or capitals (``blocking_types.MINOR``)
+    blocks nothing: a group whose every open word is minor warns.
+    Every other place :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -4497,8 +4500,47 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     if group["agreement"] == SINGLE:
         return BLOCKING
     if group["agreement"] in (VOTED, HUMAN) and group.get("n_low_confidence"):
-        return BLOCKING
+        return WARNING if _open_words_minor(group) else BLOCKING
     return WARNING
+
+
+def _open_words_minor(group: dict) -> bool:
+    """Return whether every open word of a voted group is minor.
+
+    The open words are the blocking review's word cards of the group
+    (``blocking_review.open_words``), and a block with more of them
+    than ``MANY_OPEN_WORDS`` is judged whole, as its one card is. Each
+    is minor when ``blocking_types.type_of`` names a reason of
+    ``blocking_types.MINOR``: two readings agree in their letters and
+    digits. A group with no word card to judge stays blocking.
+
+    :param group: One voted or human group with open words.
+    :returns: Whether the group warns instead of blocking.
+    :rtype: bool
+    """
+    # Imported here: ``blocking_review`` reads this module.
+    from scanning import blocking_review, blocking_types
+
+    engines = group.get("engines")
+    if not isinstance(engines, dict) or not all(
+        isinstance(unit, dict) and "text" in unit for unit in engines.values()
+    ):
+        # No readings to judge: the open count alone blocks.
+        return False
+    words = blocking_review.open_words(group)
+    if not words:
+        return False
+    if len(words) > blocking_review.MANY_OPEN_WORDS:
+        readings = [
+            group["engines"][name]["text"]
+            for name in blocking_review._present(group)
+        ]
+        return blocking_types.type_of(readings) in blocking_types.MINOR
+    return all(
+        blocking_types.type_of([r["word"] for r in word["readings"]])
+        in blocking_types.MINOR
+        for word in words
+    )
 
 
 def build_document(

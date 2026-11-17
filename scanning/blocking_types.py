@@ -40,6 +40,13 @@ TYPES: list[tuple[str, str]] = [
     ("other", "Other"),
 ]
 
+#: The reasons a vote leaves open that need no person: the letters and
+#: digits of two readings or more agree, and only the spacing, the
+#: punctuation, the quote marks or the capitals differ. A block whose
+#: every open word is one of these is a warning, never blocking
+#: (``ensemble.disagreement_level``).
+MINOR = frozenset({"spacing", "punctuation", "quotes", "capitals"})
+
 #: The slug of each type, to its label.
 LABELS = dict(TYPES)
 
