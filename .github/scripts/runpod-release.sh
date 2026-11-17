@@ -23,8 +23,8 @@ set -euo pipefail
 API="https://api.runpod.io/v2"
 repository="${IMAGE%:*}"
 
-# call METHOD URL [BODY]: sets `body` and `status`, and fails on an
-# error answer, whose body holds no endpoint.
+# call METHOD URL [BODY]: sets `body` and `status`, and returns 1 on
+# an error answer, whose body holds no endpoint.
 call() {
   local response
   response=$(curl -sS -w "\n%{http_code}" -X "$1" \
@@ -37,7 +37,7 @@ call() {
   if [ "$status" -ge 400 ]; then
     echo "$body"
     echo "::error::RunPod answered HTTP $status to $1 ${2%%\?*}"
-    exit 1
+    return 1
   fi
 }
 
@@ -46,7 +46,7 @@ call() {
 ids=""
 cursor=""
 while :; do
-  call GET "$API/serverless${cursor:+?cursor=$cursor}"
+  call GET "$API/serverless${cursor:+?cursor=$cursor}" || exit 1
   page=$(printf '%s' "$body" | jq -r --arg repo "$repository" '
     .endpoints[]
     | select((.image // "") | ltrimstr("docker.io/") | startswith($repo + ":"))
@@ -64,16 +64,28 @@ if [ -z "$ids" ]; then
 fi
 
 # Sends only `image`. The PATCH leaves every field it does not name as
-# it is, the endpoint's env included.
+# it is, the endpoint's env included. Every endpoint is tried before
+# the step fails, so one that refuses never keeps another on the old
+# image.
 payload=$(jq -nc --arg img "$IMAGE" '{image: $img}')
+failed=""
 for id in $ids; do
-  call PATCH "$API/serverless/$id" "$payload"
+  if ! call PATCH "$API/serverless/$id" "$payload"; then
+    failed="$failed $id"
+    continue
+  fi
   # The answer is the whole endpoint, env included, so only the fields
   # that say what happened are printed.
   printf '%s' "$body" | jq -c '{id, name, image}'
-  current=$(printf '%s' "$body" | jq -r '.image // empty')
+  # Read as the list is: the image may carry the registry's host.
+  current=$(printf '%s' "$body" | jq -r '(.image // "") | ltrimstr("docker.io/")')
   if [ "$current" != "$IMAGE" ]; then
     echo "::error::RunPod answered $status but endpoint $id runs '$current', not '$IMAGE'"
-    exit 1
+    failed="$failed $id"
   fi
 done
+
+if [ -n "$failed" ]; then
+  echo "::error::Not moved to $IMAGE:$failed"
+  exit 1
+fi
