@@ -316,11 +316,17 @@ def models_for(scan) -> list[str]:
     a curator changed never replace a Hein run with a bl-warm one, and
     never read an edited page with another model than its volume.
 
+    A name outside :data:`BAKED_MODELS` is not kept: only a row edited
+    by hand carries one, the worker refuses it on every shard, and kept
+    it would fail every later run of the volume too. Such a volume
+    reads with :data:`MODELS`, as it did before the identity carried
+    the model, and the log says so.
+
     :param scan: The scan.
     :returns: The weight names.
     :rtype: list[str]
     """
-    return run_models(
+    models = run_models(
         jobs.live_run(
             scan,
             JobStage.DETECT,
@@ -328,6 +334,16 @@ def models_for(scan) -> list[str]:
             fields=("run", "shard_index", "input_manifest"),
         )
     )
+    if set(models) <= set(BAKED_MODELS):
+        return models
+    logger.warning(
+        "Scan %s: the live detection run names %s, which the worker "
+        "does not bake; a new run reads with %s",
+        scan.pk,
+        models,
+        MODELS,
+    )
+    return list(MODELS)
 
 
 def labels_current(rows: list[ExternalJob]) -> bool:

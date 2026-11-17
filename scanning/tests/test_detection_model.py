@@ -174,6 +174,20 @@ class TestAVolumeKeepsItsModel(DetectStubs):
             [JobStatus.COMPLETED, JobStatus.PENDING],
         )
 
+    def test_a_weight_the_worker_does_not_bake_is_not_kept(self):
+        # Only a row edited by hand names one. Kept, it would fail
+        # every later run of the volume at the worker.
+        scan = self.read_volume(models=["bl_other"])
+
+        with self.assertLogs("scanning.yolo", level="WARNING") as logs:
+            models = yolo.models_for(scan)
+            rows = yolo.ensure_detect_jobs(scan, self.manifest)
+
+        self.assertEqual(models, ["bl_warm"])
+        self.assertIn("bl_other", logs.output[0])
+        self.assertEqual(rows[0].run, 2)
+        self.assertNotIn("models", rows[0].input_manifest)
+
     def test_a_forced_re_read_keeps_the_model_and_carries_its_results(self):
         scan = self.read_volume(models=HEIN)
 
