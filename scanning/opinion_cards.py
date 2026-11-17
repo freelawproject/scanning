@@ -182,6 +182,17 @@ def sync(opinion: Opinion, document: dict) -> Counter:
         ) != _readings_of(card):
             row.status = OpinionCard.Status.STALE
             row.note = "The engines read this place again; check the answer."
+        elif (
+            row.status == OpinionCard.Status.APPLIED
+            and row.edit_id is None
+            and row.check_name == MINOR_CHECK
+            and _check_of(card) == MINOR_CHECK
+            and _readings_of(row.card) == _readings_of(card)
+        ):
+            # A minor warning kept as shown: the keep wrote nothing, so
+            # the place is still a warning, and its closed row stays
+            # closed while the engines read it the same.
+            pass
         elif row.status == OpinionCard.Status.APPLIED:
             # The answer was written and the place is open still: the
             # edit was taken back, or it judged another word.
@@ -654,25 +665,29 @@ def _settle_minor_keeps(
 ) -> None:
     """Close the minor warning cards kept as shown: a warning blocks
     nothing, so a keep writes no edit and dismisses nothing."""
-    kept = [
-        row
-        for row in OpinionCard.objects.filter(
-            opinion=opinion,
-            check_name=MINOR_CHECK,
-            status=OpinionCard.Status.ANSWERED,
+    with transaction.atomic():
+        # Locked from the read to the close: an answer stored between
+        # them waits (``answer`` takes the same lock), and the keep is
+        # judged on the row as it stands.
+        kept = [
+            row
+            for row in OpinionCard.objects.select_for_update().filter(
+                opinion=opinion,
+                check_name=MINOR_CHECK,
+                status=OpinionCard.Status.ANSWERED,
+            )
+            if is_keep(row)
+        ]
+        if not kept:
+            return
+        counts["minor_kept"] += len(kept)
+        if dry_run:
+            return
+        OpinionCard.objects.filter(pk__in=[r.pk for r in kept]).update(
+            status=OpinionCard.Status.APPLIED,
+            applied_at=timezone.now(),
+            note="Kept as shown: a minor warning, nothing to write.",
         )
-        if is_keep(row)
-    ]
-    if not kept:
-        return
-    counts["minor_kept"] += len(kept)
-    if dry_run:
-        return
-    OpinionCard.objects.filter(pk__in=[r.pk for r in kept]).update(
-        status=OpinionCard.Status.APPLIED,
-        applied_at=timezone.now(),
-        note="Kept as shown: a minor warning, nothing to write.",
-    )
 
 
 def reasons() -> list[tuple[str, str]]:

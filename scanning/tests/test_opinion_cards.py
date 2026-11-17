@@ -899,3 +899,46 @@ class TestMinorWarningCards(CardTestCase):
         )
         self.assertEqual(minor.context["card_total"], 1)
         self.assertEqual(blocking.context["card_total"], 1)
+
+    def test_a_minor_block_of_many_open_words_has_a_card_per_word(self):
+        """Nine open words: a blocking block would be one whole-block
+        card; a minor block keeps a card per word, so none is lost."""
+        texts = [
+            " ".join(f"w{i}{mark}" for i in range(9))
+            for mark in (",", ".", ";")
+        ]
+        group = read(*texts)
+        blocking(group, gid=6, box=(36, 400, 288, 460))
+        group["level"] = ensemble.WARNING
+
+        opinion_cards.sync(self.opinion, document(group))
+
+        rows = OpinionCard.objects.all()
+        self.assertEqual(rows.count(), 9)
+        self.assertTrue(all(r.kind == "word" and r.minor for r in rows))
+
+    def test_a_kept_minor_card_stays_closed_while_its_readings_hold(self):
+        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.answer(OpinionCard.objects.get(), self.user, "held,")
+        doc = document(self.comma(ensemble.WARNING))
+        with (
+            patch("scanning.ensemble.read_document", return_value=doc),
+            patch("scanning.ensemble.is_written", return_value=True),
+        ):
+            opinion_cards.apply(self.opinion)
+
+        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        self.assertEqual(
+            OpinionCard.objects.get().status, OpinionCard.Status.APPLIED
+        )
+
+        moved = read(
+            "the court held, that x",
+            "the court held. that x",
+            "the court held: that x",
+        )
+        blocking(moved, gid=4, box=(36, 200, 288, 220))
+        moved["level"] = ensemble.WARNING
+        opinion_cards.sync(self.opinion, document(moved))
+        row = OpinionCard.objects.get()
+        self.assertEqual((row.status, row.answer), (OpinionCard.Status.OPEN, None))
