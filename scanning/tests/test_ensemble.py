@@ -5417,6 +5417,30 @@ class TestTheLevel(TestCase):
                 ensemble.disagreement_level(group, 3), ensemble.WARNING, texts
             )
 
+    def test_a_minor_word_blocks_while_the_text_holds_the_odd_reading(self):
+        """dots.mocr, whose reading the text shows, read hold; the other
+        two read held: the reason is punctuation, but the text's word is
+        the odd one, so a person still picks."""
+        from scanning.tests.test_blocking_review import read
+
+        odd = read(
+            "the court hold; that x",
+            "the court held, that x",
+            "the court held. that x",
+        )
+        shown = read(
+            "the court held, that x",
+            "the court held. that x",
+            "the court hold; that x",
+        )
+
+        self.assertEqual(
+            ensemble.disagreement_level(odd, 3), ensemble.BLOCKING
+        )
+        self.assertEqual(
+            ensemble.disagreement_level(shown, 3), ensemble.WARNING
+        )
+
     def test_an_open_word_of_other_letters_still_blocks(self):
         from scanning.tests.test_blocking_review import read
 

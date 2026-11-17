@@ -15,6 +15,7 @@ from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, render
@@ -45,6 +46,10 @@ STATUS_FILTERS = {
     "flagged": (OpinionCard.Status.FLAGGED,),
 }
 
+#: Which cards the level filter keeps: the ones a person must answer,
+#: or the minor ones the next build makes warnings (``OpinionCard.minor``).
+LEVEL_FILTERS = {"blocking": False, "minor": True}
+
 CARD_GONE_MESSAGE = (
     "This card is no longer open: its answer was written into the text, "
     "or the engines read its place again. Reload the page."
@@ -70,8 +75,10 @@ def _filters(request: HttpRequest) -> dict:
     status = request.GET.get("status", "open")
     scan = _whole_number(request.GET.get("scan"))
     volume = _whole_number(request.GET.get("volume"))
+    level = request.GET.get("level", "")
     return {
         "reason": reason if reason in blocking_types.LABELS else "",
+        "level": level if level in LEVEL_FILTERS else "",
         "status": status if status in STATUS_FILTERS else "open",
         "scan": str(scan) if scan is not None else "",
         "volume": str(volume) if volume is not None else "",
@@ -90,7 +97,9 @@ def _query(filters: dict, **changes) -> str:
     )
 
 
-def _rows(filters: dict, user, with_reason: bool = True):
+def _rows(
+    filters: dict, user, with_reason: bool = True, with_level: bool = True
+):
     """Return the card rows of the filters.
 
     The open ones are rows of an opinion in the text review whose page
@@ -120,7 +129,28 @@ def _rows(filters: dict, user, with_reason: bool = True):
         rows = rows.filter(assigned_to=user)
     if with_reason and filters["reason"]:
         rows = rows.filter(reason=filters["reason"])
+    if with_level and filters["level"]:
+        rows = rows.filter(minor=LEVEL_FILTERS[filters["level"]])
     return rows
+
+
+def _level_counts(filters: dict, user) -> dict:
+    """Return the blocking and the minor cards of the filters, the whole
+    corpus's kept for :data:`COUNTS_TTL` like the tabs."""
+    scoped = filters["scan"] or filters["volume"] or filters["mine"]
+    key = "card-levels:" + _query(filters, level="")
+    counts = None if scoped else cache.get(key)
+    if counts is None:
+        by = dict(
+            _rows(filters, user, with_level=False)
+            .values_list("minor")
+            .annotate(n=Count("id"))
+            .order_by()
+        )
+        counts = {"blocking": by.get(False, 0), "minor": by.get(True, 0)}
+        if not scoped:
+            cache.set(key, counts, COUNTS_TTL)
+    return counts
 
 
 def _tabs(filters: dict, user) -> list[dict]:
@@ -197,7 +227,10 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
         .order_by()
     )
     card_query = _query(
-        {key: filters[key] for key in ("reason", "status", "mine")}
+        {
+            key: filters[key]
+            for key in ("reason", "level", "status", "mine")
+        }
     )
     for opinion in page_obj:
         kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
@@ -217,6 +250,12 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
             "filters": filters,
             "tabs": _tabs(filters, request.user),
             "reason_label": blocking_types.LABELS.get(filters["reason"], ""),
+            "levels": _level_counts(filters, request.user),
+            "level_choices": [
+                ("", "All"),
+                ("blocking", "Blocking: a person must answer"),
+                ("minor", "Minor: become warnings at the next build"),
+            ],
             "card_total": rows.count(),
             "status_choices": [
                 ("open", "Open"),
@@ -376,6 +415,37 @@ def _set_aside(request: HttpRequest, row: OpinionCard, flag) -> JsonResponse:
     """Set a card aside, filing a rescan in the repair queue for a
     ``rescan`` flag: the review-1 button's request, for the original
     page the card sits on (``request_page_repair``'s row and key)."""
+    if flag not in OpinionCard.Flag.values:
+        return JsonResponse(
+            {"status": "error", "message": ANSWER_BAD_REQUEST_MESSAGE},
+            status=400,
+        )
+    if row.status == OpinionCard.Status.APPLIED:
+        return JsonResponse(
+            {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
+        )
+    try:
+        # One transaction: a card the locked set-aside finds closed takes
+        # the rescan it filed back with it, so no repair work outlives a
+        # refused flag.
+        with transaction.atomic():
+            message = _file_and_set_aside(request, row, flag)
+    except (opinion_cards.CardClosed, OpinionCard.DoesNotExist):
+        return JsonResponse(
+            {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
+        )
+    if isinstance(message, JsonResponse):
+        return message
+    return JsonResponse({"status": "ok", "message": message})
+
+
+def _file_and_set_aside(request: HttpRequest, row: OpinionCard, flag: str):
+    """File the rescan of a ``rescan`` flag and set the card aside.
+
+    :returns: The success message, or the refusal of a page that has no
+        original page to scan again.
+    :raises opinion_cards.CardClosed: for a card applied meanwhile.
+    """
     from scanning.models import PageRepairRequest
     from scanning.views_process import (
         _pdf_page_of,
@@ -383,11 +453,6 @@ def _set_aside(request: HttpRequest, row: OpinionCard, flag) -> JsonResponse:
         _rebuild_bad_page_card,
     )
 
-    if flag not in OpinionCard.Flag.values:
-        return JsonResponse(
-            {"status": "error", "message": ANSWER_BAD_REQUEST_MESSAGE},
-            status=400,
-        )
     repair = None
     message = REDACTION_FLAGGED_MESSAGE
     if flag == OpinionCard.Flag.RESCAN:
@@ -422,19 +487,14 @@ def _set_aside(request: HttpRequest, row: OpinionCard, flag) -> JsonResponse:
         if created:
             _rebuild_bad_page_card(scan, pdf_page)
         message = RESCAN_FILED_MESSAGE
-    try:
-        opinion_cards.set_aside(
-            row,
-            request.user,
-            flag,
-            repair=repair,
-            note=OpinionCard.Flag(flag).label,
-        )
-    except (opinion_cards.CardClosed, OpinionCard.DoesNotExist):
-        return JsonResponse(
-            {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
-        )
-    return JsonResponse({"status": "ok", "message": message})
+    opinion_cards.set_aside(
+        row,
+        request.user,
+        flag,
+        repair=repair,
+        note=OpinionCard.Flag(flag).label,
+    )
+    return message
 
 
 #: The answers of one page of the staff list.

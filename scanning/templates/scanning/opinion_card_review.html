@@ -31,6 +31,13 @@
     {% if filters.reason %}<input type="hidden" name="reason" value="{{ filters.reason }}">{% endif %}
     <label>Scan <input type="text" name="scan" value="{{ filters.scan }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
     <label>Volume <input type="text" name="volume" value="{{ filters.volume }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    <label>Level
+      <select name="level" class="input-text text-sm">
+        {% for value, label in level_choices %}
+        <option value="{{ value }}"{% if value == filters.level %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <label>Status
       <select name="status" class="input-text text-sm">
         {% for value, label in status_choices %}
@@ -42,6 +49,10 @@
     <button type="submit" class="btn-outline text-sm">Filter</button>
   </form>
 
+  <p class="text-sm mb-2">
+    <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking
+    · <b class="text-gray-600 dark:text-gray-300">{{ levels.minor }}</b> minor (warnings at the next build)
+  </p>
   <nav class="flex flex-wrap gap-1 mb-3 text-xs" aria-label="Reasons">
     {% for tab in tabs %}
     <a href="{{ tab.url }}" class="{% if tab.current %}btn-primary{% else %}btn-outline{% endif %} text-xs"{% if tab.current %} aria-current="page"{% endif %}>{{ tab.label }} <span class="opacity-75">{{ tab.count }}</span></a>

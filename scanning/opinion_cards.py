@@ -166,6 +166,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
                     check_name=_check_of(card),
                     kind=card["kind"],
                     reason=card["type"],
+                    minor=bool(card.get("minor")),
                     card=card,
                 )
             )
@@ -185,6 +186,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             row.note = "The written answer did not settle this place."
         row.card = card
         row.reason = card["type"]
+        row.minor = bool(card.get("minor"))
         row.check_name = _check_of(card)
         updated.append(row)
     if created:
@@ -196,6 +198,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             [
                 "card",
                 "reason",
+                "minor",
                 "check_name",
                 "status",
                 "answer",

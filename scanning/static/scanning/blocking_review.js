@@ -949,6 +949,7 @@
             if (card.table) {
                 // A table takes no text edit (the review page's rule).
                 list.appendChild(note('A table takes no text edit here; open the document to change it.'));
+                numberRows(list);
                 return list;
             }
         } else if (card.kind === 'block') {
@@ -966,7 +967,7 @@
                 }
                 list.appendChild(whole);
             });
-            if (card.table) { return list; }
+            if (card.table) { numberRows(list); return list; }
         }
         list.appendChild(typedRow(section, card, node));
         numberRows(list);

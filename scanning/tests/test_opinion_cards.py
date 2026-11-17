@@ -48,6 +48,11 @@ def document(*groups):
 
 class CardTestCase(ScanningTestCase):
     def setUp(self):
+        from django.core.cache import cache
+
+        # The corpus counts of the cards page are cached for two
+        # minutes, and one test's counts would be another's.
+        cache.clear()
         self.opinion = OpinionFactory(
             status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
         )
@@ -718,6 +723,21 @@ class TestNotTextAndSetAside(CardTestCase):
         row = self.row()
         self.assertEqual((row.status, row.flag), (OpinionCard.Status.OPEN, ""))
 
+    def test_a_closed_card_files_no_rescan(self):
+        """The card is applied between the page's load and the press:
+        the flag is refused, and no repair work is left in the queue."""
+        from scanning.models import PageRepairRequest
+
+        row = self.row()
+        with patch(
+            "scanning.opinion_cards.set_aside",
+            side_effect=opinion_cards.CardClosed(row.pk),
+        ):
+            answer = self.post({"flag": "rescan"})
+
+        self.assertEqual(answer.status_code, 409)
+        self.assertFalse(PageRepairRequest.objects.exists())
+
     def test_an_inserted_page_has_no_page_to_rescan(self):
         OpinionCard.objects.filter(pk=self.row().pk).update(
             card={**self.row().card, "address": [7, 1]}
@@ -737,3 +757,36 @@ class TestNotTextAndSetAside(CardTestCase):
         )
 
         self.assertContains(answer, "Redaction wrong")
+
+
+class TestTheLevelFilter(CardTestCase):
+    def setUp(self):
+        super().setUp()
+        comma = blocking(
+            read("the court held, that x", "the court held. that x", "the court held; that x"),
+            gid=4,
+            box=(36, 200, 288, 220),
+        )
+        opinion_cards.sync(self.opinion, document(self.held(), comma))
+        self.client.force_login(self.make_user())
+
+    def test_the_rows_say_which_cards_are_minor(self):
+        rows = {r.card["token"]: r for r in OpinionCard.objects.all()}
+
+        self.assertFalse(rows["held"].minor)
+        self.assertTrue(rows["held,"].minor)
+
+    def test_the_page_counts_and_filters_by_level(self):
+        url = reverse("opinion_card_review")
+
+        everything = self.client.get(url)
+        blocking = self.client.get(url + "?level=blocking")
+        minor = self.client.get(url + "?level=minor")
+
+        self.assertEqual(everything.context["levels"], {"blocking": 1, "minor": 1})
+        self.assertEqual(everything.context["card_total"], 2)
+        self.assertEqual(blocking.context["card_total"], 1)
+        self.assertEqual(
+            {t["slug"]: t["count"] for t in minor.context["tabs"]},
+            {"": 1, "punctuation": 1},
+        )

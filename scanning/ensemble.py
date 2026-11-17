@@ -4487,7 +4487,9 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     were, warns for the majority words they left, and for nothing
     else. An open word whose readings differ only in spacing,
     punctuation, quote marks or capitals (``blocking_types.MINOR``)
-    blocks nothing: a group whose every open word is minor warns.
+    blocks nothing while the text holds one of the agreeing readings
+    (``blocking_types.settles_minor``): a group whose every open word
+    is settled so warns.
     Every other place :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
@@ -4530,15 +4532,20 @@ def _open_words_minor(group: dict) -> bool:
     words = blocking_review.open_words(group)
     if not words:
         return False
+    # Minor, and the text already holds a reading of the agreeing ones
+    # (``blocking_types.settles_minor``): a text that holds the odd
+    # engine's word (``hold`` beside two ``held``) still blocks.
     if len(words) > blocking_review.MANY_OPEN_WORDS:
         readings = [
             group["engines"][name]["text"]
             for name in blocking_review._present(group)
         ]
-        return blocking_types.type_of(readings) in blocking_types.MINOR
+        return blocking_types.settles_minor(readings, group.get("text") or "")
     return all(
-        blocking_types.type_of([r["word"] for r in word["readings"]])
-        in blocking_types.MINOR
+        blocking_types.settles_minor(
+            [r["word"] for r in word["readings"]],
+            "" if word.get("gap") else word.get("token") or "",
+        )
         for word in words
     )
 

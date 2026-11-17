@@ -3986,6 +3986,14 @@ class OpinionCard(AbstractDateTimeModel):
     )
     kind = models.CharField(max_length=10)
     reason = models.CharField(max_length=32, db_index=True)
+    minor = models.BooleanField(
+        default=False,
+        help_text=(
+            "The card needs no person: a minor reason, and the text holds "
+            "one of the agreeing readings (blocking_types.settles_minor). "
+            "The next build makes its block a warning."
+        ),
+    )
     card = models.JSONField(
         help_text=(
             "The card as the review shows it: the block text, the "

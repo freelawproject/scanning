@@ -161,12 +161,9 @@ def type_of(readings: list[str]) -> str:
     texts = [r for r in readings if r.strip()]
     if len(texts) < 2 and len(readings) < 2:
         return _single(texts)
-    # Two readings alike already: the type is what the odd one differs
-    # by, so every reading must meet under the fold.
-    need = len(readings) if _agree(readings, str) else 2
-    for slug, fold in MINOR_FOLDS:
-        if _agree(readings, fold, need):
-            return slug
+    settled = _minor_fold(readings)
+    if settled is not None:
+        return settled[0]
     if not texts:
         return "other"
     if len(texts) < len(readings):
@@ -185,6 +182,58 @@ def type_of(readings: list[str]) -> str:
         return "different_text"
     texts = [strip_star(t) for t in texts]
     return _words_differ(texts)
+
+
+def _minor_fold(readings: list[str]):
+    """Return ``(slug, fold, value)`` of the lightest minor fold the
+    readings meet under, or None: ``value`` is what the agreeing
+    readings fold to.
+
+    Two readings alike already: the type is what the odd one differs
+    by, so every reading must meet under the fold. Otherwise two
+    readings meeting are enough (``¶10`` and ``¶ 10`` against ``¶0``).
+    """
+    need = len(readings) if _agree(readings, str) else 2
+    for slug, fold in MINOR_FOLDS:
+        value, count = Counter(fold(r) for r in readings).most_common(1)[0]
+        if count >= need:
+            return slug, fold, value
+    return None
+
+
+def settles_minor(readings: list[str], shown: str) -> bool:
+    """Return whether a place needs no person: its reason is minor and
+    the text already holds a reading of the agreeing ones.
+
+    A minor reason says two readings agree in their letters and
+    digits. That settles the place only when the text shows one of
+    them: ``held,`` and ``held.`` against ``hold;`` is punctuation, and
+    safe while the text reads ``held``; a text that reads ``hold`` would
+    keep the odd engine's word with nothing to stop it.
+
+    :param readings: What each engine read there, ``""`` for nothing.
+    :param shown: What the text holds there now.
+    :rtype: bool
+    """
+    readings = [r or "" for r in readings]
+    if len(readings) < 2:
+        return False
+    settled = _minor_fold(readings)
+    if settled is None or settled[0] not in MINOR:
+        return False
+    # The text's own reading must meet another engine's under a minor
+    # fold: any of them, so a hyphen the others leave out (anti-trust
+    # beside antitrust) is no odd word.
+    shown = shown or ""
+    others = list(readings)
+    if shown in others:
+        others.remove(shown)
+    return any(
+        fold(shown) == fold(other)
+        for slug, fold in MINOR_FOLDS
+        if slug in MINOR
+        for other in others
+    )
 
 
 def _agree(readings: list[str], fold, need: int = 2) -> bool:
