@@ -1731,6 +1731,57 @@ class TestTheVote(TestCase):
         self.assertFalse(tokens[1].get("low_confidence"))
         self.assertEqual(disputed, 0)
 
+    def test_the_reporter_join_is_the_longest_window_that_names_one(self):
+        """The join grows a run of words one at a time and stops where no
+        name can start, and answers what trying every window of two to
+        four words answered: the longest run that is a name, with what
+        may follow it."""
+
+        def every_window(words):
+            out, index = [], 0
+            while index < len(words):
+                for size in range(
+                    min(ensemble._REPORTER_WORDS, len(words) - index), 1, -1
+                ):
+                    if ensemble._reporter(
+                        " ".join(words[index : index + size])
+                    ):
+                        out.append(" ".join(words[index : index + size]))
+                        index += size
+                        break
+                else:
+                    out.append(words[index])
+                    index += 1
+            return out
+
+        for text in (
+            "131 L. Ed. 2d 490",
+            "115 S. Ct. 1555, 131 L. Ed. 2d, 490",
+            "the court held that N. Y. S. 3d ; here",
+            "F. Supp. 3d ) and F. App'x x",
+            "L. Ed. 2d , the rest",
+            "U.S. , So. 3d So. 2d",
+            "Ill. App. 3d is not on the list",
+            "the the the",
+        ):
+            words = text.split()
+            self.assertEqual(
+                ensemble._join_reporters(words), every_window(words), text
+            )
+
+    def test_the_key_of_a_text_is_cached(self):
+        """A rebuild keys the same texts again and again: the second
+        call of the same text is a hit."""
+        ensemble.compare_text.cache_clear()
+        ensemble.compare_text("131 L. Ed. 2d 490")
+        ensemble.compare_text("131 L. Ed. 2d 490")
+
+        self.assertEqual(ensemble.compare_text.cache_info().hits, 1)
+        self.assertEqual(
+            ensemble.compare_text("131 L. Ed. 2d 490", hyphen_gaps=False),
+            ensemble.compare_text("131 L.Ed.2d 490", hyphen_gaps=False),
+        )
+
     def test_a_reporter_reads_alike_however_it_is_spaced(self):
         """#610: ``131 L. Ed. 2d 490`` (dots.mocr), ``131 L.Ed.2d 490``
         (Mistral), ``181 L.Ed.2d 490`` (Surya, a misread digit). The
