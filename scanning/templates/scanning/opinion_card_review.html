@@ -50,8 +50,8 @@
   </form>
 
   <p class="text-sm mb-2">
-    <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking
-    · <b class="text-gray-600 dark:text-gray-300">{{ levels.minor }}</b> minor (warnings at the next build)
+    <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking{% if levels.pending %} ({{ levels.pending }} of them minor warnings after the next build){% endif %}
+    · <b class="text-amber-700 dark:text-amber-400">{{ levels.minor }}</b> minor warnings (no approval waits on them)
   </p>
   <nav class="flex flex-wrap gap-1 mb-3 text-xs" aria-label="Reasons">
     {% for tab in tabs %}

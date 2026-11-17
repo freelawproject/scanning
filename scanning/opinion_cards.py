@@ -41,6 +41,10 @@ logger = logging.getLogger(__name__)
 #: The checks whose cards are rows: the words and blocks of the vote.
 CARD_CHECKS = (OpinionCheck.NO_MAJORITY, OpinionCheck.SINGLE_ENGINE)
 
+#: The check of a minor warning card: the page's warning, which blocks
+#: nothing (``blocking_review.minor_cards``).
+MINOR_CHECK = OpinionCheck.ENGINES_DISAGREE
+
 #: A row that waits on a person: no answer, or one that went stale.
 WAITING = (OpinionCard.Status.OPEN, OpinionCard.Status.STALE)
 
@@ -93,13 +97,15 @@ def _open_pages(opinion: Opinion) -> dict[tuple[int, str], int]:
         (page, check): pk
         for pk, page, check in OpinionFinding.objects.filter(
             opinion=opinion,
-            check_name__in=CARD_CHECKS,
+            check_name__in=(*CARD_CHECKS, MINOR_CHECK),
             dismissal__isnull=True,
         ).values_list("pk", "page_in_opinion", "check_name")
     }
 
 
 def _check_of(card: dict) -> str:
+    if card.get("minor_warning"):
+        return MINOR_CHECK
     if card["kind"] == blocking_review.SINGLE:
         return OpinionCheck.SINGLE_ENGINE
     return OpinionCheck.NO_MAJORITY
@@ -131,7 +137,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
         for group in page.get("groups") or []:
             for card in blocking_review.group_cards(
                 page, number, group, schema
-            ):
+            ) + blocking_review.minor_cards(page, number, group, schema):
                 if (number, _check_of(card)) not in open_pages:
                     continue
                 # The page's durable address, for a rescan request.
@@ -166,7 +172,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
                     check_name=_check_of(card),
                     kind=card["kind"],
                     reason=card["type"],
-                    minor=bool(card.get("minor")),
+                    minor=bool(card.get("minor") or card.get("minor_warning")),
                     card=card,
                 )
             )
@@ -176,6 +182,17 @@ def sync(opinion: Opinion, document: dict) -> Counter:
         ) != _readings_of(card):
             row.status = OpinionCard.Status.STALE
             row.note = "The engines read this place again; check the answer."
+        elif (
+            row.status == OpinionCard.Status.APPLIED
+            and row.edit_id is None
+            and row.check_name == MINOR_CHECK
+            and _check_of(card) == MINOR_CHECK
+            and _readings_of(row.card) == _readings_of(card)
+        ):
+            # A minor warning kept as shown: the keep wrote nothing, so
+            # the place is still a warning, and its closed row stays
+            # closed while the engines read it the same.
+            pass
         elif row.status == OpinionCard.Status.APPLIED:
             # The answer was written and the place is open still: the
             # edit was taken back, or it judged another word.
@@ -186,7 +203,7 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             row.note = "The written answer did not settle this place."
         row.card = card
         row.reason = card["type"]
-        row.minor = bool(card.get("minor"))
+        row.minor = bool(card.get("minor") or card.get("minor_warning"))
         row.check_name = _check_of(card)
         updated.append(row)
     if created:
@@ -639,7 +656,38 @@ def apply(opinion: Opinion, dry_run: bool = False) -> Counter:
             break
         ensemble.rerun(opinion)
     _dismiss_kept(opinion, dry_run, counts)
+    _settle_minor_keeps(opinion, dry_run, counts)
     return counts
+
+
+def _settle_minor_keeps(
+    opinion: Opinion, dry_run: bool, counts: Counter
+) -> None:
+    """Close the minor warning cards kept as shown: a warning blocks
+    nothing, so a keep writes no edit and dismisses nothing."""
+    with transaction.atomic():
+        # Locked from the read to the close: an answer stored between
+        # them waits (``answer`` takes the same lock), and the keep is
+        # judged on the row as it stands.
+        kept = [
+            row
+            for row in OpinionCard.objects.select_for_update().filter(
+                opinion=opinion,
+                check_name=MINOR_CHECK,
+                status=OpinionCard.Status.ANSWERED,
+            )
+            if is_keep(row)
+        ]
+        if not kept:
+            return
+        counts["minor_kept"] += len(kept)
+        if dry_run:
+            return
+        OpinionCard.objects.filter(pk__in=[r.pk for r in kept]).update(
+            status=OpinionCard.Status.APPLIED,
+            applied_at=timezone.now(),
+            note="Kept as shown: a minor warning, nothing to write.",
+        )
 
 
 def reasons() -> list[tuple[str, str]]:

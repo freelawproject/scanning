@@ -675,6 +675,11 @@
         header.appendChild(el('span', 'bk-step', 'Fix ' + index + ' of ' + total));
         header.appendChild(el('span', 'bk-where', card.where + ' · ' + describe(card)));
         if (card.reason_label) { header.appendChild(el('span', 'bk-type', card.reason_label)); }
+        if (card.minor_warning) {
+            var minorTag = el('span', 'bk-type bk-minor', 'minor warning');
+            minorTag.title = 'The engines agree on the letters; only spacing, punctuation, quotes or capitals differ. No approval waits on this card.';
+            header.appendChild(minorTag);
+        }
         if (card.note) { header.appendChild(el('span', 'bk-note-line', card.note)); }
         if (card.kind !== 'link' && card.crop) {
             // The whole page and back, as the step-2 card review has it
