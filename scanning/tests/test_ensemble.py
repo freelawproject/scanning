@@ -1743,7 +1743,9 @@ class TestTheVote(TestCase):
                 for size in range(
                     min(ensemble._REPORTER_WORDS, len(words) - index), 1, -1
                 ):
-                    if ensemble._reporter(" ".join(words[index : index + size])):
+                    if ensemble._reporter(
+                        " ".join(words[index : index + size])
+                    ):
                         out.append(" ".join(words[index : index + size]))
                         index += size
                         break
