@@ -649,7 +649,9 @@ def apply(opinion: Opinion, dry_run: bool = False) -> Counter:
     return counts
 
 
-def _settle_minor_keeps(opinion: Opinion, dry_run: bool, counts: Counter) -> None:
+def _settle_minor_keeps(
+    opinion: Opinion, dry_run: bool, counts: Counter
+) -> None:
     """Close the minor warning cards kept as shown: a warning blocks
     nothing, so a keep writes no edit and dismisses nothing."""
     kept = [

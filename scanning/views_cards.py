@@ -155,7 +155,9 @@ def _level_counts(filters: dict, user) -> dict:
             .order_by()
         }
         blocking = {
-            key: n for key, n in by.items() if key[0] in opinion_cards.CARD_CHECKS
+            key: n
+            for key, n in by.items()
+            if key[0] in opinion_cards.CARD_CHECKS
         }
         counts = {
             "blocking": sum(blocking.values()),
@@ -270,7 +272,10 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
             "level_choices": [
                 ("", "All"),
                 ("blocking", "Blocking: holds the approval"),
-                ("minor", "Minor: letters agree, only spacing or marks differ"),
+                (
+                    "minor",
+                    "Minor: letters agree, only spacing or marks differ",
+                ),
             ],
             "card_total": rows.count(),
             "status_choices": [

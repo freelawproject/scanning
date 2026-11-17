@@ -801,7 +801,6 @@ class TestTheLevelFilter(CardTestCase):
         )
 
 
-
 class TestMinorWarningCards(CardTestCase):
     """A block the minor rule made a warning keeps its open words as
     minor warning cards, apart from the warnings a majority settled."""
@@ -845,12 +844,16 @@ class TestMinorWarningCards(CardTestCase):
         self.assertEqual(row.reason, "punctuation")
 
     def test_an_answer_outlives_the_rebuild_that_demotes_its_card(self):
-        opinion_cards.sync(self.opinion, document(self.comma(ensemble.BLOCKING)))
+        opinion_cards.sync(
+            self.opinion, document(self.comma(ensemble.BLOCKING))
+        )
         row = OpinionCard.objects.get()
         self.assertEqual(row.check_name, OpinionCheck.NO_MAJORITY)
         opinion_cards.answer(row, self.user, "held.")
 
-        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.sync(
+            self.opinion, document(self.comma(ensemble.WARNING))
+        )
 
         row = OpinionCard.objects.get()
         self.assertEqual(row.check_name, OpinionCheck.ENGINES_DISAGREE)
@@ -859,7 +862,9 @@ class TestMinorWarningCards(CardTestCase):
         )
 
     def test_a_kept_minor_card_closes_with_no_edit(self):
-        opinion_cards.sync(self.opinion, document(self.comma(ensemble.WARNING)))
+        opinion_cards.sync(
+            self.opinion, document(self.comma(ensemble.WARNING))
+        )
         opinion_cards.answer(OpinionCard.objects.get(), self.user, "held,")
         doc = document(self.comma(ensemble.WARNING))
 
@@ -882,7 +887,9 @@ class TestMinorWarningCards(CardTestCase):
         self.client.force_login(self.user)
 
         answer = self.client.get(reverse("opinion_card_review"))
-        minor = self.client.get(reverse("opinion_card_review") + "?level=minor")
+        minor = self.client.get(
+            reverse("opinion_card_review") + "?level=minor"
+        )
         blocking = self.client.get(
             reverse("opinion_card_review") + "?level=blocking"
         )
