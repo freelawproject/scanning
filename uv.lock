@@ -162,7 +162,7 @@ wheels = [
 
 [[package]]
 name = "blackletter"
-version = "0.4.4"
+version = "0.4.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -171,9 +171,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pymupdf" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ac/22/a495eda2f9925d9a528adf971294541502d1792ac6d40058072f5d21406b/blackletter-0.4.4.tar.gz", hash = "sha256:ccf5acb426d2cfba7c2e314585594217883bbebd488b8bdf8b1a0f1806964e2f", size = 208230, upload-time = "2026-10-13T15:18:08.345Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/76/94/91bd6fdf51f0666a8073e2f9a18ba6553d3bad080b8f91bd38202d9fe08c/blackletter-0.4.5.tar.gz", hash = "sha256:5ed0987c0b86d14375d3c34c67d345b1d04085024b04abc784502b3f58e8022d", size = 209475, upload-time = "2026-11-17T14:19:05.46Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/75/e6/7924e7d9ba1658aef9e7c8c4719ec27e0f767b45a27d8c55ebb054b80073/blackletter-0.4.4-py3-none-any.whl", hash = "sha256:d00d76bb91f3e7ba10ba1650cf07c3e14f853179352ff9d8374af30f3dacf46f", size = 149545, upload-time = "2026-10-13T15:18:07.041Z" },
+    { url = "https://files.pythonhosted.org/packages/aa/11/34d45e03cce9f2def227e92f1b235f011e0137fa4b68615788cc2eaa4a1e/blackletter-0.4.5-py3-none-any.whl", hash = "sha256:623005c789581d0a5cf8b94393d404a86b109a40ed1e3e81f0a1660e1a199144", size = 150234, upload-time = "2026-11-17T14:19:03.896Z" },
 ]
 
 [package.optional-dependencies]
@@ -2688,8 +2688,8 @@ local-ml = [
 
 [package.metadata]
 requires-dist = [
-    { name = "blackletter", specifier = ">=0.4.4" },
-    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.4.4" },
+    { name = "blackletter", specifier = ">=0.4.5" },
+    { name = "blackletter", extras = ["detect", "analyze"], marker = "extra == 'local-ml'", specifier = ">=0.4.5" },
     { name = "boto3" },
     { name = "celery", extras = ["redis"], specifier = ">=5.4" },
     { name = "daphne" },
