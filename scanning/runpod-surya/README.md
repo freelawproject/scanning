@@ -528,10 +528,10 @@ Worker` workflow (`.github/workflows/build-runpod-surya-worker.yml`)
 builds on any push to `main` touching `scanning/runpod-surya/**` or
 `scanning/runpod_common.py`, pushes
 `freelawproject/surya-gpu-worker:<sha_short>` + `:latest`, and PATCHes
-the RunPod template to the SHA-pinned tag.
+the RunPod endpoint to the SHA-pinned tag.
 
 Repo secrets used: `RUNPOD_API_KEY` (shared with the other workers) and
-`RUNPOD_SURYA_TEMPLATE_ID` (this endpoint's backing template). The
+`RUNPOD_SURYA_ENDPOINT_ID` (this endpoint's id). The
 PATCH step is skipped while the second is unset, so the image can be
 published before the endpoint exists.
 

@@ -118,8 +118,8 @@ This is a **new** endpoint, not a change to an existing one.
      Sequences are sorted by length so each batch pads to a near
      neighbour.
    - `HANDLER_DOWNLOAD_TIMEOUT` and friends — see `runpod_common.py`.
-5. Put the template id in the repo secret
-   `RUNPOD_CASELAW_TAGGER_TEMPLATE_ID`, so the build workflow can patch
+5. Put the endpoint id in the repo secret
+   `RUNPOD_CASELAW_TAGGER_ENDPOINT_ID`, so the build workflow can patch
    it (below). `RUNPOD_API_KEY` is shared with the other workers.
 
 Nothing in the daemon reads this endpoint yet. Wiring it in is the next
@@ -297,10 +297,10 @@ Case-law Tagger Worker` workflow
 any push to `main` touching `scanning/runpod-caselaw-tagger/**` or
 `scanning/runpod_common.py`, pushes
 `freelawproject/caselaw-tagger-gpu-worker:<sha_short>` + `:latest`, and
-PATCHes the RunPod template to the SHA-pinned tag.
+PATCHes the RunPod endpoint to the SHA-pinned tag.
 
 Repo secrets used: `RUNPOD_API_KEY` (shared) and
-`RUNPOD_CASELAW_TAGGER_TEMPLATE_ID` (this endpoint's backing template).
+`RUNPOD_CASELAW_TAGGER_ENDPOINT_ID` (this endpoint's id).
 
 A new checkpoint is a rebuild, not an input change: `TAGGER_MODEL` and
 `TAGGER_MODEL_REVISION` are build args (the snapshot is pinned to one

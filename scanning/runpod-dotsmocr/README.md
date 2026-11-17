@@ -362,11 +362,10 @@ for the full rationale): the `Build and Push RunPod dots.mocr Worker`
 workflow (`.github/workflows/build-runpod-dotsmocr-worker.yml`) builds
 on any push to `main` touching `scanning/runpod-dotsmocr/**`, pushes
 `freelawproject/dotsmocr-gpu-worker:<sha_short>` + `:latest`, and
-PATCHes the RunPod template to the SHA-pinned tag.
+PATCHes the RunPod endpoint to the SHA-pinned tag.
 
 Repo secrets used: `RUNPOD_API_KEY` (shared with the blackletter
-worker) and `RUNPOD_DOTSMOCR_TEMPLATE_ID` (this endpoint's backing
-template).
+worker) and `RUNPOD_DOTSMOCR_ENDPOINT_ID` (this endpoint's id).
 
 ## Updating Python deps
 

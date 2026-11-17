@@ -410,7 +410,7 @@ Every address is a 1-based physical page of the original as uploaded: `PageEdit.
 - dots.mocr: `DPI = 200` and `PROMPT_MODE` are module constants; `HANDLER_MAX_COMPLETION_TOKENS = 6144`; the retry ladder changes only the render (deterministic); the layout repair (`layout_json.py`, no Django import, copied into the image) runs before the ladder; `raw` is never written over
 - Tagger: GPU-only (`HANDLER_ALLOW_CPU=1` for a laptop only), transformers 5, model baked and opened at build time
 - Surya (#320): the handler owns no decode parameter and refuses one in the input (`REFUSED_INPUTS`); it calls surya's `RecognitionPredictor([image], full_page=True)` and the package's greedy pass, loop retry and block-mode fallback are the ladder. The `SURYA_*` env is set before the package is imported (its settings are read once). The base is `vllm/vllm-openai:v0.20.1` or later, the first to register `Qwen3_5ForConditionalGeneration`
-- One build workflow per image, and each PATCHes its own template id
+- One build workflow per image, and each PATCHes the image of its own endpoint through `.github/scripts/runpod-release.sh` (RunPod REST v2), never a template: an edit of a template reaches no endpoint that exists
 
 ## Files, disk and pages
 

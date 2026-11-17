@@ -352,8 +352,8 @@ failure.
 ## Releasing a new image version
 
 Pushing a new image tag to the registry alone does **not** update the
-running endpoint. The RunPod template that backs the endpoint has to be
-told about the new tag. There are two ways.
+running endpoint. The endpoint has to be told about the new tag. There
+are two ways.
 
 ### Automated release (default)
 
@@ -364,10 +364,16 @@ On any push to `main` that touches `scanning/runpod/**` or
 
 1. Builds `freelawproject/blackletter-gpu-worker` and pushes both
    `:<sha_short>` and `:latest` to Docker Hub.
-2. Calls `PATCH https://rest.runpod.io/v1/templates/<id>` to move the
-   endpoint's backing template `imageName` to the SHA-pinned tag.
-3. With `Min Workers = 0`, warm workers drain on the idle timeout and
-   the next job cold-starts on the new image.
+2. Calls `PATCH https://api.runpod.io/v2/serverless/<id>` to move the
+   endpoint's `image` to the SHA-pinned tag
+   (`.github/scripts/runpod-release.sh`, shared by the four worker
+   workflows). The endpoint is patched and never its template: since
+   RunPod's REST API v2 (v1 was retired on 2026-11-15) a template is a
+   snapshot applied when an endpoint is created, and an edit of it
+   reaches no endpoint that exists.
+3. The change is a new release of the endpoint, which rolls out as its
+   workers cycle. With `Min Workers = 0`, warm workers drain on the
+   idle timeout and the next job cold-starts on the new image.
 
 The workflow needs two repository secrets:
 
@@ -376,15 +382,13 @@ The workflow needs two repository secrets:
   offers. There is no per-template scope, so the key manages every
   template, endpoint and pod on the account; treat it as a production
   credential.
-- `RUNPOD_TEMPLATE_ID` — the ID of the endpoint's backing template.
-  An endpoint created without an explicit template still has one,
-  hidden from the default listing. Surface it with:
+- `RUNPOD_ENDPOINT_ID` — the ID of the endpoint, the value the portal
+  reads as `RUNPOD_YOLO_ENDPOINT_ID`. It is on the endpoint's page in
+  the RunPod console, or in the list of:
   ```bash
   curl -sS -H "Authorization: Bearer <API_KEY>" \
-    "https://rest.runpod.io/v1/templates?includeEndpointBoundTemplates=true"
+    "https://api.runpod.io/v2/serverless"
   ```
-  Find the entry where `isServerless: true` and the name matches the
-  endpoint, then copy its `id`.
 
 ### Manual release (the RunPod console)
 
