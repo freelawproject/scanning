@@ -9,7 +9,15 @@ on:
       - 'scanning/runpod_common.py'
       - 'scanning/perpendiculars.py'
       - '.github/workflows/build-runpod-surya-worker.yml'
+      - '.github/scripts/runpod-release.sh'
   workflow_dispatch:
+
+# One build of this image at a time, in push order: the release step
+# moves the endpoint to its own tag, so an older build that finished
+# last would move the endpoint back.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
   build-runpod-surya-worker:
