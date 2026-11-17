@@ -49,6 +49,23 @@ dead re-read goes back through this same command.
     docker exec scanning-daemon python manage.py enqueue_yolo_detect \\
         --stale-labels --read-since 2026-09-16T18:00Z \\
         --exclude 2561 2599 --dry-run
+
+With ``--model`` it is the re-read of #633: every named volume gets a
+run read with that weight, whatever the state of its run, and nothing
+is carried from a run read with another one. The Hein volumes are
+bitonal, bl-warm was trained on greyscale renders, and ``bl_hein`` is
+the weight trained on their pages. The volume keeps the model from
+then on (``yolo.models_for``): a dead run, a class re-read and the
+pages a curator changes are read with it. A volume already read with
+the weight is left alone, so a second call pays nothing.
+
+    # Read two Hein volumes again with the Hein weight.
+    docker exec scanning-daemon python manage.py enqueue_yolo_detect \\
+        2561 2599 --model bl_hein
+
+    # The same over a file of scan numbers, one per line.
+    docker exec scanning-daemon python manage.py enqueue_yolo_detect \\
+        --scans-file /tmp/hein.txt --model bl_hein --dry-run
 """
 
 from datetime import datetime
@@ -128,6 +145,22 @@ class Command(BaseCommand):
             ),
         )
         parser.add_argument(
+            "--model",
+            choices=yolo.BAKED_MODELS,
+            default=None,
+            help=(
+                "Read every named volume again with this weight (#633), "
+                "carrying nothing from a run read with another one."
+            ),
+        )
+        parser.add_argument(
+            "--scans-file",
+            default=None,
+            help="A file of scan numbers to add to the named ones, one "
+            "per line; a blank line and a line starting with # are "
+            "skipped.",
+        )
+        parser.add_argument(
             "--exclude",
             nargs="+",
             type=int,
@@ -157,13 +190,26 @@ class Command(BaseCommand):
             queue with no clock (#218).
         """
         dry_run = options["dry_run"]
-        wanted = options["scan_pks"]
+        wanted = list(options["scan_pks"])
+        if options["scans_file"]:
+            wanted += _read_scan_numbers(options["scans_file"])
         limit = options["limit"]
+        model = options["model"]
 
         if options["stale_labels"] and options["dead_runs"]:
             raise CommandError("Pass --stale-labels or --dead-runs, not both.")
         if options["read_since"] and not options["stale_labels"]:
             raise CommandError("--read-since goes with --stale-labels.")
+        if model and (options["stale_labels"] or options["dead_runs"]):
+            raise CommandError(
+                "--model goes with named scans, not with --stale-labels "
+                "or --dead-runs: both keep the model of each volume."
+            )
+        if model and not wanted:
+            raise CommandError(
+                "--model reads named volumes: name the scans, or pass "
+                "--scans-file."
+            )
         if (
             not wanted
             and not options["dead_runs"]
@@ -180,13 +226,14 @@ class Command(BaseCommand):
                 "park its rows in the queue."
             )
 
-        if options["stale_labels"]:
+        if options["stale_labels"] or model:
             self._relabel(
                 wanted,
                 options["exclude"],
                 options["read_since"],
                 limit,
                 dry_run,
+                models=[model] if model else None,
             )
             return
 
@@ -247,8 +294,15 @@ class Command(BaseCommand):
             )
         )
 
-    def _relabel(self, wanted, excluded, read_since, limit, dry_run):
+    def _relabel(
+        self, wanted, excluded, read_since, limit, dry_run, models=None
+    ):
         """Read again every selected volume read before the class set.
+
+        With ``models`` it is the re-read of #633 over the same walk: a
+        run is stale when it was read with another weight, a volume
+        with no run gets its first one, and the new runs name the
+        weight.
 
         :param wanted: Scan numbers to narrow the selection to, or empty
             for every volume in :data:`RELABEL_STATUSES`.
@@ -257,6 +311,8 @@ class Command(BaseCommand):
             with the current class set, or None.
         :param limit: The most volumes to start, or None.
         :param dry_run: Report and change nothing.
+        :param models: The weights to read with, or None for the re-read
+            of the classes, which keeps each volume's own.
         :return: None.
         """
         if read_since is not None and timezone.is_naive(read_since):
@@ -271,7 +327,7 @@ class Command(BaseCommand):
             if limit is not None and started >= limit:
                 break
             rows = yolo.live_detect_jobs(scan)
-            if not rows:
+            if not rows and not models:
                 skipped += 1
                 self.stderr.write(
                     f"scan {scan.pk}: no detection run; the sweep starts one"
@@ -313,8 +369,12 @@ class Command(BaseCommand):
             stale = [
                 group
                 for group in (rows, edit_rows)
-                if group and (not yolo.labels_current(group) or _dead(group))
+                if group and (_stale(group, models) or _dead(group))
             ]
+            if models and not rows:
+                # No run yet: the first one is read with the weight, or
+                # the sweep would pay a bl-warm run first.
+                stale.append(rows)
             took = [
                 g
                 for g in stale
@@ -354,6 +414,7 @@ class Command(BaseCommand):
                     apply.stored_shard_manifest(scan, run),
                     apply_run=run,
                     force_new_run=True,
+                    models=models,
                 )
             # Always a volume run, even when only the edited pages are
             # stale: its merge is what writes the corrected volume's
@@ -361,7 +422,7 @@ class Command(BaseCommand):
             # volume read with the class set is carried whole, at no
             # cost.
             new_rows = yolo.ensure_detect_jobs(
-                scan, manifest, force_new_run=True
+                scan, manifest, force_new_run=True, models=models
             )
             pending = sum(1 for r in new_rows if r.status == JobStatus.PENDING)
             started += 1
@@ -398,6 +459,48 @@ def _names(stale, edit_rows) -> list[str]:
         + (", dead" if _dead(group) else "")
         for group in stale
     ]
+
+
+def _stale(rows, models) -> bool:
+    """Return whether a run has to be read again.
+
+    :param rows: One run's rows.
+    :param models: The weights the command asks for, or None for the
+        re-read of the classes.
+    :returns: Whether the run was read with another weight, or, with no
+        weight asked for, before the current class set.
+    :rtype: bool
+    """
+    if models:
+        return yolo.run_models(rows) != models
+    return not yolo.labels_current(rows)
+
+
+def _read_scan_numbers(path: str) -> list[int]:
+    """Read the scan numbers of a file, one per line.
+
+    :param path: The file.
+    :returns: The numbers, in file order.
+    :rtype: list[int]
+    :raises CommandError: If the file cannot be read, or a line is not
+        a number.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except OSError as exc:
+        raise CommandError(f"--scans-file: {exc}") from exc
+    numbers = []
+    for number, line in enumerate(lines, start=1):
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if not text.isdigit():
+            raise CommandError(
+                f"--scans-file: line {number} is not a scan number: {text!r}"
+            )
+        numbers.append(int(text))
+    return numbers
 
 
 def _dead(rows) -> bool:
