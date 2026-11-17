@@ -382,11 +382,12 @@ On any push to `main` that touches `scanning/runpod/**` or
 
 The workflow needs one repository secret:
 
-- `RUNPOD_API_KEY` — a RunPod API key with **Restricted** permission
-  set to **GraphQL: Read/Write**. That is the tightest scope RunPod
-  offers. There is no per-template scope, so the key manages every
-  template, endpoint and pod on the account; treat it as a production
-  credential.
+- `RUNPOD_API_KEY` — a RunPod API key that grants the two v2 scopes
+  the script uses: `serverless:read` (the list of endpoints) and
+  `serverless:write` (the image change). It needs no template scope.
+  The scope is not per endpoint, so the key can change every endpoint
+  on the account; treat it as a production credential. A key without
+  them fails the step with `403` and `access denied`.
 
 ### Manual release (the RunPod console)
 
