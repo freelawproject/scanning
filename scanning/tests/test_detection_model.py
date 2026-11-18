@@ -20,7 +20,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.core.management import CommandError, call_command
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 from django.utils import timezone
 
 from scanning import findings, services, yolo
@@ -35,6 +35,7 @@ from scanning.models import (
 from scanning.tests.test_detection_relabel import finish
 from scanning.tests.test_findings import make_detection, make_scan
 from scanning.tests.test_jobs import make_manifest
+from scanning.tests.test_runpod_yolo_handler import handler
 
 HEIN = ["bl_hein"]
 
@@ -409,3 +410,12 @@ class TestTheFamilyOfAHeinRun(TestCase):
         )
         self.assertEqual(services._run_model_name(entries("small")), "")
         self.assertEqual(services._run_model_name([]), "")
+
+
+class TestTheBakedWeights(SimpleTestCase):
+    """The names ``--model`` takes are the weights the worker bakes."""
+
+    def test_the_portal_names_the_weights_the_worker_bakes(self):
+        # A name the image does not bake is refused on every shard of
+        # a paid run.
+        self.assertEqual(tuple(yolo.BAKED_MODELS), tuple(handler.BAKED_MODELS))
