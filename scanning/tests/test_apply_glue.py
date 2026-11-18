@@ -15,7 +15,7 @@ import pathlib
 from unittest.mock import patch
 
 import fitz
-from django.test import override_settings
+from django.test import SimpleTestCase, override_settings
 
 from scanning import apply, dots_mocr, mistral_ocr, yolo
 from scanning.models import (
@@ -569,6 +569,78 @@ class TestGlues(GlueTestCase):
 
 
 @override_settings(MEDIA_ROOT=MEDIA_ROOT)
+class TestPlacesUnderLabel(SimpleTestCase):
+    """A span uploaded as several files is one filing."""
+
+    @staticmethod
+    def page(final, edit, page, gap=67):
+        return {
+            "final_page": final,
+            "source": {
+                "kind": "edit",
+                "edit_id": edit,
+                "page": page,
+                "reference_pdf_page": gap,
+            },
+        }
+
+    def test_a_later_file_counts_the_pages_of_the_files_before_it(self):
+        """Pages 293-308 uploaded as two files under the one label: the
+        third page of the second file is the ninth page of the span,
+        never the third."""
+        inserted = [self.page(68 + n, 1, n) for n in range(6)]
+        inserted += [self.page(74 + n, 2, n) for n in range(3)]
+
+        places = apply._places_under_label(
+            inserted, {1: "293-308", 2: "293-308"}
+        )
+
+        self.assertEqual(places[76], (8, 9))
+        self.assertEqual(places[68], (0, 9))
+
+    def test_a_one_page_file_of_several_is_part_of_the_span(self):
+        """The last file of a span may hold one page. It is counted
+        with the others, so it is not read as a one-page insert that
+        prints the whole range."""
+        inserted = [self.page(68 + n, 1, n) for n in range(6)]
+        inserted.append(self.page(74, 2, 0))
+
+        places = apply._places_under_label(
+            inserted, {1: "293-308", 2: "293-308"}
+        )
+
+        self.assertEqual(places[74], (6, 7))
+
+    def test_another_label_or_another_gap_is_another_filing(self):
+        """A one-page insert under its own label, and a file in another
+        gap, stand alone."""
+        inserted = [
+            self.page(10, 1, 0, gap=9),
+            self.page(68, 2, 0),
+            self.page(69, 3, 0),
+        ]
+
+        places = apply._places_under_label(
+            inserted, {1: "293-308", 2: "293-308", 3: "913-925"}
+        )
+
+        self.assertEqual(
+            (places[10], places[68], places[69]), ((0, 1), (0, 1), (0, 1))
+        )
+
+    def test_the_gaps_on_both_sides_of_page_one_are_two_filings(self):
+        """An insert before page 1 and one after it name the same
+        reference page. The page between them keeps them apart, so
+        each one-page insert still prints its label."""
+        inserted = [self.page(1, 1, 0, gap=1), self.page(3, 2, 0, gap=1)]
+
+        places = apply._places_under_label(
+            inserted, {1: "293-308", 2: "293-308"}
+        )
+
+        self.assertEqual((places[1], places[3]), ((0, 1), (0, 1)))
+
+
 class TestMoveGlues(GlueTestCase):
     """A moved page (#261) through the bitonal copy and the three glues.
 
