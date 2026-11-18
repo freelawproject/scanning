@@ -2235,6 +2235,16 @@ document.addEventListener('DOMContentLoaded', function () {
         drawRedactionOverlaysForPage(pageIndex);
     };
 
+    // A box taken out from outside the page (the sidebar's "Remove the
+    // box" of a redaction_cuts_text card): the row leaves the page.
+    window.applyRedactionRemove = function(pageIndex, id) {
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            entry.rects = (entry.rects || []).filter(function(rect) { return rect.id !== id; });
+        });
+        drawRedactionOverlaysForPage(pageIndex);
+    };
+
     function drawRedactionOverlaysForPage(pdfIndex) {
         if (!redactionRects || !redactionsVisible) return;
         for (var i = 0; i < redactionRects.length; i++) {

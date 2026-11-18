@@ -493,6 +493,43 @@ function coverCutLine(btn) {
         });
 }
 
+// "Remove the box" of the same card: the box reaches into text that
+// should stay (a headnote box over a line of the opinion), so it goes,
+// through the endpoint of the box's own Dismiss button. The endpoint
+// rebuilt the findings, so the card goes.
+function removeCutBox(btn) {
+    var row = btn.closest("[data-redaction-id]");
+    if (!row) return;
+    var cfg = window.SCAN_CONFIG;
+    var id = parseInt(row.dataset.redactionId);
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/dismiss/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not remove the box");
+                return;
+            }
+            if (window.applyRedactionRemove) {
+                window.applyRedactionRemove(parseInt(row.dataset.pageIndex), id);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not remove the box");
+        });
+}
+
 // The "+" of a missing-caption row under an opinion card: a caption
 // box drawn where the card guesses the caption is (the row's boxes,
 // the ones a click flashes), through the same endpoint as the drawer.

@@ -1213,6 +1213,41 @@ class TestTheCutLine(ScanningTestCase):
             ).exists()
         )
 
+    def test_the_card_offers_to_remove_the_box_and_the_removal_ends_it(self):
+        """A headnote box over a line of the opinion is a box to take
+        out, not to grow: the card offers both, and the box's own
+        dismiss answers it."""
+        make_boundary(
+            self.scan,
+            make_detection(self.scan, "CASE_CAPTION", page_index=1),
+            make_detection(self.scan, "KEY_ICON", page_index=1),
+        )
+        box = make_redaction(self.scan, x0=100.0, y0=355.0, x1=470.0, y1=385.0)
+        self.write(cell("the words of the line", LINE))
+        findings.rebuild(self.scan)
+        self.client.force_login(self.make_user())
+
+        html = self.client.get(
+            reverse("review_findings", kwargs={"pk": self.scan.pk})
+        ).json()["html"]
+        self.assertIn("Cover the line", html)
+        self.assertIn("removeCutBox(this)", html)
+        self.assertIn(f'data-redaction-id="{box.pk}"', html)
+
+        answer = self.client.post(
+            reverse(
+                "dismiss_redaction",
+                kwargs={"pk": self.scan.pk, "redaction_id": box.pk},
+            )
+        )
+
+        self.assertEqual(answer.status_code, 200)
+        self.assertFalse(
+            Issue.objects.filter(
+                scan=self.scan, check_name=CheckName.REDACTION_CUTS_TEXT
+            ).exists()
+        )
+
 
 class TestThePageScopedRebuild(ScanningTestCase):
     """A write on one page rebuilds the page passes for that page alone
