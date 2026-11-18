@@ -2345,6 +2345,11 @@ def run_compute_redactions(
         _update_progress(scan_pk, "Fitting the text redactions...")
         with _log_stage("Text redaction fit"):
             text_fit.fit_rects(rects, cells, document.pages)
+        # A headnote rect ends at a key icon centred under the last
+        # lines of the opinion before (#624): blackletter gives the next
+        # opinion's headnotes the right column from its top.
+        with _log_stage("Centred key fit"):
+            bands.clip_headnotes(scan, rects, document.pages)
         # A running head's whiteout the model drew short grows across the
         # text width at its own height, so no letter of it is left on the
         # page; the page number stays.

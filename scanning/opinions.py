@@ -272,7 +272,7 @@ def keyed(
 #: what the OCR glue or the redacted PDF reads off the rows, and every
 #: opinion is rebuilt at its volume's next approval, as every approval
 #: did before the digest.
-DIGEST_RULES = 2
+DIGEST_RULES = 3
 
 
 @dataclass
@@ -281,7 +281,7 @@ class ScanRows:
 
     Read once per creation (:func:`read_rows`), the shape
     ``opinion_figures.ledger_digest`` keeps: a creation over a volume of
-    five hundred opinions runs two queries and not a thousand.
+    five hundred opinions runs three queries and not a thousand.
 
     :param redactions: ``{page_index: [(rect_type, fill, x0, y0, x1,
         y1)]}``, the boxes a reader paints, rounded to a tenth of a
@@ -289,10 +289,16 @@ class ScanRows:
     :param detections: ``{page_index: [(label, x0, y0, x1, y1,
         confidence, img_width, img_height)]}``, every live detection of
         the page, whatever its run.
+    :param ends: ``{page_index: [(end_x, end_y)]}``, the end anchor of
+        every live boundary that ends on the page, rounded to a tenth
+        of a point: a key icon across the gutter divides its page when
+        an opinion ends at it (``boundaries.ending_keys``, #624), so
+        the masks of an opinion read where its neighbour ends.
     """
 
     redactions: dict[int, list[tuple]] = field(default_factory=dict)
     detections: dict[int, list[tuple]] = field(default_factory=dict)
+    ends: dict[int, list[tuple]] = field(default_factory=dict)
 
 
 def read_rows(scan: Scan, run) -> ScanRows:
@@ -355,6 +361,12 @@ def read_rows(scan: Scan, run) -> ScanRows:
         )
     rows.redactions = dict(redactions)
     rows.detections = dict(detections)
+    rows.ends = {
+        page: [
+            (round(float(x or 0), 1), round(float(y or 0), 1)) for x, y in ends
+        ]
+        for page, ends in boundaries.live_ends(scan).items()
+    }
     return rows
 
 
@@ -371,7 +383,9 @@ def input_digest(
     live detections of the opinion's pages; its own boundary, the two
     page indexes and the two anchor points (``boundaries.outside_rects``
     builds the neighbour masks from the opinion's own anchors and the
-    page's detections, never from a neighbour's); the printed numbers
+    page's detections, and from where the opinions that end on those
+    two pages end, because a key icon centred across the gutter divides
+    its page when an opinion ends at it, #624); the printed numbers
     of its pages; and the run, whose bitonal copy and page map are
     fixed for its lifetime. Human text edits have their own
     ``edit_revision`` and the pictures their own ``figure_digest``.
@@ -418,6 +432,11 @@ def input_digest(
             ],
             "detections": [
                 [page, sorted(rows.detections.get(page, []))] for page in pages
+            ],
+            # The masks are drawn on the first and the last page alone.
+            "ends": [
+                [page, sorted(rows.ends.get(page, []))]
+                for page in sorted({row.start_page_index, row.end_page_index})
             ],
         },
         sort_keys=True,
