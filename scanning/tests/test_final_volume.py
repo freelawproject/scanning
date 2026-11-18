@@ -491,6 +491,41 @@ class TestStepTwoShowsTheCorrectedVolume(ScanningTestCase):
         self.assertIn("finalSpace: true", html)
         self.assertIn("Showing the volume as uploaded", html)
 
+    def _card_config(self, scan):
+        response = self.client.get(
+            reverse("scan_card_review", kwargs={"pk": scan.pk})
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.context["config"]
+
+    def test_the_card_review_reads_a_1_bit_volume_from_the_original(self):
+        """``serve_final_pdf`` refuses a run whose bitonal copy is the
+        original, so the crops read the presigned URL step 2's original
+        load reads, or no crop of a Hein volume ever draws."""
+        scan, _ = applied_scan(status=Status.READY_FOR_REDACTION_REVIEW)
+        ApplyRun.objects.filter(scan=scan).update(
+            bitonal_key=s3_sync.s3_original_key(scan)
+        )
+
+        config = self._card_config(scan)
+
+        self.assertEqual(
+            config["original_url"],
+            reverse("scan_original_url", kwargs={"pk": scan.pk})
+            + "?space=final",
+        )
+
+    def test_the_card_review_reads_a_converted_volume_from_its_copy(self):
+        scan, _ = applied_scan(status=Status.READY_FOR_REDACTION_REVIEW)
+
+        config = self._card_config(scan)
+
+        self.assertIsNone(config["original_url"])
+        self.assertEqual(
+            config["pdf_url"],
+            reverse("serve_final_pdf", kwargs={"pk": scan.pk}),
+        )
+
     def test_a_volume_with_edits_says_what_changed(self):
         scan, _ = applied_scan(status=Status.READY_FOR_REDACTION_REVIEW)
         ApplyRun.objects.filter(scan=scan).update(page_map=edited_map())

@@ -5425,10 +5425,24 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered page.
     """
 
+    from scanning import review_states
+
     scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     flags = _review_flags(scan)
     kwargs = {"pk": scan.pk}
     pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
+    # A 1-bit upload is its own corrected volume, and ``serve_final_pdf``
+    # refuses to stream the original (#185): the crops read it through
+    # the presigned GET step 2's "load the original" button reads.
+    original_url = None
+    if flags["final_space"]:
+        run = review_states.final_run(scan)
+        if run is not None and run.bitonal_key == s3_sync.s3_original_key(
+            scan
+        ):
+            original_url = (
+                reverse("scan_original_url", kwargs=kwargs) + "?space=final"
+            )
     review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
     config = {
         "scan": scan.pk,
@@ -5436,6 +5450,9 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
         # the page keeps no copy of ``LABEL_IDS`` (#343).
         "labels": [{"name": label.name, "id": label.value} for label in Label],
         "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        # When set, the crops read the PDF at the URL this route
+        # answers in JSON, and never ``pdf_url``.
+        "original_url": original_url,
         "cards_url": reverse("scan_review_cards", kwargs=kwargs),
         "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
         "review_open": review_open,

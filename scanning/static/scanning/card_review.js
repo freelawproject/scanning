@@ -175,7 +175,19 @@
 
     // ── the crop ─────────────────────────────────────────────────────
     function getPdf() {
-        if (!pdf) { pdf = pdfjsLib.getDocument({ url: cfg.pdf_url }).promise; }
+        if (!pdf) {
+            // A 1-bit upload is its own corrected volume: the server
+            // answers its presigned URL in JSON, the URL step 2's
+            // "load the original" button reads.
+            pdf = cfg.original_url
+                ? fetch(cfg.original_url, { credentials: 'same-origin' })
+                    .then(function (r) {
+                        if (!r.ok) { throw new Error('The scan did not load.'); }
+                        return r.json();
+                    })
+                    .then(function (body) { return pdfjsLib.getDocument({ url: body.url }).promise; })
+                : pdfjsLib.getDocument({ url: cfg.pdf_url }).promise;
+        }
         return pdf;
     }
 
