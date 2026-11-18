@@ -717,6 +717,11 @@ document.addEventListener('DOMContentLoaded', function () {
     // (shared.js) writes over.
     function offerPageReplacement(pdfPage, file, pageDiv) {
         var standing = pageDiv.querySelector('.upload-panel');
+        if (standing && standing.isBusy && standing.isBusy()) {
+            showToast('A file is still uploading for this page. ' +
+                      'Wait for it, or cancel it first.');
+            return;
+        }
         if (standing) { standing.remove(); }
         var panel = uploadPanel(file, {
             url: '/scans/' + documentId + '/replace-page/',
@@ -1346,11 +1351,16 @@ document.addEventListener('DOMContentLoaded', function () {
         return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
     }
 
-    // A refusal comes as JSON with the reason. An answer that is not
-    // JSON is a proxy's or the login page's, and says only its status.
+    // A refusal comes as JSON with the reason, and the endpoint saved
+    // nothing. An answer that is not JSON is a proxy's or the login
+    // page's, and a connection can drop: once every byte is with the
+    // server, either may hide a file that was saved all the same, so
+    // on.fail is told whether the outcome is known (`saved`: false, or
+    // null for "nobody can say from here").
     function sendPageFile(url, formData, on) {
         var xhr = new XMLHttpRequest();
         var over = false;
+        var delivered = false;
         function end(call) {
             if (over) { return; }
             over = true;
@@ -1362,7 +1372,7 @@ document.addEventListener('DOMContentLoaded', function () {
         xhr.upload.onprogress = function (e) {
             if (e.lengthComputable && e.total > 0) { on.progress(e.loaded / e.total); }
         };
-        xhr.upload.onload = function () { on.sent(); };
+        xhr.upload.onload = function () { delivered = true; on.sent(); };
         xhr.onload = function () {
             var data = null;
             try { data = JSON.parse(xhr.responseText); } catch (err) { data = null; }
@@ -1372,13 +1382,19 @@ document.addEventListener('DOMContentLoaded', function () {
                 return;
             }
             var reason = data && (data.error || data.message);
+            var refused = !!data;
             if (!reason && xhr.status === 413) {
                 reason = 'This file is too large for the server.';
+                refused = true;
             }
-            end(function () { on.fail(reason || ''); });
+            end(function () {
+                on.fail(reason || '', refused || !delivered ? false : null);
+            });
         };
         xhr.onerror = function () {
-            end(function () { on.fail('The connection was lost.'); });
+            end(function () {
+                on.fail('The connection was lost.', delivered ? null : false);
+            });
         };
         xhr.onabort = function () { end(function () {}); };
         uploadsInFlight += 1;
@@ -1417,10 +1433,14 @@ document.addEventListener('DOMContentLoaded', function () {
         panel.appendChild(actions);
 
         var xhr = null;
+        var reload = null;
         function close() {
             panel.remove();
             if (opts.closed) { opts.closed(); }
         }
+        // A panel whose file is on its way, or with the server, is not
+        // one to write over: taking the node away stops no request.
+        panel.isBusy = function () { return xhr !== null; };
         function start() {
             var formData = new FormData();
             Object.keys(opts.fields || {}).forEach(function (key) {
@@ -1452,16 +1472,34 @@ document.addEventListener('DOMContentLoaded', function () {
                     close();
                     opts.done(data);
                 },
-                fail: function (reason) {
+                fail: function (reason, saved) {
                     xhr = null;
                     panel.classList.remove('upload-saving');
                     panel.classList.add('upload-failed');
                     bar.hidden = true;
+                    cancel.hidden = false;
+                    if (saved === null) {
+                        // The whole file reached the server and no
+                        // answer came back. It may be saved, and a
+                        // second send would store the pages twice, so
+                        // the way on is a look at the page, never a
+                        // resend.
+                        status.textContent = (reason ||
+                            'The server gave no answer.') +
+                            ' The file may be saved all the same. Reload ' +
+                            'the page to see before you send it again.';
+                        reload = node('button', 'upload-send', 'Reload the page');
+                        reload.addEventListener('click', function () {
+                            window.location.reload();
+                        });
+                        actions.insertBefore(reload, cancel);
+                        cancel.textContent = 'Close';
+                        return;
+                    }
                     status.textContent = (reason ||
                         opts.fallback || 'The upload failed.') + ' Nothing was saved.';
                     send.textContent = 'Try again';
                     send.hidden = false;
-                    cancel.hidden = false;
                 },
             });
         }
