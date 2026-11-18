@@ -628,6 +628,18 @@ class TestPlacesUnderLabel(SimpleTestCase):
             (places[10], places[68], places[69]), ((0, 1), (0, 1), (0, 1))
         )
 
+    def test_the_gaps_on_both_sides_of_page_one_are_two_filings(self):
+        """An insert before page 1 and one after it name the same
+        reference page. The page between them keeps them apart, so
+        each one-page insert still prints its label."""
+        inserted = [self.page(1, 1, 0, gap=1), self.page(3, 2, 0, gap=1)]
+
+        places = apply._places_under_label(
+            inserted, {1: "293-308", 2: "293-308"}
+        )
+
+        self.assertEqual((places[1], places[3]), ((0, 1), (0, 1)))
+
 
 class TestMoveGlues(GlueTestCase):
     """A moved page (#261) through the bitonal copy and the three glues.

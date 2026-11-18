@@ -2927,20 +2927,30 @@ def _places_under_label(
     page's place counts the pages of the files before it, or an
     unread page of the second file takes a number of the first.
 
+    A filing is a run of inserted pages that follow one another in
+    the corrected volume under one label. The gap is read off the
+    final pages and never off ``reference_pdf_page``, which is the
+    same page for the gap before page 1 and the gap after it.
+
     :param inserted: The inserted pages of the printed-page map, in
         final order.
     :param labels: The folded label of each insert, by edit pk.
     :returns: ``{final_page: (place, pages filed)}``, the place
         counted from zero.
     """
-    filings: dict[tuple, list[int]] = {}
+    filings: list[list[int]] = []
+    before = None
     for page in inserted:
-        src = page["source"]
-        key = (src.get("reference_pdf_page"), labels.get(src["edit_id"]))
-        filings.setdefault(key, []).append(page["final_page"])
+        final = page["final_page"]
+        label = labels.get(page["source"]["edit_id"])
+        if before == (final - 1, label):
+            filings[-1].append(final)
+        else:
+            filings.append([final])
+        before = (final, label)
     return {
         final: (place, len(finals))
-        for finals in filings.values()
+        for finals in filings
         for place, final in enumerate(finals)
     }
 
