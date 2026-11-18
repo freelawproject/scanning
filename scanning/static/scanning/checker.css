@@ -532,6 +532,72 @@ a.doc-name:hover { text-decoration: underline; }
 }
 .upload-btn:hover { background: #1d4ed8; }
 
+/* The chosen file of a page upload: its name, the button that sends
+   it, the share sent and the wait for the server (viewer_step1.js). */
+.upload-panel {
+    width: 100%;
+    max-width: 460px;
+    margin: 0 auto 15px;
+    padding: 12px 14px;
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 6px;
+    color: #1e293b;
+    font-size: 13px;
+    font-weight: 400;
+    text-align: left;
+}
+.page-container > .upload-panel { margin: 8px auto; }
+.upload-file { display: flex; gap: 8px; align-items: baseline; }
+.upload-file-name {
+    flex: 1;
+    min-width: 0;
+    font-weight: 600;
+    overflow-wrap: anywhere;
+}
+.upload-file-size { color: #64748b; white-space: nowrap; }
+.upload-bar {
+    height: 8px;
+    margin-top: 10px;
+    background: #e2e8f0;
+    border-radius: 4px;
+    overflow: hidden;
+}
+.upload-bar-fill {
+    height: 100%;
+    width: 0;
+    background: #2563eb;
+    transition: width 0.15s linear;
+}
+.upload-saving .upload-bar-fill {
+    background: repeating-linear-gradient(
+        -45deg, #2563eb 0 10px, #60a5fa 10px 20px);
+    background-size: 28px 100%;
+    animation: upload-saving 0.8s linear infinite;
+}
+@keyframes upload-saving { to { background-position: 28px 0; } }
+@media (prefers-reduced-motion: reduce) {
+    .upload-bar-fill { transition: none; }
+    .upload-saving .upload-bar-fill { animation: none; }
+}
+.upload-status { margin-top: 8px; color: #475569; min-height: 1em; }
+.upload-status:empty { display: none; }
+.upload-failed .upload-status { color: #b91c1c; }
+.upload-actions { display: flex; gap: 8px; margin-top: 10px; }
+.upload-actions button {
+    padding: 6px 14px;
+    border-radius: 5px;
+    font-size: 13px;
+    cursor: pointer;
+}
+.upload-actions button[hidden] { display: none; }
+.upload-send { background: #2563eb; color: white; border: 1px solid #2563eb; }
+.upload-send:hover { background: #1d4ed8; }
+.upload-cancel { background: white; color: #334155; border: 1px solid #cbd5e1; }
+.upload-cancel:hover { background: #f1f5f9; }
+.missing-placeholder .upload-saved { color: #166534; }
+.insert-form[hidden] { display: none; }
+
 /* Inserted page */
 .inserted-page {
     border: 3px solid #22c55e;
