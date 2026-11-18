@@ -44,7 +44,6 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
-from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2302,9 +2301,12 @@ def printed_pages(
     any page's number, and a range stamped on every page keys every
     opinion on them at the range's end. Those pages keep the model's
     reading of each, and a page the model read no number on takes its
-    place in the range (the start plus its page in the file, ``by``
-    ``"label"``), so no inserted page is left with no number, which
-    would refuse an opinion starting on it. A one-page insert keeps
+    place in the range (the start plus its place among the pages
+    inserted in that gap under that label, ``by`` ``"label"``), so no
+    inserted page is left with no number, which would refuse an
+    opinion starting on it. The span may arrive as several files, one
+    upload after another under the one label of the placeholder, so
+    the place counts the files before it too. A one-page insert keeps
     its label whatever its shape: a compressed opinion page filed
     under ``913-925`` prints that range. The curator outranks the
     model. Citations use printed pages, so this map is a product of
@@ -2356,26 +2358,25 @@ def printed_pages(
         if page["source"]["kind"] == "edit"
         and page["source"]["edit_kind"] == str(PageEdit.Kind.INSERT_PAGE)
     ]
-    pages_of = Counter(page["source"]["edit_id"] for page in inserted)
-    labels = dict(
-        PageEdit.objects.filter(pk__in=pages_of).values_list(
-            "pk", "logical_page"
-        )
-    )
+    labels = {
+        pk: page_numbers.fold_dashes(label or "")
+        for pk, label in PageEdit.objects.filter(
+            pk__in={page["source"]["edit_id"] for page in inserted}
+        ).values_list("pk", "logical_page")
+    }
+    places = _places_under_label(inserted, labels)
     for page in inserted:
         src = page["source"]
-        label = page_numbers.fold_dashes(labels.get(src["edit_id"]) or "")
+        label = labels.get(src["edit_id"]) or ""
         if not label:
             continue
-        if (
-            pages_of[src["edit_id"]] == 1
-            or page_numbers.number_type(label) != page_numbers.RANGE
-        ):
+        place, filed = places[page["final_page"]]
+        if filed == 1 or page_numbers.number_type(label) != page_numbers.RANGE:
             curator(page, label)
         elif not page["printed"]:
             start = _range_start(label)
             if start is not None:
-                page["printed"] = str(start + src["page"])
+                page["printed"] = str(start + place)
                 page["type"] = page_numbers.SINGLE
                 page["by"] = "label"
     return {
@@ -2913,6 +2914,35 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
             f"not a printed-page map"
         )
     return document
+
+
+def _places_under_label(
+    inserted: list[dict], labels: dict[int, str]
+) -> dict[int, tuple[int, int]]:
+    """Where each inserted page stands among the pages filed in its
+    gap under its label.
+
+    A span of missing pages may be uploaded as several files, each
+    under the one label of the placeholder. They are one filing: a
+    page's place counts the pages of the files before it, or an
+    unread page of the second file takes a number of the first.
+
+    :param inserted: The inserted pages of the printed-page map, in
+        final order.
+    :param labels: The folded label of each insert, by edit pk.
+    :returns: ``{final_page: (place, pages filed)}``, the place
+        counted from zero.
+    """
+    filings: dict[tuple, list[int]] = {}
+    for page in inserted:
+        src = page["source"]
+        key = (src.get("reference_pdf_page"), labels.get(src["edit_id"]))
+        filings.setdefault(key, []).append(page["final_page"])
+    return {
+        final: (place, len(finals))
+        for finals in filings.values()
+        for place, final in enumerate(finals)
+    }
 
 
 def _range_start(label: str) -> int | None:
