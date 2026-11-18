@@ -244,10 +244,8 @@ Notes on the rows:
   .rows_are_bl_warm` reads it to pick the bl-warm confidence gates, and
   #196 depends on that. A `bl_hein` row names `bl_hein` there. The
   gates are picked in the application, never in this worker, and the
-  application does not read `bl_hein` as the bl-warm family yet: it is
-  on a blackletter below 0.4.5, and `findings.model_rows_are_bl_warm`
-  names `bl_warm` alone. Both change in #629, before any caller sends
-  `bl_hein`.
+  application reads `bl_hein` as the bl-warm family (blackletter 0.4.5,
+  `findings.model_rows_are_bl_warm`, #633).
 - `label` is a `Label` name, not a bl-warm class name. The adapter maps
   the 18 classes onto the taxonomy, splits the whole-page `body` box
   into two `TEXT_COLUMN` boxes, and carries `heading` and `blockquote`
