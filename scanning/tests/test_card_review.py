@@ -723,6 +723,11 @@ class TestTheQueueOfEveryVolume(ScanningTestCase):
     }
 
     def setUp(self):
+        from django.core.cache import cache
+
+        # The editor's note count is kept in the cache, which outlives
+        # a test.
+        cache.clear()
         self.first = make_scan()
         self.second = make_scan()
         finding(self.first, CheckName.MISSING_HEADNOTE_BRACKET, self.BRACKET)
@@ -772,6 +777,29 @@ class TestTheQueueOfEveryVolume(ScanningTestCase):
         self.assertEqual(totals[card_review.BRACKET], 2)
         self.assertEqual(totals[card_review.IMAGE], 1)
         self.assertEqual(totals[card_review.CAPTION], 0)
+
+    def test_a_note_box_inside_the_blackout_makes_no_count(self):
+        """174 boxes made 10 cards on scan 3810: the rest were inside the
+        head matter's blackout, black either way."""
+        make_detection(self.first, "EDITORIAL", label_id=int(Label.EDITORIAL))
+        make_detection(
+            self.second,
+            "EDITORIAL",
+            label_id=int(Label.EDITORIAL),
+            y0=1000.0,
+            y1=1100.0,
+        )
+        # The head matter's black box over the first volume's note.
+        make_redaction(self.first, x0=0.0, y0=0.0, x1=600.0, y1=300.0)
+
+        self.assertEqual(
+            card_review.editorial_cards_by_scan(), {self.second.pk: 1}
+        )
+        self.assertEqual(card_review.queue_totals()[card_review.EDITORIAL], 1)
+        self.assertEqual(
+            card_review.queue_scan_ids(card_review.EDITORIAL),
+            [self.second.pk],
+        )
 
     def test_the_page_and_its_list_are_for_staff(self):
         self.client.force_login(self.make_user())
