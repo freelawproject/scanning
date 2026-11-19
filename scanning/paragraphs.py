@@ -135,11 +135,19 @@ _INLINE_LABEL = re.compile(
     r"(?<=[.,;:!?\"”’')\]])\s+(\d{1,3})[.)]\s+(?=[\"“‘'(\[]*[A-Z§])"
 )
 
-#: An abbreviation that takes a number after it: "ECF No. 5. The" holds
-#: no label.
+#: What takes a number after it, so the number is no label: an
+#: abbreviation of a citation ("ECF No. 5. The", "Fed. R. Civ. P. 13.
+#: The", "Doc. 14. The"), any single capital with a period, and a number
+#: and a comma, the list of a pin cite ("Id. at 12, 13. The").
 _TAKES_A_NUMBER = re.compile(
-    r"(?:\b(?:Nos?|nn?|pp?|[Aa]rts?|[Ss]ecs?|[Cc]hs?|[Vv]ols?|[Ee]xs?)\.)$"
+    r"(?:\b(?:Nos?|nn?|pp?|fn|[Aa]rts?|[Ss]ecs?|[Cc]hs?|[Vv]ols?|[Ee]xs?"
+    r"|[Dd]ocs?|[Dd]kts?|[Tt]rs?|[Aa]pps?|[Ff]igs?|[Cc]ls?|[Pp]ts?|[Tt]its?"
+    r"|[Rr]ecs?|[Ee]xhs?|[A-Z])\.|\d,)$"
 )
+
+#: A label that starts a text with its period or parenthesis: the form
+#: no continuation takes ("28 U.S.C." has neither).
+_OWN_LABEL = re.compile(r"^\s*(\d{1,3})[.)]")
 
 #: How far past the last number a number may go and still be a label.
 #: A footnote can be missing from the opinion (on a page a redaction
@@ -518,6 +526,7 @@ def inline_labels(
     last: int | None,
     page: int,
     marked: dict[int, set[int]],
+    taken: frozenset[int] = frozenset(),
 ) -> list[int]:
     """Return the offsets at which a footnote starts inside a text.
 
@@ -525,18 +534,29 @@ def inline_labels(
     the column edge and not at the notes, so a label is in the middle of
     a group ("... shortly before. 4. In both ..."). It starts a note
     only when all of this holds: it follows the end of a sentence, it is
-    the next number of the series (:func:`_is_next_label` over the label
-    before it), the body cites that number on the page of the group or
-    the page before, and no abbreviation that takes a number is before
-    it. The body is the proof, as in :func:`_is_marked_label`: a
-    sentence that ends in a number and a period is no note without its
-    mark.
+    the next number of the series and no other (the last label plus
+    one), the body cites that number on the page of the group or the
+    page before, nothing that takes a number is before it
+    (``_TAKES_A_NUMBER``), and no later group of the page or the next
+    starts with that number. The body is the proof, as in
+    :func:`_is_marked_label`: a sentence that ends in a number and a
+    period is no note without its mark.
+
+    A wrong cut costs more than a missed one. A missed label leaves a
+    note inside the note before it, with its text. A number of a
+    citation taken for a label ("See App. 10, 14. The witness") makes a
+    note of the rest of the sentence, and the real note of that number,
+    a group of its own further down, then reads as a step back and goes
+    into it. So the step is one, and a number a later group owns is
+    that group's.
 
     :param text: The text of one footnote group.
     :param start: Where the search starts: after the label of the group.
     :param last: The last number that started a note.
     :param page: The page of the group.
     :param marked: :func:`mark_pages`.
+    :param taken: The numbers that start a later group of this page or
+        the next (:func:`_own_labels`).
     :returns: The offset of each label, in order.
     :rtype: list[int]
     """
@@ -545,7 +565,7 @@ def inline_labels(
         return cuts
     for found in _INLINE_LABEL.finditer(text, start):
         number = int(found.group(1))
-        if not last < number <= last + LABEL_STEP:
+        if number != last + 1 or number in taken:
             continue
         if not marked.get(number, set()) & {page, page - 1}:
             continue
@@ -694,29 +714,39 @@ def _plain_note(item: dict) -> dict:
     return {**item, "group": {**group, "kind": kind, "marks": marks}}
 
 
-def _opening_mark(document: dict, flow: list[dict]) -> tuple[int, int] | None:
-    """Return the first numbered mark of the body, when notes come before it.
+def _opening_mark(document: dict) -> tuple[int, int] | None:
+    """Return ``(number, page)`` of the first numbered mark of the body.
 
     The first page of an opinion that starts in the middle of a page can
     hold the last footnotes of the opinion before it. Their labels are
     the end of another series ("26."), so the opinion's own note 1 reads
     as a step back and went into that note, with every note up to the
     foreign label. The body says where its own series starts: its first
-    mark. The rule is armed only when a footnote group lies on a page
-    before that mark, so an opinion with no such group keeps the rule
-    of one series.
+    mark (:func:`_opens`).
 
     :param document: The ensemble document.
-    :param flow: The footnote items of the document.
-    :returns: ``(number, page)`` of the mark, or None.
+    :returns: The mark, or None when the body has none.
     """
     marks = _number_marks(document)
-    if not marks:
-        return None
-    number, page = marks[0]
-    if any("group" in item and item["page"] < page for item in flow):
-        return number, page
-    return None
+    return marks[0] if marks else None
+
+
+def _is_foreign(
+    last: int | None, last_page: int | None, marked: dict[int, set[int]]
+) -> bool:
+    """Return whether the last note is one the body does not cite.
+
+    A note of the opinion has its mark on its page or the page before.
+    The last note of the opinion before has none there: its number is
+    cited further on, if at all.
+
+    :param last: The last number that started a note.
+    :param last_page: The page of that note.
+    :param marked: :func:`mark_pages`.
+    """
+    if last is None or last_page is None:
+        return False
+    return not marked.get(last, set()) & {last_page, last_page - 1}
 
 
 def _opens(
@@ -726,15 +756,56 @@ def _opens(
     opening: tuple[int, int] | None,
 ) -> bool:
     """Return whether a group's label is the first note of the opinion,
-    after the notes of the opinion before it (:func:`_opening_mark`)."""
+    after the notes of the opinion before it.
+
+    The label is the number of the body's first mark, on the page of
+    that mark or the next, and a step back from the last label. The
+    caller passes ``opening`` only while the last note is foreign
+    (:func:`_is_foreign`) and the first note has not started, so a
+    continuation that starts with a small number after one of the
+    opinion's own notes stays text.
+
+    :param split: :func:`split_label` of the group.
+    :param item: The item of the group.
+    :param last: The last number that started a note.
+    :param opening: :func:`_opening_mark`, or None.
+    """
     return (
         split is not None
         and opening is not None
         and split[0].isdigit()
         and int(split[0]) == opening[0]
-        and item["page"] >= opening[1]
+        and opening[1] <= item["page"] <= opening[1] + 1
         and _starts_again(split[0], last)
     )
+
+
+def _own_labels(flow: list[dict]) -> list[tuple[int, int, int]]:
+    """Return ``(index in the flow, number, page)`` of each group that
+    starts with a label of its own: a number with its period or its
+    parenthesis, or a ``sup`` mark. :func:`inline_labels` leaves such a
+    number to its group."""
+    found = []
+    for index, item in enumerate(flow):
+        group = item.get("group")
+        if group is None:
+            continue
+        text = group.get("text") or ""
+        own = _OWN_LABEL.match(text)
+        if own:
+            found.append((index, int(own.group(1)), item["page"]))
+            continue
+        split = split_label(group)
+        if (
+            split
+            and split[0].isdigit()
+            and any(
+                mark.get("kind") == "sup" and not text[: mark["start"]].strip()
+                for mark in group.get("marks") or []
+            )
+        ):
+            found.append((index, int(split[0]), item["page"]))
+    return found
 
 
 def _restarts_here(
@@ -760,6 +831,7 @@ def _labelled_parts(
     restarts: list[tuple[str, int]],
     marked: dict[int, set[int]],
     opening: tuple[int, int] | None,
+    taken: frozenset[int],
 ) -> list[dict]:
     """Return the items of one footnote group, cut at its inner labels.
 
@@ -772,7 +844,10 @@ def _labelled_parts(
     :param last: The last number that started a note.
     :param restarts: The restarts not taken yet.
     :param marked: :func:`mark_pages`.
-    :param opening: :func:`_opening_mark`, while no note took it.
+    :param opening: :func:`_opening_mark`, while :func:`_opens` may
+        take it.
+    :param taken: The numbers a later group of the page or the next
+        starts with.
     :rtype: list[dict]
     """
     group = item["group"]
@@ -793,7 +868,7 @@ def _labelled_parts(
     ):
         last = int(split[0])
         start = len(text) - len(split[1])
-    cuts = inline_labels(text, start, last, item["page"], marked)
+    cuts = inline_labels(text, start, last, item["page"], marked, taken)
     return _cut(item, cuts) if cuts else [item]
 
 
@@ -834,14 +909,30 @@ def footnotes(document: dict) -> list[dict]:
     restarts = mark_restarts(document)
     marked = mark_pages(document)
     flow = _flow(document, FOOTNOTE_SECTION)
-    opening = _opening_mark(document, flow)
-    for whole in flow:
+    opening = _opening_mark(document)
+    own = _own_labels(flow)
+    last_page = None
+    for index, whole in enumerate(flow):
         if "group" not in whole:
             before = whole
             continue
         whole = _plain_note(whole)
+        taken = frozenset(
+            number
+            for at, number, page in own
+            if at > index and page in (whole["page"], whole["page"] + 1)
+        )
         for at, item in enumerate(
-            _labelled_parts(whole, last_number, restarts, marked, opening)
+            _labelled_parts(
+                whole,
+                last_number,
+                restarts,
+                marked,
+                opening
+                if _is_foreign(last_number, last_page, marked)
+                else None,
+                taken,
+            )
         ):
             split = split_label(item["group"])
             # A note starts on the page of its mark, so a group on a
@@ -851,7 +942,14 @@ def footnotes(document: dict) -> list[dict]:
             if split and (
                 at > 0
                 or again
-                or _opens(split, item, last_number, opening)
+                or _opens(
+                    split,
+                    item,
+                    last_number,
+                    opening
+                    if _is_foreign(last_number, last_page, marked)
+                    else None,
+                )
                 or _is_next_label(split[0], last_number)
                 or _is_marked_label(
                     split[0], last_number, item["page"], marked
@@ -859,12 +957,17 @@ def footnotes(document: dict) -> list[dict]:
             ):
                 if again:
                     restarts.pop(0)
-                if opening and item["page"] >= opening[1]:
-                    # The series of the opinion has started.
-                    opening = None
                 label, text, marks = split
                 if label.isdigit():
                     last_number = int(label)
+                    last_page = item["page"]
+                    if (
+                        opening
+                        and last_number == opening[0]
+                        and item["page"] >= opening[1]
+                    ):
+                        # The first note of the opinion has started.
+                        opening = None
                 notes.append(
                     {
                         "label": label,

@@ -756,6 +756,57 @@ class TestTheFootnotes(TestCase):
         self.assertEqual([n["label"] for n in notes], ["3", "8", "9"])
         self.assertEqual(notes[2]["paragraphs"][0]["text"], "Nine.")
 
+    def test_a_cited_number_two_ahead_inside_a_group_is_text(self):
+        """A cut takes the last label plus one and no other. "See App.
+        10, 14. The witness" inside note 12 is no note 14, though the
+        body cites 14: notes 13 and 14 are groups of their own."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "12"),
+                    self.cited(1, "B.", "13"),
+                    self.cited(2, "C.", "14"),
+                    self.note(3, "12. See the record. 14. The witness said."),
+                    self.note(4, "13. Thirteen."),
+                    self.note(5, "14. Fourteen.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["12", "13", "14"])
+        self.assertEqual(
+            notes[0]["paragraphs"][0]["text"],
+            "See the record. 14. The witness said.",
+        )
+
+    def test_a_number_of_a_citation_is_no_note_before_the_real_one(self):
+        """A sentence of note 12 goes on with "13. The" and the body cites 13:
+        the real note 13 is the next group, so the number stays text
+        and the mark links to the real note."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "12"),
+                    self.cited(1, "B.", "13"),
+                    self.note(2, "12. See the order, supra. 13. The court."),
+                    self.note(3, "13. Thirteen.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["12", "13"])
+        self.assertEqual(notes[1]["paragraphs"][0]["text"], "Thirteen.")
+        self.assertEqual(
+            notes[0]["paragraphs"][0]["text"],
+            "See the order, supra. 13. The court.",
+        )
+
     def test_a_number_out_of_the_series_inside_a_group_is_text(self):
         """A cut inside a group takes the next numbers of the series
         alone, whatever the body cites: "9." after note 3 stays text."""
@@ -808,6 +859,41 @@ class TestTheFootnotes(TestCase):
             second["paragraphs"][0]["marks"],
             [{"kind": "em", "start": 4, "end": 7}],
         )
+
+    def test_the_notes_of_the_opinion_before_on_the_page_of_the_mark(self):
+        """An opinion that starts in the middle of a page: the last note
+        of the opinion before and the first mark are on one page."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "26. The last."),
+                    self.note(3, "1. One."),
+                    self.note(4, "2. Two.", column="R"),
+                ],
+            ),
+            page(1, [self.note(0, "1 U.S.C. § 1 says so.")]),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["26", "1", "2"])
+        self.assertEqual(len(notes[2]["paragraphs"]), 2)
+
+    def test_the_first_mark_opens_no_series_two_pages_on(self):
+        """The first note is on the page of its mark or the next: a
+        small number further on is the rest of the note before it."""
+        doc = document(
+            page(0, [self.cited(0, "A.", "1"), self.note(1, "26. See")]),
+            page(1, [group(0, "B.")]),
+            page(2, [self.note(0, "1 U.S.C. § 1.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "26")
 
     def test_the_first_notes_in_one_block_after_the_notes_before(self):
         """The opinion's own notes 1 and 2, read as one block under the
@@ -927,6 +1013,14 @@ class TestTheFootnotes(TestCase):
             ("Three 4. Four.", 3, []),
             ("Three. 4 Four.", 3, []),
             ("Three. 6. Six.", 3, []),
+            ("Three. 5. Five.", 3, []),
+            ("See Fed. R. Civ. P. 4. The rule.", 3, []),
+            ("See Doc. 4. The order.", 3, []),
+            ("See Dkt. 4. The order.", 3, []),
+            ("See Tr. 4. The witness.", 3, []),
+            ("See App. 4. The record.", 3, []),
+            ("See Id. at 2, 4. The rule.", 3, []),
+            ("Id. 4. Four.", 3, [4]),
             ("Three. 4. Four.", 4, []),
             ("Three. 4. Four.", None, []),
         ]
@@ -935,6 +1029,15 @@ class TestTheFootnotes(TestCase):
                 self.assertEqual(
                     paragraphs.inline_labels(text, 0, last, 0, marked), cuts
                 )
+
+    def test_a_number_a_later_group_starts_with_is_no_label_inside(self):
+        """``inline_labels`` leaves a number to the group that owns it."""
+        self.assertEqual(
+            paragraphs.inline_labels(
+                "Three. 4. Four.", 0, 3, 0, {4: {0}}, frozenset({4})
+            ),
+            [],
+        )
 
     def test_a_label_inside_a_text_needs_its_mark_near(self):
         """The mark is on the page of the group or the page before."""
