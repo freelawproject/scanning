@@ -827,3 +827,144 @@ def cards(scan: Scan) -> list[dict]:
     order = {group: i for i, group in enumerate(GROUPS)}
     built.sort(key=lambda c: (order[c["group"]], c["page_index"], c["key"]))
     return built
+
+
+# ---------------------------------------------------------------------------
+# The queue of every volume (``/scans/all/cards/``)
+# ---------------------------------------------------------------------------
+
+#: The group of each kind of finding card, for the queue: a faint
+#: bracket is judged beside the missed ones, a picture the readers saw
+#: beside the image boxes.
+KIND_GROUPS = {
+    CAPTION: CAPTION,
+    BRACKET: BRACKET,
+    FAINT: BRACKET,
+    TEXT: TEXT,
+    PICTURE: IMAGE,
+}
+
+#: The group of each label of ``MODEL_BOXES``.
+MODEL_GROUPS = {
+    Label.IMAGE.name: IMAGE,
+    Label.EDITORIAL.name: EDITORIAL,
+}
+
+#: The cards the queue hands out at a time. A reload of the page hands
+#: out the next ones: an answered card is gone from the server's list.
+QUEUE_SIZE = 100
+
+
+def _sources(group: str) -> tuple[list[str], list[str]]:
+    """Return the checks and the model labels whose cards a group holds."""
+    checks = [c for c, kind in CHECKS.items() if KIND_GROUPS[kind] == group]
+    labels = [label for label, g in MODEL_GROUPS.items() if g == group]
+    return checks, labels
+
+
+def _open_findings(checks: list[str]):
+    return Issue.objects.filter(check_name__in=checks, dismissal__isnull=True)
+
+
+def _open_rows(labels: list[str]):
+    # The rows ``cards`` walks: live, of a model, with no decision.
+    return (
+        Detection.objects.live()
+        .filter(label__in=labels, decision__isnull=True)
+        .exclude(model_name=Detection.ModelName.MANUAL)
+    )
+
+
+def queue_scan_ids(group: str) -> list[int]:
+    """Return the volumes in review 2 with a card of ``group``, oldest first.
+
+    :param group: One of ``GROUPS``.
+    :returns: Scan ids, in pk order.
+    """
+    from django.db.models import Exists, OuterRef, Q
+
+    from scanning.models import Status
+
+    checks, labels = _sources(group)
+    work = Q()
+    if checks:
+        work |= Q(Exists(_open_findings(checks).filter(scan=OuterRef("pk"))))
+    if labels:
+        work |= Q(Exists(_open_rows(labels).filter(scan=OuterRef("pk"))))
+    return list(
+        Scan.objects.filter(work, status=Status.READY_FOR_REDACTION_REVIEW)
+        .order_by("pk")
+        .values_list("pk", flat=True)
+    )
+
+
+def queue_totals() -> dict[str, int]:
+    """Return how many cards of each group wait, over every volume.
+
+    The findings are counted exactly; the model boxes count every live,
+    undecided row, so the editor's notes inside a blackout, which make
+    no card, are in the number too.
+
+    :returns: ``{group: count}`` in ``GROUPS`` order.
+    """
+    from django.db.models import Count
+
+    from scanning.models import Status
+
+    ready = {"scan__status": Status.READY_FOR_REDACTION_REVIEW}
+    by_check = dict(
+        _open_findings(list(CHECKS))
+        .filter(**ready)
+        .order_by()
+        .values_list("check_name")
+        .annotate(n=Count("pk"))
+    )
+    by_label = dict(
+        _open_rows(list(MODEL_GROUPS))
+        .filter(**ready)
+        .order_by()
+        .values_list("label")
+        .annotate(n=Count("pk"))
+    )
+    totals = dict.fromkeys(GROUPS, 0)
+    for check, n in by_check.items():
+        totals[KIND_GROUPS[CHECKS[check]]] += n
+    for label, n in by_label.items():
+        totals[MODEL_GROUPS[label]] += n
+    return totals
+
+
+def queue_cards(
+    group: str, scan_ids: list[int], limit: int = QUEUE_SIZE
+) -> tuple[list[dict], list[int]]:
+    """Return the next cards of one group, over the volumes given.
+
+    Each volume's cards are built whole (``cards``), and the walk stops
+    at ``limit``. Every card carries its ``scan``, and its ``key`` is
+    prefixed by it, because two volumes share addresses.
+
+    :param group: One of ``GROUPS``.
+    :param scan_ids: The volumes to walk, in order.
+    :param limit: The most cards to return.
+    :returns: ``(cards, the volumes they come from)``.
+    """
+    out: list[dict] = []
+    used: list[int] = []
+    scans = Scan.objects.select_related("reporter").defer(*Scan.large_fields())
+    for pk in scan_ids:
+        if len(out) >= limit:
+            break
+        scan = scans.filter(pk=pk).first()
+        if scan is None:
+            continue
+        mine = [c for c in cards(scan) if c["group"] == group]
+        if not mine:
+            continue
+        used.append(pk)
+        volume = f"{scan.volume} {scan.reporter.cite_name}"
+        for card in mine[: limit - len(out)]:
+            card["scan"] = pk
+            card["volume"] = volume
+            card["key"] = f"{pk}:{card['key']}"
+            out.append(card)
+    return out, used
