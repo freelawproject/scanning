@@ -105,6 +105,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 renderInsertedPage(entry);
             }
         });
+        renderInsertedList();
     }
 
     function createPdfPlaceholder(entry) {
@@ -399,9 +400,111 @@ document.addEventListener('DOMContentLoaded', function () {
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
         pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        describeInsert(pageDiv, entry.logical_number, entry.insert_edit_id, entry.insert_kind, entry.unplaced);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
         drawInsertedPdf(pageDiv);
+    }
+
+    // What the sidebar's list of uploaded files reads off an inserted
+    // page: the label it was filed under, its row, its kind. The list
+    // is drawn from the pages the viewer shows and from nothing else.
+    function describeInsert(pageDiv, label, editId, kind, unplaced) {
+        pageDiv.dataset.insertLabel = label === undefined || label === null ? '' : label;
+        pageDiv.dataset.insertEditId = editId || '';
+        pageDiv.dataset.insertKind = kind === 'pdf' ? 'pdf' : 'image';
+        if (unplaced) { pageDiv.dataset.insertUnplaced = '1'; }
+    }
+
+    // The PDF page an inserted page stands after, read off the viewer:
+    // the nearest page of the original above it, 0 for none.
+    function pdfPageBefore(pageDiv) {
+        var el = pageDiv.previousElementSibling;
+        while (el) {
+            if (el.classList.contains('lazy-page') && el.dataset.pdfIndex !== undefined) {
+                return parseInt(el.dataset.pdfIndex, 10) + 1;
+            }
+            el = el.previousElementSibling;
+        }
+        return 0;
+    }
+
+    // The sidebar's list of the uploaded files, in the order they
+    // stand, redrawn whole after every upload. The page list walks the
+    // original's pages alone, so without it an upload shows only at
+    // its own place in the viewer. Several files under one label in
+    // one gap are the parts of one span (#638): the label is the
+    // span's for each of them, so the row says which part it is.
+    function renderInsertedList() {
+        var section = document.getElementById('inserted-section');
+        var list = document.getElementById('inserted-list');
+        var count = document.getElementById('inserted-count');
+        if (!section || !list) { return; }
+        var rows = [];
+        container.querySelectorAll('.inserted-page').forEach(function (pageDiv) {
+            var row = {
+                page: pageDiv,
+                label: pageDiv.dataset.insertLabel || '',
+                kind: pageDiv.dataset.insertKind,
+                unplaced: pageDiv.dataset.insertUnplaced === '1',
+                after: pdfPageBefore(pageDiv),
+                part: 1,
+                parts: 1,
+            };
+            var before = rows[rows.length - 1];
+            var prior = pageDiv.previousElementSibling;
+            if (before && prior === before.page && before.label === row.label
+                    && !before.unplaced && !row.unplaced) {
+                row.part = before.part + 1;
+            }
+            rows.push(row);
+        });
+        for (var i = rows.length - 1; i >= 0; i--) {
+            var next = rows[i + 1];
+            rows[i].parts = next && next.part === rows[i].part + 1
+                ? next.parts : rows[i].part;
+        }
+        if (count) { count.textContent = rows.length; }
+        section.hidden = rows.length === 0;
+        list.textContent = '';
+        rows.forEach(function (row) {
+            var card = document.createElement('div');
+            card.className = 'inserted-card';
+            card.title = 'Show this file in the viewer';
+            var head = document.createElement('div');
+            head.className = 'inserted-card-head';
+            var label = document.createElement('span');
+            label.className = 'inserted-card-label';
+            label.textContent = row.label
+                ? (/^\d+-\d+$/.test(row.label) ? 'Pages ' : 'Page ') + row.label
+                : 'No page number';
+            head.appendChild(label);
+            var kind = document.createElement('span');
+            kind.className = 'inserted-card-kind';
+            kind.textContent = row.kind === 'pdf' ? 'PDF' : 'IMAGE';
+            head.appendChild(kind);
+            if (row.parts > 1) {
+                var part = document.createElement('span');
+                part.className = 'inserted-card-part';
+                part.textContent = 'file ' + row.part + ' of ' + row.parts;
+                head.appendChild(part);
+            }
+            card.appendChild(head);
+            var where = document.createElement('p');
+            where.className = 'inserted-card-where';
+            where.textContent = row.unplaced
+                ? 'This volume has no place for it'
+                : (row.after ? 'after PDF p. ' + row.after : 'before PDF p. 1');
+            card.appendChild(where);
+            card.addEventListener('click', function () {
+                window.scrollPageIntoView(row.page);
+                row.page.classList.add('inserted-shown');
+                setTimeout(function () {
+                    row.page.classList.remove('inserted-shown');
+                }, 2000);
+            });
+            list.appendChild(card);
+        });
     }
 
     // A curator may upload a PDF of the page as well as an image
@@ -1553,8 +1656,10 @@ document.addEventListener('DOMContentLoaded', function () {
         inserted.className = 'page-container inserted-page';
         inserted.style.width = '';
         inserted.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id, false, data.kind, data.file_url);
+        describeInsert(inserted, pageNumber, data.edit_id, data.kind, false);
         bindRemoveInsert(inserted, data.edit_id);
         drawInsertedPdf(inserted);
+        renderInsertedList();
         if (keepCard) {
             var placeholder = pageDiv.querySelector('.missing-placeholder');
             var form = pageDiv.querySelector('.insert-form');
