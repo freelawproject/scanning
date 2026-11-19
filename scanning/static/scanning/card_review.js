@@ -188,7 +188,7 @@
     // ── the crop ─────────────────────────────────────────────────────
     /** The PDF of the card's volume. On the queue each volume's scan is
      *  read through a presigned URL its card names (``pdf_source``),
-     *  in the space step 2 draws, once per volume. */
+     *  in the space step 2 draws, downloaded whole once per volume. */
     var pdfs = {};
     function getPdf(card) {
         if (!cfg.queue) {
@@ -200,7 +200,12 @@
                 if (!answer.ok || !answer.data || !answer.data.url) {
                     throw new Error((answer.data && (answer.data.error || answer.data.message)) || 'no URL for the scan');
                 }
-                return pdfjsLib.getDocument({ url: answer.data.url, disableAutoFetch: true, disableStream: true }).promise;
+                // One download of the whole copy, as the one-volume page
+                // reads it: read in ranges, a page deep in the volume cost
+                // a 64 KB request for every page before it, because pdf.js
+                // walks the page objects in order and each sits beside its
+                // page's image (1,183 requests, no crop, 2026-11-19).
+                return pdfjsLib.getDocument({ url: answer.data.url, disableRange: true }).promise;
             });
             pdfs[card.scan].catch(function () { delete pdfs[card.scan]; });
         }
@@ -244,12 +249,15 @@
         if (!canvas || canvas.dataset.drawn) { return; }
         canvas.dataset.drawn = '1';
         var crop = cropOf(card);
-        renders = renders.then(function () {
-            // Scrolled past before its turn: its canvas was given back.
-            if (!canvas.isConnected) { return null; }
-            return getPdf(card).then(function (doc) {
-                return doc.getPage(card.page_index + 1);
-            }).then(function (page) {
+        // The volume's PDF and the page load at once, beside the
+        // others; only the render waits its turn, so a slow volume
+        // holds no other volume's crops.
+        getPdf(card).then(function (doc) {
+            return doc.getPage(card.page_index + 1);
+        }).then(function (page) {
+            var turn = renders.then(function () {
+                // Scrolled past before its turn: its canvas was given back.
+                if (!canvas.isConnected) { return null; }
                 var base = page.getViewport({ scale: 1 });
                 var scale = card.img_width / base.width * DPR;
                 var viewport = page.getViewport({
@@ -257,15 +265,17 @@
                 });
                 canvas.width = Math.ceil((crop[2] - crop[0]) * DPR);
                 canvas.height = Math.ceil((crop[3] - crop[1]) * DPR);
-                return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise
-                    .then(function () {
-                        // The decoded scan image goes once the crop is
-                        // drawn: pdf.js keeps every page's otherwise.
-                        page.cleanup();
-                    });
-            }).catch(function (error) {
-                wrap.replaceChildren(note('The scan did not load: ' + (error && error.message), 'error'));
+                return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise;
+            }).then(function () {
+                // The decoded scan image goes once the crop is drawn:
+                // pdf.js keeps every page's otherwise.
+                page.cleanup();
             });
+            // A failed render ends its turn and never the line.
+            renders = turn.catch(function () {});
+            return turn;
+        }).catch(function (error) {
+            wrap.replaceChildren(note('The scan did not load: ' + (error && error.message), 'error'));
         });
     }
 

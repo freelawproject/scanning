@@ -39,6 +39,8 @@ the wrong column.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 
@@ -742,7 +744,7 @@ def attach_others(built: list[dict], scan: Scan) -> None:
         ]
 
 
-def cards(scan: Scan) -> list[dict]:
+def cards(scan: Scan, groups: Collection[str] | None = None) -> list[dict]:
     """Return the cards of a scan, in the order of the page.
 
     The open findings of ``CHECKS`` and the live model rows of
@@ -754,9 +756,20 @@ def cards(scan: Scan) -> list[dict]:
     is not redacted yet (``editorial_card``).
 
     :param scan: The scan.
+    :param groups: The groups to build, or None for all of them: the
+        queue of every volume builds the one it hands out, because a
+        volume's image boxes are fitted one by one (``attach_fits``).
     :returns: The cards.
     :rtype: list[dict]
     """
+    checks, labels = list(CHECKS), list(MODEL_BOXES)
+    if groups is not None:
+        checks = [
+            c for c, kind in CHECKS.items() if KIND_GROUPS[kind] in groups
+        ]
+        labels = [
+            label for label in MODEL_BOXES if MODEL_GROUPS[label] in groups
+        ]
     built: list[dict] = []
     builders = {
         CAPTION: caption_card,
@@ -766,7 +779,7 @@ def cards(scan: Scan) -> list[dict]:
         PICTURE: picture_card,
     }
     issues = Issue.objects.filter(
-        scan=scan, check_name__in=list(CHECKS), dismissal__isnull=True
+        scan=scan, check_name__in=checks, dismissal__isnull=True
     ).order_by("page_number", "pk")
     for issue in issues:
         card = builders[CHECKS[issue.check_name]](issue)
@@ -787,7 +800,7 @@ def cards(scan: Scan) -> list[dict]:
     # was judged, and makes no card.
     rows = list(
         Detection.objects.live()
-        .filter(scan=scan, label__in=list(MODEL_BOXES), decision__isnull=True)
+        .filter(scan=scan, label__in=labels, decision__isnull=True)
         .exclude(model_name=Detection.ModelName.MANUAL)
         .order_by("page_index", "y0", "pk")
     )
@@ -1006,7 +1019,7 @@ def queue_cards(
         scan = scans.filter(pk=pk).first()
         if scan is None:
             continue
-        mine = [c for c in cards(scan) if c["group"] == group]
+        mine = [c for c in cards(scan, {group}) if c["group"] == group]
         if not mine:
             continue
         used.append(pk)
