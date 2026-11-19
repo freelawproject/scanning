@@ -233,24 +233,39 @@
     /** Draw the crop of a card: the page rendered at the scale of the
      *  image space the box lives in, offset so the canvas holds the
      *  crop alone. */
+    /** The crops draw one at a time, in the order they came into
+     *  view: each render decodes its page's whole scan image, and a
+     *  hundred started at once by a quick scroll ran the tab out of
+     *  memory ("Out of memory", 2026-11-19). */
+    var renders = Promise.resolve();
+
     function drawCrop(card, wrap) {
         var canvas = wrap.querySelector('canvas');
         if (!canvas || canvas.dataset.drawn) { return; }
         canvas.dataset.drawn = '1';
         var crop = cropOf(card);
-        getPdf(card).then(function (doc) {
-            return doc.getPage(card.page_index + 1);
-        }).then(function (page) {
-            var base = page.getViewport({ scale: 1 });
-            var scale = card.img_width / base.width * DPR;
-            var viewport = page.getViewport({
-                scale: scale, offsetX: -crop[0] * DPR, offsetY: -crop[1] * DPR
+        renders = renders.then(function () {
+            // Scrolled past before its turn: its canvas was given back.
+            if (!canvas.isConnected) { return null; }
+            return getPdf(card).then(function (doc) {
+                return doc.getPage(card.page_index + 1);
+            }).then(function (page) {
+                var base = page.getViewport({ scale: 1 });
+                var scale = card.img_width / base.width * DPR;
+                var viewport = page.getViewport({
+                    scale: scale, offsetX: -crop[0] * DPR, offsetY: -crop[1] * DPR
+                });
+                canvas.width = Math.ceil((crop[2] - crop[0]) * DPR);
+                canvas.height = Math.ceil((crop[3] - crop[1]) * DPR);
+                return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise
+                    .then(function () {
+                        // The decoded scan image goes once the crop is
+                        // drawn: pdf.js keeps every page's otherwise.
+                        page.cleanup();
+                    });
+            }).catch(function (error) {
+                wrap.replaceChildren(note('The scan did not load: ' + (error && error.message), 'error'));
             });
-            canvas.width = Math.ceil((crop[2] - crop[0]) * DPR);
-            canvas.height = Math.ceil((crop[3] - crop[1]) * DPR);
-            return page.render({ canvasContext: canvas.getContext('2d'), viewport: viewport }).promise;
-        }).catch(function (error) {
-            wrap.replaceChildren(note('The scan did not load: ' + (error && error.message), 'error'));
         });
     }
 
