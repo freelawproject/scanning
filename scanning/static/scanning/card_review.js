@@ -1312,6 +1312,55 @@
     }
 
     // ── the page ─────────────────────────────────────────────────────
+    // ── the walk of every volume (?group=) ──────────────────────────
+    /** Seconds between the last answer and the next volume. */
+    var ADVANCE_SECONDS = 3;
+    var advanceTimer = null;
+    /** Stay here was pressed: no more going on by itself. */
+    var stayed = false;
+
+    function cancelAdvance() {
+        if (advanceTimer) { clearTimeout(advanceTimer); advanceTimer = null; }
+        var line = root.querySelector('[data-role="advance-note"]');
+        if (line) { line.replaceChildren(); }
+    }
+
+    /** Every card answered or skipped, and no write in flight: the next
+     *  volume opens after a moment, which an Undo or Stay here stops. */
+    function maybeAdvance() {
+        var line = root.querySelector('[data-role="advance-note"]');
+        if (!cfg.next_url || !line || stayed || bulkRunning) { return; }
+        var open = cards.filter(function (card) {
+            return pending[card.key] || (!answers[card.key] && !skipped[card.key]);
+        });
+        if (open.length) { cancelAdvance(); return; }
+        if (advanceTimer) { return; }
+        line.replaceChildren(el('span', null, 'Every card answered: the next volume opens in ' + ADVANCE_SECONDS + ' s. '));
+        var stay = el('button', 'btn-outline text-xs', 'Stay here');
+        stay.type = 'button';
+        stay.addEventListener('click', function () { stayed = true; cancelAdvance(); });
+        line.appendChild(stay);
+        advanceTimer = setTimeout(function () {
+            // The last answer's write, and its rebuild, land first.
+            writes.then(function () { window.location.href = cfg.next_url; });
+        }, ADVANCE_SECONDS * 1000);
+    }
+
+    /** The next volume's copy, fetched once this page's own is in: the
+     *  browser keeps it (its address names its run), so the next page
+     *  draws its crops without the wait. The body is read and let go. */
+    function prefetchNext() {
+        if (!cfg.next_pdf_url || !window.fetch) { return; }
+        fetch(cfg.next_pdf_url, { credentials: 'same-origin' }).then(function (response) {
+            if (!response.ok || !response.body) { return null; }
+            var reader = response.body.getReader();
+            function drain() {
+                return reader.read().then(function (part) { if (!part.done) { return drain(); } return null; });
+            }
+            return drain();
+        }).catch(function () {});
+    }
+
     function countAll() {
         var keys = {};
         cards.forEach(function (card) { keys[card.key] = true; });
@@ -1328,6 +1377,7 @@
             });
         }
         refreshUndoEdit();
+        maybeAdvance();
     }
 
     function render() {
@@ -1606,6 +1656,11 @@
         });
         load().then(function () {
             if (!activeCard()) { focusNextCard(); }
+            // The next volume's copy once this one's is in, never beside
+            // it: the two would share the line.
+            if (cfg.next_pdf_url) {
+                getPdf().then(function () { setTimeout(prefetchNext, 1000); }, function () {});
+            }
         });
     });
 })();
