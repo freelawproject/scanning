@@ -5469,3 +5469,109 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
     """
     scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})
+
+
+#: How long the grand totals of the queue page are kept: the counts
+#: join the detection table, and a reload every hundred cards need not
+#: count it again.
+CARD_QUEUE_TOTALS_SECONDS = 120
+
+
+@login_required
+def all_card_review(request: HttpRequest) -> HttpResponse:
+    """Review one kind of card over every volume in review 2.
+
+    The card review of one volume (:func:`scan_card_review`), with the
+    cards of one group (``?group=bracket``) from every volume waiting
+    for review 2, ``card_review.QUEUE_SIZE`` at a time: a reload of the
+    page hands out the next ones. Every answer is the same step-2 write
+    on the card's own volume. Staff only.
+
+    :param request: The HTTP request.
+    :return: The rendered page, or a redirect home for a non-staff user.
+    """
+    from django.core.cache import cache
+
+    if not request.user.is_staff:
+        messages.error(
+            request, "Only staff can review the cards of every volume."
+        )
+        return redirect("scan_list")
+    totals = cache.get("card_queue_totals")
+    if totals is None:
+        totals = card_review.queue_totals()
+        cache.set("card_queue_totals", totals, CARD_QUEUE_TOTALS_SECONDS)
+    group = request.GET.get("group")
+    if group not in card_review.GROUPS:
+        group = None
+    config = {
+        "queue": True,
+        "group": group,
+        "labels": [{"name": label.name, "id": label.value} for label in Label],
+        "cards_url": (
+            # ``group`` is one of ``GROUPS``: a plain word.
+            reverse("all_review_cards") + "?group=" + group if group else None
+        ),
+        # The writes of every volume: the card's own scan goes in place
+        # of the 0 (``urls`` in card_review.js).
+        "url_templates": {
+            name: reverse(name, kwargs={"pk": 0})
+            for name in CARD_REVIEW_WRITES
+        },
+        "review_open": True,
+    }
+    return render(
+        request,
+        "scanning/all_card_review.html",
+        {
+            "config": config,
+            "group": group,
+            "groups": [(g, totals.get(g, 0)) for g in card_review.GROUPS],
+            "queue_size": card_review.QUEUE_SIZE,
+        },
+    )
+
+
+@login_required
+def all_review_cards(request: HttpRequest) -> JsonResponse:
+    """Return the next cards of one group, over every volume in review 2.
+
+    ``?group=`` names the group; ``?scans=1,2,3`` reads those volumes
+    again (the page's Reload), else the walk starts at the oldest
+    volume with a card of the group. Each card carries where its crop
+    reads the scan (``pdf_source``, a presigned URL in JSON, the space
+    step 2 draws) and its step-2 address.
+
+    :param request: The HTTP request.
+    :return: ``{status, cards, scans}``.
+    """
+    if not request.user.is_staff:
+        return JsonResponse(
+            {"status": "error", "message": "Staff only."}, status=403
+        )
+    group = request.GET.get("group")
+    if group not in card_review.GROUPS:
+        return JsonResponse(
+            {"status": "error", "message": "Unknown group."}, status=400
+        )
+    named = [
+        int(v)
+        for v in (request.GET.get("scans") or "").split(",")
+        if v.isdigit()
+    ]
+    built, used = card_review.queue_cards(
+        group, named or card_review.queue_scan_ids(group)
+    )
+    sources = {}
+    for pk in used:
+        scan = Scan.without_caches("ocr_results").get(pk=pk)
+        kwargs = {"pk": pk}
+        final = _review_flags(scan)["final_space"]
+        sources[pk] = {
+            "pdf_source": reverse("scan_original_url", kwargs=kwargs)
+            + ("?space=final" if final else ""),
+            "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
+        }
+    for card in built:
+        card.update(sources[card["scan"]])
+    return JsonResponse({"status": "ok", "cards": built, "scans": used})

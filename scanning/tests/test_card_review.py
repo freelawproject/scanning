@@ -26,7 +26,8 @@ from scanning.tests.test_views import ScanningTestCase
 
 APP = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = APP / "static" / "scanning" / "card_review.js"
-TEMPLATE = APP / "templates" / "scanning" / "scan_card_review.html"
+# The sections live in the include both card pages share.
+TEMPLATE = APP / "templates" / "scanning" / "_card_review_sections.html"
 
 
 def finding(
@@ -710,3 +711,119 @@ class TestTheEndpoints(ScanningTestCase):
         answer = self._post("restore_detection", {"detection_id": row.pk})
         self.assertEqual(answer.status_code, 200)
         self.assertEqual(answer.json()["restored"], 0)
+
+
+class TestTheQueueOfEveryVolume(ScanningTestCase):
+    """``/scans/all/cards/``: one group of cards over every volume in
+    review 2, ``QUEUE_SIZE`` at a time, each card on its own volume."""
+
+    BRACKET = {
+        "bbox": [200.0, 1000.0, 800.0, 1400.0],
+        "guess": [236.0, 1000.0, 290.0, 1033.0],
+    }
+
+    def setUp(self):
+        self.first = make_scan()
+        self.second = make_scan()
+        finding(self.first, CheckName.MISSING_HEADNOTE_BRACKET, self.BRACKET)
+        finding(
+            self.second,
+            CheckName.MISSING_HEADNOTE_BRACKET,
+            self.BRACKET,
+            page_index=1,
+        )
+        finding(
+            self.second,
+            CheckName.UNBOXED_PICTURE,
+            {"bbox": [100.0, 100.0, 900.0, 900.0], "readers": ["surya"]},
+        )
+
+    def test_the_volumes_with_a_card_of_the_group(self):
+        self.assertEqual(
+            card_review.queue_scan_ids(card_review.BRACKET),
+            [self.first.pk, self.second.pk],
+        )
+        self.assertEqual(card_review.queue_scan_ids(card_review.CAPTION), [])
+
+    def test_the_cards_name_their_volume_and_their_keys_differ(self):
+        """Both volumes hold a bracket at one address on its page."""
+        built, used = card_review.queue_cards(
+            card_review.BRACKET, [self.first.pk, self.second.pk]
+        )
+
+        self.assertEqual(used, [self.first.pk, self.second.pk])
+        self.assertEqual(
+            [c["scan"] for c in built], [self.first.pk, self.second.pk]
+        )
+        self.assertEqual(len({c["key"] for c in built}), 2)
+        self.assertTrue(all(c["group"] == card_review.BRACKET for c in built))
+
+    def test_the_walk_stops_at_the_limit(self):
+        built, used = card_review.queue_cards(
+            card_review.BRACKET, [self.first.pk, self.second.pk], limit=1
+        )
+
+        self.assertEqual(len(built), 1)
+        self.assertEqual(used, [self.first.pk])
+
+    def test_the_totals_count_each_group(self):
+        totals = card_review.queue_totals()
+
+        self.assertEqual(totals[card_review.BRACKET], 2)
+        self.assertEqual(totals[card_review.IMAGE], 1)
+        self.assertEqual(totals[card_review.CAPTION], 0)
+
+    def test_the_page_and_its_list_are_for_staff(self):
+        self.client.force_login(self.make_user())
+
+        page = self.client.get(reverse("all_card_review"))
+        listed = self.client.get(
+            reverse("all_review_cards"), {"group": "bracket"}
+        )
+
+        self.assertEqual(page.status_code, 302)
+        self.assertEqual(listed.status_code, 403)
+
+    def test_the_list_hands_out_the_group_with_each_volumes_sources(self):
+        self.client.force_login(self.make_staff_user())
+
+        answer = self.client.get(
+            reverse("all_review_cards"), {"group": "bracket"}
+        ).json()
+
+        self.assertEqual(answer["scans"], [self.first.pk, self.second.pk])
+        card = answer["cards"][0]
+        self.assertTrue(
+            card["pdf_source"].startswith(
+                reverse("scan_original_url", kwargs={"pk": self.first.pk})
+            )
+        )
+        self.assertTrue(card["step2_url"].endswith("?step=2"))
+
+    def test_the_list_reads_the_named_volumes_again(self):
+        self.client.force_login(self.make_staff_user())
+
+        answer = self.client.get(
+            reverse("all_review_cards"),
+            {"group": "bracket", "scans": str(self.second.pk)},
+        ).json()
+
+        self.assertEqual(answer["scans"], [self.second.pk])
+
+    def test_the_page_shows_the_tabs_and_the_chosen_section(self):
+        self.client.force_login(self.make_staff_user())
+
+        response = self.client.get(
+            reverse("all_card_review"), {"group": "bracket"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        html = response.content.decode()
+        self.assertIn("Headnote brackets", html)
+        self.assertIn('data-group="bracket"', html)
+        self.assertNotIn('data-group="caption"', html)
+        config = response.context["config"]
+        self.assertEqual(
+            config["url_templates"]["add_single_detection"],
+            reverse("add_single_detection", kwargs={"pk": 0}),
+        )
