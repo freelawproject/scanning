@@ -1,60 +1,25 @@
 {% extends "base.html" %}
-{% load static %}
 
 {% comment %}
-  The card review of every volume in review 2 (card_review.queue_cards):
-  one group of cards at a time, QUEUE_SIZE cards from as many volumes as
-  it takes, answered with the keys and the writes of the review of one
-  volume (scan_card_review), each on its card's own volume. A reload of
-  the page hands out the next ones. Staff only.
+  The walk of every volume in review 2 (all_card_review): each kind of
+  card with its open total. A tab opens the card review of the oldest
+  volume holding that kind, showing that kind alone, and its Next volume
+  goes on to the next one. Staff only.
 {% endcomment %}
 
 {% block title %}Cards of every volume - FLP Scanning Portal{% endblock %}
 
-{% block head %}
-<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
-{% endblock %}
-
 {% block content %}
-<div id="card-review">
-  {% csrf_token %}
-  {{ config|json_script:"card-review-config" }}
-  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
-    <h1 class="text-2xl font-bold">Cards of every volume <span class="text-base font-normal text-gray-500 dark:text-gray-400">in review 2</span></h1>
-    {% if group %}
-    <span class="flex flex-wrap items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
-      <span><b data-role="total">…</b> card(s) here · <b data-role="done">0</b> answered · <b data-role="skipped">0</b> skipped</span>
-      <button type="button" class="btn-outline text-sm" data-role="undo-edit" style="display:none" title="Take back the last box moved or resized from a card (u)"></button>
-      <button type="button" class="btn-outline text-sm" data-role="reload" title="Read these volumes' cards again">Reload the cards</button>
-      <a href="?group={{ group }}" class="btn-primary text-sm" title="Hand out the next {{ queue_size }}: the cards answered here are gone from the list">Next {{ queue_size }}</a>
-    </span>
-    {% endif %}
-  </div>
-
-  <nav class="flex flex-wrap gap-2 mb-3" aria-label="Card types">
-    {% for name, total in groups %}
-    <a href="?group={{ name }}" class="{% if name == group %}btn-primary{% else %}btn-outline{% endif %} text-sm">
-      {% if name == "caption" %}Captions{% elif name == "bracket" %}Headnote brackets{% elif name == "text" %}Text in no box{% elif name == "image" %}Images{% else %}Editor's notes{% endif %}
-      <span class="ml-1 font-normal">{{ total }}</span>
-    </a>
-    {% endfor %}
-  </nav>
-
-  {% if group %}
-  <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
-    The next {{ queue_size }} cards of this kind, from the oldest volumes in review 2 first. Each card names its volume, and every answer is that volume's own step-2 write, with its Undo. When these are done, press Next {{ queue_size }} (or reload the page) for more.
-    <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button, <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards.
-  </p>
-  <div data-role="cards-note"></div>
-  {% include "scanning/_card_review_sections.html" %}
-  {% else %}
-  <p class="bk-note">Pick a kind of card above. The numbers are the open cards of every volume waiting for review 2.</p>
-  {% endif %}
-</div>
-{% endblock %}
-
-{% block footer_scripts %}
-<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
-<script src="{% static 'scanning/shared.js' %}"></script>
-<script src="{% static 'scanning/card_review.js' %}"></script>
+<h1 class="text-2xl font-bold mb-2">Cards of every volume <span class="text-base font-normal text-gray-500 dark:text-gray-400">in review 2</span></h1>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-4">
+  Pick a kind of card. It opens the oldest volume with cards of that kind, showing that kind alone, with the keys and the buttons of the card review; Next volume goes on to the next one. The numbers are the open cards over every volume waiting for review 2.
+</p>
+<nav class="flex flex-wrap gap-2" aria-label="Card types">
+  {% for name, total in groups %}
+  <a href="?group={{ name }}" class="btn-outline text-sm{% if not total %} opacity-50{% endif %}">
+    {% if name == "caption" %}Captions{% elif name == "bracket" %}Headnote brackets{% elif name == "text" %}Text in no box{% elif name == "image" %}Images{% else %}Editor's notes{% endif %}
+    <span class="ml-1 font-normal">{{ total }}</span>
+  </a>
+  {% endfor %}
+</nav>
 {% endblock %}

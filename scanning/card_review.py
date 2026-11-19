@@ -39,6 +39,8 @@ the wrong column.
 
 from __future__ import annotations
 
+from collections.abc import Collection
+
 from blackletter.models import Label
 from blackletter.scanner import label_confidence
 
@@ -742,7 +744,7 @@ def attach_others(built: list[dict], scan: Scan) -> None:
         ]
 
 
-def cards(scan: Scan) -> list[dict]:
+def cards(scan: Scan, groups: Collection[str] | None = None) -> list[dict]:
     """Return the cards of a scan, in the order of the page.
 
     The open findings of ``CHECKS`` and the live model rows of
@@ -754,9 +756,20 @@ def cards(scan: Scan) -> list[dict]:
     is not redacted yet (``editorial_card``).
 
     :param scan: The scan.
+    :param groups: The groups to build, or None for all of them: the
+        queue of every volume builds the one it hands out, because a
+        volume's image boxes are fitted one by one (``attach_fits``).
     :returns: The cards.
     :rtype: list[dict]
     """
+    checks, labels = list(CHECKS), list(MODEL_BOXES)
+    if groups is not None:
+        checks = [
+            c for c, kind in CHECKS.items() if KIND_GROUPS[kind] in groups
+        ]
+        labels = [
+            label for label in MODEL_BOXES if MODEL_GROUPS[label] in groups
+        ]
     built: list[dict] = []
     builders = {
         CAPTION: caption_card,
@@ -766,7 +779,7 @@ def cards(scan: Scan) -> list[dict]:
         PICTURE: picture_card,
     }
     issues = Issue.objects.filter(
-        scan=scan, check_name__in=list(CHECKS), dismissal__isnull=True
+        scan=scan, check_name__in=checks, dismissal__isnull=True
     ).order_by("page_number", "pk")
     for issue in issues:
         card = builders[CHECKS[issue.check_name]](issue)
@@ -787,7 +800,7 @@ def cards(scan: Scan) -> list[dict]:
     # was judged, and makes no card.
     rows = list(
         Detection.objects.live()
-        .filter(scan=scan, label__in=list(MODEL_BOXES), decision__isnull=True)
+        .filter(scan=scan, label__in=labels, decision__isnull=True)
         .exclude(model_name=Detection.ModelName.MANUAL)
         .order_by("page_index", "y0", "pk")
     )
@@ -834,10 +847,10 @@ def cards(scan: Scan) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# The queue of every volume (``/scans/all/cards/``)
+# The walk of every volume, one volume at a time (``/scans/all/cards/``)
 # ---------------------------------------------------------------------------
 
-#: The group of each kind of finding card, for the queue: a faint
+#: The group of each kind of finding card, for the walk: a faint
 #: bracket is judged beside the missed ones, a picture the readers saw
 #: beside the image boxes.
 KIND_GROUPS = {
@@ -853,10 +866,6 @@ MODEL_GROUPS = {
     Label.IMAGE.name: IMAGE,
     Label.EDITORIAL.name: EDITORIAL,
 }
-
-#: The cards the queue hands out at a time. A reload of the page hands
-#: out the next ones: an answered card is gone from the server's list.
-QUEUE_SIZE = 25
 
 
 def _sources(group: str) -> tuple[list[str], list[str]]:
@@ -981,39 +990,3 @@ def queue_totals() -> dict[str, int]:
         totals[MODEL_GROUPS[label]] += n
     totals[EDITORIAL] = sum(editorial_cards_by_scan().values())
     return totals
-
-
-def queue_cards(
-    group: str, scan_ids: list[int], limit: int = QUEUE_SIZE
-) -> tuple[list[dict], list[int]]:
-    """Return the next cards of one group, over the volumes given.
-
-    Each volume's cards are built whole (``cards``), and the walk stops
-    at ``limit``. Every card carries its ``scan``, and its ``key`` is
-    prefixed by it, because two volumes share addresses.
-
-    :param group: One of ``GROUPS``.
-    :param scan_ids: The volumes to walk, in order.
-    :param limit: The most cards to return.
-    :returns: ``(cards, the volumes they come from)``.
-    """
-    out: list[dict] = []
-    used: list[int] = []
-    scans = Scan.objects.select_related("reporter").defer(*Scan.large_fields())
-    for pk in scan_ids:
-        if len(out) >= limit:
-            break
-        scan = scans.filter(pk=pk).first()
-        if scan is None:
-            continue
-        mine = [c for c in cards(scan) if c["group"] == group]
-        if not mine:
-            continue
-        used.append(pk)
-        volume = f"{scan.volume} {scan.reporter.cite_name}"
-        for card in mine[: limit - len(out)]:
-            card["scan"] = pk
-            card["volume"] = volume
-            card["key"] = f"{pk}:{card['key']}"
-            out.append(card)
-    return out, used

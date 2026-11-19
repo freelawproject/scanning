@@ -32,6 +32,12 @@
               title="Measure the redactions again: the pairing, the redaction boxes and the margins follow the boxes added here. It runs on the daemon.">Recompute redactions</button>
     </span>
   </div>
+  {% if walk %}
+  <div class="flex flex-wrap items-center justify-between gap-2 mb-2 text-sm">
+    <span class="text-gray-500 dark:text-gray-400">This kind of card alone, volume by volume: {{ walk.left }} more volume{{ walk.left|pluralize }} after this one. <a href="{{ walk.all_url }}" class="underline">All kinds</a></span>
+    <a href="{{ walk.next_url }}" class="btn-primary text-sm" title="The next volume in review 2 with cards of this kind">Next volume &rarr;</a>
+  </div>
+  {% endif %}
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
     <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>e</kbd> an editor's note box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards, <kbd>←</kbd> and <kbd>→</kbd> move a bracket's box sideways.
     Drag a box at its edges to resize it, inside it to move it. Click the label of any other box on the crop to move or resize that one instead (<kbd>Return</kbd> saves it, <kbd>Esc</kbd> leaves it): a card is often answered by pulling a box of the page out to the text.

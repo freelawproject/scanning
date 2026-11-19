@@ -786,7 +786,7 @@ class TestTheRefineScript(ScanningTestCase):
         self.assertIn("function refineOptions(card)", source)
         self.assertIn("(card.fit && card.fit.options)", source)
         self.assertIn("function saveSplit(card, node)", source)
-        self.assertIn("urls(card).add_single_detection", source)
+        self.assertIn("cfg.urls.add_single_detection", source)
         self.assertIn("Array.isArray(answer.undo)", source)
 
     def test_a_pending_split_keeps_its_label_its_reset_and_its_draft(self):

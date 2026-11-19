@@ -1394,16 +1394,9 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             return JsonResponse(
                 {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
             )
-        # ``copy=bitonal`` names the copy step 2 draws, a page of which
-        # decodes to a thirtieth of the full-quality one: the card queue
-        # of every volume crops from it, and a hundred crops of colour
-        # pages ran a tab out of memory (2026-11-19).
-        key = (
-            run.bitonal_key
-            if request.GET.get("copy") == "bitonal"
-            else run.final_pdf_key
+        url = s3_sync.presign_get(
+            run.final_pdf_key, settings.ORIGINAL_VIEW_PRESIGN_TTL
         )
-        url = s3_sync.presign_get(key, settings.ORIGINAL_VIEW_PRESIGN_TTL)
         return JsonResponse({"url": url, "embedded_whole": False})
 
     url = s3_sync.presign_original_get(scan)
@@ -5428,6 +5421,10 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     cut from the PDF step 2 draws, chosen by the rule step 2 reads
     (``final_space``).
 
+    ``?group=`` shows one kind of card alone (``card_review.GROUPS``),
+    with a link to the next volume that holds that kind: the walk of
+    every volume, one volume at a time (:func:`all_card_review`).
+
     :param request: The HTTP request.
     :param pk: Scan primary key.
     :return: The rendered page.
@@ -5438,13 +5435,32 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     kwargs = {"pk": scan.pk}
     pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
     review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
+    group = request.GET.get("group")
+    if group not in card_review.GROUPS:
+        group = None
+    cards_url = reverse("scan_review_cards", kwargs=kwargs)
+    walk = None
+    if group:
+        # ``group`` is one of ``GROUPS``: a plain word.
+        cards_url += "?group=" + group
+        later = [
+            other
+            for other in card_review.queue_scan_ids(group)
+            if other > scan.pk
+        ]
+        walk = {
+            "left": len(later),
+            "next_url": reverse("all_card_review")
+            + f"?group={group}&after={scan.pk}",
+            "all_url": reverse("all_card_review"),
+        }
     config = {
         "scan": scan.pk,
         # The labels a drawn box may take: the server's own table, so
         # the page keeps no copy of ``LABEL_IDS`` (#343).
         "labels": [{"name": label.name, "id": label.value} for label in Label],
         "pdf_url": reverse(pdf_route, kwargs=kwargs),
-        "cards_url": reverse("scan_review_cards", kwargs=kwargs),
+        "cards_url": cards_url,
         "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
         "review_open": review_open,
         "urls": {
@@ -5459,6 +5475,8 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
             "config": config,
             "review_open": review_open,
             "step2_url": config["step2_url"],
+            "group": group,
+            "walk": walk,
         },
     )
 
@@ -5475,27 +5493,31 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
     :return: ``{status, cards}``.
     """
     scan = get_object_or_404(Scan.without_caches(), pk=pk)
-    return JsonResponse({"status": "ok", "cards": card_review.cards(scan)})
+    group = request.GET.get("group")
+    groups = {group} if group in card_review.GROUPS else None
+    return JsonResponse(
+        {"status": "ok", "cards": card_review.cards(scan, groups)}
+    )
 
 
-#: How long the grand totals of the queue page are kept: the counts
-#: join the detection table, and a reload every batch of cards need not
-#: count it again.
+#: How long the grand totals of the tabs are kept: the editor's note
+#: count reads the redactions of every page that holds a note box.
 CARD_QUEUE_TOTALS_SECONDS = 120
 
 
 @login_required
 def all_card_review(request: HttpRequest) -> HttpResponse:
-    """Review one kind of card over every volume in review 2.
+    """Walk one kind of card over every volume in review 2, a volume at a time.
 
-    The card review of one volume (:func:`scan_card_review`), with the
-    cards of one group (``?group=bracket``) from every volume waiting
-    for review 2, ``card_review.QUEUE_SIZE`` at a time: a reload of the
-    page hands out the next ones. Every answer is the same step-2 write
-    on the card's own volume. Staff only.
+    With no ``?group=``, the tabs: each kind of card with its open total
+    over every volume waiting for review 2. With one, a redirect to the
+    card review of the oldest volume holding that kind
+    (:func:`scan_card_review` with ``?group=``), past ``?after=`` when
+    the page's Next volume sends it; at the end of the kind, back to the
+    tabs. Staff only.
 
     :param request: The HTTP request.
-    :return: The rendered page, or a redirect home for a non-staff user.
+    :return: The tabs, or a redirect to the next volume.
     """
     from django.core.cache import cache
 
@@ -5504,83 +5526,27 @@ def all_card_review(request: HttpRequest) -> HttpResponse:
             request, "Only staff can review the cards of every volume."
         )
         return redirect("scan_list")
+    group = request.GET.get("group")
+    if group in card_review.GROUPS:
+        after = request.GET.get("after") or ""
+        after_pk = int(after) if after.isdigit() else 0
+        ids = [pk for pk in card_review.queue_scan_ids(group) if pk > after_pk]
+        if ids:
+            return redirect(
+                reverse("scan_card_review", kwargs={"pk": ids[0]})
+                + "?group="
+                + group
+            )
+        messages.success(
+            request, "No volume in review 2 has a card of that kind left."
+        )
+        return redirect("all_card_review")
     totals = cache.get("card_queue_totals")
     if totals is None:
         totals = card_review.queue_totals()
         cache.set("card_queue_totals", totals, CARD_QUEUE_TOTALS_SECONDS)
-    group = request.GET.get("group")
-    if group not in card_review.GROUPS:
-        group = None
-    config = {
-        "queue": True,
-        "group": group,
-        "labels": [{"name": label.name, "id": label.value} for label in Label],
-        "cards_url": (
-            # ``group`` is one of ``GROUPS``: a plain word.
-            reverse("all_review_cards") + "?group=" + group if group else None
-        ),
-        # The writes of every volume: the card's own scan goes in place
-        # of the 0 (``urls`` in card_review.js).
-        "url_templates": {
-            name: reverse(name, kwargs={"pk": 0})
-            for name in CARD_REVIEW_WRITES
-        },
-        "review_open": True,
-    }
     return render(
         request,
         "scanning/all_card_review.html",
-        {
-            "config": config,
-            "group": group,
-            "groups": [(g, totals.get(g, 0)) for g in card_review.GROUPS],
-            "queue_size": card_review.QUEUE_SIZE,
-        },
+        {"groups": [(g, totals.get(g, 0)) for g in card_review.GROUPS]},
     )
-
-
-@login_required
-def all_review_cards(request: HttpRequest) -> JsonResponse:
-    """Return the next cards of one group, over every volume in review 2.
-
-    ``?group=`` names the group; ``?scans=1,2,3`` reads those volumes
-    again (the page's Reload), else the walk starts at the oldest
-    volume with a card of the group. Each card carries where its crop
-    reads the scan (``pdf_source``, a presigned URL in JSON, the space
-    step 2 draws) and its step-2 address.
-
-    :param request: The HTTP request.
-    :return: ``{status, cards, scans}``.
-    """
-    if not request.user.is_staff:
-        return JsonResponse(
-            {"status": "error", "message": "Staff only."}, status=403
-        )
-    group = request.GET.get("group")
-    if group not in card_review.GROUPS:
-        return JsonResponse(
-            {"status": "error", "message": "Unknown group."}, status=400
-        )
-    named = [
-        int(v)
-        for v in (request.GET.get("scans") or "").split(",")
-        if v.isdigit()
-    ]
-    built, used = card_review.queue_cards(
-        group, named or card_review.queue_scan_ids(group)
-    )
-    sources = {}
-    for pk in used:
-        scan = Scan.without_caches("ocr_results").get(pk=pk)
-        kwargs = {"pk": pk}
-        final = _review_flags(scan)["final_space"]
-        sources[pk] = {
-            # The bitonal copy step 2 draws, never the full-quality
-            # scan: a page of it is a thirtieth of the memory.
-            "pdf_source": reverse("scan_original_url", kwargs=kwargs)
-            + ("?space=final&copy=bitonal" if final else ""),
-            "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
-        }
-    for card in built:
-        card.update(sources[card["scan"]])
-    return JsonResponse({"status": "ok", "cards": built, "scans": used})

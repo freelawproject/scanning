@@ -360,26 +360,6 @@ class TestScanOriginalUrlFinalSpace(ScanningTestCase):
         )
         self.assertEqual(presign.call_args.args[0], run.final_pdf_key)
 
-    def test_the_bitonal_copy_is_presigned_on_request(self):
-        """The card queue crops from the copy step 2 draws: a page of
-        the full-quality scan ran a tab out of memory."""
-        scan, _ = applied_scan()
-        run = apply.current_run(scan)
-
-        with (
-            patch("scanning.s3_sync.s3_active", return_value=True),
-            patch(
-                "scanning.s3_sync.presign_get", return_value="https://x/bw"
-            ) as presign,
-        ):
-            response = self.client.get(
-                reverse("scan_original_url", kwargs={"pk": scan.pk}),
-                {"space": "final", "copy": "bitonal"},
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(presign.call_args.args[0], run.bitonal_key)
-
     def test_no_corrected_volume_is_a_409(self):
         scan = ScanFactory(status=Status.READY_FOR_REDACTION_REVIEW)
 
