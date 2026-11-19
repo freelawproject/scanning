@@ -1620,6 +1620,13 @@ def serve_final_pdf(request: HttpRequest, pk: int) -> HttpResponse:
         )
     response = FileResponse(path.open("rb"), content_type="application/pdf")
     response["X-Scan-Preview"] = "bitonal"
+    if request.GET.get("run") == str(run.pk):
+        # The address names the run whose copy this is, and a run's copy
+        # never changes, so the browser may keep it: the card review of
+        # every volume fetches the next volume's copy ahead of time
+        # (``final_pdf_url``). Without the run the answer stays uncached,
+        # because a new run changes the copy behind the same address.
+        response["Cache-Control"] = "private, max-age=3600"
     return response
 
 
@@ -5408,6 +5415,28 @@ CARD_REVIEW_WRITES = (
 )
 
 
+def final_pdf_url(scan, flags: dict | None = None) -> str | None:
+    """Return the address of the copy step 2 draws, named by its run.
+
+    The card review's crops read it, and the walk of every volume
+    fetches the next volume's ahead of time: the run in the address lets
+    the browser keep the answer (``serve_final_pdf``). None when the
+    boxes are not measured against the corrected volume, whose page then
+    reads the review-1 copy.
+
+    :param scan: The scan, with ``ocr_results`` loaded.
+    :param flags: :func:`_review_flags` of the scan, when the caller has it.
+    :returns: The address, or None.
+    """
+    flags = flags if flags is not None else _review_flags(scan)
+    if not flags["final_space"]:
+        return None
+    return (
+        reverse("serve_final_pdf", kwargs={"pk": scan.pk})
+        + f"?run={flags['final_run'].pk}"
+    )
+
+
 @login_required
 def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     """Review the boxes of a volume one after the next (``card_review``).
@@ -5433,7 +5462,6 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
     scan = get_object_or_404(Scan.without_caches("ocr_results"), pk=pk)
     flags = _review_flags(scan)
     kwargs = {"pk": scan.pk}
-    pdf_route = "serve_final_pdf" if flags["final_space"] else "serve_scan_pdf"
     review_open = scan.status == Status.READY_FOR_REDACTION_REVIEW
     group = request.GET.get("group")
     if group not in card_review.GROUPS:
@@ -5450,8 +5478,22 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
         ]
         walk = {
             "left": len(later),
-            "next_url": reverse("all_card_review")
-            + f"?group={group}&after={scan.pk}",
+            # The next volume's page itself, and its copy to fetch ahead
+            # of time; past the last volume, the tabs.
+            "next_url": (
+                reverse("scan_card_review", kwargs={"pk": later[0]})
+                + "?group="
+                + group
+                if later
+                else reverse("all_card_review")
+            ),
+            "next_pdf_url": (
+                final_pdf_url(
+                    Scan.without_caches("ocr_results").get(pk=later[0])
+                )
+                if later
+                else None
+            ),
             "all_url": reverse("all_card_review"),
         }
     config = {
@@ -5459,13 +5501,16 @@ def scan_card_review(request: HttpRequest, pk: int) -> HttpResponse:
         # The labels a drawn box may take: the server's own table, so
         # the page keeps no copy of ``LABEL_IDS`` (#343).
         "labels": [{"name": label.name, "id": label.value} for label in Label],
-        "pdf_url": reverse(pdf_route, kwargs=kwargs),
+        "pdf_url": final_pdf_url(scan, flags)
+        or reverse("serve_scan_pdf", kwargs=kwargs),
         "cards_url": cards_url,
         "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
         "review_open": review_open,
         "urls": {
             name: reverse(name, kwargs=kwargs) for name in CARD_REVIEW_WRITES
         },
+        "next_url": walk["next_url"] if walk else None,
+        "next_pdf_url": walk["next_pdf_url"] if walk else None,
     }
     return render(
         request,

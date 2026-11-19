@@ -842,6 +842,29 @@ class TestTheWalkOfEveryVolume(ScanningTestCase):
             + "?group=bracket",
         )
 
+    def test_the_review_of_one_kind_names_the_next_volume_itself(self):
+        """Next volume, and the page going on by itself, open the next
+        volume's page directly; the last one sends back to the tabs."""
+        self.client.force_login(self.make_staff_user())
+
+        first = self.client.get(self._review(self.first, "bracket"))
+        last = self.client.get(self._review(self.second, "bracket"))
+
+        self.assertEqual(
+            first.context["config"]["next_url"],
+            self._review(self.second, "bracket"),
+        )
+        self.assertEqual(
+            last.context["config"]["next_url"], reverse("all_card_review")
+        )
+        self.assertIsNone(last.context["config"]["next_pdf_url"])
+
+    def test_the_script_goes_on_and_fetches_the_next_copy(self):
+        source = SCRIPT.read_text()
+        self.assertIn("function maybeAdvance()", source)
+        self.assertIn("window.location.href = cfg.next_url", source)
+        self.assertIn("function prefetchNext()", source)
+
     def test_the_review_of_a_volume_keeps_every_section(self):
         self.client.force_login(self.make_user())
 

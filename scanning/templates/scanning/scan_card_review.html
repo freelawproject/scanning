@@ -35,8 +35,9 @@
   {% if walk %}
   <div class="flex flex-wrap items-center justify-between gap-2 mb-2 text-sm">
     <span class="text-gray-500 dark:text-gray-400">This kind of card alone, volume by volume: {{ walk.left }} more volume{{ walk.left|pluralize }} after this one. <a href="{{ walk.all_url }}" class="underline">All kinds</a></span>
-    <a href="{{ walk.next_url }}" class="btn-primary text-sm" title="The next volume in review 2 with cards of this kind">Next volume &rarr;</a>
+    <a href="{{ walk.next_url }}" class="btn-primary text-sm" title="The next volume in review 2 with cards of this kind. It opens by itself a few seconds after the last card here is answered.">{% if walk.left %}Next volume &rarr;{% else %}Back to all kinds{% endif %}</a>
   </div>
+  <p class="bk-note bk-ok" data-role="advance-note"></p>
   {% endif %}
   <p class="text-xs text-gray-500 dark:text-gray-400 mb-1 cr-keys">
     <kbd>Return</kbd> presses the first button of the card in view, <kbd>x</kbd> its no-button (No caption, No bracket, Not text, Take out), <kbd>s</kbd> skips it, <kbd>u</kbd> undoes, <kbd>f</kbd> opens the card to the whole page and back, <kbd>d</kbd> draws a new box of any label on the card, <kbd>n</kbd> adds a footnote box over a text card's block, <kbd>e</kbd> an editor's note box, <kbd>↓</kbd> and <kbd>↑</kbd> move between the cards, <kbd>←</kbd> and <kbd>→</kbd> move a bracket's box sideways.

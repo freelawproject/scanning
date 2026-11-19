@@ -290,6 +290,36 @@ class TestServeFinalPdf(ScanningTestCase):
         self.assertEqual(second.status_code, 200)
         dl.assert_called_once()
 
+    def test_the_copy_is_kept_only_under_its_run(self):
+        """A run's copy never changes, so the address that names the run
+        may be kept (the card review fetches the next volume's ahead of
+        time); the bare address follows a new run, so it is never kept."""
+        scan, _ = applied_scan(status=Status.READY_FOR_REDACTION_REVIEW)
+        run = apply.current_run(scan)
+        prefix = s3_sync.s3_processing_prefix(scan)
+        ApplyRun.objects.filter(pk=run.pk).update(
+            bitonal_key=f"{prefix}jobs/apply/a1/bitonal.pdf"
+        )
+
+        def pull(key, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"%PDF-1.4 final")
+
+        url = reverse("serve_final_pdf", kwargs={"pk": scan.pk})
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=True),
+            patch("scanning.s3_sync.download_object", side_effect=pull),
+        ):
+            named = self.client.get(url, {"run": run.pk})
+            bare = self.client.get(url)
+            stale = self.client.get(url, {"run": run.pk + 1})
+            for response in (named, bare, stale):
+                b"".join(response.streaming_content)
+
+        self.assertEqual(named["Cache-Control"], "private, max-age=3600")
+        self.assertNotIn("max-age", bare.get("Cache-Control", ""))
+        self.assertNotIn("max-age", stale.get("Cache-Control", ""))
+
     def test_a_copy_that_is_the_original_is_refused(self):
         """A 1-bit upload skips the conversion, so the run's bitonal
         copy is the multi-GB original, which #185 keeps out of this
