@@ -713,9 +713,9 @@ class TestTheEndpoints(ScanningTestCase):
         self.assertEqual(answer.json()["restored"], 0)
 
 
-class TestTheQueueOfEveryVolume(ScanningTestCase):
-    """``/scans/all/cards/``: one group of cards over every volume in
-    review 2, ``QUEUE_SIZE`` at a time, each card on its own volume."""
+class TestTheWalkOfEveryVolume(ScanningTestCase):
+    """``/scans/all/cards/``: one kind of card over every volume in
+    review 2, a volume at a time, on the card review of each."""
 
     BRACKET = {
         "bbox": [200.0, 1000.0, 800.0, 1400.0],
@@ -743,33 +743,17 @@ class TestTheQueueOfEveryVolume(ScanningTestCase):
             {"bbox": [100.0, 100.0, 900.0, 900.0], "readers": ["surya"]},
         )
 
+    def _review(self, scan, group):
+        return reverse("scan_card_review", kwargs={"pk": scan.pk}) + (
+            f"?group={group}"
+        )
+
     def test_the_volumes_with_a_card_of_the_group(self):
         self.assertEqual(
             card_review.queue_scan_ids(card_review.BRACKET),
             [self.first.pk, self.second.pk],
         )
         self.assertEqual(card_review.queue_scan_ids(card_review.CAPTION), [])
-
-    def test_the_cards_name_their_volume_and_their_keys_differ(self):
-        """Both volumes hold a bracket at one address on its page."""
-        built, used = card_review.queue_cards(
-            card_review.BRACKET, [self.first.pk, self.second.pk]
-        )
-
-        self.assertEqual(used, [self.first.pk, self.second.pk])
-        self.assertEqual(
-            [c["scan"] for c in built], [self.first.pk, self.second.pk]
-        )
-        self.assertEqual(len({c["key"] for c in built}), 2)
-        self.assertTrue(all(c["group"] == card_review.BRACKET for c in built))
-
-    def test_the_walk_stops_at_the_limit(self):
-        built, used = card_review.queue_cards(
-            card_review.BRACKET, [self.first.pk, self.second.pk], limit=1
-        )
-
-        self.assertEqual(len(built), 1)
-        self.assertEqual(used, [self.first.pk])
 
     def test_the_totals_count_each_group(self):
         totals = card_review.queue_totals()
@@ -801,57 +785,83 @@ class TestTheQueueOfEveryVolume(ScanningTestCase):
             [self.second.pk],
         )
 
-    def test_the_page_and_its_list_are_for_staff(self):
+    def test_the_tabs_are_for_staff(self):
         self.client.force_login(self.make_user())
 
-        page = self.client.get(reverse("all_card_review"))
-        listed = self.client.get(
-            reverse("all_review_cards"), {"group": "bracket"}
-        )
+        response = self.client.get(reverse("all_card_review"))
 
-        self.assertEqual(page.status_code, 302)
-        self.assertEqual(listed.status_code, 403)
+        self.assertRedirects(response, reverse("scan_list"))
 
-    def test_the_list_hands_out_the_group_with_each_volumes_sources(self):
+    def test_the_tabs_show_each_kind_and_its_total(self):
         self.client.force_login(self.make_staff_user())
 
-        answer = self.client.get(
-            reverse("all_review_cards"), {"group": "bracket"}
-        ).json()
+        response = self.client.get(reverse("all_card_review"))
 
-        self.assertEqual(answer["scans"], [self.first.pk, self.second.pk])
-        card = answer["cards"][0]
-        self.assertTrue(
-            card["pdf_source"].startswith(
-                reverse("scan_original_url", kwargs={"pk": self.first.pk})
-            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(("bracket", 2), response.context["groups"])
+        self.assertContains(response, "Headnote brackets")
+
+    def test_a_kind_opens_the_oldest_volume_and_next_goes_on(self):
+        self.client.force_login(self.make_staff_user())
+        url = reverse("all_card_review")
+
+        first = self.client.get(url, {"group": "bracket"})
+        second = self.client.get(
+            url, {"group": "bracket", "after": self.first.pk}
         )
-        self.assertTrue(card["step2_url"].endswith("?step=2"))
+        done = self.client.get(
+            url, {"group": "bracket", "after": self.second.pk}
+        )
 
-    def test_the_list_reads_the_named_volumes_again(self):
+        self.assertRedirects(
+            first,
+            self._review(self.first, "bracket"),
+            fetch_redirect_response=False,
+        )
+        self.assertRedirects(
+            second,
+            self._review(self.second, "bracket"),
+            fetch_redirect_response=False,
+        )
+        self.assertRedirects(done, url)
+
+    def test_the_review_of_one_kind_shows_its_section_and_the_next(self):
         self.client.force_login(self.make_staff_user())
 
-        answer = self.client.get(
-            reverse("all_review_cards"),
-            {"group": "bracket", "scans": str(self.second.pk)},
-        ).json()
-
-        self.assertEqual(answer["scans"], [self.second.pk])
-
-    def test_the_page_shows_the_tabs_and_the_chosen_section(self):
-        self.client.force_login(self.make_staff_user())
-
-        response = self.client.get(
-            reverse("all_card_review"), {"group": "bracket"}
-        )
+        response = self.client.get(self._review(self.first, "bracket"))
 
         self.assertEqual(response.status_code, 200)
         html = response.content.decode()
-        self.assertIn("Headnote brackets", html)
         self.assertIn('data-group="bracket"', html)
-        self.assertNotIn('data-group="caption"', html)
-        config = response.context["config"]
+        self.assertNotIn('data-group="image"', html)
+        self.assertEqual(response.context["walk"]["left"], 1)
+        self.assertIn("Next volume", html)
         self.assertEqual(
-            config["url_templates"]["add_single_detection"],
-            reverse("add_single_detection", kwargs={"pk": 0}),
+            response.context["config"]["cards_url"],
+            reverse("scan_review_cards", kwargs={"pk": self.first.pk})
+            + "?group=bracket",
         )
+
+    def test_the_review_of_a_volume_keeps_every_section(self):
+        self.client.force_login(self.make_user())
+
+        response = self.client.get(
+            reverse("scan_card_review", kwargs={"pk": self.second.pk})
+        )
+
+        self.assertContains(response, 'data-group="image"')
+        self.assertContains(response, 'data-group="bracket"')
+        self.assertIsNone(response.context["walk"])
+
+    def test_the_list_of_one_kind_holds_that_kind_alone(self):
+        self.client.force_login(self.make_user())
+        url = reverse("scan_review_cards", kwargs={"pk": self.second.pk})
+
+        every = self.client.get(url).json()["cards"]
+        brackets = self.client.get(url, {"group": "bracket"}).json()["cards"]
+
+        self.assertEqual(
+            sorted({c["group"] for c in every}),
+            [card_review.BRACKET, card_review.IMAGE],
+        )
+        self.assertEqual({c["group"] for c in brackets}, {card_review.BRACKET})

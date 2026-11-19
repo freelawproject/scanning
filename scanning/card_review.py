@@ -847,10 +847,10 @@ def cards(scan: Scan, groups: Collection[str] | None = None) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# The queue of every volume (``/scans/all/cards/``)
+# The walk of every volume, one volume at a time (``/scans/all/cards/``)
 # ---------------------------------------------------------------------------
 
-#: The group of each kind of finding card, for the queue: a faint
+#: The group of each kind of finding card, for the walk: a faint
 #: bracket is judged beside the missed ones, a picture the readers saw
 #: beside the image boxes.
 KIND_GROUPS = {
@@ -866,10 +866,6 @@ MODEL_GROUPS = {
     Label.IMAGE.name: IMAGE,
     Label.EDITORIAL.name: EDITORIAL,
 }
-
-#: The cards the queue hands out at a time. A reload of the page hands
-#: out the next ones: an answered card is gone from the server's list.
-QUEUE_SIZE = 25
 
 
 def _sources(group: str) -> tuple[list[str], list[str]]:
@@ -994,39 +990,3 @@ def queue_totals() -> dict[str, int]:
         totals[MODEL_GROUPS[label]] += n
     totals[EDITORIAL] = sum(editorial_cards_by_scan().values())
     return totals
-
-
-def queue_cards(
-    group: str, scan_ids: list[int], limit: int = QUEUE_SIZE
-) -> tuple[list[dict], list[int]]:
-    """Return the next cards of one group, over the volumes given.
-
-    Each volume's cards are built whole (``cards``), and the walk stops
-    at ``limit``. Every card carries its ``scan``, and its ``key`` is
-    prefixed by it, because two volumes share addresses.
-
-    :param group: One of ``GROUPS``.
-    :param scan_ids: The volumes to walk, in order.
-    :param limit: The most cards to return.
-    :returns: ``(cards, the volumes they come from)``.
-    """
-    out: list[dict] = []
-    used: list[int] = []
-    scans = Scan.objects.select_related("reporter").defer(*Scan.large_fields())
-    for pk in scan_ids:
-        if len(out) >= limit:
-            break
-        scan = scans.filter(pk=pk).first()
-        if scan is None:
-            continue
-        mine = [c for c in cards(scan, {group}) if c["group"] == group]
-        if not mine:
-            continue
-        used.append(pk)
-        volume = f"{scan.volume} {scan.reporter.cite_name}"
-        for card in mine[: limit - len(out)]:
-            card["scan"] = pk
-            card["volume"] = volume
-            card["key"] = f"{pk}:{card['key']}"
-            out.append(card)
-    return out, used

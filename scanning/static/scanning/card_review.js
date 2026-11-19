@@ -173,43 +173,10 @@
         return !!a && !!b && a.every(function (v, i) { return Math.abs(v - b[i]) < 0.5; });
     }
 
-    /** The step-2 writes of the card's volume: the page's own on the
-     *  review of one volume, the templates with the card's scan in
-     *  place of the 0 on the queue of every volume (/scans/all/cards/). */
-    function urls(card) {
-        if (cfg.urls) { return cfg.urls; }
-        var out = {};
-        Object.keys(cfg.url_templates).forEach(function (name) {
-            out[name] = cfg.url_templates[name].replace('/scans/0/', '/scans/' + card.scan + '/');
-        });
-        return out;
-    }
-
     // ── the crop ─────────────────────────────────────────────────────
-    /** The PDF of the card's volume. On the queue each volume's scan is
-     *  read through a presigned URL its card names (``pdf_source``),
-     *  in the space step 2 draws, downloaded whole once per volume. */
-    var pdfs = {};
-    function getPdf(card) {
-        if (!cfg.queue) {
-            if (!pdf) { pdf = pdfjsLib.getDocument({ url: cfg.pdf_url }).promise; }
-            return pdf;
-        }
-        if (!pdfs[card.scan]) {
-            pdfs[card.scan] = getJson(card.pdf_source).then(function (answer) {
-                if (!answer.ok || !answer.data || !answer.data.url) {
-                    throw new Error((answer.data && (answer.data.error || answer.data.message)) || 'no URL for the scan');
-                }
-                // One download of the whole copy, as the one-volume page
-                // reads it: read in ranges, a page deep in the volume cost
-                // a 64 KB request for every page before it, because pdf.js
-                // walks the page objects in order and each sits beside its
-                // page's image (1,183 requests, no crop, 2026-11-19).
-                return pdfjsLib.getDocument({ url: answer.data.url, disableRange: true }).promise;
-            });
-            pdfs[card.scan].catch(function () { delete pdfs[card.scan]; });
-        }
-        return pdfs[card.scan];
+    function getPdf() {
+        if (!pdf) { pdf = pdfjsLib.getDocument({ url: cfg.pdf_url }).promise; }
+        return pdf;
     }
 
     /** The crop a card shows: the whole page when it is opened. */
@@ -239,8 +206,8 @@
      *  image space the box lives in, offset so the canvas holds the
      *  crop alone. */
     /** The crops draw one at a time, in the order they came into
-     *  view: each render decodes its page's whole scan image, and a
-     *  hundred started at once by a quick scroll ran the tab out of
+     *  view: each render decodes its page's whole scan image, and
+     *  dozens started at once by a quick scroll ran the tab out of
      *  memory ("Out of memory", 2026-11-19). */
     var renders = Promise.resolve();
 
@@ -249,10 +216,7 @@
         if (!canvas || canvas.dataset.drawn) { return; }
         canvas.dataset.drawn = '1';
         var crop = cropOf(card);
-        // The volume's PDF and the page load at once, beside the
-        // others; only the render waits its turn, so a slow volume
-        // holds no other volume's crops.
-        getPdf(card).then(function (doc) {
+        getPdf().then(function (doc) {
             return doc.getPage(card.page_index + 1);
         }).then(function (page) {
             var turn = renders.then(function () {
@@ -511,7 +475,7 @@
     }
 
     function drawnAdd(card, node, box, label, labelId) {
-        postJson(urls(card).add_single_detection, {
+        postJson(cfg.urls.add_single_detection, {
             page_index: card.page_index,
             label: label,
             label_id: labelId,
@@ -533,7 +497,7 @@
     }
 
     function withdrawDrawn(card, node, other) {
-        postJson(urls(card).delete_detection, { detection_id: other.id }).then(function (answer) {
+        postJson(cfg.urls.delete_detection, { detection_id: other.id }).then(function (answer) {
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
                 return;
@@ -639,8 +603,8 @@
         // One named tab per volume, so every card's link lands in the
         // same tab and a hash change there jumps again.
         var open = el('a', 'btn-ghost text-xs', 'Open step 2');
-        open.href = (card.step2_url || cfg.step2_url) + '#' + hashTarget(card);
-        open.target = 'step2-' + (card.scan || cfg.scan);
+        open.href = cfg.step2_url + '#' + hashTarget(card);
+        open.target = 'step2-' + cfg.scan;
         open.rel = 'noopener';
         foot.appendChild(open);
         if (answer) {
@@ -801,7 +765,6 @@
         if (skipped[card.key]) { node.classList.add('cr-skipped'); }
         var header = el('header');
         header.appendChild(el('span', 'bk-step', card.step + ' of ' + card.total));
-        if (card.volume) { header.appendChild(el('span', 'bk-step', card.volume + ' · scan #' + card.scan)); }
         var where = el('span', 'bk-where', card.where + ' · ' + describe(card) + ' · ');
         // The whole page, with the box still movable: for a guess in
         // the wrong column, or a picture the crop cut.
@@ -931,7 +894,7 @@
 
     function add(card, node, as) {
         as = as || {};
-        return write(card, node, urls(card).add_single_detection, {
+        return write(card, node, cfg.urls.add_single_detection, {
             page_index: card.page_index,
             label: as.label || card.label,
             label_id: as.labelId || card.label_id,
@@ -943,7 +906,7 @@
             // The hand-drawn row that holds the box (an add, or the
             // approval of a model box it landed on): withdrawn, it
             // gives back whatever it replaced.
-            return { url: urls(card).delete_detection, body: { detection_id: data.detection_id } };
+            return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
         });
     }
 
@@ -954,16 +917,16 @@
         var onGone = retried ? null : function () {
             return freshIssueIds().then(function () { return dismiss(card, node, true); });
         };
-        return write(card, node, urls(card).dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
+        return write(card, node, cfg.urls.dismiss_finding, { issue_id: card.issue_id }, 'nothing there', function (data) {
             // The dismissal row outlives every rebuild.
-            return { url: urls(card).restore_finding, body: { dismissal_id: data.dismissal_id } };
+            return { url: cfg.urls.restore_finding, body: { dismissal_id: data.dismissal_id } };
         }, onGone);
     }
 
     /** Read the server's cards and give each card here the finding pk
      *  its address holds now, drawing nothing. */
     function freshIssueIds() {
-        return getJson(cardsUrl()).then(function (answer) {
+        return getJson(cfg.cards_url).then(function (answer) {
             var byKey = {};
             ((answer.data && answer.data.cards) || []).forEach(function (c) { byKey[c.key] = c; });
             cards.forEach(function (card) {
@@ -973,8 +936,8 @@
     }
 
     function keep(card, node) {
-        return write(card, node, urls(card).approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
-            return { url: urls(card).delete_detection, body: { detection_id: data.detection_id } };
+        return write(card, node, cfg.urls.approve_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].kept, function (data) {
+            return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
         });
     }
 
@@ -990,7 +953,7 @@
             Math.min(target.box[0], take[0]), Math.min(target.box[1], take[1]),
             Math.max(target.box[2], take[2]), Math.max(target.box[3], take[3])
         ];
-        write(card, node, urls(card).update_detection, {
+        write(card, node, cfg.urls.update_detection, {
             detection_id: target.id, new_bbox: grown
         }, label, function (data) {
             var holder = data.detection_id;
@@ -999,8 +962,8 @@
                 return { id: holder, label: o.label, box: grown, own: true, mine: true };
             });
             return holder === target.id
-                ? { url: urls(card).update_detection, body: { detection_id: target.id, new_bbox: target.box } }
-                : { url: urls(card).delete_detection, body: { detection_id: holder } };
+                ? { url: cfg.urls.update_detection, body: { detection_id: target.id, new_bbox: target.box } }
+                : { url: cfg.urls.delete_detection, body: { detection_id: holder } };
         });
     }
 
@@ -1101,19 +1064,19 @@
             if (undos.length) { answers[card.key] = { label: 'split saved in part', undo: undos }; history.push(card.key); }
             replace(card, live());
         }
-        postJson(urls(card).update_detection, { detection_id: card.detection_id, new_bbox: card.box }).then(function (answer) {
+        postJson(cfg.urls.update_detection, { detection_id: card.detection_id, new_bbox: card.box }).then(function (answer) {
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') { return fail(answer); }
-            undos.push({ url: urls(card).delete_detection, body: { detection_id: answer.data.detection_id } });
+            undos.push({ url: cfg.urls.delete_detection, body: { detection_id: answer.data.detection_id } });
             var chain = Promise.resolve(true);
             extra.forEach(function (x) {
                 chain = chain.then(function (ok) {
                     if (!ok) { return false; }
-                    return postJson(urls(card).add_single_detection, {
+                    return postJson(cfg.urls.add_single_detection, {
                         page_index: card.page_index, label: x.label, label_id: x.labelId,
                         confidence: 1.0, bbox: x.box, img_width: card.img_width, img_height: card.img_height
                     }).then(function (added) {
                         if (!added.ok || !added.data || added.data.status !== 'ok') { fail(added); return false; }
-                        undos.unshift({ url: urls(card).delete_detection, body: { detection_id: added.data.detection_id } });
+                        undos.unshift({ url: cfg.urls.delete_detection, body: { detection_id: added.data.detection_id } });
                         return true;
                     });
                 });
@@ -1136,16 +1099,16 @@
     }
 
     function resize(card, node) {
-        return write(card, node, urls(card).update_detection, {
+        return write(card, node, cfg.urls.update_detection, {
             detection_id: card.detection_id, new_bbox: card.box
         }, 'resized', function (data) {
-            return { url: urls(card).delete_detection, body: { detection_id: data.detection_id } };
+            return { url: cfg.urls.delete_detection, body: { detection_id: data.detection_id } };
         });
     }
 
     function takeOut(card, node) {
-        return write(card, node, urls(card).delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
-            return { url: urls(card).restore_detection, body: { detection_id: card.detection_id } };
+        return write(card, node, cfg.urls.delete_detection, { detection_id: card.detection_id }, MODEL_VERBS[card.kind].gone, function () {
+            return { url: cfg.urls.restore_detection, body: { detection_id: card.detection_id } };
         });
     }
 
@@ -1250,7 +1213,7 @@
      *  the card goes by itself when the moved box answers it. */
     function saveEdit(card, node) {
         var edit = card.edit;
-        postJson(urls(card).update_detection, { detection_id: edit.id, new_bbox: edit.box }).then(function (answer) {
+        postJson(cfg.urls.update_detection, { detection_id: edit.id, new_bbox: edit.box }).then(function (answer) {
             if (!answer.ok || !answer.data || answer.data.status !== 'ok') {
                 toast(failed(answer), 'error');
                 replace(card, node);
@@ -1261,8 +1224,8 @@
                 edit: {
                     label: edit.label.toLowerCase().replace(/_/g, ' ') + ' box on p. ' + (card.page_index + 1),
                     undo: holder === edit.id
-                        ? { url: urls(card).update_detection, body: { detection_id: edit.id, new_bbox: edit.original } }
-                        : { url: urls(card).delete_detection, body: { detection_id: holder } }
+                        ? { url: cfg.urls.update_detection, body: { detection_id: edit.id, new_bbox: edit.original } }
+                        : { url: cfg.urls.delete_detection, body: { detection_id: holder } }
                 }
             });
             card.edit = null;
@@ -1370,6 +1333,7 @@
     function render() {
         GROUPS.forEach(function (group) {
             var section = root.querySelector('[data-group="' + group + '"]');
+            // A page of one kind of card (?group=) holds that section alone.
             if (!section) { return; }
             var list = cards.filter(function (card) { return card.group === group; });
             section.querySelector('[data-role="count"]').textContent = String(list.length);
@@ -1406,29 +1370,20 @@
         var order = {};
         GROUPS.forEach(function (group, i) { order[group] = i; });
         fresh.sort(function (a, b) {
-            return (order[a.group] - order[b.group]) || ((a.scan || 0) - (b.scan || 0)) || (a.page_index - b.page_index) ||
+            return (order[a.group] - order[b.group]) || (a.page_index - b.page_index) ||
                 (a.key < b.key ? -1 : a.key > b.key ? 1 : 0);
         });
         return fresh;
     }
 
-    /** The volumes of the queue's batch, from its first read: a Reload
-     *  reads them again, and a reload of the page hands out the next. */
-    var batch = null;
-    function cardsUrl() {
-        return batch && batch.length ? cfg.cards_url + '&scans=' + batch.join(',') : cfg.cards_url;
-    }
-
     function load() {
         var holder = root.querySelector('[data-role="cards-note"]');
-        if (!cfg.cards_url) { return Promise.resolve(); }
-        return getJson(cardsUrl()).then(function (answer) {
+        return getJson(cfg.cards_url).then(function (answer) {
             if (!answer.ok || !answer.data || !answer.data.cards) {
                 holder.replaceChildren(note(failed(answer), 'error'));
                 return;
             }
             holder.replaceChildren();
-            if (cfg.queue && batch === null) { batch = answer.data.scans || []; }
             cards = merge(answer.data.cards);
             render();
         }).catch(function (error) {
@@ -1618,8 +1573,6 @@
         root = document.getElementById('card-review');
         if (!root) { return; }
         cfg = JSON.parse(document.getElementById('card-review-config').textContent);
-        // The queue with no kind chosen yet: the tabs alone.
-        if (cfg.queue && !cfg.cards_url) { return; }
         if (window.pdfjsLib) {
             pdfjsLib.GlobalWorkerOptions.workerSrc =
                 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
@@ -1648,10 +1601,9 @@
             });
         });
         root.querySelector('[data-role="undo-edit"]').addEventListener('click', function () { undoEdit(); });
-        var computeBtn = root.querySelector('[data-role="recompute"]');
-        if (computeBtn) {
-            computeBtn.addEventListener('click', function (event) { recompute(event.currentTarget); });
-        }
+        root.querySelector('[data-role="recompute"]').addEventListener('click', function (event) {
+            recompute(event.currentTarget);
+        });
         load().then(function () {
             if (!activeCard()) { focusNextCard(); }
         });

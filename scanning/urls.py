@@ -81,7 +81,6 @@ from scanning.views_cards import (
 from scanning.views_process import (
     add_page_insert,
     all_card_review,
-    all_review_cards,
     apply_output_index,
     approve_page_completeness,
     approve_redaction_review,
@@ -641,14 +640,9 @@ urlpatterns = [
     # The card review of review 2 (``card_review``): the page, its
     # cards, and the Undo of a dismissed model box. Every other answer
     # of the page goes to the step-2 writes below.
-    # The same review over every volume in review 2, one group at a
-    # time (``card_review.queue_cards``). Staff only.
+    # The same review over every volume in review 2, one kind of card
+    # and one volume at a time (``card_review.queue_scan_ids``). Staff only.
     path("scans/all/cards/", all_card_review, name="all_card_review"),
-    path(
-        "scans/all/cards/list/",
-        all_review_cards,
-        name="all_review_cards",
-    ),
     path(
         "scans/<int:pk>/cards/",
         scan_card_review,
