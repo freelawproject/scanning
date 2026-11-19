@@ -612,6 +612,44 @@ a.doc-name:hover { text-decoration: underline; }
     display: block;
 }
 
+/* The sidebar's list of the uploaded files */
+.inserted-card {
+    border: 1px solid #86efac;
+    background: #f0fdf4;
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 4px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.inserted-card:hover { background: #dcfce7; }
+.inserted-card-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.inserted-card-label { font-weight: 700; color: #166534; }
+.inserted-card-kind {
+    font-size: 9px;
+    font-weight: 700;
+    color: #166534;
+    border: 1px solid #86efac;
+    border-radius: 3px;
+    padding: 0 4px;
+}
+.inserted-card-part { font-size: 10px; color: #4b5563; margin-left: auto; }
+.inserted-card-where { margin: 2px 0 0; font-size: 10px; color: #6b7280; }
+.inserted-page.inserted-shown { outline: 3px solid #2563eb; }
+@media (prefers-color-scheme: dark) {
+    .inserted-card { border-color: #166534; background: rgba(20, 83, 45, 0.25); }
+    .inserted-card:hover { background: rgba(20, 83, 45, 0.45); }
+    .inserted-card-label { color: #86efac; }
+    .inserted-card-kind { color: #86efac; border-color: #166534; }
+    .inserted-card-part { color: #d1d5db; }
+    .inserted-card-where { color: #9ca3af; }
+}
+
 /* OCR detection summary in sidebar */
 .ocr-summary {
     margin-bottom: 20px;
