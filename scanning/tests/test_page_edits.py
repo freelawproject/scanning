@@ -1052,6 +1052,16 @@ class TestPageInsertEndpoints(ScanningTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertFalse(self.scan.page_edits.exists())
 
+    def test_the_answer_names_the_label_and_the_gap_as_saved(self):
+        """The viewer draws the uploaded file's row from the answer, so
+        it reads the folded label and the gap a reload would give."""
+        answer = json.loads(
+            self._upload(anchor_pdf_page=1, page_number="2\u20133").content
+        )
+
+        self.assertEqual(answer["page_number"], "2-3")
+        self.assertEqual(answer["anchor_pdf_page"], 1)
+
     def test_an_insert_can_be_removed(self):
         edit_id = json.loads(
             self._upload(anchor_pdf_page=1, page_number=2).content
@@ -1642,6 +1652,17 @@ class TestProjectInserts(TestCase):
         self.assertEqual(out[1]["insert_edit_id"], edit.pk)
         self.assertEqual(out[1]["logical_number"], 2)
         self.assertEqual(len(out), 3)
+
+    def test_an_inserted_entry_carries_the_label_and_the_gap_of_its_row(self):
+        from scanning import page_edits
+
+        self._insert(1, logical_page="2a")
+
+        out = page_edits.project_inserts(self.scan, self.page_map)
+
+        self.assertEqual(out[1]["logical_number"], 2)
+        self.assertEqual(out[1]["insert_label"], "2a")
+        self.assertEqual(out[1]["insert_anchor_pdf_page"], 1)
 
     def test_an_image_before_page_one_comes_first(self):
         self._insert(0, logical_page="0")

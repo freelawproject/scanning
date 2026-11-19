@@ -200,6 +200,21 @@ body.boundary-pick .opinion-nav.picking {
       </div>
       </div>
 
+      {% comment %}
+        The files uploaded into this volume, in the order they stand.
+        The page list below walks the original's pages alone, so an
+        upload showed nowhere but at its own place in the viewer, which
+        for a run of pages missing at the end is the last screen of the
+        volume. The viewer draws the rows from the inserted pages it
+        shows (renderInsertedList in viewer_step1.js), so the list and
+        the viewer cannot disagree, and it stays after the approval.
+      {% endcomment %}
+      <div id="inserted-section" hidden>
+      <h2 class="text-sm font-bold mt-3 mb-1">Inserted files (<span id="inserted-count">0</span>)</h2>
+      <p class="text-[10px] text-gray-500 dark:text-gray-400 mb-1">Files uploaded into this volume, in the order they stand. Click one to see it.</p>
+      <div id="inserted-list"></div>
+      </div>
+
       {% if ocr_results %}
       {% comment %}
         The pages the bad-page model suspects (#436), worst first. Its

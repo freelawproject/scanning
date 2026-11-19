@@ -105,6 +105,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 renderInsertedPage(entry);
             }
         });
+        renderInsertedList();
     }
 
     function createPdfPlaceholder(entry) {
@@ -398,10 +399,109 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        // The row's own label, which the apply files the page under.
+        // The entry's number is the placeholder's where the row took
+        // one, and the two can differ.
+        var label = entry.insert_label || entry.logical_number;
+        pageDiv.innerHTML = insertedPageHtml(label, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        describeInsert(pageDiv, label, entry.insert_edit_id, entry.insert_kind, entry.unplaced, entry.insert_anchor_pdf_page);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
         drawInsertedPdf(pageDiv);
+    }
+
+    // What the sidebar's list of uploaded files reads off an inserted
+    // page: the label and the gap its row was filed under, its row,
+    // its kind. The gap is the row's ``anchor_pdf_page`` as the server
+    // stored it, never the page above the box: a moved page can stand
+    // between the two.
+    function describeInsert(pageDiv, label, editId, kind, unplaced, anchor) {
+        pageDiv.dataset.insertLabel = label === undefined || label === null ? '' : label;
+        pageDiv.dataset.insertEditId = editId || '';
+        pageDiv.dataset.insertKind = kind === 'pdf' ? 'pdf' : 'image';
+        pageDiv.dataset.insertAnchor = anchor === undefined || anchor === null ? '' : anchor;
+        if (unplaced) { pageDiv.dataset.insertUnplaced = '1'; }
+    }
+
+    // The sidebar's list of the uploaded files, in the order they
+    // stand, redrawn whole after every upload. The page list walks the
+    // original's pages alone, so without it an upload shows only at
+    // its own place in the viewer. Several files under one label in
+    // one gap are the parts of one span (#638): the label is the
+    // span's for each of them, so the row says which part it is.
+    function renderInsertedList() {
+        var section = document.getElementById('inserted-section');
+        var list = document.getElementById('inserted-list');
+        var count = document.getElementById('inserted-count');
+        if (!section || !list) { return; }
+        var rows = [];
+        container.querySelectorAll('.inserted-page').forEach(function (pageDiv) {
+            var row = {
+                page: pageDiv,
+                label: pageDiv.dataset.insertLabel || '',
+                kind: pageDiv.dataset.insertKind,
+                unplaced: pageDiv.dataset.insertUnplaced === '1',
+                after: pageDiv.dataset.insertAnchor,
+                part: 1,
+                parts: 1,
+            };
+            var before = rows[rows.length - 1];
+            var prior = pageDiv.previousElementSibling;
+            if (before && prior === before.page && before.label === row.label
+                    && before.after === row.after
+                    && !before.unplaced && !row.unplaced) {
+                row.part = before.part + 1;
+            }
+            rows.push(row);
+        });
+        for (var i = rows.length - 1; i >= 0; i--) {
+            var next = rows[i + 1];
+            rows[i].parts = next && next.part === rows[i].part + 1
+                ? next.parts : rows[i].part;
+        }
+        if (count) { count.textContent = rows.length; }
+        section.hidden = rows.length === 0;
+        list.textContent = '';
+        rows.forEach(function (row) {
+            var card = document.createElement('div');
+            card.className = 'inserted-card';
+            card.title = 'Show this file in the viewer';
+            var head = document.createElement('div');
+            head.className = 'inserted-card-head';
+            var label = document.createElement('span');
+            label.className = 'inserted-card-label';
+            // The label as it was filed, with the mark the page list
+            // gives a printed number. No "Page" or "Pages": which of
+            // the two a label is, is the server's rule to read.
+            label.textContent = row.label ? '#' + row.label : 'No page number';
+            head.appendChild(label);
+            var kind = document.createElement('span');
+            kind.className = 'inserted-card-kind';
+            kind.textContent = row.kind === 'pdf' ? 'PDF' : 'IMAGE';
+            head.appendChild(kind);
+            if (row.parts > 1) {
+                var part = document.createElement('span');
+                part.className = 'inserted-card-part';
+                part.textContent = 'file ' + row.part + ' of ' + row.parts;
+                head.appendChild(part);
+            }
+            card.appendChild(head);
+            var where = document.createElement('p');
+            where.className = 'inserted-card-where';
+            where.textContent = row.unplaced
+                ? 'This volume has no place for it'
+                : (row.after === '' ? ''
+                    : (row.after === '0' ? 'before PDF p. 1' : 'after PDF p. ' + row.after));
+            card.appendChild(where);
+            card.addEventListener('click', function () {
+                window.scrollPageIntoView(row.page);
+                row.page.classList.add('inserted-shown');
+                setTimeout(function () {
+                    row.page.classList.remove('inserted-shown');
+                }, 2000);
+            });
+            list.appendChild(card);
+        });
     }
 
     // A curator may upload a PDF of the page as well as an image
@@ -1552,9 +1652,17 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         inserted.className = 'page-container inserted-page';
         inserted.style.width = '';
-        inserted.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id, false, data.kind, data.file_url);
+        // The label and the gap as the server saved them (it narrows
+        // the label and folds its dash), so a row drawn now and the
+        // same row after a reload read alike.
+        var saved = data.page_number || pageNumber;
+        var anchor = data.anchor_pdf_page !== undefined
+            ? data.anchor_pdf_page : entry.anchor_pdf_page;
+        inserted.innerHTML = insertedPageHtml(saved, data.image_url, data.edit_id, false, data.kind, data.file_url);
+        describeInsert(inserted, saved, data.edit_id, data.kind, false, anchor);
         bindRemoveInsert(inserted, data.edit_id);
         drawInsertedPdf(inserted);
+        renderInsertedList();
         if (keepCard) {
             var placeholder = pageDiv.querySelector('.missing-placeholder');
             var form = pageDiv.querySelector('.insert-form');
