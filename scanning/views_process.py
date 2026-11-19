@@ -4924,6 +4924,7 @@ def add_page_insert(request: HttpRequest, pk: int) -> JsonResponse:
         {
             "status": "ok",
             "page_number": label,
+            "anchor_pdf_page": anchor,
             "edit_id": edit.pk,
             "image_url": edit.image.url,
             "kind": kind,

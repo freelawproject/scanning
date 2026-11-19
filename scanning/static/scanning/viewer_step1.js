@@ -399,34 +399,28 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
-        describeInsert(pageDiv, entry.logical_number, entry.insert_edit_id, entry.insert_kind, entry.unplaced);
+        // The row's own label, which the apply files the page under.
+        // The entry's number is the placeholder's where the row took
+        // one, and the two can differ.
+        var label = entry.insert_label || entry.logical_number;
+        pageDiv.innerHTML = insertedPageHtml(label, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        describeInsert(pageDiv, label, entry.insert_edit_id, entry.insert_kind, entry.unplaced, entry.insert_anchor_pdf_page);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
         drawInsertedPdf(pageDiv);
     }
 
     // What the sidebar's list of uploaded files reads off an inserted
-    // page: the label it was filed under, its row, its kind. The list
-    // is drawn from the pages the viewer shows and from nothing else.
-    function describeInsert(pageDiv, label, editId, kind, unplaced) {
+    // page: the label and the gap its row was filed under, its row,
+    // its kind. The gap is the row's ``anchor_pdf_page`` as the server
+    // stored it, never the page above the box: a moved page can stand
+    // between the two.
+    function describeInsert(pageDiv, label, editId, kind, unplaced, anchor) {
         pageDiv.dataset.insertLabel = label === undefined || label === null ? '' : label;
         pageDiv.dataset.insertEditId = editId || '';
         pageDiv.dataset.insertKind = kind === 'pdf' ? 'pdf' : 'image';
+        pageDiv.dataset.insertAnchor = anchor === undefined || anchor === null ? '' : anchor;
         if (unplaced) { pageDiv.dataset.insertUnplaced = '1'; }
-    }
-
-    // The PDF page an inserted page stands after, read off the viewer:
-    // the nearest page of the original above it, 0 for none.
-    function pdfPageBefore(pageDiv) {
-        var el = pageDiv.previousElementSibling;
-        while (el) {
-            if (el.classList.contains('lazy-page') && el.dataset.pdfIndex !== undefined) {
-                return parseInt(el.dataset.pdfIndex, 10) + 1;
-            }
-            el = el.previousElementSibling;
-        }
-        return 0;
     }
 
     // The sidebar's list of the uploaded files, in the order they
@@ -447,13 +441,14 @@ document.addEventListener('DOMContentLoaded', function () {
                 label: pageDiv.dataset.insertLabel || '',
                 kind: pageDiv.dataset.insertKind,
                 unplaced: pageDiv.dataset.insertUnplaced === '1',
-                after: pdfPageBefore(pageDiv),
+                after: pageDiv.dataset.insertAnchor,
                 part: 1,
                 parts: 1,
             };
             var before = rows[rows.length - 1];
             var prior = pageDiv.previousElementSibling;
             if (before && prior === before.page && before.label === row.label
+                    && before.after === row.after
                     && !before.unplaced && !row.unplaced) {
                 row.part = before.part + 1;
             }
@@ -475,9 +470,10 @@ document.addEventListener('DOMContentLoaded', function () {
             head.className = 'inserted-card-head';
             var label = document.createElement('span');
             label.className = 'inserted-card-label';
-            label.textContent = row.label
-                ? (/^\d+-\d+$/.test(row.label) ? 'Pages ' : 'Page ') + row.label
-                : 'No page number';
+            // The label as it was filed, with the mark the page list
+            // gives a printed number. No "Page" or "Pages": which of
+            // the two a label is, is the server's rule to read.
+            label.textContent = row.label ? '#' + row.label : 'No page number';
             head.appendChild(label);
             var kind = document.createElement('span');
             kind.className = 'inserted-card-kind';
@@ -494,7 +490,8 @@ document.addEventListener('DOMContentLoaded', function () {
             where.className = 'inserted-card-where';
             where.textContent = row.unplaced
                 ? 'This volume has no place for it'
-                : (row.after ? 'after PDF p. ' + row.after : 'before PDF p. 1');
+                : (row.after === '' ? ''
+                    : (row.after === '0' ? 'before PDF p. 1' : 'after PDF p. ' + row.after));
             card.appendChild(where);
             card.addEventListener('click', function () {
                 window.scrollPageIntoView(row.page);
@@ -1655,8 +1652,14 @@ document.addEventListener('DOMContentLoaded', function () {
         }
         inserted.className = 'page-container inserted-page';
         inserted.style.width = '';
-        inserted.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id, false, data.kind, data.file_url);
-        describeInsert(inserted, pageNumber, data.edit_id, data.kind, false);
+        // The label and the gap as the server saved them (it narrows
+        // the label and folds its dash), so a row drawn now and the
+        // same row after a reload read alike.
+        var saved = data.page_number || pageNumber;
+        var anchor = data.anchor_pdf_page !== undefined
+            ? data.anchor_pdf_page : entry.anchor_pdf_page;
+        inserted.innerHTML = insertedPageHtml(saved, data.image_url, data.edit_id, false, data.kind, data.file_url);
+        describeInsert(inserted, saved, data.edit_id, data.kind, false, anchor);
         bindRemoveInsert(inserted, data.edit_id);
         drawInsertedPdf(inserted);
         renderInsertedList();
