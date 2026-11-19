@@ -183,6 +183,16 @@ class TestOpinionList(ScanningTestCase):
         self.assertIn(self.opinion, rows)
         self.assertNotIn(other, rows)
 
+    def test_the_pictures_filter_keeps_the_texts_that_hold_one(self):
+        with_picture = OpinionFactory(scan=self.scan, figure_digest="abc")
+
+        response = self.client.get(reverse("opinion_list"), {"pictures": "1"})
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(with_picture, rows)
+        self.assertNotIn(self.opinion, rows)
+        self.assertTrue(response.context["current_pictures"])
+
     def test_a_volume_that_is_not_a_number_is_refused(self):
         response = self.client.get(
             reverse("opinion_list"), {"volume": "notanumber"}
