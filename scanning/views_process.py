@@ -5471,7 +5471,7 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 #: How long the grand totals of the queue page are kept: the counts
-#: join the detection table, and a reload every hundred cards need not
+#: join the detection table, and a reload every batch of cards need not
 #: count it again.
 CARD_QUEUE_TOTALS_SECONDS = 120
 

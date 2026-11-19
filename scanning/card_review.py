@@ -856,7 +856,7 @@ MODEL_GROUPS = {
 
 #: The cards the queue hands out at a time. A reload of the page hands
 #: out the next ones: an answered card is gone from the server's list.
-QUEUE_SIZE = 100
+QUEUE_SIZE = 25
 
 
 def _sources(group: str) -> tuple[list[str], list[str]]:
