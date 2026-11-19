@@ -1394,9 +1394,16 @@ def scan_original_url(request: HttpRequest, pk: int) -> JsonResponse:
             return JsonResponse(
                 {"error": FINAL_VOLUME_NOT_READY_MESSAGE}, status=409
             )
-        url = s3_sync.presign_get(
-            run.final_pdf_key, settings.ORIGINAL_VIEW_PRESIGN_TTL
+        # ``copy=bitonal`` names the copy step 2 draws, a page of which
+        # decodes to a thirtieth of the full-quality one: the card queue
+        # of every volume crops from it, and a hundred crops of colour
+        # pages ran a tab out of memory (2026-11-19).
+        key = (
+            run.bitonal_key
+            if request.GET.get("copy") == "bitonal"
+            else run.final_pdf_key
         )
+        url = s3_sync.presign_get(key, settings.ORIGINAL_VIEW_PRESIGN_TTL)
         return JsonResponse({"url": url, "embedded_whole": False})
 
     url = s3_sync.presign_original_get(scan)
@@ -5472,7 +5479,7 @@ def scan_review_cards(request: HttpRequest, pk: int) -> JsonResponse:
 
 
 #: How long the grand totals of the queue page are kept: the counts
-#: join the detection table, and a reload every hundred cards need not
+#: join the detection table, and a reload every batch of cards need not
 #: count it again.
 CARD_QUEUE_TOTALS_SECONDS = 120
 
@@ -5568,8 +5575,10 @@ def all_review_cards(request: HttpRequest) -> JsonResponse:
         kwargs = {"pk": pk}
         final = _review_flags(scan)["final_space"]
         sources[pk] = {
+            # The bitonal copy step 2 draws, never the full-quality
+            # scan: a page of it is a thirtieth of the memory.
             "pdf_source": reverse("scan_original_url", kwargs=kwargs)
-            + ("?space=final" if final else ""),
+            + ("?space=final&copy=bitonal" if final else ""),
             "step2_url": reverse("scan_process", kwargs=kwargs) + "?step=2",
         }
     for card in built:

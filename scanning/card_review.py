@@ -567,9 +567,13 @@ def notes_outside_blackout(
     """
     if not rows:
         return []
+    # The pages of the boxes alone: the queue of every volume counts
+    # these over hundreds of volumes (``editorial_cards_by_scan``).
     by_page = {
         entry["page_index"]: entry["rects"]
-        for entry in redactions.visible_by_page(scan)
+        for entry in redactions.visible_by_page(
+            scan, {row.page_index for row in rows}
+        )
     }
     out = []
     for row in rows:
@@ -852,7 +856,7 @@ MODEL_GROUPS = {
 
 #: The cards the queue hands out at a time. A reload of the page hands
 #: out the next ones: an answered card is gone from the server's list.
-QUEUE_SIZE = 100
+QUEUE_SIZE = 25
 
 
 def _sources(group: str) -> tuple[list[str], list[str]]:
@@ -875,6 +879,46 @@ def _open_rows(labels: list[str]):
     )
 
 
+#: How long the editor's note count of every volume is kept: it reads
+#: the redactions of every page that holds a note box.
+EDITORIAL_COUNT_SECONDS = 300
+
+
+def editorial_cards_by_scan() -> dict[int, int]:
+    """Return the editor's note cards of each volume in review 2.
+
+    The model boxes ``cards`` makes a card of: live, undecided, and
+    outside the head matter's blackout (``notes_outside_blackout``), a
+    box inside it being black either way. Most of a volume's boxes are
+    inside it (174 boxes and 10 cards on scan 3810), so a count of the
+    boxes is no count of the work. Kept for ``EDITORIAL_COUNT_SECONDS``.
+
+    :returns: ``{scan_id: cards}``, the volumes with one or more.
+    """
+    from django.core.cache import cache
+
+    from scanning.models import Status
+
+    cached = cache.get("card_queue_editorial")
+    if cached is not None:
+        return cached
+    by_scan: dict[int, list[Detection]] = {}
+    for row in (
+        _open_rows([Label.EDITORIAL.name])
+        .filter(scan__status=Status.READY_FOR_REDACTION_REVIEW)
+        .order_by("scan_id", "page_index", "y0", "pk")
+    ):
+        by_scan.setdefault(row.scan_id, []).append(row)
+    scans = Scan.objects.only("pk").in_bulk(list(by_scan))
+    counts = {}
+    for pk, rows in by_scan.items():
+        n = len(notes_outside_blackout(scans[pk], rows))
+        if n:
+            counts[pk] = n
+    cache.set("card_queue_editorial", counts, EDITORIAL_COUNT_SECONDS)
+    return counts
+
+
 def queue_scan_ids(group: str) -> list[int]:
     """Return the volumes in review 2 with a card of ``group``, oldest first.
 
@@ -885,6 +929,10 @@ def queue_scan_ids(group: str) -> list[int]:
 
     from scanning.models import Status
 
+    if group == EDITORIAL:
+        # A volume whose note boxes are all inside the blackout makes
+        # no card, so the walk takes the volumes that make one.
+        return sorted(editorial_cards_by_scan())
     checks, labels = _sources(group)
     work = Q()
     if checks:
@@ -901,9 +949,9 @@ def queue_scan_ids(group: str) -> list[int]:
 def queue_totals() -> dict[str, int]:
     """Return how many cards of each group wait, over every volume.
 
-    The findings are counted exactly; the model boxes count every live,
-    undecided row, so the editor's notes inside a blackout, which make
-    no card, are in the number too.
+    The findings are counted exactly, and so are the editor's notes
+    (``editorial_cards_by_scan``); the image boxes count every live,
+    undecided model row, each of which makes a card.
 
     :returns: ``{group: count}`` in ``GROUPS`` order.
     """
@@ -920,7 +968,7 @@ def queue_totals() -> dict[str, int]:
         .annotate(n=Count("pk"))
     )
     by_label = dict(
-        _open_rows(list(MODEL_GROUPS))
+        _open_rows([Label.IMAGE.name])
         .filter(**ready)
         .order_by()
         .values_list("label")
@@ -931,6 +979,7 @@ def queue_totals() -> dict[str, int]:
         totals[KIND_GROUPS[CHECKS[check]]] += n
     for label, n in by_label.items():
         totals[MODEL_GROUPS[label]] += n
+    totals[EDITORIAL] = sum(editorial_cards_by_scan().values())
     return totals
 
 
