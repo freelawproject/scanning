@@ -217,15 +217,16 @@ def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
-    and the ``blocking`` switch, in the list's order, for the list and
-    for the blocking review, which reads the same query string. The
+    and the ``blocking`` and ``pictures`` switches, in the list's order,
+    for the list and for the blocking review, which reads the same
+    query string. The
     ``opinion`` filter is the review page's: its two buttons open the
     blocking and the warnings review of that opinion alone.
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "opinion", "blocking"})``, the current values as the form shows
-        them.
+        "opinion", "blocking", "pictures"})``, the current values as
+        the form shows them.
     """
     # The scan's caches stay on disk (#582): the join repeats them on
     # each of a page's rows, and no reader of the list needs one.
@@ -264,6 +265,12 @@ def _filtered_opinions(request: HttpRequest):
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The text holds a picture: the stamp of the ensemble (#463), a
+    # column of the row, where the Pictures column counts the boxes of
+    # the pages with the junk rule, in Python and for one page alone.
+    pictures_only = request.GET.get("pictures") == "1"
+    if pictures_only:
+        opinions_qs = opinions_qs.exclude(figure_digest="")
     # The order never crosses a table: ordered by the reporter's name,
     # the scan's volume and the opinion's page at once, no index served
     # the sort, and at a hundred thousand rows Postgres joined and
@@ -286,6 +293,7 @@ def _filtered_opinions(request: HttpRequest):
         "volume": volume_filter or "",
         "opinion": opinion_filter,
         "blocking": blocking_only,
+        "pictures": pictures_only,
     }
 
 
@@ -410,6 +418,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             "current_status": current["status"],
             "current_volume": current["volume"],
             "current_blocking": current["blocking"],
+            "current_pictures": current["pictures"],
             "blocking_review_url": _review_url(
                 current, "opinion_blocking_review"
             ),
