@@ -12,7 +12,15 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef, Prefetch, Q
+from django.db.models import (
+    Count,
+    Exists,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+)
+from django.db.models.functions import Coalesce
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -217,16 +225,17 @@ def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
-    and the ``blocking`` and ``pictures`` switches, in the list's order,
-    for the list and for the blocking review, which reads the same
-    query string. The
+    and the ``blocking``, ``non_blocking`` and ``pictures`` switches,
+    in the list's order or in the order of ``sort``
+    (:func:`_by_open_cards`), for the list and for the blocking review,
+    which reads the same query string. The
     ``opinion`` filter is the review page's: its two buttons open the
     blocking and the warnings review of that opinion alone.
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "opinion", "blocking", "pictures"})``, the current values as
-        the form shows them.
+        "opinion", "blocking", "non_blocking", "pictures", "sort"})``,
+        the current values as the form shows them.
     """
     # The scan's caches stay on disk (#582): the join repeats them on
     # each of a page's rows, and no reader of the list needs one.
@@ -265,6 +274,11 @@ def _filtered_opinions(request: HttpRequest):
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The twin of the switch above: the opinions no open card holds
+    # back. Both at once name no opinion, and the form unchecks one.
+    non_blocking_only = request.GET.get("non_blocking") == "1"
+    if non_blocking_only:
+        opinions_qs = _without_open_blocking_card(opinions_qs)
     # The text holds a picture: the stamp of the ensemble (#463), a
     # column of the row, where the Pictures column counts the boxes of
     # the pages with the junk rule, in Python and for one page alone.
@@ -286,6 +300,14 @@ def _filtered_opinions(request: HttpRequest):
     else:
         order = ("-pk",)
     opinions_qs = opinions_qs.order_by(*order)
+    sort = request.GET.get("sort") or ""
+    if sort not in OPINION_SORTS:
+        sort = ""
+    elif _over_the_sort_cap(opinions_qs):
+        messages.error(request, OPINION_SORT_SCOPE_MESSAGE)
+        sort = ""
+    else:
+        opinions_qs = _by_open_cards(opinions_qs, sort, order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
@@ -293,7 +315,9 @@ def _filtered_opinions(request: HttpRequest):
         "volume": volume_filter or "",
         "opinion": opinion_filter,
         "blocking": blocking_only,
+        "non_blocking": non_blocking_only,
         "pictures": pictures_only,
+        "sort": sort,
     }
 
 
@@ -315,6 +339,86 @@ def _with_open_blocking_card(opinions_qs):
     counts by (#375).
     """
     return _with_open_card(opinions_qs, blocking_filter())
+
+
+def _without_open_blocking_card(opinions_qs):
+    """Keep the opinions whose approval waits on no open card.
+
+    The complement of :func:`_with_open_blocking_card`, by the same
+    rule: an opinion with warnings alone, or with no card at all.
+    """
+    return opinions_qs.exclude(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                blocking_filter()
+            )
+        )
+    )
+
+
+#: The orders of ``/opinions/`` by the count of the Warnings column,
+#: as the ``sort`` select offers them.
+OPINION_SORTS = {
+    "-warnings": "Most warnings first",
+    "warnings": "Fewest warnings first",
+}
+
+#: The most opinions the sort by warnings counts. No index serves that
+#: order, so each kept opinion costs a count of its open cards on every
+#: page of the walk; a filter that keeps more is refused, whichever
+#: filter it is, because a status alone can keep most of the corpus.
+OPINION_SORT_MAX_ROWS = 20_000
+
+OPINION_SORT_SCOPE_MESSAGE = (
+    f"The sort by warnings takes at most {OPINION_SORT_MAX_ROWS:,} "
+    "opinions: narrow the list with a scan, a volume, a reporter or a "
+    "status first."
+)
+
+
+def _over_the_sort_cap(opinions_qs) -> bool:
+    """Return whether the filters keep more opinions than the sort takes.
+
+    A probe of one row past :data:`OPINION_SORT_MAX_ROWS`, in no order,
+    so it stops at the cap and never counts the corpus.
+    """
+    return (
+        opinions_qs.order_by()
+        .values("pk")[OPINION_SORT_MAX_ROWS : OPINION_SORT_MAX_ROWS + 1]
+        .exists()
+    )
+
+
+def _by_open_cards(opinions_qs, sort: str, order: tuple):
+    """Order the opinions by their count of open cards.
+
+    The count is the number of the Warnings column
+    (``opinions.finding_counts``: every card with no dismissal). No
+    index serves this order: Postgres counts the open cards of every
+    opinion the filters keep, one probe of the finding table's opinion
+    index each, and sorts them, so the caller refuses it past
+    :data:`OPINION_SORT_MAX_ROWS`. Opinions with the same count keep
+    the list's own order, which ends in the pk, so the order is total
+    and a LIMIT/OFFSET walk shows each opinion once.
+
+    :param opinions_qs: The filtered opinions.
+    :param sort: A key of :data:`OPINION_SORTS`.
+    :param order: The list's own order, the tie-break.
+    :returns: The queryset, ordered.
+    """
+    open_cards = (
+        OpinionFinding.objects.filter(
+            opinion=OuterRef("pk"), dismissal__isnull=True
+        )
+        .order_by()
+        .values("opinion")
+        .annotate(n=Count("pk"))
+        .values("n")
+    )
+    count = Coalesce(Subquery(open_cards), 0)
+    return opinions_qs.annotate(open_cards=count).order_by(
+        "open_cards" if sort == "warnings" else "-open_cards", *order
+    )
 
 
 #: The blocking review takes one volume at a time.
@@ -418,7 +522,10 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             "current_status": current["status"],
             "current_volume": current["volume"],
             "current_blocking": current["blocking"],
+            "current_non_blocking": current["non_blocking"],
             "current_pictures": current["pictures"],
+            "current_sort": current["sort"],
+            "sort_choices": list(OPINION_SORTS.items()),
             "blocking_review_url": _review_url(
                 current, "opinion_blocking_review"
             ),

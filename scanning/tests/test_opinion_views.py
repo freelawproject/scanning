@@ -10,7 +10,7 @@ from unittest.mock import patch
 from blackletter.models import Label
 from django.urls import reverse
 
-from scanning import stats
+from scanning import stats, views
 from scanning.factories import (
     OpinionBoundaryFactory,
     OpinionFactory,
@@ -192,6 +192,91 @@ class TestOpinionList(ScanningTestCase):
         self.assertIn(with_picture, rows)
         self.assertNotIn(self.opinion, rows)
         self.assertTrue(response.context["current_pictures"])
+
+    def test_the_non_blocking_filter_drops_an_open_blocking_card(self):
+        """A warning or a dismissed error holds no approval back."""
+        blocked = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=blocked, severity=Issue.Severity.ERROR)
+        OpinionFindingFactory(
+            opinion=self.opinion, severity=Issue.Severity.WARNING
+        )
+
+        response = self.client.get(
+            reverse("opinion_list"), {"non_blocking": "1"}
+        )
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(self.opinion, rows)
+        self.assertNotIn(blocked, rows)
+        self.assertTrue(response.context["current_non_blocking"])
+        self.assertContains(response, "Non blocking only")
+
+    def test_the_sort_orders_by_the_open_cards(self):
+        """The count of the Warnings column, a dismissed card left out."""
+        many = OpinionFactory(scan=self.scan, first_printed_page=500)
+        for page in (1, 2, 3):
+            OpinionFindingFactory(opinion=many, page_in_opinion=page)
+        one = OpinionFactory(scan=self.scan, first_printed_page=600)
+        OpinionFindingFactory(opinion=one)
+        address = reverse("opinion_list")
+
+        most = self.client.get(
+            address, {"scan": self.scan.pk, "sort": "-warnings"}
+        )
+        fewest = self.client.get(
+            address, {"scan": self.scan.pk, "sort": "warnings"}
+        )
+
+        self.assertEqual(
+            list(most.context["page_obj"]), [many, one, self.opinion]
+        )
+        self.assertEqual(
+            list(fewest.context["page_obj"]), [self.opinion, one, many]
+        )
+        self.assertEqual(most.context["current_sort"], "-warnings")
+
+    def test_the_sort_keeps_the_page_order_of_a_tie(self):
+        """Opinions with the same count stay in the list's own order."""
+        later = OpinionFactory(scan=self.scan, first_printed_page=900)
+        earlier = OpinionFactory(scan=self.scan, first_printed_page=100)
+
+        response = self.client.get(
+            reverse("opinion_list"),
+            {"scan": self.scan.pk, "sort": "-warnings"},
+        )
+
+        self.assertEqual(
+            list(response.context["page_obj"]),
+            [earlier, self.opinion, later],
+        )
+
+    def test_the_sort_takes_a_status_alone(self):
+        response = self.client.get(
+            reverse("opinion_list"),
+            {
+                "status": OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                "sort": "-warnings",
+            },
+        )
+
+        self.assertEqual(response.context["current_sort"], "-warnings")
+
+    def test_the_sort_is_refused_past_its_cap(self):
+        """No index serves the order, so the list it takes is bounded."""
+        newer = OpinionFactory(scan=self.scan, first_printed_page=900)
+        OpinionFindingFactory(opinion=self.opinion)
+
+        with patch.object(views, "OPINION_SORT_MAX_ROWS", 1):
+            response = self.client.get(
+                reverse("opinion_list"),
+                {"scan": self.scan.pk, "sort": "-warnings"},
+            )
+
+        self.assertEqual(
+            list(response.context["page_obj"]), [self.opinion, newer]
+        )
+        self.assertEqual(response.context["current_sort"], "")
+        self.assertContains(response, views.OPINION_SORT_SCOPE_MESSAGE)
 
     def test_a_volume_that_is_not_a_number_is_refused(self):
         response = self.client.get(
