@@ -56,7 +56,13 @@ from dataclasses import dataclass, field
 from django.db import transaction
 from django.db.models import Case, Count, F, Q, Value, When
 
-from scanning import apply, boundaries, review_states, s3_sync
+from scanning import (
+    apply,
+    boundaries,
+    opinion_findings,
+    review_states,
+    s3_sync,
+)
 from scanning.models import (
     STALE_OPINION_CHECKS,
     Detection,
@@ -646,6 +652,9 @@ def create_rows(
         summary.stale, summary.orphaned = _write_stale_cards(
             unmatched, by_address
         )
+        # The stored count of the list's sort, after the delete and the
+        # write above: the volume's rows whose count moved, and no other.
+        opinion_findings.stamp_open(Opinion.objects.filter(scan=scan))
     logger.info(
         "scan %s: opinions under %s: %d created, %d updated (%d rebuilt), "
         "%d stale, %d orphaned",

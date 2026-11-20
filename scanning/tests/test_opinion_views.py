@@ -8,9 +8,10 @@ pages keep their tests in ``test_views.py``, under their new names.
 from unittest.mock import patch
 
 from blackletter.models import Label
+from django.test import RequestFactory
 from django.urls import reverse
 
-from scanning import stats, views
+from scanning import opinion_findings, stats, views
 from scanning.factories import (
     OpinionBoundaryFactory,
     OpinionFactory,
@@ -211,6 +212,10 @@ class TestOpinionList(ScanningTestCase):
         self.assertTrue(response.context["current_non_blocking"])
         self.assertContains(response, "Non blocking only")
 
+    def stamp(self):
+        """Write the stored counts, as every writer of a card does."""
+        opinion_findings.stamp_open(Opinion.objects.all())
+
     def test_the_sort_orders_by_the_open_cards(self):
         """The count of the Warnings column, a dismissed card left out."""
         many = OpinionFactory(scan=self.scan, first_printed_page=500)
@@ -218,6 +223,7 @@ class TestOpinionList(ScanningTestCase):
             OpinionFindingFactory(opinion=many, page_in_opinion=page)
         one = OpinionFactory(scan=self.scan, first_printed_page=600)
         OpinionFindingFactory(opinion=one)
+        self.stamp()
         address = reverse("opinion_list")
 
         most = self.client.get(
@@ -250,33 +256,42 @@ class TestOpinionList(ScanningTestCase):
             [earlier, self.opinion, later],
         )
 
-    def test_the_sort_takes_a_status_alone(self):
-        response = self.client.get(
-            reverse("opinion_list"),
-            {
-                "status": OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
-                "sort": "-warnings",
-            },
-        )
+    def test_the_sort_takes_the_whole_corpus(self):
+        """No filter is asked for: the count is a column of the row.
 
-        self.assertEqual(response.context["current_sort"], "-warnings")
+        A tie is broken by the pk in the direction of the count, the
+        one order the index serves both ways.
+        """
+        older = self.opinion
+        newer = OpinionFactory(scan=self.scan)
+        most = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=most)
+        self.stamp()
+        address = reverse("opinion_list")
 
-    def test_the_sort_is_refused_past_its_cap(self):
-        """No index serves the order, so the list it takes is bounded."""
-        newer = OpinionFactory(scan=self.scan, first_printed_page=900)
-        OpinionFindingFactory(opinion=self.opinion)
+        down = self.client.get(address, {"sort": "-warnings"})
+        up = self.client.get(address, {"sort": "warnings"})
 
-        with patch.object(views, "OPINION_SORT_MAX_ROWS", 1):
-            response = self.client.get(
+        self.assertEqual(list(down.context["page_obj"]), [most, newer, older])
+        self.assertEqual(list(up.context["page_obj"]), [older, newer, most])
+        self.assertEqual(down.context["current_sort"], "-warnings")
+        self.assertFalse(list(down.context["messages"]))
+
+    def test_the_sort_reads_no_finding_row(self):
+        """The order is a column of the opinion and crosses no table."""
+        opinions_qs, _ = views._filtered_opinions(
+            RequestFactory().get(
                 reverse("opinion_list"),
-                {"scan": self.scan.pk, "sort": "-warnings"},
+                {
+                    "status": OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                    "sort": "-warnings",
+                },
             )
-
-        self.assertEqual(
-            list(response.context["page_obj"]), [self.opinion, newer]
         )
-        self.assertEqual(response.context["current_sort"], "")
-        self.assertContains(response, views.OPINION_SORT_SCOPE_MESSAGE)
+
+        sql = str(opinions_qs.query)
+        self.assertNotIn("opinionfinding", sql)
+        self.assertIn('"open_findings" DESC', sql)
 
     def test_a_volume_that_is_not_a_number_is_refused(self):
         response = self.client.get(

@@ -3267,6 +3267,17 @@ class Opinion(AbstractDateTimeModel):
             "key; the key is derived from the pk and the revision."
         ),
     )
+    open_findings = models.PositiveIntegerField(
+        default=0,
+        db_default=0,
+        help_text=(
+            "How many findings of this opinion carry no dismissal: the "
+            "number of the list's Warnings column, stored so the list "
+            "sorts by it off an index. A cache of the finding rows, "
+            "written by opinion_findings.stamp_open after every write of "
+            "one; the rows are the truth."
+        ),
+    )
     pdf_attempts = models.PositiveSmallIntegerField(
         default=0,
         help_text=(
@@ -3357,6 +3368,18 @@ class Opinion(AbstractDateTimeModel):
             # status walked the table backwards to fill a page.
             models.Index(
                 fields=["status", "id"], name="idx_opinion_status_id"
+            ),
+            # The opinions list sorted by warnings: the whole corpus, and
+            # one status. Each is walked forwards for the fewest first
+            # and backwards for the most, so the tie-break of that sort
+            # is the pk in the direction of the count.
+            models.Index(
+                fields=["open_findings", "id"],
+                name="idx_opinion_open_findings",
+            ),
+            models.Index(
+                fields=["status", "open_findings", "id"],
+                name="idx_opinion_status_open",
             ),
             # The "owes work" question of each opinion pass (#604): the
             # rows a pass still owes, in the order it walks them.

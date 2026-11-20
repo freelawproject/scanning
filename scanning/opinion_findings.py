@@ -15,9 +15,17 @@ a person the text does not hold (#376), so neither takes a dismissal
 
 The gate of the status lives in the view, the rule of every refused
 write: this module answers for the rows alone.
+
+``Opinion.open_findings`` is the count of the cards with no dismissal,
+stored on the row so the opinions list sorts by it off an index.
+:func:`stamp_open` is its one writer, and every writer of a finding row
+calls it after its write: the two here, ``ensemble.rebuild_findings``
+and ``opinions.create_rows``. A test pins that set of modules.
 """
 
 from django.db import transaction
+from django.db.models import Count, F, OuterRef, Subquery
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from scanning.models import (
@@ -26,6 +34,42 @@ from scanning.models import (
     OpinionFinding,
     OpinionFindingDismissal,
 )
+
+
+def stamp_open(opinions_qs) -> int:
+    """Write ``Opinion.open_findings`` again, from the finding rows.
+
+    A count of the rows as they stand and never a step up or down, so a
+    second call writes nothing and a missed one is repaired by the next
+    (or by the ``stamp_open_findings`` command). Only a row whose count
+    moved is written: the column is indexed, and the creation calls
+    this for a whole volume.
+
+    Two writers of one opinion's findings at once can each count
+    before the other commits. The ensemble and the dismissal hold the
+    opinion's row lock, so they take turns; the creation does not, and
+    its stamp can be one write behind until the next one.
+
+    :param opinions_qs: The opinions to count, a queryset of
+        ``Opinion``.
+    :returns: How many rows were written.
+    :rtype: int
+    """
+    counted = (
+        OpinionFinding.objects.filter(
+            opinion=OuterRef("pk"), dismissal__isnull=True
+        )
+        .order_by()
+        .values("opinion")
+        .annotate(n=Count("pk"))
+        .values("n")
+    )
+    return (
+        opinions_qs.order_by()
+        .annotate(open_now=Coalesce(Subquery(counted), 0))
+        .exclude(open_findings=F("open_now"))
+        .update(open_findings=F("open_now"))
+    )
 
 
 class UndismissableOpinionFinding(ValueError):
@@ -74,6 +118,7 @@ def dismiss(
             page_in_opinion=finding.page_in_opinion,
             check_name=finding.check_name,
         ).update(dismissal=row)
+        stamp_open(Opinion.objects.filter(pk=opinion.pk))
     return row
 
 
@@ -88,6 +133,8 @@ def restore(opinion: Opinion, finding: OpinionFinding) -> bool:
         return False
     now = timezone.now()
     with transaction.atomic():
+        # The lock of :func:`dismiss`, so the two stamps take turns.
+        Opinion.objects.select_for_update().filter(pk=opinion.pk).first()
         stamped = OpinionFindingDismissal.objects.filter(
             pk=finding.dismissal_id,
             opinion=opinion,
@@ -96,4 +143,5 @@ def restore(opinion: Opinion, finding: OpinionFinding) -> bool:
         OpinionFinding.objects.filter(
             dismissal_id=finding.dismissal_id
         ).update(dismissal=None)
+        stamp_open(Opinion.objects.filter(pk=opinion.pk))
     return bool(stamped)

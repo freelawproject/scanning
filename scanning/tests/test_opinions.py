@@ -469,6 +469,8 @@ class TestCreateRows(TestCase):
             [(c.check_name, c.page_in_opinion) for c in cards],
             [(OpinionCheck.ORPHANED_OPINION, None)],
         )
+        # The stored count of the list's sort follows the card.
+        self.assertEqual(orphan.open_findings, 1)
         # The row keeps its data.
         self.assertEqual(orphan.last_printed_page, 505)
         self.assertEqual(Opinion.objects.filter(scan=self.scan).count(), 2)

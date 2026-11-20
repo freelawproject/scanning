@@ -6,9 +6,13 @@ stale card, which is a fact about the row, and every opinion that is
 not ready for the text review.
 """
 
+import ast
+import pathlib
+
+from django.core.management import call_command
 from django.urls import reverse
 
-from scanning import ensemble
+from scanning import ensemble, opinion_findings
 from scanning.factories import (
     OpinionFactory,
     OpinionFindingFactory,
@@ -16,6 +20,7 @@ from scanning.factories import (
 )
 from scanning.models import (
     Issue,
+    Opinion,
     OpinionCheck,
     OpinionFinding,
     OpinionFindingDismissal,
@@ -228,3 +233,96 @@ class TestTheRestore(OpinionFindingTestCase):
 
         self.assertEqual(response.status_code, 409)
         self.assertIsNone(OpinionFindingDismissal.objects.get().withdrawn_at)
+
+
+class TestOpenFindingsCount(OpinionFindingTestCase):
+    """``Opinion.open_findings``, the stored count of the list's sort.
+
+    A cache of the finding rows with no dismissal. Every writer of a
+    finding row stamps it, and the set of those modules is pinned, so a
+    new writer is a decision that updates this test and not a count the
+    list sorts by in silence.
+    """
+
+    def count(self, opinion=None) -> int:
+        row = Opinion.objects.get(pk=(opinion or self.opinion).pk)
+        return row.open_findings
+
+    def test_the_stamp_counts_the_cards_with_no_dismissal(self):
+        OpinionFindingFactory(opinion=self.opinion, page_in_opinion=1)
+        other = OpinionFactory(scan=self.scan)
+
+        written = opinion_findings.stamp_open(
+            Opinion.objects.filter(scan=self.scan)
+        )
+
+        self.assertEqual(written, 1)
+        self.assertEqual(self.count(), 2)
+        self.assertEqual(self.count(other), 0)
+
+    def test_a_second_stamp_writes_nothing(self):
+        rows = Opinion.objects.filter(pk=self.opinion.pk)
+        opinion_findings.stamp_open(rows)
+
+        self.assertEqual(opinion_findings.stamp_open(rows), 0)
+
+    def test_a_dismissal_and_its_restore_move_the_count(self):
+        opinion_findings.stamp_open(Opinion.objects.filter(pk=self.opinion.pk))
+        self.assertEqual(self.count(), 1)
+
+        self.dismiss()
+        self.assertEqual(self.count(), 0)
+
+        self.finding.refresh_from_db()
+        self.restore()
+        self.assertEqual(self.count(), 1)
+
+    def test_a_rebuild_of_the_ensemble_stamps_the_count(self):
+        page = page_of(majority=2, differing=2, warning=2)
+
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        self.assertEqual(
+            self.count(),
+            OpinionFinding.objects.filter(
+                opinion=self.opinion, dismissal__isnull=True
+            ).count(),
+        )
+        self.assertEqual(self.count(), 1)
+
+    def test_the_command_writes_the_rows_from_before_the_column(self):
+        call_command("stamp_open_findings", "--all", "--dry-run")
+        self.assertEqual(self.count(), 0)
+
+        call_command("stamp_open_findings", self.scan.pk)
+
+        self.assertEqual(self.count(), 1)
+
+    def test_the_writers_of_a_finding_row_are_the_known_modules(self):
+        """A module that writes ``OpinionFinding`` rows calls the stamp."""
+        writes = {"bulk_create", "create", "delete", "update", "save"}
+        writers = set()
+        for path in pathlib.Path("scanning").rglob("*.py"):
+            if "tests" in path.parts or "migrations" in path.parts:
+                continue
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in writes
+                ):
+                    continue
+                names = {
+                    inner.id
+                    for inner in ast.walk(node.func)
+                    if isinstance(inner, ast.Name)
+                }
+                if "OpinionFinding" in names:
+                    writers.add(path.name)
+        self.assertEqual(
+            writers, {"ensemble.py", "opinions.py", "opinion_findings.py"}
+        )
+        for name in writers:
+            source = (pathlib.Path("scanning") / name).read_text()
+            self.assertIn("stamp_open(", source, name)

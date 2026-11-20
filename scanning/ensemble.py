@@ -169,7 +169,13 @@ from django.db import transaction
 from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
-from scanning import detections, markup, opinion_ocr, s3_sync
+from scanning import (
+    detections,
+    markup,
+    opinion_findings,
+    opinion_ocr,
+    s3_sync,
+)
 from scanning.models import (
     OPINION_ENSEMBLE_MAX_ATTEMPTS,
     OPINION_ENSEMBLE_OWED,
@@ -5162,6 +5168,8 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 )
             )
     OpinionFinding.objects.bulk_create(cards)
+    # The stored count of the list's sort, after every write of a card.
+    opinion_findings.stamp_open(Opinion.objects.filter(pk=opinion.pk))
     return len(cards)
 
 

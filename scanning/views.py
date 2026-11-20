@@ -12,15 +12,7 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import (
-    Count,
-    Exists,
-    OuterRef,
-    Prefetch,
-    Q,
-    Subquery,
-)
-from django.db.models.functions import Coalesce
+from django.db.models import Count, Exists, OuterRef, Prefetch, Q
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -303,9 +295,6 @@ def _filtered_opinions(request: HttpRequest):
     sort = request.GET.get("sort") or ""
     if sort not in OPINION_SORTS:
         sort = ""
-    elif _over_the_sort_cap(opinions_qs):
-        messages.error(request, OPINION_SORT_SCOPE_MESSAGE)
-        sort = ""
     else:
         opinions_qs = _by_open_cards(opinions_qs, sort, order)
     return opinions_qs, {
@@ -363,62 +352,32 @@ OPINION_SORTS = {
     "warnings": "Fewest warnings first",
 }
 
-#: The most opinions the sort by warnings counts. No index serves that
-#: order, so each kept opinion costs a count of its open cards on every
-#: page of the walk; a filter that keeps more is refused, whichever
-#: filter it is, because a status alone can keep most of the corpus.
-OPINION_SORT_MAX_ROWS = 20_000
-
-OPINION_SORT_SCOPE_MESSAGE = (
-    f"The sort by warnings takes at most {OPINION_SORT_MAX_ROWS:,} "
-    "opinions: narrow the list with a scan, a volume, a reporter or a "
-    "status first."
-)
-
-
-def _over_the_sort_cap(opinions_qs) -> bool:
-    """Return whether the filters keep more opinions than the sort takes.
-
-    A probe of one row past :data:`OPINION_SORT_MAX_ROWS`, in no order,
-    so it stops at the cap and never counts the corpus.
-    """
-    return (
-        opinions_qs.order_by()
-        .values("pk")[OPINION_SORT_MAX_ROWS : OPINION_SORT_MAX_ROWS + 1]
-        .exists()
-    )
-
 
 def _by_open_cards(opinions_qs, sort: str, order: tuple):
     """Order the opinions by their count of open cards.
 
-    The count is the number of the Warnings column
-    (``opinions.finding_counts``: every card with no dismissal). No
-    index serves this order: Postgres counts the open cards of every
-    opinion the filters keep, one probe of the finding table's opinion
-    index each, and sorts them, so the caller refuses it past
-    :data:`OPINION_SORT_MAX_ROWS`. Opinions with the same count keep
-    the list's own order, which ends in the pk, so the order is total
-    and a LIMIT/OFFSET walk shows each opinion once.
+    The count is ``Opinion.open_findings``, the number of the Warnings
+    column stored on the row (``opinion_findings.stamp_open``), so the
+    order crosses no table. Opinions with the same count keep the
+    list's own order, which ends in the pk, so the order is total and a
+    LIMIT/OFFSET walk shows each opinion once.
+
+    The list with no scan, reporter or volume is the corpus, newest
+    first, and there an index serves the sort
+    (``idx_opinion_open_findings``, ``idx_opinion_status_open``): the
+    tie-break is the pk in the direction of the count, so the fewest
+    first is the index walked forwards and the most first the same
+    index walked backwards.
 
     :param opinions_qs: The filtered opinions.
     :param sort: A key of :data:`OPINION_SORTS`.
     :param order: The list's own order, the tie-break.
     :returns: The queryset, ordered.
     """
-    open_cards = (
-        OpinionFinding.objects.filter(
-            opinion=OuterRef("pk"), dismissal__isnull=True
-        )
-        .order_by()
-        .values("opinion")
-        .annotate(n=Count("pk"))
-        .values("n")
-    )
-    count = Coalesce(Subquery(open_cards), 0)
-    return opinions_qs.annotate(open_cards=count).order_by(
-        "open_cards" if sort == "warnings" else "-open_cards", *order
-    )
+    if sort == "warnings":
+        tie = ("pk",) if order == ("-pk",) else order
+        return opinions_qs.order_by("open_findings", *tie)
+    return opinions_qs.order_by("-open_findings", *order)
 
 
 #: The blocking review takes one volume at a time.
