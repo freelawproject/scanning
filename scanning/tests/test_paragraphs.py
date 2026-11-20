@@ -532,6 +532,524 @@ class TestTheFootnotes(TestCase):
             "The appeal lies under\n28 U.S.C. 1291.",
         )
 
+    def test_a_number_the_body_cites_is_a_label_past_the_step(self):
+        """One label the engines missed does not end the series: notes
+        3 and 4 read as one block leave the last label at 3, and note 8
+        is still a note because the body cites it on its page."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "3"),
+                    self.cited(1, "B.", "7"),
+                    self.note(2, "3. Three. 4. Four. 5. Five. 6. Seven."),
+                ],
+            ),
+            page(
+                1,
+                [
+                    self.cited(0, "C.", "8"),
+                    self.cited(1, "D.", "9"),
+                    self.note(2, "8. Eight."),
+                    self.note(3, "9. Nine.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["3", "8", "9"])
+
+    def test_a_far_number_cited_on_another_page_is_text(self):
+        """A continuation that starts with a number the body cites far
+        away is still the rest of the note before it."""
+        doc = document(
+            page(0, [self.cited(0, "A.", "28")]),
+            page(1, [group(0, "B.")]),
+            page(
+                2,
+                [self.cited(0, "C.", "1"), self.note(1, "1. See generally")],
+            ),
+            page(3, [self.note(0, "28 U.S.C. § 1291.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "1")
+
+    def test_a_label_inside_a_group_the_body_cites_cuts_the_group(self):
+        """The engines read the short notes of a page as two blocks cut
+        at the column edge: each label the body cites starts its note,
+        and the rest of note 4 in the next column goes on with it."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "3"),
+                    self.cited(1, "B.", "4"),
+                    self.cited(2, "C.", "5"),
+                    self.cited(3, "D.", "6"),
+                    self.note(4, "3. Three. 4. Four goes"),
+                    self.note(
+                        5,
+                        "on here. 5. Five, 6. Six.",
+                        column="R",
+                        marks=[{"kind": "em", "start": 12, "end": 16}],
+                    ),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["3", "4", "5", "6"])
+        self.assertEqual(
+            [n["paragraphs"][0]["text"] for n in notes],
+            ["Three.", "Four goes\non here.", "Five,", "Six."],
+        )
+        self.assertEqual(
+            notes[2]["paragraphs"][0]["marks"],
+            [{"kind": "em", "start": 0, "end": 4}],
+        )
+
+    def test_a_number_inside_a_group_the_body_does_not_cite_is_text(self):
+        """A sentence that ends in a number is no note without its mark,
+        and "ECF No. 4." holds no label even with one."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "3"),
+                    self.note(1, "3. See page 2. 4. The rule."),
+                ],
+            ),
+            page(
+                1,
+                [
+                    self.cited(0, "B.", "4"),
+                    self.cited(1, "C.", "5"),
+                    self.note(2, "4. See ECF No. 5. The brief."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["3", "4"])
+
+    def test_a_footnote_is_no_heading_and_keeps_no_heading_bold(self):
+        """One engine read the first line of a note as a heading: the
+        kind and the bold over the whole group go; the bold of a part
+        of it is the print's, and stays."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.note(
+                        0,
+                        "1. Section 5 provides:",
+                        kind="heading",
+                        marks=[{"kind": "strong", "start": 0, "end": 22}],
+                    ),
+                    self.note(
+                        1,
+                        "2. ORPC 1.1 provides:",
+                        column="R",
+                        kind="heading",
+                        marks=[{"kind": "strong", "start": 0, "end": 11}],
+                    ),
+                ],
+            ),
+        )
+
+        first, second = paragraphs.footnotes(doc)
+
+        self.assertEqual(first["paragraphs"][0]["kind"], "paragraph")
+        self.assertEqual(first["paragraphs"][0]["marks"], [])
+        self.assertEqual(
+            second["paragraphs"][0]["marks"],
+            [{"kind": "strong", "start": 0, "end": 8}],
+        )
+        self.assertEqual(second["paragraphs"][0]["kind"], "paragraph")
+
+    def test_the_notes_of_the_opinion_before_do_not_take_the_first_note(
+        self,
+    ):
+        """The first page holds the last notes of the opinion before:
+        the body's first mark starts the opinion's own series."""
+        doc = document(
+            page(0, [group(0, "A caption."), self.note(1, "26. The last.")]),
+            page(
+                1,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "1. One."),
+                    self.note(3, "2. Two.", column="R"),
+                ],
+            ),
+            page(2, [self.note(0, "1 U.S.C. § 1 says so.")]),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["26", "1", "2"])
+        self.assertEqual(len(notes[2]["paragraphs"]), 2)
+
+    def test_a_list_label_does_not_break_a_note_at_the_column(self):
+        """One engine labels a numbered note a list item: the half in
+        the next column is a paragraph, and the note is still one."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.note(0, "1. The presen-", kind="list_item"),
+                    self.note(1, "tence report says so.", column="R"),
+                ],
+            ),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(
+            [p["text"] for p in note["paragraphs"]],
+            ["The presen-\ntence report says so."],
+        )
+        self.assertEqual(note["paragraphs"][0]["kind"], "paragraph")
+
+    def test_a_label_the_body_cites_on_the_page_before_is_a_label(self):
+        """A mark in the last line of a page sends its note to the next
+        page: the label past the step is still a label there."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "8"),
+                    self.note(2, "1. One."),
+                ],
+            ),
+            page(1, [group(0, "C."), self.note(1, "8. Eight.")]),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["1", "8"])
+
+    def test_the_labels_inside_a_group_go_on_from_its_own_far_label(self):
+        """A group that starts with a label past the step, proved by the
+        body, is cut at the labels that follow that label."""
+        doc = document(
+            page(0, [self.cited(0, "A.", "3"), self.note(1, "3. Three.")]),
+            page(
+                1,
+                [
+                    self.cited(0, "B.", "8"),
+                    self.cited(1, "C.", "9"),
+                    self.note(2, "8. Eight. 9. Nine."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["3", "8", "9"])
+        self.assertEqual(notes[2]["paragraphs"][0]["text"], "Nine.")
+
+    def test_a_cited_number_two_ahead_inside_a_group_is_text(self):
+        """A cut takes the last label plus one and no other. "See App.
+        10, 14. The witness" inside note 12 is no note 14, though the
+        body cites 14: notes 13 and 14 are groups of their own."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "12"),
+                    self.cited(1, "B.", "13"),
+                    self.cited(2, "C.", "14"),
+                    self.note(3, "12. See the record. 14. The witness said."),
+                    self.note(4, "13. Thirteen."),
+                    self.note(5, "14. Fourteen.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["12", "13", "14"])
+        self.assertEqual(
+            notes[0]["paragraphs"][0]["text"],
+            "See the record. 14. The witness said.",
+        )
+
+    def test_a_number_of_a_citation_is_no_note_before_the_real_one(self):
+        """A sentence of note 12 goes on with "13. The" and the body cites 13:
+        the real note 13 is the next group, so the number stays text
+        and the mark links to the real note."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "12"),
+                    self.cited(1, "B.", "13"),
+                    self.note(2, "12. See the order, supra. 13. The court."),
+                    self.note(3, "13. Thirteen.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["12", "13"])
+        self.assertEqual(notes[1]["paragraphs"][0]["text"], "Thirteen.")
+        self.assertEqual(
+            notes[0]["paragraphs"][0]["text"],
+            "See the order, supra. 13. The court.",
+        )
+
+    def test_a_number_out_of_the_series_inside_a_group_is_text(self):
+        """A cut inside a group takes the next numbers of the series
+        alone, whatever the body cites: "9." after note 3 stays text."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "3"),
+                    self.cited(1, "B.", "9"),
+                    self.note(2, "3. Three. 9. The rest."),
+                ],
+            ),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "3")
+        self.assertEqual(note["paragraphs"][0]["text"], "Three. 9. The rest.")
+
+    def test_a_cut_keeps_every_mark_on_its_own_note(self):
+        """The marks of a cut group go to the note that holds them, in
+        the offsets of that note's text."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "2"),
+                    self.note(
+                        2,
+                        "1. See Roe. 2. See Doe.",
+                        marks=[
+                            {"kind": "em", "start": 7, "end": 10},
+                            {"kind": "em", "start": 19, "end": 22},
+                        ],
+                    ),
+                ],
+            ),
+        )
+
+        first, second = paragraphs.footnotes(doc)
+
+        self.assertEqual(first["paragraphs"][0]["text"], "See Roe.")
+        self.assertEqual(
+            first["paragraphs"][0]["marks"],
+            [{"kind": "em", "start": 4, "end": 7}],
+        )
+        self.assertEqual(second["paragraphs"][0]["text"], "See Doe.")
+        self.assertEqual(
+            second["paragraphs"][0]["marks"],
+            [{"kind": "em", "start": 4, "end": 7}],
+        )
+
+    def test_the_notes_of_the_opinion_before_on_the_page_of_the_mark(self):
+        """An opinion that starts in the middle of a page: the last note
+        of the opinion before and the first mark are on one page."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "26. The last."),
+                    self.note(3, "1. One."),
+                    self.note(4, "2. Two.", column="R"),
+                ],
+            ),
+            page(1, [self.note(0, "1 U.S.C. § 1 says so.")]),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["26", "1", "2"])
+        self.assertEqual(len(notes[2]["paragraphs"]), 2)
+
+    def test_the_first_mark_opens_no_series_two_pages_on(self):
+        """The first note is on the page of its mark or the next: a
+        small number further on is the rest of the note before it."""
+        doc = document(
+            page(0, [self.cited(0, "A.", "1"), self.note(1, "26. See")]),
+            page(1, [group(0, "B.")]),
+            page(2, [self.note(0, "1 U.S.C. § 1.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "26")
+
+    def test_the_first_notes_in_one_block_after_the_notes_before(self):
+        """The opinion's own notes 1 and 2, read as one block under the
+        last note of the opinion before, are both notes."""
+        doc = document(
+            page(0, [group(0, "A caption."), self.note(1, "26. The last.")]),
+            page(
+                1,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "1. One. 2. Two."),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["26", "1", "2"])
+
+    def test_with_no_note_before_the_first_mark_one_series_stands(self):
+        """The first mark starts a series only after the notes of the
+        opinion before: with none, a small number after note 5 is text."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "5"),
+                    self.note(2, "5. See"),
+                ],
+            ),
+            page(1, [self.note(0, "1 U.S.C. § 1.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "5")
+
+    def test_the_bold_over_a_whole_group_with_no_label_goes(self):
+        """The rest of a note one engine read as a heading is plain."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.note(0, "1. Section 5 provides:"),
+                    self.note(
+                        1,
+                        "The court shall decide.",
+                        kind="heading",
+                        marks=[{"kind": "strong", "start": 0, "end": 23}],
+                    ),
+                ],
+            ),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(
+            [(p["kind"], p["marks"]) for p in note["paragraphs"]],
+            [("paragraph", []), ("paragraph", [])],
+        )
+
+    def test_a_heading_in_the_body_keeps_its_kind_and_its_bold(self):
+        """The rule of the footnotes changes no group of the body."""
+        doc = document(
+            page(
+                0,
+                [
+                    group(
+                        0,
+                        "III. DISCUSSION",
+                        kind="heading",
+                        marks=[{"kind": "strong", "start": 0, "end": 15}],
+                    ),
+                ],
+            ),
+        )
+
+        (paragraph,) = paragraphs.body(doc)
+
+        self.assertEqual(paragraph["kind"], "heading")
+        self.assertEqual(
+            paragraph["marks"], [{"kind": "strong", "start": 0, "end": 15}]
+        )
+
+    def test_the_body_marks_are_listed_by_number_and_page(self):
+        """``mark_pages`` reads the numbered ``sup`` marks alone."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "1"),
+                    self.cited(1, "B.", "*"),
+                    self.note(2, "1. One."),
+                ],
+            ),
+            page(1, [self.cited(0, "C.", "1"), self.cited(1, "D.", "2")]),
+        )
+
+        self.assertEqual(paragraphs.mark_pages(doc), {1: {0, 1}, 2: {1}})
+
+    def test_a_label_inside_a_text(self):
+        """``inline_labels``: the end of a sentence, the next number, a
+        mark of the body, and no abbreviation before the number."""
+        marked = {4: {0}, 5: {0}}
+        cases = [
+            ("Three. 4. Four.", 3, [7]),
+            ("Three, 4. Four.", 3, [7]),
+            ('He said "no." 4. Four.', 3, [14]),
+            ("Three. 4) Four.", 3, [7]),
+            ("Three. 4. Four. 5. Five.", 3, [7, 16]),
+            ("See ECF No. 4. The brief.", 3, []),
+            ("See id. at 12 n. 4. The rule.", 3, []),
+            ("See p. 4. The rule.", 3, []),
+            ("Three. 4. four.", 3, []),
+            ("Three 4. Four.", 3, []),
+            ("Three. 4 Four.", 3, []),
+            ("Three. 6. Six.", 3, []),
+            ("Three. 5. Five.", 3, []),
+            ("See Fed. R. Civ. P. 4. The rule.", 3, []),
+            ("See Doc. 4. The order.", 3, []),
+            ("See Dkt. 4. The order.", 3, []),
+            ("See Tr. 4. The witness.", 3, []),
+            ("See App. 4. The record.", 3, []),
+            ("See Id. at 2, 4. The rule.", 3, []),
+            ("Id. 4. Four.", 3, [4]),
+            ("Three. 4. Four.", 4, []),
+            ("Three. 4. Four.", None, []),
+        ]
+        for text, last, cuts in cases:
+            with self.subTest(text=text, last=last):
+                self.assertEqual(
+                    paragraphs.inline_labels(text, 0, last, 0, marked), cuts
+                )
+
+    def test_a_number_a_later_group_starts_with_is_no_label_inside(self):
+        """``inline_labels`` leaves a number to the group that owns it."""
+        self.assertEqual(
+            paragraphs.inline_labels(
+                "Three. 4. Four.", 0, 3, 0, {4: {0}}, frozenset({4})
+            ),
+            [],
+        )
+
+    def test_a_label_inside_a_text_needs_its_mark_near(self):
+        """The mark is on the page of the group or the page before."""
+        for page_of_mark, cuts in ((2, [7]), (1, [7]), (0, []), (3, [])):
+            with self.subTest(page_of_mark=page_of_mark):
+                self.assertEqual(
+                    paragraphs.inline_labels(
+                        "Three. 4. Four.", 0, 3, 2, {4: {page_of_mark}}
+                    ),
+                    cuts,
+                )
+
     def test_a_skipped_number_is_still_a_label(self):
         """A footnote on a page a redaction took leaves a gap."""
         doc = document(

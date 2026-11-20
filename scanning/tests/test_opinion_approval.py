@@ -512,6 +512,69 @@ class TestTheRewrite(ApprovalTestCase):
             self.opinion.final_xml_attempts, final_xml.MAX_ATTEMPTS
         )
 
+    def test_with_footnotes_leaves_out_an_opinion_with_none(self):
+        """A rule of the footnotes alone writes the same text for an
+        opinion with no footnote, so the walk does not read it (#649)."""
+        self.opinion.pages.update(footnotes="")
+        out = StringIO()
+
+        with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):
+            call_command(
+                "rewrite_approved_text",
+                "--all",
+                "--with-footnotes",
+                stdout=out,
+            )
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.approved_text_key, self.first)
+        self.assertIn("Wrote 0 approved text(s)", out.getvalue())
+        self.assertIn("Left out 1 approved opinion(s)", out.getvalue())
+
+    def test_with_footnotes_writes_an_opinion_that_holds_one(self):
+        """One page with a footnote is enough (#649)."""
+        self.opinion.pages.update(footnotes="")
+        page = self.opinion.pages.order_by("page_in_opinion").last()
+        page.footnotes = "1. A note."
+        page.save(update_fields=["footnotes"])
+        out = StringIO()
+
+        with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):
+            call_command(
+                "rewrite_approved_text",
+                str(self.opinion.scan_id),
+                "--with-footnotes",
+                stdout=out,
+            )
+
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.approved_text_key, self.first)
+        self.assertIn(
+            f".j{paragraphs.JOIN_RULE + 1}.t", self.opinion.approved_text_key
+        )
+        self.assertIn("Wrote 1 approved text(s)", out.getvalue())
+        self.assertIn("Left out 0 approved opinion(s)", out.getvalue())
+
+    def test_the_dry_run_with_footnotes_names_the_opinion_and_writes_none(
+        self,
+    ):
+        self.opinion.pages.update(footnotes="1. A note.")
+        out = StringIO()
+
+        with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):
+            call_command(
+                "rewrite_approved_text",
+                "--all",
+                "--with-footnotes",
+                "--dry-run",
+                stdout=out,
+            )
+
+        self.opinion.refresh_from_db()
+        self.assertEqual(self.opinion.approved_text_key, self.first)
+        self.assertIn("Would write 1 approved text(s)", out.getvalue())
+        self.assertIn(f"scan {self.opinion.scan_id}", out.getvalue())
+
     def test_the_dry_run_changes_nothing(self):
         with patch.object(paragraphs, "JOIN_RULE", paragraphs.JOIN_RULE + 1):
             call_command(
