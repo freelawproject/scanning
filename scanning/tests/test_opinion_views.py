@@ -10,7 +10,7 @@ from unittest.mock import patch
 from blackletter.models import Label
 from django.urls import reverse
 
-from scanning import stats
+from scanning import stats, views
 from scanning.factories import (
     OpinionBoundaryFactory,
     OpinionFactory,
@@ -192,6 +192,63 @@ class TestOpinionList(ScanningTestCase):
         self.assertIn(with_picture, rows)
         self.assertNotIn(self.opinion, rows)
         self.assertTrue(response.context["current_pictures"])
+
+    def test_the_non_blocking_filter_drops_an_open_blocking_card(self):
+        """A warning or a dismissed error holds no approval back."""
+        blocked = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=blocked, severity=Issue.Severity.ERROR)
+        OpinionFindingFactory(
+            opinion=self.opinion, severity=Issue.Severity.WARNING
+        )
+
+        response = self.client.get(
+            reverse("opinion_list"), {"non_blocking": "1"}
+        )
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(self.opinion, rows)
+        self.assertNotIn(blocked, rows)
+        self.assertTrue(response.context["current_non_blocking"])
+        self.assertContains(response, "Non blocking only")
+
+    def test_the_sort_orders_by_the_open_cards(self):
+        """The count of the Warnings column, a dismissed card left out."""
+        many = OpinionFactory(scan=self.scan)
+        for page in (1, 2, 3):
+            OpinionFindingFactory(opinion=many, page_in_opinion=page)
+        one = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=one)
+        address = reverse("opinion_list")
+
+        most = self.client.get(
+            address, {"scan": self.scan.pk, "sort": "-warnings"}
+        )
+        fewest = self.client.get(
+            address, {"scan": self.scan.pk, "sort": "warnings"}
+        )
+
+        self.assertEqual(
+            list(most.context["page_obj"]), [many, one, self.opinion]
+        )
+        self.assertEqual(
+            list(fewest.context["page_obj"]), [self.opinion, one, many]
+        )
+        self.assertEqual(most.context["current_sort"], "-warnings")
+
+    def test_the_sort_is_refused_on_the_whole_corpus(self):
+        """No index serves the order, so it takes a narrowed list."""
+        newer = OpinionFactory(scan=self.scan)
+        OpinionFindingFactory(opinion=self.opinion)
+
+        response = self.client.get(
+            reverse("opinion_list"), {"sort": "-warnings"}
+        )
+
+        self.assertEqual(
+            list(response.context["page_obj"]), [newer, self.opinion]
+        )
+        self.assertEqual(response.context["current_sort"], "")
+        self.assertContains(response, views.OPINION_SORT_SCOPE_MESSAGE)
 
     def test_a_volume_that_is_not_a_number_is_refused(self):
         response = self.client.get(
