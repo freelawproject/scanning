@@ -67,6 +67,9 @@ docker exec scanning-daemon python manage.py score_bad_pages 2845
 # Write the approved texts again after a change of the join rule (#375)
 docker exec scanning-daemon python manage.py rewrite_approved_text --all --dry-run
 
+# Write the approved texts of the opinions with footnotes alone, after a change of the footnote rule (#649)
+docker exec scanning-daemon python manage.py rewrite_approved_text --all --with-footnotes --dry-run
+
 # Write the text of named opinions again, by the pk of their review page (#465)
 docker exec scanning-daemon python manage.py rerun_opinion_ensemble --opinion 1234 1235 --dry-run
 
