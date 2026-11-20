@@ -816,6 +816,12 @@ class OpinionFindingInline(admin.TabularInline):
     extra = 0
     fields = ["check_name", "page_in_opinion", "severity", "dismissal"]
     readonly_fields = fields
+    # A delete here would move the count of open findings with no stamp
+    # of ``Opinion.open_findings``, the count the list sorts by.
+    can_delete = False
+
+    def has_add_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(Opinion)
@@ -847,6 +853,10 @@ class OpinionAdmin(ScanCachesDeferred, admin.ModelAdmin):
         # means the file exists; the attempts count its failed ticks.
         "redacted_pdf_revision",
         "pdf_attempts",
+        # A cache of the finding rows, written by
+        # ``opinion_findings.stamp_open`` alone: a number typed here
+        # would misorder the opinions list.
+        "open_findings",
     ]
     inlines = [OpinionTextInline, OpinionFindingInline]
 

@@ -298,6 +298,17 @@ class TestOpenFindingsCount(OpinionFindingTestCase):
 
         self.assertEqual(self.count(), 1)
 
+    def test_the_admin_writes_no_count_and_deletes_no_finding(self):
+        """The admin is no writer: the count is read-only there, and its
+        inline of the findings deletes none."""
+        from django.contrib import admin as django_admin
+
+        from scanning.admin import OpinionFindingInline
+
+        model_admin = django_admin.site._registry[Opinion]
+        self.assertIn("open_findings", model_admin.readonly_fields)
+        self.assertFalse(OpinionFindingInline.can_delete)
+
     def test_the_writers_of_a_finding_row_are_the_known_modules(self):
         """A module that writes ``OpinionFinding`` rows calls the stamp."""
         writes = {"bulk_create", "create", "delete", "update", "save"}

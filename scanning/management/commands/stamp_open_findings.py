@@ -7,8 +7,9 @@ so this command is for the rows from before the column, **once after
 the deploy**, and for a count that drifted.
 
 It reads the finding rows and writes one column of the opinions whose
-count moved, one volume at a time. No finding, no status, no revision.
-A second run writes nothing.
+count moved, one volume at a time, under the row locks of that volume's
+opinions, so it is safe beside live pods. No finding, no status, no
+revision. A second run writes nothing.
 
 Examples:
 
@@ -75,9 +76,18 @@ class Command(BaseCommand):
             # A dry run is the write, rolled back: one rule for the
             # count, and the number it reports is the number it writes.
             with transaction.atomic():
-                written = opinion_findings.stamp_open(
-                    Opinion.objects.filter(scan_id=scan_id)
+                rows = Opinion.objects.filter(scan_id=scan_id)
+                # The row lock of the dismissal and of the ensemble,
+                # taken before the count is read, in pk order: the
+                # command runs beside live pods, and a count read
+                # before one of their stamps committed would be
+                # written over it.
+                list(
+                    rows.select_for_update()
+                    .order_by("pk")
+                    .values_list("pk", flat=True)
                 )
+                written = opinion_findings.stamp_open(rows)
                 if dry_run:
                     transaction.set_rollback(True)
             if written:
