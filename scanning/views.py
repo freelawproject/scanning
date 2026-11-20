@@ -303,17 +303,11 @@ def _filtered_opinions(request: HttpRequest):
     sort = request.GET.get("sort") or ""
     if sort not in OPINION_SORTS:
         sort = ""
-    elif not (
-        scan_filter
-        or reporter_filter
-        or volume_filter
-        or status_filter
-        or opinion_filter
-    ):
+    elif _over_the_sort_cap(opinions_qs):
         messages.error(request, OPINION_SORT_SCOPE_MESSAGE)
         sort = ""
     else:
-        opinions_qs = _by_open_cards(opinions_qs, sort)
+        opinions_qs = _by_open_cards(opinions_qs, sort, order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
@@ -369,26 +363,47 @@ OPINION_SORTS = {
     "warnings": "Fewest warnings first",
 }
 
-#: The sort by warnings takes a narrowed list.
+#: The most opinions the sort by warnings counts. No index serves that
+#: order, so each kept opinion costs a count of its open cards on every
+#: page of the walk; a filter that keeps more is refused, whichever
+#: filter it is, because a status alone can keep most of the corpus.
+OPINION_SORT_MAX_ROWS = 20_000
+
 OPINION_SORT_SCOPE_MESSAGE = (
-    "Pick a status, a reporter, a volume or a scan first: the sort by "
-    "warnings counts the cards of every opinion of the list."
+    f"The sort by warnings takes at most {OPINION_SORT_MAX_ROWS:,} "
+    "opinions: narrow the list with a scan, a volume, a reporter or a "
+    "status first."
 )
 
 
-def _by_open_cards(opinions_qs, sort: str):
+def _over_the_sort_cap(opinions_qs) -> bool:
+    """Return whether the filters keep more opinions than the sort takes.
+
+    A probe of one row past :data:`OPINION_SORT_MAX_ROWS`, in no order,
+    so it stops at the cap and never counts the corpus.
+    """
+    return (
+        opinions_qs.order_by()
+        .values("pk")[OPINION_SORT_MAX_ROWS : OPINION_SORT_MAX_ROWS + 1]
+        .exists()
+    )
+
+
+def _by_open_cards(opinions_qs, sort: str, order: tuple):
     """Order the opinions by their count of open cards.
 
     The count is the number of the Warnings column
     (``opinions.finding_counts``: every card with no dismissal). No
     index serves this order: Postgres counts the open cards of every
     opinion the filters keep, one probe of the finding table's opinion
-    index each, and sorts them, so the caller refuses it on the unfiltered
-    corpus. The pk is the last key, so the order is total and a
-    LIMIT/OFFSET walk shows each opinion once.
+    index each, and sorts them, so the caller refuses it past
+    :data:`OPINION_SORT_MAX_ROWS`. Opinions with the same count keep
+    the list's own order, which ends in the pk, so the order is total
+    and a LIMIT/OFFSET walk shows each opinion once.
 
     :param opinions_qs: The filtered opinions.
     :param sort: A key of :data:`OPINION_SORTS`.
+    :param order: The list's own order, the tie-break.
     :returns: The queryset, ordered.
     """
     open_cards = (
@@ -402,7 +417,7 @@ def _by_open_cards(opinions_qs, sort: str):
     )
     count = Coalesce(Subquery(open_cards), 0)
     return opinions_qs.annotate(open_cards=count).order_by(
-        "open_cards" if sort == "warnings" else "-open_cards", "-pk"
+        "open_cards" if sort == "warnings" else "-open_cards", *order
     )
 
 

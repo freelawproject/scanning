@@ -213,10 +213,10 @@ class TestOpinionList(ScanningTestCase):
 
     def test_the_sort_orders_by_the_open_cards(self):
         """The count of the Warnings column, a dismissed card left out."""
-        many = OpinionFactory(scan=self.scan)
+        many = OpinionFactory(scan=self.scan, first_printed_page=500)
         for page in (1, 2, 3):
             OpinionFindingFactory(opinion=many, page_in_opinion=page)
-        one = OpinionFactory(scan=self.scan)
+        one = OpinionFactory(scan=self.scan, first_printed_page=600)
         OpinionFindingFactory(opinion=one)
         address = reverse("opinion_list")
 
@@ -235,17 +235,45 @@ class TestOpinionList(ScanningTestCase):
         )
         self.assertEqual(most.context["current_sort"], "-warnings")
 
-    def test_the_sort_is_refused_on_the_whole_corpus(self):
-        """No index serves the order, so it takes a narrowed list."""
-        newer = OpinionFactory(scan=self.scan)
-        OpinionFindingFactory(opinion=self.opinion)
+    def test_the_sort_keeps_the_page_order_of_a_tie(self):
+        """Opinions with the same count stay in the list's own order."""
+        later = OpinionFactory(scan=self.scan, first_printed_page=900)
+        earlier = OpinionFactory(scan=self.scan, first_printed_page=100)
 
         response = self.client.get(
-            reverse("opinion_list"), {"sort": "-warnings"}
+            reverse("opinion_list"),
+            {"scan": self.scan.pk, "sort": "-warnings"},
         )
 
         self.assertEqual(
-            list(response.context["page_obj"]), [newer, self.opinion]
+            list(response.context["page_obj"]),
+            [earlier, self.opinion, later],
+        )
+
+    def test_the_sort_takes_a_status_alone(self):
+        response = self.client.get(
+            reverse("opinion_list"),
+            {
+                "status": OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+                "sort": "-warnings",
+            },
+        )
+
+        self.assertEqual(response.context["current_sort"], "-warnings")
+
+    def test_the_sort_is_refused_past_its_cap(self):
+        """No index serves the order, so the list it takes is bounded."""
+        newer = OpinionFactory(scan=self.scan, first_printed_page=900)
+        OpinionFindingFactory(opinion=self.opinion)
+
+        with patch.object(views, "OPINION_SORT_MAX_ROWS", 1):
+            response = self.client.get(
+                reverse("opinion_list"),
+                {"scan": self.scan.pk, "sort": "-warnings"},
+            )
+
+        self.assertEqual(
+            list(response.context["page_obj"]), [self.opinion, newer]
         )
         self.assertEqual(response.context["current_sort"], "")
         self.assertContains(response, views.OPINION_SORT_SCOPE_MESSAGE)
