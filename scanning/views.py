@@ -225,7 +225,8 @@ def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
-    and the ``blocking``, ``non_blocking`` and ``pictures`` switches,
+    and the ``blocking``, ``non_blocking``, ``pictures`` and
+    ``no_pictures`` switches,
     in the list's order or in the order of ``sort``
     (:func:`_by_open_cards`), for the list and for the blocking review,
     which reads the same query string. The
@@ -234,7 +235,8 @@ def _filtered_opinions(request: HttpRequest):
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "opinion", "blocking", "non_blocking", "pictures", "sort"})``,
+        "opinion", "blocking", "non_blocking", "pictures", "no_pictures",
+        "sort"})``,
         the current values as the form shows them.
     """
     # The scan's caches stay on disk (#582): the join repeats them on
@@ -285,6 +287,13 @@ def _filtered_opinions(request: HttpRequest):
     pictures_only = request.GET.get("pictures") == "1"
     if pictures_only:
         opinions_qs = opinions_qs.exclude(figure_digest="")
+    # The twin of the switch above: a text with no picture, which is a
+    # text the ensemble has not built yet too, because the stamp is
+    # blank until then. Both at once name no opinion, and the form
+    # unchecks one.
+    no_pictures_only = request.GET.get("no_pictures") == "1"
+    if no_pictures_only:
+        opinions_qs = opinions_qs.filter(figure_digest="")
     # The order never crosses a table: ordered by the reporter's name,
     # the scan's volume and the opinion's page at once, no index served
     # the sort, and at a hundred thousand rows Postgres joined and
@@ -317,6 +326,7 @@ def _filtered_opinions(request: HttpRequest):
         "blocking": blocking_only,
         "non_blocking": non_blocking_only,
         "pictures": pictures_only,
+        "no_pictures": no_pictures_only,
         "sort": sort,
     }
 
@@ -524,6 +534,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             "current_blocking": current["blocking"],
             "current_non_blocking": current["non_blocking"],
             "current_pictures": current["pictures"],
+            "current_no_pictures": current["no_pictures"],
             "current_sort": current["sort"],
             "sort_choices": list(OPINION_SORTS.items()),
             "blocking_review_url": _review_url(

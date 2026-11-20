@@ -77,6 +77,10 @@
           <input type="checkbox" name="pictures" value="1" {% if current_pictures %}checked{% endif %} class="rounded">
           With pictures
         </label>
+        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose text holds no picture, a text not built yet included">
+          <input type="checkbox" name="no_pictures" value="1" {% if current_no_pictures %}checked{% endif %} class="rounded">
+          No pictures
+        </label>
         <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Order by the count of the Warnings column; a list too long for the count is refused">
           Sort
           <select name="sort" class="input-text py-1 text-xs">
@@ -171,7 +175,7 @@
 {% if page_obj.has_other_pages %}
 <nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
   {% if page_obj.has_previous %}
-  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">&laquo; Previous</a>
   {% endif %}
 
@@ -180,7 +184,7 @@
   </span>
 
   {% if page_obj.has_next %}
-  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
+  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">Next &raquo;</a>
   {% endif %}
 </nav>
@@ -195,16 +199,21 @@
 </div>
 {% endif %}
 <script>
-  // "Blocking only" and "Non blocking only" name no opinion together,
-  // so checking one unchecks the other.
+  // The two switches of a pair name no opinion together, so checking
+  // one unchecks the other.
   (function () {
-    const pair = ["blocking", "non_blocking"].map(
-      (name) => document.querySelector('input[name="' + name + '"]'),
-    );
-    pair.forEach((box, i) => {
-      if (!box) return;
-      box.addEventListener("change", () => {
-        if (box.checked && pair[1 - i]) pair[1 - i].checked = false;
+    [
+      ["blocking", "non_blocking"],
+      ["pictures", "no_pictures"],
+    ].forEach((names) => {
+      const pair = names.map((name) =>
+        document.querySelector('input[name="' + name + '"]'),
+      );
+      pair.forEach((box, i) => {
+        if (!box) return;
+        box.addEventListener("change", () => {
+          if (box.checked && pair[1 - i]) pair[1 - i].checked = false;
+        });
       });
     });
   })();
