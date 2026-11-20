@@ -194,6 +194,19 @@ class TestOpinionList(ScanningTestCase):
         self.assertNotIn(self.opinion, rows)
         self.assertTrue(response.context["current_pictures"])
 
+    def test_the_no_pictures_filter_keeps_the_texts_that_hold_none(self):
+        with_picture = OpinionFactory(scan=self.scan, figure_digest="abc")
+
+        response = self.client.get(
+            reverse("opinion_list"), {"no_pictures": "1"}
+        )
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(self.opinion, rows)
+        self.assertNotIn(with_picture, rows)
+        self.assertTrue(response.context["current_no_pictures"])
+        self.assertContains(response, "No pictures")
+
     def test_the_non_blocking_filter_drops_an_open_blocking_card(self):
         """A warning or a dismissed error holds no approval back."""
         blocked = OpinionFactory(scan=self.scan)
