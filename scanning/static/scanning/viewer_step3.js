@@ -472,6 +472,13 @@
             placeOver(zone, box, scale);
             wrapper.appendChild(zone);
         });
+        ((page.zones || {}).syllabus || []).forEach(function (box) {
+            var zone = document.createElement('div');
+            zone.className = 'ensemble-zone ensemble-syllabus-zone';
+            zone.title = 'The syllabus starts here';
+            placeOver(zone, box, scale);
+            wrapper.appendChild(zone);
+        });
         handDropped(page).forEach(function (drop) {
             if (!drop.box_pt) { return; }
             var junk = document.createElement('div');
