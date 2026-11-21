@@ -349,6 +349,25 @@ class TestPlanRun(ApplyTestCase):
             ],
         )
 
+    def test_moved_pages_on_one_anchor_follow_their_ordinals(self):
+        # A span scanned in reverse (#395): pages 5, 4, 3 land after
+        # page 1 in that order, which the ordinals say and the page
+        # order contradicts.
+        for pdf_page, ordinal in ((3, 2), (4, 1), (5, 0)):
+            self.edit(
+                PageEdit.Kind.MOVE_PAGE,
+                pdf_page=pdf_page,
+                anchor_pdf_page=1,
+                ordinal=ordinal,
+            )
+
+        plan = apply.plan_run(self.scan)
+
+        self.assertEqual(
+            self.sources(plan),
+            [("o", 1), ("o", 5), ("o", 4), ("o", 3), ("o", 2), ("o", 6)],
+        )
+
     def test_a_moved_page_keeps_its_own_rows(self):
         # What lands in the gap is what the page's rows make of it: a
         # deleted page lands nowhere, a turned one lands as its shard.
