@@ -39,6 +39,7 @@ from scanning import (
     opinion_review,
     opinions,
     paragraphs,
+    redactions,
     views_api,
 )
 from scanning.models import (
@@ -1140,6 +1141,35 @@ class TestTheLedger(FigureTestCase):
         )
 
         self.assertFalse(opinion_figures.owed().exists())
+
+
+class TestTheCoverRead(FigureTestCase):
+    """The covers of a picture read the redactions of its pages alone
+    (#603), not every visible redaction of the volume."""
+
+    def test_the_ledger_reads_the_picture_pages_alone(self):
+        self.run_ensemble()
+        self.opinion.refresh_from_db()
+        box = to_pt(self.PICTURE)
+        self.redact(0, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+
+        with patch(
+            "scanning.redactions.visible_by_page",
+            wraps=redactions.visible_by_page,
+        ) as read:
+            opinion_figures.ledger_digest(self.opinion, self.stored())
+
+        self.assertEqual(read.call_args.kwargs["pages"], {2})
+
+    def test_a_redaction_on_another_page_is_not_a_cover(self):
+        box = to_pt(self.PICTURE)
+        self.redact(0, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+        self.redact(2, [box[0] + 5, box[1] + 5, box[0] + 30, box[1] + 15])
+
+        hidden = opinion_figures.covers(self.opinion, {2})
+
+        self.assertNotIn(0, hidden)
+        self.assertEqual(len(hidden[2]), 1)
 
 
 class TestTheCard(FigureTestCase):

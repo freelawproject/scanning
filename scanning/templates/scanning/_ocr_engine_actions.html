@@ -1,11 +1,15 @@
 {% comment %}
 One OCR engine's control on the step-1 bar, staff-only for the button.
-Included once per engine by _process_actions.html: Mistral (#191) and
-Surya (#364).
+Included twice per engine by _process_actions.html: Mistral (#191) and
+Surya (#364). The bar is two rows (#333), so each engine is included
+once with `part="status"` in the status row, for the run state, and
+once with `part="button"` in the button row. Each include renders its
+half alone.
 
 The two differ in five values only, so they share this file rather
 than a copy of it (#364). The caller passes:
 
+  part        - "status" or "button", the half this include renders
   run         - the run summary of that engine's rows, or None
   label       - what a line calls the engine ("Mistral OCR")
   start_url   - the name of the POST route that creates the rows
@@ -23,6 +27,10 @@ Neither stage moves a scan status, so its state comes from the run
 summary and never from `is_processing`. That summary still renders
 after the run ends, so a historical run stays readable.
 
+A run with a failed part and parts still running says both (#534):
+the button is hidden while the run is open, and "failed" alone read as
+a run that had ended with no way to re-run it.
+
 The button has no review-state gate, because both reads are over the
 original shards: what they need exists from the moment the pipeline
 cut them, and nothing later in the pipeline moves a page they name.
@@ -31,9 +39,11 @@ it confirms first; an environment that must not spend leaves the
 engine's key or endpoint id unset, and the view refuses with a
 message.
 {% endcomment %}
-{% if run %}
-<span class="text-sm text-gray-600 mr-2" title="{{ label }} run {{ run.run }}: {{ run.label }}">
-  {% if run.failed %}
+{% if part == "status" and run %}
+<span class="text-sm text-gray-600" title="{{ label }} run {{ run.run }}: {{ run.label }}">
+  {% if run.failed and run.open %}
+  {{ label }}: {{ run.failed }} of {{ run.total }} part(s) failed ({{ run.error_code }}), {{ run.open }} still running{% if user.is_staff %}; re-run once they end{% endif %}
+  {% elif run.failed %}
   {{ label }} failed on {{ run.failed }} of {{ run.total }} part(s): {{ run.error_code }}
   {% elif run.open %}
   {{ label }} running: {{ run.done }} of {{ run.total }} part(s) done
@@ -45,7 +55,7 @@ message.
   {% endif %}
 </span>
 {% endif %}
-{% if user.is_staff and not run.open %}
+{% if part == "button" and user.is_staff and not run.open %}
 <form method="post" action="{% url start_url scan.pk %}" class="inline">
   {% csrf_token %}
   <button type="submit" class="btn-outline text-sm" title="{{ title }}" onclick="return confirm('{{ confirm|escapejs }}');">{% if run %}Re-run {{ label }}{% else %}Run {{ label }}{% endif %}</button>

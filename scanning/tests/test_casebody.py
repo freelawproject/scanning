@@ -1250,6 +1250,38 @@ class TestTheSubOpinionFootnotes(TestCase):
         self.assertNotIn("cb-opinions", casebody.display_html(xml))
 
 
+class TestAPerTokenDocument(TestCase):
+    """The spans of the per-token weights still export (#573).
+
+    The word-level weights change no stored spans: an opinion keeps the
+    spans of the old weights until ``retag_opinions`` places new ones,
+    and ``casebody.repair_spans`` keeps answering them.
+    """
+
+    def test_the_samples_are_per_token_documents_that_export(self):
+        for number in ("25", "826"):
+            approved = json.loads(
+                (FIXTURES / f"approved.so3d.388.{number}.json").read_text()
+            )
+            tags = json.loads(
+                (FIXTURES / f"tags.so3d.388.{number}.json").read_text()
+            )
+            with self.subTest(number=number):
+                self.assertNotEqual(tags["model"], tagger.MODEL)
+                ET.fromstring(casebody.build(approved, tags))
+
+    def test_the_repair_is_a_fixed_point_on_whole_word_spans(self):
+        # The word decoder's spans cut no word, so the repair's first
+        # step has nothing to do; its output, repaired again, is itself.
+        approved = json.loads(
+            (FIXTURES / "approved.so3d.388.826.json").read_text()
+        )
+        tags = json.loads((FIXTURES / "tags.so3d.388.826.json").read_text())
+        body, spans = casebody.repair_spans(approved["body"], tags["spans"])
+
+        self.assertEqual(casebody.repair_spans(body, spans), (body, spans))
+
+
 class TestTheClusterSample(TestCase):
     """Scan 3593, opinion 826.0: the cluster of the issue (#442)."""
 

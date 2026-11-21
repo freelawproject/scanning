@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+
+{% comment %}
+  The walk of every volume in review 2 (all_card_review): each kind of
+  card with its open total. A tab opens the card review of the oldest
+  volume holding that kind, showing that kind alone, and its Next volume
+  goes on to the next one. Staff only.
+{% endcomment %}
+
+{% block title %}Cards of every volume - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<h1 class="text-2xl font-bold mb-2">Cards of every volume <span class="text-base font-normal text-gray-500 dark:text-gray-400">in review 2</span></h1>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-4">
+  Pick a kind of card. It opens the oldest volume with cards of that kind, showing that kind alone, with the keys and the buttons of the card review; Next volume goes on to the next one. The numbers are the open cards over every volume waiting for review 2.
+</p>
+<nav class="flex flex-wrap gap-2" aria-label="Card types">
+  {% for name, total in groups %}
+  <a href="?group={{ name }}" class="btn-outline text-sm{% if not total %} opacity-50{% endif %}">
+    {% if name == "caption" %}Captions{% elif name == "bracket" %}Headnote brackets{% elif name == "text" %}Text in no box{% elif name == "image" %}Images{% else %}Editor's notes{% endif %}
+    <span class="ml-1 font-normal">{{ total }}</span>
+  </a>
+  {% endfor %}
+</nav>
+{% endblock %}

@@ -32,13 +32,15 @@ from scanning import (
 )
 
 
-def sweep() -> jobs.SweepSummary:
+def sweep(providers: tuple[str, ...] | None = None) -> jobs.SweepSummary:
     """Ask after every in-flight external job (pass 1).
 
+    :param providers: The providers whose rows are swept, or ``None``
+        for every one: the daemon's own pass. A Celery tick names one.
     :returns: What the sweep did.
     :rtype: jobs.SweepSummary
     """
-    return jobs.sweep_jobs()
+    return jobs.sweep_jobs(providers=providers)
 
 
 def merge_conversions() -> dict[str, int]:

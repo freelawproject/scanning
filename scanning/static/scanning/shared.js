@@ -504,7 +504,7 @@ function undoDeletePage(csrfToken, docId, pdfPage, pageDiv, labelPrefix, onDelet
  * @param {string} [type="error"] - "error" (red), "info" (blue),
  *     "success" (green), or "warning" (amber).
  */
-function showToast(message, type) {
+function showToast(message, type, action) {
     type = type || 'error';
     var container = document.getElementById('toast-container');
     if (!container) {
@@ -514,15 +514,20 @@ function showToast(message, type) {
         document.body.appendChild(container);
     }
     var key = type + '\n' + message;
-    for (var i = 0; i < container.children.length; i++) {
-        var standing = container.children[i];
-        if (standing.dataset.toastKey === key && standing._restart) {
-            standing._restart();
-            return;
+    // A line with an action is never folded into a standing one: two
+    // drags that dismissed the same number of boxes read alike, and
+    // each Undo must carry the ids of its own write.
+    if (!action) {
+        for (var i = 0; i < container.children.length; i++) {
+            var standing = container.children[i];
+            if (standing.dataset.toastKey === key && standing._restart) {
+                standing._restart();
+                return;
+            }
         }
     }
     var toast = document.createElement('div');
-    toast.dataset.toastKey = key;
+    toast.dataset.toastKey = action ? '' : key;
     var bg = '#2563eb';
     if (type === 'error') { bg = '#dc2626'; }
     else if (type === 'success') { bg = '#059669'; }
@@ -533,6 +538,19 @@ function showToast(message, type) {
     text.style.flex = '1';
     text.textContent = message;
     toast.appendChild(text);
+
+    // An optional button on the line (``{label, onClick}``): the Undo of
+    // a write that took several things at once. A line with one stays
+    // until it is closed or used, because the Undo is the one way back
+    // from a drag that took more than it should have.
+    if (action && action.label && typeof action.onClick === 'function') {
+        var actionBtn = document.createElement('button');
+        actionBtn.textContent = action.label;
+        actionBtn.style.cssText = 'background:rgba(255,255,255,0.2);border:1px solid rgba(255,255,255,0.6);color:#fff;cursor:pointer;font-size:12px;padding:2px 8px;border-radius:4px;flex-shrink:0;';
+        actionBtn.addEventListener('click', function () { dismiss(); action.onClick(); });
+        toast.appendChild(actionBtn);
+    }
+    var lifetime = action ? null : 5000;
 
     var closeBtn = document.createElement('button');
     closeBtn.textContent = '✕';
@@ -552,15 +570,15 @@ function showToast(message, type) {
         removal = setTimeout(function () { toast.remove(); }, 400);
     }
 
-    var timer = setTimeout(dismiss, 5000);
+    var timer = lifetime ? setTimeout(dismiss, lifetime) : null;
     toast._restart = function () {
         clearTimeout(timer);
         clearTimeout(removal);
         toast.style.opacity = '1';
-        timer = setTimeout(dismiss, 5000);
+        timer = lifetime ? setTimeout(dismiss, lifetime) : null;
     };
     closeBtn.addEventListener('mouseenter', function () { clearTimeout(timer); });
-    closeBtn.addEventListener('mouseleave', function () { timer = setTimeout(dismiss, 2000); });
+    closeBtn.addEventListener('mouseleave', function () { if (lifetime) timer = setTimeout(dismiss, 2000); });
 }
 
 // The key the saved line waits under while the page reloads (#322).

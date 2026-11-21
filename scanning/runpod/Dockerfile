@@ -2,9 +2,10 @@
 #
 # GPU worker image for RunPod Serverless: blackletter YOLO detection.
 #
-# Runs one step, ``detect``, with the bl_warm weight. No Django, no AWS
-# credentials, no DB client. The weight is baked in so cold start skips
-# the network.
+# Runs one step, ``detect``, with the bl_warm weight (our own scans) or
+# the bl_hein weight (the bitonal Hein scans, #628), whichever the job
+# names. No Django, no AWS credentials, no DB client. Both weights are
+# baked in so cold start skips the network.
 #
 # Build with the scanning/ directory as context (handler.py imports the
 # shared runpod_common.py that lives there):
@@ -75,43 +76,69 @@ COPY runpod/pyproject.toml runpod/uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --python python3.12
 
-# ── Bake the bl_warm weight into the image ──────────────────────────
+# ── Bake the bl_warm and bl_hein weights into the image ─────────────
 # blackletter bundles no weights; ``ensure_weights`` downloads them from
 # the public HF repo freelawproject/blackletter-weights, each pinned to
 # the commit it was uploaded at. A weight already on disk resolves with
 # no network, so cold start stays offline.
 #
-# Only bl_warm is baked. The legacy small/medium/large trio went with
-# the legacy pipeline (#173), so running it again means a rebuild, not
-# an input change -- which is what handler._missing_weights refuses.
+# bl_warm and bl_hein are baked, the two names of
+# handler.BAKED_MODELS: one checkpoint per kind of scan, chosen by the
+# job's ``models`` input (#628). The legacy small/medium/large trio
+# went with the legacy pipeline (#173), so running it again means a
+# rebuild, not an input change -- which is what
+# handler._missing_weights refuses.
 #
 # Retries 3 times so a flaky HF doesn't fail the build. Then verifies
-# the file and opens it with YOLO(...), which catches a truncated
+# each file and opens it with YOLO(...), which catches a truncated
 # download here rather than on the first paid job. The printed imgsz is
 # the resolution the model predicts at: ultralytics reads it off the
-# checkpoint, and 1024 is what bl_warm was trained at.
+# checkpoint, and 1024 is what bl_warm was trained at. The class names
+# are checked too: blackletter picks its bl-warm adapter by them
+# (``bl_warm.is_bl_warm``), and a checkpoint without them would come
+# out untranslated, with no error.
 #
 # HF_HOME is removed in the same layer: hf_hub_download writes the file
 # into the package weights directory, and any cache copy beside it is
-# 52 MB of duplicate bytes in the image.
-RUN set -e; \
-    for i in 1 2 3; do \
-      python -c "from blackletter.api import ensure_weights; ensure_weights(['bl_warm'])" \
-        && break; \
-      echo "ensure_weights attempt $i failed; sleeping 10s"; \
-      sleep 10; \
-    done \
- && python -c "\
-import blackletter, pathlib; \
-from ultralytics import YOLO; \
-p = pathlib.Path(blackletter.__file__).resolve().parent / 'weights' / 'bl_warm.pt'; \
-assert p.is_file() and p.stat().st_size > 45_000_000, \
-    f'weight missing or truncated: {p} ({p.stat().st_size if p.is_file() else 0} bytes)'; \
-m = YOLO(str(p)); \
-print(f'weight OK: {p.stat().st_size // 1024 // 1024} MB, imgsz={m.overrides.get(\"imgsz\")}, classes={len(m.names)}')" \
- && rm -rf /opt/hf
+# 52 MB of duplicate bytes per weight in the image.
+#
+# A heredoc, so the check is a script and not one quoted line: the
+# syntax line at the top of this file is what allows it.
+RUN <<'BAKE'
+set -e
+for i in 1 2 3; do
+  python -c "from blackletter.api import ensure_weights; ensure_weights(['bl_warm', 'bl_hein'])" \
+    && break
+  echo "ensure_weights attempt $i failed; sleeping 10s"
+  sleep 10
+done
+python - <<'CHECK'
+import pathlib
 
-# Nothing may reach Hugging Face at run time now: the weight is on
+import blackletter
+from blackletter.bl_warm import is_bl_warm
+from ultralytics import YOLO
+
+weights = pathlib.Path(blackletter.__file__).resolve().parent / "weights"
+for name in ("bl_warm", "bl_hein"):
+    path = weights / f"{name}.pt"
+    size = path.stat().st_size if path.is_file() else 0
+    assert size > 45_000_000, (
+        f"weight missing or truncated: {path} ({size} bytes)"
+    )
+    model = YOLO(str(path))
+    assert is_bl_warm(model.names), (
+        f"{name} lacks the bl-warm class names: {model.names}"
+    )
+    print(
+        f"weight OK: {name} {size // 1024 // 1024} MB, "
+        f"imgsz={model.overrides.get('imgsz')}, classes={len(model.names)}"
+    )
+CHECK
+rm -rf /opt/hf
+BAKE
+
+# Nothing may reach Hugging Face at run time now: the weights are on
 # disk, and a name that is not is a caller error the handler refuses.
 ENV HF_HUB_OFFLINE=1
 
