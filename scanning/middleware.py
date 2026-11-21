@@ -5,7 +5,9 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 
-from django.http import HttpRequest, HttpResponse
+from django.conf import settings
+from django.http import HttpRequest, HttpResponse, JsonResponse
+from django.shortcuts import redirect
 
 from . import observability
 
@@ -65,3 +67,57 @@ class InFlightRequestMiddleware:
             username,
         )
         return None
+
+
+class VolunteerGateMiddleware:
+    """Confine a volunteer to the card review (``scanning.volunteers``).
+
+    After the URL is resolved and the user is known, a request from a
+    volunteer for a view outside ``volunteers.URL_NAMES`` is answered
+    here and never reaches the view: a page request is sent to their
+    cards, and a request that wants no page (a POST, or a GET that
+    accepts JSON) gets a 403 as JSON, the shape every refusal of the
+    card endpoints has. Everyone else passes untouched, and so does a
+    view of another app, which keeps its own gate.
+    """
+
+    def __init__(
+        self, get_response: Callable[[HttpRequest], HttpResponse]
+    ) -> None:
+        self.get_response = get_response
+
+    def __call__(self, request: HttpRequest) -> HttpResponse:
+        return self.get_response(request)
+
+    def process_view(
+        self,
+        request: HttpRequest,
+        view_func: Callable[..., HttpResponse],
+        view_args: tuple,
+        view_kwargs: dict,
+    ) -> HttpResponse | None:
+        from scanning import volunteers
+
+        if not volunteers.of_request(request):
+            return None
+        match = getattr(request, "resolver_match", None)
+        if match is None or match.url_name in volunteers.URL_NAMES:
+            return None
+        # The portal's own views alone: another app's view (the admin,
+        # the debug toolbar, the browser reload of development) keeps
+        # its own gate, and a redirect of a polled endpoint loops.
+        if not (getattr(view_func, "__module__", "") or "").startswith(
+            "scanning."
+        ):
+            return None
+        if request.path.startswith((settings.STATIC_URL, settings.MEDIA_URL)):
+            return None
+        wants_page = request.method == "GET" and (
+            "application/json" not in request.headers.get("Accept", "")
+        )
+        if wants_page:
+            return redirect(volunteers.home_url())
+        return JsonResponse(
+            {"status": "error", "message": volunteers.REFUSED_MESSAGE},
+            status=403,
+        )

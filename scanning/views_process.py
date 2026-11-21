@@ -50,6 +50,7 @@ from scanning import (
     surya,
     tagger,
     tasks,
+    volunteers,
     yolo,
 )
 from scanning.badpage import scoring as badpage_scoring
@@ -70,6 +71,7 @@ from scanning.models import (
     JobStatus,
     Opinion,
     OpinionBoundary,
+    OpinionCard,
     OpinionReviewStatus,
     OpinionScan,
     PageEdit,
@@ -2042,6 +2044,18 @@ def opinion_pdf_url(
     """
     scan = get_object_or_404(Scan.without_caches(), pk=pk)
     opinion = get_object_or_404(Opinion, pk=opinion_pk, scan=scan)
+    if (
+        volunteers.of_request(request)
+        and not OpinionCard.objects.filter(
+            opinion=opinion, assigned_to=request.user
+        ).exists()
+    ):
+        # A volunteer reads the crops of the opinions they hold a card
+        # of and no other (``scanning.volunteers``).
+        return JsonResponse(
+            {"status": "error", "message": volunteers.CARD_MESSAGE},
+            status=403,
+        )
     if not opinion_pdf.is_written(opinion):
         return _json_404(
             OPINION_PDF_NOT_WRITTEN_MESSAGE,

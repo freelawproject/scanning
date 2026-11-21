@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% comment %}
+  The practice cards of the volunteers' FAQ (scanning/volunteer_practice.py):
+  real cards in the card review's own shape, each with its right answer
+  and why. A choice is checked by practice.js in the browser; nothing is
+  written. Add an example to EXAMPLES, never here.
+{% endcomment %}
+
+{% block title %}Practice cards - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
+
+{% block content %}
+<div id="practice" class="max-w-3xl">
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
+    <h1 class="text-2xl font-bold">Practice cards</h1>
+    <span class="text-sm text-gray-500 dark:text-gray-400">
+      <b data-role="done">0</b> of {{ cards|length }} answered ·
+      <a href="{% url 'volunteer_faq' %}" class="text-blue-600 dark:text-blue-400 hover:underline">Questions and answers</a> ·
+      <a href="{% url 'opinion_card_review' %}?mine=1" class="text-blue-600 dark:text-blue-400 hover:underline">My cards</a>
+    </span>
+  </div>
+  <p class="text-sm text-gray-600 dark:text-gray-300 mb-6">
+    Real cards from a volume, one for each thing you will meet. Each works like a card of your
+    own: look at the cut of the page, then pick the reading that matches it, leave the place
+    blank, or type the words. The card then tells you whether that was right, and why. The keys
+    are the same as on your cards: 1, 2, 3 choose a reading, 0 leaves it blank, e types, ↓ and ↑
+    move between cards. Nothing you do here is saved.
+  </p>
+
+  {% for card in cards %}
+  <article class="bk-card bk-word{% if card.single %} bk-single{% endif %}" data-slug="{{ card.slug }}" data-answer="{{ card.answer }}"{% if card.answer.typed %} data-typed="{{ card.answer.typed }}"{% endif %}>
+    <header>
+      <span class="bk-step">Example {{ card.n }} of {{ card.total }}</span>
+      <span class="bk-where">{{ card.where }} · {{ card.lesson }}</span>
+      <span class="bk-type">{{ card.scenario }}</span>
+    </header>
+    <div class="bk-cropwrap">
+      <img src="{% static 'scanning/faq/practice/'|add:card.image %}" alt="The cut of the page this card is about" style="width: 100%; height: auto; display: block;">
+    </div>
+    {% if not card.single %}
+    <p class="bk-snippet">… {{ card.before }} {% if card.gap %}<mark class="bk-gap" title="A gap: an engine read words here that the shown engine did not">[ ]</mark>{% else %}<mark>{{ card.token }}</mark>{% endif %} {{ card.after }} …</p>
+    {% endif %}
+    <div class="bk-stack">
+      {% for row in card.rows %}
+      <button type="button" class="bk-opt {{ row.cls }}" data-key="{{ row.key }}" data-choice="{{ row.key }}">
+        <span class="bk-who"><kbd class="bk-kbd">{{ row.key }}</kbd>{{ row.engine }}</span>
+        <span class="bk-val">{% if row.value %}{% if row.ctx_before %}<span class="bk-ctx">{{ row.ctx_before }} </span>{% endif %}{{ row.value }}{% if row.ctx_after %}<span class="bk-ctx"> {{ row.ctx_after }}</span>{% endif %}{% else %}<span class="bk-nothing">read nothing here</span>{% endif %}</span>
+      </button>
+      {% endfor %}
+      {% if not card.single %}
+      <button type="button" class="bk-opt bk-blank" data-key="0" data-choice="0" title="{% if card.gap %}Nothing goes into the gap{% else %}Take the word out: nothing is there on the page{% endif %}">
+        <span class="bk-who"><kbd class="bk-kbd">0</kbd>leave blank</span>
+        <span class="bk-val"><span class="bk-nothing">{% if card.gap %}nothing goes in the gap{% else %}take the word out{% endif %}</span></span>
+      </button>
+      {% endif %}
+      <label class="bk-opt bk-typed" data-key="e">
+        <span class="bk-who"><kbd class="bk-kbd">e</kbd>you</span>
+        <input type="text" placeholder="{% if card.gap %}Type the words the page has in the gap and press Return{% elif card.single %}Type the whole block as the page has it and press Return{% else %}Type what the page says and press Return{% endif %}">
+      </label>
+    </div>
+    <footer>
+      <span class="bk-state">not yet decided</span>
+      <span class="bk-grow"></span>
+      <button type="button" class="btn-outline text-xs hidden" data-role="again">Try again</button>
+    </footer>
+    <p class="bk-note hidden" data-role="why">{{ card.why }}</p>
+  </article>
+  {% endfor %}
+
+  <p class="text-sm text-gray-600 dark:text-gray-300 mt-6">
+    Done? <a href="{% url 'opinion_card_review' %}?mine=1" class="text-blue-600 dark:text-blue-400 hover:underline">Your cards are here.</a>
+  </p>
+</div>
+<script src="{% static 'scanning/practice.js' %}"></script>
+{% endblock %}
