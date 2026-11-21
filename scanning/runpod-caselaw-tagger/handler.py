@@ -4,14 +4,25 @@ Dispatches on ``job["input"]["action"]``. There is one action:
 
 - ``tag``: take a list of sequences -- one court case each, serialized
   as the minimal HTML the model was trained on -- run the
-  ``freelawproject/caselaw-block-tagger`` token classifier over each,
-  and return the labelled character spans (party, docket number,
-  court, judges, date filed, disposition, ...).
+  ``freelawproject/caselaw-block-tagger-wordlevel`` token classifier
+  over each, and return the labelled character spans (party, docket
+  number, court, judges, date filed, disposition, ...).
 
 The model is a ModernBERT-large fine-tune with an 8,192-token context.
 It never generates text: it emits one BIO label per token, and this
-handler decodes the runs back into ``(start, end, label)`` spans over
-the input string, so a caller can place them without re-tokenizing.
+handler decodes them back into ``(start, end, label)`` spans over the
+input string, so a caller can place them without re-tokenizing.
+
+**The weights are word-level** (#564, #573): they were trained with a
+label on the first token of each word alone, so the other tokens of a
+word carry no meaningful prediction and a per-token decoder reads
+garbage from them. ``wordlevel.decode_word_spans`` reads one label per
+word, from its first token, and every span starts and ends on a word;
+``heal.heal_disposition`` then joins a disposition the model returned
+in pieces. Both modules are copies of the ai-research ``tagger/``
+modules the weights were scored with, copied into the image beside
+this file, and the loader refuses a checkpoint whose
+``label_maps.json`` does not say ``word_level: true``.
 
 **The worker does not build its input.** Turning the dots.mocr cells
 of a volume into case sequences -- splitting at the case boundaries,
@@ -48,8 +59,10 @@ from bisect import bisect_left
 from pathlib import Path
 from typing import Any
 
+import heal
 import runpod
 import runpod_common
+import wordlevel
 from runpod_common import (
     RESULT_SCHEMA_VERSION,  # noqa: F401  (part of this module's contract)
     BadInputError,
@@ -84,13 +97,21 @@ sentry_sdk = runpod_common.init_sentry(logger)
 
 
 # ── Tunables ────────────────────────────────────────────────────────
-#: Hugging Face id of the checkpoint the image carries. Set by the
-#: Dockerfile from its build arg; reported in every payload as
-#: provenance, since a later checkpoint is a rebuild and a reader of
-#: two result objects must be able to tell which model wrote each.
-MODEL_NAME = os.environ.get(
-    "TAGGER_MODEL", "freelawproject/caselaw-block-tagger"
+#: Hugging Face id of the checkpoint the image carries, and the commit
+#: of that repository the bake pinned. Both are set by the Dockerfile
+#: from its build args, so a push to the repository never changes what
+#: a build carries.
+MODEL_REPO = os.environ.get(
+    "TAGGER_MODEL", "freelawproject/caselaw-block-tagger-wordlevel"
 )
+MODEL_REVISION = os.environ.get(
+    "TAGGER_MODEL_REVISION", "00a26dda233db0f77268019020f5ae96a221ba44"
+)
+#: ``repo@revision``, reported in every payload as provenance: a later
+#: checkpoint is a rebuild, a reader of two result objects must tell
+#: which weights wrote each, and the portal refuses a result of weights
+#: other than the ones its row asked for (``tagger.MODEL``).
+MODEL_NAME = f"{MODEL_REPO}@{MODEL_REVISION}"
 #: Where the Dockerfile baked the snapshot. Nothing reaches Hugging
 #: Face at run time (``HF_HUB_OFFLINE=1`` in the image).
 MODEL_DIR = Path(os.environ.get("TAGGER_MODEL_DIR", "/opt/model"))
@@ -125,7 +146,39 @@ OVERLAP_TOKENS = 800
 # Download tunables (HANDLER_DOWNLOAD_*) live in runpod_common.
 
 
+#: The file of the checkpoint that says how its labels were trained.
+LABEL_MAPS = "label_maps.json"
+
+
 # ── Cold-start preload ──────────────────────────────────────────────
+def check_word_level(model_dir: Path) -> None:
+    """Refuse a checkpoint that was not trained with word-level labels.
+
+    The decoder reads one label per word, from its first token. Weights
+    trained with a label on every token would be read on one token in
+    each word and lose the rest; weights trained on the first token
+    alone and read per token give garbage. The bake runs this check
+    too, so neither pairing ships.
+
+    :param model_dir: The snapshot directory.
+    :raises RuntimeError: When ``label_maps.json`` is missing, is not
+        JSON, or does not say ``word_level: true``.
+    """
+    path = model_dir / LABEL_MAPS
+    try:
+        maps = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"{path} is missing or unreadable ({exc}): the word decoder "
+            "cannot tell how this checkpoint was trained"
+        ) from exc
+    if not isinstance(maps, dict) or maps.get("word_level") is not True:
+        raise RuntimeError(
+            f"{path} does not say word_level: true; this worker decodes "
+            "per word and must not run per-token weights"
+        )
+
+
 def _load_model() -> None:
     """Load the tokenizer and the model onto ``_DEVICE``.
 
@@ -135,10 +188,14 @@ def _load_model() -> None:
     boot and surface the real error, instead of the worker answering
     every job with the same swallowed exception.
 
+    :raises RuntimeError: When the snapshot is not word-level
+        (:func:`check_word_level`).
     :raises Exception: Whatever transformers raises: a missing or
         truncated snapshot, a config the installed version cannot read.
     """
     global _MODEL, _TOKENIZER
+
+    check_word_level(MODEL_DIR)
 
     import torch
     from transformers import AutoModelForTokenClassification, AutoTokenizer
@@ -519,87 +576,64 @@ def decode_spans(
     offsets: list[tuple[int, int]],
     label_ids: list[int],
     id2label: dict[int, str],
-) -> list[dict]:
-    """Turn per-token BIO labels into character spans over ``text``.
+) -> tuple[list[dict], int]:
+    """Turn per-token BIO labels into whole-word character spans.
 
-    The model card's own decoding rule, made lenient in the one way a
-    reader needs: an ``I-x`` that follows nothing, or follows a
-    different class, opens a span (the model dropped the ``B``), rather
-    than being discarded. A span's edges are trimmed to the text they
-    cover -- a token's offset often starts at the space before it --
-    and an empty span is dropped.
+    ``wordlevel.decode_word_spans`` reads one label per word, from the
+    first token whose first word character lies in it: ``B-x`` opens a
+    span, ``I-x`` continues a span of ``x`` or opens one after anything
+    else (the model dropped the ``B``), ``O`` closes. A word is a run of
+    characters that are neither whitespace nor inside one of the tags
+    the projection writes (``wordlevel.MARKUP_RE``); punctuation glued
+    to a word is part of it, and a page mark glued to the front of a
+    word is a word of its own. So a span never starts or ends inside a
+    word, markup never opens or splits one, and the bytes of one
+    multi-byte character (the West key) cannot split a span, because
+    they lie inside one word.
+
+    ``heal.heal_disposition`` then joins a disposition returned in
+    pieces: two or more ``disposition`` spans inside one ``<p>`` become
+    one span over the block's inner text, and every other span inside
+    that block is dropped. A ``<blockquote>`` is never healed.
 
     Pure: no model, no torch, so it is tested directly.
 
     :param text: The input string the offsets index.
     :param offsets: One ``(start, end)`` per token. Special tokens
-        carry an empty range and are skipped.
-    :param label_ids: One label id per token, same length.
+        carry an empty range and head no word.
+    :param label_ids: One label id per token, same length. An id the
+        table does not hold reads as ``O``.
     :param id2label: The model's label table, integer-keyed.
-    :returns: ``[{"start", "end", "label", "text"}, ...]`` in text
-        order. ``end`` is exclusive; ``label`` is the class without its
-        BIO prefix.
-    :rtype: list[dict]
+    :returns: ``(spans, healed)``: ``[{"start", "end", "label",
+        "text"}, ...]`` in text order, ``end`` exclusive and ``label``
+        the class without its BIO prefix; and how many blocks the heal
+        joined.
+    :rtype: tuple[list[dict], int]
+    :raises ValueError: If ``offsets`` and ``label_ids`` differ in
+        length.
     """
-    spans: list[dict] = []
-    current: dict | None = None
-    # Markup predictions were not supervised during training. Keep
-    # markup as context for inference, but never let its labels open
-    # or split an entity. Mixed text/markup tokens snap to text edges.
-    is_text = bytearray(not ch.isspace() for ch in text)
-    for match in re.finditer(r"<[^>]*>", text):
-        is_text[match.start() : match.end()] = bytes(len(match.group()))
-
-    def close() -> None:
-        nonlocal current
-        if current is None:
-            return
-        start, end = current["start"], current["end"]
-        while start < end and text[start].isspace():
-            start += 1
-        while end > start and text[end - 1].isspace():
-            end -= 1
-        if end > start:
-            spans.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "label": current["label"],
-                    "text": text[start:end],
-                }
-            )
-        current = None
-
-    for (start, end), label_id in zip(offsets, label_ids, strict=True):
-        while start < end and not is_text[start]:
-            start += 1
-        while end > start and not is_text[end - 1]:
-            end -= 1
-        if end <= start:
-            # A special token ([CLS], [SEP], padding) covers no text
-            # and must neither open nor split a span.
-            continue
-        if current is not None and start < current["end"]:
-            # A later byte of one multi-byte character: byte-level BPE
-            # splits a symbol such as the West key (☞) into several
-            # tokens that all carry the character's offsets. One
-            # character cannot hold two labels or end a span in its
-            # middle, so whatever the label says, the token extends
-            # the span it shares a character with.
-            current["end"] = max(current["end"], end)
-            continue
-        label = id2label.get(int(label_id), "O")
-        if label == "O":
-            close()
-            continue
-        prefix, _, name = label.partition("-")
-        if prefix == "I" and current is not None and current["label"] == name:
-            current["end"] = end
-            continue
-        close()
-        current = {"start": start, "end": end, "label": name}
-    close()
-    return spans
+    if len(offsets) != len(label_ids):
+        raise ValueError(f"{len(offsets)} offsets but {len(label_ids)} labels")
+    outside = next((k for k, name in id2label.items() if name == "O"), None)
+    names = [id2label.get(k, "O") for k in range(max(id2label) + 1)]
+    if outside is None:
+        outside = len(names)
+        names.append("O")
+    pred_ids = [int(k) if int(k) in id2label else outside for k in label_ids]
+    spans = wordlevel.decode_word_spans(text, offsets, pred_ids, names)
+    spans, log = heal.heal_disposition(text, spans)
+    return (
+        [
+            {
+                "start": span["start"],
+                "end": span["end"],
+                "label": span["label"],
+                "text": text[span["start"] : span["end"]],
+            }
+            for span in spans
+        ],
+        len(log),
+    )
 
 
 def _action_tag(job: dict, inputs: dict, tmp_dir: Path) -> dict:
@@ -615,9 +649,11 @@ def _action_tag(job: dict, inputs: dict, tmp_dir: Path) -> dict:
     :returns: ``{"sequences": [...], "sequence_count": int,
         "failed_sequences": [ids], "model": str, "max_tokens": int,
         "duration_ms": int}``. Each sequence entry carries its ``id``,
-        its ``token_count``, ``window_count`` and merged ``spans`` (see
-        :func:`decode_spans`). Entries keep the input order. Long cases
-        are windowed internally; ``failed_sequences`` stays empty.
+        its ``token_count``, ``window_count``, merged ``spans`` and
+        ``healed_blocks`` (see :func:`decode_spans`). Entries keep the
+        input order. Long cases are windowed internally;
+        ``failed_sequences`` stays empty. ``model`` is
+        ``repo@revision``.
     :rtype: dict
     :raises BadInputError: On any bad input.
     """
@@ -687,12 +723,16 @@ def _action_tag(job: dict, inputs: dict, tmp_dir: Path) -> dict:
             raise RuntimeError(
                 "window merge left text tokens without predictions"
             )
-        results[index]["spans"] = decode_spans(
+        # The window merge stays per token: the head token of a word is
+        # owned by exactly one window, so a word never reads two labels.
+        spans, healed = decode_spans(
             text,
             [pair for pair, _ in text_tokens],
             [label for _, label in text_tokens],
             id2label,
         )
+        results[index]["spans"] = spans
+        results[index]["healed_blocks"] = healed
 
     duration_ms = int((time.monotonic() - t0) * 1000)
     ordered = [results[index] for index in range(len(sequences))]

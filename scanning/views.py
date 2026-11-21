@@ -12,7 +12,15 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import PasswordChangeForm
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import (
+    Count,
+    Exists,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+)
+from django.db.models.functions import Coalesce
 from django.http import Http404, HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -123,6 +131,8 @@ def scan_list(request: HttpRequest) -> HttpResponse:
         # ``uploaded_by`` is joined because every row prints the
         # username: without it the page cost one query per scan.
         Scan.objects.select_related("reporter", "uploaded_by")
+        # The row's caches and logs stay on disk: the list prints none.
+        .defer(*Scan.large_fields())
         # The legacy rows, on purpose: ``opinions`` is the new
         # ``Opinion`` table since #335, and this column counts what the
         # legacy pipeline generated. #334 gives the new rows their own
@@ -207,7 +217,7 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :param pk: The primary key of the scan.
     :return: A redirect to the scan process view.
     """
-    scan = get_object_or_404(Scan, pk=pk)
+    scan = get_object_or_404(Scan.without_caches(), pk=pk)
     return redirect("scan_process", pk=scan.pk)
 
 
@@ -215,30 +225,25 @@ def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
-    and the ``blocking`` switch, in the list's order, for the list and
-    for the blocking review, which reads the same query string. The
+    and the ``blocking``, ``non_blocking``, ``pictures`` and
+    ``no_pictures`` switches,
+    in the list's order or in the order of ``sort``
+    (:func:`_by_open_cards`), for the list and for the blocking review,
+    which reads the same query string. The
     ``opinion`` filter is the review page's: its two buttons open the
     blocking and the warnings review of that opinion alone.
 
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
-        "opinion", "blocking"})``, the current values as the form shows
-        them.
+        "opinion", "blocking", "non_blocking", "pictures", "no_pictures",
+        "sort"})``,
+        the current values as the form shows them.
     """
+    # The scan's caches stay on disk (#582): the join repeats them on
+    # each of a page's rows, and no reader of the list needs one.
     opinions_qs = Opinion.objects.select_related(
         "scan", "scan__reporter"
-    ).order_by(
-        "scan__reporter__short_name",
-        "scan__volume",
-        "first_printed_page",
-        "index_in_page",
-        # The last key makes the ordering total. ``Scan`` has no unique
-        # key over (reporter, volume) -- a volume comes in parts -- so
-        # two scans tie on the four keys above, and Postgres may rank
-        # tied rows differently for each page of a LIMIT/OFFSET walk.
-        # An opinion would then show on two pages, or on none.
-        "pk",
-    )
+    ).defer(*Scan.large_fields("scan__"))
 
     scan_filter = request.GET.get("scan")
     if _whole_number(scan_filter) is not None:
@@ -271,6 +276,47 @@ def _filtered_opinions(request: HttpRequest):
     blocking_only = request.GET.get("blocking") == "1"
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
+    # The twin of the switch above: the opinions no open card holds
+    # back. Both at once name no opinion, and the form unchecks one.
+    non_blocking_only = request.GET.get("non_blocking") == "1"
+    if non_blocking_only:
+        opinions_qs = _without_open_blocking_card(opinions_qs)
+    # The text holds a picture: the stamp of the ensemble (#463), a
+    # column of the row, where the Pictures column counts the boxes of
+    # the pages with the junk rule, in Python and for one page alone.
+    pictures_only = request.GET.get("pictures") == "1"
+    if pictures_only:
+        opinions_qs = opinions_qs.exclude(figure_digest="")
+    # The twin of the switch above: a text with no picture, which is a
+    # text the ensemble has not built yet too, because the stamp is
+    # blank until then. Both at once name no opinion, and the form
+    # unchecks one.
+    no_pictures_only = request.GET.get("no_pictures") == "1"
+    if no_pictures_only:
+        opinions_qs = opinions_qs.filter(figure_digest="")
+    # The order never crosses a table: ordered by the reporter's name,
+    # the scan's volume and the opinion's page at once, no index served
+    # the sort, and at a hundred thousand rows Postgres joined and
+    # sorted them all for every page. One scan is read in page order
+    # (the unique key over scan, page and index is the index); a
+    # reporter or a volume number scan by scan in page order; the whole
+    # corpus newest first, which is the primary key. The last key makes
+    # every order total, so a LIMIT/OFFSET walk shows each opinion once.
+    if scan_filter or opinion_filter:
+        order = ("first_printed_page", "index_in_page", "pk")
+    elif reporter_filter or volume_filter:
+        order = ("scan_id", "first_printed_page", "index_in_page", "pk")
+    else:
+        order = ("-pk",)
+    opinions_qs = opinions_qs.order_by(*order)
+    sort = request.GET.get("sort") or ""
+    if sort not in OPINION_SORTS:
+        sort = ""
+    elif _over_the_sort_cap(opinions_qs):
+        messages.error(request, OPINION_SORT_SCOPE_MESSAGE)
+        sort = ""
+    else:
+        opinions_qs = _by_open_cards(opinions_qs, sort, order)
     return opinions_qs, {
         "scan": scan_filter,
         "reporter": reporter_filter,
@@ -278,6 +324,10 @@ def _filtered_opinions(request: HttpRequest):
         "volume": volume_filter or "",
         "opinion": opinion_filter,
         "blocking": blocking_only,
+        "non_blocking": non_blocking_only,
+        "pictures": pictures_only,
+        "no_pictures": no_pictures_only,
+        "sort": sort,
     }
 
 
@@ -299,6 +349,86 @@ def _with_open_blocking_card(opinions_qs):
     counts by (#375).
     """
     return _with_open_card(opinions_qs, blocking_filter())
+
+
+def _without_open_blocking_card(opinions_qs):
+    """Keep the opinions whose approval waits on no open card.
+
+    The complement of :func:`_with_open_blocking_card`, by the same
+    rule: an opinion with warnings alone, or with no card at all.
+    """
+    return opinions_qs.exclude(
+        Exists(
+            OpinionFinding.objects.filter(opinion=OuterRef("pk")).filter(
+                blocking_filter()
+            )
+        )
+    )
+
+
+#: The orders of ``/opinions/`` by the count of the Warnings column,
+#: as the ``sort`` select offers them.
+OPINION_SORTS = {
+    "-warnings": "Most warnings first",
+    "warnings": "Fewest warnings first",
+}
+
+#: The most opinions the sort by warnings counts. No index serves that
+#: order, so each kept opinion costs a count of its open cards on every
+#: page of the walk; a filter that keeps more is refused, whichever
+#: filter it is, because a status alone can keep most of the corpus.
+OPINION_SORT_MAX_ROWS = 20_000
+
+OPINION_SORT_SCOPE_MESSAGE = (
+    f"The sort by warnings takes at most {OPINION_SORT_MAX_ROWS:,} "
+    "opinions: narrow the list with a scan, a volume, a reporter or a "
+    "status first."
+)
+
+
+def _over_the_sort_cap(opinions_qs) -> bool:
+    """Return whether the filters keep more opinions than the sort takes.
+
+    A probe of one row past :data:`OPINION_SORT_MAX_ROWS`, in no order,
+    so it stops at the cap and never counts the corpus.
+    """
+    return (
+        opinions_qs.order_by()
+        .values("pk")[OPINION_SORT_MAX_ROWS : OPINION_SORT_MAX_ROWS + 1]
+        .exists()
+    )
+
+
+def _by_open_cards(opinions_qs, sort: str, order: tuple):
+    """Order the opinions by their count of open cards.
+
+    The count is the number of the Warnings column
+    (``opinions.finding_counts``: every card with no dismissal). No
+    index serves this order: Postgres counts the open cards of every
+    opinion the filters keep, one probe of the finding table's opinion
+    index each, and sorts them, so the caller refuses it past
+    :data:`OPINION_SORT_MAX_ROWS`. Opinions with the same count keep
+    the list's own order, which ends in the pk, so the order is total
+    and a LIMIT/OFFSET walk shows each opinion once.
+
+    :param opinions_qs: The filtered opinions.
+    :param sort: A key of :data:`OPINION_SORTS`.
+    :param order: The list's own order, the tie-break.
+    :returns: The queryset, ordered.
+    """
+    open_cards = (
+        OpinionFinding.objects.filter(
+            opinion=OuterRef("pk"), dismissal__isnull=True
+        )
+        .order_by()
+        .values("opinion")
+        .annotate(n=Count("pk"))
+        .values("n")
+    )
+    count = Coalesce(Subquery(open_cards), 0)
+    return opinions_qs.annotate(open_cards=count).order_by(
+        "open_cards" if sort == "warnings" else "-open_cards", *order
+    )
 
 
 #: The blocking review takes one volume at a time.
@@ -323,6 +453,35 @@ def _review_url(current: dict, route: str) -> str | None:
     return f"{address}?{urlencode(query)}" if query else address
 
 
+def _scan_choices() -> list[tuple[str, str]]:
+    """Return the volumes the list's scan filter offers.
+
+    Every scan with an opinion row, in the list's order, named as the
+    rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
+    the scans, with the opinions as a semi-join on their scan index,
+    and the caches of every one of them left on disk (#582).
+
+    :returns: ``(scan pk, label)`` pairs.
+    :rtype: list[tuple[str, str]]
+    """
+    scans = (
+        Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
+        .select_related("reporter")
+        .defer(*Scan.large_fields())
+        .order_by("reporter__short_name", "volume", "pk")
+    )
+    return [
+        (str(s.pk), f"vol. {s.volume} {s.reporter.cite_name}, scan {s.pk}")
+        for s in scans
+    ]
+
+
+#: The rows of one page of ``/opinions/`` (#598). Each row costs its
+#: share of the page's picture and finding counts, and a corpus-wide
+#: status filter timed out at fifty.
+OPINIONS_PER_PAGE = 20
+
+
 @login_required
 def opinion_list(request: HttpRequest) -> HttpResponse:
     """List the opinions of the third review (#334).
@@ -332,7 +491,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     of the scan list, and the step-3 tab of a volume sends ``scan``.
 
     The warning count is stamped after the pagination, so one grouped
-    query answers the 50 rows of this page and the size of the corpus
+    query answers the rows of this page and the size of the corpus
     never reaches it. This is the badge rule of the scan list (#266).
 
     The opinions of the legacy pipeline are on their own page
@@ -342,7 +501,7 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
     :return: The rendered opinion list page.
     """
     opinions_qs, current = _filtered_opinions(request)
-    paginator = Paginator(opinions_qs, 50)
+    paginator = Paginator(opinions_qs, OPINIONS_PER_PAGE)
     page_obj = paginator.get_page(request.GET.get("page"))
 
     counts = opinions.finding_counts([row.pk for row in page_obj])
@@ -367,11 +526,17 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
                 (str(r.pk), f"{r.full_name} ({r.short_name})")
                 for r in Reporter.objects.all()
             ],
+            "scan_choices": _scan_choices(),
             "current_scan": current["scan"],
             "current_reporter": current["reporter"],
             "current_status": current["status"],
             "current_volume": current["volume"],
             "current_blocking": current["blocking"],
+            "current_non_blocking": current["non_blocking"],
+            "current_pictures": current["pictures"],
+            "current_no_pictures": current["no_pictures"],
+            "current_sort": current["sort"],
+            "sort_choices": list(OPINION_SORTS.items()),
             "blocking_review_url": _review_url(
                 current, "opinion_blocking_review"
             ),
@@ -494,9 +659,12 @@ def legacy_opinion_list(request: HttpRequest) -> HttpResponse:
     """
     # Not ``opinions``: that name holds the module this view's twin
     # calls for its warning badge, and a local would hide it.
-    opinions_qs = OpinionScan.objects.select_related(
-        "reporter", "scan"
-    ).order_by("reporter__short_name", "volume", "page_start", "pk")
+    opinions_qs = (
+        OpinionScan.objects.select_related("reporter", "scan")
+        # The scan's caches stay on disk (#582): the list prints none.
+        .defer(*Scan.large_fields("scan__"))
+        .order_by("reporter__short_name", "volume", "page_start", "pk")
+    )
 
     # Filtering
     scan_filter = request.GET.get("scan")
@@ -587,7 +755,7 @@ def opinion_review(request: HttpRequest, pk: int) -> HttpResponse:
     opinion = get_object_or_404(
         Opinion.objects.select_related(
             "scan", "scan__reporter", "apply_run", "boundary", "approved_by"
-        ),
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
     findings = list(
@@ -790,7 +958,9 @@ def legacy_opinion_detail(request: HttpRequest, pk: int) -> HttpResponse:
     :return: The rendered legacy opinion detail page.
     """
     opinion = get_object_or_404(
-        OpinionScan.objects.select_related("reporter", "scan", "uploaded_by"),
+        OpinionScan.objects.select_related(
+            "reporter", "scan", "uploaded_by"
+        ).defer(*Scan.large_fields("scan__")),
         pk=pk,
     )
 
@@ -892,7 +1062,17 @@ def queue_view(request: HttpRequest) -> HttpResponse:
 
     volumes = (
         Volume.objects.select_related("reporter", "assigned_to")
-        .prefetch_related("scans")
+        # A row per scan under its volume, a badge and a page range: the
+        # caches stay on disk, and the uploader comes in the same query
+        # instead of one more per scan.
+        .prefetch_related(
+            Prefetch(
+                "scans",
+                queryset=Scan.objects.select_related("uploaded_by").defer(
+                    *Scan.large_fields()
+                ),
+            )
+        )
         .order_by("reporter__short_name", "volume_number")
     )
 
@@ -1061,7 +1241,11 @@ def queue_detail_view(
         reporter__short_name=reporter_slug,
         volume_number=vol,
     )
-    scans = volume.scans.select_related("uploaded_by").order_by("start_page")
+    scans = (
+        volume.scans.select_related("uploaded_by")
+        .defer(*Scan.large_fields())
+        .order_by("start_page")
+    )
 
     return render(
         request,

@@ -68,13 +68,18 @@ logger = logging.getLogger(__name__)
 #: Handler action on the worker image. Its only one.
 ACTION = "detect"
 
-#: Weights the worker loads. Only ``bl_warm.pt`` is baked into the
-#: image, and ``api.detect`` calls ``ensure_weights`` itself, so any
-#: other name would reach Hugging Face from inside a paid job. The
-#: worker refuses an unbaked name up front
-#: (``handler._missing_weights``); running the legacy small/medium/large
+#: Weights a run reads with when nothing names another. The worker
+#: refuses a name its image does not bake
+#: (``handler._missing_weights``), because ``api.detect`` calls
+#: ``ensure_weights`` itself and any other name would reach Hugging
+#: Face from inside a paid job; running the legacy small/medium/large
 #: trio again is a rebuild, not a changed input.
 MODELS = ["bl_warm"]
+
+#: The weights the worker image bakes (``handler.BAKED_MODELS``, #628),
+#: the names ``enqueue_yolo_detect --model`` takes (#633). ``bl_hein``
+#: is bl-warm trained again on Hein's bitonal pages.
+BAKED_MODELS = ("bl_warm", "bl_hein")
 
 #: Score below which a detection is dropped. blackletter's own
 #: ``CONFIDENCE_THRESHOLD``. Low on purpose: the per-class gates that
@@ -224,7 +229,12 @@ def build_payload(job: ExternalJob, input_url: str, output_url: str) -> dict:
 
 
 def ensure_detect_jobs(
-    scan, manifest: dict, *, apply_run=None, force_new_run: bool = False
+    scan,
+    manifest: dict,
+    *,
+    apply_run=None,
+    force_new_run: bool = False,
+    models: list[str] | None = None,
 ) -> list[ExternalJob]:
     """Return the live detection jobs for ``scan``, creating them if the
     current run does not describe today's shard set.
@@ -247,14 +257,29 @@ def ensure_detect_jobs(
     Every row carries :data:`LABEL_SET` in its identity, so the carry
     takes only a result read with today's class set.
 
+    A run of another model than :data:`MODELS` carries its ``models``
+    in the identity too (#633), which :func:`build_payload` sends, so
+    a result read with one model is never carried into a run of
+    another. A row with no ``models`` is a :data:`MODELS` row: the key
+    is written for another model alone, so no run from before it stops
+    describing its shard set, and none is paid again.
+
     :param apply_run: The apply run (#224) whose one-page shards the
         manifest describes, or None for the volume.
     :param force_new_run: Start a new run even when the live one is
-        whole: the re-read of a run read with another class set (#338),
-        which only ``enqueue_yolo_detect --stale-labels`` passes.
+        whole: the re-read of a run read with another class set (#338)
+        or another model (#633), which only ``enqueue_yolo_detect``
+        passes.
+    :param models: The weights to read with, or None for the volume's
+        own (:func:`models_for`). Only ``enqueue_yolo_detect --model``
+        names them.
     :returns: The live run's rows, ordered by shard index.
     :rtype: list[ExternalJob]
     """
+    identity_extra: dict = {"label_set": LABEL_SET}
+    models = list(models) if models else models_for(scan)
+    if models != MODELS:
+        identity_extra["models"] = models
     return jobs.ensure_shard_jobs(
         scan,
         manifest,
@@ -264,8 +289,61 @@ def ensure_detect_jobs(
         reuse_results=True,
         force_new_run=force_new_run,
         apply_run=apply_run,
-        identity_extra={"label_set": LABEL_SET},
+        identity_extra=identity_extra,
     )
+
+
+def run_models(rows: list[ExternalJob]) -> list[str]:
+    """Return the weights a run was read with.
+
+    :param rows: One run's rows.
+    :returns: The ``models`` of its identity, or :data:`MODELS` for a
+        run that names none, an empty one included.
+    :rtype: list[str]
+    """
+    for row in rows:
+        return list((row.input_manifest or {}).get("models") or MODELS)
+    return list(MODELS)
+
+
+def models_for(scan) -> list[str]:
+    """Return the weights a new detection run of ``scan`` reads with.
+
+    The one rule (#633): a volume keeps the model of its live volume
+    run, and a volume with no run reads with :data:`MODELS`. Every
+    caller of :func:`ensure_detect_jobs` goes through it, so the re-run
+    of a dead run, the re-read of the classes and the rows of the pages
+    a curator changed never replace a Hein run with a bl-warm one, and
+    never read an edited page with another model than its volume.
+
+    A name outside :data:`BAKED_MODELS` is not kept: only a row edited
+    by hand carries one, the worker refuses it on every shard, and kept
+    it would fail every later run of the volume too. Such a volume
+    reads with :data:`MODELS`, as it did before the identity carried
+    the model, and the log says so.
+
+    :param scan: The scan.
+    :returns: The weight names.
+    :rtype: list[str]
+    """
+    models = run_models(
+        jobs.live_run(
+            scan,
+            JobStage.DETECT,
+            JobEngine.BLACKLETTER,
+            fields=("run", "shard_index", "input_manifest"),
+        )
+    )
+    if set(models) <= set(BAKED_MODELS):
+        return models
+    logger.warning(
+        "Scan %s: the live detection run names %s, which the worker "
+        "does not bake; a new run reads with %s",
+        scan.pk,
+        models,
+        MODELS,
+    )
+    return list(MODELS)
 
 
 def labels_current(rows: list[ExternalJob]) -> bool:
@@ -375,6 +453,8 @@ def enqueue_missing_runs() -> int:
         .exclude(pk__in=skipped)
         .annotate(detected=Exists(detected))
         .filter(detected=False)
+        # The caches stay on disk (#582): the enqueue reads none.
+        .defer(*Scan.large_fields())
         .order_by("-pk")[: settings.YOLO_MAX_CONCURRENCY]
     )
 
@@ -1064,21 +1144,30 @@ def queue_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
+    # The status first and no ``order_by``, for the reason
+    # ``dots_mocr.apply_glued_runs`` gives: the join drives from the
+    # scans in an apply status, and the scan's default ordering stays
+    # out of the DISTINCT.
     scan_ids = (
         Scan.objects.filter(
+            status__in=APPLY_STATUSES,
             jobs__stage=JobStage.DETECT,
             jobs__engine=JobEngine.BLACKLETTER,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
             jobs__apply_run__isnull=True,
         )
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
     queued = 0
-    for scan in Scan.objects.filter(
-        pk__in=list(scan_ids), status__in=APPLY_STATUSES
-    ).select_related("reporter"):
+    for scan in (
+        Scan.objects.filter(pk__in=list(scan_ids), status__in=APPLY_STATUSES)
+        .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
+    ):
         rows = live_detect_jobs(scan)
         if not rows:
             continue

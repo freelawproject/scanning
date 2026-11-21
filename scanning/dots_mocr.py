@@ -284,6 +284,8 @@ def enqueue_missing_runs() -> int:
         .exclude(pk__in=skipped)
         .annotate(read=Exists(read))
         .filter(read=False)
+        # The caches stay on disk (#582): the enqueue reads none.
+        .defer(*Scan.large_fields())
         .order_by("-pk")[: settings.DOTS_MOCR_MAX_CONCURRENCY]
     )
 
@@ -1014,6 +1016,53 @@ def _record_apply_failure(scan, analyze_jobs: list[ExternalJob], exc) -> None:
         )
 
 
+def _owing_apply(scan_ids) -> list[int]:
+    """Return the scans, among ``scan_ids``, whose live run owes the apply.
+
+    A pre-filter in one query (#602): the loop of :func:`apply_ready_runs`
+    judges every survivor again by :func:`live_analyze_jobs` and
+    :func:`_apply_state`, and this only drops the scans that loop would
+    skip, so the volumes in review 1, which hold an applied run for
+    good, cost no scan row and no read of their job rows every tick.
+    The live run is the rows at the highest run number
+    (:func:`jobs.live_run`), its ledger the first row's by shard index
+    (:func:`jobs.run_ledger`).
+
+    :param scan_ids: The candidates, a queryset or an iterable of keys.
+    :returns: The scan ids the loop must judge.
+    :rtype: list[int]
+    """
+    by_scan: dict[int, list[tuple]] = {}
+    for scan_id, run, shard_index, status, state in ExternalJob.objects.filter(
+        scan_id__in=scan_ids,
+        stage=JobStage.ANALYZE,
+        engine=JobEngine.DOTS_MOCR,
+        opinion=None,
+        apply_run=None,
+    ).values_list(
+        "scan_id", "run", "shard_index", "status", "provider_meta__apply"
+    ):
+        by_scan.setdefault(scan_id, []).append(
+            (run, shard_index, status, state)
+        )
+    owing = []
+    for scan_id, items in by_scan.items():
+        live = max(run for run, *_ in items)
+        rows = sorted(
+            (item for item in items if item[0] == live),
+            key=lambda item: item[1],
+        )
+        if any(status != JobStatus.CONSUMED for _, _, status, _ in rows):
+            continue
+        state = rows[0][3] if isinstance(rows[0][3], dict) else {}
+        if state.get("applied_at"):
+            continue
+        if int(state.get("attempts") or 0) >= APPLY_MAX_ATTEMPTS:
+            continue
+        owing.append(scan_id)
+    return owing
+
+
 def apply_ready_runs() -> int:
     """Apply every glued run: page numbers, Issues, and the READY edge.
 
@@ -1052,21 +1101,33 @@ def apply_ready_runs() -> int:
     if not s3_sync.s3_active():
         return 0
 
+    # The status first, so the join drives from the few scans in an
+    # apply status and not from every consumed row of the stage, and
+    # no ``order_by``: the scan's default ordering would put its
+    # ``date_created`` into the DISTINCT and sort the join.
     scan_ids = (
         Scan.objects.filter(
+            status__in=APPLY_STATUSES,
             jobs__stage=JobStage.ANALYZE,
             jobs__engine=JobEngine.DOTS_MOCR,
             jobs__provider=JobProvider.RUNPOD,
             jobs__status=JobStatus.CONSUMED,
             jobs__apply_run__isnull=True,
         )
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
     applied = 0
-    for scan in Scan.objects.filter(
-        pk__in=list(scan_ids), status__in=APPLY_STATUSES
-    ).select_related("reporter"):
+    for scan in (
+        Scan.objects.filter(
+            pk__in=_owing_apply(scan_ids), status__in=APPLY_STATUSES
+        )
+        .select_related("reporter")
+        # The caches stay on disk (#602): the apply writes
+        # ``ocr_results`` whole and reads the rest on access.
+        .defer(*Scan.large_fields())
+    ):
         rows = live_analyze_jobs(scan)
         if not rows:
             continue

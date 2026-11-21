@@ -409,6 +409,48 @@ function addGuessedDetection(btn, variant) {
         });
 }
 
+// The text card's "Grow footnote": the page's footnote box beside the
+// block is resized over it, through the endpoint a drag of its handles
+// uses, so one footnote box covers the line it stopped short of and no
+// seam is left. A model box becomes a hand-drawn one the next compute
+// keeps; the viewer follows the id the server answers.
+function growDetection(btn) {
+    var d = _getDetectionData(btn);
+    var id = parseInt(btn.dataset.growId, 10);
+    var bbox = (btn.dataset.growBbox || "").split(",").map(function (v) { return parseFloat(v); });
+    if (!d || !id || bbox.length !== 4 || bbox.some(isNaN)) return;
+    var cfg = window.SCAN_CONFIG;
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/update-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify({ detection_id: id, new_bbox: bbox }),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && (data.message || data.error)) || "Could not grow the box");
+                return;
+            }
+            if (window.moveDetectionBox) {
+                window.moveDetectionBox(id, data.detection_id, bbox, d.pageIndex);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not grow the box");
+        });
+}
 // "Cover the line" of a card about a redaction that covers part of a
 // line of text: the box is moved to cover the whole line (the card's
 // ``cover``, the box grown over the reader's cell), through the same
@@ -448,6 +490,43 @@ function coverCutLine(btn) {
             btn.disabled = false;
             btn.textContent = label;
             showToast("Could not move the box");
+        });
+}
+
+// "Remove the box" of the same card: the box reaches into text that
+// should stay (a headnote box over a line of the opinion), so it goes,
+// through the endpoint of the box's own Dismiss button. The endpoint
+// rebuilt the findings, so the card goes.
+function removeCutBox(btn) {
+    var row = btn.closest("[data-redaction-id]");
+    if (!row) return;
+    var cfg = window.SCAN_CONFIG;
+    var id = parseInt(row.dataset.redactionId);
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/dismiss/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not remove the box");
+                return;
+            }
+            if (window.applyRedactionRemove) {
+                window.applyRedactionRemove(parseInt(row.dataset.pageIndex), id);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not remove the box");
         });
 }
 

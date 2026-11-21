@@ -5,6 +5,7 @@ from unittest.mock import patch
 from django.db import OperationalError
 from django.test import TestCase, override_settings
 
+from scanning import stopping
 from scanning.factories import ScanFactory
 from scanning.management.commands.run_daemon import Command, ScheduledTask
 from scanning.models import Scan, Status
@@ -80,9 +81,9 @@ class TestRunDaemonSchedule(TestCase):
         ):
             cmd.handle()
 
-        # At least one task fires on the first tick (both are due since
-        # last_ran=0.0).
-        self.assertGreaterEqual(len(calls), 1)
+        # Every task is due on the first tick (last_ran=0.0), but the
+        # signal set during the first one ends the round (#534).
+        self.assertEqual(len(calls), 1)
         self.assertIn(
             calls[0], {"process_next_scan", "cleanup_processing_tmp"}
         )
@@ -126,6 +127,17 @@ class TestRunDaemonSchedule(TestCase):
 
 class TestHandleSignal(TestCase):
     """The signal handler should re-queue in-flight scans and report to Sentry."""
+
+    def setUp(self):
+        stopping.reset()
+        self.addCleanup(stopping.reset)
+
+    def test_signal_asks_the_running_pass_to_stop(self):
+        """The Mistral wave reads the flag between its uploads (#534)."""
+        cmd = Command()
+        with patch("sentry_sdk.capture_message"):
+            cmd._handle_signal(15, None)
+        self.assertTrue(stopping.requested())
 
     def test_signal_requeues_processing_scans(self):
         """PROCESSING scans get reset to QUEUED so the next tick retries them."""
@@ -260,6 +272,7 @@ class TestCeleryMode(TestCase):
     @override_settings(CELERY_ENABLED=True)
     def test_the_signal_requeues_nothing(self):
         """The workers hold the scans."""
+        self.addCleanup(stopping.reset)
         scan = ScanFactory(status=Status.PROCESSING)
         cmd = Command()
         cmd.celery = True

@@ -33,6 +33,7 @@ from scanning import (
     detections,
     editorial,
     findings,
+    pictures,
     text_fit,
     undetected,
 )
@@ -149,6 +150,9 @@ class Command(BaseCommand):
             written = brackets.write_rows(scan, document, run)
             notes = editorial.write_rows(scan, document, run)
             undetected.write_rows(scan, document, run)
+            pictures.write_rows(
+                scan, pictures.engine_documents(scan, run, document), run
+            )
             findings.rebuild(scan, run=run)
             missed = Issue.objects.filter(
                 scan=scan,
@@ -161,11 +165,15 @@ class Command(BaseCommand):
             in_no_box = Issue.objects.filter(
                 scan=scan, check_name=CheckName.UNDETECTED_TEXT
             ).count()
+            unboxed = Issue.objects.filter(
+                scan=scan, check_name=CheckName.UNBOXED_PICTURE
+            ).count()
             if dry_run:
                 transaction.set_rollback(True)
         self.stdout.write(
             f"scan {scan.pk}: {written} reading(s), {missed} missed "
             f"bracket(s), {notes} editor's note(s), {uncovered} uncovered, "
-            f"{in_no_box} block(s) of text in no box"
+            f"{in_no_box} block(s) of text in no box, {unboxed} picture(s) "
+            "or table(s) in no image box"
         )
         return written, missed, notes, uncovered

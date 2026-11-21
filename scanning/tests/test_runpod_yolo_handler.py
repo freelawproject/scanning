@@ -83,8 +83,12 @@ handler = _load_handler()
 
 
 def _weights(tmp_path: Path, *names: str) -> Path:
-    """Create empty weight files and return their directory."""
-    for name in names or ("bl_warm",):
+    """Create empty weight files and return their directory.
+
+    With no names it holds what the image holds: every weight of
+    ``handler.BAKED_MODELS``.
+    """
+    for name in names or handler.BAKED_MODELS:
         (tmp_path / f"{name}.pt").write_bytes(b"")
     return tmp_path
 
@@ -190,6 +194,7 @@ class TestDetectValidation(_DetectCase):
         # The message names what the image does carry, so triage needs
         # no shell on the worker.
         self.assertIn("bl_warm", out["error"])
+        self.assertIn("bl_hein", out["error"])
         # Refused before any download: ensure_weights would otherwise
         # reach Hugging Face from inside a paid job.
         self.detect.assert_not_called()
@@ -198,6 +203,22 @@ class TestDetectValidation(_DetectCase):
     def test_models_may_be_a_bare_string(self):
         out = self.run_detect(models="bl_warm")
         self.assertEqual(out["models"], ["bl_warm"])
+
+    def test_the_hein_weight_runs_when_the_job_names_it(self):
+        # One image serves both kinds of scan (#628): the caller picks
+        # the model, and the name reaches blackletter and the answer.
+        out = self.run_detect(models=["bl_hein"])
+        self.assertEqual(out["models"], ["bl_hein"])
+        _, kwargs = self.detect.call_args
+        self.assertEqual(kwargs["models"], ["bl_hein"])
+
+    def test_a_baked_weight_the_image_lost_is_refused(self):
+        # A name of BAKED_MODELS is still refused when its file is not
+        # there: the file on disk is the rule, never the constant.
+        (self.weights_dir / "bl_hein.pt").unlink()
+        out = self.run_detect(models=["bl_hein"])
+        self.assertEqual(out["error_code"], "BAD_INPUT")
+        self.detect.assert_not_called()
 
     def test_models_of_the_wrong_type_is_refused(self):
         out = self.run_detect(models=[7])
@@ -234,6 +255,8 @@ class TestDetectValidation(_DetectCase):
     def test_defaults_reach_blackletter(self):
         self.run_detect()
         _, kwargs = self.detect.call_args
+        # bl_hein is in the image and is never a default: a job that
+        # names no model gets what it got before #628.
         self.assertEqual(kwargs["models"], ["bl_warm"])
         self.assertEqual(kwargs["confidence"], handler.DEFAULT_CONFIDENCE)
         # No imgsz and no dpi: the checkpoint owns the first and
@@ -382,4 +405,43 @@ class TestPreload(SimpleTestCase):
         stub = self._run_preload_with_gpu(
             weights_dir, yolo_error=RuntimeError("corrupt file")
         )
-        stub.YOLO.assert_called_once_with(str(weights_dir / "bl_warm.pt"))
+        # Each weight has its own guard, so the first failure does not
+        # cost the second model its warm start.
+        self.assertEqual(
+            stub.YOLO.call_args_list,
+            [
+                mock.call(str(weights_dir / "bl_warm.pt")),
+                mock.call(str(weights_dir / "bl_hein.pt")),
+            ],
+        )
+
+    def test_every_baked_weight_is_warmed(self):
+        weights_dir = _weights(Path(self.enterContext(_tmp_dir())))
+        stub = self._run_preload_with_gpu(weights_dir)
+        self.assertEqual(
+            [call.args[0] for call in stub.YOLO.call_args_list],
+            [str(weights_dir / f"{name}.pt") for name in handler.BAKED_MODELS],
+        )
+
+    def test_one_missing_weight_does_not_skip_the_other(self):
+        weights_dir = _weights(Path(self.enterContext(_tmp_dir())), "bl_hein")
+        stub = self._run_preload_with_gpu(weights_dir)
+        stub.YOLO.assert_called_once_with(str(weights_dir / "bl_hein.pt"))
+
+
+class TestBakedWeights(SimpleTestCase):
+    """The handler's list and the Dockerfile's bake name the same files."""
+
+    def test_the_dockerfile_bakes_and_checks_every_baked_model(self):
+        # A name in BAKED_MODELS that the build does not bake is a
+        # weight every job of that kind is refused for; a baked name
+        # the handler does not list is never warmed.
+        dockerfile = (_HANDLER_PATH.parent / "Dockerfile").read_text()
+        names = ", ".join(f"'{name}'" for name in handler.BAKED_MODELS)
+        self.assertIn(f"ensure_weights([{names}])", dockerfile)
+        checked = ", ".join(f'"{name}"' for name in handler.BAKED_MODELS)
+        self.assertIn(f"for name in ({checked}):", dockerfile)
+
+    def test_the_default_is_baked(self):
+        for name in handler.DEFAULT_MODELS:
+            self.assertIn(name, handler.BAKED_MODELS)

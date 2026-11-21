@@ -71,8 +71,16 @@ from scanning.views_api import (
     withdraw_opinion_edit,
     withdraw_stale_edit,
 )
+from scanning.views_cards import (
+    answer_opinion_card,
+    opinion_card_answers,
+    opinion_card_review,
+    opinion_card_rows,
+    send_back_opinion_card,
+)
 from scanning.views_process import (
     add_page_insert,
+    all_card_review,
     apply_output_index,
     approve_page_completeness,
     approve_redaction_review,
@@ -139,6 +147,31 @@ urlpatterns = [
         "opinions/blocking/",
         opinion_blocking_review,
         name="opinion_blocking_review",
+    ),
+    path(
+        "opinions/cards/",
+        opinion_card_review,
+        name="opinion_card_review",
+    ),
+    path(
+        "opinions/cards/answers/",
+        opinion_card_answers,
+        name="opinion_card_answers",
+    ),
+    path(
+        "scans/<int:pk>/opinions/<int:opinion_pk>/card-rows/",
+        opinion_card_rows,
+        name="opinion_card_rows",
+    ),
+    path(
+        "scans/<int:pk>/cards/<int:card_pk>/answer/",
+        answer_opinion_card,
+        name="answer_opinion_card",
+    ),
+    path(
+        "scans/<int:pk>/cards/<int:card_pk>/send-back/",
+        send_back_opinion_card,
+        name="send_back_opinion_card",
     ),
     path(
         "opinions/warnings/",
@@ -607,6 +640,9 @@ urlpatterns = [
     # The card review of review 2 (``card_review``): the page, its
     # cards, and the Undo of a dismissed model box. Every other answer
     # of the page goes to the step-2 writes below.
+    # The same review over every volume in review 2, one kind of card
+    # and one volume at a time (``card_review.queue_scan_ids``). Staff only.
+    path("scans/all/cards/", all_card_review, name="all_card_review"),
     path(
         "scans/<int:pk>/cards/",
         scan_card_review,
