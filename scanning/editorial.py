@@ -48,7 +48,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass
 
 from blackletter.models import Label
@@ -265,7 +265,11 @@ def _in_detection(row: Detection, cx: float, cy: float) -> bool:
     )
 
 
-def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
+def uncovered(
+    scan: Scan,
+    run: ApplyRun | None,
+    pages: Collection[int] | None = None,
+) -> Iterator[dict]:
     """Yield one finding per editor's note nothing redacts.
 
     Rows only: the readings of the measured run, the visible black
@@ -286,13 +290,13 @@ def uncovered(scan: Scan, run: ApplyRun | None) -> Iterator[dict]:
 
     :param scan: The scan.
     :param run: The apply run the rows are measured against, or None.
+    :param pages: The page indexes to judge, or None for every page.
     :yields: The finding dicts ``findings.rebuild`` writes.
     """
-    readings = [
-        r
-        for r in EditorialReading.objects.filter(scan=scan, apply_run=run)
-        if r.img_width and r.img_height
-    ]
+    rows = EditorialReading.objects.filter(scan=scan, apply_run=run)
+    if pages is not None:
+        rows = rows.filter(page_index__in=pages)
+    readings = [r for r in rows if r.img_width and r.img_height]
     if not readings:
         return
     pages = {r.page_index for r in readings}
@@ -343,8 +347,12 @@ def _finding(reading: EditorialReading) -> dict:
 
     The metadata is what ``findings.address_of`` keys a dismissal by,
     and what ``_getDetectionData`` in ``viewer_sidebar.js`` reads off
-    the card to highlight the band. It names no detection, so the card
-    offers no detection button.
+    the card to highlight the band and to add the box: the card's
+    "+ editor's note" writes an ``EDITORIAL`` row at ``bbox`` with
+    the label the card carries, through ``add_single_detection``, and
+    the live hand-drawn box covers the reading at the next rebuild.
+    It names no detection of the model's, so it offers no approve or
+    delete.
     """
     return {
         "check_name": CheckName.UNCOVERED_EDITORS_NOTE,
@@ -352,7 +360,8 @@ def _finding(reading: EditorialReading) -> dict:
         "page_number": reading.page_index + 1,
         "message": (
             f"The reader found an editor's note here ({reading.text}), "
-            "and no redaction covers it. Draw an EDITORIAL box over it."
+            "and no redaction covers it. Add an editor's note box over "
+            "it, or draw one."
         ),
         "metadata": {
             "page_index": reading.page_index,

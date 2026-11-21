@@ -214,6 +214,24 @@ class TestQueueReadyRuns(TestCase):
             yolo.apply_state(yolo.live_detect_jobs(scan)).get("queued_at")
         )
 
+    def test_the_task_is_sent_after_the_ledger_is_written(self):
+        """The worker writes the ledger as soon as it claims (#503), so
+        the sender's write must land first or it erases the worker's."""
+        merged_scan()
+        order = []
+        with (
+            patch(
+                "scanning.yolo.write_apply_state",
+                side_effect=lambda rows, state: order.append("ledger"),
+            ),
+            patch(
+                "scanning.tasks.dispatch_scan",
+                side_effect=lambda pk, action: order.append("dispatch"),
+            ),
+        ):
+            yolo.queue_ready_runs()
+        self.assertEqual(order, ["ledger", "dispatch"])
+
     def test_the_apply_itself_does_not_run_here(self):
         """It renders every page; the tick's scheduler is serial."""
         merged_scan()

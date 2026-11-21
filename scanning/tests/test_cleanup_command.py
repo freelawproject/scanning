@@ -83,6 +83,38 @@ class TestCleanupProcessingTmp(TestCase):
         self.assertTrue(self.stale.exists())
 
     @override_settings(DEVELOPMENT=False)
+    def test_no_uploads_sweeps_the_dirs_and_not_the_uploads(self):
+        with (
+            override_settings(
+                PROCESSING_TMP_DIR=str(self.tmp_root),
+                PROCESSING_TMP_TTL_HOURS=1.0,
+            ),
+            patch(
+                "scanning.management.commands.cleanup_processing_tmp"
+                ".Command._sweep_pending_uploads"
+            ) as uploads,
+        ):
+            call_command("cleanup_processing_tmp", no_uploads=True)
+        uploads.assert_not_called()
+        self.assertFalse(self.stale.exists())
+
+    @override_settings(DEVELOPMENT=False)
+    def test_uploads_only_sweeps_the_uploads_and_not_the_dirs(self):
+        with (
+            override_settings(
+                PROCESSING_TMP_DIR=str(self.tmp_root),
+                PROCESSING_TMP_TTL_HOURS=1.0,
+            ),
+            patch(
+                "scanning.management.commands.cleanup_processing_tmp"
+                ".Command._sweep_pending_uploads"
+            ) as uploads,
+        ):
+            call_command("cleanup_processing_tmp", uploads_only=True)
+        uploads.assert_called_once()
+        self.assertTrue(self.stale.exists())
+
+    @override_settings(DEVELOPMENT=False)
     def test_sweeps_stale_dirs(self):
         with override_settings(
             PROCESSING_TMP_DIR=str(self.tmp_root),

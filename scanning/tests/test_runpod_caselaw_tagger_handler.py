@@ -11,11 +11,13 @@ module from its file path, and gives ``torch`` a CUDA-less answer so
 The handler imports the shared transfer code as a top-level
 ``runpod_common`` module (the Dockerfile copies it next to handler.py),
 so the loader aliases the real ``scanning.runpod_common`` under that
-name; its download/upload behaviour is covered in
+name, and loads the word decoder and the disposition heal
+(``wordlevel.py``, ``heal.py``, copied beside it) from their files; its download/upload behaviour is covered in
 ``test_runpod_common.py``. These tests cover what is specific to this
 worker: the dispatch and error-code surface, the GPU gating, the input
-validation of the ``tag`` action in both its shapes, the BIO decoding
-into character spans, long-case windowing and merging, and both delivery
+validation of the ``tag`` action in both its shapes, the word-level
+decoding into character spans and the disposition heal (#573), the
+refusal of per-token weights, long-case windowing and merging, and both delivery
 shapes.
 
 Only ``_predict_batch`` is stubbed: it is the one function that needs
@@ -28,21 +30,34 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from django.test import SimpleTestCase
 
-from scanning import runpod_common
+from scanning import markup, runpod_common
 
-_HANDLER_PATH = (
-    Path(__file__).resolve().parent.parent
-    / "runpod-caselaw-tagger"
-    / "handler.py"
-)
+_WORKER_DIR = Path(__file__).resolve().parent.parent / "runpod-caselaw-tagger"
+_HANDLER_PATH = _WORKER_DIR / "handler.py"
+
+
+def _load_worker_module(name):
+    """Import one pure module the image copies beside handler.py."""
+    spec = importlib.util.spec_from_file_location(
+        f"_runpod_caselaw_tagger_{name}_under_test", _WORKER_DIR / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+wordlevel = _load_worker_module("wordlevel")
+heal = _load_worker_module("heal")
 
 #: The checkpoint's classes, in its own order; ``ID2LABEL`` is the
 #: 25-entry BIO table its config carries.
@@ -88,9 +103,11 @@ def _load_handler(*, cuda=False):
         "runpod": stub_runpod,
         "torch": stub_torch,
         "transformers": mock.MagicMock(),
-        # The real shared module, under the top-level name the worker
-        # image gives it.
+        # The real shared modules, under the top-level names the worker
+        # image gives them.
         "runpod_common": runpod_common,
+        "wordlevel": wordlevel,
+        "heal": heal,
     }
     with mock.patch.dict(sys.modules, stubs):
         spec = importlib.util.spec_from_file_location(
@@ -543,21 +560,50 @@ class TestTagging(_TagCase):
         self.assertEqual(out["sequence_count"], 1)
 
 
+def _decode(text, pieces, labels):
+    """Decode ``labels`` over tokens cut at ``pieces``.
+
+    :param pieces: One ``(start, end)`` per token, ``(0, 0)`` for a
+        special token, so a test can cut a word into several tokens the
+        way byte-level BPE does.
+    :param labels: One label name per token.
+    """
+    return handler.decode_spans(
+        text, pieces, [LABEL2ID[label] for label in labels], ID2LABEL
+    )
+
+
+def _cut(text, *parts):
+    """Return the offsets of ``parts``, consecutive substrings of
+    ``text`` that together cover it."""
+    offsets, pos = [], 0
+    for part in parts:
+        index = text.index(part, pos)
+        offsets.append((index, index + len(part)))
+        pos = index + len(part)
+    return offsets
+
+
 class TestDecodeSpans(SimpleTestCase):
-    """The BIO decoder, a pure function over offsets and labels."""
+    """The word-level decoder, a pure function over offsets and labels.
+
+    The weights label the first token of each word alone (#573): the
+    other tokens of a word are noise the decoder must not read.
+    """
 
     def decode(self, text, labels):
-        """Tokenize ``text`` with the fake and decode ``labels`` (one
-        per word, by name) over it."""
+        """Tokenize ``text`` with the whitespace fake (one token per
+        word) and decode ``labels`` (one per word, by name) over it."""
         encoded = FakeTokenizer()(text)
         label_ids = (
             [LABEL2ID["O"]]
             + [LABEL2ID[label] for label in labels]
             + [LABEL2ID["O"]]
         )
-        return handler.decode_spans(
+        spans, _ = handler.decode_spans(
             text, encoded["offset_mapping"], label_ids, ID2LABEL
         )
+        return spans
 
     def test_b_then_i_is_one_span(self):
         spans = self.decode(
@@ -588,13 +634,51 @@ class TestDecodeSpans(SimpleTestCase):
             [("party", "Jane ROE"), ("docketnumber", "No. 24-1")],
         )
 
-    def test_span_edges_are_trimmed_to_the_text(self):
-        # A real tokenizer's offsets often start at the space before the
-        # word; the span must cover the words only.
+    def test_all_outside_is_no_span(self):
+        self.assertEqual(self.decode("Jane ROE", ["O", "O"]), [])
+
+    def test_a_word_reads_the_label_of_its_first_token(self):
+        # ``TR|UST``: the head token says party, the continuation says
+        # court. The continuation was never supervised, so the word is
+        # party, whole, and the court label opens nothing.
+        text = "TRUST COMPANY"
+        spans, _ = _decode(
+            text,
+            [(0, 0), *_cut(text, "TR", "UST", " COMPANY"), (0, 0)],
+            ["O", "B-party", "B-court", "I-party", "O"],
+        )
+        self.assertEqual(
+            spans,
+            [{"start": 0, "end": 13, "label": "party", "text": text}],
+        )
+
+    def test_a_span_cut_inside_a_word_comes_back_on_the_word(self):
+        # The predictions end the span on ``Color`` of ``Colorado``: the
+        # word's head opened it, so the whole word is in the span.
+        text = "Court of Colorado. Opinion"
+        spans, _ = _decode(
+            text,
+            [(0, 0), *_cut(text, "Court", " of", " Color", "ado.", " Opinion")]
+            + [(0, 0)],
+            ["O", "B-court", "I-court", "I-court", "O", "O", "O"],
+        )
+        self.assertEqual([s["text"] for s in spans], ["Court of Colorado."])
+
+    def test_a_word_whose_head_is_outside_opens_no_span(self):
+        text = "Colorado Court"
+        spans, _ = _decode(
+            text,
+            [(0, 0), *_cut(text, "Color", "ado", " Court"), (0, 0)],
+            ["O", "O", "B-court", "O", "O"],
+        )
+        self.assertEqual(spans, [])
+
+    def test_offsets_that_start_at_the_space_before_the_word(self):
+        # A real tokenizer's offsets often start at the space before
+        # the word; the span must cover the words only.
         text = "  Jane   ROE  "
         offsets = [(0, 0), (0, 6), (6, 14), (0, 0)]
-        label_ids = [0, LABEL2ID["B-party"], LABEL2ID["I-party"], 0]
-        spans = handler.decode_spans(text, offsets, label_ids, ID2LABEL)
+        spans, _ = _decode(text, offsets, ["O", "B-party", "I-party", "O"])
         self.assertEqual(
             spans,
             [{"start": 2, "end": 12, "label": "party", "text": "Jane   ROE"}],
@@ -605,30 +689,18 @@ class TestDecodeSpans(SimpleTestCase):
         # empty-offset token in the middle must not end a run.
         text = "Jane ROE"
         offsets = [(0, 0), (0, 4), (0, 0), (5, 8), (0, 0)]
-        label_ids = [
-            LABEL2ID["B-party"],
-            LABEL2ID["B-party"],
-            LABEL2ID["O"],
-            LABEL2ID["I-party"],
-            LABEL2ID["B-court"],
-        ]
-        spans = handler.decode_spans(text, offsets, label_ids, ID2LABEL)
+        spans, _ = _decode(
+            text, offsets, ["B-party", "B-party", "O", "I-party", "B-court"]
+        )
         self.assertEqual([s["text"] for s in spans], ["Jane ROE"])
 
-    def test_all_outside_is_no_span(self):
-        self.assertEqual(self.decode("Jane ROE", ["O", "O"]), [])
-
-    def test_markup_noise_cannot_open_or_split_entities(self):
+    def test_markup_and_whitespace_never_open_or_split_a_span(self):
         text = "<p>Jane <em>ROE</em></p>"
-        parts = ["<p>", "Jane", " ", "<em>", "ROE", "</em>", "</p>"]
-        offsets, pos = [], 0
-        for part in parts:
-            offsets.append((pos, pos + len(part)))
-            pos += len(part)
-        labels = ["B-court", "B-party", "O", "O", "I-party", "B-court", "O"]
-        spans = handler.decode_spans(
-            text, offsets, [LABEL2ID[label] for label in labels], ID2LABEL
+        offsets = _cut(
+            text, "<p>", "Jane", " ", "<em>", "ROE", "</em>", "</p>"
         )
+        labels = ["B-court", "B-party", "B-court", "O", "I-party", "B-court"]
+        spans, _ = _decode(text, offsets, labels + ["O"])
         self.assertEqual(
             spans,
             [
@@ -641,17 +713,32 @@ class TestDecodeSpans(SimpleTestCase):
             ],
         )
 
-    def test_mixed_text_and_markup_tokens_are_trimmed(self):
+    def test_a_token_of_markup_and_text_heads_the_word(self):
         self.assertEqual(
             self.decode("<p>Jane ROE</p>", ["B-party", "I-party"]),
             [{"start": 3, "end": 11, "label": "party", "text": "Jane ROE"}],
         )
 
+    def test_a_page_mark_glued_to_a_word_is_its_own_word(self):
+        # ``↓47ORDER``: the OCR page mark and the word after it are two
+        # words, so a span can start at ``ORDER``.
+        text = "\u219347ORDER of the court"
+        spans, _ = _decode(
+            text,
+            [(0, 0), *_cut(text, "\u2193", "47", "ORDER", " of", " the")]
+            + [*_cut(text, " court"), (0, 0)],
+            ["O", "O", "O", "B-heading", "O", "O", "O", "O"],
+        )
+        self.assertEqual(
+            spans,
+            [{"start": 3, "end": 8, "label": "heading", "text": "ORDER"}],
+        )
+
     def test_bytes_of_one_character_cannot_split_a_span(self):
         # Byte-level BPE gives every byte of a multi-byte symbol the same
-        # character offsets. On real volume 2574 the model labelled the
-        # second byte of a West key symbol ``B-heading``, and the
-        # decoder opened a second span one character inside the first.
+        # character offsets. On real volume 2574 the per-token decoder
+        # opened a second span on the second byte of a West key; the
+        # bytes lie inside one word, and only the first one is read.
         text = "2. Appeal and Error \u261e"
         mark = (len(text) - 1, len(text))
         offsets = [
@@ -673,37 +760,25 @@ class TestDecodeSpans(SimpleTestCase):
             "I-heading",
             "I-heading",
             "B-heading",
-            "I-heading",
+            "O",
             "O",
         ]
-        spans = handler.decode_spans(
-            text, offsets, [LABEL2ID[label] for label in labels], ID2LABEL
-        )
+        spans, _ = _decode(text, offsets, labels)
         self.assertEqual(
             spans,
             [{"start": 0, "end": len(text), "label": "heading", "text": text}],
         )
 
-    def test_an_outside_byte_inside_a_character_does_not_close_the_span(self):
-        text = "Error \u261e 26"
-        mark = (6, 7)
-        offsets = [(0, 0), (0, 5), mark, mark, mark, (8, 10), (0, 0)]
-        labels = [
-            "O",
-            "B-heading",
-            "I-heading",
-            "O",
-            "I-heading",
-            "I-heading",
-            "O",
-        ]
-        spans = handler.decode_spans(
-            text, offsets, [LABEL2ID[label] for label in labels], ID2LABEL
-        )
-        self.assertEqual([s["text"] for s in spans], [text])
+    def test_an_escaped_bracket_is_text(self):
+        # The projection escapes ``<``, ``>`` and ``&``; the decoder
+        # masks only the tags the projection writes, so an escaped
+        # bracket of the print is part of its word.
+        text = "<p>Jane &lt;ROE&gt;</p>"
+        spans = self.decode(text, ["B-party", "I-party"])
+        self.assertEqual([s["text"] for s in spans], ["Jane &lt;ROE&gt;"])
 
     def test_unknown_label_id_reads_as_outside(self):
-        spans = handler.decode_spans(
+        spans, _ = handler.decode_spans(
             "Jane", [(0, 0), (0, 4), (0, 0)], [0, 99, 0], ID2LABEL
         )
         self.assertEqual(spans, [])
@@ -711,6 +786,156 @@ class TestDecodeSpans(SimpleTestCase):
     def test_mismatched_lengths_raise(self):
         with self.assertRaises(ValueError):
             handler.decode_spans("Jane", [(0, 4)], [1, 2], ID2LABEL)
+
+
+class TestTheMarkupRule(SimpleTestCase):
+    """One markup rule for the projection and the decoder (#573)."""
+
+    def test_the_projection_writes_only_tags_the_decoder_masks(self):
+        def para(text, blockquote=False, marks=()):
+            return {
+                "kind": "paragraph",
+                "blockquote": blockquote,
+                "text": text,
+                "marks": [
+                    {"start": a, "end": b, "kind": kind}
+                    for a, b, kind in marks
+                ],
+                "pages": [0],
+                "page_breaks": [],
+                "joins": [],
+                "human": False,
+            }
+
+        body = [
+            para("Smith & Sons <Untrue> v. Jones", marks=[(0, 5, "em")]),
+            para("quoted 3", blockquote=True, marks=[(7, 8, "sup")]),
+            para("Affirmed.", marks=[(0, 9, "strong")]),
+        ]
+        text = markup.project(body).text
+        bare = wordlevel.MARKUP_RE.sub("", text)
+        self.assertNotIn("<", bare)
+        self.assertNotIn(">", bare)
+        self.assertIn("&lt;Untrue&gt;", bare)
+
+
+def _write_label_maps(model_dir: Path, *, word_level) -> None:
+    maps = {"block": list(ID2LABEL.values())}
+    if word_level is not None:
+        maps["word_level"] = word_level
+    (model_dir / handler.LABEL_MAPS).write_text(json.dumps(maps))
+
+
+class TestWordLevelGuard(SimpleTestCase):
+    """The handler refuses weights it would decode wrongly."""
+
+    def setUp(self):
+        super().setUp()
+        self.dir = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def test_word_level_weights_pass(self):
+        _write_label_maps(self.dir, word_level=True)
+        handler.check_word_level(self.dir)
+
+    def test_per_token_weights_are_refused(self):
+        _write_label_maps(self.dir, word_level=False)
+        with self.assertRaisesRegex(RuntimeError, "word_level"):
+            handler.check_word_level(self.dir)
+
+    def test_a_snapshot_with_no_label_maps_is_refused(self):
+        # The per-token checkpoint carries no label_maps.json.
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            handler.check_word_level(self.dir)
+
+    def test_the_load_checks_before_it_reads_the_weights(self):
+        _write_label_maps(self.dir, word_level=None)
+        with (
+            mock.patch.object(handler, "MODEL_DIR", self.dir),
+            mock.patch.object(handler, "_DEVICE", "cpu"),
+            self.assertRaises(RuntimeError),
+        ):
+            handler._load_model()
+
+    def test_the_payload_names_the_pinned_weights(self):
+        self.assertEqual(
+            handler.MODEL_NAME,
+            "freelawproject/caselaw-block-tagger-wordlevel"
+            "@00a26dda233db0f77268019020f5ae96a221ba44",
+        )
+
+
+class TestDispositionHeal(SimpleTestCase):
+    """The heal after the decoder: a disposition returned in pieces."""
+
+    def heal(self, text, labels):
+        encoded = FakeTokenizer()(text)
+        label_ids = (
+            [LABEL2ID["O"]]
+            + [LABEL2ID[label] for label in labels]
+            + [LABEL2ID["O"]]
+        )
+        return handler.decode_spans(
+            text, encoded["offset_mapping"], label_ids, ID2LABEL
+        )
+
+    def test_two_pieces_in_one_p_become_one_span_over_the_block(self):
+        text = (
+            "<p>The judgment is affirmed. Costs to appellee.</p>\n"
+            "<p>Smith, J.</p>"
+        )
+        labels = [
+            "B-disposition",  # The
+            "I-disposition",  # judgment
+            "O",  # is
+            "B-disposition",  # affirmed.
+            "B-otherdate",  # Costs: another span inside the block
+            "O",  # to
+            "O",  # appellee.</p>
+            "B-author",  # <p>Smith,
+            "I-author",  # J.</p>
+        ]
+        spans, healed = self.heal(text, labels)
+        self.assertEqual(healed, 1)
+        self.assertEqual(
+            [(s["label"], s["text"]) for s in spans],
+            [
+                (
+                    "disposition",
+                    "The judgment is affirmed. Costs to appellee.",
+                ),
+                ("author", "Smith, J."),
+            ],
+        )
+
+    def test_one_piece_is_left_alone(self):
+        text = "<p>The judgment is affirmed.</p>"
+        spans, healed = self.heal(text, ["O", "O", "O", "B-disposition"])
+        self.assertEqual(healed, 0)
+        self.assertEqual([s["text"] for s in spans], ["affirmed."])
+
+    def test_a_blockquote_is_left_alone(self):
+        text = "<blockquote>Affirmed in part, reversed in part.</blockquote>"
+        spans, healed = self.heal(
+            text,
+            ["B-disposition", "I-disposition", "O", "B-disposition"]
+            + ["O", "O"],
+        )
+        self.assertEqual(healed, 0)
+        self.assertEqual(
+            [s["text"] for s in spans], ["Affirmed in", "reversed"]
+        )
+
+    def test_a_healed_span_lands_on_text_and_not_on_markup(self):
+        text = "<p><em>Affirmed</em> in part; <em>reversed in part.</em></p>"
+        spans, healed = self.heal(
+            text,
+            ["B-disposition", "O", "O", "B-disposition", "O", "O"],
+        )
+        self.assertEqual(healed, 1)
+        self.assertEqual(
+            [s["text"] for s in spans],
+            ["Affirmed</em> in part; <em>reversed in part."],
+        )
 
 
 class TestDelivery(_TagCase):
@@ -804,7 +1029,12 @@ class TestPreload(SimpleTestCase):
     def test_successful_boot_does_not_call_helpers_defined_later(self):
         # Exercise the actual module-level _load_model call. Previously
         # its final log called _max_tokens before that function existed.
-        with mock.patch.object(handler.logger, "exception") as log_error:
+        model_dir = self.enterContext(tempfile.TemporaryDirectory())
+        _write_label_maps(Path(model_dir), word_level=True)
+        with (
+            mock.patch.dict(os.environ, {"TAGGER_MODEL_DIR": model_dir}),
+            mock.patch.object(handler.logger, "exception") as log_error,
+        ):
             loaded = _load_handler(cuda=True)
         self.assertIsNotNone(loaded._MODEL)
         self.assertEqual(loaded._DEVICE, "cuda")

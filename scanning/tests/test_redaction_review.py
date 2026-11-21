@@ -295,6 +295,26 @@ class TestTheApplyOpensReviewTwo(ComputeMixin, TestCase):
         scan.refresh_from_db()
         self.assertEqual(scan.status, Status.PAGE_COMPLETENESS_REVIEW_DONE)
 
+    def test_a_failed_compute_writes_the_cards_from_the_rows_it_left(self):
+        """A click's rebuild keeps the volume cards it does not
+        recompute, so the cards must never be older than the rows: the
+        failure handler rebuilds them whole from the rows as they
+        stand."""
+        from unittest.mock import patch
+
+        scan, _ = merged_scan()
+        stubs = self.patch_geometry()
+        stubs["_measure_redaction_rects"].side_effect = RuntimeError("no")
+        self.claim(scan)
+
+        with patch("scanning.findings.rebuild") as rebuild:
+            services.run_compute_redactions(scan.pk)
+
+        rebuild.assert_called_once()
+        self.assertNotIn("pages", rebuild.call_args.kwargs)
+        self.assertNotIn("labels", rebuild.call_args.kwargs)
+        self.assertEqual(rebuild.call_args.args[0].pk, scan.pk)
+
     def test_a_failed_recompute_stays_in_review_two(self):
         """The run keeps the stamp of the apply that worked, so the
         volume still shows measured geometry. A park in review 1 would

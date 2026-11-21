@@ -401,6 +401,49 @@ class TestPass(ScanningTestCase):
         )
 
 
+class TestInProcessRender(ScanningTestCase):
+    """A process that may not have children measures with no pool (#519).
+
+    A Celery prefork child is daemonic, and the stdlib refuses it a
+    pool; the score must still be the pool's score.
+    """
+
+    @staticmethod
+    def _no_pool():
+        from scanning.badpage import features
+
+        return mock.patch.object(
+            features.mp,
+            "get_context",
+            side_effect=AssertionError("a pool was opened"),
+        )
+
+    def test_jobs_one_measures_in_this_process_and_scores_like_the_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "bitonal.pdf"
+            _bitonal_volume(pdf, 3)
+            with self._no_pool():
+                inline = scoring.score_pdf(pdf, jobs=1)
+            pooled = scoring.score_pdf(pdf, jobs=2)
+        self.assertEqual(sorted(inline), [1, 2, 3])
+        self.assertEqual(inline, pooled)
+
+    def test_a_daemonic_process_measures_in_this_process(self):
+        from scanning.badpage import features
+
+        process = features.mp.current_process()
+        self.assertFalse(features.in_process())
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "bitonal.pdf"
+            _bitonal_volume(pdf, 1)
+            daemonic = {**process._config, "daemon": True}
+            with mock.patch.object(process, "_config", daemonic):
+                self.assertTrue(features.in_process())
+                with self._no_pool():
+                    scores = scoring.score_pdf(pdf, jobs=2)
+        self.assertEqual(sorted(scores), [1])
+
+
 class TestAnswers(ScanningTestCase):
     """A replacement and a request answer a card, on the server too."""
 

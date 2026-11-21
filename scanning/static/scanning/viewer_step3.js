@@ -1098,8 +1098,10 @@
      *
      * The part is ``[from, to)`` of the group's ``text``. A voted group
      * draws its tokens with their flags; the words join with one space,
-     * the rule the document's own ``text`` follows, so a token starts
-     * where the one before it ends plus one, and a part cut at word
+     * none before a token that carries ``attach`` (a mark printed
+     * against its word, ``ensemble.join_tokens``), the rule the
+     * document's own ``text`` follows, so a token starts where the one
+     * before it ends, plus one unless it is attached, and a part cut at word
      * edges (``opinion_edits.snap_span``) never cuts a token. Every
      * other group draws its text with its marks cut to the part.
      *
@@ -1122,10 +1124,13 @@
             return;
         }
         var at = 0;
+        var seen = false;
         var first = true;
         tokens.forEach(function (token) {
+            if (seen && !token.attach) { at += 1; }
+            seen = true;
             var start = at;
-            at += token.text.length + 1;
+            at += token.text.length;
             if (start < from || start >= to) { return; }
             var span = document.createElement('span');
             markedNodes(
@@ -1147,7 +1152,20 @@
                 span.title = 'A majority chose this word, and not'
                     + ' every engine read it so.';
             }
-            if (!first) {
+            if (token.gap || token.gap_after) {
+                // A gap beside this word: some engine read words there
+                // that the shown engine did not, and they are not in
+                // the text. The level is the gap's own.
+                var gapLevel = token.gap || token.gap_after;
+                span.classList.add(gapLevel === 'blocking' ? 'ensemble-low' : 'ensemble-voted');
+                span.title = (token.gap_after ? 'After' : 'Before') + ' this word an engine'
+                    + ' read words the shown engine did not'
+                    + (gapLevel === 'blocking'
+                        ? ', and no two engines read the same there.'
+                        : '; the other engines read nothing there.')
+                    + ' None of them is in the text; the readings show them.';
+            }
+            if (!first && !token.attach) {
                 // The separator the text holds there: a line break a
                 // person kept (``opinion_edits.fold``) stays one.
                 var between = (group.text || '').charAt(start - 1);
@@ -3046,6 +3064,28 @@
             });
     }
 
+    /** The walk buttons count their cards: a finding is one row per
+     *  page, and a page makes a card per open word or gap, so the
+     *  server's number is the finding count until the cards endpoint
+     *  answers with the real one. */
+    function bindCardCounts() {
+        var links = Array.prototype.slice.call(document.querySelectorAll('[data-card-count-url]'));
+        if (!links.length) { return; }
+        // One request for both numbers: the endpoint reads the document
+        // once and answers the two lengths, no card over the wire.
+        fetch(links[0].dataset.cardCountUrl + '?counts=1', { credentials: 'same-origin' })
+            .then(function (response) { return response.ok ? response.json() : null; })
+            .then(function (data) {
+                if (!data || data.status !== 'ok' || !data.counts) { return; }
+                links.forEach(function (link) {
+                    var count = link.querySelector('[data-card-count]');
+                    var value = data.counts[link.dataset.cardLevel];
+                    if (count && typeof value === 'number') { count.textContent = value; }
+                });
+            })
+            .catch(function () { /* the finding count stays */ });
+    }
+
     document.addEventListener('DOMContentLoaded', function () {
         root = document.getElementById('opinion-review');
         if (!root) { return; }
@@ -3054,6 +3094,7 @@
         bindRerun();
         bindApproval();
         bindFindings();
+        bindCardCounts();
         bindZoom();
         bindQuiet();
         bindHelp();

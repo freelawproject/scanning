@@ -234,6 +234,21 @@ def _range_value(match: re.Match | None) -> str | None:
     return f"{first}-{last}"
 
 
+def fold_dashes(value: str) -> str:
+    """Return ``value`` with an en dash or an em dash made a hyphen.
+
+    A reporter prints a range with an en dash (``913–925``) and a
+    curator types what the page shows, so a typed number and an
+    insert's label both come in either way; a stored number holds one
+    hyphen, and ``number_type`` reads the hyphen alone.
+
+    :param value: What the curator typed.
+    :returns: The same text with every dash a hyphen.
+    :rtype: str
+    """
+    return value.replace("\u2013", "-").replace("\u2014", "-")
+
+
 def number_type(value: str | None) -> str | None:
     """Name the shape of one stored printed page number.
 
@@ -500,7 +515,10 @@ def carries_number(text: str, value: str | None) -> bool:
         return False
     wanted = str(value)
     for line in _clean(text).splitlines():
-        folded = compare_text(line).lstrip(_BULLETS).strip()
+        # The vote's fold less its hyphen rule: ``677- 679`` at the end
+        # of a ``Cite as`` line ends in the page number as the engine
+        # wrote it, and folded to ``677-679`` it would end in a range.
+        folded = compare_text(line, hyphen_gaps=False).lstrip(_BULLETS).strip()
         for detected, _type, _side in _line_readings(folded):
             if detected == wanted:
                 return True
@@ -622,7 +640,9 @@ def engine_candidates(page: dict, document: dict, spec) -> list[dict]:
             continue
         text = unit.get(spec.text_key) or ""
         for index, line in enumerate(_clean(text).splitlines()):
-            line = compare_text(line).lstrip(_BULLETS).strip()
+            line = (
+                compare_text(line, hyphen_gaps=False).lstrip(_BULLETS).strip()
+            )
             for detected, number_type, side in _line_readings(line):
                 distance = _corner_distance(bbox, width, side)
                 corner = distance <= CORNER_BAND

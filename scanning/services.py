@@ -40,10 +40,11 @@ from blackletter.validate import (
     build_issues,
 )
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Case, F, Value, When
 from django.utils import timezone
 
-from scanning import boundaries, undetected
+from scanning import boundaries, tasks, undetected
 from scanning.badpage import scoring as badpage_scoring
 from scanning.models import (
     BUSY_STATUSES,
@@ -253,6 +254,7 @@ def apply_upload_action(scan: Scan, action: str) -> None:
     scan.save()
     flag_partial_volume(scan)
     refresh_volume_queue_status_for_scan(scan)
+    tasks.dispatch_scan(scan.pk, QueuedAction.FULL_PIPELINE)
 
 
 def recover_pending_upload(pending) -> bool:
@@ -308,7 +310,14 @@ def _update_progress(
     :param total: Total step count, if applicable.
     :param kwargs: Additional Scan fields to update.
     """
-    updates = {"progress_message": message[:255]}
+    # The heartbeat (#503): ``processed_at`` is the claim stamp the
+    # stale sweep reads (``process_next_scan.recover_stale``), and a
+    # progress write refreshes it, so a long action on one of several
+    # workers is never swept for being old while it reports progress.
+    updates = {
+        "progress_message": message[:255],
+        "processed_at": timezone.now(),
+    }
     if current is not None:
         updates["progress_current"] = current
     if total is not None:
@@ -797,6 +806,52 @@ def drop_junk_entries(entries: list) -> tuple[set[int], int]:
     return dropped, len(report.cut)
 
 
+def detection_entry(d: Detection, page_numbers: dict) -> dict:
+    """Return one live row in the shape blackletter reads.
+
+    The one lift of a row into the dict :func:`detection_entries` lists
+    and :func:`drop_junk_entries` judges, so ``findings.read_ids`` lifts
+    the rows it judges the same way.
+
+    :param d: The row.
+    :param page_numbers: The ``{page_index: (start, end)}`` lookup, or
+        an empty dict for no printed numbers.
+    :return: The dict.
+    """
+    entry = {
+        # The row pk, so the compute can name the caption and the
+        # key rows of each opinion exactly (#240 PR C). blackletter
+        # reads the keys it knows and ignores this one.
+        "id": d.pk,
+        "page_index": d.page_index,
+        "label": d.label,
+        "label_id": d.label_id,
+        "confidence": d.confidence,
+        "bbox": [d.x0, d.y0, d.x1, d.y1],
+        "img_width": d.img_width,
+        "img_height": d.img_height,
+        "model_count": d.model_count,
+    }
+    if d.found_by and d.model_name != Detection.ModelName.MANUAL:
+        # Load-bearing, not decoration: the confidence gates are per
+        # model family since blackletter #73, and
+        # ``rows_are_bl_warm`` reads this provenance off the list.
+        # ``blackletter.api.pair`` reads it from here, so a list
+        # without it pairs a bl-warm volume on the legacy gates.
+        # A hand-added detection carries none, and must not: it
+        # would read as a second model family and send the whole
+        # volume back to those gates. Rows written before #196 carry
+        # a "manual" claim, so the row kind is the guard, not the
+        # field.
+        entry["found_by"] = d.found_by
+    pn = page_numbers.get(d.page_index)
+    if pn:
+        entry["page_number"] = pn[0]
+        if pn[1] is not None:
+            entry["page_number_end"] = pn[1]
+    return entry
+
+
 def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
     """The live detections of a scan, in the shape blackletter reads.
 
@@ -825,40 +880,7 @@ def detection_entries(scan_pk: int, page_numbers: dict | None = None) -> list:
         .filter(scan_id=scan_pk)
         .order_by("page_index", "y0", "x0", "pk")
     )
-    det_data = []
-    for d in all_saved:
-        entry = {
-            # The row pk, so the compute can name the caption and the
-            # key rows of each opinion exactly (#240 PR C). blackletter
-            # reads the keys it knows and ignores this one.
-            "id": d.pk,
-            "page_index": d.page_index,
-            "label": d.label,
-            "label_id": d.label_id,
-            "confidence": d.confidence,
-            "bbox": [d.x0, d.y0, d.x1, d.y1],
-            "img_width": d.img_width,
-            "img_height": d.img_height,
-            "model_count": d.model_count,
-        }
-        if d.found_by and d.model_name != Detection.ModelName.MANUAL:
-            # Load-bearing, not decoration: the confidence gates are per
-            # model family since blackletter #73, and
-            # ``rows_are_bl_warm`` reads this provenance off the list.
-            # ``blackletter.api.pair`` reads it from here, so a list
-            # without it pairs a bl-warm volume on the legacy gates.
-            # A hand-added detection carries none, and must not: it
-            # would read as a second model family and send the whole
-            # volume back to those gates. Rows written before #196 carry
-            # a "manual" claim, so the row kind is the guard, not the
-            # field.
-            entry["found_by"] = d.found_by
-        pn = page_numbers.get(d.page_index)
-        if pn:
-            entry["page_number"] = pn[0]
-            if pn[1] is not None:
-                entry["page_number_end"] = pn[1]
-        det_data.append(entry)
+    det_data = [detection_entry(d, page_numbers) for d in all_saved]
     # The blot along the top or the bottom edge that the model boxes as
     # a key icon or a headnote, the image box that is a text box's twin
     # and the key that is the show-through of the leaf's other side are
@@ -1065,7 +1087,9 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
     the measure gave no page is a thin handle at the edge for the
     curator to widen, held off the detections like every strip, so a
     page whose content box blackletter could not establish gets four
-    handles too.
+    handles too. Last, every strip is pulled back off the page's
+    ``PAGE_NUMBER`` boxes (``margin_fit.hold_off_page_numbers``), which
+    blackletter's own pull-back exempts: the printed page number stays.
 
     :param pdf_path: Path to the PDF to compute margins for.
     :param document: The snapped document the rects were measured from.
@@ -1083,6 +1107,7 @@ def _measure_margin_rects(pdf_path: str, document: "BLDoc") -> list:
         pages = margin_fit.clipped_pages(document.pages)
         entries = compute_margin_rects(str(pdf_path), pages=pages)
         margin_fit.ensure_strips(entries, pages)
+        margin_fit.hold_off_page_numbers(entries, pages)
         return entries
 
 
@@ -1699,6 +1724,29 @@ def recalculate_issues(scan: "Scan") -> None:
 
 
 def run_compute_issues(scan: "Scan", result_key: str) -> bool:
+    """Apply the page numbers under the lock the bad-page score shares.
+
+    See :func:`_run_compute_issues`. The score (``badpage.scoring
+    .score_scan``) stamps and rebuilds under the same lock (#503), so
+    this apply never reads the scores before the stamp and opens the
+    review after the score's status check.
+
+    :param scan: The scan whose live run is fully glued.
+    :param result_key: S3 key of the run's glued volume JSON.
+    :returns: Whether the apply completed.
+    :rtype: bool
+    """
+    from scanning import locks
+
+    with locks.held(badpage_scoring.ISSUES_LOCK, wait=True) as held:
+        if not held:
+            # A holder's dead session, until the server reaps it: the
+            # next tick applies the numbers.
+            return False
+        return _run_compute_issues(scan, result_key)
+
+
+def _run_compute_issues(scan: "Scan", result_key: str) -> bool:
     """Read page numbers off a glued dots.mocr run and rebuild Issues.
 
     The apply step of issues #149/#204, called by
@@ -1841,10 +1889,90 @@ def _import_detections(
         come back.
     :return: How many rows were created.
     """
-    from scanning import columns
+    from scanning import bands, columns
     from scanning import detections as decisions
 
     scan = Scan.objects.get(pk=scan_pk)
+    # One transaction from the delete through ``resolve`` (#603): a
+    # reader in between saw a volume with no model boxes, and a crash
+    # in between left the decisions unlanded until the next compute.
+    with transaction.atomic():
+        kept = _replace_model_detections(scan, detections, run, detect_run)
+        rows_written = len(detections)
+        if cells:
+            # The rows the decisions were made on are the shaped rows.
+            columns.separate_rows(scan, cells)
+            columns.trim_feet(scan, cells)
+            # Its own run alone: the hand-drawn rows kept above are
+            # still at their page of the run before.
+            bands.trim_rows(scan, cells, run=run)
+        landed, stale = decisions.resolve(scan)
+        moved = 0
+        if run is not None and kept:
+            # The kept hand-drawn rows follow the new page space, by
+            # their address; the model rows arrived in it.
+            moved, _unplaced = decisions.relocate_manual_rows(scan, run)
+    logger.info(
+        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
+        "%d moved; %d decision(s) landed, %d stale)",
+        rows_written,
+        scan_pk,
+        kept,
+        moved,
+        landed,
+        len(stale),
+    )
+    return rows_written
+
+
+def _run_model_name(detections: list) -> str:
+    """Return the ``Detection.model_name`` of a merged run's rows.
+
+    One decision for the whole run, off blackletter's own reader,
+    rather than a guess per row: the run either came from the bl-warm
+    family or it did not. Inside the family the name is the weight's
+    own when one weight drew every row (``bl_hein``, #633), so the
+    admin can tell a Hein volume's rows apart; the gates never read
+    this column, only ``found_by``.
+
+    :param detections: The merged document's ``detections`` list.
+    :returns: A ``Detection.ModelName`` value, or blank for a run
+        outside the family.
+    :rtype: str
+    """
+    if not rows_are_bl_warm(detections):
+        return ""
+    names = {
+        found.get("model")
+        for entry in detections
+        for found in entry.get("found_by") or []
+        if isinstance(found, dict)
+    }
+    if names == {Detection.ModelName.BL_HEIN.value}:
+        return Detection.ModelName.BL_HEIN
+    return Detection.ModelName.BL_WARM
+
+
+def _replace_model_detections(
+    scan: Scan,
+    detections: list,
+    run: "ApplyRun | None",
+    detect_run: int | None,
+) -> int:
+    """Delete a scan's model detections and write the new ones.
+
+    The hand-drawn rows (``model_name`` ``MANUAL``) are kept. The
+    caller holds the transaction (#603).
+
+    :param scan: The scan.
+    :param detections: The merged document's ``detections`` list.
+    :param run: The apply run whose space the list is in, or None.
+    :param detect_run: The ``ExternalJob.run`` of the detection run.
+    :return: How many hand-drawn rows were kept.
+    """
+    from scanning import detections as decisions
+
+    scan_pk = scan.pk
     kept = Detection.objects.filter(
         scan_id=scan_pk, model_name=Detection.ModelName.MANUAL
     ).count()
@@ -1852,12 +1980,7 @@ def _import_detections(
         model_name=Detection.ModelName.MANUAL
     ).delete()
 
-    # One decision for the whole run, off blackletter's own reader,
-    # rather than a guess per row: the run either came from bl-warm or
-    # it did not.
-    model_name = (
-        Detection.ModelName.BL_WARM if rows_are_bl_warm(detections) else ""
-    )
+    model_name = _run_model_name(detections)
     rows = []
     for entry in detections:
         bbox = entry.get("bbox") or [0, 0, 1, 1]
@@ -1887,27 +2010,7 @@ def _import_detections(
             )
         )
     Detection.objects.bulk_create(rows, batch_size=1000)
-    if cells:
-        # The rows the decisions were made on are the shaped rows.
-        columns.separate_rows(scan, cells)
-        columns.trim_feet(scan, cells)
-    landed, stale = decisions.resolve(scan)
-    moved = 0
-    if run is not None and kept:
-        # The kept hand-drawn rows follow the new page space, by their
-        # address; the model rows arrived in it.
-        moved, _unplaced = decisions.relocate_manual_rows(scan, run)
-    logger.info(
-        "Imported %d detection(s) for scan %s (%d hand-made row(s) kept, "
-        "%d moved; %d decision(s) landed, %d stale)",
-        len(rows),
-        scan_pk,
-        kept,
-        moved,
-        landed,
-        len(stale),
-    )
-    return len(rows)
+    return kept
 
 
 _UNSET_RUN = object()
@@ -2000,10 +2103,12 @@ def run_compute_redactions(
     """
     from scanning import (
         apply,
+        bands,
         brackets,
         columns,
         editorial,
         findings,
+        pictures,
         redactions,
         review_states,
         s3_sync,
@@ -2176,6 +2281,7 @@ def run_compute_redactions(
             # A column box the model ran to the foot of the facing
             # column ends at its own last line of print.
             columns.trim_feet(scan, cells)
+            bands.trim_rows(scan, cells)
 
         # The brackets the reader saw, stored as rows so that the
         # findings can be rebuilt from the rows alone (#328). It reads
@@ -2189,6 +2295,13 @@ def run_compute_redactions(
         # block no box covers (``undetected``).
         with _log_stage("Text readings"):
             undetected.write_rows(scan, ocr_document, run)
+        # The pictures and tables every reader saw, the same way, for
+        # the image cards (``pictures``): the other engines' documents
+        # are read here, the one S3 read the readings add.
+        with _log_stage("Picture readings"):
+            pictures.write_rows(
+                scan, pictures.engine_documents(scan, run, ocr_document), run
+            )
 
         if importing:
             # Only after an import: the correction converges, so it is
@@ -2202,6 +2315,7 @@ def run_compute_redactions(
             with _log_stage("Column gutter"):
                 columns.separate_rows(scan, cells)
                 columns.trim_feet(scan, cells)
+                bands.trim_rows(scan, cells)
 
         # One corrected document for the pairing and the geometry, and
         # one pairing (#240 PR C): the boundaries are rows written from
@@ -2231,6 +2345,11 @@ def run_compute_redactions(
         _update_progress(scan_pk, "Fitting the text redactions...")
         with _log_stage("Text redaction fit"):
             text_fit.fit_rects(rects, cells, document.pages)
+        # A headnote rect ends at a key icon centred under the last
+        # lines of the opinion before (#624): blackletter gives the next
+        # opinion's headnotes the right column from its top.
+        with _log_stage("Centred key fit"):
+            bands.clip_headnotes(scan, rects, document.pages)
         # A running head's whiteout the model drew short grows across the
         # text width at its own height, so no letter of it is left on the
         # page; the page number stays.
@@ -2323,6 +2442,20 @@ def run_compute_redactions(
                 "The redaction computation failed. The detections are "
                 "safe; ask a staff member to look at it."
             )
+        # The rows the compute wrote before it failed are the rows the
+        # next click reads, and a click's rebuild keeps the volume
+        # cards it does not recompute (``findings.rebuild``): write
+        # every card from the rows as they stand, so no card of an
+        # older row set outlives them. Best effort, the failure itself
+        # is logged above.
+        try:
+            findings.rebuild(scan, run=run if merged else None)
+        except Exception:
+            logger.exception(
+                "compute_redactions: scan %s: the findings were not "
+                "rebuilt after the failure",
+                scan_pk,
+            )
         _park_after_redactions(scan_pk, unapproved(message), park())
         return
 
@@ -2405,6 +2538,7 @@ def queue_redaction_compute(scan: "Scan") -> tuple[bool, str]:
         progress_total=0,
     )
     if queued:
+        tasks.dispatch_scan(scan.pk, QueuedAction.COMPUTE_REDACTIONS)
         return True, (
             "Queued. The redactions are computed on the server, and this "
             "page reloads when they are ready."
@@ -2462,7 +2596,7 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
             f"The redactions are computed, with {open_findings} open "
             "finding(s). The opinions are queued for creation."
         )
-    Scan.objects.filter(
+    moved = Scan.objects.filter(
         pk=scan_pk, status__in=(Status.PROCESSING, Status.QUEUED)
     ).update(
         status=Status.QUEUED,
@@ -2471,6 +2605,8 @@ def _queue_opinions_after_compute(scan_pk: int, open_findings: int) -> None:
         progress_current=0,
         progress_total=0,
     )
+    if moved:
+        tasks.dispatch_scan(scan_pk, QueuedAction.CREATE_OPINIONS)
 
 
 def _park_after_redactions(

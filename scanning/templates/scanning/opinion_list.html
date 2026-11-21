@@ -28,8 +28,16 @@
 <!-- Filters -->
 <div class="card mb-6">
   <form method="get">
-    {% if current_scan %}<input type="hidden" name="scan" value="{{ current_scan }}">{% endif %}
     <div class="flex flex-col sm:flex-row gap-3">
+      <div class="flex-1">
+        <label for="filter-scan" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Scanned volume</label>
+        <select id="filter-scan" name="scan" class="input-text w-full" title="One scanned volume: the opinions of that scan alone">
+          <option value="">All volumes</option>
+          {% for value, label in scan_choices %}
+          <option value="{{ value }}" {% if current_scan == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
       <div class="flex-1">
         <label for="filter-reporter" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Reporter</label>
         <select id="filter-reporter" name="reporter" class="input-text w-full">
@@ -54,20 +62,42 @@
         </select>
       </div>
     </div>
-    <div class="flex items-center justify-between gap-2 mt-3">
-      <span class="text-xs text-gray-500 dark:text-gray-400 flex items-center gap-4">
+    <div class="flex flex-wrap items-center justify-between gap-3 mt-3">
+      <span class="text-xs text-gray-500 dark:text-gray-400 flex flex-wrap items-center gap-4">
         {% if current_scan %}<span>One volume only (scan #{{ current_scan }}).</span>{% endif %}
-        <label class="inline-flex items-center gap-1 cursor-pointer" title="Only the opinions whose approval waits on an open card">
+        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose approval waits on an open card">
           <input type="checkbox" name="blocking" value="1" {% if current_blocking %}checked{% endif %} class="rounded">
           Blocking only
         </label>
+        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose approval waits on no open card: warnings alone, or no card">
+          <input type="checkbox" name="non_blocking" value="1" {% if current_non_blocking %}checked{% endif %} class="rounded">
+          Non blocking only
+        </label>
+        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose text holds a picture">
+          <input type="checkbox" name="pictures" value="1" {% if current_pictures %}checked{% endif %} class="rounded">
+          With pictures
+        </label>
+        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose text holds no picture, a text not built yet included">
+          <input type="checkbox" name="no_pictures" value="1" {% if current_no_pictures %}checked{% endif %} class="rounded">
+          No pictures
+        </label>
+        <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Order by the count of the Warnings column; a list too long for the count is refused">
+          Sort
+          <select name="sort" class="input-text py-1 text-xs">
+            <option value="">Default order</option>
+            {% for value, label in sort_choices %}
+            <option value="{{ value }}" {% if current_sort == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </select>
+        </label>
       </span>
-      <div class="flex items-center gap-2">
+      <div class="flex flex-wrap items-center gap-2 ml-auto whitespace-nowrap">
         {% if blocking_review_url %}
         <a href="{{ blocking_review_url }}" class="btn-primary text-sm" title="Answer every open blocking card of this volume, one after the next"><i class="fa-solid fa-list-check"></i> Review all blocking</a>
         {% else %}
         <span class="btn-primary text-sm opacity-50 cursor-not-allowed" title="Filter to one scan or one volume first: the blocking review takes one volume at a time"><i class="fa-solid fa-list-check"></i> Review all blocking</span>
         {% endif %}
+        <a href="{% url 'opinion_card_review' %}" class="btn-outline text-sm" title="The open blocking cards of every volume, walked by reason; an answer is saved and applied later"><i class="fa-solid fa-layer-group"></i> Cards by reason</a>
         {% if warning_review_url %}
         <a href="{{ warning_review_url }}" class="btn-outline text-sm" title="Walk every open warning card of this volume, one after the next; a warning gates nothing"><i class="fa-solid fa-list-check"></i> Review all warnings</a>
         {% endif %}
@@ -145,7 +175,7 @@
 {% if page_obj.has_other_pages %}
 <nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
   {% if page_obj.has_previous %}
-  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}"
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">&laquo; Previous</a>
   {% endif %}
 
@@ -154,7 +184,7 @@
   </span>
 
   {% if page_obj.has_next %}
-  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}"
+  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">Next &raquo;</a>
   {% endif %}
 </nav>
@@ -168,4 +198,24 @@
   </p>
 </div>
 {% endif %}
+<script>
+  // The two switches of a pair name no opinion together, so checking
+  // one unchecks the other.
+  (function () {
+    [
+      ["blocking", "non_blocking"],
+      ["pictures", "no_pictures"],
+    ].forEach((names) => {
+      const pair = names.map((name) =>
+        document.querySelector('input[name="' + name + '"]'),
+      );
+      pair.forEach((box, i) => {
+        if (!box) return;
+        box.addEventListener("change", () => {
+          if (box.checked && pair[1 - i]) pair[1 - i].checked = false;
+        });
+      });
+    });
+  })();
+</script>
 {% endblock %}

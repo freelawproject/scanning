@@ -105,6 +105,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 renderInsertedPage(entry);
             }
         });
+        renderInsertedList();
     }
 
     function createPdfPlaceholder(entry) {
@@ -387,7 +388,9 @@ document.addEventListener('DOMContentLoaded', function () {
                 // stamped on this placeholder (issue #214). The printed
                 // number cannot place an image: front matter has none,
                 // and two pages can print the same one.
-                uploadPageInsert(entry, fileInput.files[0], pageDiv);
+                offerPageInsert(entry, fileInput.files[0], pageDiv);
+                // The same file chosen again must fire a change.
+                fileInput.value = '';
             }
         });
     }
@@ -396,10 +399,109 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = document.createElement('div');
         pageDiv.className = 'page-container inserted-page';
         pageDiv.id = 'page-' + entry.logical_number;
-        pageDiv.innerHTML = insertedPageHtml(entry.logical_number, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        // The row's own label, which the apply files the page under.
+        // The entry's number is the placeholder's where the row took
+        // one, and the two can differ.
+        var label = entry.insert_label || entry.logical_number;
+        pageDiv.innerHTML = insertedPageHtml(label, entry.insert_url, entry.insert_edit_id, entry.unplaced, entry.insert_kind, entry.insert_file_url);
+        describeInsert(pageDiv, label, entry.insert_edit_id, entry.insert_kind, entry.unplaced, entry.insert_anchor_pdf_page);
         bindRemoveInsert(pageDiv, entry.insert_edit_id);
         container.appendChild(pageDiv);
         drawInsertedPdf(pageDiv);
+    }
+
+    // What the sidebar's list of uploaded files reads off an inserted
+    // page: the label and the gap its row was filed under, its row,
+    // its kind. The gap is the row's ``anchor_pdf_page`` as the server
+    // stored it, never the page above the box: a moved page can stand
+    // between the two.
+    function describeInsert(pageDiv, label, editId, kind, unplaced, anchor) {
+        pageDiv.dataset.insertLabel = label === undefined || label === null ? '' : label;
+        pageDiv.dataset.insertEditId = editId || '';
+        pageDiv.dataset.insertKind = kind === 'pdf' ? 'pdf' : 'image';
+        pageDiv.dataset.insertAnchor = anchor === undefined || anchor === null ? '' : anchor;
+        if (unplaced) { pageDiv.dataset.insertUnplaced = '1'; }
+    }
+
+    // The sidebar's list of the uploaded files, in the order they
+    // stand, redrawn whole after every upload. The page list walks the
+    // original's pages alone, so without it an upload shows only at
+    // its own place in the viewer. Several files under one label in
+    // one gap are the parts of one span (#638): the label is the
+    // span's for each of them, so the row says which part it is.
+    function renderInsertedList() {
+        var section = document.getElementById('inserted-section');
+        var list = document.getElementById('inserted-list');
+        var count = document.getElementById('inserted-count');
+        if (!section || !list) { return; }
+        var rows = [];
+        container.querySelectorAll('.inserted-page').forEach(function (pageDiv) {
+            var row = {
+                page: pageDiv,
+                label: pageDiv.dataset.insertLabel || '',
+                kind: pageDiv.dataset.insertKind,
+                unplaced: pageDiv.dataset.insertUnplaced === '1',
+                after: pageDiv.dataset.insertAnchor,
+                part: 1,
+                parts: 1,
+            };
+            var before = rows[rows.length - 1];
+            var prior = pageDiv.previousElementSibling;
+            if (before && prior === before.page && before.label === row.label
+                    && before.after === row.after
+                    && !before.unplaced && !row.unplaced) {
+                row.part = before.part + 1;
+            }
+            rows.push(row);
+        });
+        for (var i = rows.length - 1; i >= 0; i--) {
+            var next = rows[i + 1];
+            rows[i].parts = next && next.part === rows[i].part + 1
+                ? next.parts : rows[i].part;
+        }
+        if (count) { count.textContent = rows.length; }
+        section.hidden = rows.length === 0;
+        list.textContent = '';
+        rows.forEach(function (row) {
+            var card = document.createElement('div');
+            card.className = 'inserted-card';
+            card.title = 'Show this file in the viewer';
+            var head = document.createElement('div');
+            head.className = 'inserted-card-head';
+            var label = document.createElement('span');
+            label.className = 'inserted-card-label';
+            // The label as it was filed, with the mark the page list
+            // gives a printed number. No "Page" or "Pages": which of
+            // the two a label is, is the server's rule to read.
+            label.textContent = row.label ? '#' + row.label : 'No page number';
+            head.appendChild(label);
+            var kind = document.createElement('span');
+            kind.className = 'inserted-card-kind';
+            kind.textContent = row.kind === 'pdf' ? 'PDF' : 'IMAGE';
+            head.appendChild(kind);
+            if (row.parts > 1) {
+                var part = document.createElement('span');
+                part.className = 'inserted-card-part';
+                part.textContent = 'file ' + row.part + ' of ' + row.parts;
+                head.appendChild(part);
+            }
+            card.appendChild(head);
+            var where = document.createElement('p');
+            where.className = 'inserted-card-where';
+            where.textContent = row.unplaced
+                ? 'This volume has no place for it'
+                : (row.after === '' ? ''
+                    : (row.after === '0' ? 'before PDF p. 1' : 'after PDF p. ' + row.after));
+            card.appendChild(where);
+            card.addEventListener('click', function () {
+                window.scrollPageIntoView(row.page);
+                row.page.classList.add('inserted-shown');
+                setTimeout(function () {
+                    row.page.classList.remove('inserted-shown');
+                }, 2000);
+            });
+            list.appendChild(card);
+        });
     }
 
     // A curator may upload a PDF of the page as well as an image
@@ -706,41 +808,40 @@ document.addEventListener('DOMContentLoaded', function () {
         var pageDiv = input.closest('.page-container');
         var btn = pageDiv.querySelector('.replace-btn');
         var pdfPage = parseInt(btn.dataset.pdfPage, 10);
-        uploadPageReplacement(pdfPage, input.files[0], pageDiv);
+        offerPageReplacement(pdfPage, input.files[0], pageDiv);
         input.value = '';
     });
 
-    function uploadPageReplacement(pdfPage, file, pageDiv) {
-        var formData = new FormData();
-        formData.append('pdf_page', pdfPage);
-        formData.append('image', file);
-        fetch('/scans/' + documentId + '/replace-page/', {
-            method: 'POST',
-            headers: { 'X-CSRFToken': csrfToken },
-            body: formData,
-        })
-        .then(function (r) {
-            return r.json().then(function (d) { return { ok: r.ok, data: d }; });
-        })
-        .then(function (res) {
-            if (!res.ok || res.data.status !== 'ok') {
-                showToast((res.data && res.data.error) ||
-                          'Could not replace this page.');
-                return;
-            }
-            markPageAsReplaced(pageDiv, pdfPage, {
-                url: res.data.file_url,
-                kind: res.data.kind,
-            });
-            markSidebarReplaced(pdfPage, true);
-            if (typeof window.refreshProcessActionBar === 'function') {
-                window.refreshProcessActionBar();
-            }
-            window.onPageEditSaved();
-        })
-        .catch(function () {
-            showToast('Could not replace this page. Try again.');
+    // The chosen file waits under the page's label until the curator
+    // sends it. The panel is outside the label, which markPageAsDeleted
+    // (shared.js) writes over.
+    function offerPageReplacement(pdfPage, file, pageDiv) {
+        var standing = pageDiv.querySelector('.upload-panel');
+        if (standing && standing.isBusy && standing.isBusy()) {
+            showToast('A file is still uploading for this page. ' +
+                      'Wait for it, or cancel it first.');
+            return;
+        }
+        if (standing) { standing.remove(); }
+        var panel = uploadPanel(file, {
+            url: '/scans/' + documentId + '/replace-page/',
+            fields: { pdf_page: pdfPage },
+            verb: 'Replace this page',
+            fallback: 'Could not replace this page.',
+            done: function (data) {
+                markPageAsReplaced(pageDiv, pdfPage, {
+                    url: data.file_url,
+                    kind: data.kind,
+                });
+                markSidebarReplaced(pdfPage, true);
+                if (typeof window.refreshProcessActionBar === 'function') {
+                    window.refreshProcessActionBar();
+                }
+                window.onPageEditSaved();
+            },
         });
+        var label = pageDiv.querySelector('.page-label');
+        pageDiv.insertBefore(panel, label ? label.nextSibling : pageDiv.firstChild);
     }
 
     // The note that says this page stands in for the scanned one. It
@@ -1326,43 +1427,255 @@ document.addEventListener('DOMContentLoaded', function () {
         });
     }
 
-    // --- Page insert upload ---
-    function uploadPageInsert(entry, file, pageDiv) {
-        var pageNumber = entry.logical_number;
-        var formData = new FormData();
-        formData.append('page_number', pageNumber);
-        formData.append('anchor_pdf_page', entry.anchor_pdf_page);
-        formData.append('image', file);
+    // --- Page uploads: choose, confirm, send with progress ---
+    // A page file can be a 100-page PDF of well over a hundred
+    // megabytes, and a choice that uploaded at once gave the curator no
+    // look at the name and no sign of life until the answer. So the
+    // two uploads of this step (the insert and the replacement) share
+    // one panel: the chosen file's name and size, a button that sends
+    // it, the share of it sent, and the wait while the server stores
+    // it. fetch reports no upload progress, so the send is an
+    // XMLHttpRequest; the request is the one fetch made.
+    var uploadsInFlight = 0;
+    window.addEventListener('beforeunload', function (e) {
+        if (uploadsInFlight > 0) {
+            e.preventDefault();
+            e.returnValue = '';
+        }
+    });
 
-        var placeholder = pageDiv.querySelector('.missing-placeholder');
-        if (placeholder) placeholder.innerHTML = '<p>Uploading...</p>';
+    function fileSize(bytes) {
+        if (bytes < 1024 * 1024) {
+            return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+        }
+        return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    }
 
-        fetch('/scans/' + documentId + '/insert/', {
-            method: 'POST',
-            headers: { 'X-CSRFToken': csrfToken },
-            body: formData,
-        })
-        .then(function (r) { return r.json(); })
-        .then(function (data) {
-            if (data.status !== 'ok') {
-                if (placeholder) {
-                    placeholder.innerHTML = '<p>' + escapeHtml(data.error || 'Upload failed. Try again.') + '</p>';
-                }
+    // A refusal comes as JSON with the reason, and the endpoint saved
+    // nothing. An answer that is not JSON is a proxy's or the login
+    // page's, and a connection can drop: once every byte is with the
+    // server, either may hide a file that was saved all the same, so
+    // on.fail is told whether the outcome is known (`saved`: false, or
+    // null for "nobody can say from here").
+    function sendPageFile(url, formData, on) {
+        var xhr = new XMLHttpRequest();
+        var over = false;
+        var delivered = false;
+        function end(call) {
+            if (over) { return; }
+            over = true;
+            uploadsInFlight -= 1;
+            call();
+        }
+        xhr.open('POST', url);
+        xhr.setRequestHeader('X-CSRFToken', csrfToken);
+        xhr.upload.onprogress = function (e) {
+            if (e.lengthComputable && e.total > 0) { on.progress(e.loaded / e.total); }
+        };
+        xhr.upload.onload = function () { delivered = true; on.sent(); };
+        xhr.onload = function () {
+            var data = null;
+            try { data = JSON.parse(xhr.responseText); } catch (err) { data = null; }
+            var ok = xhr.status >= 200 && xhr.status < 300;
+            if (ok && data && data.status === 'ok') {
+                end(function () { on.done(data); });
                 return;
             }
-            pageDiv.className = 'page-container inserted-page';
-            pageDiv.style.width = '';
-            pageDiv.innerHTML = insertedPageHtml(pageNumber, data.image_url, data.edit_id, false, data.kind, data.file_url);
-            bindRemoveInsert(pageDiv, data.edit_id);
-            drawInsertedPdf(pageDiv);
-            if (typeof window.refreshProcessActionBar === 'function') {
-                window.refreshProcessActionBar();
+            var reason = data && (data.error || data.message);
+            var refused = !!data;
+            if (!reason && xhr.status === 413) {
+                reason = 'This file is too large for the server.';
+                refused = true;
             }
-            window.onPageEditSaved();
-        })
-        .catch(function (err) {
-            if (placeholder) placeholder.innerHTML = '<p>Upload failed. Try again.</p>';
+            end(function () {
+                on.fail(reason || '', refused || !delivered ? false : null);
+            });
+        };
+        xhr.onerror = function () {
+            end(function () {
+                on.fail('The connection was lost.', delivered ? null : false);
+            });
+        };
+        xhr.onabort = function () { end(function () {}); };
+        uploadsInFlight += 1;
+        xhr.send(formData);
+        return xhr;
+    }
+
+    // Every node is built with textContent: a file's name is a
+    // person's typing.
+    function uploadPanel(file, opts) {
+        function node(tag, className, text) {
+            var el = document.createElement(tag);
+            el.className = className;
+            if (text) { el.textContent = text; }
+            if (tag === 'button') { el.type = 'button'; }
+            return el;
+        }
+        var panel = node('div', 'upload-panel');
+        var name = node('div', 'upload-file');
+        name.appendChild(node('span', 'upload-file-name', file.name));
+        name.appendChild(node('span', 'upload-file-size', fileSize(file.size)));
+        var bar = node('div', 'upload-bar');
+        var fill = node('div', 'upload-bar-fill');
+        bar.appendChild(fill);
+        bar.hidden = true;
+        var status = node('div', 'upload-status');
+        status.setAttribute('role', 'status');
+        var send = node('button', 'upload-send', opts.verb || 'Upload');
+        var cancel = node('button', 'upload-cancel', 'Cancel');
+        var actions = node('div', 'upload-actions');
+        actions.appendChild(send);
+        actions.appendChild(cancel);
+        panel.appendChild(name);
+        panel.appendChild(bar);
+        panel.appendChild(status);
+        panel.appendChild(actions);
+
+        var xhr = null;
+        var reload = null;
+        function close() {
+            panel.remove();
+            if (opts.closed) { opts.closed(); }
+        }
+        // A panel whose file is on its way, or with the server, is not
+        // one to write over: taking the node away stops no request.
+        panel.isBusy = function () { return xhr !== null; };
+        function start() {
+            var formData = new FormData();
+            Object.keys(opts.fields || {}).forEach(function (key) {
+                formData.append(key, opts.fields[key]);
+            });
+            formData.append('image', file);
+            panel.classList.remove('upload-failed');
+            send.hidden = true;
+            bar.hidden = false;
+            fill.style.width = '0%';
+            status.textContent = 'Uploading… 0%';
+            xhr = sendPageFile(opts.url, formData, {
+                progress: function (share) {
+                    var percent = Math.min(100, Math.floor(share * 100));
+                    fill.style.width = percent + '%';
+                    status.textContent = 'Uploading… ' + percent + '%';
+                },
+                // The bytes are with the server, which still counts the
+                // pages and stores the file. Nothing here can stop that,
+                // so the panel offers no Cancel while it waits.
+                sent: function () {
+                    fill.style.width = '100%';
+                    panel.classList.add('upload-saving');
+                    status.textContent = 'Sent. The server is saving the file…';
+                    cancel.hidden = true;
+                },
+                done: function (data) {
+                    xhr = null;
+                    close();
+                    opts.done(data);
+                },
+                fail: function (reason, saved) {
+                    xhr = null;
+                    panel.classList.remove('upload-saving');
+                    panel.classList.add('upload-failed');
+                    bar.hidden = true;
+                    cancel.hidden = false;
+                    if (saved === null) {
+                        // The whole file reached the server and no
+                        // answer came back. It may be saved, and a
+                        // second send would store the pages twice, so
+                        // the way on is a look at the page, never a
+                        // resend.
+                        status.textContent = (reason ||
+                            'The server gave no answer.') +
+                            ' The file may be saved all the same. Reload ' +
+                            'the page to see before you send it again.';
+                        reload = node('button', 'upload-send', 'Reload the page');
+                        reload.addEventListener('click', function () {
+                            window.location.reload();
+                        });
+                        actions.insertBefore(reload, cancel);
+                        cancel.textContent = 'Close';
+                        return;
+                    }
+                    status.textContent = (reason ||
+                        opts.fallback || 'The upload failed.') + ' Nothing was saved.';
+                    send.textContent = 'Try again';
+                    send.hidden = false;
+                },
+            });
+        }
+        send.addEventListener('click', start);
+        cancel.addEventListener('click', function () {
+            if (xhr) {
+                var sending = xhr;
+                xhr = null;
+                sending.abort();
+            }
+            close();
         });
+        return panel;
+    }
+
+    // --- Page insert upload ---
+    function offerPageInsert(entry, file, pageDiv) {
+        var placeholder = pageDiv.querySelector('.missing-placeholder');
+        var form = pageDiv.querySelector('.insert-form');
+        if (!placeholder || !form) { return; }
+        var saved = placeholder.querySelector('.upload-saved');
+        if (saved) { saved.remove(); }
+        form.hidden = true;
+        var panel = uploadPanel(file, {
+            url: '/scans/' + documentId + '/insert/',
+            fields: {
+                page_number: entry.logical_number,
+                anchor_pdf_page: entry.anchor_pdf_page,
+            },
+            verb: 'Upload',
+            fallback: 'The upload failed.',
+            closed: function () { form.hidden = false; },
+            done: function (data) { showInsertedPage(entry, file, pageDiv, data); },
+        });
+        placeholder.insertBefore(panel, form.nextSibling);
+    }
+
+    // A one-page gap is filled by its upload, so the card becomes the
+    // page. A range may come as several files, one after another under
+    // the card's label (#638), so that card stays, the new file goes in
+    // above it where a reload draws it, and the form takes the next.
+    function showInsertedPage(entry, file, pageDiv, data) {
+        var pageNumber = entry.logical_number;
+        var keepCard = !!entry.missing_range;
+        var inserted = pageDiv;
+        if (keepCard) {
+            inserted = document.createElement('div');
+            inserted.id = 'page-' + pageNumber;
+            container.insertBefore(inserted, pageDiv);
+        }
+        inserted.className = 'page-container inserted-page';
+        inserted.style.width = '';
+        // The label and the gap as the server saved them (it narrows
+        // the label and folds its dash), so a row drawn now and the
+        // same row after a reload read alike.
+        var saved = data.page_number || pageNumber;
+        var anchor = data.anchor_pdf_page !== undefined
+            ? data.anchor_pdf_page : entry.anchor_pdf_page;
+        inserted.innerHTML = insertedPageHtml(saved, data.image_url, data.edit_id, false, data.kind, data.file_url);
+        describeInsert(inserted, saved, data.edit_id, data.kind, false, anchor);
+        bindRemoveInsert(inserted, data.edit_id);
+        drawInsertedPdf(inserted);
+        renderInsertedList();
+        if (keepCard) {
+            var placeholder = pageDiv.querySelector('.missing-placeholder');
+            var form = pageDiv.querySelector('.insert-form');
+            var note = document.createElement('p');
+            note.className = 'upload-saved';
+            note.textContent = 'Saved: ' + file.name + '. If the pages come in ' +
+                'several files, choose the next one, in page order.';
+            placeholder.insertBefore(note, form);
+        }
+        if (typeof window.refreshProcessActionBar === 'function') {
+            window.refreshProcessActionBar();
+        }
+        window.onPageEditSaved();
     }
 
     // --- Show duplicate pages side by side in a modal ---

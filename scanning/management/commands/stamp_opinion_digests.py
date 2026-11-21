@@ -17,6 +17,11 @@ stand would call those edits built; its next approval stamps it. A row
 whose boundary is gone or that sits in another run's space is left for
 that creation too.
 
+Only a blank digest is written. A row that carries a digest of other
+inputs, or of an older ``opinions.DIGEST_RULES``, owes a rebuild at its
+volume's next approval, and a stamp over it would cancel that rebuild:
+the rules are raised so that every opinion is built again.
+
 Examples:
 
     docker exec scanning-daemon python manage.py stamp_opinion_digests \\
@@ -99,7 +104,7 @@ class Command(BaseCommand):
                 continue
             lookup = opinions.printed_lookup(printed)
             scan_rows = opinions.read_rows(scan, run)
-            stamped = current = skipped = 0
+            stamped = current = skipped = stale = 0
             for opinion in rows:
                 if opinion.boundary is None or opinion.apply_run_id != run.pk:
                     skipped += 1
@@ -110,6 +115,12 @@ class Command(BaseCommand):
                 if opinion.input_digest == digest:
                     current += 1
                     continue
+                if opinion.input_digest:
+                    # A digest of other inputs or of an older
+                    # ``DIGEST_RULES``: the row owes a rebuild, and a
+                    # stamp here would cancel it.
+                    stale += 1
+                    continue
                 stamped += 1
                 if not dry_run:
                     Opinion.objects.filter(pk=opinion.pk).update(
@@ -118,7 +129,8 @@ class Command(BaseCommand):
             verb = "would stamp" if dry_run else "stamped"
             self.stdout.write(
                 f"scan {scan.pk}: {verb} {stamped}, {current} current, "
-                f"{skipped} skipped (no boundary or another run)"
+                f"{stale} left for the next approval (a digest of other "
+                f"inputs), {skipped} skipped (no boundary or another run)"
             )
             total_stamped += stamped
             total_current += current

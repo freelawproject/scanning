@@ -289,6 +289,20 @@ class TestSubmitPending(ScanningTestCase):
             self.assertEqual(job.provider_meta["output"], {"pages": 10})
             self.assertEqual(job.provider_meta["confirmed_by"], "response")
 
+    def test_a_wave_leaves_the_volumes_caches_on_disk(self):
+        """No query of a submit wave reads a cache column of the scan
+        (#582), the slice's join or a submit that loads one later."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        with CaptureQueriesContext(connection) as captured:
+            summary, _ = self._summary(return_value={"pages": 10})
+
+        self.assertEqual(summary.submitted, 3)
+        self.assertEqual(large_scan_columns(captured), [])
+
     def test_each_row_gets_its_own_attempt_scoped_result_key(self):
         self._summary(return_value={"pages": 10})
 
@@ -602,6 +616,79 @@ class TestApplyRowsGoFirst(ScanningTestCase):
                 self.assertTrue(self._sent(apply_row))
                 self.assertFalse(self._sent(volume))
 
+    def test_the_slice_ranks_ids_before_it_joins(self):
+        """The rank reads the job table alone, and the joins touch the
+        rows the wave keeps. Ranked with the joins in place, every
+        pending row of the engine was joined to its scan and sorted,
+        six times every five seconds (2026-11-02)."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        scan = ScanFactory()
+        volume = jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        apply_row = self._apply_row(
+            scan, JobStage.CONVERT, JobEngine.BITONAL, JobProvider.DOCTOR
+        )
+        queryset = ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        )
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs._pending_slice(queryset, 2)
+        self.assertEqual(
+            [row.pk for row in rows], [apply_row.pk, min(r.pk for r in volume)]
+        )
+        self.assertEqual(len(captured), 2)
+        self.assertNotIn('"scanning_scan"', captured[0]["sql"])
+        self.assertIn('"scanning_scan"', captured[1]["sql"])
+        # Both reads ask for PENDING: the claim swaps on the status it
+        # read, so a row another writer moved between the two queries
+        # must not come back at all.
+        for query in captured:
+            self.assertIn("'pending'", query["sql"])
+        # The rows carry their joins: the claim reads the apply run's
+        # number and the scan without another query.
+        with self.assertNumQueries(0):
+            self.assertEqual(rows[0].apply_run.scan_id, scan.pk)
+            self.assertEqual(rows[1].scan.reporter.pk, scan.reporter.pk)
+        self.assertEqual(jobs._pending_slice(queryset.none(), 2), [])
+
+    def test_the_slice_leaves_the_volumes_caches_on_disk(self):
+        """The join read the scan's OCR cache once per row of the wave
+        (#582), and no submit reads one."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.models import Scan
+        from scanning.tests.test_views import large_scan_columns
+
+        scan = ScanFactory()
+        jobs.ensure_convert_jobs(scan, make_manifest(shard_count=3))
+        queryset = ExternalJob.objects.filter(
+            provider=JobProvider.DOCTOR, stage=JobStage.CONVERT
+        )
+        with CaptureQueriesContext(connection) as captured:
+            rows = jobs._pending_slice(queryset, 3)
+
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(large_scan_columns(captured), [])
+        for row in rows:
+            self.assertLessEqual(
+                set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+            )
+
+    def test_the_polls_have_their_indexes(self):
+        """The wave's slice and the two sweeps' probes read an index,
+        never the table (the 2026-11-02 outage)."""
+        names = {index.name for index in ExternalJob._meta.indexes}
+        self.assertLessEqual(
+            {
+                "idx_job_pending_wave",
+                "idx_job_detect_probe",
+                "idx_job_analyze_probe",
+            },
+            names,
+        )
+
     def test_two_apply_rows_keep_the_creation_order(self):
         """The id stays the second key: one class drains fairly."""
         scan = ScanFactory()
@@ -800,6 +887,55 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(self.job.status, JobStatus.SUBMITTED)
         self.assertEqual(self.job.attempt, 1)
 
+    def test_a_sweep_named_for_a_provider_judges_its_rows_alone(self):
+        """One sweep per provider: RunPod's pass leaves the doctor row
+        untouched and runs no Mistral leftover pass; doctor's pass
+        takes it. The daemon's own pass, with no name, judges all."""
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 0)
+        self.assertEqual(self.job.status, JobStatus.SUBMITTED)
+        self.assertIsNone(self.job.last_polled_at)
+        leftover.assert_not_called()
+
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            patch("scanning.mistral_ocr.delete_leftover_files") as leftover,
+        ):
+            summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        self.job.refresh_from_db()
+        self.assertEqual(summary.completed, 1)
+        self.assertEqual(self.job.status, JobStatus.COMPLETED)
+        leftover.assert_not_called()
+
+        with patch("scanning.mistral_ocr.delete_leftover_files") as leftover:
+            jobs.sweep_jobs(providers=(JobProvider.MISTRAL,))
+        leftover.assert_called_once()
+
+    def test_a_stranded_row_is_written_off_by_its_own_provider_alone(self):
+        stranded = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=stranded.pk).update(
+            deadline=timezone.now() - timedelta(seconds=1)
+        )
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            jobs.sweep_jobs(providers=(JobProvider.RUNPOD,))
+        stranded.refresh_from_db()
+        self.assertEqual(stranded.status, JobStatus.PENDING)
+
+        with patch("scanning.s3_sync.object_exists", return_value=False):
+            with self.assertLogs("scanning.jobs", level="ERROR"):
+                summary = jobs.sweep_jobs(providers=(JobProvider.DOCTOR,))
+        stranded.refresh_from_db()
+        self.assertEqual(summary.failed, 1)
+        self.assertEqual(stranded.status, JobStatus.FAILED)
+
     def test_a_pending_row_past_its_stamped_ceiling_is_written_off(self):
         """A row an endpoint kept declining must still end.
 
@@ -822,6 +958,56 @@ class TestSweepJobs(ScanningTestCase):
         self.assertEqual(summary.failed, 1)
         self.assertEqual(stranded.status, JobStatus.FAILED)
         self.assertEqual(stranded.error_code, "QUEUE_TIMEOUT")
+
+    def test_the_sweep_leaves_the_volumes_caches_on_disk(self):
+        """Every in-flight row was joined to its scan's OCR cache, on
+        every tick of every provider's sweep (#582). No query of a
+        sweep reads a cache column: not the join, and not a reader that
+        loads the deferred field row by row, waiting or completing."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        shards = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=3)
+        )
+        now = timezone.now()
+        for job in shards:
+            ExternalJob.objects.filter(pk=job.pk).update(
+                status=JobStatus.SUBMITTED,
+                result_key=f"processing/jobs/convert/bitonal/{job.pk}.pdf",
+                submitted_at=now,
+                deadline=now + timedelta(seconds=900),
+            )
+        stranded = jobs.ensure_convert_jobs(
+            ScanFactory(), make_manifest(shard_count=1)
+        )[0]
+        ExternalJob.objects.filter(pk=stranded.pk).update(
+            deadline=now - timedelta(seconds=1)
+        )
+
+        # Nothing landed yet: every row waits, and the stranded one is
+        # written off.
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=False),
+            self.assertLogs("scanning.jobs", level="ERROR"),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            summary = jobs.sweep_jobs()
+        self.assertEqual(large_scan_columns(captured), [])
+        self.assertEqual(summary.pending, 4)
+        self.assertEqual(summary.failed, 1)
+
+        # Every result landed: every row completes, polled again once
+        # its interval is out and inside its deadline.
+        with (
+            patch("scanning.s3_sync.object_exists", return_value=True),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            summary = jobs.sweep_jobs(now=now + timedelta(seconds=600))
+        self.assertEqual(large_scan_columns(captured), [])
+        self.assertEqual(summary.completed, 4)
 
 
 class TestVolumeResultKey(ScanningTestCase):
@@ -1443,3 +1629,50 @@ class TestDurationLogging(ScanningTestCase):
             self.assertFalse(jobs._complete(job, None, timezone.now()))
 
         self.assertNotIn("completed in", "\n".join(logs.output))
+
+
+class TestSwapProviderMeta(ScanningTestCase):
+    """A ledger write never erases what another pass wrote beside it
+    (#503)."""
+
+    def setUp(self):
+        super().setUp()
+        self.scan = ScanFactory()
+        self.row = ExternalJobFactory(
+            scan=self.scan, provider_meta={"glue": {"attempts": 1}}
+        )
+
+    def test_a_key_is_changed_and_the_others_kept(self):
+        jobs.swap_provider_meta(self.row, lambda m: m.update(apply={"a": 1}))
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "apply": {"a": 1}},
+        )
+
+    def test_a_write_that_lands_between_the_read_and_the_swap_survives(self):
+        """The first swap loses, the second reads the other's write."""
+        rival_written = []
+
+        def rival_then_mine(meta):
+            if not rival_written:
+                ExternalJob.objects.filter(pk=self.row.pk).update(
+                    provider_meta={"glue": {"attempts": 1}, "rival": True}
+                )
+                rival_written.append(True)
+            meta["mine"] = True
+
+        jobs.swap_provider_meta(self.row, rival_then_mine)
+        self.row.refresh_from_db()
+        self.assertEqual(
+            self.row.provider_meta,
+            {"glue": {"attempts": 1}, "rival": True, "mine": True},
+        )
+
+    def test_the_run_ledger_counts_through_the_swap(self):
+        attempts, head = jobs.bump_run_ledger(
+            [self.row], "glue", RuntimeError("boom")
+        )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(head.provider_meta["glue"]["attempts"], 2)
+        self.assertEqual(head.provider_meta["glue"]["last_error"], "boom")

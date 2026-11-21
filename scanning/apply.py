@@ -52,7 +52,7 @@ import fitz
 from django.db import transaction
 from django.utils import timezone
 
-from scanning import page_edits, s3_sync
+from scanning import page_edits, s3_sync, tasks
 from scanning.models import (
     DEAD_JOB_STATUSES,
     IN_FLIGHT_JOB_STATUSES,
@@ -733,11 +733,19 @@ def latest_run(scan: Scan) -> ApplyRun | None:
     :returns: The run with the highest number, or None.
     :rtype: ApplyRun | None
     """
-    return scan.apply_runs.order_by("-number").first()
+    return (
+        scan.apply_runs.defer(*ApplyRun.LARGE_FIELDS)
+        .order_by("-number")
+        .first()
+    )
 
 
 def current_run(scan: Scan) -> ApplyRun | None:
     """Return the scan's newest apply run that still stands.
+
+    The page map stays on disk (#588): the tick checks call this per
+    waiting scan, every tick, and read the run's keys and stamps alone.
+    A reader of ``page_map`` loads it on access.
 
     :param scan: The scan.
     :returns: The newest run without ``superseded_at``, or None.
@@ -745,6 +753,7 @@ def current_run(scan: Scan) -> ApplyRun | None:
     """
     return (
         scan.apply_runs.filter(superseded_at__isnull=True)
+        .defer(*ApplyRun.LARGE_FIELDS)
         .order_by("-number")
         .first()
     )
@@ -1664,13 +1673,17 @@ def _note_dead_rows() -> int:
     """
     noted = 0
     blocking = list(GLUE_STAGES.values())
-    runs = ApplyRun.objects.filter(
-        superseded_at__isnull=True,
-        built_at__isnull=False,
-        dead_row_noted_at__isnull=True,
-        jobs__status__in=DEAD_JOB_STATUSES,
-        jobs__stage__in=blocking,
-    ).distinct()
+    runs = (
+        ApplyRun.objects.filter(
+            superseded_at__isnull=True,
+            built_at__isnull=False,
+            dead_row_noted_at__isnull=True,
+            jobs__status__in=DEAD_JOB_STATUSES,
+            jobs__stage__in=blocking,
+        )
+        .defer(*ApplyRun.LARGE_FIELDS)
+        .distinct()
+    )
     for run in runs:
         dead = (
             run.jobs.filter(status__in=DEAD_JOB_STATUSES, stage__in=blocking)
@@ -1748,6 +1761,8 @@ def queue_ready_scans() -> int:
     for scan in (
         Scan.objects.filter(pk__in=candidates, status=APPLY_STATUS)
         .select_related("reporter")
+        # The caches stay on disk (#582): the queue reads none of them.
+        .defer(*Scan.large_fields())
         .order_by("-pk")
     ):
         if queued >= room:
@@ -1773,6 +1788,7 @@ def queue_ready_scans() -> int:
         if claimed:
             logger.info("apply: scan %s: queued the %s phase", scan.pk, phase)
             queued += claimed
+            tasks.dispatch_scan(scan.pk, QueuedAction.APPLY_PAGE_EDITS)
     return queued
 
 
@@ -2279,9 +2295,22 @@ def printed_pages(
     documents filling the blanks, #351), overlaid with the curator's
     decisions: a ``SET_NUMBER`` row lands on the slot its original
     page holds (a replaced or rotated page included), and an inserted
-    page carries the label its row was uploaded under. The curator
-    outranks the model. Citations use printed pages, so this map is a
-    product of the apply, not review scaffolding.
+    page carries the label its row was uploaded under. A file of many
+    pages filed under a range is the one exception: that label is the
+    span the file fills (a 260-page insert under ``1125-1381``), not
+    any page's number, and a range stamped on every page keys every
+    opinion on them at the range's end. Those pages keep the model's
+    reading of each, and a page the model read no number on takes its
+    place in the range (the start plus its place among the pages
+    inserted in that gap under that label, ``by`` ``"label"``), so no
+    inserted page is left with no number, which would refuse an
+    opinion starting on it. The span may arrive as several files, one
+    upload after another under the one label of the placeholder, so
+    the place counts the files before it too. A one-page insert keeps
+    its label whatever its shape: a compressed opinion page filed
+    under ``913-925`` prints that range. The curator outranks the
+    model. Citations use printed pages, so this map is a product of
+    the apply, not review scaffolding.
 
     :param scan: The scan.
     :param run: The built run.
@@ -2323,18 +2352,33 @@ def printed_pages(
         final = slots.get(edit.pdf_page)
         if final is not None:
             curator(by_final_out[final], edit.value)
-    for page in pages:
+    inserted = [
+        page
+        for page in pages
+        if page["source"]["kind"] == "edit"
+        and page["source"]["edit_kind"] == str(PageEdit.Kind.INSERT_PAGE)
+    ]
+    labels = {
+        pk: page_numbers.fold_dashes(label or "")
+        for pk, label in PageEdit.objects.filter(
+            pk__in={page["source"]["edit_id"] for page in inserted}
+        ).values_list("pk", "logical_page")
+    }
+    places = _places_under_label(inserted, labels)
+    for page in inserted:
         src = page["source"]
-        if src["kind"] == "edit" and src["edit_kind"] == str(
-            PageEdit.Kind.INSERT_PAGE
-        ):
-            label = (
-                PageEdit.objects.filter(pk=src["edit_id"])
-                .values_list("logical_page", flat=True)
-                .first()
-            )
-            if label:
-                curator(page, label)
+        label = labels.get(src["edit_id"]) or ""
+        if not label:
+            continue
+        place, filed = places[page["final_page"]]
+        if filed == 1 or page_numbers.number_type(label) != page_numbers.RANGE:
+            curator(page, label)
+        elif not page["printed"]:
+            start = _range_start(label)
+            if start is not None:
+                page["printed"] = str(start + place)
+                page["type"] = page_numbers.SINGLE
+                page["by"] = "label"
     return {
         "schema_version": MAP_SCHEMA_VERSION,
         "scan_pk": scan.pk,
@@ -2870,6 +2914,58 @@ def load_printed_pages(scan: Scan, run: ApplyRun) -> dict:
             f"not a printed-page map"
         )
     return document
+
+
+def _places_under_label(
+    inserted: list[dict], labels: dict[int, str]
+) -> dict[int, tuple[int, int]]:
+    """Where each inserted page stands among the pages filed in its
+    gap under its label.
+
+    A span of missing pages may be uploaded as several files, each
+    under the one label of the placeholder. They are one filing: a
+    page's place counts the pages of the files before it, or an
+    unread page of the second file takes a number of the first.
+
+    A filing is a run of inserted pages that follow one another in
+    the corrected volume under one label. The gap is read off the
+    final pages and never off ``reference_pdf_page``, which is the
+    same page for the gap before page 1 and the gap after it.
+
+    :param inserted: The inserted pages of the printed-page map, in
+        final order.
+    :param labels: The folded label of each insert, by edit pk.
+    :returns: ``{final_page: (place, pages filed)}``, the place
+        counted from zero.
+    """
+    filings: list[list[int]] = []
+    before = None
+    for page in inserted:
+        final = page["final_page"]
+        label = labels.get(page["source"]["edit_id"])
+        if before == (final - 1, label):
+            filings[-1].append(final)
+        else:
+            filings.append([final])
+        before = (final, label)
+    return {
+        final: (place, len(finals))
+        for finals in filings
+        for place, final in enumerate(finals)
+    }
+
+
+def _range_start(label: str) -> int | None:
+    """Return the first number of a range label, or None.
+
+    :param label: A label ``number_type`` read as a range.
+    :returns: The start, or None when it is not a number.
+    :rtype: int | None
+    """
+    try:
+        return int(label.split("-", 1)[0].strip())
+    except ValueError:
+        return None
 
 
 def printed_numbers(printed: dict) -> dict[int, str]:

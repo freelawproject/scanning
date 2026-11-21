@@ -12,11 +12,14 @@ dependencies = [
 
     # Inference. The `detect` extra adds ultralytics and
     # huggingface_hub; base blackletter brings numpy, opencv-python,
-    # pillow, pymupdf and ocrmypdf. 0.3.1 is the floor: 0.3.0 carries
+    # pillow, pymupdf and ocrmypdf. 0.4.5 is the floor: 0.3.0 carries
     # the bl_warm adapter, the bl_warm entry in the Hugging Face weight
-    # table, and its confidence gates (blackletter #73); 0.3.1 keeps
-    # the app and the worker on one release (blackletter #75).
-    "blackletter[detect]>=0.3.1",
+    # table, and its confidence gates (blackletter #73); 0.4.5 adds the
+    # bl_hein entry to that table, counts it in the bl-warm family for
+    # the gates and trusts its captions and key icons in the merge
+    # (blackletter #90, scanning #628). The Dockerfile bakes both
+    # weights, so an older release fails the build at ensure_weights.
+    "blackletter[detect]>=0.4.5",
 
     # RunPod plumbing
     "requests>=2.33,<3",

@@ -6,7 +6,7 @@ carries its own status. So the PDF is one pass over the rows and not a
 schedule (``build_opinion_pdfs``, last in ``run_daemon``), the tick
 finds one row that owes its PDF, writes it, and stamps the row. One PDF
 per tick (:data:`PDFS_PER_TICK`), the rule of the Mistral wave
-(``mistral_ocr.MAX_SUBMITS_PER_TICK``), because the tick blocks the
+(``mistral_ocr.submits_per_tick``), because the tick blocks the
 serial scheduler for the whole write, and every other task
 (``process_next_scan``, the two job waves) waits for it. After the
 pulls that is a second or two of re-encoding. The first tick of a
@@ -99,6 +99,9 @@ from django.utils import timezone
 
 from scanning import apply, boundaries, review_states, s3_sync, sharding
 from scanning.models import (
+    OPINION_PASS_ORDER,
+    OPINION_PDF_MAX_ATTEMPTS,
+    OPINION_PDF_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -115,7 +118,7 @@ logger = logging.getLogger(__name__)
 PDFS_PER_TICK = 1
 
 #: Counted faults a row may spend at one revision before it is ``ERROR``.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_PDF_MAX_ATTEMPTS
 
 #: The scan statuses whose rows the pass writes. One value today: the
 #: approval of review 2 wrote the rows. Review 3 (#334) moves a scan
@@ -269,13 +272,12 @@ def owed() -> QuerySet:
     """
     return (
         Opinion.objects.filter(
-            scan__status__in=OPINION_PDF_STATUSES,
-            pdf_attempts__lt=MAX_ATTEMPTS,
+            OPINION_PDF_OWED, scan__status__in=OPINION_PDF_STATUSES
         )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .exclude(redacted_pdf_revision=F("glue_revision"))
         .select_related("scan", "scan__reporter", "boundary")
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
+        # The scan's caches stay on disk (#582): the PDF reads none.
+        .defer(*Scan.large_fields("scan__"))
+        .order_by(*OPINION_PASS_ORDER)
     )
 
 
@@ -1097,7 +1099,7 @@ def release_mirrors() -> int:
     removed = 0
     for scan in Scan.objects.filter(
         pk__in=pks, status__in=OPINION_PDF_STATUSES
-    ):
+    ).defer(*Scan.large_fields()):
         if s3_sync.release_local_processing(scan):
             removed += 1
     if removed:

@@ -71,6 +71,16 @@ class Command(BaseCommand):
         :return: None.
         """
         parser.add_argument(
+            "--no-uploads",
+            action="store_true",
+            help="Sweep the processing directories only (#503: a per-pod task).",
+        )
+        parser.add_argument(
+            "--uploads-only",
+            action="store_true",
+            help="Sweep the abandoned uploads only (#503: the one locked task).",
+        )
+        parser.add_argument(
             "--ttl-hours",
             type=float,
             default=None,
@@ -89,8 +99,13 @@ class Command(BaseCommand):
         """
         # DB cleanup of abandoned direct-to-S3 uploads runs in every
         # environment (it's independent of the /tmp/ sweep below, which
-        # is a DEVELOPMENT no-op).
-        self._sweep_pending_uploads()
+        # is a DEVELOPMENT no-op). Under Celery the two halves are two
+        # tasks (#503): the uploads once, under a lock, the /tmp sweep
+        # once per pod.
+        if not options.get("no_uploads"):
+            self._sweep_pending_uploads()
+        if options.get("uploads_only"):
+            return
 
         if settings.DEVELOPMENT:
             self.stdout.write(

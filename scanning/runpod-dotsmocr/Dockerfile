@@ -116,7 +116,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # glue, which repairs the results already in the bucket, and one arm
 # that drifted between the two would repair a page differently
 # depending on which side read it.
-COPY runpod_common.py layout_json.py runpod-dotsmocr/handler.py ./
+COPY runpod_common.py layout_json.py perpendiculars.py runpod-dotsmocr/handler.py ./
 
 # The base image's entrypoint launches the vLLM API server directly;
 # this worker instead boots the RunPod handler, which spawns and
