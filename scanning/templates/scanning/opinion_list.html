@@ -33,8 +33,12 @@
         <label for="filter-scan" class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Scanned volume</label>
         <select id="filter-scan" name="scan" class="input-text w-full" title="One scanned volume: the opinions of that scan alone">
           <option value="">All volumes</option>
-          {% for value, label in scan_choices %}
-          <option value="{{ value }}" {% if current_scan == value %}selected{% endif %}>{{ label }}</option>
+          {% for reporter, volumes in scan_choices %}
+          <optgroup label="{{ reporter }}">
+            {% for value, label in volumes %}
+            <option value="{{ value }}" {% if current_scan == value %}selected{% endif %}>{{ label }}</option>
+            {% endfor %}
+          </optgroup>
           {% endfor %}
         </select>
       </div>
@@ -65,21 +69,29 @@
     <div class="flex flex-wrap items-center justify-between gap-3 mt-3">
       <span class="text-xs text-gray-500 dark:text-gray-400 flex flex-wrap items-center gap-4">
         {% if current_scan %}<span>One volume only (scan #{{ current_scan }}).</span>{% endif %}
-        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose approval waits on an open card">
-          <input type="checkbox" name="blocking" value="1" {% if current_blocking %}checked{% endif %} class="rounded">
-          Blocking only
+        <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Blocking: the approval waits on an open card. Non blocking: warnings alone, or no card">
+          Cards
+          <select name="blocking" class="input-text py-1 text-xs">
+            <option value="" {% if not current_blocking and not current_non_blocking %}selected{% endif %}>All</option>
+            <option value="1" {% if current_blocking %}selected{% endif %}>Blocking</option>
+            <option value="0" {% if current_non_blocking %}selected{% endif %}>Non blocking</option>
+          </select>
         </label>
-        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose approval waits on no open card: warnings alone, or no card">
-          <input type="checkbox" name="non_blocking" value="1" {% if current_non_blocking %}checked{% endif %} class="rounded">
-          Non blocking only
+        <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Whether the opinion's text holds a picture; no pictures includes a text not built yet">
+          Pictures
+          <select name="pictures" class="input-text py-1 text-xs">
+            <option value="" {% if not current_pictures and not current_no_pictures %}selected{% endif %}>All</option>
+            <option value="1" {% if current_pictures %}selected{% endif %}>With pictures</option>
+            <option value="0" {% if current_no_pictures %}selected{% endif %}>No pictures</option>
+          </select>
         </label>
-        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose text holds a picture">
-          <input type="checkbox" name="pictures" value="1" {% if current_pictures %}checked{% endif %} class="rounded">
-          With pictures
-        </label>
-        <label class="inline-flex items-center gap-1 whitespace-nowrap cursor-pointer" title="Only the opinions whose text holds no picture, a text not built yet included">
-          <input type="checkbox" name="no_pictures" value="1" {% if current_no_pictures %}checked{% endif %} class="rounded">
-          No pictures
+        <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Tagged: the tagger's spans are over the text approved now. Not tagged: every other opinion, not approved yet included (pick Text review done in the status to see the approved ones)">
+          Tags
+          <select name="tagged" class="input-text py-1 text-xs">
+            <option value="" {% if not current_tagged and not current_untagged %}selected{% endif %}>All</option>
+            <option value="1" {% if current_tagged %}selected{% endif %}>Tagged</option>
+            <option value="0" {% if current_untagged %}selected{% endif %}>Not tagged</option>
+          </select>
         </label>
         <label class="inline-flex items-center gap-1 whitespace-nowrap" title="Order by the count of the Warnings column; a list too long for the count is refused">
           Sort
@@ -109,23 +121,23 @@
 </div>
 
 {% if page_obj %}
-<div class="card overflow-hidden p-0">
+<div class="card overflow-x-auto p-0">
   <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">
     <thead class="bg-gray-50 dark:bg-gray-800">
       <tr>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Citation</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volume</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Printed pages</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Warnings</th>
-        <th class="px-4 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider" title="The IMAGE boxes of the redaction review in this opinion's pages">Pictures</th>
-        <th class="px-4 py-3"></th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Citation</th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Volume</th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Printed pages</th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Status</th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Warnings</th>
+        <th class="px-3 py-2 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider" title="The IMAGE boxes of the redaction review in this opinion's pages">Pictures</th>
+        <th class="px-3 py-2"></th>
       </tr>
     </thead>
     <tbody class="divide-y divide-gray-200 dark:divide-gray-700">
       {% for opinion in page_obj %}
       <tr class="hover:bg-gray-50 dark:hover:bg-gray-800/50">
-        <td class="px-4 py-3 whitespace-nowrap">
+        <td class="px-3 py-2 whitespace-nowrap">
           {% comment %}
             The filters ride on the link, so the review page's back
             link opens the list the reviewer left, not the corpus.
@@ -135,19 +147,19 @@
           </a>
           {% if opinion.index_in_page %}<span class="text-xs text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }})</span>{% endif %}
         </td>
-        <td class="px-4 py-3 text-sm whitespace-nowrap">
+        <td class="px-3 py-2 text-sm whitespace-nowrap">
           <a href="{% url 'scan_process' pk=opinion.scan.pk %}" class="text-blue-600 dark:text-blue-400 hover:underline">
             {{ opinion.scan.reporter.short_name|upper }} vol. {{ opinion.scan.volume }}
           </a>
         </td>
-        <td class="px-4 py-3 text-sm whitespace-nowrap">
+        <td class="px-3 py-2 text-sm whitespace-nowrap">
           {{ opinion.first_printed_page }}{% if opinion.last_printed_page != opinion.first_printed_page %} &ndash; {{ opinion.last_printed_page }}{% endif %}
           <span class="text-xs text-gray-500 dark:text-gray-400">({{ opinion.page_count }} pages)</span>
         </td>
-        <td class="px-4 py-3 whitespace-nowrap">
+        <td class="px-3 py-2 whitespace-nowrap">
           <span class="badge-{{ opinion.status }}">{{ opinion.get_status_display }}</span>
         </td>
-        <td class="px-4 py-3 text-sm whitespace-nowrap">
+        <td class="px-3 py-2 text-sm whitespace-nowrap">
           {% if opinion.open_findings %}
           <span class="text-yellow-700 dark:text-yellow-300 font-medium">{{ opinion.open_findings }}</span>
           {% if opinion.blocking_findings %}<span class="ml-1 text-xs font-bold text-red-700 dark:text-red-300" title="Findings the approval of the text waits on">{{ opinion.blocking_findings }} blocking</span>{% endif %}
@@ -156,10 +168,10 @@
           <span class="text-gray-400">&mdash;</span>
           {% endif %}
         </td>
-        <td class="px-4 py-3 text-sm whitespace-nowrap">
+        <td class="px-3 py-2 text-sm whitespace-nowrap">
           {% if opinion.pictures %}<span class="font-medium" title="IMAGE boxes of the redaction review"><i class="fa-regular fa-image mr-1"></i>{{ opinion.pictures }}</span>{% else %}<span class="text-gray-400">&mdash;</span>{% endif %}
         </td>
-        <td class="px-4 py-3 text-sm text-right">
+        <td class="px-3 py-2 text-sm text-right">
           {% if opinion.final_xml_ready %}
           <a href="{% url 'opinion_final_xml' pk=opinion.scan.pk opinion_pk=opinion.pk %}" class="btn-outline text-xs px-2 py-1 mr-1" title="Open the final XML of this opinion"><i class="fa-solid fa-code"></i> XML</a>
           {% endif %}
@@ -175,7 +187,7 @@
 {% if page_obj.has_other_pages %}
 <nav class="flex items-center justify-center gap-2 mt-6" aria-label="Pagination">
   {% if page_obj.has_previous %}
-  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
+  <a href="?page={{ page_obj.previous_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% elif current_non_blocking %}&blocking=0{% endif %}{% if current_pictures %}&pictures=1{% elif current_no_pictures %}&pictures=0{% endif %}{% if current_tagged %}&tagged=1{% elif current_untagged %}&tagged=0{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">&laquo; Previous</a>
   {% endif %}
 
@@ -184,7 +196,7 @@
   </span>
 
   {% if page_obj.has_next %}
-  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% endif %}{% if current_non_blocking %}&non_blocking=1{% endif %}{% if current_pictures %}&pictures=1{% endif %}{% if current_no_pictures %}&no_pictures=1{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
+  <a href="?page={{ page_obj.next_page_number }}{% if current_scan %}&scan={{ current_scan }}{% endif %}{% if current_status %}&status={{ current_status }}{% endif %}{% if current_reporter %}&reporter={{ current_reporter }}{% endif %}{% if current_volume %}&volume={{ current_volume }}{% endif %}{% if current_blocking %}&blocking=1{% elif current_non_blocking %}&blocking=0{% endif %}{% if current_pictures %}&pictures=1{% elif current_no_pictures %}&pictures=0{% endif %}{% if current_tagged %}&tagged=1{% elif current_untagged %}&tagged=0{% endif %}{% if current_sort %}&sort={{ current_sort }}{% endif %}"
      class="btn-outline text-sm">Next &raquo;</a>
   {% endif %}
 </nav>
@@ -198,24 +210,4 @@
   </p>
 </div>
 {% endif %}
-<script>
-  // The two switches of a pair name no opinion together, so checking
-  // one unchecks the other.
-  (function () {
-    [
-      ["blocking", "non_blocking"],
-      ["pictures", "no_pictures"],
-    ].forEach((names) => {
-      const pair = names.map((name) =>
-        document.querySelector('input[name="' + name + '"]'),
-      );
-      pair.forEach((box, i) => {
-        if (!box) return;
-        box.addEventListener("change", () => {
-          if (box.checked && pair[1 - i]) pair[1 - i].checked = false;
-        });
-      });
-    });
-  })();
-</script>
 {% endblock %}
