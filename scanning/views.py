@@ -15,6 +15,7 @@ from django.core.paginator import Paginator
 from django.db.models import (
     Count,
     Exists,
+    F,
     OuterRef,
     Prefetch,
     Q,
@@ -225,8 +226,8 @@ def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
     The four filters of ``/opinions/`` (scan, reporter, status, volume)
-    and the ``blocking``, ``non_blocking``, ``pictures`` and
-    ``no_pictures`` switches,
+    and the ``blocking``, ``non_blocking``, ``pictures``,
+    ``no_pictures``, ``tagged`` and ``untagged`` switches,
     in the list's order or in the order of ``sort``
     (:func:`_by_open_cards`), for the list and for the blocking review,
     which reads the same query string. The
@@ -236,7 +237,7 @@ def _filtered_opinions(request: HttpRequest):
     :param request: The current HTTP request.
     :returns: ``(queryset, {"scan", "reporter", "status", "volume",
         "opinion", "blocking", "non_blocking", "pictures", "no_pictures",
-        "sort"})``,
+        "tagged", "untagged", "sort"})``,
         the current values as the form shows them.
     """
     # The scan's caches stay on disk (#582): the join repeats them on
@@ -294,6 +295,19 @@ def _filtered_opinions(request: HttpRequest):
     no_pictures_only = request.GET.get("no_pictures") == "1"
     if no_pictures_only:
         opinions_qs = opinions_qs.filter(figure_digest="")
+    # The tagger's spans are over the text approved now: the rule of
+    # ``tagger.is_written``, two columns of the row. Its twin is every
+    # other opinion, an approved one whose run is out or never started
+    # and one not approved yet; the status filter narrows it.
+    tagged = Q(tagged_text_key=F("approved_text_key")) & ~Q(
+        approved_text_key=""
+    )
+    tagged_only = request.GET.get("tagged") == "1"
+    if tagged_only:
+        opinions_qs = opinions_qs.filter(tagged)
+    untagged_only = request.GET.get("untagged") == "1"
+    if untagged_only:
+        opinions_qs = opinions_qs.exclude(tagged)
     # The order never crosses a table: ordered by the reporter's name,
     # the scan's volume and the opinion's page at once, no index served
     # the sort, and at a hundred thousand rows Postgres joined and
@@ -327,6 +341,8 @@ def _filtered_opinions(request: HttpRequest):
         "non_blocking": non_blocking_only,
         "pictures": pictures_only,
         "no_pictures": no_pictures_only,
+        "tagged": tagged_only,
+        "untagged": untagged_only,
         "sort": sort,
     }
 
@@ -535,6 +551,8 @@ def opinion_list(request: HttpRequest) -> HttpResponse:
             "current_non_blocking": current["non_blocking"],
             "current_pictures": current["pictures"],
             "current_no_pictures": current["no_pictures"],
+            "current_tagged": current["tagged"],
+            "current_untagged": current["untagged"],
             "current_sort": current["sort"],
             "sort_choices": list(OPINION_SORTS.items()),
             "blocking_review_url": _review_url(

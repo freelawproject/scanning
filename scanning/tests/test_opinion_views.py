@@ -206,6 +206,52 @@ class TestOpinionList(ScanningTestCase):
         self.assertTrue(response.context["current_no_pictures"])
         self.assertContains(response, "No pictures")
 
+    def _tagged(self):
+        """An approved opinion whose spans are over its approved text."""
+        return OpinionFactory(
+            scan=self.scan,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            approved_text_key="approved/r1.e0.json",
+            tagged_text_key="approved/r1.e0.json",
+        )
+
+    def test_the_tagged_filter_keeps_the_texts_tagged_now(self):
+        tagged = self._tagged()
+        # Approved again since its run: its spans are over an older text.
+        stale = OpinionFactory(
+            scan=self.scan,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            approved_text_key="approved/r2.e0.json",
+            tagged_text_key="approved/r1.e0.json",
+        )
+
+        response = self.client.get(reverse("opinion_list"), {"tagged": "1"})
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(tagged, rows)
+        self.assertNotIn(stale, rows)
+        self.assertNotIn(self.opinion, rows)
+        self.assertTrue(response.context["current_tagged"])
+
+    def test_the_untagged_filter_keeps_every_other_text(self):
+        tagged = self._tagged()
+
+        response = self.client.get(reverse("opinion_list"), {"untagged": "1"})
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(self.opinion, rows)
+        self.assertNotIn(tagged, rows)
+        self.assertTrue(response.context["current_untagged"])
+        self.assertContains(response, "Not tagged")
+
+    def test_the_pages_keep_the_tagged_filter(self):
+        for _ in range(views.OPINIONS_PER_PAGE + 1):
+            OpinionFactory(scan=self.scan)
+
+        response = self.client.get(reverse("opinion_list"), {"untagged": "1"})
+
+        self.assertContains(response, "&untagged=1")
+
     def test_the_non_blocking_filter_drops_an_open_blocking_card(self):
         """A warning or a dismissed error holds no approval back."""
         blocked = OpinionFactory(scan=self.scan)
