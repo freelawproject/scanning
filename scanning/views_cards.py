@@ -712,3 +712,16 @@ def volunteer_faq(request: HttpRequest) -> HttpResponse:
     (``volunteers.URL_NAMES``), and so may everyone else.
     """
     return render(request, "scanning/volunteer_faq.html", {})
+
+
+@login_required
+def volunteer_practice(request: HttpRequest) -> HttpResponse:
+    """The practice cards of the FAQ: real cards with their answers
+    (``volunteer_practice.EXAMPLES``), checked in the browser."""
+    from scanning import volunteer_practice
+
+    return render(
+        request,
+        "scanning/volunteer_practice.html",
+        {"cards": volunteer_practice.cards()},
+    )

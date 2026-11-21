@@ -746,11 +746,15 @@
             answer ? answer.label : (kept ? 'kept as shown' : (skipped ? 'skipped' : 'not yet decided')));
         footer.appendChild(state);
         footer.appendChild(el('span', 'bk-grow'));
-        var open = el('a', 'btn-ghost text-xs', 'Open in the document');
-        // The review page names its page containers ``op-page-{index}``,
-        // 0-based, and jumps to the one in the hash (viewer_step3.js).
-        open.href = section.reviewUrl + '#op-page-' + card.page_in_opinion;
-        footer.appendChild(open);
+        // A volunteer has no review page to open (``scanning.volunteers``):
+        // the section carries no address, and the card offers no link.
+        if (section.reviewUrl) {
+            var open = el('a', 'btn-ghost text-xs', 'Open in the document');
+            // The review page names its page containers ``op-page-{index}``,
+            // 0-based, and jumps to the one in the hash (viewer_step3.js).
+            open.href = section.reviewUrl + '#op-page-' + card.page_in_opinion;
+            footer.appendChild(open);
+        }
         if (answer) {
             // An applied row's answer is an edit now: its Undo is the
             // review page's, so the cards page offers none.

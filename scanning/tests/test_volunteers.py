@@ -81,10 +81,22 @@ class TestTheGate(VolunteerTestCase):
         self.assertEqual(answer.json()["status"], "error")
 
     def test_the_allowed_pages_open(self):
-        for name in ("opinion_card_review", "volunteer_faq", "profile"):
+        for name in (
+            "opinion_card_review",
+            "volunteer_faq",
+            "volunteer_practice",
+            "profile",
+        ):
             self.assertEqual(
                 self.client.get(reverse(name)).status_code, 200, name
             )
+
+    def test_another_apps_view_keeps_its_own_gate(self):
+        """The admin sends a non-staff user to its login, never to the
+        cards; the dev toolbar's polls would loop on a redirect."""
+        answer = self.client.get(reverse("admin:index"))
+        self.assertEqual(answer.status_code, 302)
+        self.assertIn("/admin/login/", answer["Location"])
 
     def test_a_regular_user_is_not_gated(self):
         self.client.force_login(self.make_user())
@@ -118,11 +130,19 @@ class TestTheirCards(VolunteerTestCase):
         self.assertEqual(answer.context["card_total"], 1)
         self.assertContains(answer, f'id="opinion-{self.opinion.pk}"')
         self.assertNotContains(answer, "Open the review page")
+        # No review page for the card's link either: the script reads
+        # the address off the section and offers none when it is blank.
+        self.assertContains(answer, 'data-review-url=""')
 
     def test_a_curator_sees_the_review_link(self):
         self.client.force_login(self.make_user())
         answer = self.client.get(reverse("opinion_card_review"))
         self.assertContains(answer, "Open the review page")
+        self.assertContains(
+            answer,
+            'data-review-url="'
+            + reverse("opinion_review", kwargs={"pk": self.opinion.pk}),
+        )
 
     def test_the_rows_are_theirs_alone(self):
         address = reverse("opinion_card_rows", kwargs=self.card_kwargs())
@@ -214,3 +234,47 @@ class TestTheCommand(VolunteerTestCase):
             call_command("assign_cards", reason="characters")
         with self.assertRaises(CommandError):
             call_command("assign_cards", "vol")
+
+
+class TestThePractice(VolunteerTestCase):
+    def test_every_example_is_whole(self):
+        """Each example has its image under the static files, readings,
+        and an answer that names one of them, a blank, or typed words."""
+        from pathlib import Path
+
+        from django.contrib.staticfiles import finders
+
+        from scanning import volunteer_practice
+
+        slugs = [e["slug"] for e in volunteer_practice.EXAMPLES]
+        self.assertEqual(len(slugs), len(set(slugs)))
+        for example in volunteer_practice.EXAMPLES:
+            with self.subTest(example["slug"]):
+                found = finders.find(
+                    "scanning/faq/practice/" + example["image"]
+                )
+                self.assertTrue(
+                    found and Path(found).is_file(), example["image"]
+                )
+                self.assertTrue(example["readings"])
+                answer = example["answer"]
+                if isinstance(answer, dict):
+                    self.assertTrue(answer.get("typed"))
+                else:
+                    self.assertIn(
+                        answer, range(0, len(example["readings"]) + 1)
+                    )
+                self.assertTrue(example["why"])
+
+    def test_the_page_draws_every_example(self):
+        from scanning import volunteer_practice
+
+        self.client.force_login(self.volunteer)
+        answer = self.client.get(reverse("volunteer_practice"))
+        self.assertEqual(answer.status_code, 200)
+        for example in volunteer_practice.EXAMPLES:
+            self.assertContains(answer, f'data-slug="{example["slug"]}"')
+        self.assertContains(answer, "scanning/practice.js")
+        # The FAQ offers it, and the gate lets a volunteer in.
+        faq = self.client.get(reverse("volunteer_faq"))
+        self.assertContains(faq, reverse("volunteer_practice"))

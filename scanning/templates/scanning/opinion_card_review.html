@@ -70,7 +70,7 @@
            data-opinion="{{ opinion.pk }}"
            data-cards-url="{{ opinion.cards_url }}"
            data-pdf-url-endpoint="{{ opinion.pdf_url_endpoint }}"
-           data-review-url="{{ opinion.review_url }}">
+           data-review-url="{% if not is_volunteer %}{{ opinion.review_url }}{% endif %}">
     <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
       <h2 class="text-lg font-bold">
         {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}{% if opinion.index_in_page %}

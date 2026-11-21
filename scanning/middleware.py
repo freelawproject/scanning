@@ -77,7 +77,8 @@ class VolunteerGateMiddleware:
     here and never reaches the view: a page request is sent to their
     cards, and a request that wants no page (a POST, or a GET that
     accepts JSON) gets a 403 as JSON, the shape every refusal of the
-    card endpoints has. Everyone else passes untouched.
+    card endpoints has. Everyone else passes untouched, and so does a
+    view of another app, which keeps its own gate.
     """
 
     def __init__(
@@ -100,7 +101,14 @@ class VolunteerGateMiddleware:
         if not volunteers.of_request(request):
             return None
         match = getattr(request, "resolver_match", None)
-        if match is not None and match.url_name in volunteers.URL_NAMES:
+        if match is None or match.url_name in volunteers.URL_NAMES:
+            return None
+        # The portal's own views alone: another app's view (the admin,
+        # the debug toolbar, the browser reload of development) keeps
+        # its own gate, and a redirect of a polled endpoint loops.
+        if not (getattr(view_func, "__module__", "") or "").startswith(
+            "scanning."
+        ):
             return None
         if request.path.startswith((settings.STATIC_URL, settings.MEDIA_URL)):
             return None

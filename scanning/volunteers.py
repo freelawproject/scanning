@@ -44,6 +44,7 @@ URL_NAMES = frozenset(
         "answer_opinion_card",
         "opinion_pdf_url",
         "volunteer_faq",
+        "volunteer_practice",
         "login",
         "logout",
         "profile",
