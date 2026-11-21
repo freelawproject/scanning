@@ -39,7 +39,8 @@ class Command(BaseCommand):
         parser.add_argument("username", nargs="?")
         parser.add_argument(
             "--group",
-            help="Every member of this auth group, each given --count "
+            help="Every active, non-staff member of this auth group (the "
+            "members volunteers.is_volunteer counts), each given --count "
             "cards (or each released), in username order.",
         )
         parser.add_argument(
@@ -70,14 +71,28 @@ class Command(BaseCommand):
                 self._assign(user, options)
 
     def _users(self, options) -> list:
-        """The volunteers named: one user, or every member of a group."""
+        """The volunteers named: one user, or every member of a group.
+
+        A group's members are the ones ``volunteers.is_volunteer``
+        counts, active and not staff: a card given to a staff member
+        or a disabled account is locked away from the real volunteers.
+        """
         if options["group"]:
+            if options["username"]:
+                raise CommandError("Name a user or a --group, not both.")
             group = Group.objects.filter(name=options["group"]).first()
             if group is None:
                 raise CommandError(f"No group {options['group']!r}.")
-            users = list(group.user_set.order_by("username"))
+            users = list(
+                group.user_set.filter(is_active=True, is_staff=False).order_by(
+                    "username"
+                )
+            )
             if not users:
-                raise CommandError(f"The group {group.name!r} has no member.")
+                raise CommandError(
+                    f"The group {group.name!r} has no active, non-staff "
+                    "member."
+                )
             return users
         if not options["username"]:
             raise CommandError("Name a user, or a --group.")

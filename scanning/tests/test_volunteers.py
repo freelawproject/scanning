@@ -39,6 +39,27 @@ class TestTheRule(VolunteerTestCase):
         self.assertFalse(volunteers.is_volunteer(AnonymousUser()))
         self.assertFalse(volunteers.is_volunteer(None))
 
+    def test_a_recheck_never_touches_the_session(self):
+        """The answer lives in the cache, by user: a session write would
+        save the session and move its expiry out, and a recheck every
+        ten minutes would keep an active account signed in for ever."""
+        from django.contrib.sessions.models import Session
+        from django.core.cache import cache
+
+        self.client.force_login(self.volunteer)
+        key = self.client.session.session_key
+        before = Session.objects.get(session_key=key).expire_date
+        cache.delete(volunteers.cache_key(self.volunteer))
+
+        answer = self.client.get(reverse("opinion_card_review"))
+
+        self.assertEqual(answer.status_code, 200)
+        self.assertTrue(answer.context["filters"]["mine"])
+        self.assertEqual(
+            Session.objects.get(session_key=key).expire_date, before
+        )
+        self.assertIs(cache.get(volunteers.cache_key(self.volunteer)), True)
+
     def test_the_home_is_their_cards(self):
         self.assertEqual(
             volunteers.home_url(), reverse("opinion_card_review") + "?mine=1"
@@ -216,6 +237,24 @@ class TestTheCommand(VolunteerTestCase):
         self.card.refresh_from_db()
         self.assertIsNone(self.card.assigned_to)
 
+    def test_staff_and_disabled_members_get_no_card(self):
+        """The members are the ones the gate counts: a card given to a
+        staff member or a disabled account is locked away."""
+        staff = self.make_staff_user(username="aaa-staff")
+        staff.groups.add(self.group)
+        gone = self.make_user(username="aab-gone", is_active=False)
+        gone.groups.add(self.group)
+
+        call_command(
+            "assign_cards",
+            group=volunteers.GROUP,
+            reason="characters",
+            count=1,
+        )
+
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, self.volunteer)
+
     def test_a_dry_run_assigns_nothing(self):
         call_command(
             "assign_cards",
@@ -234,6 +273,10 @@ class TestTheCommand(VolunteerTestCase):
             call_command("assign_cards", reason="characters")
         with self.assertRaises(CommandError):
             call_command("assign_cards", "vol")
+        with self.assertRaises(CommandError):
+            call_command(
+                "assign_cards", "vol", group=volunteers.GROUP, reason="name"
+            )
 
 
 class TestThePractice(VolunteerTestCase):
