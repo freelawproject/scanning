@@ -23,7 +23,7 @@ from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
 
-from scanning import blocking_types, opinion_cards
+from scanning import blocking_types, opinion_cards, volunteers
 from scanning.models import (
     Opinion,
     OpinionCard,
@@ -88,7 +88,10 @@ def _filters(request: HttpRequest) -> dict:
         "status": status if status in STATUS_FILTERS else "open",
         "scan": str(scan) if scan is not None else "",
         "volume": str(volume) if volume is not None else "",
-        "mine": request.GET.get("mine") == "1",
+        # A volunteer sees their own cards and no others
+        # (``scanning.volunteers``): the filter is forced, not offered.
+        "mine": request.GET.get("mine") == "1"
+        or volunteers.of_request(request),
     }
 
 
@@ -376,6 +379,14 @@ def answer_opinion_card(
     change: ``apply_card_answers`` writes the answers later.
     """
     row = get_object_or_404(OpinionCard, pk=card_pk, opinion__scan_id=pk)
+    if (
+        volunteers.of_request(request)
+        and row.assigned_to_id != request.user.pk
+    ):
+        return JsonResponse(
+            {"status": "error", "message": volunteers.CARD_MESSAGE},
+            status=403,
+        )
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, UnicodeDecodeError):
@@ -691,3 +702,13 @@ def send_back_opinion_card(
             {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
         )
     return JsonResponse({"status": "ok", "message": SENT_BACK_MESSAGE})
+
+
+@login_required
+def volunteer_faq(request: HttpRequest) -> HttpResponse:
+    """The questions and answers of the card review, for the volunteers.
+
+    A page of the template alone; a volunteer may reach it
+    (``volunteers.URL_NAMES``), and so may everyone else.
+    """
+    return render(request, "scanning/volunteer_faq.html", {})

@@ -24,6 +24,7 @@
       {{ card_total }} card(s) in {{ page_obj.paginator.count }} opinion(s)
       · <b data-role="total">…</b> open on this page · <b data-role="done">0</b> answered here
       {% if request.user.is_staff %}· <a href="{% url 'opinion_card_answers' %}" class="text-blue-600 dark:text-blue-400 hover:underline">The answers</a>{% endif %}
+      · <a href="{% url 'volunteer_faq' %}" class="text-blue-600 dark:text-blue-400 hover:underline">Help</a>
     </span>
   </div>
 
@@ -77,7 +78,7 @@
       </h2>
       <span class="text-xs text-gray-500 dark:text-gray-400" data-role="meta">{{ opinion.card_count }} card(s)</span>
       <span class="flex items-center gap-2">
-        <a href="{{ opinion.review_url }}" class="btn-ghost text-xs">Open the review page</a>
+        {% if not is_volunteer %}<a href="{{ opinion.review_url }}" class="btn-ghost text-xs">Open the review page</a>{% endif %}
         <button type="button" class="hidden" data-role="approve" disabled></button>
       </span>
     </header>

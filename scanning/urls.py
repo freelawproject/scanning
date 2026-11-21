@@ -77,6 +77,7 @@ from scanning.views_cards import (
     opinion_card_review,
     opinion_card_rows,
     send_back_opinion_card,
+    volunteer_faq,
 )
 from scanning.views_process import (
     add_page_insert,
@@ -158,6 +159,7 @@ urlpatterns = [
         opinion_card_answers,
         name="opinion_card_answers",
     ),
+    path("opinions/cards/help/", volunteer_faq, name="volunteer_faq"),
     path(
         "scans/<int:pk>/opinions/<int:opinion_pk>/card-rows/",
         opinion_card_rows,

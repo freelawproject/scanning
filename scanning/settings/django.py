@@ -95,6 +95,7 @@ TEMPLATES = [
                 "django.template.context_processors.static",
                 "scanning.context_processors.inject_settings",
                 "scanning.context_processors.waiting_repairs",
+                "scanning.context_processors.volunteer",
             ),
             "debug": DEBUG,
         },
@@ -111,6 +112,8 @@ MIDDLEWARE = [
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    # After auth and URL resolution: a volunteer sees the card review alone.
+    "scanning.middleware.VolunteerGateMiddleware",
 ]
 
 ROOT_URLCONF = "scanning.urls"

@@ -1,0 +1,110 @@
+{% extends "base.html" %}
+
+{% comment %}
+  The FAQ of the card review, for the volunteers. Add a question as one
+  <details> block: the <summary> is the question, the <div> the answer.
+  The page is reachable by every logged-in user; a volunteer gets it
+  and their cards and nothing else (scanning/volunteers.py).
+{% endcomment %}
+
+{% block title %}Card review FAQ - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-4 gap-2">
+    <h1 class="text-2xl font-bold">Card review: questions and answers</h1>
+    <a href="{% url 'opinion_card_review' %}?mine=1" class="btn-outline text-sm">Back to my cards</a>
+  </div>
+
+  <p class="text-sm text-gray-600 dark:text-gray-300 mb-6">
+    Each card shows a small cut of a scanned page and the words three readers made of it.
+    Your answer is the reading that matches the page. Nothing you answer changes the text
+    at once: the answers are checked and written in later, and Undo takes one back until then.
+  </p>
+
+  <h2 class="text-lg font-semibold mt-6 mb-2">The cards</h2>
+  <div class="space-y-3">
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">What is a card?</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        One place on a page where the three readers did not agree. The card shows the cut of
+        the page and each reading. Pick the one that matches the print, or type the right
+        words.
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">Which part of the block is the card asking about?</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        The words around the place are greyed; the word in question is the underlined one.
+        Answer for that word, and leave the greyed words as they are.
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">Which keys do what?</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        ↓ and ↑ move between cards; the card in the middle of the screen is the selected one.
+        → and ← move down and up its options, and Return chooses the outlined one.
+        1, 2 and 3 choose a reading, 0 leaves the place blank, e types the words, s skips
+        (nothing is saved), u undoes, f opens the card to the whole page.
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">What does "Problem" mean?</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        The block is not text at all (bleed-through from the page behind, a stamp), the page is
+        a bad scan that needs scanning again, or a black box on the page is in the wrong place.
+      </div>
+    </details>
+  </div>
+
+  <h2 class="text-lg font-semibold mt-8 mb-2">Common patterns</h2>
+  <div class="space-y-3">
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">One reading runs on past the block</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        <p>A reader often continues into the next paragraph, the next column or the next page,
+        and may even make words up. The three readings of one block can look like this:</p>
+        <ul class="list-disc ml-5 my-2">
+          <li>Dorothy traveled on the yellow br-</li>
+          <li>Dorothy traveled on the yellow brick road</li>
+          <li>Dorothy traveled on the yellow brick road to Oz and …</li>
+        </ul>
+        <p>We want what is plainly in the block on the page, even when the sentence goes on
+        somewhere else. If the block ends at "br-", the first reading is the right one.</p>
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">The ⊥ mark (an upside-down T), usually with a number: ⊥123</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        <p>These are West's page markers, and we do not want them in the text for this round.
+        Leave the mark and its number out: pick the reading without it, or type the words
+        without it.</p>
+        <p class="mt-2">It can also land in the middle of a word, as in "perp⊥indicular123".
+        There too the "⊥123" comes out and the word is "perpendicular".</p>
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">Footnote numbers (superscripts)</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        Keep the number, as a plain number where it stands, the way the line reads. The
+        superscript is rebuilt later from the numbers we find.
+      </div>
+    </details>
+
+    <details class="card">
+      <summary class="font-semibold cursor-pointer">Runs of dots</summary>
+      <div class="mt-2 text-sm text-gray-700 dark:text-gray-200">
+        An ellipsis or a row of dots that is on the page belongs in the text. Keep it as the
+        page shows it.
+      </div>
+    </details>
+  </div>
+
+  {# Other common occurrences go here, one <details> block each. #}
+</div>
+{% endblock %}
