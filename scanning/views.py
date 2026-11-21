@@ -222,6 +222,27 @@ def scan_detail(request: HttpRequest, pk: int) -> HttpResponse:
     return redirect("scan_process", pk=scan.pk)
 
 
+def _switch(
+    request: HttpRequest, name: str, opposite: str
+) -> tuple[bool, bool]:
+    """Return one dropdown of the list's filters: the switch and its twin.
+
+    ``?name=1`` keeps the opinions of the switch, ``?name=0`` the others,
+    and nothing keeps every one. ``?opposite=1`` is the twin too, the
+    address of the checkbox the dropdown replaced, which links and
+    bookmarks still carry.
+
+    :param request: The current HTTP request.
+    :param name: The switch, as the dropdown names it.
+    :param opposite: The old name of its twin.
+    :returns: ``(switch on, twin on)``; never both.
+    """
+    value = request.GET.get(name)
+    if value == "1":
+        return True, False
+    return False, value == "0" or request.GET.get(opposite) == "1"
+
+
 def _filtered_opinions(request: HttpRequest):
     """Return the opinions of the list's filters, and the filters.
 
@@ -274,38 +295,42 @@ def _filtered_opinions(request: HttpRequest):
         opinions_qs = opinions_qs.filter(pk=opinion_filter)
     else:
         opinion_filter = ""
-    blocking_only = request.GET.get("blocking") == "1"
+    blocking_only, non_blocking_only = _switch(
+        request, "blocking", "non_blocking"
+    )
     if blocking_only:
         opinions_qs = _with_open_blocking_card(opinions_qs)
     # The twin of the switch above: the opinions no open card holds
     # back. Both at once name no opinion, and the form unchecks one.
-    non_blocking_only = request.GET.get("non_blocking") == "1"
     if non_blocking_only:
         opinions_qs = _without_open_blocking_card(opinions_qs)
     # The text holds a picture: the stamp of the ensemble (#463), a
     # column of the row, where the Pictures column counts the boxes of
     # the pages with the junk rule, in Python and for one page alone.
-    pictures_only = request.GET.get("pictures") == "1"
+    pictures_only, no_pictures_only = _switch(
+        request, "pictures", "no_pictures"
+    )
     if pictures_only:
         opinions_qs = opinions_qs.exclude(figure_digest="")
     # The twin of the switch above: a text with no picture, which is a
     # text the ensemble has not built yet too, because the stamp is
     # blank until then. Both at once name no opinion, and the form
     # unchecks one.
-    no_pictures_only = request.GET.get("no_pictures") == "1"
     if no_pictures_only:
         opinions_qs = opinions_qs.filter(figure_digest="")
     # The tagger's spans are over the text approved now: the rule of
-    # ``tagger.is_written``, two columns of the row. Its twin is every
-    # other opinion, an approved one whose run is out or never started
-    # and one not approved yet; the status filter narrows it.
-    tagged = Q(tagged_text_key=F("approved_text_key")) & ~Q(
-        approved_text_key=""
+    # ``tagger.is_written`` over three columns of the row (the spans, the
+    # approved text, and the text the spans were placed on). Its twin is
+    # every other opinion, an approved one whose run is out or never
+    # started and one not approved yet; the status filter narrows it.
+    tagged = (
+        Q(tagged_text_key=F("approved_text_key"))
+        & ~Q(approved_text_key="")
+        & ~Q(tag_key="")
     )
-    tagged_only = request.GET.get("tagged") == "1"
+    tagged_only, untagged_only = _switch(request, "tagged", "untagged")
     if tagged_only:
         opinions_qs = opinions_qs.filter(tagged)
-    untagged_only = request.GET.get("untagged") == "1"
     if untagged_only:
         opinions_qs = opinions_qs.exclude(tagged)
     # The order never crosses a table: ordered by the reporter's name,
@@ -469,26 +494,34 @@ def _review_url(current: dict, route: str) -> str | None:
     return f"{address}?{urlencode(query)}" if query else address
 
 
-def _scan_choices() -> list[tuple[str, str]]:
-    """Return the volumes the list's scan filter offers.
+def _scan_choices() -> list[tuple[str, list[tuple[str, str]]]]:
+    """Return the volumes the list's scan filter offers, by reporter.
 
-    Every scan with an opinion row, in the list's order, named as the
-    rows name them (``vol. 682 F.Supp.3d, scan 2337``). One query over
-    the scans, with the opinions as a semi-join on their scan index,
-    and the caches of every one of them left on disk (#582).
+    Every scan with an opinion row, grouped under its reporter's
+    citation name in alphabetical order, the volumes of each in number
+    order, each named as a citation (``682 F. Supp. 3d · scan 2337``), so
+    a reviewer finds a volume as they would cite it. One query over the
+    scans, with the opinions as a semi-join on their scan index, and the
+    caches of every one of them left on disk (#582); the reporter's
+    citation name is a property, so the sort is in Python.
 
-    :returns: ``(scan pk, label)`` pairs.
-    :rtype: list[tuple[str, str]]
+    :returns: ``(reporter, [(scan pk, label)])`` pairs.
+    :rtype: list[tuple[str, list[tuple[str, str]]]]
     """
     scans = (
         Scan.objects.filter(pk__in=Opinion.objects.values("scan_id"))
         .select_related("reporter")
         .defer(*Scan.large_fields())
-        .order_by("reporter__short_name", "volume", "pk")
     )
+    groups: dict[str, list[tuple[int, int, str]]] = {}
+    for s in scans:
+        name = s.reporter.cite_name
+        groups.setdefault(name, []).append(
+            (s.volume, s.pk, f"{s.volume} {name} · scan {s.pk}")
+        )
     return [
-        (str(s.pk), f"vol. {s.volume} {s.reporter.cite_name}, scan {s.pk}")
-        for s in scans
+        (name, [(str(pk), label) for _, pk, label in sorted(groups[name])])
+        for name in sorted(groups, key=str.lower)
     ]
 
 

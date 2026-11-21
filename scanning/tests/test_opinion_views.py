@@ -213,6 +213,7 @@ class TestOpinionList(ScanningTestCase):
             status=OpinionReviewStatus.TEXT_REVIEW_DONE,
             approved_text_key="approved/r1.e0.json",
             tagged_text_key="approved/r1.e0.json",
+            tag_key="tag/spans-r1.json",
         )
 
     def test_the_tagged_filter_keeps_the_texts_tagged_now(self):
@@ -223,6 +224,15 @@ class TestOpinionList(ScanningTestCase):
             status=OpinionReviewStatus.TEXT_REVIEW_DONE,
             approved_text_key="approved/r2.e0.json",
             tagged_text_key="approved/r1.e0.json",
+            tag_key="tag/spans-r1.json",
+        )
+        # The text keys agree, and no spans were placed: not written
+        # (``tagger.is_written``).
+        no_spans = OpinionFactory(
+            scan=self.scan,
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE,
+            approved_text_key="approved/r1.e0.json",
+            tagged_text_key="approved/r1.e0.json",
         )
 
         response = self.client.get(reverse("opinion_list"), {"tagged": "1"})
@@ -230,13 +240,14 @@ class TestOpinionList(ScanningTestCase):
         rows = list(response.context["page_obj"])
         self.assertIn(tagged, rows)
         self.assertNotIn(stale, rows)
+        self.assertNotIn(no_spans, rows)
         self.assertNotIn(self.opinion, rows)
         self.assertTrue(response.context["current_tagged"])
 
     def test_the_untagged_filter_keeps_every_other_text(self):
         tagged = self._tagged()
 
-        response = self.client.get(reverse("opinion_list"), {"untagged": "1"})
+        response = self.client.get(reverse("opinion_list"), {"tagged": "0"})
 
         rows = list(response.context["page_obj"])
         self.assertIn(self.opinion, rows)
@@ -248,9 +259,28 @@ class TestOpinionList(ScanningTestCase):
         for _ in range(views.OPINIONS_PER_PAGE + 1):
             OpinionFactory(scan=self.scan)
 
+        response = self.client.get(reverse("opinion_list"), {"tagged": "0"})
+
+        self.assertContains(response, "&tagged=0")
+
+    def test_the_old_address_of_a_twin_still_filters(self):
+        """A link or a bookmark of the checkbox the dropdown replaced."""
+        tagged = self._tagged()
+
         response = self.client.get(reverse("opinion_list"), {"untagged": "1"})
 
-        self.assertContains(response, "&untagged=1")
+        self.assertNotIn(tagged, list(response.context["page_obj"]))
+        self.assertTrue(response.context["current_untagged"])
+
+    def test_the_dropdowns_offer_each_side(self):
+        with_picture = OpinionFactory(scan=self.scan, figure_digest="abc")
+
+        response = self.client.get(reverse("opinion_list"), {"pictures": "0"})
+
+        rows = list(response.context["page_obj"])
+        self.assertIn(self.opinion, rows)
+        self.assertNotIn(with_picture, rows)
+        self.assertTrue(response.context["current_no_pictures"])
 
     def test_the_non_blocking_filter_drops_an_open_blocking_card(self):
         """A warning or a dismissed error holds no approval back."""
@@ -268,7 +298,7 @@ class TestOpinionList(ScanningTestCase):
         self.assertIn(self.opinion, rows)
         self.assertNotIn(blocked, rows)
         self.assertTrue(response.context["current_non_blocking"])
-        self.assertContains(response, "Non blocking only")
+        self.assertContains(response, "Non blocking")
 
     def test_the_sort_orders_by_the_open_cards(self):
         """The count of the Warnings column, a dismissed card left out."""
@@ -401,27 +431,50 @@ class TestOpinionList(ScanningTestCase):
         )
 
     def test_the_scan_filter_offers_the_scanned_volumes(self):
-        """Every scan with an opinion, in the list's order, and no scan
-        without one."""
+        """Every scan with an opinion, grouped under its reporter, and no
+        scan without one."""
         empty = ScanFactory(reporter=self.reporter, volume=1)
         response = self.client.get(reverse("opinion_list"))
         choices = response.context["scan_choices"]
+        name = self.reporter.cite_name
         self.assertEqual(
             choices,
             [
                 (
-                    str(self.scan.pk),
-                    f"vol. 237 {self.reporter.cite_name}, scan {self.scan.pk}",
+                    name,
+                    [(str(self.scan.pk), f"237 {name} · scan {self.scan.pk}")],
                 )
             ],
         )
-        self.assertNotIn(str(empty.pk), [value for value, _ in choices])
+        values = [value for _, volumes in choices for value, _ in volumes]
+        self.assertNotIn(str(empty.pk), values)
+        self.assertContains(response, f'<optgroup label="{name}">')
         self.assertContains(response, 'name="scan"')
         self.assertContains(response, "All volumes")
         narrowed = self.client.get(
             reverse("opinion_list"), {"scan": self.scan.pk}
         )
         self.assertContains(narrowed, f'value="{self.scan.pk}" selected')
+
+    def test_the_scan_filter_sorts_by_reporter_then_volume(self):
+        """A reporter's volumes in number order, the reporters by name."""
+        other = ReporterFactory(short_name="aaa", full_name="Aaa Reports")
+        for volume in (10, 9):
+            OpinionFactory(
+                scan=ScanFactory(reporter=self.reporter, volume=volume)
+            )
+        OpinionFactory(scan=ScanFactory(reporter=other, volume=5))
+
+        choices = self.client.get(reverse("opinion_list")).context[
+            "scan_choices"
+        ]
+
+        names = [name for name, _ in choices]
+        self.assertEqual(names, sorted(names, key=str.lower))
+        mine = dict(choices)[self.reporter.cite_name]
+        self.assertEqual(
+            [label.split()[0] for _, label in mine], ["9", "10", "237"]
+        )
 
     def test_the_ordering_is_total(self):
         """Two scans of one reporter and volume tie on the four keys
