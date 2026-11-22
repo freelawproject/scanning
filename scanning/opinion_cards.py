@@ -24,6 +24,7 @@ import logging
 from collections import Counter, defaultdict
 
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from scanning import blocking_review, blocking_types, ensemble, opinion_edits
@@ -693,3 +694,122 @@ def _settle_minor_keeps(
 def reasons() -> list[tuple[str, str]]:
     """Return the reasons a card can carry, hardest first, with labels."""
     return list(blocking_types.TYPES)
+
+
+# ── A volunteer claims a batch ──────────────────────────────────────
+
+#: How many cards one claim hands out, at most.
+CLAIM_COUNT = 250
+
+#: The longest reading a claimed card may hold, in words: a card a
+#: volunteer judges at a glance, never a run of text to read through.
+CLAIM_MAX_WORDS = 3
+
+
+def claimable(row: OpinionCard) -> bool:
+    """Whether a volunteer may claim this card.
+
+    A word card with its crop and one reading per engine of the three,
+    every reading short: a choice of three, judged off the crop alone.
+    A gap, a block, a one-engine block and a link card ("open the
+    document") are left to staff.
+
+    :param row: The card row.
+    :returns: Whether it is claimable.
+    """
+    card = row.card or {}
+    if row.kind != "word" or card.get("gap") or not card.get("crop"):
+        return False
+    readings = card.get("readings") or []
+    if len(readings) != 3:
+        return False
+    return all(
+        len((reading.get("word") or "").split()) <= CLAIM_MAX_WORDS
+        for reading in readings
+    )
+
+
+def open_rows():
+    """Return the card rows that wait on a person: the one rule.
+
+    Waiting (open or stale), of an opinion in the text review, on a
+    page whose finding still waits: a page a person dismissed on the
+    review page keeps its rows until the next build, and they are no
+    work. The cards page lists these, a claim hands out these, and a
+    person holds a card only when it is one of these, so a card someone
+    holds is always a card they can see.
+    """
+    return OpinionCard.objects.filter(
+        status__in=WAITING,
+        opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+    ).filter(
+        Exists(
+            OpinionFinding.objects.filter(
+                opinion_id=OuterRef("opinion_id"),
+                page_in_opinion=OuterRef("page_in_opinion"),
+                check_name=OuterRef("check_name"),
+                dismissal__isnull=True,
+            )
+        )
+    )
+
+
+def holds_open(user) -> bool:
+    """Whether a person holds an open card (:func:`open_rows`)."""
+    return open_rows().filter(assigned_to=user).exists()
+
+
+def claim(user, count: int = CLAIM_COUNT) -> int:
+    """Assign up to ``count`` claimable cards to ``user``.
+
+    The open rows (:func:`open_rows`) that :func:`claimable` takes,
+    the blocking cards first, then the minor warnings; whole opinions
+    at a time, so two volunteers never share an opinion's crops, in the
+    order of the volumes (the rule of ``assign_cards``); only opinions
+    whose text holds no picture. An opinion with more claimable cards
+    than the room left is skipped, never cut, so a claim never passes
+    ``count``: an opinion with more than ``count`` of them is left to
+    staff. The write is guarded on the rows still being unassigned, so
+    two claims at once never take the same card; the caller serializes
+    the claims of one person (``views_cards.claim_opinion_cards``).
+
+    :param user: Who claims.
+    :param count: The most cards to hand out.
+    :returns: How many cards were assigned.
+    """
+    picked: list[int] = []
+
+    def take(group: list[int]) -> None:
+        if group and len(picked) + len(group) <= count:
+            picked.extend(group)
+
+    for checks in (CARD_CHECKS, (MINOR_CHECK,)):
+        if len(picked) >= count:
+            break
+        rows = (
+            open_rows()
+            .filter(
+                assigned_to__isnull=True,
+                kind="word",
+                check_name__in=checks,
+                opinion__figure_digest="",
+            )
+            .only("pk", "opinion_id", "kind", "card")
+            .order_by("opinion__scan_id", "opinion_id", "pk")
+        )
+        current, group = None, []
+        for row in rows.iterator(chunk_size=500):
+            if row.opinion_id != current:
+                take(group)
+                if len(picked) >= count:
+                    group = []
+                    break
+                current, group = row.opinion_id, []
+            if claimable(row):
+                group.append(row.pk)
+        take(group)
+    if not picked:
+        return 0
+    return OpinionCard.objects.filter(
+        pk__in=picked, assigned_to__isnull=True
+    ).update(assigned_to=user)

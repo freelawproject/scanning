@@ -1,6 +1,8 @@
 /* The practice cards of the volunteers' FAQ (volunteer_practice.html):
  * a choice is checked against the card's data-answer and the card says
- * why. Nothing is sent anywhere. The keys are the card review's. */
+ * why. No answer is sent anywhere: once every card has been answered,
+ * the page tells the server the practice is done (the first claim waits
+ * on it). The keys are the card review's. */
 (function () {
     'use strict';
     var root = document.getElementById('practice');
@@ -27,9 +29,28 @@
         cards.forEach(function (other) { other.classList.toggle('bk-active', other === card); });
     }
 
+    var reported = root.dataset.practiced === '1';
     function countDone() {
         var n = cards.filter(function (card) { return card.classList.contains('bk-done'); }).length;
         if (doneNode) { doneNode.textContent = String(n); }
+        if (n === cards.length && cards.length) { finished(); }
+    }
+
+    // Every card answered, right or wrong: the server records the
+    // practice once, and the page offers the person's own cards.
+    function finished() {
+        var box = root.querySelector('[data-role="finished"]');
+        var hint = root.querySelector('[data-role="unfinished"]');
+        if (box) { box.classList.remove('hidden'); }
+        if (hint) { hint.classList.add('hidden'); }
+        if (reported || !root.dataset.doneUrl) { return; }
+        reported = true;
+        var token = root.querySelector('[name=csrfmiddlewaretoken]');
+        fetch(root.dataset.doneUrl, {
+            method: 'POST',
+            headers: { 'X-CSRFToken': token ? token.value : '' },
+        }).then(function (r) { if (!r.ok) { reported = false; } })
+          .catch(function () { reported = false; });
     }
 
     /* Judge a choice: the key of a row ('1', '2', '3', '0'), or typed

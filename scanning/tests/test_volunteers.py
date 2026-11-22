@@ -201,10 +201,26 @@ class TestTheirCards(VolunteerTestCase):
         # Past the gate: no PDF is written for this opinion, a 404.
         self.assertEqual(self.client.get(address).status_code, 404)
 
+    def test_the_page_offers_no_scan_volume_or_mine_filter(self):
+        """A volunteer's cards are their own, so the scan, volume and
+        "Assigned to me" filters are left off; a curator keeps them."""
+        answer = self.client.get(reverse("opinion_card_review"))
+        self.assertNotContains(answer, 'name="scan"')
+        self.assertNotContains(answer, 'name="volume"')
+        self.assertNotContains(answer, 'name="mine"')
+        self.assertContains(answer, 'name="level"')
+
+        self.client.force_login(self.make_user())
+        answer = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(answer, 'name="scan"')
+        self.assertContains(answer, 'name="volume"')
+        self.assertContains(answer, 'name="mine"')
+
     def test_the_header_offers_their_cards_and_the_help(self):
         answer = self.client.get(reverse("opinion_card_review"))
         self.assertContains(answer, "My cards")
         self.assertContains(answer, reverse("volunteer_faq"))
+        self.assertContains(answer, f'href="{reverse("volunteer_practice")}"')
         self.assertNotContains(answer, f'href="{reverse("stats")}"')
         self.assertNotContains(answer, f'href="{reverse("opinion_list")}"')
 
@@ -321,3 +337,138 @@ class TestThePractice(VolunteerTestCase):
         # The FAQ offers it, and the gate lets a volunteer in.
         faq = self.client.get(reverse("volunteer_faq"))
         self.assertContains(faq, reverse("volunteer_practice"))
+
+
+class TestTheClaim(VolunteerTestCase):
+    """A volunteer with an empty list claims a batch of short three-way
+    word cards, of opinions with no picture, and sees their total."""
+
+    def setUp(self):
+        super().setUp()
+        volunteers.mark_practiced(self.volunteer)
+        self.client.force_login(self.volunteer)
+
+    def claim(self):
+        return self.client.post(reverse("claim_opinion_cards"), follow=True)
+
+    def test_an_empty_list_offers_the_claim_and_the_claim_assigns(self):
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, reverse("claim_opinion_cards"))
+        self.assertContains(page, f"Claim {opinion_cards.CLAIM_COUNT} cards")
+
+        answer = self.claim()
+
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, self.volunteer)
+        self.assertContains(answer, "You claimed 1 card(s)")
+        self.assertNotContains(answer, reverse("claim_opinion_cards"))
+
+    def test_a_volunteer_who_holds_a_card_is_refused(self):
+        self.assign()
+        before = OpinionCard.objects.filter(assigned_to=self.volunteer).count()
+
+        answer = self.claim()
+
+        self.assertContains(answer, "Finish the cards you have first")
+        self.assertEqual(
+            OpinionCard.objects.filter(assigned_to=self.volunteer).count(),
+            before,
+        )
+
+    def test_an_opinion_with_a_picture_is_not_claimed(self):
+        self.opinion.figure_digest = "abc"
+        self.opinion.save(update_fields=["figure_digest"])
+
+        answer = self.claim()
+
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+        self.assertContains(answer, "no cards to claim")
+
+    def test_a_card_assigned_to_someone_else_is_not_claimed(self):
+        self.assign(self.make_user(username="other"))
+        self.claim()
+        self.card.refresh_from_db()
+        self.assertNotEqual(self.card.assigned_to, self.volunteer)
+
+    def test_a_held_card_whose_page_is_answered_holds_no_one(self):
+        """A card someone holds whose page finding is gone is no work: the
+        list does not show it, so it must not refuse their next claim."""
+        self.assign()
+        self.finding.delete()
+
+        self.assertFalse(opinion_cards.holds_open(self.volunteer))
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, reverse("claim_opinion_cards"))
+
+    def test_a_card_its_list_would_hide_is_not_claimed(self):
+        self.finding.delete()
+        answer = self.claim()
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+        self.assertContains(answer, "no cards to claim")
+
+    def test_an_opinion_bigger_than_the_claim_is_left_to_staff(self):
+        self.assertEqual(opinion_cards.claim(self.volunteer, count=0), 0)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+    def test_only_short_three_way_word_cards_are_claimable(self):
+        self.assertTrue(opinion_cards.claimable(self.card))
+        for change in (
+            lambda c: c["readings"].pop(),
+            lambda c: c["readings"][0].update(
+                word="a run of more than three words"
+            ),
+            lambda c: c.update(gap=True),
+            lambda c: c.update(crop=None),
+        ):
+            row = OpinionCard.objects.get(pk=self.card.pk)
+            change(row.card)
+            self.assertFalse(opinion_cards.claimable(row))
+
+    def test_the_page_shows_their_answered_total(self):
+        self.card.answered_by = self.volunteer
+        self.card.save(update_fields=["answered_by"])
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, "You've answered <b>1</b> card.")
+
+
+class TestThePracticeFirst(VolunteerTestCase):
+    """The first claim waits on the practice cards, once."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.volunteer)
+
+    def test_a_new_volunteer_is_sent_to_the_practice(self):
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, "Start the practice cards")
+        self.assertNotContains(page, reverse("claim_opinion_cards"))
+
+        answer = self.client.post(reverse("claim_opinion_cards"))
+
+        self.assertRedirects(answer, reverse("volunteer_practice"))
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+    def test_finishing_the_practice_opens_the_claim(self):
+        answer = self.client.post(reverse("volunteer_practice_done"))
+        self.assertEqual(answer.json()["status"], "ok")
+        self.assertTrue(volunteers.has_practiced(self.volunteer))
+
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, reverse("claim_opinion_cards"))
+        self.client.post(reverse("claim_opinion_cards"))
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, self.volunteer)
+
+    def test_someone_who_answered_a_card_has_practiced(self):
+        self.card.answered_by = self.volunteer
+        self.card.save(update_fields=["answered_by"])
+        self.assertTrue(volunteers.has_practiced(self.volunteer))
+
+    def test_the_practice_page_reports_where_to_send_done(self):
+        page = self.client.get(reverse("volunteer_practice"))
+        self.assertContains(page, reverse("volunteer_practice_done"))
+        self.assertContains(page, 'data-practiced="0"')

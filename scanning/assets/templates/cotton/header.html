@@ -22,8 +22,9 @@
     <nav class="hidden sm:flex items-center">
       {% if user.is_authenticated %}
         {% if is_volunteer %}
-        {# A volunteer sees their cards and the FAQ (scanning/volunteers.py). #}
+        {# A volunteer sees their cards, the practice cards and the FAQ (scanning/volunteers.py). #}
         <a href="{% url 'opinion_card_review' %}?mine=1" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-rectangle-list"></i> My cards</a>
+        <a href="{% url 'volunteer_practice' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-graduation-cap"></i> Practice</a>
         <a href="{% url 'volunteer_faq' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-circle-question"></i> Help</a>
         {% else %}
         <a href="{% url 'scan_list' %}" class="btn-ghost text-sm whitespace-nowrap"><i class="fa-solid fa-fw fa-book"></i> Scans</a>
@@ -65,6 +66,7 @@
       {% if user.is_authenticated %}
         {% if is_volunteer %}
         <a href="{% url 'opinion_card_review' %}?mine=1" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-rectangle-list"></i> My cards</a>
+        <a href="{% url 'volunteer_practice' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-graduation-cap"></i> Practice</a>
         <a href="{% url 'volunteer_faq' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-circle-question"></i> Help</a>
         {% else %}
         <a href="{% url 'scan_list' %}" class="block btn-ghost text-sm"><i class="fa-solid fa-fw fa-book"></i> Scans</a>

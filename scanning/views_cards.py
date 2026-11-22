@@ -9,16 +9,18 @@ writes the answers into the text later (``opinion_cards.apply``).
 from __future__ import annotations
 
 import json
+import logging
 
+from django.contrib import messages
 from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
-from django.shortcuts import get_object_or_404, render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
@@ -27,10 +29,11 @@ from scanning import blocking_types, opinion_cards, volunteers
 from scanning.models import (
     Opinion,
     OpinionCard,
-    OpinionFinding,
     OpinionReviewStatus,
     Scan,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The opinions of one page of the walk.
 OPINIONS_PER_PAGE = 25
@@ -115,20 +118,14 @@ def _rows(
     still waits on its finding: a page a person dismissed on the review
     page keeps its rows until the next build, and they are no work.
     """
-    rows = OpinionCard.objects.filter(
-        status__in=STATUS_FILTERS[filters["status"]],
-        opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
-    )
     if filters["status"] == "open":
-        rows = rows.filter(
-            Exists(
-                OpinionFinding.objects.filter(
-                    opinion_id=OuterRef("opinion_id"),
-                    page_in_opinion=OuterRef("page_in_opinion"),
-                    check_name=OuterRef("check_name"),
-                    dismissal__isnull=True,
-                )
-            )
+        # The one rule of an open card (``opinion_cards.open_rows``),
+        # which the claim and its hold check read too.
+        rows = opinion_cards.open_rows()
+    else:
+        rows = OpinionCard.objects.filter(
+            status__in=STATUS_FILTERS[filters["status"]],
+            opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
         )
     if filters["scan"]:
         rows = rows.filter(opinion__scan_id=filters["scan"])
@@ -288,8 +285,82 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
                 ("applied", "Applied"),
             ],
             "query": _query(filters),
+            **_claim_context(request, filters),
         },
     )
+
+
+#: The line after a claim, and the line when nothing was left to claim.
+CLAIMED_MESSAGE = "You claimed {n} card(s). They are below."
+NOTHING_TO_CLAIM_MESSAGE = (
+    "There are no cards to claim right now. Try again later."
+)
+#: The refusal of a first claim before the practice cards are done.
+PRACTICE_FIRST_MESSAGE = (
+    "Start with the practice cards: finish them once, then claim your "
+    "first batch."
+)
+#: The refusal of a claim while the person still holds open cards.
+STILL_HOLDING_MESSAGE = (
+    "Finish the cards you have first: a new batch can be claimed once "
+    "your list is empty."
+)
+
+
+def _claim_context(request: HttpRequest, filters: dict) -> dict:
+    """Return the claim button's state and the viewer's answered total.
+
+    Read on the viewer's own list alone (``mine``), the page a
+    volunteer always sees: the button shows when they hold no open card,
+    and the total counts every card they ever answered.
+    """
+    if not filters.get("mine"):
+        return {}
+    user = request.user
+    can_claim = not opinion_cards.holds_open(user)
+    return {
+        "can_claim": can_claim,
+        "must_practice": can_claim and not volunteers.has_practiced(user),
+        "answered_total": OpinionCard.objects.filter(answered_by=user).count(),
+        "claim_count": opinion_cards.CLAIM_COUNT,
+    }
+
+
+@login_required
+@require_POST
+def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
+    """Give the viewer a batch of cards, when their list is empty.
+
+    ``opinion_cards.claim`` picks them: short three-way word cards, the
+    blocking ones first, of opinions with no picture. A person who has
+    not finished the practice cards once is sent to them, and one who
+    still holds an open card is refused, so a batch is never stacked.
+    """
+    user = request.user
+    if not volunteers.has_practiced(user):
+        messages.warning(request, PRACTICE_FIRST_MESSAGE)
+        return redirect(reverse("volunteer_practice"))
+    # One claim of a person at a time: a double click or a second tab
+    # waits on the lock of their user row, then finds the first batch
+    # held and is refused, so a batch is never stacked.
+    with transaction.atomic():
+        get_user_model().objects.select_for_update().filter(pk=user.pk).first()
+        n = (
+            None
+            if opinion_cards.holds_open(user)
+            else opinion_cards.claim(user)
+        )
+    if n is None:
+        messages.warning(request, STILL_HOLDING_MESSAGE)
+    else:
+        logger.info(
+            "claim_opinion_cards: user=%s claimed %s card(s)", user.pk, n
+        )
+        if n:
+            messages.success(request, CLAIMED_MESSAGE.format(n=n))
+        else:
+            messages.info(request, NOTHING_TO_CLAIM_MESSAGE)
+    return redirect(reverse("opinion_card_review") + "?mine=1")
 
 
 def _card_of(row: OpinionCard, scan_pk: int) -> dict:
@@ -723,5 +794,21 @@ def volunteer_practice(request: HttpRequest) -> HttpResponse:
     return render(
         request,
         "scanning/volunteer_practice.html",
-        {"cards": volunteer_practice.cards()},
+        {
+            "cards": volunteer_practice.cards(),
+            "practiced": volunteers.has_practiced(request.user),
+        },
     )
+
+
+@login_required
+@require_POST
+def volunteer_practice_done(request: HttpRequest) -> JsonResponse:
+    """Record that the viewer finished every practice card.
+
+    The practice page's script sends it once the last card is answered,
+    right or wrong (each card says why); the first claim waits on it.
+    """
+    volunteers.mark_practiced(request.user)
+    logger.info("volunteer_practice_done: user=%s", request.user.pk)
+    return JsonResponse({"status": "ok", "cards_url": volunteers.home_url()})

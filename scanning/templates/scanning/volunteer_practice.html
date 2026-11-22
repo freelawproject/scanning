@@ -15,7 +15,7 @@
 {% endblock %}
 
 {% block content %}
-<div id="practice" class="max-w-3xl">
+<div id="practice" class="max-w-3xl" data-done-url="{% url 'volunteer_practice_done' %}" data-practiced="{{ practiced|yesno:'1,0' }}">{% csrf_token %}
   <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
     <h1 class="text-2xl font-bold">Practice cards</h1>
     <span class="text-sm text-gray-500 dark:text-gray-400">
@@ -72,9 +72,15 @@
   </article>
   {% endfor %}
 
-  <p class="text-sm text-gray-600 dark:text-gray-300 mt-6">
-    Done? <a href="{% url 'opinion_card_review' %}?mine=1" class="text-blue-600 dark:text-blue-400 hover:underline">Your cards are here.</a>
+  <div class="card mt-6{% if not practiced %} hidden{% endif %}" data-role="finished">
+    <p class="text-sm text-gray-700 dark:text-gray-200 mb-3">That's every practice card. You're ready for your own.</p>
+    <a href="{% url 'opinion_card_review' %}?mine=1" class="btn-primary text-sm">Go to my cards</a>
+  </div>
+  {% if not practiced %}
+  <p class="text-sm text-gray-600 dark:text-gray-300 mt-6" data-role="unfinished">
+    Answer every practice card once to start claiming cards of your own. A wrong answer counts: the card tells you why, and Try again lets you have another go.
   </p>
+  {% endif %}
 </div>
 <script src="{% static 'scanning/practice.js' %}"></script>
 {% endblock %}
