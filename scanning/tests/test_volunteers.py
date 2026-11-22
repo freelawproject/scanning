@@ -321,3 +321,64 @@ class TestThePractice(VolunteerTestCase):
         # The FAQ offers it, and the gate lets a volunteer in.
         faq = self.client.get(reverse("volunteer_faq"))
         self.assertContains(faq, reverse("volunteer_practice"))
+
+
+class TestTheAssigneeFilter(VolunteerTestCase):
+    """A curator's view of who holds what: the cards page filters by
+    assignee and names the holder of each opinion's cards."""
+
+    def setUp(self):
+        super().setUp()
+        self.curator = self.make_user(username="curator")
+        self.client.force_login(self.curator)
+        self.address = reverse("opinion_card_review") + "?reason=characters"
+
+    def total(self, query: str) -> int:
+        return self.client.get(self.address + query).context["card_total"]
+
+    def test_unassigned_and_assigned(self):
+        page = self.client.get(self.address + "&assigned=none")
+        self.assertEqual(page.context["card_total"], 1)
+        self.assertNotContains(page, 'data-role="holder"')
+        self.assertEqual(self.total("&assigned=any"), 0)
+
+        self.assign()
+        page = self.client.get(self.address + "&assigned=any")
+        self.assertEqual(page.context["card_total"], 1)
+        self.assertContains(page, "assigned to vol")
+        self.assertEqual(self.total("&assigned=none"), 0)
+        self.assertEqual(self.total(f"&assigned={self.volunteer.pk}"), 1)
+        self.assertEqual(self.total(f"&assigned={self.curator.pk}"), 0)
+
+    def test_the_choices_carry_the_counts(self):
+        self.assign()
+        page = self.client.get(self.address)
+        self.assertEqual(
+            page.context["assignee_choices"],
+            [
+                ("", "All"),
+                ("none", "Not assigned (0)"),
+                ("any", "Assigned (1)"),
+                (str(self.volunteer.pk), "vol (1)"),
+            ],
+        )
+        # The section's rows feed follows the filter.
+        rows = self.client.get(
+            reverse("opinion_card_rows", kwargs=self.card_kwargs())
+            + "?reason=characters&assigned=none"
+        ).json()
+        self.assertEqual(rows["cards"], [])
+
+    def test_a_bad_value_is_every_card(self):
+        page = self.client.get(self.address + "&assigned=x")
+        self.assertEqual(page.context["filters"]["assigned"], "")
+        self.assertEqual(page.context["card_total"], 1)
+
+    def test_a_volunteer_gets_no_such_filter(self):
+        self.assign()
+        self.client.force_login(self.volunteer)
+        page = self.client.get(self.address + "&assigned=none")
+        self.assertEqual(page.context["filters"]["assigned"], "")
+        self.assertEqual(page.context["assignee_choices"], [])
+        self.assertEqual(page.context["card_total"], 1)
+        self.assertNotContains(page, 'name="assigned"')

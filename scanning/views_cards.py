@@ -82,6 +82,13 @@ def _filters(request: HttpRequest) -> dict:
     scan = _whole_number(request.GET.get("scan"))
     volume = _whole_number(request.GET.get("volume"))
     level = request.GET.get("level", "")
+    # Whose cards: ``none`` the unassigned, ``any`` the assigned, a user
+    # pk one volunteer's. A curator's filter; a volunteer's page is
+    # theirs already.
+    assigned = request.GET.get("assigned", "")
+    if assigned not in ("none", "any") and not assigned.isdigit():
+        assigned = ""
+    volunteer = volunteers.of_request(request)
     return {
         "reason": reason if reason in blocking_types.LABELS else "",
         "level": level if level in LEVEL_FILTERS else "",
@@ -90,8 +97,8 @@ def _filters(request: HttpRequest) -> dict:
         "volume": str(volume) if volume is not None else "",
         # A volunteer sees their own cards and no others
         # (``scanning.volunteers``): the filter is forced, not offered.
-        "mine": request.GET.get("mine") == "1"
-        or volunteers.of_request(request),
+        "mine": request.GET.get("mine") == "1" or volunteer,
+        "assigned": "" if volunteer else assigned,
     }
 
 
@@ -136,6 +143,13 @@ def _rows(
         rows = rows.filter(opinion__scan__volume=filters["volume"])
     if filters["mine"]:
         rows = rows.filter(assigned_to=user)
+    assigned = filters.get("assigned")
+    if assigned == "none":
+        rows = rows.filter(assigned_to__isnull=True)
+    elif assigned == "any":
+        rows = rows.filter(assigned_to__isnull=False)
+    elif assigned:
+        rows = rows.filter(assigned_to_id=int(assigned))
     if with_reason and filters["reason"]:
         rows = rows.filter(reason=filters["reason"])
     if with_level and filters["level"]:
@@ -146,7 +160,12 @@ def _rows(
 def _level_counts(filters: dict, user) -> dict:
     """Return the blocking and the minor cards of the filters, the whole
     corpus's kept for :data:`COUNTS_TTL` like the tabs."""
-    scoped = filters["scan"] or filters["volume"] or filters["mine"]
+    scoped = (
+        filters["scan"]
+        or filters["volume"]
+        or filters["mine"]
+        or filters.get("assigned")
+    )
     key = "card-levels:" + _query(filters, level="")
     counts = None if scoped else cache.get(key)
     if counts is None:
@@ -177,9 +196,49 @@ def _level_counts(filters: dict, user) -> dict:
     return counts
 
 
+def _assignee_choices(filters: dict, user) -> list[tuple[str, str]]:
+    """Return the choices of the assignee filter, each with its count
+    under the page's other filters: the unassigned, the assigned, and
+    every volunteer holding one, by name."""
+    rows = _rows({**filters, "assigned": ""}, user)
+    unassigned = rows.filter(assigned_to__isnull=True).count()
+    by_user = list(
+        rows.filter(assigned_to__isnull=False)
+        .values_list("assigned_to_id", "assigned_to__username")
+        .annotate(n=Count("id"))
+        .order_by("assigned_to__username")
+    )
+    assigned = sum(n for _, _, n in by_user)
+    return [
+        ("", "All"),
+        ("none", f"Not assigned ({unassigned})"),
+        ("any", f"Assigned ({assigned})"),
+        *[(str(pk), f"{name} ({n})") for pk, name, n in by_user],
+    ]
+
+
+def _holders(rows, opinion_ids: list[int]) -> dict[int, str]:
+    """Return who holds the cards of each opinion of the page, the
+    names joined, under the page's filters."""
+    holders: dict[int, set[str]] = {}
+    for opinion_id, username in (
+        rows.filter(opinion_id__in=opinion_ids, assigned_to__isnull=False)
+        .order_by()
+        .values_list("opinion_id", "assigned_to__username")
+        .distinct()
+    ):
+        holders.setdefault(opinion_id, set()).add(username)
+    return {pk: ", ".join(sorted(names)) for pk, names in holders.items()}
+
+
 def _tabs(filters: dict, user) -> list[dict]:
     """Return one tab per reason with a card, hardest first."""
-    scoped = filters["scan"] or filters["volume"] or filters["mine"]
+    scoped = (
+        filters["scan"]
+        or filters["volume"]
+        or filters["mine"]
+        or filters.get("assigned")
+    )
     key = "card-reasons:" + _query(filters, reason="")
     counts = None if scoped else cache.get(key)
     if counts is None:
@@ -251,11 +310,16 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
         .order_by()
     )
     card_query = _query(
-        {key: filters[key] for key in ("reason", "level", "status", "mine")}
+        {
+            key: filters[key]
+            for key in ("reason", "level", "status", "mine", "assigned")
+        }
     )
+    holders = _holders(rows, [o.pk for o in page_obj])
     for opinion in page_obj:
         kwargs = {"pk": opinion.scan_id, "opinion_pk": opinion.pk}
         opinion.card_count = counts.get(opinion.pk, 0)
+        opinion.assignees = holders.get(opinion.pk, "")
         opinion.cards_url = (
             reverse("opinion_card_rows", kwargs=kwargs) + f"?{card_query}"
         )
@@ -281,6 +345,11 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
                 ),
             ],
             "card_total": rows.count(),
+            "assignee_choices": (
+                []
+                if volunteers.of_request(request)
+                else _assignee_choices(filters, request.user)
+            ),
             "status_choices": [
                 ("open", "Open"),
                 ("answered", "Answered, not applied"),

@@ -46,6 +46,15 @@
         {% endfor %}
       </select>
     </label>
+    {% if assignee_choices %}
+    <label>Assigned
+      <select name="assigned" class="input-text text-sm">
+        {% for value, label in assignee_choices %}
+        <option value="{{ value }}"{% if value == filters.assigned %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% endif %}
     <label class="flex items-center gap-1"><input type="checkbox" name="mine" value="1"{% if filters.mine %} checked{% endif %} class="rounded"> Assigned to me</label>
     <button type="submit" class="btn-outline text-sm">Filter</button>
   </form>
@@ -77,6 +86,7 @@
         <span class="text-sm font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
       </h2>
       <span class="text-xs text-gray-500 dark:text-gray-400" data-role="meta">{{ opinion.card_count }} card(s)</span>
+      {% if opinion.assignees %}<span class="text-xs text-gray-500 dark:text-gray-400" data-role="holder">assigned to {{ opinion.assignees }}</span>{% endif %}
       <span class="flex items-center gap-2">
         {% if not is_volunteer %}<a href="{{ opinion.review_url }}" class="btn-ghost text-xs">Open the review page</a>{% endif %}
         <button type="button" class="hidden" data-role="approve" disabled></button>
