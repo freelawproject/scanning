@@ -73,6 +73,7 @@ from scanning.views_api import (
 )
 from scanning.views_cards import (
     answer_opinion_card,
+    claim_opinion_cards,
     opinion_card_answers,
     opinion_card_review,
     opinion_card_rows,
@@ -161,6 +162,11 @@ urlpatterns = [
         name="opinion_card_answers",
     ),
     path("opinions/cards/help/", volunteer_faq, name="volunteer_faq"),
+    path(
+        "opinions/cards/claim/",
+        claim_opinion_cards,
+        name="claim_opinion_cards",
+    ),
     path(
         "opinions/cards/practice/",
         volunteer_practice,

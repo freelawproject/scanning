@@ -9,8 +9,10 @@ writes the answers into the text later (``opinion_cards.apply``).
 from __future__ import annotations
 
 import json
+import logging
 
 from django.contrib.auth import get_user_model
+from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
@@ -18,7 +20,7 @@ from django.core.paginator import Paginator
 from django.db import transaction
 from django.db.models import Count, Exists, OuterRef, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
-from django.shortcuts import get_object_or_404, render
+from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
@@ -31,6 +33,8 @@ from scanning.models import (
     OpinionReviewStatus,
     Scan,
 )
+
+logger = logging.getLogger(__name__)
 
 #: The opinions of one page of the walk.
 OPINIONS_PER_PAGE = 25
@@ -288,8 +292,64 @@ def opinion_card_review(request: HttpRequest) -> HttpResponse:
                 ("applied", "Applied"),
             ],
             "query": _query(filters),
+            **_claim_context(request, filters),
         },
     )
+
+
+#: The line after a claim, and the line when nothing was left to claim.
+CLAIMED_MESSAGE = "You claimed {n} card(s). They are below."
+NOTHING_TO_CLAIM_MESSAGE = (
+    "There are no cards to claim right now. Try again later."
+)
+#: The refusal of a claim while the person still holds open cards.
+STILL_HOLDING_MESSAGE = (
+    "Finish the cards you have first: a new batch can be claimed once "
+    "your list is empty."
+)
+
+
+def _claim_context(request: HttpRequest, filters: dict) -> dict:
+    """Return the claim button's state and the viewer's answered total.
+
+    Read on the viewer's own list alone (``mine``), the page a
+    volunteer always sees: the button shows when they hold no open card,
+    and the total counts every card they ever answered.
+    """
+    if not filters.get("mine"):
+        return {}
+    user = request.user
+    return {
+        "can_claim": not OpinionCard.objects.filter(
+            assigned_to=user, status__in=opinion_cards.WAITING
+        ).exists(),
+        "answered_total": OpinionCard.objects.filter(answered_by=user).count(),
+        "claim_count": opinion_cards.CLAIM_COUNT,
+    }
+
+
+@login_required
+@require_POST
+def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
+    """Give the viewer a batch of cards, when their list is empty.
+
+    ``opinion_cards.claim`` picks them: short three-way word cards, the
+    blocking ones first, of opinions with no picture. A person who
+    still holds an open card is refused, so a batch is never stacked.
+    """
+    user = request.user
+    if OpinionCard.objects.filter(
+        assigned_to=user, status__in=opinion_cards.WAITING
+    ).exists():
+        messages.warning(request, STILL_HOLDING_MESSAGE)
+    else:
+        n = opinion_cards.claim(user)
+        logger.info("claim_opinion_cards: user=%s claimed %s card(s)", user.pk, n)
+        if n:
+            messages.success(request, CLAIMED_MESSAGE.format(n=n))
+        else:
+            messages.info(request, NOTHING_TO_CLAIM_MESSAGE)
+    return redirect(reverse("opinion_card_review") + "?mine=1")
 
 
 def _card_of(row: OpinionCard, scan_pk: int) -> dict:

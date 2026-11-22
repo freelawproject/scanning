@@ -30,8 +30,10 @@
 
   <form method="get" class="flex flex-wrap items-center gap-2 mb-3 text-sm">
     {% if filters.reason %}<input type="hidden" name="reason" value="{{ filters.reason }}">{% endif %}
+    {% if not is_volunteer %}
     <label>Scan <input type="text" name="scan" value="{{ filters.scan }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
     <label>Volume <input type="text" name="volume" value="{{ filters.volume }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    {% endif %}
     <label>Level
       <select name="level" class="input-text text-sm">
         {% for value, label in level_choices %}
@@ -46,10 +48,16 @@
         {% endfor %}
       </select>
     </label>
+    {% if not is_volunteer %}
+    {# A volunteer's own cards are the only ones they are shown: the filter is forced (views_cards._filters), not offered. #}
     <label class="flex items-center gap-1"><input type="checkbox" name="mine" value="1"{% if filters.mine %} checked{% endif %} class="rounded"> Assigned to me</label>
+    {% endif %}
     <button type="submit" class="btn-outline text-sm">Filter</button>
   </form>
 
+  {% if answered_total is not None %}
+  <p class="text-sm mb-2">You've answered <b>{{ answered_total }}</b> card{{ answered_total|pluralize }}.</p>
+  {% endif %}
   <p class="text-sm mb-2">
     <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking{% if levels.pending %} ({{ levels.pending }} of them minor warnings after the next build){% endif %}
     · <b class="text-amber-700 dark:text-amber-400">{{ levels.minor }}</b> minor warnings (no approval waits on them)
@@ -86,7 +94,15 @@
   </section>
   {% empty %}
   <div class="card">
+    {% if can_claim %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">You have no cards right now. Claim a batch to start: up to {{ claim_count }} cards, each a choice of three short readings.</p>
+    <form method="post" action="{% url 'claim_opinion_cards' %}">
+      {% csrf_token %}
+      <button type="submit" class="btn-primary text-sm">Claim {{ claim_count }} cards</button>
+    </form>
+    {% else %}
     <p class="text-sm text-gray-600 dark:text-gray-300">No card matches these filters.</p>
+    {% endif %}
   </div>
   {% endfor %}
 

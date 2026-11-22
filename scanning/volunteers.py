@@ -37,13 +37,15 @@ from django.urls import reverse
 GROUP = "volunteers"
 
 #: The url names a volunteer may reach: the cards page, the rows feed,
-#: the answer and the redacted-PDF link its script calls, the FAQ, and
+#: the answer and the redacted-PDF link its script calls, the claim of a
+#: batch, the FAQ, and
 #: the account pages. A name not here is sent to :func:`home_url`.
 URL_NAMES = frozenset(
     {
         "opinion_card_review",
         "opinion_card_rows",
         "answer_opinion_card",
+        "claim_opinion_cards",
         "opinion_pdf_url",
         "volunteer_faq",
         "volunteer_practice",
