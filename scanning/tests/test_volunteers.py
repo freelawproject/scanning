@@ -391,6 +391,28 @@ class TestTheClaim(VolunteerTestCase):
         self.card.refresh_from_db()
         self.assertNotEqual(self.card.assigned_to, self.volunteer)
 
+    def test_a_held_card_whose_page_is_answered_holds_no_one(self):
+        """A card someone holds whose page finding is gone is no work: the
+        list does not show it, so it must not refuse their next claim."""
+        self.assign()
+        self.finding.delete()
+
+        self.assertFalse(opinion_cards.holds_open(self.volunteer))
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, reverse("claim_opinion_cards"))
+
+    def test_a_card_its_list_would_hide_is_not_claimed(self):
+        self.finding.delete()
+        answer = self.claim()
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+        self.assertContains(answer, "no cards to claim")
+
+    def test_an_opinion_bigger_than_the_claim_is_left_to_staff(self):
+        self.assertEqual(opinion_cards.claim(self.volunteer, count=0), 0)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
     def test_only_short_three_way_word_cards_are_claimable(self):
         self.assertTrue(opinion_cards.claimable(self.card))
         for change in (

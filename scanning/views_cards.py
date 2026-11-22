@@ -18,7 +18,7 @@ from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
 from django.core.paginator import Paginator
 from django.db import transaction
-from django.db.models import Count, Exists, OuterRef, Q
+from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
@@ -29,7 +29,6 @@ from scanning import blocking_types, opinion_cards, volunteers
 from scanning.models import (
     Opinion,
     OpinionCard,
-    OpinionFinding,
     OpinionReviewStatus,
     Scan,
 )
@@ -119,20 +118,14 @@ def _rows(
     still waits on its finding: a page a person dismissed on the review
     page keeps its rows until the next build, and they are no work.
     """
-    rows = OpinionCard.objects.filter(
-        status__in=STATUS_FILTERS[filters["status"]],
-        opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
-    )
     if filters["status"] == "open":
-        rows = rows.filter(
-            Exists(
-                OpinionFinding.objects.filter(
-                    opinion_id=OuterRef("opinion_id"),
-                    page_in_opinion=OuterRef("page_in_opinion"),
-                    check_name=OuterRef("check_name"),
-                    dismissal__isnull=True,
-                )
-            )
+        # The one rule of an open card (``opinion_cards.open_rows``),
+        # which the claim and its hold check read too.
+        rows = opinion_cards.open_rows()
+    else:
+        rows = OpinionCard.objects.filter(
+            status__in=STATUS_FILTERS[filters["status"]],
+            opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
         )
     if filters["scan"]:
         rows = rows.filter(opinion__scan_id=filters["scan"])
@@ -324,9 +317,7 @@ def _claim_context(request: HttpRequest, filters: dict) -> dict:
     if not filters.get("mine"):
         return {}
     user = request.user
-    can_claim = not OpinionCard.objects.filter(
-        assigned_to=user, status__in=opinion_cards.WAITING
-    ).exists()
+    can_claim = not opinion_cards.holds_open(user)
     return {
         "can_claim": can_claim,
         "must_practice": can_claim and not volunteers.has_practiced(user),
@@ -349,12 +340,15 @@ def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
     if not volunteers.has_practiced(user):
         messages.warning(request, PRACTICE_FIRST_MESSAGE)
         return redirect(reverse("volunteer_practice"))
-    if OpinionCard.objects.filter(
-        assigned_to=user, status__in=opinion_cards.WAITING
-    ).exists():
+    # One claim of a person at a time: a double click or a second tab
+    # waits on the lock of their user row, then finds the first batch
+    # held and is refused, so a batch is never stacked.
+    with transaction.atomic():
+        get_user_model().objects.select_for_update().filter(pk=user.pk).first()
+        n = None if opinion_cards.holds_open(user) else opinion_cards.claim(user)
+    if n is None:
         messages.warning(request, STILL_HOLDING_MESSAGE)
     else:
-        n = opinion_cards.claim(user)
         logger.info(
             "claim_opinion_cards: user=%s claimed %s card(s)", user.pk, n
         )

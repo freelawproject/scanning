@@ -24,6 +24,7 @@ import logging
 from collections import Counter, defaultdict
 
 from django.db import transaction
+from django.db.models import Exists, OuterRef
 from django.utils import timezone
 
 from scanning import blocking_review, blocking_types, ensemble, opinion_edits
@@ -728,31 +729,69 @@ def claimable(row: OpinionCard) -> bool:
     )
 
 
+def open_rows():
+    """Return the card rows that wait on a person: the one rule.
+
+    Waiting (open or stale), of an opinion in the text review, on a
+    page whose finding still waits: a page a person dismissed on the
+    review page keeps its rows until the next build, and they are no
+    work. The cards page lists these, a claim hands out these, and a
+    person holds a card only when it is one of these, so a card someone
+    holds is always a card they can see.
+    """
+    return OpinionCard.objects.filter(
+        status__in=WAITING,
+        opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
+    ).filter(
+        Exists(
+            OpinionFinding.objects.filter(
+                opinion_id=OuterRef("opinion_id"),
+                page_in_opinion=OuterRef("page_in_opinion"),
+                check_name=OuterRef("check_name"),
+                dismissal__isnull=True,
+            )
+        )
+    )
+
+
+def holds_open(user) -> bool:
+    """Whether a person holds an open card (:func:`open_rows`)."""
+    return open_rows().filter(assigned_to=user).exists()
+
+
 def claim(user, count: int = CLAIM_COUNT) -> int:
     """Assign up to ``count`` claimable cards to ``user``.
 
-    The blocking cards first, then the minor warnings; whole opinions
-    at a time, so two volunteers never share an opinion's crops, and
-    in the order of the volumes (the rule of ``assign_cards``); only
-    opinions in text review whose text holds no picture. The write is
-    guarded on the rows still being unassigned, so two claims at once
-    never take the same card.
+    The open rows (:func:`open_rows`) that :func:`claimable` takes,
+    the blocking cards first, then the minor warnings; whole opinions
+    at a time, so two volunteers never share an opinion's crops, in the
+    order of the volumes (the rule of ``assign_cards``); only opinions
+    whose text holds no picture. An opinion with more claimable cards
+    than the room left is skipped, never cut, so a claim never passes
+    ``count``: an opinion with more than ``count`` of them is left to
+    staff. The write is guarded on the rows still being unassigned, so
+    two claims at once never take the same card; the caller serializes
+    the claims of one person (``views_cards.claim_opinion_cards``).
 
     :param user: Who claims.
     :param count: The most cards to hand out.
     :returns: How many cards were assigned.
     """
     picked: list[int] = []
+
+    def take(group: list[int]) -> None:
+        if group and len(picked) + len(group) <= count:
+            picked.extend(group)
+
     for checks in (CARD_CHECKS, (MINOR_CHECK,)):
         if len(picked) >= count:
             break
         rows = (
-            OpinionCard.objects.filter(
-                status__in=WAITING,
+            open_rows()
+            .filter(
                 assigned_to__isnull=True,
                 kind="word",
                 check_name__in=checks,
-                opinion__status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW,
                 opinion__figure_digest="",
             )
             .only("pk", "opinion_id", "kind", "card")
@@ -761,20 +800,14 @@ def claim(user, count: int = CLAIM_COUNT) -> int:
         current, group = None, []
         for row in rows.iterator(chunk_size=500):
             if row.opinion_id != current:
-                if group and (not picked or len(picked) + len(group) <= count):
-                    picked += group
+                take(group)
                 if len(picked) >= count:
                     group = []
                     break
                 current, group = row.opinion_id, []
             if claimable(row):
                 group.append(row.pk)
-        if (
-            group
-            and len(picked) < count
-            and (not picked or len(picked) + len(group) <= count)
-        ):
-            picked += group
+        take(group)
     if not picked:
         return 0
     return OpinionCard.objects.filter(
