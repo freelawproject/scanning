@@ -1007,6 +1007,25 @@ class TestTheCard(ScanningTestCase):
         self.assertIsNotNone(self.cards().get().dismissal_id)
         self.assertEqual(ReviewDismissal.objects.count(), 1)
 
+    def test_a_dismissed_card_offers_to_cover_it_with_the_margin(self):
+        """The dismissed card keeps its Undo and offers "Cover with
+        margin", which the open card does not: the block is judged not
+        text before the margin is pulled over it."""
+        findings.rebuild(self.scan, run=None)
+        self.client.force_login(self.make_user())
+        url = reverse("review_findings", kwargs={"pk": self.scan.pk})
+        self.assertNotIn(
+            "coverWithMargin(this)", self.client.get(url).json()["html"]
+        )
+
+        findings.dismiss(self.scan, self.cards().get(), self.make_user())
+        findings.rebuild(self.scan, run=None)
+        html = self.client.get(url).json()["html"]
+
+        self.assertIn("coverWithMargin(this)", html)
+        self.assertIn("Cover with margin", html)
+        self.assertIn("data-cover-margin", html)
+
 
 #: A line of text in the reader's render: x 108-540 pt, y 360-378 pt.
 LINE = [300.0, 1000.0, 1500.0, 1050.0]
