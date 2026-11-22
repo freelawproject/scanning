@@ -575,6 +575,21 @@ class TestThePageFollowsTheGroups(ScanningTestCase):
         self.assertIn("var writes = Promise.resolve();", source)
         self.assertIn("writes.then(send, send)", source)
 
+    def test_return_adds_a_drawn_box_before_the_form_field_rule(self):
+        """A box just drawn waits in its label menu: Return presses its
+        Add and Esc its Cancel, wherever the focus is, so the select the
+        menu focuses and an Add button reached by Tab both add the box
+        and never answer the card. The menu's keys come before the rule
+        that leaves a form field's keys alone."""
+        source = SCRIPT.read_text()
+        self.assertIn("add.dataset.role = 'draw-add';", source)
+        self.assertIn("cancel.dataset.role = 'draw-cancel';", source)
+        handler = source[source.index("function onKey(event)") :]
+        self.assertLess(
+            handler.index("'.cr-draw-popup'"),
+            handler.index("INPUT|TEXTAREA|SELECT"),
+        )
+
     def test_the_script_lists_the_groups(self):
         source = SCRIPT.read_text()
         match = re.search(r"var GROUPS = \[([^\]]*)\];", source)
