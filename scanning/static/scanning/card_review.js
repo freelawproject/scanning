@@ -457,6 +457,8 @@
         popup.appendChild(select);
         var add = el('button', 'btn-primary text-xs', 'Add');
         add.type = 'button';
+        add.dataset.role = 'draw-add';
+        add.title = 'Key: Return';
         add.addEventListener('click', function () {
             add.disabled = true;
             var option = select.options[select.selectedIndex];
@@ -465,6 +467,8 @@
         popup.appendChild(add);
         var cancel = el('button', 'btn-outline text-xs', 'Cancel');
         cancel.type = 'button';
+        cancel.dataset.role = 'draw-cancel';
+        cancel.title = 'Key: Esc';
         cancel.addEventListener('click', function () { band.remove(); popup.remove(); });
         popup.appendChild(cancel);
         var crop = cropOf(card);
@@ -1555,8 +1559,23 @@
     }
 
     function onKey(event) {
-        if (event.target && /INPUT|TEXTAREA|SELECT/.test(event.target.tagName)) { return; }
         if (event.metaKey || event.ctrlKey || event.altKey) { return; }
+        // A box just drawn waits for its label: Return adds it with the
+        // label the menu shows, Esc throws it away. The menu's own select
+        // holds the focus then, so this comes before the rule that leaves
+        // every key in a form field alone; without it Return did nothing
+        // there, and once the focus had left the menu it answered the card
+        // instead of adding the box.
+        var popup = root.querySelector('.cr-draw-popup');
+        if (popup && (event.key === 'Enter' || event.key === 'Escape')) {
+            var target = popup.querySelector(event.key === 'Enter' ? '[data-role="draw-add"]' : '[data-role="draw-cancel"]');
+            if (target && !target.disabled) {
+                event.preventDefault();
+                target.click();
+                return;
+            }
+        }
+        if (event.target && /INPUT|TEXTAREA|SELECT/.test(event.target.tagName)) { return; }
         var drawing = root.querySelector('.cr-layer.cr-drawing');
         if (drawing && event.key === 'Escape') {
             event.preventDefault();
