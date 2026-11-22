@@ -1024,6 +1024,7 @@ class TestTheCard(ScanningTestCase):
 
         self.assertIn("coverWithMargin(this)", html)
         self.assertIn("Cover with margin", html)
+        self.assertIn("data-cover-margin", html)
 
 
 #: A line of text in the reader's render: x 108-540 pt, y 360-378 pt.

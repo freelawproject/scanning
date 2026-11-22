@@ -952,8 +952,14 @@ document.addEventListener('DOMContentLoaded', function () {
     // Answers whether it showed the line, so a write that dismissed
     // nothing shows the plain one.
     function dropDismissedUnder(data, pageDiv) {
+        return _dropDismissed(data, pageDiv) !== null;
+    }
+    // The boxes the server dismissed under a whiteout leave the page, and
+    // one toast offers their Undo. Answers the rows taken off (the ones a
+    // restore puts back), or null when the server dismissed nothing.
+    function _dropDismissed(data, pageDiv) {
         var ids = (data && data.dismissed) || [];
-        if (!ids.length) return false;
+        if (!ids.length) return null;
         var removed = [];
         if (allDetections) {
             allDetections = allDetections.filter(function (det) {
@@ -968,8 +974,16 @@ document.addEventListener('DOMContentLoaded', function () {
             label: 'Undo',
             onClick: function () { restoreDismissed(ids, removed, pageDiv, pageIndex); },
         });
-        return true;
+        return removed;
     }
+    // The sidebar's "Cover with margin" (viewer_sidebar.js): the drop of
+    // the boxes its move dismissed, and their restore when it uncovers.
+    window.marginCoverDropped = function (data, pageIndex) {
+        return _dropDismissed(data, _pageDivForIndex(pageIndex)) || [];
+    };
+    window.marginCoverRestore = function (ids, removed, pageIndex) {
+        restoreDismissed(ids, removed, _pageDivForIndex(pageIndex), pageIndex);
+    };
     // One restore after another, never all at once: every restore
     // rebuilds the findings, and two in flight could leave the cards
     // at the slower one's older snapshot. The page refreshes once, at
@@ -2251,19 +2265,29 @@ document.addEventListener('DOMContentLoaded', function () {
             if (entry.page_index !== pageIndex) return;
             (entry.rects || []).forEach(function(rect) {
                 if (rect.rect_type !== 'margin') return;
-                // The bottom strip: wider than tall, in the lower half.
-                if ((rect.x1 - rect.x0) <= (rect.y1 - rect.y0)) return;
-                if (rect.y0 < vp.height / 2) return;
-                if (!strip || rect.y1 > strip.y1) strip = rect;
+                // The bottom strip, by its foot: it ends near the bottom
+                // of the page, whatever its top, so a strip already pulled
+                // up (by this button, or by hand) is still found.
+                if (rect.y1 < vp.height * 0.9) return;
+                if ((rect.x1 - rect.x0) < vp.width / 2) return;
+                if (!strip || rect.y1 > strip.y1 || (rect.y1 === strip.y1 && rect.y0 < strip.y0)) strip = rect;
             });
         });
         if (!strip) return null;
         var top = bboxPx[1] * vp.height / imgH - MARGIN_COVER_PAD_PT;
         return {
             id: strip.id,
+            origin: strip.origin,
             from: {x0: strip.x0, y0: strip.y0, x1: strip.x1, y1: strip.y1},
             to: {x0: strip.x0, y0: Math.max(0, Math.min(top, strip.y0)), x1: strip.x1, y1: strip.y1},
         };
+    };
+
+    // The boxes of one page read again from the server and drawn: after
+    // a restore, which brings a computed row back and takes its moved copy
+    // away, so no local edit can say what stands.
+    window.reloadRedactionPage = function(pageIndex) {
+        loadRedactionRows(function () { drawRedactionOverlaysForPage(pageIndex); });
     };
 
     // A box taken out from outside the page (the sidebar's "Remove the

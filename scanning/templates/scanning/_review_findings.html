@@ -76,7 +76,7 @@
     <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Take the dismissal back" onclick="event.stopPropagation(); restoreFinding(this, {{ issue.pk }})">Undo</button>
     {% if issue.check_name == 'undetected_text' and issue.metadata.bbox %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-indigo-600 text-white hover:bg-indigo-700" title="Pull the page's bottom margin up to just over this block, so the block and everything under it is whited out. Press again to put the margin back."
-            onclick="event.stopPropagation(); coverWithMargin(this)">Cover with margin</button>
+            data-cover-margin onclick="event.stopPropagation(); coverWithMargin(this)">Cover with margin</button>
     {% endif %}
     {% elif issue.is_stale %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" title="Take back the decision this finding names. The model's answer stands; make the decision again on the page as it is now." onclick="event.stopPropagation(); withdrawStaleEdit(this, {{ issue.pk }})">Withdraw</button>
