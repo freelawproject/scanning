@@ -371,7 +371,8 @@ class TestTheClaim(VolunteerTestCase):
 
         self.assertContains(answer, "Finish the cards you have first")
         self.assertEqual(
-            OpinionCard.objects.filter(assigned_to=self.volunteer).count(), before
+            OpinionCard.objects.filter(assigned_to=self.volunteer).count(),
+            before,
         )
 
     def test_an_opinion_with_a_picture_is_not_claimed(self):
@@ -394,7 +395,9 @@ class TestTheClaim(VolunteerTestCase):
         self.assertTrue(opinion_cards.claimable(self.card))
         for change in (
             lambda c: c["readings"].pop(),
-            lambda c: c["readings"][0].update(word="a run of more than three words"),
+            lambda c: c["readings"][0].update(
+                word="a run of more than three words"
+            ),
             lambda c: c.update(gap=True),
             lambda c: c.update(crop=None),
         ):

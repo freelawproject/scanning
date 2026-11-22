@@ -769,7 +769,11 @@ def claim(user, count: int = CLAIM_COUNT) -> int:
                 current, group = row.opinion_id, []
             if claimable(row):
                 group.append(row.pk)
-        if group and len(picked) < count and (not picked or len(picked) + len(group) <= count):
+        if (
+            group
+            and len(picked) < count
+            and (not picked or len(picked) + len(group) <= count)
+        ):
             picked += group
     if not picked:
         return 0

@@ -11,8 +11,8 @@ from __future__ import annotations
 import json
 import logging
 
-from django.contrib.auth import get_user_model
 from django.contrib import messages
+from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied
@@ -355,7 +355,9 @@ def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
         messages.warning(request, STILL_HOLDING_MESSAGE)
     else:
         n = opinion_cards.claim(user)
-        logger.info("claim_opinion_cards: user=%s claimed %s card(s)", user.pk, n)
+        logger.info(
+            "claim_opinion_cards: user=%s claimed %s card(s)", user.pk, n
+        )
         if n:
             messages.success(request, CLAIMED_MESSAGE.format(n=n))
         else:
@@ -811,6 +813,4 @@ def volunteer_practice_done(request: HttpRequest) -> JsonResponse:
     """
     volunteers.mark_practiced(request.user)
     logger.info("volunteer_practice_done: user=%s", request.user.pk)
-    return JsonResponse(
-        {"status": "ok", "cards_url": volunteers.home_url()}
-    )
+    return JsonResponse({"status": "ok", "cards_url": volunteers.home_url()})
