@@ -345,7 +345,11 @@ def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
     # held and is refused, so a batch is never stacked.
     with transaction.atomic():
         get_user_model().objects.select_for_update().filter(pk=user.pk).first()
-        n = None if opinion_cards.holds_open(user) else opinion_cards.claim(user)
+        n = (
+            None
+            if opinion_cards.holds_open(user)
+            else opinion_cards.claim(user)
+        )
     if n is None:
         messages.warning(request, STILL_HOLDING_MESSAGE)
     else:
