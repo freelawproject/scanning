@@ -1014,7 +1014,9 @@ class TestTheCard(ScanningTestCase):
         findings.rebuild(self.scan, run=None)
         self.client.force_login(self.make_user())
         url = reverse("review_findings", kwargs={"pk": self.scan.pk})
-        self.assertNotIn("coverWithMargin(this)", self.client.get(url).json()["html"])
+        self.assertNotIn(
+            "coverWithMargin(this)", self.client.get(url).json()["html"]
+        )
 
         findings.dismiss(self.scan, self.cards().get(), self.make_user())
         findings.rebuild(self.scan, run=None)
