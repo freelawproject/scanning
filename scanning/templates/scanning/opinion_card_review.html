@@ -94,7 +94,10 @@
   </section>
   {% empty %}
   <div class="card">
-    {% if can_claim %}
+    {% if must_practice %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">Welcome! Before your first cards, go through the practice cards once: real cards with the right answer and why. When you have answered them all, come back here to claim your cards.</p>
+    <a href="{% url 'volunteer_practice' %}" class="btn-primary text-sm">Start the practice cards</a>
+    {% elif can_claim %}
     <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">You have no cards right now. Claim a batch to start: up to {{ claim_count }} cards, each a choice of three short readings.</p>
     <form method="post" action="{% url 'claim_opinion_cards' %}">
       {% csrf_token %}

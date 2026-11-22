@@ -302,6 +302,11 @@ CLAIMED_MESSAGE = "You claimed {n} card(s). They are below."
 NOTHING_TO_CLAIM_MESSAGE = (
     "There are no cards to claim right now. Try again later."
 )
+#: The refusal of a first claim before the practice cards are done.
+PRACTICE_FIRST_MESSAGE = (
+    "Start with the practice cards: finish them once, then claim your "
+    "first batch."
+)
 #: The refusal of a claim while the person still holds open cards.
 STILL_HOLDING_MESSAGE = (
     "Finish the cards you have first: a new batch can be claimed once "
@@ -319,10 +324,12 @@ def _claim_context(request: HttpRequest, filters: dict) -> dict:
     if not filters.get("mine"):
         return {}
     user = request.user
+    can_claim = not OpinionCard.objects.filter(
+        assigned_to=user, status__in=opinion_cards.WAITING
+    ).exists()
     return {
-        "can_claim": not OpinionCard.objects.filter(
-            assigned_to=user, status__in=opinion_cards.WAITING
-        ).exists(),
+        "can_claim": can_claim,
+        "must_practice": can_claim and not volunteers.has_practiced(user),
         "answered_total": OpinionCard.objects.filter(answered_by=user).count(),
         "claim_count": opinion_cards.CLAIM_COUNT,
     }
@@ -334,10 +341,14 @@ def claim_opinion_cards(request: HttpRequest) -> HttpResponse:
     """Give the viewer a batch of cards, when their list is empty.
 
     ``opinion_cards.claim`` picks them: short three-way word cards, the
-    blocking ones first, of opinions with no picture. A person who
+    blocking ones first, of opinions with no picture. A person who has
+    not finished the practice cards once is sent to them, and one who
     still holds an open card is refused, so a batch is never stacked.
     """
     user = request.user
+    if not volunteers.has_practiced(user):
+        messages.warning(request, PRACTICE_FIRST_MESSAGE)
+        return redirect(reverse("volunteer_practice"))
     if OpinionCard.objects.filter(
         assigned_to=user, status__in=opinion_cards.WAITING
     ).exists():
@@ -783,5 +794,23 @@ def volunteer_practice(request: HttpRequest) -> HttpResponse:
     return render(
         request,
         "scanning/volunteer_practice.html",
-        {"cards": volunteer_practice.cards()},
+        {
+            "cards": volunteer_practice.cards(),
+            "practiced": volunteers.has_practiced(request.user),
+        },
+    )
+
+
+@login_required
+@require_POST
+def volunteer_practice_done(request: HttpRequest) -> JsonResponse:
+    """Record that the viewer finished every practice card.
+
+    The practice page's script sends it once the last card is answered,
+    right or wrong (each card says why); the first claim waits on it.
+    """
+    volunteers.mark_practiced(request.user)
+    logger.info("volunteer_practice_done: user=%s", request.user.pk)
+    return JsonResponse(
+        {"status": "ok", "cards_url": volunteers.home_url()}
     )

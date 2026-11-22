@@ -345,6 +345,7 @@ class TestTheClaim(VolunteerTestCase):
 
     def setUp(self):
         super().setUp()
+        volunteers.mark_practiced(self.volunteer)
         self.client.force_login(self.volunteer)
 
     def claim(self):
@@ -406,3 +407,43 @@ class TestTheClaim(VolunteerTestCase):
         self.card.save(update_fields=["answered_by"])
         page = self.client.get(reverse("opinion_card_review"))
         self.assertContains(page, "You've answered <b>1</b> card.")
+
+
+class TestThePracticeFirst(VolunteerTestCase):
+    """The first claim waits on the practice cards, once."""
+
+    def setUp(self):
+        super().setUp()
+        self.client.force_login(self.volunteer)
+
+    def test_a_new_volunteer_is_sent_to_the_practice(self):
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, "Start the practice cards")
+        self.assertNotContains(page, reverse("claim_opinion_cards"))
+
+        answer = self.client.post(reverse("claim_opinion_cards"))
+
+        self.assertRedirects(answer, reverse("volunteer_practice"))
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+    def test_finishing_the_practice_opens_the_claim(self):
+        answer = self.client.post(reverse("volunteer_practice_done"))
+        self.assertEqual(answer.json()["status"], "ok")
+        self.assertTrue(volunteers.has_practiced(self.volunteer))
+
+        page = self.client.get(reverse("opinion_card_review"))
+        self.assertContains(page, reverse("claim_opinion_cards"))
+        self.client.post(reverse("claim_opinion_cards"))
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, self.volunteer)
+
+    def test_someone_who_answered_a_card_has_practiced(self):
+        self.card.answered_by = self.volunteer
+        self.card.save(update_fields=["answered_by"])
+        self.assertTrue(volunteers.has_practiced(self.volunteer))
+
+    def test_the_practice_page_reports_where_to_send_done(self):
+        page = self.client.get(reverse("volunteer_practice"))
+        self.assertContains(page, reverse("volunteer_practice_done"))
+        self.assertContains(page, 'data-practiced="0"')

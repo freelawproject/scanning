@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from django.contrib.auth.signals import user_logged_in
 from django.core.cache import cache
+from django.db.models import Q
 from django.dispatch import receiver
 from django.urls import reverse
 
@@ -49,6 +50,7 @@ URL_NAMES = frozenset(
         "opinion_pdf_url",
         "volunteer_faq",
         "volunteer_practice",
+        "volunteer_practice_done",
         "login",
         "logout",
         "profile",
@@ -61,6 +63,10 @@ HOME = "opinion_card_review"
 
 #: How long the cached answer is trusted before the group is read again.
 RECHECK_SECONDS = 600
+
+#: The group of the people who finished the practice cards once. A
+#: group and not a field, so staff see it and clear it in the admin.
+PRACTICED_GROUP = "volunteers-practiced"
 
 REFUSED_MESSAGE = "This page is not part of the card review."
 CARD_MESSAGE = "This card is not assigned to you."
@@ -96,6 +102,34 @@ def of_request(request) -> bool:
         cached = is_volunteer(getattr(request, "user", None))
         request._is_volunteer = cached
     return cached
+
+
+def has_practiced(user) -> bool:
+    """Return whether a person may claim cards without the practice.
+
+    The first claim waits on the practice cards, once: a person who
+    finished them (:data:`PRACTICED_GROUP`), or who has answered or
+    holds a card already (they were taught by hand before the practice
+    was required), has practiced.
+
+    :param user: The person.
+    :rtype: bool
+    """
+    from scanning.models import OpinionCard
+
+    if user.groups.filter(name=PRACTICED_GROUP).exists():
+        return True
+    return OpinionCard.objects.filter(
+        Q(answered_by=user) | Q(assigned_to=user)
+    ).exists()
+
+
+def mark_practiced(user) -> None:
+    """Record that a person finished the practice cards."""
+    from django.contrib.auth.models import Group
+
+    group, _ = Group.objects.get_or_create(name=PRACTICED_GROUP)
+    user.groups.add(group)
 
 
 def home_url() -> str:
