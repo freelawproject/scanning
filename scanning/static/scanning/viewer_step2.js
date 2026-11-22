@@ -2235,6 +2235,37 @@ document.addEventListener('DOMContentLoaded', function () {
         drawRedactionOverlaysForPage(pageIndex);
     };
 
+    // The bottom margin strip of a page, and the box that pulls it up to
+    // just over a block of the page (the sidebar's "Cover with margin" of
+    // a dismissed text card): the block's top, from the card's pixels to
+    // points through the page's own size, less MARGIN_COVER_PAD_PT. The
+    // strip keeps its sides and its foot. Null when the page has no
+    // bottom strip or its PDF page is not loaded yet.
+    var MARGIN_COVER_PAD_PT = 2;
+    window.marginCoverFor = function(pageIndex, bboxPx, imgW, imgH) {
+        var pdfPage = pdfPages[pageIndex];
+        if (!pdfPage || !imgW || !imgH) return null;
+        var vp = pdfPage.getViewport({scale: 1});
+        var strip = null;
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            (entry.rects || []).forEach(function(rect) {
+                if (rect.rect_type !== 'margin') return;
+                // The bottom strip: wider than tall, in the lower half.
+                if ((rect.x1 - rect.x0) <= (rect.y1 - rect.y0)) return;
+                if (rect.y0 < vp.height / 2) return;
+                if (!strip || rect.y1 > strip.y1) strip = rect;
+            });
+        });
+        if (!strip) return null;
+        var top = bboxPx[1] * vp.height / imgH - MARGIN_COVER_PAD_PT;
+        return {
+            id: strip.id,
+            from: {x0: strip.x0, y0: strip.y0, x1: strip.x1, y1: strip.y1},
+            to: {x0: strip.x0, y0: Math.max(0, Math.min(top, strip.y0)), x1: strip.x1, y1: strip.y1},
+        };
+    };
+
     // A box taken out from outside the page (the sidebar's "Remove the
     // box" of a redaction_cuts_text card): the row leaves the page.
     window.applyRedactionRemove = function(pageIndex, id) {

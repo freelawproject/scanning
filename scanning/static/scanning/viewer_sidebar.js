@@ -493,6 +493,74 @@ function coverCutLine(btn) {
         });
 }
 
+// "Cover with margin" of a dismissed "text in no box" card: the page's
+// bottom margin strip is pulled up to just over the card's block, through
+// the endpoint a drag of the strip's handles uses, so the block and
+// everything under it is whited out. A second press puts the strip back
+// where it was (the button holds the place it came from, for this page
+// load). A computed strip becomes a hand-drawn one the next compute keeps.
+function coverWithMargin(btn) {
+    var row = btn.closest("[data-bbox]");
+    if (!row || !window.marginCoverFor) return;
+    var cfg = window.SCAN_CONFIG;
+    var pageIndex = parseInt(row.dataset.pageIndex);
+    var bboxPx = row.dataset.bbox.split(",").map(function (v) { return parseFloat(v); });
+    var id, bbox, back;
+    if (btn.dataset.coveredId) {
+        id = parseInt(btn.dataset.coveredId);
+        bbox = JSON.parse(btn.dataset.coveredFrom);
+        back = true;
+    } else {
+        var plan = window.marginCoverFor(
+            pageIndex, bboxPx, parseFloat(row.dataset.imgW), parseFloat(row.dataset.imgH)
+        );
+        if (!plan) {
+            showToast("This page has no bottom margin strip to move (or it has not loaded: open the page first)");
+            return;
+        }
+        if (plan.to.y0 >= plan.from.y0) {
+            showToast("The bottom margin already covers this block");
+            return;
+        }
+        id = plan.id;
+        bbox = plan.to;
+        btn.dataset.coveredFrom = JSON.stringify(plan.from);
+        back = false;
+    }
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/move/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+        body: JSON.stringify(bbox),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            btn.disabled = false;
+            if (!data || data.status !== "ok") {
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not move the margin");
+                return;
+            }
+            if (window.applyRedactionMove) window.applyRedactionMove(pageIndex, id, data.id, bbox);
+            if (back) {
+                delete btn.dataset.coveredId;
+                delete btn.dataset.coveredFrom;
+                btn.textContent = "Cover with margin";
+            } else {
+                btn.dataset.coveredId = data.id;
+                btn.textContent = "Uncover";
+            }
+            showSaved(data);
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not move the margin");
+        });
+}
+
 // "Remove the box" of the same card: the box reaches into text that
 // should stay (a headnote box over a line of the opinion), so it goes,
 // through the endpoint of the box's own Dismiss button. The endpoint
