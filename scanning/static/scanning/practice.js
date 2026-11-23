@@ -55,6 +55,12 @@
 
     /* Judge a choice: the key of a row ('1', '2', '3', '0'), or typed
      * words. The answer is a row key, or typed words to match. */
+    function readsNothing(card, key) {
+        if (key === '0') { return true; }
+        var row = card.querySelector('button.bk-opt[data-choice="' + key + '"]');
+        return Boolean(row && row.querySelector('.bk-nothing'));
+    }
+
     function judge(card, choice, typed) {
         var answer = card.dataset.answer;
         var expectTyped = card.dataset.typed;
@@ -67,7 +73,10 @@
             var value = row ? row.dataset.value : '';
             right = fold(typed) === fold(value);
         } else {
-            right = choice === answer;
+            // "Leave blank" (0) and a reader who read nothing there say the
+            // same thing: the place holds no text. Either is right when the
+            // answer is one of them.
+            right = choice === answer || (readsNothing(card, choice) && readsNothing(card, answer));
         }
         var state = card.querySelector('.bk-state');
         var why = card.querySelector('[data-role="why"]');
