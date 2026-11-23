@@ -557,9 +557,9 @@ def _skip(request: HttpRequest, row: OpinionCard, skip: bool) -> JsonResponse:
         return JsonResponse(
             {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
         )
-    OpinionCard.objects.filter(
-        pk=row.pk, assigned_to=request.user
-    ).update(assigned_to=None)
+    OpinionCard.objects.filter(pk=row.pk, assigned_to=request.user).update(
+        assigned_to=None
+    )
     logger.info("skip: card=%s released by user=%s", row.pk, request.user.pk)
     return JsonResponse({"status": "ok", "message": SKIPPED_MESSAGE})
 
