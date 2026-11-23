@@ -22,6 +22,7 @@ from django.db.models import Count, Q
 from django.http import HttpRequest, HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
 
@@ -31,6 +32,7 @@ from scanning.models import (
     OpinionCard,
     OpinionReviewStatus,
     Scan,
+    VolunteerInvite,
 )
 
 logger = logging.getLogger(__name__)
@@ -808,3 +810,123 @@ def volunteer_practice_done(request: HttpRequest) -> JsonResponse:
     volunteers.mark_practiced(request.user)
     logger.info("volunteer_practice_done: user=%s", request.user.pk)
     return JsonResponse({"status": "ok", "cards_url": volunteers.home_url()})
+
+
+#: The page of a sign-up link that is wrong or already used.
+INVITE_INVALID_MESSAGE = (
+    "This sign-up link is not valid, or it has been used already. Ask "
+    "the person who sent it for a new one."
+)
+#: The line on the practice page after a sign-up.
+SIGNED_UP_MESSAGE = (
+    "Welcome! Your account is ready. Start with the practice cards: once "
+    "you have answered them all, you can claim cards of your own."
+)
+
+
+#: The password rules of a volunteer's sign-up. The site sets no
+#: ``AUTH_PASSWORD_VALIDATORS``, so the form names its own: an account
+#: made from a public page gets Django's standard four.
+SIGNUP_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {
+        "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
+        "OPTIONS": {"min_length": 8},
+    },
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
+
+
+def _signup_form():
+    """Django's user-creation form, held to :data:`SIGNUP_PASSWORD_VALIDATORS`."""
+    from django.contrib.auth import password_validation
+    from django.contrib.auth.forms import UserCreationForm
+    from django.core.exceptions import ValidationError
+
+    class VolunteerSignupForm(UserCreationForm):
+        def clean(self):
+            cleaned = super().clean()
+            password = cleaned.get("password2") or cleaned.get("password1")
+            if password and not self.has_error("password2"):
+                user = self._meta.model(username=cleaned.get("username"))
+                try:
+                    password_validation.validate_password(
+                        password,
+                        user,
+                        password_validators=password_validation.get_password_validators(
+                            SIGNUP_PASSWORD_VALIDATORS
+                        ),
+                    )
+                except ValidationError as error:
+                    self.add_error("password2", error)
+            return cleaned
+
+    return VolunteerSignupForm
+
+
+def volunteer_signup(request: HttpRequest, token: str) -> HttpResponse:
+    """Make a volunteer's account from their one-time sign-up link.
+
+    Public: the link is the proof (``VolunteerInvite``), sent by staff
+    themselves, since the portal sends no mail. The person picks a
+    username and a password (Django's own form and password rules); the
+    account takes the invite's email, joins the volunteers group, is
+    logged in and sent to the practice cards. The invite is locked for
+    the write and stamped used, so a link makes one account.
+    """
+    from django.contrib.auth import login
+    from django.contrib.auth.models import Group
+
+    invite = VolunteerInvite.objects.filter(
+        token=token, used_at__isnull=True
+    ).first()
+    if invite is None:
+        return render(
+            request,
+            "scanning/volunteer_signup.html",
+            {"invalid": INVITE_INVALID_MESSAGE},
+            status=404,
+        )
+    if request.user.is_authenticated:
+        return render(
+            request,
+            "scanning/volunteer_signup.html",
+            {"signed_in": True, "invite": invite},
+        )
+    form = _signup_form()(request.POST or None)
+    if request.method == "POST" and form.is_valid():
+        with transaction.atomic():
+            invite = (
+                VolunteerInvite.objects.select_for_update()
+                .filter(pk=invite.pk, used_at__isnull=True)
+                .first()
+            )
+            if invite is None:
+                return render(
+                    request,
+                    "scanning/volunteer_signup.html",
+                    {"invalid": INVITE_INVALID_MESSAGE},
+                    status=404,
+                )
+            user = form.save(commit=False)
+            user.email = invite.email
+            user.save()
+            group, _ = Group.objects.get_or_create(name=volunteers.GROUP)
+            user.groups.add(group)
+            invite.user = user
+            invite.used_at = timezone.now()
+            invite.save(update_fields=["user", "used_at", "date_modified"])
+        login(
+            request, user, backend="django.contrib.auth.backends.ModelBackend"
+        )
+        logger.info(
+            "volunteer_signup: invite=%s made user=%s", invite.pk, user.pk
+        )
+        messages.success(request, SIGNED_UP_MESSAGE)
+        return redirect(reverse("volunteer_practice"))
+    return render(
+        request,
+        "scanning/volunteer_signup.html",
+        {"form": form, "invite": invite},
+    )

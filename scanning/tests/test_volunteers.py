@@ -472,3 +472,62 @@ class TestThePracticeFirst(VolunteerTestCase):
         page = self.client.get(reverse("volunteer_practice"))
         self.assertContains(page, reverse("volunteer_practice_done"))
         self.assertContains(page, 'data-practiced="0"')
+
+
+class TestTheSignup(VolunteerTestCase):
+    """A one-time link from staff makes a volunteer's account."""
+
+    def setUp(self):
+        super().setUp()
+        from scanning.models import VolunteerInvite
+
+        self.invite = VolunteerInvite.objects.create(email="new@example.com")
+        self.url = reverse("volunteer_signup", kwargs={"token": self.invite.token})
+
+    def post(self, username="newvol", password="a-long-pass-phrase"):
+        return self.client.post(
+            self.url,
+            {"username": username, "password1": password, "password2": password},
+        )
+
+    def test_the_link_opens_the_form_logged_out(self):
+        page = self.client.get(self.url)
+        self.assertContains(page, "new@example.com")
+        self.assertContains(page, 'name="password1"')
+
+    def test_signing_up_makes_a_volunteer_and_sends_them_to_practice(self):
+        from django.contrib.auth import get_user_model
+
+        answer = self.post()
+
+        self.assertRedirects(answer, reverse("volunteer_practice"))
+        user = get_user_model().objects.get(username="newvol")
+        self.assertEqual(user.email, "new@example.com")
+        self.assertFalse(user.is_staff)
+        self.assertTrue(volunteers.is_volunteer(user))
+        self.invite.refresh_from_db()
+        self.assertEqual(self.invite.user, user)
+        self.assertIsNotNone(self.invite.used_at)
+        self.assertEqual(int(self.client.session["_auth_user_id"]), user.pk)
+
+    def test_the_link_works_once(self):
+        self.post()
+        self.client.logout()
+        page = self.client.get(self.url)
+        self.assertEqual(page.status_code, 404)
+        self.assertContains(page, "not valid", status_code=404)
+
+    def test_a_wrong_link_is_refused(self):
+        page = self.client.get(
+            reverse("volunteer_signup", kwargs={"token": "nope"})
+        )
+        self.assertEqual(page.status_code, 404)
+
+    def test_a_weak_password_is_refused(self):
+        from django.contrib.auth import get_user_model
+
+        answer = self.post(password="12345678")
+        self.assertEqual(answer.status_code, 200)
+        self.assertFalse(get_user_model().objects.filter(username="newvol").exists())
+        self.invite.refresh_from_db()
+        self.assertIsNone(self.invite.used_at)
