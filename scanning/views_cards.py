@@ -369,8 +369,13 @@ def _card_of(row: OpinionCard, scan_pk: int) -> dict:
     """Return one row as the script's card, with its answer and its URL."""
     stale = row.status == OpinionCard.Status.STALE
     flagged = row.status == OpinionCard.Status.FLAGGED
+    card = {
+        key: value
+        for key, value in (row.card or {}).items()
+        if key != opinion_cards.SKIPPED_BY
+    }
     return {
-        **row.card,
+        **card,
         "row_id": row.pk,
         "reason": row.reason,
         "reason_label": blocking_types.LABELS.get(row.reason, row.reason),
@@ -452,18 +457,30 @@ def answer_opinion_card(
     change: ``apply_card_answers`` writes the answers later.
     """
     row = get_object_or_404(OpinionCard, pk=card_pk, opinion__scan_id=pk)
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+    # A volunteer answers their own cards alone; the one card they may
+    # touch unassigned is one they just skipped, to take it back.
+    taking_back = (
+        isinstance(body, dict)
+        and body.get("skip") is False
+        and row.assigned_to_id is None
+        and request.user.pk
+        in ((row.card or {}).get(opinion_cards.SKIPPED_BY) or [])
+    )
     if (
         volunteers.of_request(request)
         and row.assigned_to_id != request.user.pk
+        and not taking_back
     ):
         return JsonResponse(
             {"status": "error", "message": volunteers.CARD_MESSAGE},
             status=403,
         )
-    try:
-        body = json.loads(request.body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        body = None
+    if isinstance(body, dict) and "skip" in body:
+        return _skip(request, row, body["skip"] is True)
     if not isinstance(body, dict) or not (
         "answer" in body or body.get("drop") is True or "flag" in body
     ):
@@ -515,6 +532,80 @@ RESCAN_NO_PAGE_MESSAGE = (
     "This page was inserted in review 1, so it has no original page to "
     "scan again. Set it aside as a redaction fix, or open the review page."
 )
+
+
+#: The lines of a skip and of its undo.
+SKIPPED_MESSAGE = "Skipped: the card goes back for someone else to answer."
+UNSKIPPED_MESSAGE = "The card is yours again."
+#: The refusal of an undo the person's own skip does not stand behind:
+#: someone else has the card, or it is no longer open.
+SKIP_TAKEN_MESSAGE = (
+    "This card cannot be taken back: someone else has it now, or it is no "
+    "longer open."
+)
+#: The refusal of a skip of a card the person does not hold open.
+SKIP_REFUSED_MESSAGE = (
+    "Only an open card of your own can be skipped. Reload the page."
+)
+
+
+def _skip(request: HttpRequest, row: OpinionCard, skip: bool) -> JsonResponse:
+    """Release a card its holder cannot answer, or take it back.
+
+    A skip clears the card's assignment and adds the holder to the
+    card's ``skipped_by`` (``opinion_cards.SKIPPED_BY``, a key of the row's
+    own JSON, so no column): the card is open in the pool again, no longer
+    counts as held, and a claim never hands it back to them. Only the
+    holder of an open card can skip it. Its undo assigns it back only to
+    someone whose skip released it, while it is open and nobody else has
+    claimed it. Both writes lock the row first.
+    """
+    uid = request.user.pk
+    with transaction.atomic():
+        locked = OpinionCard.objects.select_for_update().get(pk=row.pk)
+        skippers = list(
+            (locked.card or {}).get(opinion_cards.SKIPPED_BY) or []
+        )
+        if skip:
+            if (
+                locked.assigned_to_id != uid
+                or locked.status not in opinion_cards.WAITING
+            ):
+                return JsonResponse(
+                    {"status": "error", "message": SKIP_REFUSED_MESSAGE},
+                    status=409,
+                )
+            if uid not in skippers:
+                skippers.append(uid)
+            locked.assigned_to = None
+            message = SKIPPED_MESSAGE
+        else:
+            if (
+                uid not in skippers
+                or locked.assigned_to_id is not None
+                or locked.status not in opinion_cards.WAITING
+            ):
+                return JsonResponse(
+                    {"status": "error", "message": SKIP_TAKEN_MESSAGE},
+                    status=409,
+                )
+            skippers.remove(uid)
+            locked.assigned_to = request.user
+            message = UNSKIPPED_MESSAGE
+        card = dict(locked.card or {})
+        if skippers:
+            card[opinion_cards.SKIPPED_BY] = skippers
+        else:
+            card.pop(opinion_cards.SKIPPED_BY, None)
+        locked.card = card
+        locked.save(update_fields=["card", "assigned_to", "date_modified"])
+    logger.info(
+        "skip: card=%s %s by user=%s",
+        row.pk,
+        "released" if skip else "taken back",
+        uid,
+    )
+    return JsonResponse({"status": "ok", "message": message})
 
 
 def _set_aside(request: HttpRequest, row: OpinionCard, flag) -> JsonResponse:
