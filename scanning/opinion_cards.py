@@ -24,7 +24,7 @@ import logging
 from collections import Counter, defaultdict
 
 from django.db import transaction
-from django.db.models import Exists, OuterRef
+from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
 from scanning import blocking_review, blocking_types, ensemble, opinion_edits
@@ -45,6 +45,11 @@ CARD_CHECKS = (OpinionCheck.NO_MAJORITY, OpinionCheck.SINGLE_ENGINE)
 #: The check of a minor warning card: the page's warning, which blocks
 #: nothing (``blocking_review.minor_cards``).
 MINOR_CHECK = OpinionCheck.ENGINES_DISAGREE
+
+#: The key of a row's ``card`` JSON that names the people who skipped
+#: it (``views_cards._skip``): a claim never hands the card back to them,
+#: and a rebuild carries the list over (:func:`sync`).
+SKIPPED_BY = "skipped_by"
 
 #: A row that waits on a person: no answer, or one that went stale.
 WAITING = (OpinionCard.Status.OPEN, OpinionCard.Status.STALE)
@@ -202,7 +207,8 @@ def sync(opinion: Opinion, document: dict) -> Counter:
             row.edit = None
             row.applied_at = None
             row.note = "The written answer did not settle this place."
-        row.card = card
+        skippers = (row.card or {}).get(SKIPPED_BY)
+        row.card = {**card, SKIPPED_BY: skippers} if skippers else card
         row.reason = card["type"]
         row.minor = bool(card.get("minor") or card.get("minor_warning"))
         row.check_name = _check_of(card)
@@ -793,6 +799,12 @@ def claim(user, count: int = CLAIM_COUNT) -> int:
                 kind="word",
                 check_name__in=checks,
                 opinion__figure_digest="",
+            )
+            # Never a card this person skipped. The key is tested first:
+            # a row without it must stay, and SQL's NULL would drop it.
+            .exclude(
+                Q(card__has_key=SKIPPED_BY)
+                & Q(**{f"card__{SKIPPED_BY}__contains": [user.pk]})
             )
             .only("pk", "opinion_id", "kind", "card")
             .order_by("opinion__scan_id", "opinion_id", "pk")

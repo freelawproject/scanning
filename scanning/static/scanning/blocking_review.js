@@ -136,6 +136,8 @@
         this.cards = [];
         this.kept = {};
         this.skipped = {};
+        // The cards a saved skip released, by key (the rows mode).
+        this.skippedCards = {};
         /** The findings a settle is dismissing, by pk. */
         this.settling = {};
         this.answered = 0;
@@ -175,6 +177,14 @@
                         };
                     });
                 self.cards = self.cards.filter(function (card) { return card.stored === null; });
+                // A card skipped here was released on the server, so the
+                // person's list no longer sends it: it stays on the page,
+                // with its Undo, until the page is left.
+                var shown = {};
+                self.cards.forEach(function (card) { shown[keyOf(card)] = true; });
+                Object.keys(self.skippedCards).forEach(function (key) {
+                    if (!shown[key]) { self.cards.push(self.skippedCards[key]); }
+                });
             }
             // The open blocking cards, whatever this page walks: the
             // approval stays behind the gate.
@@ -435,6 +445,7 @@
     Section.prototype.release = function (card) {
         delete this.kept[keyOf(card)];
         delete this.skipped[keyOf(card)];
+        delete this.skippedCards[keyOf(card)];
         this.render();
         countAll();
         var node = this.cardsNode.querySelector('[data-key="' + keyOf(card) + '"]');
@@ -736,7 +747,9 @@
             // below it, and the page under the reader. The Undo below
             // is the way to another answer.
             var rows = stack(section, card, node);
-            if (answer) { freezeRows(rows, card); }
+            // A saved skip is closed too: its card is no longer the
+            // person's, so only its Undo is offered.
+            if (answer || (rowsMode && section.skippedCards[keyOf(card)])) { freezeRows(rows, card); }
             node.appendChild(rows);
         }
         var footer = el('footer');
@@ -828,7 +841,7 @@
         // the text holds keeps it (``choose`` reads a value that leaves
         // the text as shown as a keep), and a button that keeps an
         // unnamed reading read as "the first option".
-        if (rowsMode && card.answer_url && !answer) {
+        if (rowsMode && card.answer_url && !answer && !section.skippedCards[keyOf(card)]) {
             // Saved on the row like any answer: the apply takes the
             // block out, or staff take the card from here. One quiet
             // group after the answers, so the footer reads as the
@@ -893,6 +906,7 @@
                             return;
                         }
                         section.skipped[keyOf(card)] = true;
+                        section.skippedCards[keyOf(card)] = card;
                         section.render();
                         focusNextCard();
                     });

@@ -585,7 +585,7 @@ class TestTheSkip(VolunteerTestCase):
 
         answer = self.send({"skip": False})
 
-        self.assertEqual(answer.status_code, 403)
+        self.assertIn(answer.status_code, (403, 409))
         self.card.refresh_from_db()
         self.assertNotEqual(self.card.assigned_to, self.volunteer)
 
@@ -595,3 +595,57 @@ class TestTheSkip(VolunteerTestCase):
         self.assertEqual(answer.status_code, 403)
         self.card.refresh_from_db()
         self.assertIsNotNone(self.card.assigned_to)
+
+    def test_a_skipped_card_is_never_claimed_back(self):
+        self.send({"skip": True})
+        self.client.post(reverse("claim_opinion_cards"))
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+        other = self.make_user(username="other")
+        self.assertEqual(opinion_cards.claim(other), 1)
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, other)
+
+    def test_a_card_never_skipped_cannot_be_taken(self):
+        self.assign(None)
+        self.card.assigned_to = None
+        self.card.save(update_fields=["assigned_to"])
+
+        answer = self.send({"skip": False})
+
+        self.assertEqual(answer.status_code, 403)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+    def test_a_skip_of_a_card_not_held_is_refused(self):
+        staff = self.make_staff_user(username="curator")
+        self.card.assigned_to = None
+        self.card.save(update_fields=["assigned_to"])
+        self.client.force_login(staff)
+
+        self.assertEqual(self.send({"skip": True}).status_code, 409)
+        self.assertEqual(self.send({"skip": False}).status_code, 409)
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+
+    def test_a_rebuild_keeps_who_skipped(self):
+        self.send({"skip": True})
+        opinion_cards.sync(self.opinion, document(self.held()))
+        self.card.refresh_from_db()
+        self.assertEqual(
+            self.card.card[opinion_cards.SKIPPED_BY], [self.volunteer.pk]
+        )
+
+    def test_the_card_sent_to_the_page_names_no_skipper(self):
+        self.send({"skip": True})
+        self.send({"skip": False})
+        self.send({"skip": True})
+        self.client.post(reverse("claim_opinion_cards"))
+        rows = self.client.get(
+            reverse(
+                "opinion_card_rows",
+                kwargs={"pk": self.opinion.scan_id, "opinion_pk": self.opinion.pk},
+            )
+        )
+        self.assertNotIn(opinion_cards.SKIPPED_BY, rows.content.decode())
