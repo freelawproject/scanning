@@ -5692,3 +5692,57 @@ class ExternalJob(AbstractDateTimeModel):
             f"{target} {self.stage}/{self.engine}{shard} "
             f"({self.get_status_display()})"
         )
+
+
+def _invite_token() -> str:
+    """A random, URL-safe token for a volunteer's sign-up link."""
+    import secrets
+
+    return secrets.token_urlsafe(32)
+
+
+class VolunteerInvite(AbstractDateTimeModel):
+    """One approved volunteer's one-time sign-up link.
+
+    Staff add an email in the admin and send the link it shows themselves;
+    the portal sends no mail. The link opens the sign-up page
+    (``views_cards.volunteer_signup``), where the person picks a username
+    and a password and joins the volunteers group. It works once: the
+    account it made is kept on the row, and ``used_at`` is stamped.
+    """
+
+    email = models.EmailField(
+        unique=True, help_text="The address the link was sent to."
+    )
+    token = models.CharField(
+        max_length=64,
+        unique=True,
+        default=_invite_token,
+        editable=False,
+        help_text="The secret part of the sign-up link.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="volunteer_invites_sent",
+        help_text="The staff member who added the invite.",
+    )
+    used_at = models.DateTimeField(
+        null=True, blank=True, help_text="When the account was made."
+    )
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="volunteer_invite",
+        help_text="The account the link made.",
+    )
+
+    class Meta:
+        ordering = ["-date_created"]
+
+    def __str__(self) -> str:
+        return self.email

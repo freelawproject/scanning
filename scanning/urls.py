@@ -81,6 +81,7 @@ from scanning.views_cards import (
     volunteer_faq,
     volunteer_practice,
     volunteer_practice_done,
+    volunteer_signup,
 )
 from scanning.views_process import (
     add_page_insert,
@@ -172,6 +173,11 @@ urlpatterns = [
         "opinions/cards/practice/",
         volunteer_practice,
         name="volunteer_practice",
+    ),
+    path(
+        "volunteers/signup/<str:token>/",
+        volunteer_signup,
+        name="volunteer_signup",
     ),
     path(
         "opinions/cards/practice/done/",

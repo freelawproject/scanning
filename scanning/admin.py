@@ -40,6 +40,7 @@ from scanning.models import (
     Status,
     TextReading,
     Volume,
+    VolunteerInvite,
     WithdrawnOpinion,
 )
 from scanning.services import (
@@ -1426,3 +1427,49 @@ class RedactionAdmin(ScanCachesDeferred, admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(VolunteerInvite)
+class VolunteerInviteAdmin(admin.ModelAdmin):
+    """The approved volunteers and their one-time sign-up links.
+
+    Add an email and save: the page shows the link to send them yourself
+    (the portal sends no mail). The link works once; the account it made
+    is shown here.
+    """
+
+    list_display = ["email", "used", "user", "created_by", "date_created"]
+    list_filter = [("used_at", admin.EmptyFieldListFilter)]
+    search_fields = ["email", "user__username"]
+    fields = ["email", "signup_link", "used_at", "user", "created_by"]
+    readonly_fields = ["signup_link", "used_at", "user", "created_by"]
+
+    def changeform_view(self, request, *args, **kwargs):
+        # The link is shown whole, host and all, so it can be copied.
+        self._request = request
+        return super().changeform_view(request, *args, **kwargs)
+
+    @admin.display(boolean=True, description="Used")
+    def used(self, obj):
+        return obj.used_at is not None
+
+    @admin.display(description="Sign-up link")
+    def signup_link(self, obj):
+        if not obj.pk:
+            return "Save to get the link."
+        if obj.used_at:
+            return "Used: the account is made."
+        path = reverse("volunteer_signup", kwargs={"token": obj.token})
+        request = getattr(self, "_request", None)
+        url = request.build_absolute_uri(path) if request else path
+        return format_html(
+            '<input type="text" value="{}" readonly style="width: 40em" '
+            'onclick="this.select()"> <span class="help">Copy it and send it '
+            "to them yourself; it works once.</span>",
+            url,
+        )
+
+    def save_model(self, request, obj, form, change):
+        if not change:
+            obj.created_by = request.user
+        super().save_model(request, obj, form, change)
