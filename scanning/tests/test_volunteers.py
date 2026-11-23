@@ -482,12 +482,18 @@ class TestTheSignup(VolunteerTestCase):
         from scanning.models import VolunteerInvite
 
         self.invite = VolunteerInvite.objects.create(email="new@example.com")
-        self.url = reverse("volunteer_signup", kwargs={"token": self.invite.token})
+        self.url = reverse(
+            "volunteer_signup", kwargs={"token": self.invite.token}
+        )
 
     def post(self, username="newvol", password="a-long-pass-phrase"):
         return self.client.post(
             self.url,
-            {"username": username, "password1": password, "password2": password},
+            {
+                "username": username,
+                "password1": password,
+                "password2": password,
+            },
         )
 
     def test_the_link_opens_the_form_logged_out(self):
@@ -528,6 +534,8 @@ class TestTheSignup(VolunteerTestCase):
 
         answer = self.post(password="12345678")
         self.assertEqual(answer.status_code, 200)
-        self.assertFalse(get_user_model().objects.filter(username="newvol").exists())
+        self.assertFalse(
+            get_user_model().objects.filter(username="newvol").exists()
+        )
         self.invite.refresh_from_db()
         self.assertIsNone(self.invite.used_at)

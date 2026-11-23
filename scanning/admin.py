@@ -1429,7 +1429,6 @@ class RedactionAdmin(ScanCachesDeferred, admin.ModelAdmin):
         return False
 
 
-
 @admin.register(VolunteerInvite)
 class VolunteerInviteAdmin(admin.ModelAdmin):
     """The approved volunteers and their one-time sign-up links.
