@@ -93,6 +93,25 @@ EXAMPLES: list[dict] = [
         ),
     },
     {
+        "slug": "perpendicular-mark",
+        "scenario": "West's page mark",
+        "lesson": "The ⊥ mark and its number come out",
+        "where": "page 8, body, right column",
+        "image": "perpendicular-mark.png",
+        "before": "",
+        "token": "11",
+        "after": "The Imbler decision,",
+        "readings": ["11", "", "II."],
+        "answer": 0,
+        "why": (
+            "The upside-down T with a small number beside it (⊥10 here) is "
+            "West's mark for a page of another reporter. It is not part of "
+            "the opinion, so it comes out: take the word out (0), or pick the "
+            "reader who read nothing there (2), which is the same answer. "
+            '"11" and "II." are two readers turning the mark into text.'
+        ),
+    },
+    {
         "slug": "footnote-number-quotes",
         "scenario": "Footnote numbers",
         "lesson": "Keep the number as the line reads",
