@@ -563,7 +563,9 @@ def _skip(request: HttpRequest, row: OpinionCard, skip: bool) -> JsonResponse:
     uid = request.user.pk
     with transaction.atomic():
         locked = OpinionCard.objects.select_for_update().get(pk=row.pk)
-        skippers = list((locked.card or {}).get(opinion_cards.SKIPPED_BY) or [])
+        skippers = list(
+            (locked.card or {}).get(opinion_cards.SKIPPED_BY) or []
+        )
         if skip:
             if (
                 locked.assigned_to_id != uid

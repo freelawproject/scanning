@@ -645,7 +645,10 @@ class TestTheSkip(VolunteerTestCase):
         rows = self.client.get(
             reverse(
                 "opinion_card_rows",
-                kwargs={"pk": self.opinion.scan_id, "opinion_pk": self.opinion.pk},
+                kwargs={
+                    "pk": self.opinion.scan_id,
+                    "opinion_pk": self.opinion.pk,
+                },
             )
         )
         self.assertNotIn(opinion_cards.SKIPPED_BY, rows.content.decode())
