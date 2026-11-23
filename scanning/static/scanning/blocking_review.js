@@ -777,7 +777,24 @@
             release.dataset.key = 'u';
             keyBadge(release);
             release.title = 'Open this card again';
-            release.addEventListener('click', function () { section.release(card); });
+            release.addEventListener('click', function () {
+                if (skipped && rowsMode && card.answer_url) {
+                    // A saved skip is taken back on the server first: the
+                    // card is assigned to the person again, unless someone
+                    // else has claimed it meanwhile.
+                    release.disabled = true;
+                    postJson(card.answer_url, { skip: false }).then(function (answer) {
+                        if (!answer || !answer.ok) {
+                            release.disabled = false;
+                            showToast((answer && answer.data && answer.data.message) || 'The card could not be taken back.');
+                            return;
+                        }
+                        section.release(card);
+                    });
+                    return;
+                }
+                section.release(card);
+            });
             footer.appendChild(release);
         } else if (card.kind === 'cover' && card.dismiss_url) {
             var covered = el('button', 'btn-outline text-xs', 'Looks right');
@@ -865,6 +882,22 @@
             skip.dataset.key = 's';
             keyBadge(skip);
             skip.addEventListener('click', function () {
+                if (rowsMode && card.answer_url) {
+                    // On the cards page a skip is saved: the card goes back
+                    // to the pool, so the next claim does not wait on it.
+                    skip.disabled = true;
+                    postJson(card.answer_url, { skip: true }).then(function (answer) {
+                        if (!answer || !answer.ok) {
+                            skip.disabled = false;
+                            showToast((answer && answer.data && answer.data.message) || 'The skip was refused.');
+                            return;
+                        }
+                        section.skipped[keyOf(card)] = true;
+                        section.render();
+                        focusNextCard();
+                    });
+                    return;
+                }
                 section.skipped[keyOf(card)] = true;
                 section.render();
                 focusNextCard();

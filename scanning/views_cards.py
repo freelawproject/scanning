@@ -452,18 +452,28 @@ def answer_opinion_card(
     change: ``apply_card_answers`` writes the answers later.
     """
     row = get_object_or_404(OpinionCard, pk=card_pk, opinion__scan_id=pk)
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = None
+    # A volunteer answers their own cards alone; the one card they may
+    # touch unassigned is one they just skipped, to take it back.
+    taking_back = (
+        isinstance(body, dict)
+        and body.get("skip") is False
+        and row.assigned_to_id is None
+    )
     if (
         volunteers.of_request(request)
         and row.assigned_to_id != request.user.pk
+        and not taking_back
     ):
         return JsonResponse(
             {"status": "error", "message": volunteers.CARD_MESSAGE},
             status=403,
         )
-    try:
-        body = json.loads(request.body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        body = None
+    if isinstance(body, dict) and "skip" in body:
+        return _skip(request, row, body["skip"] is True)
     if not isinstance(body, dict) or not (
         "answer" in body or body.get("drop") is True or "flag" in body
     ):
@@ -515,6 +525,43 @@ RESCAN_NO_PAGE_MESSAGE = (
     "This page was inserted in review 1, so it has no original page to "
     "scan again. Set it aside as a redaction fix, or open the review page."
 )
+
+
+#: The lines of a skip and of its undo.
+SKIPPED_MESSAGE = "Skipped: the card goes back for someone else to answer."
+UNSKIPPED_MESSAGE = "The card is yours again."
+#: The refusal of an undo after someone else has claimed the card.
+SKIP_TAKEN_MESSAGE = (
+    "Someone else has this card now, so it cannot be taken back."
+)
+
+
+def _skip(request: HttpRequest, row: OpinionCard, skip: bool) -> JsonResponse:
+    """Release a card its holder cannot answer, or take it back.
+
+    A skip clears the card's assignment, and nothing else: the card is
+    open in the pool again, and it no longer counts as held, so the
+    holder's next claim is not waiting on it. Its undo assigns it back
+    while nobody else has claimed it. Nothing records who skipped it.
+    """
+    if not skip:
+        taken = OpinionCard.objects.filter(
+            pk=row.pk, assigned_to__isnull=True
+        ).update(assigned_to=request.user)
+        if not taken and row.assigned_to_id != request.user.pk:
+            return JsonResponse(
+                {"status": "error", "message": SKIP_TAKEN_MESSAGE}, status=409
+            )
+        return JsonResponse({"status": "ok", "message": UNSKIPPED_MESSAGE})
+    if row.status not in opinion_cards.WAITING:
+        return JsonResponse(
+            {"status": "error", "message": CARD_GONE_MESSAGE}, status=409
+        )
+    OpinionCard.objects.filter(
+        pk=row.pk, assigned_to=request.user
+    ).update(assigned_to=None)
+    logger.info("skip: card=%s released by user=%s", row.pk, request.user.pk)
+    return JsonResponse({"status": "ok", "message": SKIPPED_MESSAGE})
 
 
 def _set_aside(request: HttpRequest, row: OpinionCard, flag) -> JsonResponse:

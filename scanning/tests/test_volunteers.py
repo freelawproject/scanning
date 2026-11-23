@@ -539,3 +539,59 @@ class TestTheSignup(VolunteerTestCase):
         )
         self.invite.refresh_from_db()
         self.assertIsNone(self.invite.used_at)
+
+
+class TestTheSkip(VolunteerTestCase):
+    """A skip on the cards page releases the card, so the next claim
+    does not wait on it; Undo takes it back while nobody has it."""
+
+    def setUp(self):
+        super().setUp()
+        volunteers.mark_practiced(self.volunteer)
+        self.assign()
+        self.client.force_login(self.volunteer)
+        self.url = reverse(
+            "answer_opinion_card",
+            kwargs={"pk": self.opinion.scan_id, "card_pk": self.card.pk},
+        )
+
+    def send(self, body):
+        import json
+
+        return self.client.post(
+            self.url, json.dumps(body), content_type="application/json"
+        )
+
+    def test_a_skip_releases_the_card_and_frees_the_claim(self):
+        answer = self.send({"skip": True})
+
+        self.assertEqual(answer.json()["status"], "ok")
+        self.card.refresh_from_db()
+        self.assertIsNone(self.card.assigned_to)
+        self.assertEqual(self.card.status, OpinionCard.Status.OPEN)
+        self.assertFalse(opinion_cards.holds_open(self.volunteer))
+
+    def test_undo_takes_the_card_back(self):
+        self.send({"skip": True})
+        answer = self.send({"skip": False})
+
+        self.assertEqual(answer.json()["status"], "ok")
+        self.card.refresh_from_db()
+        self.assertEqual(self.card.assigned_to, self.volunteer)
+
+    def test_undo_is_refused_once_someone_else_has_it(self):
+        self.send({"skip": True})
+        self.assign(self.make_user(username="other"))
+
+        answer = self.send({"skip": False})
+
+        self.assertEqual(answer.status_code, 403)
+        self.card.refresh_from_db()
+        self.assertNotEqual(self.card.assigned_to, self.volunteer)
+
+    def test_a_volunteer_cannot_skip_someone_elses_card(self):
+        self.assign(self.make_user(username="other"))
+        answer = self.send({"skip": True})
+        self.assertEqual(answer.status_code, 403)
+        self.card.refresh_from_db()
+        self.assertIsNotNone(self.card.assigned_to)
