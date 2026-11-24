@@ -56,6 +56,7 @@ from scanning import (
     opinion_pdf,
     redactions,
     s3_sync,
+    shared_footnotes,
 )
 from scanning.models import (
     OPINION_FIGURES_MAX_ATTEMPTS,
@@ -200,8 +201,15 @@ def covers(
     found: dict[int, list[dict]] = {}
     for entry in redactions.visible_by_page(opinion.scan, pages=pages):
         found.setdefault(entry["page_index"], []).extend(entry["rects"])
+    # A person who kept the first-page footnotes lifts their mask
+    # (#457), the rule of the OCR glue and of the PDF pass: a picture
+    # inside a kept note (#486) is never painted white.
+    kept = {opinion.boundary.pk} if shared_footnotes.kept(opinion) else set()
     for rect in boundaries.outside_rects(
-        opinion.scan, [opinion.boundary], document=volume
+        opinion.scan,
+        [opinion.boundary],
+        document=volume,
+        kept_footnotes=kept,
     ).get(opinion.boundary.pk, []):
         found.setdefault(rect["page_index"], []).append(
             {**rect, "fill": "white"}

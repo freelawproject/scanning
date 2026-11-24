@@ -214,14 +214,14 @@ def printed_span(
 def live_boundaries(scan: Scan) -> list[OpinionBoundary]:
     """Return the boundaries an opinion is cut from, in reading order.
 
-    ``boundaries.standing`` less the dismissed rows: the set step 3
-    reads through ``viewer_payload(live_only=True)``.
+    ``boundaries.live``: the set step 3 reads through
+    ``viewer_payload(live_only=True)``.
 
     :param scan: The scan.
     :returns: The rows.
     :rtype: list[OpinionBoundary]
     """
-    return [r for r in boundaries.standing(scan) if not r.is_dismissed]
+    return boundaries.live(scan)
 
 
 def check_space(scan: Scan, run, rows: list[OpinionBoundary]) -> None:
@@ -272,7 +272,7 @@ def keyed(
 #: what the OCR glue or the redacted PDF reads off the rows, and every
 #: opinion is rebuilt at its volume's next approval, as every approval
 #: did before the digest.
-DIGEST_RULES = 3
+DIGEST_RULES = 4
 
 
 @dataclass

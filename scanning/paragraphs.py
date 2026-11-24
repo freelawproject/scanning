@@ -72,8 +72,10 @@ APPROVED_SCHEMA = 1
 
 #: Version of the join rule and of the footnote rule. It is in the
 #: object and in its key: raise it when the same ensemble document
-#: gives another text.
-JOIN_RULE = 3
+#: gives another text. 4: a cited number a later group starts with
+#: starts no note at the start of a group either, and six more
+#: abbreviations take a number (#457).
+JOIN_RULE = 4
 
 #: What a join writes between two groups: a line break, never a space,
 #: so the dehyphenation downstream reads the two edges as one.
@@ -154,7 +156,8 @@ _INLINE_LABEL = re.compile(
 _TAKES_A_NUMBER = re.compile(
     r"(?:\b(?:Nos?|nn?|pp?|fn|[Aa]rts?|[Ss]ecs?|[Cc]hs?|[Vv]ols?|[Ee]xs?"
     r"|[Dd]ocs?|[Dd]kts?|[Tt]rs?|[Aa]pps?|[Ff]igs?|[Cc]ls?|[Pp]ts?|[Tt]its?"
-    r"|[Rr]ecs?|[Ee]xhs?|[A-Z])\.|\d,)$"
+    r"|[Rr]ecs?|[Ee]xhs?|[Bb]rs?|[Mm]ems?|[Oo]ps?|[Mm]ots?|[Dd]eps?"
+    r"|[Dd]ecls?|[A-Z])\.|\d,)$"
 )
 
 #: A label that starts a text with its period or parenthesis: the form
@@ -511,8 +514,51 @@ def _starts_again(label: str, last: int | None) -> bool:
     )
 
 
+def leading_label(text: str) -> str | None:
+    """Return the footnote label a text starts with, or None.
+
+    The label rule of :func:`split_label` over plain text: a number or
+    a symbol followed by a period, a parenthesis or a space. The
+    ``SHARED_FOOTNOTES`` card reads it over the notes the mask took
+    (#457).
+
+    :param text: The text of one note.
+    :returns: The label, or None.
+    :rtype: str | None
+    """
+    found = _LABEL.match(text or "")
+    return found.group(1) if found else None
+
+
+def body_marks(group: dict) -> list[str]:
+    """Return the footnote marks of one group, in the order of its text.
+
+    A mark is a ``sup`` mark whose text is a label alone: a number or a
+    footnote symbol. The ``SHARED_FOOTNOTES`` card reads it over the
+    body of a first page (#457).
+
+    :param group: One group of the ensemble document.
+    :returns: The labels.
+    :rtype: list[str]
+    """
+    text = group.get("text") or ""
+    labels = []
+    for mark in sorted(
+        (m for m in group.get("marks") or [] if m.get("kind") == "sup"),
+        key=lambda m: m["start"],
+    ):
+        found = _LABEL_ALONE.match(text[mark["start"] : mark["end"]])
+        if found:
+            labels.append(found.group(1))
+    return labels
+
+
 def _is_marked_label(
-    label: str, last: int | None, page: int, marked: dict[int, set[int]]
+    label: str,
+    last: int | None,
+    page: int,
+    marked: dict[int, set[int]],
+    taken: frozenset[int] = frozenset(),
 ) -> bool:
     """Return whether a number past ``LABEL_STEP`` is still a label.
 
@@ -523,14 +569,21 @@ def _is_marked_label(
     ``LABEL_STEP`` past the last one read: notes 3 to 7 read as two
     blocks left the last label at 3, and notes 8 to 29 went into note 3.
     A continuation that starts with a number ("28 U.S.C. 1291") is a
-    label only where the body cites a note of that number there.
+    label only where the body cites a note of that number there, and
+    never where a later group of the page or the next starts with that
+    number: "9 F.3d 100", the rest of note 5, is no note 9 when the
+    real "9." is further down, or notes 6 to 9 go into it.
 
     :param label: The label :func:`split_label` read.
     :param last: The last number that started a note.
     :param page: The page of the group.
     :param marked: :func:`mark_pages`.
+    :param taken: The numbers that start a later group of this page or
+        the next (:func:`_own_labels`).
     """
     if not label.isdigit() or last is None or int(label) <= last:
+        return False
+    if int(label) in taken:
         return False
     return bool(marked.get(int(label), set()) & {page, page - 1})
 
@@ -878,7 +931,7 @@ def _labelled_parts(
             _restarts_here(split, item, last, restarts)
             or _opens(split, item, last, opening)
             or _is_next_label(split[0], last)
-            or _is_marked_label(split[0], last, item["page"], marked)
+            or _is_marked_label(split[0], last, item["page"], marked, taken)
         )
     ):
         last = int(split[0])
@@ -967,7 +1020,7 @@ def footnotes(document: dict) -> list[dict]:
                 )
                 or _is_next_label(split[0], last_number)
                 or _is_marked_label(
-                    split[0], last_number, item["page"], marked
+                    split[0], last_number, item["page"], marked, taken
                 )
             ):
                 if again:

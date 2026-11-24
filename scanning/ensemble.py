@@ -181,7 +181,15 @@ from django.db import transaction
 from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
-from scanning import casebody, detections, markup, opinion_ocr, s3_sync
+from scanning import (
+    casebody,
+    detections,
+    markup,
+    opinion_ocr,
+    paragraphs,
+    s3_sync,
+    shared_footnotes,
+)
 from scanning.models import (
     OPINION_ENSEMBLE_MAX_ATTEMPTS,
     OPINION_ENSEMBLE_OWED,
@@ -234,8 +242,10 @@ logger = logging.getLogger(__name__)
 #: 17 stamps ``syllabus_start`` on the body group under the syllabus
 #: zone, writes that zone beside the other two, and gives the page its
 #: ``syllabus_doubt`` entries (#518).
-SCHEMA_VERSION = 17
-SCHEMA_VERSION = 16
+#: 18 writes the footnote zones the first-page mask took under
+#: ``zones.footnotes_taken`` and leaves them out of ``zones.footnotes``
+#: (#457).
+SCHEMA_VERSION = 18
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -389,6 +399,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.BLOCKQUOTE_LIST,
         OpinionCheck.SYLLABUS_UNSURE,
         OpinionCheck.UNRESOLVED_EDIT,
+        OpinionCheck.SHARED_FOOTNOTES,
         # No writer since the pictures are review 2's boxes: here so
         # the rebuild deletes the rows written before.
         OpinionCheck.FIGURE_ONE_ENGINE,
@@ -1530,6 +1541,10 @@ _BOX_REASONS = frozenset(
     {
         "redaction",
         "outside",
+        # The mask over the notes of the opinion before is the outside
+        # mask's twin (#457): an engine that read the last line of the
+        # text and the first note as one unit keeps the line.
+        opinion_ocr.NEIGHBOUR_FOOTNOTES,
         opinion_ocr.PAGE_NUMBER,
         opinion_ocr.PICTURE,
         opinion_ocr.RUNNING_HEAD,
@@ -1886,6 +1901,26 @@ def _merge(
         # The fold of the words the verdict took (``compare_text``),
         # for :func:`_dropped_alike`: a key and never the words.
         "hidden_key": compare_text(" ".join(plain(m["text"]) for m in out)),
+        # The footnote label at the start of every line the verdict
+        # took (#457), for :func:`_note_labels`: an engine reads
+        # several notes as one unit, and the key above shows the first
+        # label alone. A label and never the words.
+        # Whether the mask over the notes of the opinion before took a
+        # member (#457). The reason below is the first member's, and a
+        # unit of the last line and the first note is "outside".
+        "footnote_mask": any(
+            (m["exclusion"] or {}).get("reason")
+            == opinion_ocr.NEIGHBOUR_FOOTNOTES
+            for m in out
+        ),
+        "hidden_labels": sorted(
+            {
+                label
+                for m in out
+                for line in (m["text"] or "").split("\n")
+                if (label := paragraphs.leading_label(line.strip()))
+            }
+        ),
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
@@ -4205,7 +4240,17 @@ def build_page(
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
     starts = _zones_of(read, SYLLABUS)
-    entry["zones"] = {FOOTNOTES: zones, BLOCKQUOTES: quotes, SYLLABUS: starts}
+    # A footnote zone the first-page mask took is the opinion before's
+    # (#457): the section of a group still reads it, and the viewer,
+    # which draws ``zones``, draws it no more.
+    taken = _zones_of(read, opinion_ocr.TAKEN_FOOTNOTES)
+    entry["zones"] = {
+        FOOTNOTES: [box for box in zones if box not in taken],
+        BLOCKQUOTES: quotes,
+        SYLLABUS: starts,
+    }
+    if taken:
+        entry["zones"][opinion_ocr.TAKEN_FOOTNOTES] = taken
     groups = align_page(units, width, height, zones)
     # The columns of the page, off every group of it and before the
     # split into sections (#399): the footnotes are set in two columns
@@ -4362,6 +4407,19 @@ def build_page(
                     # drop where the detections drew nothing, the sign
                     # of a column they missed rather than bleed-through.
                     "agreed": _dropped_alike(group),
+                    # The labels of the notes the footnote mask took
+                    # (#457), for the ``SHARED_FOOTNOTES`` card. A
+                    # label and never the words.
+                    "labels": (
+                        _note_labels(group)
+                        if group["excluded"] and _took_notes(group)
+                        else []
+                    ),
+                    # Whether the footnote mask took a reading of any
+                    # engine here. The reason above is one engine's,
+                    # and another can name the outside mask for the
+                    # same block.
+                    "notes_taken": group["excluded"] and _took_notes(group),
                     # The edit that took the block out, for its Undo.
                     "edit": (
                         {
@@ -5156,6 +5214,9 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
         )
     }
     cards = []
+    # A person kept the footnotes of the first page (#457): the mask
+    # took nothing, and the card says who decided, with the way back.
+    kept = shared_footnotes.kept_on_shared_page(opinion)
     if document.get("unresolved_edits"):
         cards.append(
             _card(
@@ -5296,6 +5357,11 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                     standing,
                 )
             )
+        shared = _shared_footnotes_card(
+            opinion, page, page_number == 0 and kept, standing
+        )
+        if shared is not None:
+            cards.append(shared)
         if counts.get("syllabus_doubt"):
             # The two signals of the syllabus disagree (#518): a
             # warning the reader dismisses, and a log line so the case
@@ -5339,10 +5405,105 @@ _REASON_WORDS = {
     "redaction": "a redaction",
     "outside": "the mask of the opinion before",
     opinion_ocr.PAGE_NUMBER: "the page number",
+    opinion_ocr.NEIGHBOUR_FOOTNOTES: "the footnote mask of the opinion before",
     opinion_ocr.RUNNING_HEAD: "the running head",
     opinion_ocr.UNDETECTED: "no detection",
     DROP_HUMAN: "a person",
 }
+
+
+def _shared_footnotes_card(
+    opinion: Opinion, page: dict, kept: bool, standing: dict
+) -> OpinionFinding | None:
+    """Return the ``SHARED_FOOTNOTES`` card of one page, or None (#457).
+
+    The footnote mask of a first page the opinion before ends on took
+    the notes of that page as the earlier opinion's. Each such page is
+    one card: a warning, because the earlier opinion's notes are the
+    daily shape of it, or an ERROR the approval waits on when the
+    opinion's own body text on the page carries a footnote mark that a
+    taken note has as its label (or a taken block whose label no engine
+    read may have), a sign that one of the notes is its own, or when
+    the opinion starts and ends on that page, whose notes are then
+    likely its own. A person answers it with a dismissal (the notes are
+    the earlier opinion's) or with "Keep the footnotes"
+    (``shared_footnotes.keep``). A kept page is a warning that says so,
+    and carries the way back.
+
+    :param opinion: The row.
+    :param page: One page of the document.
+    :param kept: Whether a person kept the notes of this page.
+    :param standing: The standing dismissals.
+    :returns: The card, or None.
+    """
+    if kept:
+        return _card(
+            opinion,
+            page["page_in_opinion"],
+            OpinionCheck.SHARED_FOOTNOTES,
+            Issue.Severity.WARNING,
+            "A person kept the footnotes of this page as this opinion's "
+            "own, so the text and the redacted PDF hold them. The opinion "
+            "before ends on this page; give them back if they are its "
+            "notes.",
+            standing,
+        )
+    taken = [
+        drop
+        for drop in page["dropped"]
+        if drop.get("notes_taken")
+        or drop["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
+    ]
+    if not taken:
+        return None
+    marks = [
+        label
+        for group in page["groups"]
+        if group.get("section", BODY) == BODY
+        for label in paragraphs.body_marks(group)
+    ]
+    message = (
+        f"The opinion before ends on this page, so its {len(taken)} "
+        "footnote block(s) were taken out of the text and whited out of "
+        "the redacted PDF."
+    )
+    # A mark of the body names a note the mask took when a taken note
+    # has its label, or when a taken block has no label the engines
+    # read, which may be that note.
+    labels = {label for drop in taken for label in drop.get("labels") or []}
+    unlabelled = any(not drop.get("labels") for drop in taken)
+    own = [mark for mark in marks if unlabelled or mark in labels]
+    if own or opinion.page_count == 1:
+        why = (
+            f"The text of this opinion on the page carries the footnote "
+            f"mark(s) {', '.join(own)}, so a note may be its own."
+            if own
+            else "This opinion starts and ends on this page, so a note "
+            "may be its own."
+        )
+        return _card(
+            opinion,
+            page["page_in_opinion"],
+            OpinionCheck.SHARED_FOOTNOTES,
+            Issue.Severity.ERROR,
+            f"{message} {why} Keep the footnotes if it is, or dismiss the "
+            "card if every note is the opinion before's.",
+            standing,
+        )
+    return _card(
+        opinion,
+        page["page_in_opinion"],
+        OpinionCheck.SHARED_FOOTNOTES,
+        Issue.Severity.WARNING,
+        f"{message} Keep the footnotes if they are this opinion's."
+        + (
+            f" The footnote mark(s) {', '.join(marks)} of this opinion's "
+            "text name no note that was taken."
+            if marks
+            else ""
+        ),
+        standing,
+    )
 
 
 def _figure_message(page: dict) -> str:
@@ -5403,6 +5564,48 @@ def _undetected_message(page: dict) -> str:
         "behind, as the engines read it. Check that no column of print "
         "is among them."
     )
+
+
+def _took_notes(group: dict) -> bool:
+    """Return whether the footnote mask took a reading of a group.
+
+    Any engine's, and any member of it: the group's ``reason`` is the
+    first excluded engine's first member's. One engine reads the last
+    line of the opinion before and its first note as one unit, which
+    the outside mask covers most of, and names the group "outside",
+    while the note another engine read alone went under the footnote
+    mask. Read by the reason alone, that note left the text with no
+    ``SHARED_FOOTNOTES`` card (#457).
+
+    :param group: One aligned group.
+    """
+    return group["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES or any(
+        unit.get("footnote_mask") for unit in group["engines"].values()
+    )
+
+
+def _note_labels(group: dict) -> list[str]:
+    """Return the footnote labels the engines read in a dropped group.
+
+    The label at the start of every line the verdict took from each
+    engine (``hidden_labels`` of :func:`_merge`), and the one its
+    ``hidden_key`` starts with. A group can hold several notes, in one
+    unit or in several, and a mark of the body may name any of them, so
+    each line counts: a continuation that starts with a number gives a
+    label too many, which costs a card a person dismisses, and a label
+    missed lets an opinion be approved without its own note. The
+    engines can disagree on a label, so every label any engine read is
+    one of the group's.
+
+    :param group: One dropped group.
+    :returns: The labels, sorted.
+    :rtype: list[str]
+    """
+    labels = set()
+    for unit in group["engines"].values():
+        labels.add(paragraphs.leading_label(unit.get("hidden_key") or ""))
+        labels.update(unit.get("hidden_labels") or [])
+    return sorted(label for label in labels if label)
 
 
 def _dropped_alike(group: dict) -> bool:
