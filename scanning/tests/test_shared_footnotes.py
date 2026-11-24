@@ -16,6 +16,7 @@ from django.urls import reverse
 from scanning import (
     boundaries,
     ensemble,
+    opinion_figures,
     opinion_ocr,
     opinion_pdf,
     paragraphs,
@@ -689,6 +690,20 @@ class TestThePdfMasks(ScanningTestCase):
         notes = footnote_masks(opinion_pdf._masks(self.opinion, self.volume))
 
         self.assertEqual(notes, [])
+
+    def test_the_picture_cut_paints_the_footnote_mask(self):
+        """A picture in the earlier opinion's notes is never shown."""
+        covers = opinion_figures.covers(self.opinion, {1})
+
+        self.assertEqual(len(footnote_masks(covers[1])), 1)
+
+    def test_the_picture_cut_of_a_kept_opinion_has_no_footnote_mask(self):
+        """A picture inside a kept note (#486) is not painted white."""
+        shared_footnotes.keep(self.opinion, self.user)
+
+        covers = opinion_figures.covers(self.opinion, {1})
+
+        self.assertEqual(footnote_masks(covers.get(1, [])), [])
 
     def test_the_footnote_mask_starts_at_the_top_of_its_box(self):
         """``generate`` moves an outside rect's top down by 3 pt (#457)."""
