@@ -16,6 +16,14 @@ read and no page is rendered.
 An opinion whose approved text holds the rule of this code already is
 skipped: its key would be the same.
 
+A rule that changes the footnotes alone (#649) changes no text of an
+opinion with no footnote, so ``--with-footnotes`` leaves those opinions
+out: it walks only the approved opinions whose text holds a footnote,
+read off the ``OpinionText.footnotes`` cache of their pages, with no
+read of the bucket. An opinion it leaves out keeps the object of the
+older rule, whose text the new rule would write the same, and a later
+run without the flag writes it under the new key.
+
 Examples:
 
     # Say what would be written, and change nothing.
@@ -25,12 +33,41 @@ Examples:
     # Write the approved text of two volumes again.
     docker exec scanning-daemon python manage.py \\
         rewrite_approved_text 2845 2702
+
+    # After a change of the footnote rule: the opinions with footnotes
+    # alone, first what would be written, then the write.
+    docker exec scanning-daemon python manage.py \\
+        rewrite_approved_text --all --with-footnotes --dry-run
+    docker exec scanning-daemon python manage.py \\
+        rewrite_approved_text --all --with-footnotes
 """
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db.models import Exists, OuterRef, QuerySet
 
 from scanning import opinion_review, paragraphs
-from scanning.models import Opinion, OpinionReviewStatus, Scan
+from scanning.models import Opinion, OpinionReviewStatus, OpinionText, Scan
+
+
+def with_footnotes(rows: QuerySet) -> QuerySet:
+    """Return the opinions of ``rows`` whose text holds a footnote.
+
+    The ensemble writes the footnotes of every page into
+    ``OpinionText.footnotes`` (#399), and nothing builds an approved
+    opinion again, so the cache of an approved opinion is the footnote
+    section of the document its approved text was written from.
+
+    :param rows: A queryset of ``Opinion``.
+    :returns: The rows with a page whose footnote cache is not blank.
+    :rtype: QuerySet
+    """
+    return rows.filter(
+        Exists(
+            OpinionText.objects.filter(opinion=OuterRef("pk")).exclude(
+                footnotes=""
+            )
+        )
+    )
 
 
 class Command(BaseCommand):
@@ -56,6 +93,14 @@ class Command(BaseCommand):
             "--all",
             action="store_true",
             help="Write the approved opinions of every volume again.",
+        )
+        parser.add_argument(
+            "--with-footnotes",
+            action="store_true",
+            help=(
+                "Walk only the approved opinions whose text holds a "
+                "footnote: for a rule that changes the footnotes alone."
+            ),
         )
         parser.add_argument(
             "--dry-run",
@@ -86,6 +131,11 @@ class Command(BaseCommand):
         ).select_related("scan", "apply_run", "approved_by")
         if pks:
             rows = rows.filter(scan_id__in=pks)
+        left_out = 0
+        if options["with_footnotes"]:
+            approved = rows.count()
+            rows = with_footnotes(rows)
+            left_out = approved - rows.count()
         written = current = failed = 0
         for opinion in rows.order_by(
             "scan_id", "first_printed_page", "index_in_page"
@@ -124,3 +174,7 @@ class Command(BaseCommand):
             f"text(s) under join rule {paragraphs.JOIN_RULE}, {current} "
             f"current, {failed} failed"
         )
+        if options["with_footnotes"]:
+            self.stdout.write(
+                f"Left out {left_out} approved opinion(s) with no footnote"
+            )
