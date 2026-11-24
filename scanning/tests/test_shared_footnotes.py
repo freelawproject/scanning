@@ -36,7 +36,13 @@ from scanning.models import (
 )
 from scanning.tests.test_boundaries import IMG_H, IMG_W
 from scanning.tests.test_detections import model_row
-from scanning.tests.test_ensemble import engine_page, read_units, unit
+from scanning.tests.test_ensemble import (
+    HEIGHT,
+    WIDTH,
+    engine_page,
+    read_units,
+    unit,
+)
 from scanning.tests.test_views import ScanningTestCase
 
 
@@ -246,6 +252,52 @@ class TestTheVerdict(ScanningTestCase):
         exclusion, _ = opinion_ocr.verdict(self.BOX, [], [mask])
 
         self.assertEqual(exclusion, {"reason": "outside"})
+
+
+class TestTheMaskIsABox(ScanningTestCase):
+    """The footnote mask uncovers a reading like the outside mask."""
+
+    def test_a_unit_of_the_text_and_a_note_keeps_the_text(self):
+        """dots.mocr read the last line of the text and the first note
+        as one unit, and the mask covers the note's share of it. The
+        other engines drew the note its own box, covered whole, so the
+        note comes out of the dots.mocr reading and the line stays."""
+        note = {"reason": opinion_ocr.NEIGHBOUR_FOOTNOTES}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 580, 288, 640),
+                "The judgment is affirmed.\n7 Id. at 12.",
+                note,
+                0.4,
+            ),
+            unit(
+                "mistral_ocr",
+                0,
+                (36, 580, 288, 610),
+                "The judgment is affirmed.",
+            ),
+            unit(
+                "mistral_ocr",
+                1,
+                (36, 616, 288, 640),
+                "7 Id. at 12.",
+                note,
+                1.0,
+            ),
+            unit("surya", 0, (36, 580, 288, 610), "The judgment is affirmed."),
+            unit("surya", 1, (36, 616, 288, 640), "7 Id. at 12.", note, 1.0),
+        ]
+
+        groups = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertEqual(len(groups), 1)
+        dots = groups[0]["engines"]["dots_mocr"]
+        self.assertEqual(dots["text"], "The judgment is affirmed.")
+        self.assertEqual(dots["uncovered"], 1)
+        self.assertFalse(dots["excluded"])
+        self.assertEqual(ensemble.resolve(groups[0])["silent"], [])
 
 
 def page_of(dropped=(), groups=()):
