@@ -409,6 +409,48 @@ function addGuessedDetection(btn, variant) {
         });
 }
 
+// The text card's "Grow footnote": the page's footnote box beside the
+// block is resized over it, through the endpoint a drag of its handles
+// uses, so one footnote box covers the line it stopped short of and no
+// seam is left. A model box becomes a hand-drawn one the next compute
+// keeps; the viewer follows the id the server answers.
+function growDetection(btn) {
+    var d = _getDetectionData(btn);
+    var id = parseInt(btn.dataset.growId, 10);
+    var bbox = (btn.dataset.growBbox || "").split(",").map(function (v) { return parseFloat(v); });
+    if (!d || !id || bbox.length !== 4 || bbox.some(isNaN)) return;
+    var cfg = window.SCAN_CONFIG;
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/update-detection/", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "X-CSRFToken": cfg.csrfToken,
+        },
+        body: JSON.stringify({ detection_id: id, new_bbox: bbox }),
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status === "error" || data.error) {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && (data.message || data.error)) || "Could not grow the box");
+                return;
+            }
+            if (window.moveDetectionBox) {
+                window.moveDetectionBox(id, data.detection_id, bbox, d.pageIndex);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not grow the box");
+        });
+}
 // "Cover the line" of a card about a redaction that covers part of a
 // line of text: the box is moved to cover the whole line (the card's
 // ``cover``, the box grown over the reader's cell), through the same
@@ -448,6 +490,185 @@ function coverCutLine(btn) {
             btn.disabled = false;
             btn.textContent = label;
             showToast("Could not move the box");
+        });
+}
+
+// "Cover with margin" of a dismissed "text in no box" card: the page's
+// bottom margin strip is pulled up to just over the card's block, through
+// the endpoint a drag of the strip's handles uses, so the block and
+// everything under it is whited out. The boxes the strip then covers are
+// dismissed by the server, dropped from the page with one Undo.
+//
+// The state is the page's, never the button's: every card the strip was
+// pulled up for, the strip's place before the first cover, the computed
+// row it replaced, and the boxes it dismissed. A second card of the page
+// pulls it further up, or only joins when it is covered already.
+// "Uncover", from any of them, puts the page back as it was before the
+// first cover: the computed strip through its own restore (which takes
+// the moved copy away), a hand-drawn one moved back, the dismissed boxes
+// restored. The state lives here, outside the sidebar, which every write
+// draws again; it lasts the page load.
+var _marginCovers = {};
+
+function _marginCoverRow(btn) {
+    return btn.closest("[data-bbox]");
+}
+
+function _marginCoverKey(row) {
+    return row.dataset.pageIndex + ":" + row.dataset.bbox;
+}
+
+// The buttons say what a press would do, after every draw of the sidebar.
+function labelMarginCovers() {
+    document.querySelectorAll("[data-cover-margin]").forEach(function (btn) {
+        var row = _marginCoverRow(btn);
+        if (!row) return;
+        var page = _marginCovers[row.dataset.pageIndex];
+        var covered = page && page.keys.indexOf(_marginCoverKey(row)) !== -1;
+        btn.textContent = covered ? "Uncover" : "Cover with margin";
+    });
+}
+
+function _marginMove(id, bbox) {
+    var cfg = window.SCAN_CONFIG;
+    return fetch("/scans/" + cfg.docId + "/redactions/" + id + "/move/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+        body: JSON.stringify(bbox),
+    }).then(function (r) { return r.json(); });
+}
+
+function _marginRestore(id) {
+    var cfg = window.SCAN_CONFIG;
+    return fetch("/scans/" + cfg.docId + "/redactions/" + id + "/restore/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+    }).then(function (r) { return r.json(); });
+}
+
+function coverWithMargin(btn) {
+    var row = _marginCoverRow(btn);
+    if (!row || !window.marginCoverFor) return;
+    var pageIndex = parseInt(row.dataset.pageIndex);
+    var key = _marginCoverKey(row);
+    var page = _marginCovers[row.dataset.pageIndex];
+    var label = btn.textContent;
+    var fail = function (message) {
+        btn.disabled = false;
+        btn.textContent = label;
+        showToast(message || "Could not move the margin");
+    };
+
+    if (page && page.keys.indexOf(key) !== -1) {
+        // Uncover: the page as it was before its first cover.
+        btn.disabled = true;
+        btn.textContent = "...";
+        var back = page.computedId
+            ? _marginRestore(page.computedId)
+            : _marginMove(page.id, page.from);
+        back.then(function (data) {
+            if (!data || data.status !== "ok") { fail(data && data.message); return; }
+            delete _marginCovers[row.dataset.pageIndex];
+            if (page.computedId) {
+                if (window.reloadRedactionPage) window.reloadRedactionPage(pageIndex);
+            } else if (window.applyRedactionMove) {
+                window.applyRedactionMove(pageIndex, page.id, data.id, page.from);
+            }
+            if (page.dismissed.length && window.marginCoverRestore) {
+                // Restores the boxes one by one, then refreshes the cards
+                // and shows the server's line.
+                window.marginCoverRestore(page.dismissed, page.removed, pageIndex);
+            } else {
+                showSaved(data);
+                refreshFindings();
+            }
+        }).catch(function () { fail(); });
+        return;
+    }
+
+    var plan = window.marginCoverFor(
+        pageIndex,
+        row.dataset.bbox.split(",").map(function (v) { return parseFloat(v); }),
+        parseFloat(row.dataset.imgW),
+        parseFloat(row.dataset.imgH)
+    );
+    if (!plan) {
+        showToast("This page has no bottom margin strip to move (or it has not loaded: open the page first)");
+        return;
+    }
+    if (plan.to.y0 >= plan.from.y0) {
+        if (page) {
+            // The strip another card pulled up covers this block too.
+            page.keys.push(key);
+            labelMarginCovers();
+        } else {
+            showToast("The bottom margin already covers this block");
+        }
+        return;
+    }
+    btn.disabled = true;
+    btn.textContent = "...";
+    _marginMove(plan.id, plan.to).then(function (data) {
+        if (!data || data.status !== "ok") { fail(data && data.message); return; }
+        if (!page) {
+            page = _marginCovers[row.dataset.pageIndex] = {
+                computedId: plan.origin === "computed" ? plan.id : null,
+                from: plan.from,
+                keys: [],
+                dismissed: [],
+                removed: [],
+            };
+        }
+        page.id = data.id;
+        page.keys.push(key);
+        if (window.applyRedactionMove) window.applyRedactionMove(pageIndex, plan.id, data.id, plan.to);
+        var removed = window.marginCoverDropped ? window.marginCoverDropped(data, pageIndex) : [];
+        if (removed.length || (data.dismissed || []).length) {
+            page.dismissed = page.dismissed.concat(data.dismissed || []);
+            page.removed = page.removed.concat(removed);
+        } else {
+            showSaved(data);
+        }
+        // The move rebuilt the page's cards under new ids: the sidebar is
+        // drawn again, and the labels follow the state above.
+        refreshFindings();
+    }).catch(function () { fail(); });
+}
+
+// "Remove the box" of the same card: the box reaches into text that
+// should stay (a headnote box over a line of the opinion), so it goes,
+// through the endpoint of the box's own Dismiss button. The endpoint
+// rebuilt the findings, so the card goes.
+function removeCutBox(btn) {
+    var row = btn.closest("[data-redaction-id]");
+    if (!row) return;
+    var cfg = window.SCAN_CONFIG;
+    var id = parseInt(row.dataset.redactionId);
+    var label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "...";
+    fetch("/scans/" + cfg.docId + "/redactions/" + id + "/dismiss/", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-CSRFToken": cfg.csrfToken },
+    })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+            if (!data || data.status !== "ok") {
+                btn.disabled = false;
+                btn.textContent = label;
+                showToast((data && data.message) || "Could not remove the box");
+                return;
+            }
+            if (window.applyRedactionRemove) {
+                window.applyRedactionRemove(parseInt(row.dataset.pageIndex), id);
+            }
+            showSaved(data);
+            refreshFindings();
+        })
+        .catch(function () {
+            btn.disabled = false;
+            btn.textContent = label;
+            showToast("Could not remove the box");
         });
 }
 
@@ -691,6 +912,7 @@ function _applyFindings(data) {
     if (!section) return;
     if (data && typeof data.html === "string") section.innerHTML = data.html;
     labelFindingCards();
+    labelMarginCovers();
     if (typeof window.refreshProcessActionBar === "function") {
         window.refreshProcessActionBar();
     }

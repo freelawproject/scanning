@@ -227,16 +227,18 @@ def _document(opinion: Opinion) -> dict:
 
 
 def _embed_figures(opinion: Opinion, document: dict, text: dict) -> None:
-    """Put each picture of the approved body in its paragraph (#463).
+    """Put each picture of the approved text in its paragraph (#463).
 
     The cut of ``opinion_figures``, as base64 JPEG, beside the size it
     has on the page, so the approved object holds the picture and the
     final XML is built from it and the spans alone. The box found the
-    cut and leaves the object: the approved text holds no geometry.
+    cut and leaves the object: the approved text holds no geometry. The
+    pictures of the footnotes too (#486): a note can hold one.
 
     :param opinion: The row, with ``scan``.
     :param document: The stamped ensemble document the text came from.
-    :param text: The approved object; its ``body`` is changed in place.
+    :param text: The approved object; its ``body`` and its
+        ``footnotes`` are changed in place.
     :raises ApprovalRefused: When a cut is missing, or the bucket did
         not answer.
     """
@@ -245,7 +247,15 @@ def _embed_figures(opinion: Opinion, document: dict, text: dict) -> None:
         for page in document.get("pages") or []
     }
     run_label = document.get("apply_run") or ""
-    for paragraph in text.get("body") or []:
+    every = [
+        *(text.get("body") or []),
+        *(
+            paragraph
+            for note in text.get("footnotes") or []
+            for paragraph in note.get("paragraphs") or []
+        ),
+    ]
+    for paragraph in every:
         if paragraph.get("kind") != paragraphs.FIGURE:
             continue
         figure = paragraph.get("figure") or {}

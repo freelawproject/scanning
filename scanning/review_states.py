@@ -284,11 +284,17 @@ def promote_ready_scans() -> int:
             # anyway, at the cost of a read per tick.
             jobs__apply_run__isnull=True,
         )
+        # No ``order_by``: the scan's default ordering would put its
+        # ``date_created`` into the DISTINCT and sort the join.
+        .order_by()
         .values_list("pk", flat=True)
         .distinct()
     )
     promoted = 0
-    for scan in Scan.objects.filter(pk__in=list(scan_ids)):
+    # The caches stay on disk (#582): the promotion reads none of them.
+    for scan in Scan.objects.filter(pk__in=list(scan_ids)).defer(
+        *Scan.large_fields()
+    ):
         rows = yolo.live_detect_jobs(scan)
         if not redaction_review_ready(scan, rows):
             continue

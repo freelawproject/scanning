@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% comment %}
+  A volunteer's sign-up page, opened from the one-time link staff send
+  (views_cards.volunteer_signup, VolunteerInvite). Public: the link is
+  the proof.
+{% endcomment %}
+
+{% block title %}Volunteer sign-up - FLP Scanning Portal{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-center min-h-[60vh]">
+  <div class="card w-full max-w-md">
+    <h1 class="text-2xl font-bold text-center mb-2">Volunteer sign-up</h1>
+
+    {% if invalid %}
+    <div class="alert alert-danger mt-4">{{ invalid }}</div>
+
+    {% elif signed_in %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 mt-4">
+      You are signed in as {{ user.username }}. To make the volunteer account for {{ invite.email }}, sign out first, then open the link again.
+    </p>
+    <form method="post" action="{% url 'logout' %}" class="mt-4">
+      {% csrf_token %}
+      <button type="submit" class="btn-outline w-full">Sign out</button>
+    </form>
+
+    {% else %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 text-center mb-6">
+      Pick a username and a password for {{ invite.email }}. You will start with a few practice cards.
+    </p>
+
+    {% if form.non_field_errors %}
+    <div class="alert alert-danger mb-4">{{ form.non_field_errors|join:" " }}</div>
+    {% endif %}
+
+    <form method="post">
+      {% csrf_token %}
+      <div class="space-y-4">
+        <div>
+          <label for="id_username" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Username</label>
+          <input type="text" name="username" id="id_username" value="{{ form.username.value|default_if_none:'' }}" class="input-text w-full" autocomplete="username" autofocus required>
+          {% for error in form.username.errors %}<p class="text-xs text-red-600 dark:text-red-400 mt-1">{{ error }}</p>{% endfor %}
+        </div>
+        <div>
+          <label for="id_password1" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Password</label>
+          <input type="password" name="password1" id="id_password1" class="input-text w-full" autocomplete="new-password" required>
+          {% for error in form.password1.errors %}<p class="text-xs text-red-600 dark:text-red-400 mt-1">{{ error }}</p>{% endfor %}
+          <p class="text-xs text-gray-500 dark:text-gray-400 mt-1">At least 8 characters, not all numbers, and not too like your username.</p>
+        </div>
+        <div>
+          <label for="id_password2" class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Password again</label>
+          <input type="password" name="password2" id="id_password2" class="input-text w-full" autocomplete="new-password" required>
+          {% for error in form.password2.errors %}<p class="text-xs text-red-600 dark:text-red-400 mt-1">{{ error }}</p>{% endfor %}
+        </div>
+        <button type="submit" class="btn-primary w-full">Create my account</button>
+      </div>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

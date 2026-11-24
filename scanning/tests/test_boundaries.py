@@ -5,6 +5,8 @@ of the curator's dismissals, the moves, the readers, and the three
 endpoints. The compute around them is tested in ``test_yolo_apply``.
 """
 
+from unittest.mock import patch
+
 from blackletter.models import BBox, Label, Page
 from blackletter.models import Detection as BLDetection
 from blackletter.models import Document as BLDoc
@@ -442,6 +444,30 @@ class TestDismissAndResolve(TestCase):
 
         self.assertFalse(
             OpinionBoundary.objects.human().filter(scan=self.scan).exists()
+        )
+
+    def test_the_landed_rows_are_written_in_one_statement(self):
+        """One ``bulk_update`` for every landed dismissal (#603)."""
+        first_key = key_row(self.scan, 0, x0=200.0, y0=900.0)
+        second_caption = caption_row(self.scan, 0, y0=1300.0)
+        document, row_ids = document_of(
+            [self.caption, first_key, second_caption, self.key]
+        )
+        boundaries.write_computed(self.scan, document, row_ids, None, 1)
+        rows = list(OpinionBoundary.objects.computed().filter(scan=self.scan))
+        for row in rows:
+            boundaries.dismiss(self.scan, row, self.user)
+        OpinionBoundary.objects.computed().filter(scan=self.scan).update(
+            decision=None
+        )
+
+        with self.assertNumQueries(4):
+            self.assertEqual(boundaries.resolve(self.scan), (2, []))
+
+        self.assertFalse(
+            OpinionBoundary.objects.computed()
+            .filter(scan=self.scan, decision__isnull=True)
+            .exists()
         )
 
     def test_resolve_reads_no_row_when_no_dismissal_stands(self):
@@ -1192,3 +1218,75 @@ class TestEndpoints(TestCase):
         self.client.logout()
         response = self._post("dismiss", {"boundary_id": self.row.pk})
         self.assertEqual(response.status_code, 302)
+
+
+class TestTheImportReplacesTheModelRows(TestCase):
+    """``services._import_detections`` is one transaction (#603)."""
+
+    def setUp(self):
+        self.scan = ScanFactory(page_count=2)
+        self.caption, self.key, self.row = one_opinion(self.scan)
+        self.entry = {
+            "page_index": 0,
+            "label": "KEY_ICON",
+            "label_id": 1,
+            "confidence": 0.9,
+            "bbox": [100.0, 100.0, 200.0, 200.0],
+            "img_width": 1700,
+            "img_height": 2200,
+            "found_by": [{"model": "bl_warm", "confidence": 0.9}],
+            "pdf_page": 1,
+        }
+
+    def test_a_failure_after_the_delete_leaves_the_old_rows(self):
+        from scanning import services
+
+        before = set(
+            Detection.objects.filter(scan=self.scan).values_list(
+                "pk", flat=True
+            )
+        )
+
+        with (
+            patch(
+                "scanning.detections.resolve",
+                side_effect=RuntimeError("boom"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            services._import_detections(self.scan.pk, [self.entry])
+
+        self.assertEqual(
+            set(
+                Detection.objects.filter(scan=self.scan).values_list(
+                    "pk", flat=True
+                )
+            ),
+            before,
+        )
+        self.row.refresh_from_db()
+        self.assertEqual(self.row.start_detection_id, self.caption.pk)
+        self.assertEqual(self.row.end_detection_id, self.key.pk)
+
+    def test_the_anchors_on_a_model_row_are_nulled(self):
+        from scanning import services
+
+        manual = model_row(
+            self.scan, model_name=Detection.ModelName.MANUAL, page_index=1
+        )
+        OpinionBoundary.objects.filter(pk=self.row.pk).update(
+            end_detection=manual
+        )
+
+        services._import_detections(self.scan.pk, [self.entry])
+
+        self.row.refresh_from_db()
+        self.assertIsNone(self.row.start_detection_id)
+        self.assertEqual(self.row.end_detection_id, manual.pk)
+        self.assertTrue(Detection.objects.filter(pk=manual.pk).exists())
+        self.assertEqual(
+            Detection.objects.filter(scan=self.scan)
+            .exclude(model_name=Detection.ModelName.MANUAL)
+            .count(),
+            1,
+        )

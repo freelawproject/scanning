@@ -60,7 +60,10 @@ RUNPOD_YOLO_ENDPOINT_ID = env.str("RUNPOD_YOLO_ENDPOINT_ID", default="")
 # warm worker may cost less than three at once. The real cost control is
 # the endpoint's own ``max_workers``, which must be at least this value
 # or the extra rows wait in the provider's queue with the ceiling clock
-# running on them (#250 raised this from 2 to 3).
+# running on them (#250 raised this from 2 to 3; the stale-labels
+# re-read of October 2026 raised it to 8, with the endpoint's
+# ``max_workers`` at 8 first, because the portal does nothing with
+# a shard while RunPod reads it).
 #
 # The detection sweep (``yolo.enqueue_missing_runs``) reads it too, as
 # the number of volumes it looks at per submit tick. The two count
@@ -68,7 +71,7 @@ RUNPOD_YOLO_ENDPOINT_ID = env.str("RUNPOD_YOLO_ENDPOINT_ID", default="")
 # value serves both, and a second knob would be one nobody tunes: a
 # smaller batch only means the backlog takes more ticks to become
 # rows, and nothing waits on that.
-YOLO_MAX_CONCURRENCY = env.int("YOLO_MAX_CONCURRENCY", default=3)
+YOLO_MAX_CONCURRENCY = env.int("YOLO_MAX_CONCURRENCY", default=8)
 
 # Attempts per shard before its job is failed. Serverless workers are
 # preempted, scheduled without a GPU, or land with a dead inference

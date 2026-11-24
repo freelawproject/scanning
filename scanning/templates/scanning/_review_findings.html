@@ -60,7 +60,7 @@
      data-img-w="{{ issue.metadata.img_width }}" data-img-h="{{ issue.metadata.img_height }}" data-label-id="{{ issue.metadata.label_id }}"
      {% if issue.metadata.detection_id %}data-detection-id="{{ issue.metadata.detection_id }}"{% endif %}
      {% if issue.metadata.redaction_id and issue.metadata.cover %}data-redaction-id="{{ issue.metadata.redaction_id }}" data-cover="{{ issue.metadata.cover.0 }},{{ issue.metadata.cover.1 }},{{ issue.metadata.cover.2 }},{{ issue.metadata.cover.3 }}"{% endif %}
-     {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% elif issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' %}data-guess="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"{% endif %}
+     {% if issue.metadata.guess %}data-guess="{{ issue.metadata.guess.0 }},{{ issue.metadata.guess.1 }},{{ issue.metadata.guess.2 }},{{ issue.metadata.guess.3 }}"{% elif issue.check_name == 'uncovered_editors_note' or issue.check_name == 'missing_caption' and issue.metadata.label == 'CASE_CAPTION' %}data-guess="{{ issue.metadata.bbox.0 }},{{ issue.metadata.bbox.1 }},{{ issue.metadata.bbox.2 }},{{ issue.metadata.bbox.3 }}"{% endif %}
      onclick="highlightDetection(this)"
      {% elif issue.nav_pdf_index is not None %}
      data-pdf-index="{{ issue.nav_pdf_index }}" onclick="goToPage(this)"
@@ -74,6 +74,10 @@
   <div class="flex gap-1 mt-1">
     {% if issue.is_dismissed %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-gray-600 text-white" title="Take the dismissal back" onclick="event.stopPropagation(); restoreFinding(this, {{ issue.pk }})">Undo</button>
+    {% if issue.check_name == 'undetected_text' and issue.metadata.bbox %}
+    <button class="text-[10px] px-2 py-0.5 rounded bg-indigo-600 text-white hover:bg-indigo-700" title="Pull the page's bottom margin up to just over this block, so the block and everything under it is whited out. Press again to put the margin back."
+            data-cover-margin onclick="event.stopPropagation(); coverWithMargin(this)">Cover with margin</button>
+    {% endif %}
     {% elif issue.is_stale %}
     <button class="text-[10px] px-2 py-0.5 rounded bg-red-600 text-white" title="Take back the decision this finding names. The model's answer stands; make the decision again on the page as it is now." onclick="event.stopPropagation(); withdrawStaleEdit(this, {{ issue.pk }})">Withdraw</button>
     {% else %}
@@ -85,15 +89,31 @@
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a caption box where the card guesses the caption is, the box the card flashes. Resize it on the page if it is off; the next compute starts the opinion on it. (The first key of the volume gets no +: its box is the key, not a caption.)"
             onclick="event.stopPropagation(); addGuessedDetection(this)">+</button>
     {% endif %}
+    {% if issue.check_name == 'unboxed_picture' and issue.metadata.guess %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add an image box where the readers saw the picture or the table, the box the card flashes. The opinion PDF pastes the original scan of it over the page, and the opinion text leaves it out. The card goes now."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+ image</button>
+    {% endif %}
+    {% if issue.check_name == 'uncovered_editors_note' and issue.metadata.bbox %}
+    <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add an editor's note box over the note the reader saw, the band the card flashes. The next compute blacks it out. The card goes now."
+            onclick="event.stopPropagation(); addGuessedDetection(this)">+ editor's note</button>
+    {% endif %}
     {% if issue.check_name == 'undetected_text' and issue.metadata.guess %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Add a text column box over this block, the box the card flashes, and resize it on the page if it is short. A box in a column that has one already joins that column. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this)">+ column</button>
+    {% if issue.metadata.grow %}
+    <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Grow the page's footnote box over this block: the footnote line it stopped short of. One footnote box, no seam. A model box becomes a hand-drawn one the next compute keeps. The card goes now."
+            data-grow-id="{{ issue.metadata.grow.id }}" data-grow-bbox="{{ issue.metadata.grow.grown.0 }},{{ issue.metadata.grow.grown.1 }},{{ issue.metadata.grow.grown.2 }},{{ issue.metadata.grow.grown.3 }}"
+            onclick="event.stopPropagation(); growDetection(this)">Grow footnote</button>
+    {% else %}
     <button class="px-1 py-0.5 rounded bg-blue-600 text-white text-[10px] hover:bg-blue-700" title="Add a footnote box over this block: the footnote line the page's footnote box stopped short of. The opinion text takes it as a footnote. The card goes now."
             onclick="event.stopPropagation(); addGuessedDetection(this, 'footnote')">+ footnote</button>
+    {% endif %}
     {% endif %}
     {% if issue.check_name == 'redaction_cuts_text' and issue.metadata.redaction_id and issue.metadata.cover %}
     <button class="px-1 py-0.5 rounded bg-green-600 text-white text-[10px] hover:bg-green-700" title="Grow the box over the whole line, so no word of it prints beside the box. A computed box becomes a hand-drawn one the next compute keeps. The card goes now."
             onclick="event.stopPropagation(); coverCutLine(this)">Cover the line</button>
+    <button class="px-1 py-0.5 rounded bg-red-600 text-white text-[10px] hover:bg-red-700" title="Take the box out instead: it reaches into text that should stay (a headnote box over a line of the opinion). A computed box is dismissed and a drawn one withdrawn, with an Undo on the box's page. The card goes now."
+            onclick="event.stopPropagation(); removeCutBox(this)">Remove the box</button>
     {% endif %}
     {% if issue.check_name == 'unmatched_key_icon' or issue.check_name == 'unmatched_caption' or issue.check_name == 'low_confidence_headnote_bracket' %}
     {% if issue.metadata.conf < 1 %}

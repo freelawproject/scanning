@@ -101,6 +101,18 @@ boxes lists as blockquotes (#211), so a run that
 :data:`LIST_READERS` engines read as a list is the ``BLOCKQUOTE_LIST``
 card, which warns and changes nothing.
 
+**The syllabus (#518).** The OCR glue freezes the ``SYLLABUS``
+detection, the model's box over the heading line that opens a
+syllabus, as ``zones.syllabus``, and :func:`syllabus_start` stamps the
+body group the zone covers :data:`SYLLABUS_SHARE` of. The stamp names
+the start alone: the extent of the syllabus is read off the tagger's
+spans in ``casebody``, which the approved text carries the stamp to.
+The heading's words are the second signal (``casebody.is_syllabus_heading``),
+and :func:`syllabus_doubts` names each place the two disagree: a box
+on a block that is no syllabus heading, or on no block, and a syllabus
+heading with no box. Each is the ``SYLLABUS_UNSURE`` card, a warning
+that gates nothing; a page where both agree raises none.
+
 **A seventh step, the list (#428).** The OCR glue takes the bullet off
 every list item and writes one ``li`` mark per item, because the
 engines agree on the words and not on the glyph (``*``, ``•``, a
@@ -161,6 +173,7 @@ import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
+from functools import lru_cache
 from itertools import combinations
 
 from django.conf import settings
@@ -169,6 +182,7 @@ from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
 from scanning import (
+    casebody,
     detections,
     markup,
     opinion_ocr,
@@ -177,6 +191,10 @@ from scanning import (
     shared_footnotes,
 )
 from scanning.models import (
+    OPINION_ENSEMBLE_MAX_ATTEMPTS,
+    OPINION_ENSEMBLE_OWED,
+    OPINION_PASS_ORDER,
+    ApplyRun,
     Issue,
     Opinion,
     OpinionCheck,
@@ -185,6 +203,7 @@ from scanning.models import (
     OpinionFindingDismissal,
     OpinionReviewStatus,
     OpinionText,
+    Scan,
     Status,
 )
 
@@ -207,11 +226,26 @@ logger = logging.getLogger(__name__)
 #: applies the blockquote edits: ``quote_edit`` and ``quote_span`` on
 #: a group (#419).
 #: 11 gives a list item group its ``li`` marks and its ``list`` type,
-#: and the page its list runs (``lists``, #428). 12 writes the footnote
-#: zones the first-page mask took under ``zones.footnotes_taken`` and
-#: leaves them out of ``zones.footnotes`` (#457), and writes a picture
+#: and the page its list runs (``lists``, #428). 12 writes a picture
 #: as a ``figure`` group with no text, its size under ``figure`` (#463).
-SCHEMA_VERSION = 12
+#: 13 counts the positions of a person's kept tokens over the words as
+#: ``_pairs`` joins them (a hyphen gap, a lone quotation mark), the
+#: split the cards align the engines with (``blocking_review.open_words``).
+#: 14 joins the halves of an empty bracket the same way (``express[ ]``,
+#: #610), which moves those positions again.
+#: 15 splits a mark off its word where 14 joined it (an ellipsis, a run
+#: of dashes, a paragraph or section sign, an empty bracket), and a
+#: voted token printed against the one before it carries ``attach``
+#: (:func:`_pairs`), which moves the positions once more.
+#: 16 puts a picture in the footnotes by the zone or a section edit,
+#: like a block of text (#486).
+#: 17 stamps ``syllabus_start`` on the body group under the syllabus
+#: zone, writes that zone beside the other two, and gives the page its
+#: ``syllabus_doubt`` entries (#518).
+#: 18 writes the footnote zones the first-page mask took under
+#: ``zones.footnotes_taken`` and leaves them out of ``zones.footnotes``
+#: (#457).
+SCHEMA_VERSION = 18
 
 #: The file, beside the ``{engine}.json`` files of the OCR glue. A
 #: build over human edits writes ``ensemble.e{n}.json`` instead, with
@@ -288,6 +322,17 @@ FOOTNOTE_SHARE = 0.5
 #: writes it under (``opinion_ocr.ZONES``, #411).
 BLOCKQUOTES = "blockquotes"
 
+#: The name of the syllabus zone of a page, the key the OCR glue
+#: writes it under (``opinion_ocr.ZONES``, #518): the detection over
+#: the heading line that opens a syllabus.
+SYLLABUS = "syllabus"
+
+#: The share of a group's box the syllabus zone must cover for the
+#: group to open the syllabus (#518). The value of the footnote zone:
+#: the zone is the model's box over one heading line, and the group
+#: under it is that line, so the two boxes are nearly one.
+SYLLABUS_SHARE = 0.5
+
 #: The share of a group's box the blockquote zone must cover for the
 #: group to be in the quote (#411). The value of the footnote zone: an
 #: engine that joins a quote and the next paragraph into one block
@@ -352,6 +397,7 @@ ENSEMBLE_CHECKS = frozenset(
         OpinionCheck.PAGE_NOT_READ,
         OpinionCheck.FOOTNOTE_UNSURE,
         OpinionCheck.BLOCKQUOTE_LIST,
+        OpinionCheck.SYLLABUS_UNSURE,
         OpinionCheck.UNRESOLVED_EDIT,
         OpinionCheck.SHARED_FOOTNOTES,
         # No writer since the pictures are review 2's boxes: here so
@@ -366,7 +412,7 @@ ENSEMBLE_CHECKS = frozenset(
 ENSEMBLE_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_ENSEMBLE_MAX_ATTEMPTS
 
 #: The start of every ``Opinion.error_message`` this module writes, so
 #: a success clears its own message and nobody else's.
@@ -406,6 +452,201 @@ _MARKUP = re.compile(r"[*_`~#•▪◦●]+")
 #: A run of two periods or more, and a run of spaced periods: one
 #: engine writes ``....`` where the other writes ``. . . .``.
 _DOT_RUN = re.compile(r"\.(?:\s*\.)+")
+
+#: Whitespace before an ellipsis (#610): dots.mocr writes ``another...``
+#: where Mistral writes ``another . . .``, the same ellipsis set apart.
+#: The key takes the space out, and :func:`_pairs` splits the dots off
+#: as a word of their own.
+_ELLIPSIS_GAP = re.compile(r"\s+(?=\.\.\.)|(?<=\.\.\.)\s+(?=[,;:])")
+
+#: Whitespace after an ellipsis: Mistral writes ``...it`` where Surya
+#: writes ``... it``. Folded in the block key alone, and never for the
+#: page-number reader (``hyphen_gaps=False``), whose line ends in the
+#: number after a run of leader dots.
+_ELLIPSIS_AFTER = re.compile(r"(?<=\.\.\.)\s+")
+
+#: Whitespace around a single dash between two words (#610): dots.mocr
+#: writes ``municipality' - that`` where Mistral writes
+#: ``municipality'-that``, one dash spaced two ways. A double dash
+#: (``677 -- 679``) is a mark of its own and keeps its spaces.
+_DASH_GAP = re.compile(r"(?<=[^\s-])\s+-\s+(?=[^\s-])")
+
+#: A run of two dashes or more and the whitespace around it, one mark
+#: however it is spelled: ``--``, ``---`` and ``– –`` read as the ``—``
+#: of another engine, whose spaces ``_DASH_GAP`` folds the same way.
+_DASH_RUN = re.compile(r"\s*-(?:\s*-)+\s*")
+
+#: A key that is dashes alone: one dash, however many an engine wrote.
+_DASHES_ONLY = re.compile(r"-[-\s]*")
+
+#: Whitespace inside an abbreviation of single letters (#610): dots.mocr
+#: writes ``S.D.N. Y.`` where Surya writes ``S.D.N.Y.``, one court. A
+#: space after a capital and its period closes up when a single capital
+#: follows (``Y.``, or ``Y`` with the period lost), so ``A. Smith`` and
+#: ``Mr. Jones`` keep theirs.
+_INITIALS_GAP = re.compile(r"(?<=\b[A-Z]\.)\s+(?=[A-Z](?![A-Za-z]))")
+_INITIAL_END = re.compile(r"\b[A-Z]\.$")
+_INITIAL_NEXT = re.compile(r"^[A-Z](?![A-Za-z])")
+
+#: Whitespace after a paragraph or section sign (#610): ``¶ 8`` and
+#: ``¶8``, ``§ 1983`` and ``§1983``, one reference spaced two ways.
+_SIGN_GAP = re.compile(r"(?<=[¶§])\s+")
+
+#: A hyphen between a word character and whitespace, with a word after:
+#: Mistral writes ``CP-23-CR-0001065- 2021`` where dots.mocr writes
+#: ``CP-23-CR-0001065-2021``, the same docket number, and the two are
+#: no two engines agreeing on a word. A dash between spaces, or the
+#: second of a double dash (``677 -- 679``), is a mark of its own and
+#: stays.
+_HYPHEN_GAP = re.compile(r"(?<=\w)-\s+(?=\w)")
+
+#: A word that ends in a hyphen after a word character, the head of a
+#: ``_HYPHEN_GAP`` split; ``--`` is not one.
+_HYPHEN_END = re.compile(r"\w-$")
+
+#: Whitespace between two quotation marks: a quote inside a quote.
+#: Mistral writes ``“ ‘finally`` and ``justice’ ”`` where dots.mocr
+#: writes ``"'finally`` and ``justice'"``, the same marks at the same
+#: ends. The fold table has made the curly and the straight marks
+#: alike already; this takes the space out, so the two read as one.
+#: Surya, which drops the inner mark (``“finally``), is then one
+#: engine against two, a warning and not a block.
+_QUOTE_GAP = re.compile(r"(?<=[\"'])\s+(?=[\"'])")
+
+#: Whitespace inside an empty bracket (#610): Mistral writes the
+#: court's alteration ``express[ ]`` where Surya writes ``express[]``,
+#: one mark spelled two ways, and with the space it is two words to the
+#: vote against one. The key folds the space out, and :func:`_pairs`
+#: reads ``express[`` and ``]'`` as one word. Not one of :data:`_GAPS`:
+#: those pick the spelling a reader sees, and this rule changes the
+#: comparison alone, so the shown text is the winning engine's own.
+_BRACKET_GAP = re.compile(r"\[\s+\]")
+
+#: A hyphen between two letters (#610): a word a line end broke. One
+#: engine keeps the hyphen (``Mohort-er``) where another joins the
+#: halves (``Mohorter``), the same word. The key drops it, so the two
+#: agree only where another engine read the joined word. Between digits
+#: it stays: ``12-345`` and ``123-45`` are two numbers, ``1-3`` is no
+#: ``13``. Of two spellings that agree, :func:`_tidiest` shows the one
+#: more engines wrote, and the one with fewer only when they tie.
+_WORD_HYPHEN = re.compile(r"(?<=[^\W\d_])-(?=[^\W\d_])")
+
+#: The reporters whose abbreviation the vote reads alike however it is
+#: spaced (#610): ``L. Ed. 2d`` and ``L.Ed.2d`` are one reporter, and
+#: one engine's spacing against another's was a block nobody agrees on.
+#: An allowlist and never all of reporters-db, whose short and old
+#: abbreviations (``A.``, ``F.``, ``P.``) are words of the text as
+#: well. Written without spaces; a trailing comma or semicolon is no
+#: part of the name.
+REPORTERS = frozenset(
+    {
+        "U.S.",
+        "S.Ct.",
+        "L.Ed.",
+        "L.Ed.2d",
+        "F.2d",
+        "F.3d",
+        "F.4th",
+        "F.Supp.",
+        "F.Supp.2d",
+        "F.Supp.3d",
+        "F.App'x",
+        "A.2d",
+        "A.3d",
+        "N.E.2d",
+        "N.E.3d",
+        "N.W.2d",
+        "S.E.2d",
+        "S.W.2d",
+        "S.W.3d",
+        "P.2d",
+        "P.3d",
+        "So.2d",
+        "So.3d",
+        "N.Y.S.2d",
+        "N.Y.S.3d",
+        "Cal.Rptr.2d",
+        "Cal.Rptr.3d",
+    }
+)
+
+#: The most words a spaced :data:`REPORTERS` name takes (``N. Y. S. 3d``).
+_REPORTER_WORDS = 4
+
+#: What may close a reporter's word and is no part of its name.
+_AFTER_REPORTER = ",;:)"
+
+
+#: Every leading part of every :data:`REPORTERS` name, the name itself
+#: included: a run of words whose spaceless join is none of these, and
+#: no name followed by :data:`_AFTER_REPORTER`, starts no name, so
+#: :func:`_join_reporters` stops there.
+_REPORTER_PREFIXES = frozenset(
+    name[:end] for name in REPORTERS for end in range(1, len(name) + 1)
+)
+
+
+def _reporter(text: str) -> str | None:
+    """Return a reporter name of :data:`REPORTERS` spelled without its
+    spaces, with what follows it, or None when ``text`` is none."""
+    joined = "".join(text.split()).translate(_SAME_CHARACTER)
+    name = joined.rstrip(_AFTER_REPORTER)
+    return joined if name in REPORTERS else None
+
+
+def _join_reporters(words: list[str]) -> list[str]:
+    """Join the words of a spaced reporter name into one word, its
+    spacing kept: ``131 L. Ed. 2d 490`` is three words, as an engine
+    that writes ``L.Ed.2d`` reads it.
+
+    The longest run of two to :data:`_REPORTER_WORDS` words that
+    :func:`_reporter` reads as a name wins. The run grows one word at a
+    time and stops at the first join that neither starts a name
+    (:data:`_REPORTER_PREFIXES`) nor is one with what may follow it,
+    because no longer run can then be a name: almost every word of a
+    text stops at itself, where trying every window of every word made
+    this the cost of a rebuild (half a million joins for one opinion).
+    """
+    out: list[str] = []
+    index = 0
+    count = len(words)
+    while index < count:
+        joined = ""
+        best = 0
+        for size in range(1, min(_REPORTER_WORDS, count - index) + 1):
+            # A word may hold a space (a lone quote joined back onto it):
+            # the join is spaceless, as :func:`_reporter` makes it.
+            word = words[index + size - 1]
+            joined += "".join(word.split()).translate(_SAME_CHARACTER)
+            is_name = joined.rstrip(_AFTER_REPORTER) in REPORTERS
+            if size >= 2 and is_name:
+                best = size
+            if not (is_name or joined in _REPORTER_PREFIXES):
+                break
+        if best:
+            out.append(" ".join(words[index : index + best]))
+            index += best
+        else:
+            out.append(words[index])
+            index += 1
+    return out
+
+
+#: The gaps the key folds out. Readings that agree by key and differ
+#: by one of these are one reading spelled two ways, and the shown one
+#: is the spelling with the fewest (:func:`_tidiest`): the rank's
+#: engine wrote ``CP-1- 2021`` once where two others wrote
+#: ``CP-1-2021``, and the approved text took the stray space.
+_GAPS = (_HYPHEN_GAP, _QUOTE_GAP)
+
+#: A word that is quotation marks alone, the half of a nested quote
+#: Mistral sets apart with a space; :func:`_join_lone_quotes` puts it
+#: back onto the neighbour that holds the other mark.
+_LONE_QUOTES = re.compile(
+    r"^[\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e]+$"
+)
+_CLOSING = frozenset("\u2019\u201d\u201b")
+_QUOTE_CHARS = frozenset("\"'\u2018\u2019\u201a\u201b\u201c\u201d\u201e")
 
 _TAG = re.compile(r"<[^>]+>")
 _WS = re.compile(r"\s+")
@@ -470,6 +711,38 @@ class RevisionMoved(TransientFault):
 # ---------------------------------------------------------------------------
 
 
+def _tidiest(spellings: list[str]) -> str:
+    """Return the spelling with the fewest gaps of :data:`_GAPS`, then
+    the one most engines wrote, then the one with the fewest hyphens
+    between letters, the first of them when they tie.
+
+    A hyphen is never a reason on its own: two engines that wrote
+    ``self-defense`` show it over one that lost the hyphen
+    (``selfdefense``), and only one engine against one, a word a line
+    end broke (``Mohort-er``, ``Mohorter``), shows the joined word
+    (#610).
+
+    :param spellings: Readings that agree by key, in rank order, one
+        per engine.
+    :returns: The one to show.
+    :rtype: str
+    """
+    written = Counter(spellings)
+
+    def rank(text: str) -> tuple[int, int, int]:
+        # Counted on the text as the key sees it: a curly mark or an
+        # en dash is folded before a gap pattern can match beside it.
+        folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
+        spaced = _HYPHEN_GAP.sub("-", folded)
+        return (
+            sum(len(gap.findall(folded)) for gap in _GAPS),
+            -written[text],
+            len(_WORD_HYPHEN.findall(spaced)),
+        )
+
+    return min(spellings, key=rank)
+
+
 def plain(fragment: str | None) -> str:
     """Return one unit's content, its whitespace folded.
 
@@ -503,7 +776,8 @@ def _strip_markup(fragment: str) -> str:
     return _TAG.sub(" ", _MD_IMAGE.sub(" ", fragment))
 
 
-def compare_text(text: str) -> str:
+@lru_cache(maxsize=8192)
+def compare_text(text: str, *, hyphen_gaps: bool = True) -> str:
     """Return the text as the vote compares it, never as it is shown.
 
     **The comparison is not the text.** The engines agree about the
@@ -515,11 +789,36 @@ def compare_text(text: str) -> str:
     text is what a reader sees.
 
     :param text: One engine's read.
+    :param hyphen_gaps: Fold a hyphen with whitespace after it inside a
+        word (``_HYPHEN_GAP``). The page-number reader turns it off
+        (``page_numbers.carries_number``): a ``Cite as`` line that
+        ends ``677- 679`` ends in the page number as the engine wrote
+        it, and folded it would end in a range.
     :returns: The key.
     :rtype: str
+
+    Cached: a pure function of its two arguments, and a rebuild keys
+    the same texts again and again (the alignment, the vote and every
+    card of a group).
     """
     folded = unicodedata.normalize("NFKC", text).translate(_SAME_CHARACTER)
     folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    folded = _ELLIPSIS_GAP.sub("", folded)
+    folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
+    if hyphen_gaps:
+        # The dash and the hyphen folds read a range out of ``677 - 679``
+        # too, so the page-number reader keeps the text as written.
+        folded = _ELLIPSIS_AFTER.sub("", folded)
+        folded = _DASH_GAP.sub("-", _DASH_RUN.sub("-", folded))
+        folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
+    folded = _QUOTE_GAP.sub("", folded)
+    folded = _BRACKET_GAP.sub("[]", folded)
+    # Every name of :data:`REPORTERS` holds a period, and no fold of
+    # ``_SAME_CHARACTER`` makes one, so a word with none is no name.
+    folded = " ".join(
+        (_reporter(word) if "." in word else None) or word
+        for word in _join_reporters(folded.split())
+    )
     return _WS.sub(" ", folded).strip()
 
 
@@ -535,42 +834,229 @@ def compare_word(word: str) -> str:
     :rtype: str
     """
     folded = unicodedata.normalize("NFKC", word).translate(_SAME_CHARACTER)
-    return _DOT_RUN.sub("...", _MARKUP.sub("", folded)).strip()
+    folded = _DOT_RUN.sub("...", _MARKUP.sub("", folded))
+    folded = _ELLIPSIS_GAP.sub("", folded)
+    folded = _DASH_GAP.sub("-", folded)
+    folded = _SIGN_GAP.sub("", _INITIALS_GAP.sub("", folded))
+    folded = _WORD_HYPHEN.sub("", _HYPHEN_GAP.sub("-", folded))
+    folded = _QUOTE_GAP.sub("", folded)
+    folded = _BRACKET_GAP.sub("[]", folded).strip()
+    if _DASHES_ONLY.fullmatch(folded):
+        return "-"
+    return _reporter(folded) or folded
 
 
-#: A word that is dots alone: one of a spaced ellipsis.
-_LONE_DOTS = re.compile(r"^\.+$")
+class Glued(str):
+    """A word printed against the one before it, with no space between.
+
+    :func:`_pairs` splits a mark off its word (``restriction—it`` is
+    ``restriction``, ``—``, ``it``), and the pieces after the first are
+    this: the vote reads them as words, and the text keeps the page's
+    spacing, because a token of one carries ``attach`` and
+    :func:`join_tokens` writes no space before it.
+    """
+
+    __slots__ = ()
+
+
+def join_words(words: list[str]) -> str:
+    """Return the words as one text, a :class:`Glued` word with no
+    space before it; :class:`Glued` itself when the first one is."""
+    out = "".join(
+        (word if not index or isinstance(word, Glued) else f" {word}")
+        for index, word in enumerate(words)
+    )
+    return Glued(out) if words and isinstance(words[0], Glued) else out
+
+
+def join_tokens(tokens: list[dict]) -> str:
+    """Return the text of voted tokens: one space between two, and none
+    before a token that carries ``attach`` (:class:`Glued`). The first
+    token's ``attach`` is no space at the start."""
+    shown = [token for token in tokens if token.get("text")]
+    return "".join(
+        token["text"]
+        if not index or token.get("attach")
+        else " " + token["text"]
+        for index, token in enumerate(shown)
+    )
+
+
+def _attach(tokens: list[dict]) -> list[dict]:
+    """Turn the :class:`Glued` text of each token into ``attach``, so
+    the document holds plain strings.
+
+    A piece is glued to the word before it in its engine's read, so it
+    stays attached only beside that word: the token kept just before it
+    stands at the base position before its own, or is a word the vote
+    put in at its own position. When the vote dropped what stood
+    between (``restriction—it`` against two engines' ``restriction
+    it``, the dash dropped), the piece takes its space back, or two
+    words would run together.
+    """
+    previous: dict | None = None
+    for token in tokens:
+        glued = isinstance(token.get("text"), Glued)
+        token["text"] = str(token["text"])
+        if glued and previous is not None:
+            here, there = token.get("position"), previous.get("position")
+            beside = (
+                there == here
+                if previous.get("inserted")
+                else there is not None
+                and here is not None
+                and there == here - 1
+            )
+            if beside:
+                token["attach"] = True
+        previous = token
+    return tokens
+
+
+#: What stands for a space inside one mark while a read is split on
+#: whitespace: a spaced ellipsis (``. . .``), a spaced run of dashes
+#: (``– –``) and a spaced empty bracket (``[ ]``) are one mark each.
+_HELD_SPACE = "\ue001"
+_SPACED_MARK = re.compile(
+    r"\.(?:[ \t]*\.)+"
+    r"|(?<!\S)[-\u2013\u2014\u2212]+(?:\s+[-\u2013\u2014\u2212]+)+(?!\S)"
+    r"|\[\s+\]"
+)
+
+#: A mark inside a word, split off as a word of its own: an ellipsis
+#: (two dots or more, ``…``), a run of dashes, an empty bracket, and a
+#: paragraph or section sign at the start.
+_MARK = re.compile(
+    r"\.(?:\ue001?\.)+|…+"
+    r"|[-\u2013\u2014\u2212]+(?:\ue001[-\u2013\u2014\u2212]+)*"
+    r"|\[\ue001?\]|^[¶§]+"
+)
+
+
+def _keeps_dash(word: str, match: re.Match) -> bool:
+    """Return whether a dash stays inside its word: a hyphen after a
+    letter or a digit (``self-defense``, ``CP-23``, the ``0001065-`` of
+    a hyphen gap), and one dash between two digits (``17–19``)."""
+    mark = match.group()
+    before = word[match.start() - 1] if match.start() else ""
+    after = word[match.end()] if match.end() < len(word) else ""
+    if mark == "-" and before.isalnum():
+        return True
+    return len(mark) == 1 and before.isdigit() and after.isdigit()
+
+
+def _pieces(word: str) -> list[str]:
+    """Return one word with its marks split off, the pieces after the
+    first :class:`Glued`, every held space a space again."""
+    cuts = [0]
+    for match in _MARK.finditer(word):
+        if match.group()[0] in "-\u2013\u2014\u2212" and _keeps_dash(
+            word, match
+        ):
+            continue
+        cuts += [match.start(), match.end()]
+    cuts.append(len(word))
+    parts = [word[a:b] for a, b in zip(cuts, cuts[1:], strict=False) if b > a]
+    return [
+        Glued(part.replace(_HELD_SPACE, " "))
+        if index
+        else part.replace(_HELD_SPACE, " ")
+        for index, part in enumerate(parts)
+    ]
 
 
 def _pairs(text: str) -> list[tuple[str, str]]:
     """Return ``[(key, the word as it is shown)]`` for one read.
 
-    A run of two or more words that are dots alone is one word: Surya
-    writes the spaced ellipsis of the page (``. . .``) where Mistral
-    writes ``...``, and :func:`compare_text` reads them alike already
-    (``_DOT_RUN``). Split on whitespace first, they are three words
-    against one, and a block that agrees to the letter goes to a vote.
-    The shown word keeps the engine's own spacing.
+    **A mark is a word of its own** (#610): an ellipsis however it is
+    spaced (``another...``, ``another . . .``, ``...it``), a run of
+    dashes (``—``, ``--``, ``– –``), an empty bracket (``[ ]``) and a
+    paragraph or section sign (``¶8``) are split off the words around
+    them. The engines agree about the words and set the marks against
+    them each their own way: joined to a neighbour, a mark made every
+    engine's word a different word, and a block that agrees to the
+    letter went to a vote nobody wins. A piece printed against the one
+    before it is :class:`Glued`, so the text keeps its spacing. A
+    hyphen inside a word stays (``self-defense``), and so does a dash
+    between two digits (``17–19``).
+
+    The words an engine spaces apart are still one word: a word that
+    ends in a hyphen and the word after it (``0001065- 2021``,
+    ``_HYPHEN_GAP``), the pieces of an abbreviation of single letters
+    (``S.D.N. Y.``, ``_INITIALS_GAP``), a word of quotation marks alone
+    and its neighbour (``_LONE_QUOTES``, :func:`_join_lone_quotes`) and
+    the words of a spaced reporter name of :data:`REPORTERS`
+    (``L. Ed. 2d``). The shown word keeps the engine's own spacing.
 
     :param text: One engine's read.
     :returns: The pairs.
     :rtype: list[tuple[str, str]]
     """
-    words = text.split()
+    held = _SPACED_MARK.sub(
+        lambda match: re.sub(r"\s+", _HELD_SPACE, match.group()), text
+    )
+    words = _join_reporters(_join_lone_quotes(held.split()))
     pairs: list[tuple[str, str]] = []
     index = 0
     while index < len(words):
         end = index
-        while end < len(words) and _LONE_DOTS.match(words[end]):
+        while end + 1 < len(words) and (
+            (_HYPHEN_END.search(words[end]) and words[end + 1][:1].isalnum())
+            or (
+                _INITIAL_END.search(words[end])
+                and _INITIAL_NEXT.match(words[end + 1])
+            )
+        ):
             end += 1
-        if end - index >= 2:
-            shown = " ".join(words[index:end])
-            pairs.append((compare_word(shown), shown))
-            index = end
-            continue
-        pairs.append((compare_word(words[index]), words[index]))
-        index += 1
+        for piece in _pieces(" ".join(words[index : end + 1])):
+            pairs.append((compare_word(piece), piece))
+        index = end + 1
     return pairs
+
+
+def _join_lone_quotes(words: list[str]) -> list[str]:
+    """Join each word of quotation marks alone onto the neighbour that
+    holds the other mark of the pair.
+
+    The word after it when that word starts with a mark, the word
+    before when that one ends with a mark; with both, an opening mark
+    (``“``, ``‘``) goes after and a closing one (``”``, ``’``) before,
+    and a straight mark, which is either, goes after. A lone mark with
+    no marked neighbour is a word of its own, as it was. The joined
+    word keeps the space, which the key folds out (``_QUOTE_GAP``).
+
+    :param words: One read, split on whitespace.
+    :returns: The words, with the lone marks joined on.
+    :rtype: list[str]
+    """
+    if not any(_LONE_QUOTES.match(word) for word in words):
+        return words
+    out: list[str] = []
+    index = 0
+    while index < len(words):
+        word = words[index]
+        if not _LONE_QUOTES.match(word):
+            out.append(word)
+            index += 1
+            continue
+        before = out[-1] if out else None
+        after = words[index + 1] if index + 1 < len(words) else None
+        can_go_after = (
+            after is not None
+            and after[:1] in _QUOTE_CHARS
+            and not _LONE_QUOTES.match(after)
+        )
+        can_go_before = before is not None and before[-1:] in _QUOTE_CHARS
+        if can_go_after and can_go_before:
+            can_go_after = not any(c in _CLOSING for c in word)
+        if can_go_after:
+            words[index + 1] = f"{word} {after}"
+        elif can_go_before:
+            out[-1] = f"{before} {word}"
+        else:
+            out.append(word)
+        index += 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2318,6 +2804,95 @@ def list_readers(group: dict) -> list[str]:
     )
 
 
+def syllabus_start(group: dict, zones: list[list[float]]) -> bool:
+    """Return whether one aligned group opens a syllabus (#518).
+
+    **The one rule**, the shape of :func:`quoted`: a body group the
+    syllabus zone covers :data:`SYLLABUS_SHARE` of. The build stamps
+    the first kept group of each zone in the order the page is written
+    and no other (:func:`_take_zone`), so a box taller than the heading
+    line opens one run, and a dropped block under it takes no stamp.
+    The zone is the
+    ``SYLLABUS`` detection of the run, the model's box over the
+    heading line that opens a syllabus, or a curator's own box in
+    review 2, so the stamp says where a syllabus starts and nothing
+    about where it ends: the final XML reads the extent off the
+    tagger's spans (``casebody.syllabus_range``). A footnote is never
+    a syllabus, so a group in the footnotes is not stamped.
+
+    :param group: One group of :func:`align_page`, with its
+        ``section`` set.
+    :param zones: The page's syllabus zones, in points.
+    :rtype: bool
+    """
+    return (
+        group.get("section", BODY) == BODY
+        and bool(zones)
+        and zone_share(group["box_pt"], zones) >= SYLLABUS_SHARE
+    )
+
+
+def _take_zone(group: dict, open_zones: list[list[float]]) -> bool:
+    """Stamp one kept group with the first open syllabus zone it opens,
+    and close that zone. The zones are taken in the order the page is
+    written, one group each."""
+    for zone in open_zones:
+        if syllabus_start(group, [zone]):
+            open_zones.remove(zone)
+            return True
+    return False
+
+
+def syllabus_doubts(
+    groups: list[dict], zones: list[list[float]]
+) -> list[dict]:
+    """Return each place the two syllabus signals disagree (#518).
+
+    **The one rule** of the ``SYLLABUS_UNSURE`` card. A stamped group
+    whose words are no syllabus heading (``casebody.is_syllabus_heading``)
+    is a ``box`` doubt: the model, or a curator, drew the box on other
+    text, and the final XML opens the syllabus there. A zone with no
+    stamped group under it is a ``box`` doubt with no text. A body
+    heading whose words are a syllabus heading and that carries no
+    stamp is a ``heading`` doubt: the model drew no box, and the final
+    XML opens the syllabus at the words alone. A box on a heading with
+    the words is the clean case and no doubt.
+
+    :param groups: The page's kept groups (the document's entries).
+    :param zones: The page's syllabus zones, in points.
+    :returns: ``[{"doubt": "box" | "heading", "text": the block's
+        first words}, ...]``, in reading order.
+    :rtype: list[dict]
+    """
+    doubts = []
+    stamped = [g for g in groups if g.get("syllabus_start")]
+    for group in stamped:
+        if not casebody.is_syllabus_heading(group.get("text")):
+            doubts.append({"doubt": "box", "text": _first_words(group)})
+    for zone in zones:
+        # Each zone on its own: a page two cases share can hold two.
+        if not any(
+            zone_share(group["box_pt"], [zone]) >= SYLLABUS_SHARE
+            for group in stamped
+        ):
+            doubts.append({"doubt": "box", "text": ""})
+    for group in groups:
+        if (
+            group.get("section", BODY) == BODY
+            and group.get("kind") == markup.HEADING
+            and not group.get("syllabus_start")
+            and casebody.is_syllabus_heading(group.get("text"))
+        ):
+            doubts.append({"doubt": "heading", "text": _first_words(group)})
+    return doubts
+
+
+def _first_words(group: dict, limit: int = 8) -> str:
+    """Return the first words of a group's text."""
+    words = (group.get("text") or "").split()
+    return " ".join(words[:limit]) + (" ..." if len(words) > limit else "")
+
+
 def blockquote_runs(groups: list[dict]) -> list[dict]:
     """Return the blockquotes of one page, one per run of quoted groups
     (#411).
@@ -2568,8 +3143,11 @@ def _candidates(
     matcher = SequenceMatcher(None, base_keys, other_keys, autojunk=False)
     for tag, i1, i2, j1, j2 in matcher.get_opcodes():
         if tag == "equal":
-            for index in range(i1, i2):
-                at.setdefault(index, []).append(base[index])
+            # The engine's own spelling of the word it read as the
+            # base's: one key, and the shown word may differ by a gap
+            # the key folds (``_tidiest`` picks between them).
+            for offset in range(i2 - i1):
+                at.setdefault(i1 + offset, []).append(other[j1 + offset])
         elif tag == "replace":
             if i2 - i1 == j2 - j1:
                 for offset in range(i2 - i1):
@@ -2578,7 +3156,7 @@ def _candidates(
                 span = other[j1:j2]
                 joined = (
                     " ".join(key for key, _ in span),
-                    " ".join(word for _, word in span),
+                    join_words([word for _, word in span]),
                 )
                 at.setdefault(i1, []).append(joined)
                 for index in range(i1 + 1, i2):
@@ -2613,11 +3191,13 @@ def vote_words(
       majority as a whole (#380).
     - ``"low_confidence": True``: a person must read it. Either no
       majority settled the word, and the base engine's own word is
-      kept, or the base never read it and the engines that did put it
-      in.
-    - ``"inserted": True``, beside the flag above: the second of those
-      two. They are different faults and they read differently, so the
-      viewer must not name one of them for both (#380).
+      kept, or the base never read it and a tie of the engines that
+      did put it in.
+    - ``"inserted": True``, beside either flag: a word the base never
+      read. Beside ``low_confidence`` it is a tie's word, a different
+      fault from a word no majority settled, and the viewer must not
+      name one of them for both (#380); beside ``majority`` a majority
+      read it alike, and it is settled (#610).
 
     Every token carries ``position``, the base position it answers for,
     or the one an inserted run was put in before: the blocking review
@@ -2625,12 +3205,12 @@ def vote_words(
     over :func:`_candidates`), and a token answers for one position of
     the base read alone.
 
-    A word the base engine did not read is put in, marked and counted
-    when the engines that read it are a majority or a tie: the base is
-    the engine this module believes, so a word it did not read is a
-    question for a person, and with two engines every difference is a
-    tie. A word only a minority read is dropped, which is the reading
-    of the majority.
+    A word the base engine did not read is put in when the engines that
+    read it are a majority or a tie. A majority's word is ``majority``,
+    settled as a word the base read otherwise is (#610); a tie's is
+    marked and counted, a question for a person, and with two engines
+    every difference is a tie. A word only a minority read is dropped,
+    which is the reading of the majority.
 
     **A gap is a spot.** Where a run was dropped, what each engine read
     in the gap is a reading like a word's: the base's is nothing, and
@@ -2713,13 +3293,17 @@ def vote_words(
                 for k, w in runs
                 if tuple(key for key in k if key) == keys
             )
+            # A majority that read the run alike settles it, as it settles
+            # a word the base read otherwise (#610): ``majority``, a
+            # warning. A tie is still a question for a person.
+            settled = count >= quorum
             for key, word in zip(run_keys, run_words, strict=True):
                 if not key:
                     continue
                 add(
                     {
                         "text": word,
-                        "low_confidence": True,
+                        ("majority" if settled else "low_confidence"): True,
                         "inserted": True,
                         "position": position,
                     }
@@ -2727,7 +3311,8 @@ def vote_words(
             # A word the base did not read is marked, so it is counted
             # too: the mark the viewer draws and the card the findings
             # write read the same number.
-            disputed += len(keys)
+            if not settled:
+                disputed += len(keys)
         if dropped:
             # The gap is a spot: each engine's reading of it is the
             # keys of its run here, and nothing for the base and for
@@ -2779,8 +3364,8 @@ def vote_words(
                 # "" is the reading of a majority that dropped the word,
                 # and of a mark that carries no reading at all.
                 token = {
-                    "text": next(
-                        word for key, word in readings if key == winner
+                    "text": _tidiest(
+                        [word for key, word in readings if key == winner]
                     ),
                     "position": position,
                 }
@@ -2801,7 +3386,7 @@ def vote_words(
                     "position": position,
                 }
             )
-    return tokens, disputed
+    return _attach(tokens), disputed
 
 
 def _vote_of(
@@ -2896,12 +3481,19 @@ def resolve(group: dict) -> dict:
         quorum = (len(present) + 2) // 2
         if votes >= quorum:
             agreeing = [name for name in present if keys[name] == winner]
+            # The spelling shown is the tidiest of the agreeing ones,
+            # and ``source`` names its engine, the side the cards vote
+            # from (``blocking_review.open_words``).
+            shown = _tidiest([engines[name]["text"] for name in agreeing])
+            source = next(
+                name for name in agreeing if engines[name]["text"] == shown
+            )
             answer = {
                 "agreement": UNANIMOUS if votes == len(present) else MAJORITY,
-                "source": agreeing[0],
+                "source": source,
                 "agreeing": agreeing,
                 "silent": silent,
-                "text": engines[agreeing[0]]["text"],
+                "text": shown,
                 "tokens": [],
                 "n_low_confidence": 0,
             }
@@ -2919,9 +3511,7 @@ def resolve(group: dict) -> dict:
                 "source": base,
                 "agreeing": [],
                 "silent": silent,
-                "text": " ".join(
-                    token["text"] for token in tokens if token["text"]
-                ),
+                "text": join_tokens(tokens),
                 "tokens": tokens,
                 "n_low_confidence": disputed,
             }
@@ -3057,6 +3647,9 @@ def _counts() -> dict:
         "undetected_agreed": 0,
         "footnote_groups": 0,
         "footnote_doubt": 0,
+        # The places the two syllabus signals disagree (#518), the
+        # ``SYLLABUS_UNSURE`` card.
+        "syllabus_doubt": 0,
         "blockquotes": 0,
         "blockquote_lists": 0,
         "lists": 0,
@@ -3266,11 +3859,17 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
             token["run_index"] = run_index
         else:
             run_index = None
-    words = text.split()
+    # The person's words, split as the vote splits a read: a run of
+    # dots or a hyphen gap the vote joined is one token with a space
+    # in it, and split on whitespace it is two words that never match
+    # it, so a word the person left as it was read as changed and its
+    # card closed unjudged.
+    person = _pairs(text)
+    words = [shown for _, shown in person]
     matcher = SequenceMatcher(
         None,
         [compare_word(t["text"]) for t in voted],
-        [compare_word(w) for w in words],
+        [key for key, _ in person],
         autojunk=False,
     )
     # What the engines read in each gap, by the base position the gap
@@ -3324,7 +3923,7 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
         elif tag == "replace":
             for offset in range(i2 - i1):
                 landed[i1 + offset] = j1 + min(offset, j2 - j1 - 1)
-            human_keys = [compare_word(w) for w in words[j1:j2]]
+            human_keys = [key for key, _ in person[j1:j2]]
             voted_keys = [compare_word(t["text"]) for t in voted[i1:i2]]
             extra = set(human_keys) - set(voted_keys)
             # More words than were replaced, and not the same words
@@ -3352,7 +3951,9 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
                 landed[i1 + offset] = None
     tokens: list[dict] = []
     for index, word in enumerate(words):
-        token: dict = {"text": word}
+        token: dict = {"text": str(word)}
+        if index and isinstance(word, Glued):
+            token["attach"] = True
         old = carried.get(index)
         if old:
             for flag in ("low_confidence", "majority", "inserted"):
@@ -3554,7 +4155,7 @@ def build_page(
         "pdf_page": first.get("pdf_page"),
         "source": first.get("source"),
         "frame": None,
-        "zones": {FOOTNOTES: [], BLOCKQUOTES: []},
+        "zones": {FOOTNOTES: [], BLOCKQUOTES: [], SYLLABUS: []},
         "text": "",
         "footnotes": "",
         # One entry per blockquote of the body text (#411).
@@ -3614,6 +4215,7 @@ def build_page(
     }
     zones = _zones_of(read, FOOTNOTES)
     quotes = _zones_of(read, BLOCKQUOTES)
+    starts = _zones_of(read, SYLLABUS)
     # A footnote zone the first-page mask took is the opinion before's
     # (#457): the section of a group still reads it, and the viewer,
     # which draws ``zones``, draws it no more.
@@ -3621,6 +4223,7 @@ def build_page(
     entry["zones"] = {
         FOOTNOTES: [box for box in zones if box not in taken],
         BLOCKQUOTES: quotes,
+        SYLLABUS: starts,
     }
     if taken:
         entry["zones"][opinion_ocr.TAKEN_FOOTNOTES] = taken
@@ -3634,34 +4237,29 @@ def build_page(
     # dropped (#376), so an edit whose block a redaction now takes says
     # so and never lands on a neighbour.
     unresolved: list[dict] = []
-    # A picture takes no edit (#463): it is a box of review 2, the views
-    # refuse every edit of it, and a box copy must not land one. So a
-    # drop lands on the text groups alone, and an old drop of the words
-    # under a picture lands on the words, which the box took already,
-    # and never on the picture.
+    # A picture takes no edit of its text, its quote or its drop
+    # (#463): it is a box of review 2, the views refuse those edits of
+    # it, and a box copy must not land one. So a drop lands on the text
+    # groups alone, and an old drop of the words under a picture lands
+    # on the words, which the box took already, and never on the
+    # picture. It takes a section (#486): a picture can be part of a
+    # footnote.
     texts = [group for group in groups if not group.get("figure")]
-    for kind, key in (
-        (OpinionEdit.Kind.SECTION, "_section_edit"),
-        (OpinionEdit.Kind.TEXT, "_text_edit"),
-        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit"),
-        (OpinionEdit.Kind.DROP, "_drop_edit"),
+    for kind, key, targets in (
+        (OpinionEdit.Kind.SECTION, "_section_edit", groups),
+        (OpinionEdit.Kind.TEXT, "_text_edit", texts),
+        (OpinionEdit.Kind.BLOCKQUOTE, "_quote_edit", texts),
+        (OpinionEdit.Kind.DROP, "_drop_edit", texts),
     ):
         wanted = [edit for edit in edits if edit["kind"] == kind]
-        landed = land_edits([edit["box_pt"] for edit in wanted], texts)
+        landed = land_edits([edit["box_pt"] for edit in wanted], targets)
         for here, edit in enumerate(wanted):
             if here in landed:
-                texts[landed[here]][key] = edit
+                targets[landed[here]][key] = edit
             else:
                 unresolved.append(_unresolved(edit, EDIT_NO_GROUP))
     by_section: dict[str, list[dict]] = {BODY: [], FOOTNOTES: []}
     for group in groups:
-        if group.get("figure"):
-            # A picture is body text in its place (#463): no zone moves
-            # it to the footnotes and none makes it a quote.
-            group["section"], group["footnote_doubt"] = BODY, False
-            group["blockquote"] = group["_zone_blockquote"] = False
-            by_section[BODY].append(group)
-            continue
         group["section"], group["footnote_doubt"] = section(group, zones)
         placed = group.get("_section_edit")
         if placed and placed["section"] in by_section:
@@ -3669,6 +4267,13 @@ def build_page(
             # not decide and the engines' label raises no doubt.
             group["section"] = placed["section"]
             group["footnote_doubt"] = False
+        if group.get("figure"):
+            # A picture takes its section like a block of text (#486),
+            # because a footnote can hold one, and is never a quote
+            # (#463). It reads nothing, so no label raises a doubt.
+            group["blockquote"] = group["_zone_blockquote"] = False
+            by_section[group["section"]].append(group)
+            continue
         group["blockquote"] = quoted(group, quotes)
         # The flag of the zone, for the place of a dropped group in the
         # runs: an edit whose block a redaction takes is not applied,
@@ -3701,13 +4306,24 @@ def build_page(
     # blockquote runs (#411): a dropped paragraph outside every quote
     # still parts two quotes.
     sequence: list[dict] = []
+    # One start per syllabus zone (#518): the first kept group under
+    # it, in the order the page is written, after the drops and the
+    # order edits. A box taller than the heading line covers the
+    # paragraphs under it too, and a stamp on each would part a
+    # paragraph a column cut (``paragraphs._joins``); a stray mark the
+    # box covers first is dropped and must not take the stamp.
+    open_zones = list(starts)
     for group in ordered:
         if group.get("figure") and not group["excluded"]:
             entry["groups"].append(
-                _figure_entry(group, len(entry["groups"]), offsets[BODY])
+                _figure_entry(
+                    group, len(entry["groups"]), offsets[group["section"]]
+                )
             )
             sequence.append(entry["groups"][-1])
             entry["counts"]["figures"] += 1
+            if group["section"] == FOOTNOTES:
+                entry["counts"]["footnote_groups"] += 1
             continue
         read_back = resolve(group)
         # A person said the block is not text: the bleed-through of
@@ -3820,6 +4436,7 @@ def build_page(
                 quote_span = [int(v) for v in quote["span"]]
                 group["blockquote"] = False
         name = group["section"]
+        stamped = _take_zone(group, open_zones)
         start = offsets[name]
         end = start + len(read_back["text"])
         offsets[name] = end + len(PARAGRAPH_GAP)
@@ -3835,6 +4452,7 @@ def build_page(
                 "blockquote": group["blockquote"],
                 "quote_span": quote_span,
                 "quote_edit": (quote or {}).get("id"),
+                "syllabus_start": stamped,
                 "list_by": list_readers(group),
                 "box_pt": group["box_pt"],
                 "start": start,
@@ -3904,14 +4522,17 @@ def build_page(
         if group["footnote_doubt"]:
             entry["counts"]["footnote_doubt"] += 1
 
-    # A picture never goes to the footnotes (#463), so it is in no
-    # block's ``below`` and has none of its own.
-    texts = [g for g in entry["groups"] if g["kind"] != markup.FIGURE]
-    for group in texts:
+    # A picture goes to the footnotes like a block (#486), so it is in
+    # the ``below`` of a block above it and has one of its own.
+    for group in entry["groups"]:
         if group["section"] == BODY:
-            group["below"] = blocks_below(texts, group)
+            group["below"] = blocks_below(entry["groups"], group)
     entry["text"] = PARAGRAPH_GAP.join(parts[BODY])
     entry["footnotes"] = PARAGRAPH_GAP.join(parts[FOOTNOTES])
+    entry["syllabus_doubt"] = syllabus_doubts(
+        entry["groups"], entry["zones"][SYLLABUS]
+    )
+    entry["counts"]["syllabus_doubt"] = len(entry["syllabus_doubt"])
     entry["blockquotes"] = blockquote_runs(sequence)
     entry["counts"]["blockquotes"] = len(entry["blockquotes"])
     entry["lists"] = list_runs(sequence)
@@ -3955,33 +4576,38 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
     """Return the document entry of one picture group (#463).
 
     The shape of a text group, so every reader of the groups reads it,
-    with no text: ``start`` and ``end`` are the place in the body text
-    the picture sits at, and the body text takes no paragraph for it.
+    with no text: ``start`` and ``end`` are the place in the text of
+    its section the picture sits at, and that text takes no paragraph
+    for it. A picture in the footnotes is part of the note it follows
+    (#486), the rule of a group with no label.
     ``figure`` holds the box and the size the picture has on the page,
     which the cut and the approved text read. It has no ``level``: the
     engines vote on no text here.
 
     :param group: The picture group of :func:`align_page`.
     :param group_id: Its id in the page.
-    :param offset: The body offset it sits at.
+    :param offset: The offset it sits at, in the text of its section.
     :returns: The entry.
     :rtype: dict
     """
     box = group["box_pt"]
     engines = _ranked(group["engines"])
+    name = group["section"]
     return {
         "id": group_id,
-        # Body text whatever band it sits in: the approved text reads
-        # the body band alone, and a picture at the head or the foot of
-        # a page is still a picture of the opinion, cut and paid for.
-        "band": "body",
+        # In the body, the body band whatever band it sits in: the
+        # approved text reads the body band alone, and a picture at the
+        # head or the foot of a page is still a picture of the opinion,
+        # cut and paid for. The footnotes have one band of their own.
+        "band": "body" if name == BODY else group["band"],
         "column": group["column"],
-        "section": BODY,
+        "section": name,
         "footnote_doubt": False,
         "footnote_by": [],
         "blockquote": False,
         "quote_span": None,
         "quote_edit": None,
+        "syllabus_start": False,
         "list_by": [],
         "box_pt": box,
         "start": offset,
@@ -3996,7 +4622,7 @@ def _figure_entry(group: dict, group_id: int, offset: int) -> dict:
         "n_low_confidence": 0,
         "level": None,
         "human": None,
-        "section_edit": None,
+        "section_edit": (group.get("_section_edit") or {}).get("id"),
         "tokens": [],
         "text": "",
         "kind": markup.FIGURE,
@@ -4073,7 +4699,12 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     the same fact as a block a majority read whole. A block a person
     wrote (``HUMAN``) blocks for the open words they left as they
     were, warns for the majority words they left, and for nothing
-    else. Every other place :func:`_differs` answers for is a warning.
+    else. An open word whose readings differ only in spacing,
+    punctuation, quote marks or capitals (``blocking_types.MINOR``)
+    blocks nothing while the text holds one of the agreeing readings
+    (``blocking_types.settles_minor``): a group whose every open word
+    is settled so warns.
+    Every other place :func:`_differs` answers for is a warning.
 
     :param group: One group of the document.
     :param engines: How many engines the document holds.
@@ -4085,8 +4716,52 @@ def disagreement_level(group: dict, engines: int) -> str | None:
     if group["agreement"] == SINGLE:
         return BLOCKING
     if group["agreement"] in (VOTED, HUMAN) and group.get("n_low_confidence"):
-        return BLOCKING
+        return WARNING if _open_words_minor(group) else BLOCKING
     return WARNING
+
+
+def _open_words_minor(group: dict) -> bool:
+    """Return whether every open word of a voted group is minor.
+
+    The open words are the blocking review's word cards of the group
+    (``blocking_review.open_words``), and a block with more of them
+    than ``MANY_OPEN_WORDS`` is judged whole, as its one card is. Each
+    is minor when ``blocking_types.type_of`` names a reason of
+    ``blocking_types.MINOR``: two readings agree in their letters and
+    digits. A group with no word card to judge stays blocking.
+
+    :param group: One voted or human group with open words.
+    :returns: Whether the group warns instead of blocking.
+    :rtype: bool
+    """
+    # Imported here: ``blocking_review`` reads this module.
+    from scanning import blocking_review, blocking_types
+
+    engines = group.get("engines")
+    if not isinstance(engines, dict) or not all(
+        isinstance(unit, dict) and "text" in unit for unit in engines.values()
+    ):
+        # No readings to judge: the open count alone blocks.
+        return False
+    words = blocking_review.open_words(group)
+    if not words:
+        return False
+    # Minor, and the text already holds a reading of the agreeing ones
+    # (``blocking_types.settles_minor``): a text that holds the odd
+    # engine's word (``hold`` beside two ``held``) still blocks.
+    if len(words) > blocking_review.MANY_OPEN_WORDS:
+        readings = [
+            group["engines"][name]["text"]
+            for name in blocking_review._present(group)
+        ]
+        return blocking_types.settles_minor(readings, group.get("text") or "")
+    return all(
+        blocking_types.settles_minor(
+            [r["word"] for r in word["readings"]],
+            "" if word.get("gap") else word.get("token") or "",
+        )
+        for word in words
+    )
 
 
 def build_document(
@@ -4251,30 +4926,11 @@ def due(limit: int | None = None):
     :param limit: How many rows to take, newest scan first.
     :returns: The queryset.
     """
-    rows = (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ensemble_attempts__lt=MAX_ATTEMPTS,
-            ocr_glue_revision__isnull=False,
-            ocr_glue_revision=F("glue_revision"),
-            ocr_engine_count__gte=min_engines(),
-        )
-        .exclude(
-            status__in=(
-                OpinionReviewStatus.ERROR,
-                OpinionReviewStatus.TEXT_REVIEW_DONE,
-            )
-        )
-        .filter(
-            Q(ensemble_revision__isnull=True)
-            | ~Q(ensemble_revision=F("ocr_glue_revision"))
-            # A human edit the text does not hold yet (#376): the
-            # request that wrote it builds the text, and a build that
-            # failed there is built here.
-            | ~Q(ensemble_edit_revision=F("edit_revision"))
-        )
-        .order_by("-scan_id", "first_printed_page", "index_in_page")
-    )
+    rows = Opinion.objects.filter(
+        OPINION_ENSEMBLE_OWED,
+        scan__status=Status.REDACTION_REVIEW_DONE,
+        ocr_engine_count__gte=min_engines(),
+    ).order_by(*OPINION_PASS_ORDER)
     return rows[:limit] if limit else rows
 
 
@@ -4344,6 +5000,21 @@ def _address(page: dict) -> tuple[int | None, int | None]:
     return detections.source_of_entry(page)
 
 
+#: The fields :func:`write_rows` writes over on a page's row: the cache
+#: of the documents, never ``human_text`` or its stamps.
+WRITTEN_TEXT_FIELDS = (
+    "text",
+    "footnotes",
+    "disagreements",
+    "marks",
+    "source_edit",
+    "source_page",
+    "page_index",
+    "apply_run",
+    "date_modified",
+)
+
+
 def write_rows(opinion: Opinion, document: dict) -> int:
     """Write the ``OpinionText`` rows of one opinion.
 
@@ -4357,24 +5028,33 @@ def write_rows(opinion: Opinion, document: dict) -> int:
     :returns: How many rows were written.
     :rtype: int
     """
-    written = 0
+    rows = []
     for page in document["pages"]:
         source_edit_id, source_page = _address(page)
-        OpinionText.objects.update_or_create(
-            opinion=opinion,
-            page_in_opinion=page["page_in_opinion"],
-            defaults={
-                "text": page["text"],
-                "footnotes": page.get("footnotes") or "",
-                "disagreements": _disagreements(page),
-                "marks": _marks(page),
-                "source_edit_id": source_edit_id,
-                "source_page": source_page,
-                "page_index": page["page_index"],
-                "apply_run_id": opinion.apply_run_id,
-            },
+        rows.append(
+            OpinionText(
+                opinion=opinion,
+                page_in_opinion=page["page_in_opinion"],
+                text=page["text"],
+                footnotes=page.get("footnotes") or "",
+                disagreements=_disagreements(page),
+                marks=_marks(page),
+                source_edit_id=source_edit_id,
+                source_page=source_page,
+                page_index=page["page_index"],
+                apply_run_id=opinion.apply_run_id,
+            )
         )
-        written += 1
+    # One statement for every page, under the opinion's row lock
+    # (#603): a page's row is written over on ``unique_opinion_page``,
+    # and the fields a person writes are not among the ones updated.
+    OpinionText.objects.bulk_create(
+        rows,
+        update_conflicts=True,
+        unique_fields=["opinion", "page_in_opinion"],
+        update_fields=WRITTEN_TEXT_FIELDS,
+    )
+    written = len(rows)
     # A row of a page the opinion no longer has. An opinion does grow
     # shorter: ``opinions.create_rows`` writes ``page_count`` again on
     # a matched row, so a boundary a curator moves up takes a page off
@@ -4654,6 +5334,27 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
         )
         if shared is not None:
             cards.append(shared)
+        if counts.get("syllabus_doubt"):
+            # The two signals of the syllabus disagree (#518): a
+            # warning the reader dismisses, and a log line so the case
+            # is looked at later.
+            card = _card(
+                opinion,
+                page_number,
+                OpinionCheck.SYLLABUS_UNSURE,
+                Issue.Severity.WARNING,
+                _syllabus_message(page),
+                standing,
+            )
+            cards.append(card)
+            if card.dismissal is None:
+                logger.error(
+                    "%s of scan %s, page %s: %s",
+                    opinion,
+                    opinion.scan_id,
+                    page_number + 1,
+                    card.message,
+                )
         if counts.get("figures") or counts.get("figure_partial"):
             cards.append(
                 _card(
@@ -4942,6 +5643,30 @@ def _footnote_message(page: dict) -> str:
         f"{named} read {count} block(s) of this page as a footnote, but no "
         "footnote detection covers them. They are in the body text."
     )
+
+
+def _syllabus_message(page: dict) -> str:
+    """Return the line of one ``SYLLABUS_UNSURE`` card (#518)."""
+    lines = []
+    for doubt in page.get("syllabus_doubt") or []:
+        if doubt["doubt"] == "heading":
+            lines.append(
+                f'The heading "{doubt["text"]}" has no SYLLABUS detection: '
+                "the final XML opens the syllabus at its words. Draw the "
+                "box in step 2 if the model missed it."
+            )
+        elif doubt["text"]:
+            lines.append(
+                f'A SYLLABUS detection sits on "{doubt["text"]}", which is '
+                "no syllabus heading: the final XML opens the syllabus "
+                "there. Move or dismiss the box in step 2 if it is wrong."
+            )
+        else:
+            lines.append(
+                "A SYLLABUS detection covers no block of text. Move or "
+                "dismiss the box in step 2."
+            )
+    return " ".join(lines)
 
 
 #: How many words of a group the ``BLOCKQUOTE_LIST`` card quotes.
@@ -5310,6 +6035,11 @@ def write(opinion: Opinion, documents: dict[str, dict]) -> dict:
             )
             write_rows(opinion, document)
             rebuild_findings(opinion, document)
+            # The blocking cards as rows, after the findings they hang
+            # on. Imported here: ``opinion_cards`` reads this module.
+            from scanning import opinion_cards
+
+            opinion_cards.sync(opinion, document)
             digest = opinion_figures.ledger_digest(opinion, document)
             stamped = Opinion.objects.filter(
                 pk=opinion.pk,
@@ -5456,7 +6186,16 @@ def run_tick(limit: int = ENSEMBLE_PER_TICK) -> int:
     """
     if not s3_sync.s3_active():
         return 0
-    rows = list(due(limit).select_related("scan", "apply_run"))
+    # The scan's caches stay on disk (#582), and the run's page map
+    # (#602): the ensemble reads neither.
+    rows = list(
+        due(limit)
+        .select_related("scan", "apply_run")
+        .defer(
+            *Scan.large_fields("scan__"),
+            *(f"apply_run__{name}" for name in ApplyRun.LARGE_FIELDS),
+        )
+    )
     if not rows:
         return 0
     started = time.monotonic()

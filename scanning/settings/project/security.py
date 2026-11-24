@@ -31,6 +31,16 @@ if DEVELOPMENT:
     if not TESTING:
         INSTALLED_APPS.append("debug_toolbar")
         MIDDLEWARE.append("debug_toolbar.middleware.DebugToolbarMiddleware")
+        # Without the cache panel: under the async dev server it wraps the
+        # cache again on every request (debug-toolbar 6.2), and a page
+        # that reads the cache dies of RecursionError after a few dozen.
+        DEBUG_TOOLBAR_CONFIG = {
+            "DISABLE_PANELS": {
+                "debug_toolbar.panels.redirects.RedirectsPanel",
+                "debug_toolbar.panels.profiling.ProfilingPanel",
+                "debug_toolbar.panels.cache.CachePanel",
+            },
+        }
 
     try:
         hostname, _, ips = socket.gethostbyname_ex(socket.gethostname())

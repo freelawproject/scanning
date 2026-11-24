@@ -32,6 +32,8 @@ from django.urls import reverse
 from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
 from scanning.factories import ScanFactory
 from scanning.models import (
+    DISMISSABLE_OPINION_CHECKS,
+    ApplyRun,
     Issue,
     Opinion,
     OpinionCheck,
@@ -40,6 +42,7 @@ from scanning.models import (
     OpinionReviewStatus,
     OpinionText,
     PageEdit,
+    Scan,
     Status,
 )
 from scanning.tests.test_detections import model_row
@@ -975,6 +978,33 @@ class TestTheVote(TestCase):
         # ``alpha`` alone is the no-majority place.
         self.assertEqual(answer["n_low_confidence"], 1)
 
+    def test_a_word_the_vote_joined_keeps_its_flag_beside_an_answer(self):
+        """``0001065- 2021`` is one word to the vote (``_pairs``), shown
+        with its space. The person answered the card of ``x`` and left
+        it as it was. Aligned on the text split on whitespace it was
+        two words against one token, read as changed, and its card
+        closed unjudged; the carry splits the person's text as the
+        vote does, so the flag and the position stay."""
+        group = self.read(
+            "No. 0001065- 2021 x", "No. 0001065-2O21 y", "No. 0001065, 2021 z"
+        )
+        answer = ensemble.resolve(group)
+        self.assertEqual(answer["text"], "No. 0001065- 2021 x")
+        self.assertEqual(answer["n_low_confidence"], 2)
+
+        kept = ensemble._human_read(
+            answer,
+            {"text": "No. 0001065- 2021 w", "span": [18, 19]},
+            group["engines"],
+        )
+
+        joined = next(
+            t for t in kept["tokens"] if t["text"] == "0001065- 2021"
+        )
+        self.assertTrue(joined.get("low_confidence"))
+        self.assertEqual(joined.get("position"), 1)
+        self.assertEqual(kept["n_low_confidence"], 1)
+
     def test_a_changed_neighbour_leaves_the_gap_open(self):
         """The person answered the word before the gap, ``b`` to ``z``,
         and never looked at the gap: it stays, on the same word, with
@@ -1136,7 +1166,8 @@ class TestTheVote(TestCase):
         self.assertEqual([t["text"] for t in tokens], ["a", "smith", "b"])
         self.assertTrue(tokens[1].get("inserted"))
         self.assertFalse(any("gap" in t or "gap_after" in t for t in tokens))
-        self.assertEqual(disputed, 1)
+        # A majority's run is settled (#610), so nothing is counted.
+        self.assertEqual(disputed, 0)
 
     def test_a_run_after_the_last_word_marks_that_word(self):
         tokens, disputed = ensemble.vote_words(
@@ -1309,9 +1340,9 @@ class TestTheVote(TestCase):
         self.assertEqual(marked, ["beta", "delta"])
 
     def test_a_word_the_base_never_read_says_so(self):
-        """#380: a run the engines put in and a word no majority
-        settled are both marked, and they read differently. The viewer
-        names one of them, so the token must say which it is."""
+        """#380: a run the engines put in says so (``inserted``), apart
+        from a word the base read. A majority's run is settled (#610);
+        a tie's is marked, which the two-engine test checks."""
         answer = ensemble.resolve(
             self.read(
                 "the court held today",
@@ -1325,7 +1356,7 @@ class TestTheVote(TestCase):
         self.assertEqual(put_in, ["plainly"])
         for token in answer["tokens"]:
             if token.get("inserted"):
-                self.assertTrue(token.get("low_confidence"), token)
+                self.assertTrue(token.get("majority"), token)
 
     def test_a_word_no_majority_settles_is_not_an_inserted_word(self):
         answer = ensemble.resolve(
@@ -1444,6 +1475,676 @@ class TestTheVote(TestCase):
         self.assertEqual(ensemble.compare_text("appeal. . . ."), "appeal...")
         self.assertEqual(ensemble.compare_word("##"), "")
 
+    def test_the_shown_spelling_of_an_agreed_word_has_no_gap(self):
+        """The rank's engine wrote ``CP-1- 2021`` where two others wrote
+        ``CP-1-2021``: one reading by key, and the text shows the
+        spelling without the stray space, at the word (``vote_words``)
+        and for a block read alike (``resolve``), whose ``source``
+        names the engine it took it from."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("No. CP-1- 2021 x"),
+            [
+                ensemble._pairs("No. CP-1-2021 y"),
+                ensemble._pairs("No. CP-1-2021 z"),
+            ],
+        )
+        self.assertEqual(tokens[1]["text"], "CP-1-2021")
+        self.assertFalse(tokens[1].get("low_confidence"))
+
+        answer = ensemble.resolve(
+            self.read("No. CP-1- 2021 x", "No. CP-1-2021 x", "No. CP-1-2021 x")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+        self.assertEqual(answer["text"], "No. CP-1-2021 x")
+        self.assertEqual(answer["source"], "mistral_ocr")
+        # Alike to the letter, the rank's own spelling stays.
+        answer = ensemble.resolve(self.read("a - b", "a - b", "a - b"))
+        self.assertEqual(answer["source"], "dots_mocr")
+        # A nested quote the same way: the spelling without the space.
+        answer = ensemble.resolve(
+            self.read(
+                "father \u201c \u2018finally",
+                "father \"'finally",
+                "father \"'finally",
+            )
+        )
+        self.assertEqual(answer["text"], "father \"'finally")
+        self.assertEqual(answer["source"], "mistral_ocr")
+
+    def test_a_quote_inside_a_quote_reads_alike_however_it_is_spaced(self):
+        """Mistral wrote ``father “ ‘finally`` and ``justice’ ” so``
+        where dots.mocr wrote ``father "'finally`` and ``justice'" so``:
+        the same marks at the same ends, with a space between them.
+        The key folds the space, and the pairing joins a lone mark onto
+        its neighbour, an opening one forward and a closing one back,
+        so the two engines read one word alike and are the majority
+        over Surya, which drops the inner mark; the card is a warning,
+        not a block nobody agrees on."""
+        self.assertEqual(
+            ensemble.compare_text("father \u201c \u2018finally have"),
+            ensemble.compare_text("father \"'finally have"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("his justice\u2019 \u201d so"),
+            ensemble.compare_text("his justice'\" so"),
+        )
+        self.assertEqual(
+            ensemble._pairs("father \u201c \u2018finally have"),
+            [
+                ("father", "father"),
+                ("\"'finally", "\u201c \u2018finally"),
+                ("have", "have"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("his justice\u2019 \u201d so"),
+            [
+                ("his", "his"),
+                ("justice'\"", "justice\u2019 \u201d"),
+                ("so", "so"),
+            ],
+        )
+        # A straight mark goes to the neighbour that holds a mark. A
+        # lone mark with no marked neighbour stays a word of its own.
+        self.assertEqual(
+            ensemble._pairs("said ' \"go"),
+            [("said", "said"), ("'\"go", "' \"go")],
+        )
+        self.assertEqual(
+            ensemble._pairs("go' \" now"),
+            [("go'\"", "go' \""), ("now", "now")],
+        )
+        self.assertEqual(
+            ensemble._pairs('a " b'), [("a", "a"), ('"', '"'), ("b", "b")]
+        )
+        self.assertEqual(ensemble._pairs("\u201d"), [('"', "\u201d")])
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("father \"'finally have"),
+            [
+                ensemble._pairs("father \u201c \u2018finally have"),
+                ensemble._pairs("father \u201cfinally have"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["father", "\"'finally", "have"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+    def test_a_hyphen_with_a_space_after_it_is_the_hyphen(self):
+        """Mistral wrote ``CP-23-CR-0001065- 2021`` for the docket
+        number dots.mocr wrote as ``CP-23-CR-0001065-2021``: one
+        reading with a space in it, not two readings. The key folds
+        the space, the pairing reads the two words as one, and the
+        two engines are the majority over Surya's comma; the card is
+        a warning, not a block nobody agrees on. A dash between
+        spaces is a mark of its own and stays."""
+        self.assertEqual(
+            ensemble.compare_text("No(s): CP-23-CR-0001065- 2021"),
+            "No(s): CP-23-CR-0001065-2021",
+        )
+        # A run of dashes is one dash however it is spaced (#610).
+        self.assertEqual(
+            ensemble.compare_text("a - b"), ensemble.compare_text("a-b")
+        )
+        self.assertEqual(ensemble.compare_text("677 -- 679"), "677-679")
+        self.assertEqual(
+            ensemble.compare_text("677 - 679", hyphen_gaps=False), "677 - 679"
+        )
+        self.assertEqual(
+            ensemble.compare_text("677- 679", hyphen_gaps=False), "677- 679"
+        )
+        self.assertEqual(
+            ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+            [
+                ("No(s):", "No(s):"),
+                ("CP-23-CR-0001065-2021", "CP-23-CR-0001065- 2021"),
+            ],
+        )
+        # The dash is a word of its own, and any run of dashes keys
+        # as one.
+        self.assertEqual(
+            ensemble._pairs("a - b"), [("a", "a"), ("-", "-"), ("b", "b")]
+        )
+        self.assertEqual(
+            ensemble._pairs("677 -- 679"),
+            [("677", "677"), ("-", "--"), ("679", "679")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("No(s): CP-23-CR-0001065-2021"),
+            [
+                ensemble._pairs("No(s): CP-23-CR-0001065- 2021"),
+                ensemble._pairs("No(s): CP-23-CR-0001065, 2021"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["No(s):", "CP-23-CR-0001065-2021"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+    def test_an_empty_bracket_reads_alike_however_it_is_spaced(self):
+        """#610: the court's alteration ``'express[ ]'`` (2129, p. 79).
+        Mistral wrote ``'express[ ]'``, Surya ``'express[]'`` and
+        dots.mocr dropped the bracket: three readings, a block nobody
+        agrees on. The key folds the space inside the bracket and the
+        pairing splits the bracket off the word, so Mistral and Surya
+        are the majority over dots.mocr, a warning. The text is the
+        engines' own: no spelling is rewritten."""
+        self.assertEqual(
+            ensemble.compare_text("an 'express[ ]' choice"),
+            ensemble.compare_text("an 'express[]' choice"),
+        )
+        self.assertEqual(ensemble.compare_word("[  ]"), "[]")
+        # A filled bracket keeps its spaces, and two words stay two.
+        self.assertEqual(ensemble.compare_text("[ a ]"), "[ a ]")
+        self.assertEqual(
+            ensemble._pairs("an 'express[ ]' choice"),
+            [
+                ("an", "an"),
+                ("'express", "'express"),
+                ("[]", "[ ]"),
+                ("'", "'"),
+                ("choice", "choice"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("use [ ] it"),
+            [("use", "use"), ("[]", "[ ]"), ("it", "it")],
+        )
+        self.assertEqual(
+            ensemble._pairs("a [b] c"),
+            [("a", "a"), ("[b]", "[b]"), ("c", "c")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("must make an 'express' choice"),
+            [
+                ensemble._pairs("must make an 'express[ ]' choice"),
+                ensemble._pairs("must make an 'express[]' choice"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["must", "make", "an", "'express[ ]'", "choice"],
+        )
+        self.assertTrue(tokens[3].get("majority"))
+        self.assertFalse(tokens[3].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+        # Spaced alike or not, the three agree: no card.
+        answer = ensemble.resolve(
+            self.read("a 'waive[]' b", "a 'waive[ ]' b", "a 'waive[ ]' b")
+        )
+        self.assertEqual(answer["agreement"], ensemble.UNANIMOUS)
+
+    def test_a_hyphen_between_letters_reads_as_the_joined_word(self):
+        """#610: a name broken at a line end (2129). dots.mocr kept the
+        hyphen (``Mohort-er``), Surya joined the halves (``Mohorter``),
+        Mistral left a space (``Mohort er``): a block nobody agrees on.
+        The key drops a hyphen inside a word, so dots.mocr and Surya are
+        the majority, and the shown spelling is the one without it."""
+        self.assertEqual(
+            ensemble.compare_word("Mohort-er"),
+            ensemble.compare_word("Mohorter"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("a Mohort- er b"),
+            ensemble.compare_text("a Mohorter b"),
+        )
+
+        # Between digits the hyphen counts: two numbers, not one.
+        self.assertNotEqual(
+            ensemble.compare_word("12-345"), ensemble.compare_word("123-45")
+        )
+        self.assertNotEqual(
+            ensemble.compare_word("1-3"), ensemble.compare_word("13")
+        )
+        # Two engines' hyphen shows over one engine that lost it.
+        self.assertEqual(
+            ensemble._tidiest(["self-defense", "selfdefense", "self-defense"]),
+            "self-defense",
+        )
+        self.assertEqual(
+            ensemble._tidiest(["selfdefense", "self-defense", "self-defense"]),
+            "self-defense",
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("Diane Mohort-er filed"),
+            [
+                ensemble._pairs("Diane Mohort er filed"),
+                ensemble._pairs("Diane Mohorter filed"),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens], ["Diane", "Mohorter", "filed"]
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(tokens[1].get("low_confidence"))
+        self.assertEqual(disputed, 0)
+
+    def test_the_reporter_join_is_the_longest_window_that_names_one(self):
+        """The join grows a run of words one at a time and stops where no
+        name can start, and answers what trying every window of two to
+        four words answered: the longest run that is a name, with what
+        may follow it."""
+
+        def every_window(words):
+            out, index = [], 0
+            while index < len(words):
+                for size in range(
+                    min(ensemble._REPORTER_WORDS, len(words) - index), 1, -1
+                ):
+                    if ensemble._reporter(
+                        " ".join(words[index : index + size])
+                    ):
+                        out.append(" ".join(words[index : index + size]))
+                        index += size
+                        break
+                else:
+                    out.append(words[index])
+                    index += 1
+            return out
+
+        for text in (
+            "131 L. Ed. 2d 490",
+            "115 S. Ct. 1555, 131 L. Ed. 2d, 490",
+            "the court held that N. Y. S. 3d ; here",
+            "F. Supp. 3d ) and F. App'x x",
+            "L. Ed. 2d , the rest",
+            "U.S. , So. 3d So. 2d",
+            "Ill. App. 3d is not on the list",
+            "the the the",
+        ):
+            words = text.split()
+            self.assertEqual(
+                ensemble._join_reporters(words), every_window(words), text
+            )
+
+    def test_the_key_of_a_text_is_cached(self):
+        """A rebuild keys the same texts again and again: the second
+        call of the same text is a hit."""
+        ensemble.compare_text.cache_clear()
+        ensemble.compare_text("131 L. Ed. 2d 490")
+        ensemble.compare_text("131 L. Ed. 2d 490")
+
+        self.assertEqual(ensemble.compare_text.cache_info().hits, 1)
+        self.assertEqual(
+            ensemble.compare_text("131 L. Ed. 2d 490", hyphen_gaps=False),
+            ensemble.compare_text("131 L.Ed.2d 490", hyphen_gaps=False),
+        )
+
+    def test_a_reporter_reads_alike_however_it_is_spaced(self):
+        """#610: ``131 L. Ed. 2d 490`` (dots.mocr), ``131 L.Ed.2d 490``
+        (Mistral), ``181 L.Ed.2d 490`` (Surya, a misread digit). The
+        spacing inside a reporter of the allowlist is no difference, so
+        dots.mocr and Mistral are the majority over Surya's digit. A
+        name off the list, and a word that only looks like one, keep
+        their spaces."""
+        self.assertEqual(
+            ensemble.compare_text("115 S. Ct. 1555, 131 L. Ed. 2d 490"),
+            ensemble.compare_text("115 S.Ct. 1555, 131 L.Ed.2d 490"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("N. Y. S. 3d,"),
+            ensemble.compare_text("N.Y.S.3d,"),
+        )
+        self.assertNotEqual(
+            ensemble.compare_text("Ill. App. 3d"),
+            ensemble.compare_text("Ill.App.3d"),
+        )
+        self.assertEqual(
+            ensemble._pairs("131 L. Ed. 2d 490"),
+            [("131", "131"), ("L.Ed.2d", "L. Ed. 2d"), ("490", "490")],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("1555, 131 L. Ed. 2d 490"),
+            [
+                ensemble._pairs("1555, 131 L.Ed.2d 490"),
+                ensemble._pairs("1555, 181 L.Ed.2d 490"),
+            ],
+        )
+
+        self.assertEqual(
+            # The spelling two engines wrote shows (``_tidiest``).
+            [t["text"] for t in tokens],
+            ["1555,", "131", "L.Ed.2d", "490"],
+        )
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_an_ellipsis_is_a_word_of_its_own(self):
+        """#610: ``through another... source`` (dots.mocr), ``through
+        another . . . source`` (Mistral), ``through another source``
+        (Surya, which dropped it). The dots read alike already
+        (``_DOT_RUN``); attached or set apart, they are a word of their
+        own, so every engine reads ``another`` and dots.mocr and Mistral
+        are the majority over Surya on the ellipsis. A lone period
+        stays a word of its own."""
+        self.assertEqual(
+            ensemble.compare_text("through another... source"),
+            ensemble.compare_text("through another . . . source"),
+        )
+        self.assertEqual(
+            ensemble._pairs("through another . . . source"),
+            [
+                ("through", "through"),
+                ("another", "another"),
+                ("...", ". . ."),
+                ("source", "source"),
+            ],
+        )
+        self.assertEqual(
+            ensemble._pairs("a . b"), [("a", "a"), (".", "."), ("b", "b")]
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs('through another... source."4'),
+            [
+                ensemble._pairs('through another . . . source."4'),
+                ensemble._pairs('through another source."4'),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["through", "another", "...", 'source."4'],
+        )
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(
+            ensemble.join_tokens(tokens), 'through another... source."4'
+        )
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_an_abbreviation_of_single_letters_reads_alike_spaced(self):
+        """#610: ``(S.D.N. Y. 2005)`` (dots.mocr), ``(S.D.N. Y 2005)``
+        (Mistral, the period lost), ``(S.D.N.Y. 2005)`` (Surya). The
+        space inside the court's abbreviation closes up, so dots.mocr
+        and Surya are the majority over Mistral's missing period. A
+        name after an initial keeps its space."""
+        self.assertEqual(
+            ensemble.compare_text("477 (S.D.N. Y. 2005)."),
+            ensemble.compare_text("477 (S.D.N.Y. 2005)."),
+        )
+        self.assertNotEqual(
+            ensemble.compare_text("John A. Smith"),
+            ensemble.compare_text("John A.Smith"),
+        )
+        self.assertEqual(
+            ensemble._pairs("477 (S.D.N. Y. 2005)."),
+            [
+                ("477", "477"),
+                ("(S.D.N.Y.", "(S.D.N. Y."),
+                ("2005).", "2005)."),
+            ],
+        )
+
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("477 (S.D.N. Y. 2005)."),
+            [
+                ensemble._pairs("477 (S.D.N. Y 2005)."),
+                ensemble._pairs("477 (S.D.N.Y. 2005)."),
+            ],
+        )
+
+        self.assertTrue(tokens[1].get("majority"))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+    def test_a_paragraph_or_section_sign_reads_alike_spaced(self):
+        """#610: ``Comp. ¶ 8);`` and ``Comp. ¶8);``, ``§ 1983`` and
+        ``§1983``: one reference spaced two ways."""
+        self.assertEqual(
+            ensemble.compare_text("Comp. ¶ 8);"),
+            ensemble.compare_text("Comp. ¶8);"),
+        )
+        self.assertEqual(
+            ensemble.compare_text("42 U.S.C. §§ 1983"),
+            ensemble.compare_text("42 U.S.C. §§1983"),
+        )
+        # The sign is a word of its own, attached or set apart.
+        for text in ("Comp. ¶ 8);", "Comp. ¶8);"):
+            self.assertEqual(
+                ensemble._pairs(text),
+                [("Comp.", "Comp."), ("¶", "¶"), ("8);", "8);")],
+            )
+
+    def test_words_the_base_missed_that_a_majority_read_are_settled(self):
+        """#610: dots.mocr, the base, read nothing of ``the alleged
+        conspirators.”``, and Mistral and Surya read it alike: two of
+        three, a majority, as on a word the base read otherwise. The
+        words go in as ``majority`` (a warning), not marked for a
+        person; a tie of two engines still is."""
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("minds among Lawrence"),
+            [
+                ensemble._pairs(
+                    "minds among the alleged conspirators. Lawrence"
+                ),
+                ensemble._pairs(
+                    "minds among the alleged conspirators. Lawrence"
+                ),
+            ],
+        )
+
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["minds", "among", "the", "alleged", "conspirators.", "Lawrence"],
+        )
+        put_in = [t for t in tokens if t.get("inserted")]
+        self.assertEqual(len(put_in), 3)
+        self.assertTrue(all(t.get("majority") for t in put_in))
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
+
+        # Two engines: the other's words are a tie, still marked.
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("minds among Lawrence"),
+            [ensemble._pairs("minds among the alleged Lawrence")],
+        )
+        self.assertTrue(
+            all(t.get("low_confidence") for t in tokens if t.get("inserted"))
+        )
+        self.assertEqual(disputed, 2)
+
+    def test_a_comma_after_an_ellipsis_is_a_word_of_its_own(self):
+        """#610: ``face ..., be`` (dots.mocr), ``face . . . , be``
+        (Mistral), ``face . . . be`` (Surya, no comma). The ellipsis
+        and the comma are split off the word, so every engine reads
+        ``face`` and the ellipsis, and the comma is a majority's."""
+        self.assertEqual(
+            ensemble._pairs("on their face . . . , be"),
+            [
+                ("on", "on"),
+                ("their", "their"),
+                ("face", "face"),
+                ("...", ". . ."),
+                (",", ","),
+                ("be", "be"),
+            ],
+        )
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("on their face ..., be"),
+            [
+                ensemble._pairs("on their face . . . , be"),
+                ensemble._pairs("on their face . . . be"),
+            ],
+        )
+        self.assertEqual(tokens[4]["text"], ",")
+        self.assertTrue(tokens[4].get("majority"))
+        self.assertTrue(tokens[4].get("attach"))
+        self.assertEqual(disputed, 0)
+
+    def test_a_mark_split_off_its_word_lines_up_the_words(self):
+        """#610: the engines set an ellipsis, a dash, a sign or an empty
+        bracket against their words each their own way. Joined to a
+        neighbour, the mark made every engine's word a different word,
+        and the block went to a vote nobody wins; split off, the words
+        line up and the mark is a word of its own. Cards of 2677, 2129
+        and the corpus sample, each blocking before."""
+        cases = [
+            # Mistral wrote no space after the ellipsis.
+            (
+                "no restriction—it would",
+                "no restriction—...it would",
+                "no restriction—... it would",
+            ),
+            (
+                "they wanted... like, they",
+                "they wanted...like, they",
+                "they wanted . . like, they",
+            ),
+            # One dash, spelled three ways.
+            (
+                "robbery with – – for the",
+                "robbery with -- for the",
+                "robbery with — for the",
+            ),
+            (
+                "the conversation . . . —have it",
+                "the conversation ...—have it",
+                "the conversation—have it",
+            ),
+            ("(§ 13.3).)", "(¶ 13,3).)", "(¶ 13.3).)"),
+            (
+                "generally accepted",
+                "generally[ ]accepted",
+                "generally [accepted",
+            ),
+            ("adverse[ ] to", "adverse[ ]' to", "adverse ['] to"),
+            ("said....” He", "said.” He", "said. . . .” He"),
+        ]
+        for base, *others in cases:
+            with self.subTest(base=base):
+                tokens, disputed = ensemble.vote_words(
+                    ensemble._pairs(base),
+                    [ensemble._pairs(other) for other in others],
+                )
+                self.assertEqual(disputed, 0)
+                self.assertFalse(any(t.get("low_confidence") for t in tokens))
+
+    def test_a_split_mark_keeps_the_spacing_of_the_page(self):
+        """A piece printed against the word before it is ``attach``, so
+        the text of the tokens is the engine's own: no space goes in."""
+        for text in (
+            "no restriction—it would",
+            "they wanted...like, they",
+            "the court's alteration 'express[ ]' and ¶8);",
+            "said....” He",
+        ):
+            with self.subTest(text=text):
+                tokens, _ = ensemble.vote_words(
+                    ensemble._pairs(text), [ensemble._pairs(text)]
+                )
+                self.assertEqual(ensemble.join_tokens(tokens), text)
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("no restriction—it would"),
+            [ensemble._pairs("no restriction—it would")],
+        )
+        self.assertEqual(
+            [(t["text"], bool(t.get("attach"))) for t in tokens],
+            [
+                ("no", False),
+                ("restriction", False),
+                ("—", True),
+                ("it", True),
+                ("would", False),
+            ],
+        )
+
+    def test_a_dash_inside_a_word_or_a_range_stays(self):
+        """A hyphen after a letter or a digit is part of the word
+        (``self-defense``, ``CP-23``), and so is one dash between two
+        digits (``17–19``): split, a range would read as three words
+        against one engine's ``17-19``."""
+        for text, words in (
+            ("self-defense", ["self-defense"]),
+            ("CP-23-CR-0001065-2021", ["CP-23-CR-0001065-2021"]),
+            ("pages 17–19, and", ["pages", "17–19,", "and"]),
+            ("a 'quote'-that", ["a", "'quote'", "-", "that"]),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    [shown for _, shown in ensemble._pairs(text)], words
+                )
+        self.assertEqual(
+            ensemble.compare_text("pages 17–19"),
+            ensemble.compare_text("pages 17-19"),
+        )
+        # A block that differs only by how a dash between two words is
+        # written reads alike, however it is spelled or spaced.
+        keys = {
+            ensemble.compare_text(text)
+            for text in (
+                "restriction—it",
+                "restriction-it",
+                "restriction - it",
+                "restriction — it",
+                "restriction--it",
+            )
+        }
+        self.assertEqual(len(keys), 1)
+
+    def test_a_dropped_mark_gives_the_word_after_it_its_space(self):
+        """Two engines read ``restriction it`` where dots.mocr read
+        ``restriction—it``: the dash loses the vote, and ``it``, glued
+        to it in dots.mocr's read, must not run into ``restriction``."""
+        tokens, _ = ensemble.vote_words(
+            ensemble._pairs("no restriction—it would"),
+            [
+                ensemble._pairs("no restriction it would"),
+                ensemble._pairs("no restriction it would"),
+            ],
+        )
+        self.assertEqual(
+            ensemble.join_tokens(tokens), "no restriction it would"
+        )
+
+    def test_the_page_number_reader_keeps_the_space_after_leader_dots(self):
+        """``carries_number`` reads the last word of a line as written: a
+        number after leader dots stays a word of its own."""
+        self.assertEqual(
+            ensemble.compare_text(". . . 677", hyphen_gaps=False), "... 677"
+        )
+
+    def test_a_dash_between_words_reads_alike_spaced(self):
+        """#610: ``municipality' - that`` (dots.mocr),
+        ``municipality'-that`` (Mistral), ``municipality' that``
+        (Surya, no dash)."""
+        self.assertEqual(
+            ensemble.compare_text("the municipality' - that is,"),
+            ensemble.compare_text("the municipality'-that is,"),
+        )
+        tokens, disputed = ensemble.vote_words(
+            ensemble._pairs("the municipality' - that is,"),
+            [
+                ensemble._pairs("the municipality'-that is,"),
+                ensemble._pairs("the municipality' that is,"),
+            ],
+        )
+        # The dash is a word of its own, attached or set apart.
+        self.assertEqual(
+            [t["text"] for t in tokens],
+            ["the", "municipality'", "-", "that", "is,"],
+        )
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(disputed, 0)
+        self.assertEqual(
+            ensemble.join_tokens(tokens), "the municipality' - that is,"
+        )
+
     def test_a_word_only_the_other_engine_read_is_marked_and_counted(self):
         """Two engines make every difference a tie, and the same tie on
         a word the base does have is marked. So the word goes in,
@@ -1484,12 +2185,12 @@ class TestTheVote(TestCase):
         )
 
         self.assertEqual(
-            " ".join(token["text"] for token in tokens),
-            "La.), \u00b6 235-236. No one",
+            ensemble.join_tokens(tokens), "La.), \u00b6 235-236. No one"
         )
-        marked = [t["text"] for t in tokens if t.get("low_confidence")]
-        self.assertEqual(marked, ["\u00b6", "235-236."])
-        self.assertEqual(disputed, 2)
+        # The sign is a word of its own (#610), so the number lines up
+        # in all three reads and a majority settles both.
+        self.assertFalse(any(t.get("low_confidence") for t in tokens))
+        self.assertEqual(disputed, 0)
 
     def test_a_join_two_engines_agree_on_writes_the_tail_once(self):
         """The other side of #391: both engines joined the two base
@@ -1563,7 +2264,9 @@ class TestTheVote(TestCase):
         self.assertEqual([t["text"] for t in tokens], ["alpha", "gamma"])
         self.assertEqual(disputed, 0)
 
-    def test_a_word_a_majority_read_goes_in_marked_and_counted(self):
+    def test_a_word_a_majority_read_goes_in_settled(self):
+        """A word the base missed and a majority read goes in, settled
+        as a majority's word, not counted for a person (#610)."""
         tokens, disputed = ensemble.vote_words(
             ensemble._pairs("the quick fox"),
             [
@@ -1575,7 +2278,8 @@ class TestTheVote(TestCase):
         self.assertEqual(
             [t["text"] for t in tokens], ["the", "quick", "brown", "fox"]
         )
-        self.assertEqual(disputed, 1)
+        self.assertTrue(tokens[2].get("majority"))
+        self.assertEqual(disputed, 0)
 
     def test_an_engine_that_read_nothing_does_not_vote(self):
         """One engine calls a region a picture and reads no word of it
@@ -1615,7 +2319,8 @@ class TestTheVote(TestCase):
     def test_a_spaced_ellipsis_is_one_word(self):
         """Surya writes the ``. . .`` of the page where Mistral writes
         ``...``, and the block key reads them alike; the word vote must
-        too, or a block that agrees to the letter goes to a vote."""
+        too, or a block that agrees to the letter goes to a vote. The
+        ellipsis is one word of its own (#610)."""
         self.assertEqual(
             ensemble._pairs("sentence . . . must"),
             [("sentence", "sentence"), ("...", ". . ."), ("must", "must")],
@@ -1999,6 +2704,40 @@ class TestTheRows(EnsembleTestCase):
         row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
         self.assertEqual(row.source_page, 1)
         self.assertEqual(row.source_edit_id, self.edit().pk)
+
+    def test_the_pages_are_written_in_one_statement(self):
+        """One upsert for every page under the row lock, and one delete
+        of the pages the opinion lost (#603), however long it is."""
+        ensemble.write_rows(self.opinion, document_of(page_of(0)))
+        pages = [page_of(i, text=f"page {i}") for i in range(4)]
+
+        with self.assertNumQueries(2):
+            self.assertEqual(
+                ensemble.write_rows(self.opinion, document_of(*pages)), 4
+            )
+
+        self.assertEqual(
+            list(
+                OpinionText.objects.filter(opinion=self.opinion).values_list(
+                    "page_in_opinion", "text"
+                )
+            ),
+            [(i, f"page {i}") for i in range(4)],
+        )
+
+    def test_a_written_page_keeps_its_human_text_and_its_birth(self):
+        ensemble.write_rows(self.opinion, document_of(page_of(0)))
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        row.human_text = "what the curator typed"
+        row.save(update_fields=["human_text"])
+
+        ensemble.write_rows(self.opinion, document_of(page_of(0, text="new")))
+
+        again = OpinionText.objects.get(pk=row.pk)
+        self.assertEqual(again.text, "new")
+        self.assertEqual(again.human_text, "what the curator typed")
+        self.assertEqual(again.date_created, row.date_created)
+        self.assertGreater(again.date_modified, row.date_modified)
 
     def test_a_page_the_opinion_lost_keeps_a_curator_s_text(self):
         """An opinion does grow shorter, and ``human_text`` is never
@@ -3018,6 +3757,211 @@ class TestTheCommand(EnsembleTestCase):
             self.run_command()
 
 
+class TestTheCommandByOpinion(EnsembleTestCase):
+    """``rerun_opinion_ensemble --opinion``: the rows a person names (#465)."""
+
+    def setUp(self):
+        super().setUp()
+        self.sibling = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 4, 5),
+            505,
+        )
+        self.glue()
+        self.glue(self.sibling)
+
+    def run_command(self, *args) -> str:
+        out = StringIO()
+        call_command("rerun_opinion_ensemble", *args, stdout=out, stderr=out)
+        return out.getvalue()
+
+    def written(self) -> list[bool]:
+        """Whether each of the two opinions has its text written."""
+        return [
+            ensemble.is_written(Opinion.objects.get(pk=row.pk))
+            for row in (self.opinion, self.sibling)
+        ]
+
+    def test_the_rows_read_leave_the_caches_of_the_scan_and_the_run(self):
+        """Both selectors read the tick's query (#582, #602)."""
+        read = []
+
+        def capture(opinion):
+            read.append(opinion)
+            return rerun(opinion)
+
+        rerun = ensemble.rerun
+        for args in (
+            ("--opinion", str(self.opinion.pk)),
+            (str(self.scan.pk),),
+        ):
+            read.clear()
+            with (
+                self.subTest(args=args),
+                patch.object(ensemble, "rerun", side_effect=capture),
+            ):
+                self.run_command(*args)
+
+                self.assertTrue(read)
+                for row in read:
+                    self.assertLessEqual(
+                        set(Scan.LARGE_FIELDS), row.scan.get_deferred_fields()
+                    )
+                    self.assertLessEqual(
+                        set(ApplyRun.LARGE_FIELDS),
+                        row.apply_run.get_deferred_fields(),
+                    )
+
+    def test_the_named_opinion_is_read_alone(self):
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.written(), [True, False])
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan", output
+        )
+        self.assertIn("Wrote 1 opinion(s), 0 failed", output)
+
+    def test_the_two_spellings_read_the_same_rows_once(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), str(self.sibling.pk)
+        )
+        self.assertIn("Wrote 2 opinion(s)", output)
+
+        output = self.run_command(
+            "--opinion",
+            str(self.opinion.pk),
+            "--opinion",
+            str(self.sibling.pk),
+            "--opinion",
+            str(self.opinion.pk),
+        )
+        self.assertIn("Wrote 2 opinion(s)", output)
+        self.assertEqual(self.written(), [True, True])
+
+    def test_a_dry_run_names_the_opinion_and_reads_nothing(self):
+        output = self.run_command(
+            "--opinion", str(self.opinion.pk), "--dry-run"
+        )
+
+        self.assertIn(
+            f"opinion {self.opinion.pk} ({self.opinion}) of scan "
+            f"{self.scan.pk}: would read, 2 engine(s)",
+            output,
+        )
+        self.assertIn("Would read 1 opinion(s)", output)
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_refused_opinion_stops_the_call_and_nothing_is_read(self):
+        Opinion.objects.filter(pk=self.sibling.pk).update(
+            status=OpinionReviewStatus.TEXT_REVIEW_DONE
+        )
+        unglued = self.make_opinion(
+            self.scan,
+            self.apply_run,
+            self.make_boundary(self.scan, self.apply_run, 0, 0),
+            501,
+        )
+        for named, said in (
+            (self.sibling.pk, "approved"),
+            (99999, "do not exist"),
+            (unglued.pk, "no OCR documents"),
+        ):
+            with self.assertRaisesMessage(CommandError, said) as refused:
+                self.run_command("--opinion", str(self.opinion.pk), str(named))
+            self.assertIn(str(named), str(refused.exception))
+
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_named_opinion_keeps_the_waiver_of_every_count(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(ocr_engine_count=1)
+
+        output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("Wrote 1 opinion(s)", output)
+
+    def test_an_error_opinion_is_read_and_comes_back(self):
+        Opinion.objects.filter(pk=self.opinion.pk).update(
+            status=OpinionReviewStatus.ERROR,
+            error_message=f"{ensemble.MESSAGE_PREFIX}the bucket was gone",
+        )
+
+        self.run_command("--opinion", str(self.opinion.pk))
+
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.status, OpinionReviewStatus.ERROR)
+        self.assertTrue(ensemble.is_written(self.opinion))
+
+    def test_a_glue_that_moved_is_reported_and_not_a_failure(self):
+        with patch(
+            "scanning.ensemble.rerun",
+            side_effect=ensemble.RevisionMoved("the glue wrote again"),
+        ):
+            output = self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertIn("the opinion moved during the read", output)
+        self.assertIn(
+            "Wrote 0 opinion(s), 0 failed, 1 moved during the read", output
+        )
+
+    def test_a_scan_read_reports_a_moved_glue_too(self):
+        with patch(
+            "scanning.ensemble.rerun",
+            side_effect=ensemble.RevisionMoved("the glue wrote again"),
+        ):
+            output = self.run_command(str(self.scan.pk))
+
+        self.assertIn("0 failed, 2 moved during the read", output)
+
+    def test_the_opinions_are_read_in_the_order_of_the_call(self):
+        output = self.run_command(
+            "--opinion",
+            str(self.sibling.pk),
+            str(self.opinion.pk),
+            str(self.sibling.pk),
+        )
+
+        first = output.index(f"opinion {self.sibling.pk} (")
+        second = output.index(f"opinion {self.opinion.pk} (")
+        self.assertLess(first, second)
+        self.assertEqual(output.count(f"opinion {self.sibling.pk} ("), 1)
+
+    def test_a_scan_number_after_opinion_is_read_as_an_opinion(self):
+        """``--opinion`` takes every number after it, so a scan written
+        after it names an opinion, and a pk that is no opinion stops the
+        call before anything is read. The help says so."""
+        with self.assertRaisesMessage(CommandError, "do not exist"):
+            self.run_command("--opinion", str(self.opinion.pk), "99999")
+
+        self.assertEqual(self.written(), [False, False])
+
+    def test_a_call_with_no_file_store_is_refused_once(self):
+        with (
+            patch("scanning.s3_sync.s3_active", return_value=False),
+            self.assertRaisesMessage(CommandError, "the file store is off"),
+        ):
+            self.run_command("--opinion", str(self.opinion.pk))
+
+        self.assertEqual(self.written(), [False, False])
+        # A dry run reads nothing from the bucket.
+        with patch("scanning.s3_sync.s3_active", return_value=False):
+            output = self.run_command(
+                "--opinion", str(self.opinion.pk), "--dry-run"
+            )
+        self.assertIn("Would read 1 opinion(s)", output)
+
+    def test_opinion_with_another_selector_is_refused(self):
+        for args in (
+            (str(self.scan.pk), "--opinion", str(self.opinion.pk)),
+            ("--all", "--opinion", str(self.opinion.pk)),
+        ):
+            with self.assertRaisesMessage(
+                CommandError, "pass --opinion alone"
+            ):
+                self.run_command(*args)
+        self.assertEqual(self.written(), [False, False])
+
+
 # ── the section (#399) ───────────────────────────────────────────────
 #: The left and the right column of a test page, and a footnote band
 #: across both, in points.
@@ -3041,11 +3985,13 @@ def read_units(*specs) -> list[dict]:
     return units
 
 
-def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
+def engine_page(
+    units_of_engine: list[dict], zones=(), quotes=(), starts=()
+) -> dict:
     """One engine's page of an opinion document, for ``build_page``.
 
-    ``zones`` are the footnote zones and ``quotes`` the blockquote
-    zones, in points.
+    ``zones`` are the footnote zones, ``quotes`` the blockquote zones
+    and ``starts`` the syllabus zones, in points.
     """
     return {
         "page_in_opinion": 0,
@@ -3053,7 +3999,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
         "pdf_page": 2,
         "source": {"kind": "original", "pdf_page": 2},
         "frame": {"width_pt": WIDTH, "height_pt": HEIGHT},
-        "zones": {"footnotes": list(zones), "blockquotes": list(quotes)},
+        "zones": {
+            "footnotes": list(zones),
+            "blockquotes": list(quotes),
+            "syllabus": list(starts),
+        },
         "units": [
             {
                 "id": u["id"],
@@ -3071,11 +4021,11 @@ def engine_page(units_of_engine: list[dict], zones=(), quotes=()) -> dict:
     }
 
 
-def build(units, zones=(), quotes=()) -> dict:
+def build(units, zones=(), quotes=(), starts=()) -> dict:
     """The ensemble of one page read by the two engines of ``units``."""
     pages = {
         engine: engine_page(
-            [u for u in units if u["engine"] == engine], zones, quotes
+            [u for u in units if u["engine"] == engine], zones, quotes, starts
         )
         for engine in ("dots_mocr", "mistral_ocr")
     }
@@ -3244,7 +4194,8 @@ class TestTheTwoTexts(TestCase):
         )
         self.assertEqual(page["footnotes"], "1. left note")
         self.assertEqual(
-            page["zones"], {"footnotes": [FOOT_ZONE], "blockquotes": []}
+            page["zones"],
+            {"footnotes": [FOOT_ZONE], "blockquotes": [], "syllabus": []},
         )
 
     def test_without_a_zone_the_footnote_stays_in_the_body(self):
@@ -3372,7 +4323,11 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         self.assertEqual(page["footnotes"], "body B 2")
         self.assertEqual(
             page["zones"],
-            {"footnotes": [to_pt(self.BAND_B)], "blockquotes": []},
+            {
+                "footnotes": [to_pt(self.BAND_B)],
+                "blockquotes": [],
+                "syllabus": [],
+            },
         )
         # The first page masks its header, above the caption.
         self.assertEqual(document["pages"][0]["text"], "body A 1\n\nbody B 1")
@@ -3491,6 +4446,66 @@ class TestTheFootnoteCard(TestTheFindings):
 
     def test_the_check_is_the_rebuild_s_own(self):
         self.assertIn(OpinionCheck.FOOTNOTE_UNSURE, ensemble.ENSEMBLE_CHECKS)
+
+
+class TestTheSyllabusCard(TestTheFindings):
+    """The ``SYLLABUS_UNSURE`` card (#518): a warning where the box and
+    the heading disagree, and a log line."""
+
+    def doubted(self, *doubts) -> list[OpinionFinding]:
+        page = page_of(syllabus_doubt=len(doubts))
+        page["syllabus_doubt"] = list(doubts)
+        with self.assertLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_a_heading_with_no_box_is_a_warning(self):
+        cards = self.doubted({"doubt": "heading", "text": "Syllabus"})
+
+        self.assertEqual([c.check_name for c in cards], ["syllabus_unsure"])
+        self.assertEqual(cards[0].severity, Issue.Severity.WARNING)
+        self.assertEqual(cards[0].page_in_opinion, 0)
+        self.assertIn(
+            'The heading "Syllabus" has no SYLLABUS detection',
+            cards[0].message,
+        )
+
+    def test_a_box_on_other_words_names_them(self):
+        cards = self.doubted({"doubt": "box", "text": "Ford is global ..."})
+
+        self.assertIn(
+            'A SYLLABUS detection sits on "Ford is global ..."',
+            cards[0].message,
+        )
+
+    def test_a_box_over_no_block_says_so(self):
+        cards = self.doubted({"doubt": "box", "text": ""})
+
+        self.assertIn("covers no block of text", cards[0].message)
+
+    def test_no_doubt_is_no_card(self):
+        cards = self.rebuild()
+
+        self.assertEqual(cards, [])
+
+    def test_a_standing_dismissal_mutes_the_card_and_the_log(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.SYLLABUS_UNSURE,
+        )
+        page = page_of(syllabus_doubt=1)
+        page["syllabus_doubt"] = [{"doubt": "heading", "text": "Syllabus"}]
+
+        with self.assertNoLogs("scanning.ensemble", level="ERROR"):
+            ensemble.rebuild_findings(self.opinion, document_of(page))
+
+        card = OpinionFinding.objects.get(opinion=self.opinion)
+        self.assertEqual(card.dismissal_id, dismissal.pk)
+
+    def test_the_check_is_the_rebuild_s_own_and_dismissable(self):
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, ensemble.ENSEMBLE_CHECKS)
+        self.assertIn(OpinionCheck.SYLLABUS_UNSURE, DISMISSABLE_OPINION_CHECKS)
 
 
 class TestTheBracketToken(EnsembleTestCase):
@@ -4129,6 +5144,179 @@ def paragraphs(*specs) -> list[dict]:
     return units
 
 
+class TestTheSyllabusStart(TestCase):
+    """``ensemble.syllabus_start`` (#518): the zone stamps the body
+    group under it, and the stamp names the start alone."""
+
+    HEADING = (50, 100, 300, 120)
+    FIRST = (50, 125, 300, 300)
+
+    def test_the_group_under_the_zone_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [zone_over(self.HEADING)])
+
+    def test_a_tall_zone_stamps_its_first_group_alone(self):
+        """A curator's box over the heading and the paragraphs under
+        it opens one run: a stamp on each would part the paragraphs."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING, self.FIRST)],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+
+    def test_a_dropped_opener_passes_the_stamp_to_the_next_kept_group(self):
+        """A stray mark a redaction takes, under a box taller than the
+        heading: the kept heading under it opens the run."""
+        stray = (50, 95, 300, 99)
+        page = build(
+            paragraphs(
+                (
+                    stray,
+                    "x",
+                    ("paragraph", "paragraph"),
+                    {"reason": "redaction"},
+                ),
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(stray, self.HEADING)],
+        )
+
+        self.assertEqual(
+            [(g["text"], g["syllabus_start"]) for g in page["groups"]],
+            [("Syllabus *", True), ("The company is global.", False)],
+        )
+        self.assertEqual(page["syllabus_doubt"], [])
+
+    def test_two_zones_are_judged_apart(self):
+        """A page two cases share: the zone that stamped nothing is a
+        doubt although the other stamped the heading."""
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING), [400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [True, False]
+        )
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
+        )
+
+    def test_a_box_on_the_heading_is_no_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.HEADING)],
+        )
+
+        self.assertEqual(page["syllabus_doubt"], [])
+        self.assertEqual(page["counts"]["syllabus_doubt"], 0)
+
+    def test_a_box_on_other_words_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Summary", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            ),
+            starts=[zone_over(self.FIRST)],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "box", "text": "The company is global."}],
+        )
+        self.assertEqual(page["counts"]["syllabus_doubt"], 1)
+
+    def test_a_syllabus_heading_with_no_box_is_a_doubt(self):
+        page = build(
+            paragraphs(
+                (
+                    self.HEADING,
+                    "Syllabus by the Court",
+                    ("heading", "heading"),
+                ),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"],
+            [{"doubt": "heading", "text": "Syllabus by the Court"}],
+        )
+
+    def test_a_box_over_no_block_is_a_doubt(self):
+        page = build(
+            paragraphs((self.FIRST, "The company is global.")),
+            starts=[[400.0, 600.0, 500.0, 620.0]],
+        )
+
+        self.assertEqual(
+            page["syllabus_doubt"], [{"doubt": "box", "text": ""}]
+        )
+
+    def test_without_a_zone_no_group_is_stamped(self):
+        page = build(
+            paragraphs(
+                (self.HEADING, "Syllabus *", ("heading", "heading")),
+                (self.FIRST, "The company is global."),
+            )
+        )
+
+        self.assertEqual(
+            [g["syllabus_start"] for g in page["groups"]], [False, False]
+        )
+        self.assertEqual(page["zones"]["syllabus"], [])
+
+    def test_a_footnote_is_never_a_syllabus(self):
+        note = (50, 600, 300, 700)
+        page = build(
+            read_units((note, "1. a note")),
+            zones=[FOOT_ZONE],
+            starts=[zone_over(note)],
+        )
+
+        self.assertEqual(page["groups"][0]["section"], ensemble.FOOTNOTES)
+        self.assertFalse(page["groups"][0]["syllabus_start"])
+
+    def test_the_share_is_of_the_group(self):
+        group = ensemble.align_page(
+            read_units((self.FIRST, "The company is global.")),
+            WIDTH,
+            HEIGHT,
+        )[0]
+        group["section"] = ensemble.BODY
+        # A one-line zone over the first line of a long paragraph: the
+        # box the model draws over a heading never covers a paragraph.
+        thin = [50.0, 125.0, 300.0, 140.0]
+
+        self.assertFalse(ensemble.syllabus_start(group, [thin]))
+        self.assertTrue(
+            ensemble.syllabus_start(group, [zone_over(self.FIRST)])
+        )
+
+
 class TestTheQuotedRule(TestCase):
     """``ensemble.quoted``: the zone decides, the group goes whole."""
 
@@ -4504,6 +5692,60 @@ class TestTheLevel(TestCase):
                 n_low_confidence=1,
             ),
             ensemble.BLOCKING,
+        )
+
+    def test_an_open_word_of_punctuation_or_capitals_alone_warns(self):
+        """The letters of the three readings agree; only the mark after
+        the word, or its capitals, differ (``blocking_types.MINOR``)."""
+        from scanning.tests.test_blocking_review import read
+
+        for texts in (
+            (
+                "the court held, that x",
+                "the court held. that x",
+                "the court held; that x",
+            ),
+            ("a COURT b", "a Court b", "a court b"),
+        ):
+            group = read(*texts)
+            self.assertEqual(group["n_low_confidence"], 1, texts)
+            self.assertEqual(
+                ensemble.disagreement_level(group, 3), ensemble.WARNING, texts
+            )
+
+    def test_a_minor_word_blocks_while_the_text_holds_the_odd_reading(self):
+        """dots.mocr, whose reading the text shows, read hold; the other
+        two read held: the reason is punctuation, but the text's word is
+        the odd one, so a person still picks."""
+        from scanning.tests.test_blocking_review import read
+
+        odd = read(
+            "the court hold; that x",
+            "the court held, that x",
+            "the court held. that x",
+        )
+        shown = read(
+            "the court held, that x",
+            "the court held. that x",
+            "the court hold; that x",
+        )
+
+        self.assertEqual(
+            ensemble.disagreement_level(odd, 3), ensemble.BLOCKING
+        )
+        self.assertEqual(
+            ensemble.disagreement_level(shown, 3), ensemble.WARNING
+        )
+
+    def test_an_open_word_of_other_letters_still_blocks(self):
+        from scanning.tests.test_blocking_review import read
+
+        group = read(
+            "the court held that", "the court heId that", "the court hold that"
+        )
+
+        self.assertEqual(
+            ensemble.disagreement_level(group, 3), ensemble.BLOCKING
         )
 
     def test_a_voted_group_every_word_settled_is_a_warning(self):

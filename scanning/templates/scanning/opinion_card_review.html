@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% comment %}
+  The card rows of the text review, walked by reason (OpinionCard). One
+  section per opinion: the script asks opinion_card_rows for its cards
+  and draws the crops from the redacted PDF, as on the blocking review.
+  An answer is stored on its row; apply_card_answers writes the answers
+  into the text later, so nothing here edits, dismisses or approves.
+{% endcomment %}
+
+{% block title %}Cards by reason - FLP Scanning Portal{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{% static 'scanning/checker.css' %}">
+{% endblock %}
+
+{% block content %}
+<div id="blocking-review" data-level="blocking" data-mode="rows">
+  {% csrf_token %}
+  <div class="flex flex-col sm:flex-row sm:items-baseline sm:justify-between mb-2 gap-2">
+    <h1 class="text-2xl font-bold">Cards by reason{% if reason_label %}: {{ reason_label }}{% endif %}</h1>
+    <span class="text-sm text-gray-500 dark:text-gray-400">
+      {{ card_total }} card(s) in {{ page_obj.paginator.count }} opinion(s)
+      · <b data-role="total">…</b> open on this page · <b data-role="done">0</b> answered here
+      {% if request.user.is_staff %}· <a href="{% url 'opinion_card_answers' %}" class="text-blue-600 dark:text-blue-400 hover:underline">The answers</a>{% endif %}
+      · <a href="{% url 'volunteer_faq' %}" class="text-blue-600 dark:text-blue-400 hover:underline">Help</a>
+    </span>
+  </div>
+
+  <form method="get" class="flex flex-wrap items-center gap-2 mb-3 text-sm">
+    {% if filters.reason %}<input type="hidden" name="reason" value="{{ filters.reason }}">{% endif %}
+    {% if not is_volunteer %}
+    <label>Scan <input type="text" name="scan" value="{{ filters.scan }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    <label>Volume <input type="text" name="volume" value="{{ filters.volume }}" class="input-text w-24 text-sm" inputmode="numeric"></label>
+    {% endif %}
+    <label>Level
+      <select name="level" class="input-text text-sm">
+        {% for value, label in level_choices %}
+        <option value="{{ value }}"{% if value == filters.level %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>Status
+      <select name="status" class="input-text text-sm">
+        {% for value, label in status_choices %}
+        <option value="{{ value }}"{% if value == filters.status %} selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    {% if not is_volunteer %}
+    {# A volunteer's own cards are the only ones they are shown: the filter is forced (views_cards._filters), not offered. #}
+    <label class="flex items-center gap-1"><input type="checkbox" name="mine" value="1"{% if filters.mine %} checked{% endif %} class="rounded"> Assigned to me</label>
+    {% endif %}
+    <button type="submit" class="btn-outline text-sm">Filter</button>
+  </form>
+
+  {% if answered_total is not None %}
+  <p class="text-sm mb-2">You've answered <b>{{ answered_total }}</b> card{{ answered_total|pluralize }}.</p>
+  {% endif %}
+  <p class="text-sm mb-2">
+    <b class="text-red-700 dark:text-red-400">{{ levels.blocking }}</b> blocking{% if levels.pending %} ({{ levels.pending }} of them minor warnings after the next build){% endif %}
+    · <b class="text-amber-700 dark:text-amber-400">{{ levels.minor }}</b> minor warnings (no approval waits on them)
+  </p>
+  <nav class="flex flex-wrap gap-1 mb-3 text-xs" aria-label="Reasons">
+    {% for tab in tabs %}
+    <a href="{{ tab.url }}" class="{% if tab.current %}btn-primary{% else %}btn-outline{% endif %} text-xs"{% if tab.current %} aria-current="page"{% endif %}>{{ tab.label }} <span class="opacity-75">{{ tab.count }}</span></a>
+    {% endfor %}
+  </nav>
+
+  <p class="text-xs text-gray-500 dark:text-gray-400 mb-6">
+    Pick the reading that matches the page, or type the right words. An answer is saved on the card and goes into the text later, when the answers are applied; Undo takes it back until then.
+    ↓ and ↑ move between cards, and the card in the middle of the screen is the selected one. → and ← move down and up its options, and Return chooses the outlined one (Esc leaves the typed box). 1, 2, 3 choose a reading, 0 leaves it blank (the word goes, a gap stays empty), e types the words, s skips a card you cannot answer (it goes back for someone else, and your next batch does not wait on it; u takes it back), u undoes, f opens the card to the whole page (f or Esc comes back). Under Problem: t the whole block is not text (bleed-through from the page behind, a stamp: every word of the block goes), r the page is a bad scan and needs scanning again, x a redaction box here is wrong. A stray mark inside the text, such as a West perpendicular read as "1" or "la", is not a problem: pick the reading without it, or "read nothing here" in a gap.
+  </p>
+
+  {% for opinion in page_obj %}
+  <section class="bk-opinion card mb-6" id="opinion-{{ opinion.pk }}"
+           data-opinion="{{ opinion.pk }}"
+           data-cards-url="{{ opinion.cards_url }}"
+           data-pdf-url-endpoint="{{ opinion.pdf_url_endpoint }}"
+           data-review-url="{% if not is_volunteer %}{{ opinion.review_url }}{% endif %}">
+    <header class="flex flex-wrap items-baseline justify-between gap-2 mb-3">
+      <h2 class="text-lg font-bold">
+        {{ opinion.scan.volume }} {{ opinion.scan.reporter.cite_name }} {{ opinion.first_printed_page }}{% if opinion.index_in_page %}
+        <span class="text-sm font-normal text-gray-500 dark:text-gray-400">({{ opinion.index_in_page|add:1 }} of that page)</span>{% endif %}
+      </h2>
+      <span class="text-xs text-gray-500 dark:text-gray-400" data-role="meta">{{ opinion.card_count }} card(s)</span>
+      <span class="flex items-center gap-2">
+        {% if not is_volunteer %}<a href="{{ opinion.review_url }}" class="btn-ghost text-xs">Open the review page</a>{% endif %}
+        <button type="button" class="hidden" data-role="approve" disabled></button>
+      </span>
+    </header>
+    <div data-role="cards"><p class="bk-note">Loading the cards…</p></div>
+  </section>
+  {% empty %}
+  <div class="card">
+    {% if must_practice %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">Welcome! Before your first cards, go through the practice cards once: real cards with the right answer and why. When you have answered them all, come back here to claim your cards.</p>
+    <a href="{% url 'volunteer_practice' %}" class="btn-primary text-sm">Start the practice cards</a>
+    {% elif can_claim %}
+    <p class="text-sm text-gray-600 dark:text-gray-300 mb-3">You have no cards right now. Claim a batch to start: up to {{ claim_count }} cards, each a choice of three short readings.</p>
+    <form method="post" action="{% url 'claim_opinion_cards' %}">
+      {% csrf_token %}
+      <button type="submit" class="btn-primary text-sm">Claim {{ claim_count }} cards</button>
+    </form>
+    {% else %}
+    <p class="text-sm text-gray-600 dark:text-gray-300">No card matches these filters.</p>
+    {% endif %}
+  </div>
+  {% endfor %}
+
+  {% if page_obj.has_other_pages %}
+  <div class="flex items-center justify-between mt-6 text-sm">
+    {% if page_obj.has_previous %}
+    <a href="?page={{ page_obj.previous_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Previous</a>
+    {% else %}<span></span>{% endif %}
+    <span class="text-gray-500 dark:text-gray-400">Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
+    {% if page_obj.has_next %}
+    <a href="?page={{ page_obj.next_page_number }}{% if query %}&{{ query }}{% endif %}" class="btn-outline text-sm">Next</a>
+    {% else %}<span></span>{% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block footer_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
+<script src="{% static 'scanning/shared.js' %}"></script>
+<script src="{% static 'scanning/blocking_review.js' %}"></script>
+{% endblock %}

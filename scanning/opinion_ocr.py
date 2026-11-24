@@ -159,6 +159,8 @@ from scanning import (
 )
 from scanning.models import (
     DEAD_JOB_STATUSES,
+    OPINION_OCR_MAX_ATTEMPTS,
+    OPINION_OCR_OWED,
     Detection,
     Opinion,
     OpinionReviewStatus,
@@ -176,11 +178,12 @@ logger = logging.getLogger(__name__)
 #: beside the footnote zone (#411); 6 keeps a ``manual`` bracket box
 #: out of the verdict of the unit whose bracket token it deleted
 #: (#419); 7 takes the bullet of a list item off its text and marks
-#: every item with an ``li`` mark (#428); 8 names a unit the
-#: first-page footnote mask takes (:data:`NEIGHBOUR_FOOTNOTES`, #457)
-#: and the zones it takes (:data:`TAKEN_FOOTNOTES`), and gives a
-#: picture unit the ``figure`` kind (#463).
-SCHEMA_VERSION = 8
+#: every item with an ``li`` mark (#428); 8 gives a picture unit the
+#: ``figure`` kind (#463); 9 puts the syllabus zone beside the footnote
+#: and blockquote zones (#518); 10 names a unit the first-page footnote
+#: mask takes (:data:`NEIGHBOUR_FOOTNOTES`, #457) and the zones it
+#: takes (:data:`TAKEN_FOOTNOTES`).
+SCHEMA_VERSION = 10
 
 #: The redaction types whose box can delete the bracket token of the
 #: unit it touches (#373). A curator fixes a bracket the model missed
@@ -224,6 +227,9 @@ FOOTNOTE_LABEL = Label.FOOTNOTES.name
 #: The detection label of a blockquote (#411).
 BLOCKQUOTE_LABEL = Label.BLOCKQUOTE.name
 
+#: The detection label of the heading that opens a syllabus (#518).
+SYLLABUS_LABEL = Label.SYLLABUS.name
+
 
 @dataclass(frozen=True)
 class Zone:
@@ -233,11 +239,16 @@ class Zone:
     :param count_key: The key of the manifest counts.
     :param floor_setting: The name of the setting that holds the least
         confidence of a row that counts, or empty for every row.
+    :param own: Whether a box the neighbour's outside mask covers
+        :data:`EXCLUDE_SHARE` of is left out. A zone of the whole page
+        (a footnote band) is a fact of the page; a zone that opens the
+        next case's syllabus on a shared page is the neighbour's.
     """
 
     label: str
     count_key: str
     floor_setting: str = ""
+    own: bool = False
 
     def counts(self, row) -> bool:
         """Return whether one live row of the label is part of the zone."""
@@ -247,14 +258,17 @@ class Zone:
 
 
 #: The zones of a page, by the name they take under ``zones`` (#399,
-#: #411). The ensemble reads them by these names. A hand-drawn row
-#: counts like a model row: a curator who drew the box said where the
-#: zone is.
+#: #411, #518). The ensemble reads them by these names. A hand-drawn
+#: row counts like a model row: a curator who drew the box said where
+#: the zone is. The syllabus zone is the model's box over the heading
+#: line that opens a syllabus, one line high: it marks the start and
+#: never the extent, which the final XML reads off the tagger's spans.
 ZONES: dict[str, Zone] = {
     "footnotes": Zone(FOOTNOTE_LABEL, "footnote_zones"),
     "blockquotes": Zone(
         BLOCKQUOTE_LABEL, "blockquote_zones", "BLOCKQUOTE_MIN_CONFIDENCE"
     ),
+    "syllabus": Zone(SYLLABUS_LABEL, "syllabus_zones", own=True),
 }
 
 #: The footnote zones of a page the first-page footnote mask takes
@@ -359,7 +373,7 @@ SEAM_PT = EDGE_PT
 OPINIONS_PER_TICK = 10
 
 #: Failed ticks on one row at one revision before the row is ERROR.
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = OPINION_OCR_MAX_ATTEMPTS
 
 #: The verdict of a unit nobody could measure: no box, or a page with
 #: no size. Not clean text, and not a redaction either.
@@ -692,16 +706,8 @@ def due():
 
     :returns: The queryset, unordered.
     """
-    return (
-        Opinion.objects.filter(
-            scan__status=Status.REDACTION_REVIEW_DONE,
-            ocr_glue_attempts__lt=MAX_ATTEMPTS,
-        )
-        .exclude(status=OpinionReviewStatus.ERROR)
-        .filter(
-            Q(ocr_glue_revision__isnull=True)
-            | ~Q(ocr_glue_revision=F("glue_revision"))
-        )
+    return Opinion.objects.filter(
+        OPINION_OCR_OWED, scan__status=Status.REDACTION_REVIEW_DONE
     )
 
 
@@ -995,8 +1001,9 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     """Return the page of every curated picture of some runs.
 
     :func:`kept_pictures` over the pages that hold a live ``IMAGE`` box:
-    two queries, the image boxes and then every live row of their pages,
-    which the junk rule judges them against.
+    two queries whatever the number of runs, the image boxes and then
+    every live row of their pages, which the junk rule judges them
+    against.
 
     :param run_ids: The ``ApplyRun`` ids.
     :returns: ``{run id: [page_index, ...]}``, one entry per picture;
@@ -1011,16 +1018,21 @@ def picture_pages(run_ids) -> dict[int, list[int]]:
     )
     if not pairs:
         return {}
-    by_run: dict[int, dict[int, list]] = {}
+    # One query for every run, never one per run (#599): a page of the
+    # opinions list spans many volumes. Each run's own pages, an exact
+    # lookup on ``idx_det_live_run_page``.
+    of_their_pages = Q()
     for run_id, pages in _pages_by_run(pairs).items():
-        for row in (
-            Detection.objects.live()
-            .filter(apply_run_id=run_id, page_index__in=pages)
-            .only(*PICTURE_FIELDS)
-        ):
-            by_run.setdefault(run_id, {}).setdefault(
-                row.page_index, []
-            ).append(row)
+        of_their_pages |= Q(apply_run_id=run_id, page_index__in=pages)
+    by_run: dict[int, dict[int, list]] = {}
+    for row in (
+        Detection.objects.live()
+        .filter(of_their_pages)
+        .only("apply_run_id", *PICTURE_FIELDS)
+    ):
+        by_run.setdefault(row.apply_run_id, {}).setdefault(
+            row.page_index, []
+        ).append(row)
     out: dict[int, list[int]] = {}
     for run_id, rows_by_page in by_run.items():
         for page_index, pictures in kept_pictures(rows_by_page).items():
@@ -1122,7 +1134,32 @@ def zones_pt(rows: list, size: tuple[float, float]) -> list[list[float]]:
     return zones
 
 
-def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
+#: The region boxes of a page: the columns, the footnote block and the
+#: pictures, with the running head's line and the two marks between the
+#: columns, the key icon and the case sequence. Every other label names
+#: what a piece of text is (a caption, a headnote, a syllabus, an
+#: editor's note, the judges, a heading, a blockquote) and sits inside
+#: one of these. The text card of review 2 measures against the region
+#: boxes alone (``undetected.uncovered``), so a column with no
+#: ``TEXT_COLUMN`` box is asked for even when a model ``BLOCKQUOTE`` box
+#: lies over it (659 S.W.3d 243, 2026-11-06: the viewer draws no model
+#: box of that label, so the column looked bare and no card said so).
+#: The glue's verdict keeps every box as cover: a line a caption box
+#: alone holds goes into the text, and the card only asks for the box.
+REGION_LABELS = HEAD_LINE_LABELS | frozenset(
+    {
+        Label.TEXT_COLUMN.name,
+        Label.FOOTNOTES.name,
+        Label.IMAGE.name,
+        Label.KEY_ICON.name,
+        Label.CASE_SEQUENCE.name,
+    }
+)
+
+
+def page_frame(
+    rows: list, size: tuple[float, float], labels: frozenset | None = None
+) -> list[dict] | None:
     """Return the frame of one page, in points, or None.
 
     The union of every detection of the page, in the shape
@@ -1130,15 +1167,20 @@ def page_frame(rows: list, size: tuple[float, float]) -> list[dict] | None:
     is :data:`UNDETECTED`. None on a page with no ``TEXT_COLUMN``
     detection, because the rule needs the detections to have read the
     page: a page they missed whole keeps every unit, and the vote
-    says what it says.
+    says what it says. With ``labels``, the detections of those labels
+    alone: the text card passes :data:`REGION_LABELS`; the glue passes
+    nothing.
 
     :param rows: The page's live detections.
     :param size: The page size in points.
+    :param labels: The labels to keep, or None for every label.
     :returns: The rects, or None.
     :rtype: list[dict] | None
     """
     if not any(row.label == Label.TEXT_COLUMN.name for row in rows):
         return None
+    if labels is not None:
+        rows = [row for row in rows if row.label in labels]
     return [
         {"x0": box[0], "y0": box[1], "x1": box[2], "y1": box[3]}
         for box in zones_pt(rows, size)
@@ -1818,10 +1860,10 @@ def build_document(
             "pdf_page": page_index + 1,
             "source": page.get("source"),
             "frame": None,
-            # The zones of the page, in points (#399, #411). The same
-            # value on every engine's page, because they are a fact of
-            # the page and not of the engine. Empty when no detection
-            # drew one, or when no size puts it in points.
+            # The zones of the page, in points (#399, #411, #518). The
+            # same value on every engine's page, because they are a
+            # fact of the page and not of the engine. Empty when no
+            # detection drew one, or when no size puts it in points.
             "zones": {name: [] for name in ZONES},
             "units": [],
         }
@@ -1832,16 +1874,27 @@ def build_document(
                 "render_width": frame[0],
                 "render_height": frame[1],
             }
+        page_masks = masks.get(page_index, [])
         if size:
             for name, zone in ZONES.items():
-                entry["zones"][name] = zones_pt(
+                boxes = zones_pt(
                     inputs.zones.get(name, {}).get(page_index, []), size
                 )
-                counts[zone.count_key] += len(entry["zones"][name])
+                if zone.own:
+                    # The next case's syllabus box on a shared last
+                    # page is the neighbour's (#518), the rule a unit
+                    # under the mask follows.
+                    boxes = [
+                        box
+                        for box in boxes
+                        if covered_share(box, page_masks)[0] < EXCLUDE_SHARE
+                    ]
+                entry["zones"][name] = boxes
+                counts[zone.count_key] += len(boxes)
             taken = [
                 box
                 for box in entry["zones"]["footnotes"]
-                if _taken(box, masks.get(page_index, []))
+                if _taken(box, page_masks)
             ]
             if taken:
                 entry["zones"][TAKEN_FOOTNOTES] = taken
@@ -1858,7 +1911,6 @@ def build_document(
         rects = [
             r for r in rects if r.get("rect_type") != brackets.BRACKET_LABEL
         ]
-        page_masks = masks.get(page_index, [])
         printed = inputs.printed.get(page_index)
         frame_rects = (
             page_frame(inputs.detected.get(page_index, []), size)
@@ -2207,7 +2259,9 @@ def glue_due(limit: int = OPINIONS_PER_TICK) -> int:
         due().order_by("-scan_id").values_list("scan_id", flat=True).distinct()
     )
     for scan_id in scan_ids:
-        scan = Scan.objects.get(pk=scan_id)
+        # The caches stay on disk (#582): a held scan is read again on
+        # every tick, and the glue reads none of them.
+        scan = Scan.objects.defer(*Scan.large_fields()).get(pk=scan_id)
         try:
             inputs = load_inputs(scan)
         except ScanHeld as exc:
@@ -2234,6 +2288,7 @@ def _glue_scan(scan: Scan, inputs: ScanInputs, limit: int) -> int:
         due()
         .filter(scan=scan)
         .select_related("boundary", "scan")
+        .defer(*Scan.large_fields("scan__"))
         .order_by("first_printed_page", "index_in_page")[:limit]
     )
     started = time.monotonic()
@@ -2304,9 +2359,11 @@ def reglue_rows(scan: Scan | None = None) -> QuerySet:
     :returns: The rows.
     :rtype: QuerySet
     """
-    rows = Opinion.objects.exclude(
-        status=OpinionReviewStatus.TEXT_REVIEW_DONE
-    ).select_related("scan", "scan__reporter")
+    rows = (
+        Opinion.objects.exclude(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .select_related("scan", "scan__reporter")
+        .defer(*Scan.large_fields("scan__"))
+    )
     if scan is not None:
         rows = rows.filter(scan=scan)
     return rows.order_by("scan_id", "first_printed_page", "index_in_page")

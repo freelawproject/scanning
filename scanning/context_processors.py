@@ -32,3 +32,19 @@ def waiting_repairs(request):
     from scanning import repairs
 
     return {"waiting_repairs_count": repairs.waiting_count()}
+
+
+def volunteer(request):
+    """Inject whether the viewer is a volunteer (``volunteers.is_volunteer``).
+
+    The header shows a volunteer their cards and the FAQ alone, and the
+    cards page hides the review link from them.
+
+    :param request: The current HTTP request.
+    :type request: django.http.HttpRequest
+    :returns: A dictionary with ``is_volunteer``.
+    :rtype: dict[str, bool]
+    """
+    from scanning import volunteers
+
+    return {"is_volunteer": volunteers.of_request(request)}

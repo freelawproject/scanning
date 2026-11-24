@@ -937,12 +937,85 @@ document.addEventListener('DOMContentLoaded', function () {
                         showToast((data && data.message) || 'Failed to save the box');
                         return;
                     }
-                    showSaved(data);
+                    if (!dropDismissedUnder(data, pageDiv)) showSaved(data);
                     refreshOverlays();
                     if (window.refreshFindings) window.refreshFindings();
                 });
             }
         };
+    }
+    // The model boxes a whiteout covered are dismissed by the write,
+    // one decision each (``detections.dismiss_under_whiteout``). They
+    // leave the page at once, and the server's line gets one Undo for
+    // the lot, which restores each box through the endpoint the card
+    // review's Undo uses, so the per-box Undo elsewhere still holds.
+    // Answers whether it showed the line, so a write that dismissed
+    // nothing shows the plain one.
+    function dropDismissedUnder(data, pageDiv) {
+        return _dropDismissed(data, pageDiv) !== null;
+    }
+    // The boxes the server dismissed under a whiteout leave the page, and
+    // one toast offers their Undo. Answers the rows taken off (the ones a
+    // restore puts back), or null when the server dismissed nothing.
+    function _dropDismissed(data, pageDiv) {
+        var ids = (data && data.dismissed) || [];
+        if (!ids.length) return null;
+        var removed = [];
+        if (allDetections) {
+            allDetections = allDetections.filter(function (det) {
+                if (ids.indexOf(det.id) === -1) return true;
+                removed.push(det);
+                return false;
+            });
+        }
+        var pageIndex = pageDiv ? parseInt(pageDiv.dataset.pdfIndex, 10) : null;
+        if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+        showToast(data.message, 'success', {
+            label: 'Undo',
+            onClick: function () { restoreDismissed(ids, removed, pageDiv, pageIndex); },
+        });
+        return removed;
+    }
+    // The sidebar's "Cover with margin" (viewer_sidebar.js): the drop of
+    // the boxes its move dismissed, and their restore when it uncovers.
+    window.marginCoverDropped = function (data, pageIndex) {
+        return _dropDismissed(data, _pageDivForIndex(pageIndex)) || [];
+    };
+    window.marginCoverRestore = function (ids, removed, pageIndex) {
+        restoreDismissed(ids, removed, _pageDivForIndex(pageIndex), pageIndex);
+    };
+    // One restore after another, never all at once: every restore
+    // rebuilds the findings, and two in flight could leave the cards
+    // at the slower one's older snapshot. The page refreshes once, at
+    // the end, and the line shown is the server's own (#322).
+    function restoreDismissed(ids, removed, pageDiv, pageIndex) {
+        var csrfToken = document.querySelector('[name=csrfmiddlewaretoken]').value;
+        var failed = 0;
+        var last = null;
+        var chain = Promise.resolve();
+        ids.forEach(function (id) {
+            chain = chain.then(function () {
+                return fetch('/scans/' + documentId + '/restore-detection/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrfToken },
+                    body: JSON.stringify({ detection_id: id }),
+                })
+                .then(function (r) { return r.json(); })
+                .then(function (data) {
+                    if (!data || data.status !== 'ok') { failed += 1; return; }
+                    last = data;
+                    var det = removed.filter(function (d) { return d.id === id; })[0];
+                    if (det && allDetections && allDetections.indexOf(det) === -1) allDetections.push(det);
+                })
+                .catch(function () { failed += 1; });
+            });
+        });
+        chain.then(function () {
+            if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+            if (window.refreshFindings) window.refreshFindings();
+            if (failed) showToast(failed + ' of the boxes could not be put back.');
+            else showSaved(last);
+        });
     }
 
     // --- Detection overlay ---
@@ -997,6 +1070,9 @@ document.addEventListener('DOMContentLoaded', function () {
 
         if (_globalDetections) {
             loadDetections(function () {
+                // A second toggle before the fetch answered turned the
+                // boxes off again: draw nothing.
+                if (!_globalDetections) return;
                 // Show on all rendered pages
                 document.querySelectorAll('.lazy-page').forEach(function(pd) {
                     var pIdx = parseInt(pd.dataset.pdfIndex);
@@ -1810,22 +1886,13 @@ document.addEventListener('DOMContentLoaded', function () {
     }
 
     // The actions on a detection box apply only while the boxes are on, so
-    // that part of the guide waits for them (#299). The panel opens itself
-    // the first time in a session: a reviewer meets the guide once, and
-    // the "?" gives it back at any time.
+    // that part of the guide waits for them (#299). The panel never opens
+    // itself: it covered the page at the first toggle, and the "?" gives
+    // it at any time.
     function _showDetectionHelp(on) {
         var part = document.getElementById('viewer-help-detections');
         if (!part) return;
         part.hidden = !on;
-        if (!on) return;
-        var key = 'viewer-help-seen-' + documentId;
-        try {
-            if (sessionStorage.getItem(key)) return;
-            sessionStorage.setItem(key, '1');
-        } catch (e) {
-            return;
-        }
-        _setHelpOpen(true);
     }
 
     if (_overlayBtn) {
@@ -2158,7 +2225,7 @@ document.addEventListener('DOMContentLoaded', function () {
                 rectData.origin = 'human';
                 div.dataset.id = data.id;
             }
-            showSaved(data);
+            if (!dropDismissedUnder(data, div.closest('.page-container'))) showSaved(data);
             if (window.refreshFindings) window.refreshFindings();
         }).catch(function() { showToast('Failed to save the box'); });
     }
@@ -2178,6 +2245,57 @@ document.addEventListener('DOMContentLoaded', function () {
                     rect.origin = 'human';
                 }
             });
+        });
+        drawRedactionOverlaysForPage(pageIndex);
+    };
+
+    // The bottom margin strip of a page, and the box that pulls it up to
+    // just over a block of the page (the sidebar's "Cover with margin" of
+    // a dismissed text card): the block's top, from the card's pixels to
+    // points through the page's own size, less MARGIN_COVER_PAD_PT. The
+    // strip keeps its sides and its foot. Null when the page has no
+    // bottom strip or its PDF page is not loaded yet.
+    var MARGIN_COVER_PAD_PT = 2;
+    window.marginCoverFor = function(pageIndex, bboxPx, imgW, imgH) {
+        var pdfPage = pdfPages[pageIndex];
+        if (!pdfPage || !imgW || !imgH) return null;
+        var vp = pdfPage.getViewport({scale: 1});
+        var strip = null;
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            (entry.rects || []).forEach(function(rect) {
+                if (rect.rect_type !== 'margin') return;
+                // The bottom strip, by its foot: it ends near the bottom
+                // of the page, whatever its top, so a strip already pulled
+                // up (by this button, or by hand) is still found.
+                if (rect.y1 < vp.height * 0.9) return;
+                if ((rect.x1 - rect.x0) < vp.width / 2) return;
+                if (!strip || rect.y1 > strip.y1 || (rect.y1 === strip.y1 && rect.y0 < strip.y0)) strip = rect;
+            });
+        });
+        if (!strip) return null;
+        var top = bboxPx[1] * vp.height / imgH - MARGIN_COVER_PAD_PT;
+        return {
+            id: strip.id,
+            origin: strip.origin,
+            from: {x0: strip.x0, y0: strip.y0, x1: strip.x1, y1: strip.y1},
+            to: {x0: strip.x0, y0: Math.max(0, Math.min(top, strip.y0)), x1: strip.x1, y1: strip.y1},
+        };
+    };
+
+    // The boxes of one page read again from the server and drawn: after
+    // a restore, which brings a computed row back and takes its moved copy
+    // away, so no local edit can say what stands.
+    window.reloadRedactionPage = function(pageIndex) {
+        loadRedactionRows(function () { drawRedactionOverlaysForPage(pageIndex); });
+    };
+
+    // A box taken out from outside the page (the sidebar's "Remove the
+    // box" of a redaction_cuts_text card): the row leaves the page.
+    window.applyRedactionRemove = function(pageIndex, id) {
+        (redactionRects || []).forEach(function(entry) {
+            if (entry.page_index !== pageIndex) return;
+            entry.rects = (entry.rects || []).filter(function(rect) { return rect.id !== id; });
         });
         drawRedactionOverlaysForPage(pageIndex);
     };
@@ -2258,6 +2376,23 @@ document.addEventListener('DOMContentLoaded', function () {
     };
 
 
+    // A box the sidebar resized (the text card's "Grow footnote"): the
+    // entry takes the new box and the id the server answered, a model
+    // box having become a hand-drawn one, and its page is drawn again.
+    window.moveDetectionBox = function (oldId, newId, bbox, pageIndex) {
+        if (!allDetections) return;
+        for (var i = 0; i < allDetections.length; i++) {
+            var entry = allDetections[i];
+            if (entry.id !== oldId && entry.id !== newId) continue;
+            entry.bbox = bbox.slice();
+            if (newId !== undefined && newId !== null) entry.id = newId;
+            entry.manual = true;
+            entry.confidence = 1.0;
+            break;
+        }
+        var pageDiv = _pageDivForIndex(pageIndex);
+        if (pageDiv && detectionsVisible[pageIndex]) drawDetectionOverlay(pageDiv, pageIndex);
+    };
     // A row the sidebar drew (the "add" of a missed-bracket card): one
     // entry, drawn on its page the way the drawer's own add is.
     window.addDetectionRow = function (det) {
@@ -2647,6 +2782,16 @@ document.addEventListener('DOMContentLoaded', function () {
             if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT') return;
             e.preventDefault();
             toggleOverlays();
+        }
+        // The key "d" is the Detections button of every page label, and is
+        // offered only where the page draws that button: step 3 shows an
+        // opinion's PDF and leaves the volume's boxes out.
+        if ((e.key === 'd' || e.key === 'D') && !e.metaKey && !e.ctrlKey && !e.altKey) {
+            if (!previewOnly && (viewOnly || opinionEditMode)) return;
+            if (e.repeat) return;
+            if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) return;
+            e.preventDefault();
+            toggleDetections();
         }
     });
 

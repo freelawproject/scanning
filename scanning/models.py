@@ -555,6 +555,54 @@ class opinion_pdf_path:
 
 
 class Scan(AbstractDateTimeModel):
+    #: The columns that hold a volume's caches and logs, kilobytes to
+    #: megabytes a row. A list of scans defers them (``views.scan_list``):
+    #: a page of twenty-five that read them pulled every volume's OCR
+    #: cache off disk (2026-11-02). So does a query that joins the scan
+    #: (:meth:`large_fields`, #582): the join repeats the scan's columns
+    #: on every row it returns. A reader that needs one loads it on
+    #: access.
+    LARGE_FIELDS = (
+        "process_output",
+        "progress_log",
+        "ocr_results",
+        "page_map",
+        "missing_pages",
+        "page_scores",
+    )
+
+    @classmethod
+    def large_fields(cls, prefix: str = "") -> list[str]:
+        """Return :attr:`LARGE_FIELDS` as ``defer()`` names.
+
+        :param prefix: The path to the scan from the queried model, such
+            as ``"scan__"`` for a query that joins it with
+            ``select_related("scan")``; empty for a query of scans.
+        :returns: The names, in the order of :attr:`LARGE_FIELDS`.
+        :rtype: list[str]
+        """
+        return [f"{prefix}{name}" for name in cls.LARGE_FIELDS]
+
+    @classmethod
+    def without_caches(cls, *keep: str) -> models.QuerySet:
+        """Return the scans with the caches deferred, but those in ``keep``.
+
+        The query of a view that fetches one scan (#602): a review click
+        or a poll that reads no cache moves none of them, and one that
+        reads a cache through a helper names it here. A deferred field
+        a path does read costs one query, never a wrong answer.
+
+        :param keep: Names of :attr:`LARGE_FIELDS` the caller reads.
+        :returns: The queryset.
+        :rtype: QuerySet
+        """
+        unknown = set(keep) - set(cls.LARGE_FIELDS)
+        if unknown:
+            raise ValueError(f"not a cache of Scan: {sorted(unknown)}")
+        return cls.objects.defer(
+            *(name for name in cls.LARGE_FIELDS if name not in keep)
+        )
+
     volume_obj = models.ForeignKey(
         Volume,
         on_delete=models.PROTECT,
@@ -1122,6 +1170,14 @@ class CheckName(models.TextChoices):
         "redaction_cuts_text",
         "Redaction covers part of a line of text",
     )
+    UNBOXED_PICTURE = (
+        "unboxed_picture",
+        "Picture or table in no image box",
+    )
+    IMAGE_OVER_BOUNDARY = (
+        "image_over_boundary",
+        "Image box over a key icon or a caption",
+    )
     STALE_DETECTION_EDIT = (
         "stale_detection_edit",
         "Detection decision not applied",
@@ -1196,6 +1252,8 @@ REVIEW2_CHECKS = STALE_REVIEW2_CHECKS | frozenset(
         CheckName.UNCOVERED_EDITORS_NOTE,
         CheckName.UNDETECTED_TEXT,
         CheckName.REDACTION_CUTS_TEXT,
+        CheckName.UNBOXED_PICTURE,
+        CheckName.IMAGE_OVER_BOUNDARY,
     }
 )
 
@@ -1468,13 +1526,15 @@ class Detection(AbstractDateTimeModel):
         say which family found it is read with the legacy gates. The
         row's ``found_by`` carries the same fact per detection, and
         ``blackletter.bl_warm.rows_are_bl_warm`` is the one reader of
-        it.
+        it. ``BL_HEIN`` is the same family read with the weight trained
+        on Hein's bitonal pages (#633), and takes the same gates.
         """
 
         SMALL = "small", "Small"
         MEDIUM = "medium", "Medium"
         LARGE = "large", "Large"
         BL_WARM = "bl_warm", "bl-warm"
+        BL_HEIN = "bl_hein", "bl-hein"
         MANUAL = "manual", "Manual"
 
     page_index = models.PositiveIntegerField(db_index=True)
@@ -1603,6 +1663,30 @@ class Detection(AbstractDateTimeModel):
             models.Index(
                 fields=["scan", "active"],
                 name="idx_det_scan_active",
+            ),
+            # The live rows of one run by page (#599): the opinions
+            # list's Pictures column asks a run's image boxes and then
+            # every live row of their pages (``opinion_ocr
+            # .picture_pages``), and without it Postgres read the whole
+            # label index, of every scan, for the first. The label is
+            # last, so the run's pages are an exact lookup and its image
+            # boxes are a read of that run's entries alone.
+            models.Index(
+                fields=["apply_run", "page_index", "label"],
+                condition=models.Q(active=True),
+                name="idx_det_live_run_page",
+            ),
+            # The hand-drawn rows of a scan alone, for the question the
+            # step-2 bar and the review-2 approval ask on every render
+            # (``detections.changed_since_compute``): was one added or
+            # withdrawn since the last compute. Without it the planner
+            # walks every detection of the volume to find the few
+            # manual ones, which on a large volume is a minute of disk
+            # reads per page load.
+            models.Index(
+                fields=["scan", "date_created", "withdrawn_at"],
+                condition=models.Q(model_name="manual"),
+                name="idx_det_manual_by_scan",
             ),
         ]
 
@@ -2626,6 +2710,98 @@ class TextReading(AbstractDateTimeModel):
         return f"{len(self.cells or [])} cell(s) p.{self.page_index + 1}"
 
 
+class PictureReading(AbstractDateTimeModel):
+    """The pictures and tables of one page, as the readers saw them
+    (``pictures``).
+
+    Every OCR engine labels a picture and a table beside its text
+    (dots.mocr a ``Picture`` cell, Mistral an ``image`` block, Surya a
+    ``Picture`` or ``Figure``), and the three agree with each other to
+    within a few percent, where the model's ``IMAGE`` box misses a
+    picture or runs over the text around it. This row is their measure
+    of the page, stored so that ``findings.rebuild`` and the card review
+    can compare it with the ``Detection`` rows without an S3 read
+    (``pictures.uncovered``, ``pictures.fit_for``).
+
+    **One row per page, not per mark.** ``marks`` is the list: one
+    ``{"engine", "kind", "box"}`` per picture or table a reader marked,
+    the engine a key of ``opinion_ocr.ENGINES``, the kind ``picture``
+    or ``table``, the box in the pixels of the row's render
+    (``img_width`` by ``img_height``, the first reader's), whatever
+    render the reader drew it in.
+
+    A disposable row, the rule of ``TextReading``: every compute
+    replaces the scan's set (``pictures.write_rows``), and a curator
+    never writes one. The address is the source page, the rule of
+    ``Detection``.
+    """
+
+    scan = models.ForeignKey(
+        Scan,
+        on_delete=models.CASCADE,
+        related_name="picture_readings",
+    )
+    apply_run = models.ForeignKey(
+        "ApplyRun",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The apply run whose page space ``page_index`` is in. Null "
+            "means the original's space."
+        ),
+    )
+    source_edit = models.ForeignKey(
+        "PageEdit",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="picture_readings",
+        help_text=(
+            "The page edit whose one-page shard this page is. Null "
+            "means the original as uploaded."
+        ),
+    )
+    source_page = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        help_text="1-based page of the source document.",
+    )
+    source_fingerprint = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        help_text=(
+            "The scan's source fingerprint when the reading was "
+            "written. Blank matches anything."
+        ),
+    )
+    page_index = models.PositiveIntegerField(db_index=True)
+    img_width = models.PositiveIntegerField(default=0)
+    img_height = models.PositiveIntegerField(default=0)
+    marks = models.JSONField(
+        default=list,
+        help_text=(
+            "The pictures and tables of the page: "
+            "``[{engine, kind, box}, ...]``, the box in the pixels of "
+            "the row's render."
+        ),
+    )
+
+    class Meta:
+        ordering = ["page_index"]
+        indexes = [
+            models.Index(
+                fields=["scan", "apply_run", "page_index"],
+                name="idx_picread_scan_run_page",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{len(self.marks or [])} mark(s) p.{self.page_index + 1}"
+
+
 class OpinionReviewStatus(models.TextChoices):
     """The state of one opinion in the third review (#335).
 
@@ -2669,6 +2845,10 @@ class OpinionCheck(models.TextChoices):
         "An engine read a footnote no detection covers",
     )
     BLOCKQUOTE_LIST = "blockquote_list", "A blockquote may be a list"
+    SYLLABUS_UNSURE = (
+        "syllabus_unsure",
+        "The syllabus box and the syllabus heading disagree",
+    )
     PAGE_GAP = "page_gap", "A gap in the printed page numbers"
     STALE_PAGE_NUMBER = "stale_page_number", "The printed number changed"
     ORPHANED_OPINION = "orphaned_opinion", "No boundary matches this opinion"
@@ -2707,6 +2887,97 @@ UNDISMISSABLE_OPINION_CHECKS = STALE_OPINION_CHECKS | frozenset(
 DISMISSABLE_OPINION_CHECKS = (
     frozenset(OpinionCheck) - UNDISMISSABLE_OPINION_CHECKS
 )
+
+# ── What the opinion passes owe (#604) ───────────────────────────────
+# Each pass asks every tick which rows still owe its output, and the
+# answer compares two columns of the row, which no plain index serves.
+# Each question is one ``Q`` here, read by the pass's query and by a
+# partial index of ``Opinion.Meta`` whose condition is that ``Q``: the
+# two compile to the same SQL, so the planner matches them, and neither
+# changes without the other. A change of a ``Q`` or of a cap below is a
+# migration. What depends on the clock, a setting or another table (the
+# scan's status, a cooldown, the ensemble's engine count) stays in the
+# pass's query.
+
+#: Failed ticks of a pass on a row before the pass leaves it alone.
+#: ``opinion_pdf``, ``opinion_figures``, ``opinion_ocr`` and
+#: ``ensemble`` read theirs as ``MAX_ATTEMPTS``.
+OPINION_PDF_MAX_ATTEMPTS = 3
+OPINION_FIGURES_MAX_ATTEMPTS = 3
+OPINION_OCR_MAX_ATTEMPTS = 3
+OPINION_ENSEMBLE_MAX_ATTEMPTS = 3
+
+#: The redacted PDF is not written at the live revision
+#: (``opinion_pdf.owed``).
+OPINION_PDF_OWED = (
+    models.Q(pdf_attempts__lt=OPINION_PDF_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & ~models.Q(redacted_pdf_revision=models.F("glue_revision"))
+)
+
+#: The pictures of the live text are not all cut
+#: (``opinion_figures.owed``).
+OPINION_FIGURES_OWED = (
+    models.Q(
+        figure_attempts__lt=OPINION_FIGURES_MAX_ATTEMPTS,
+        ocr_glue_revision=models.F("glue_revision"),
+        ensemble_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(figure_digest="")
+    & ~models.Q(figures_cut_digest=models.F("figure_digest"))
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+            OpinionReviewStatus.ERROR,
+        )
+    )
+)
+
+#: The OCR documents are not written at the live revision
+#: (``opinion_ocr.due``).
+OPINION_OCR_OWED = (
+    models.Q(ocr_glue_attempts__lt=OPINION_OCR_MAX_ATTEMPTS)
+    & ~models.Q(status=OpinionReviewStatus.ERROR)
+    & (
+        models.Q(ocr_glue_revision__isnull=True)
+        | ~models.Q(ocr_glue_revision=models.F("glue_revision"))
+    )
+)
+
+#: The ensemble text is not built over the live OCR documents and the
+#: standing edits (``ensemble.due``, which adds the engine count).
+OPINION_ENSEMBLE_OWED = (
+    models.Q(
+        ensemble_attempts__lt=OPINION_ENSEMBLE_MAX_ATTEMPTS,
+        ocr_glue_revision__isnull=False,
+        ocr_glue_revision=models.F("glue_revision"),
+    )
+    & ~models.Q(
+        status__in=(
+            OpinionReviewStatus.ERROR,
+            OpinionReviewStatus.TEXT_REVIEW_DONE,
+        )
+    )
+    & (
+        models.Q(ensemble_revision__isnull=True)
+        | ~models.Q(ensemble_revision=models.F("ocr_glue_revision"))
+        # A human edit the text does not hold yet (#376): the request
+        # that wrote it builds the text, and a build that failed there
+        # is built here.
+        | ~models.Q(ensemble_edit_revision=models.F("edit_revision"))
+    )
+)
+
+#: A stored final XML whose text review is no longer done
+#: (``final_xml.withdrawn_rows``).
+OPINION_FINAL_XML_WITHDRAWN = ~models.Q(final_xml_tag_key="") & ~models.Q(
+    status=OpinionReviewStatus.TEXT_REVIEW_DONE
+)
+
+#: The order every opinion pass walks its rows in, newest scan first
+#: and then reading order: the columns of the four indexes above and
+#: the ``order_by`` of the four queries.
+OPINION_PASS_ORDER = ["-scan_id", "first_printed_page", "index_in_page"]
 
 
 class Opinion(AbstractDateTimeModel):
@@ -3088,6 +3359,40 @@ class Opinion(AbstractDateTimeModel):
         indexes = [
             models.Index(
                 fields=["scan", "status"], name="idx_opinion_review_status"
+            ),
+            # The opinions list filtered by status, newest first (#599):
+            # the filter, the order and the paginator's count off one
+            # index. With ``status`` and the primary key apart, a rare
+            # status walked the table backwards to fill a page.
+            models.Index(
+                fields=["status", "id"], name="idx_opinion_status_id"
+            ),
+            # The "owes work" question of each opinion pass (#604): the
+            # rows a pass still owes, in the order it walks them.
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_PDF_OWED,
+                name="idx_opinion_pdf_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_FIGURES_OWED,
+                name="idx_opinion_figures_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_OCR_OWED,
+                name="idx_opinion_ocr_owed",
+            ),
+            models.Index(
+                fields=OPINION_PASS_ORDER,
+                condition=OPINION_ENSEMBLE_OWED,
+                name="idx_opinion_ensemble_owed",
+            ),
+            models.Index(
+                fields=["id"],
+                condition=OPINION_FINAL_XML_WITHDRAWN,
+                name="idx_opinion_xml_withdrawn",
             ),
         ]
 
@@ -3705,6 +4010,154 @@ class KeptFootnotes(AbstractDateTimeModel):
         return f"Footnotes kept on {self.opinion}"
 
 
+class OpinionCard(AbstractDateTimeModel):
+    """One blocking card of the text review, as a row.
+
+    The cards of ``blocking_review.group_cards``, written by the
+    ensemble build (``opinion_cards.sync``) beside the findings: one row
+    per word no two engines agree on, per block one engine alone read,
+    per block too garbled for a card per word. Each carries its reason
+    (``blocking_types``), so the cards can be handed out and walked by
+    reason across the corpus without a read of any document.
+
+    **An answer is stored, not applied.** A volunteer picks a reading
+    or types the text, and the row keeps it; ``opinion_cards.apply``
+    writes the answers later as the review page's own text edits
+    (``OpinionEdit``), the one writer of the text, and dismisses a
+    page's finding whose every card was kept as shown.
+
+    **The address is the key**, never a group id: the page, a copy of
+    the block's box and the word's base position (``key``). Every build
+    writes the rows again by that key, so an answer outlives a rerun; a
+    card the engines now agree on goes, and an answered card whose
+    readings moved is ``STALE``, its answer kept for a new look.
+    """
+
+    class Status(models.TextChoices):
+        OPEN = "open", "Open"
+        ANSWERED = "answered", "Answered"
+        STALE = "stale", "Needs a new answer"
+        APPLIED = "applied", "Applied"
+        FLAGGED = "flagged", "Set aside"
+
+    class Action(models.TextChoices):
+        TEXT = "text", "Words for the place"
+        DROP = "drop", "Not text: take the block out"
+
+    class Flag(models.TextChoices):
+        RESCAN = "rescan", "Bad scan: rescan asked for"
+        REDACTION = "redaction", "Redaction wrong: fix in review 2"
+
+    opinion = models.ForeignKey(
+        Opinion,
+        on_delete=models.CASCADE,
+        related_name="cards",
+    )
+    page_in_opinion = models.PositiveSmallIntegerField()
+    key = models.CharField(
+        max_length=200,
+        help_text="The address: page, block box, kind and base position.",
+    )
+    check_name = models.CharField(
+        max_length=50,
+        choices=OpinionCheck.choices,
+        help_text="The finding of the page the card answers.",
+    )
+    kind = models.CharField(max_length=10)
+    reason = models.CharField(max_length=32, db_index=True)
+    minor = models.BooleanField(
+        default=False,
+        help_text=(
+            "The card needs no person: a minor reason, and the text holds "
+            "one of the agreeing readings (blocking_types.settles_minor). "
+            "The next build makes its block a warning."
+        ),
+    )
+    card = models.JSONField(
+        help_text=(
+            "The card as the review shows it: the block text, the "
+            "word's offsets, each engine's reading, the crop."
+        ),
+    )
+    status = models.CharField(
+        max_length=10, choices=Status.choices, default=Status.OPEN
+    )
+    answer = models.TextField(
+        null=True,
+        blank=True,
+        help_text="The words chosen for the card; null while unanswered.",
+    )
+    action = models.CharField(
+        max_length=10,
+        choices=Action.choices,
+        default=Action.TEXT,
+        help_text="What the apply writes: the answer's words, or a drop.",
+    )
+    flag = models.CharField(
+        max_length=10,
+        choices=Flag.choices,
+        blank=True,
+        default="",
+        help_text="Why a set-aside card waits on staff, not a volunteer.",
+    )
+    repair = models.ForeignKey(
+        "PageRepairRequest",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cards",
+        help_text="The rescan request a flag filed in the repair queue.",
+    )
+    answered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="answered_cards",
+    )
+    answered_at = models.DateTimeField(null=True, blank=True)
+    assigned_to = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="assigned_cards",
+    )
+    edit = models.ForeignKey(
+        OpinionEdit,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cards",
+        help_text="The text edit the apply wrote for the answer.",
+    )
+    applied_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(
+        blank=True,
+        default="",
+        help_text="Why the card needs a new answer, or what the apply did.",
+    )
+
+    class Meta:
+        ordering = ["opinion_id", "page_in_opinion", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["opinion", "key"], name="uniq_opinion_card_key"
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["reason", "status"], name="idx_opinion_card_reason"
+            ),
+            models.Index(
+                fields=["opinion", "status"], name="idx_opinion_card_status"
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.reason} card on {self.opinion}"
+
+
 class PageEdit(AbstractDateTimeModel):
     """One decision a person made about one page of a scan (issue #214).
 
@@ -4106,6 +4559,13 @@ class ApplyRun(AbstractDateTimeModel):
     the volume ``bitonal.pdf``, with no copy. The printed-page map is
     written for every run, because it is a product.
     """
+
+    #: The column that holds a whole volume's page map, kilobytes to
+    #: hundreds of kilobytes a row (#588). The tick checks read a run's
+    #: keys and stamps alone, so the readers of the standing run defer
+    #: it (:func:`apply.current_run`), and a reader that needs it loads
+    #: it on access, one run at a time.
+    LARGE_FIELDS = ("page_map",)
 
     scan = models.ForeignKey(
         Scan,
@@ -5087,11 +5547,66 @@ class ExternalJob(AbstractDateTimeModel):
             ),
         ]
         indexes = [
+            # The rows that still name a file at Mistral (#540): the
+            # sweep asks every tick, and a row names one rarely, so the
+            # index holds a handful of rows and the ask reads no other.
+            models.Index(
+                fields=["id"],
+                name="idx_externaljob_files_left",
+                condition=models.Q(provider_meta__has_key="files_left"),
+            ),
             # The daemon's hot query: everything still open, and which
             # of those is past its deadline.
             models.Index(
                 fields=["status", "deadline"],
                 name="idx_job_status_deadline",
+            ),
+            # The submit wave's slice (``jobs._pending_slice``): one
+            # engine's pending rows ranked apply-run-first, then by id,
+            # off the index alone. The pending rows are few against the
+            # table and a row leaves the index when it is sent.
+            models.Index(
+                fields=["provider", "stage", "engine", "apply_run", "id"],
+                condition=models.Q(status="pending"),
+                name="idx_job_pending_wave",
+            ),
+            # The missing-run sweeps' probe (``yolo`` and ``dots_mocr
+            # .enqueue_missing_runs``): "has this volume a detect (an
+            # analyze) run for this fingerprint", asked once per volume
+            # in the sweep statuses every time the sweep runs, answered
+            # off the index without the row. Both conditions spell the
+            # probe's filter, or the planner cannot use them.
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="detect",
+                    engine="blackletter",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_detect_probe",
+            ),
+            models.Index(
+                fields=["scan", "source_fingerprint"],
+                condition=models.Q(
+                    stage="analyze",
+                    engine="dots_mocr",
+                    opinion__isnull=True,
+                    apply_run__isnull=True,
+                ),
+                name="idx_job_analyze_probe",
+            ),
+            # The volume runs of one engine, scan by scan
+            # (``jobs.ready_apply_runs`` and ``ready_volume_runs``): the
+            # live run of every scan and the runs not yet consumed, asked
+            # every collect tick for each engine. Without it each ask
+            # read the whole table, seconds of disk a tick (#588); with
+            # the status carried, the index answers both alone.
+            models.Index(
+                fields=["stage", "engine", "provider", "scan", "run"],
+                include=["status"],
+                condition=models.Q(apply_run__isnull=True),
+                name="idx_job_volume_runs",
             ),
             models.Index(
                 fields=["scan", "stage", "run"],
@@ -5250,3 +5765,57 @@ class ExternalJob(AbstractDateTimeModel):
             f"{target} {self.stage}/{self.engine}{shard} "
             f"({self.get_status_display()})"
         )
+
+
+def _invite_token() -> str:
+    """A random, URL-safe token for a volunteer's sign-up link."""
+    import secrets
+
+    return secrets.token_urlsafe(32)
+
+
+class VolunteerInvite(AbstractDateTimeModel):
+    """One approved volunteer's one-time sign-up link.
+
+    Staff add an email in the admin and send the link it shows themselves;
+    the portal sends no mail. The link opens the sign-up page
+    (``views_cards.volunteer_signup``), where the person picks a username
+    and a password and joins the volunteers group. It works once: the
+    account it made is kept on the row, and ``used_at`` is stamped.
+    """
+
+    email = models.EmailField(
+        unique=True, help_text="The address the link was sent to."
+    )
+    token = models.CharField(
+        max_length=64,
+        unique=True,
+        default=_invite_token,
+        editable=False,
+        help_text="The secret part of the sign-up link.",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="volunteer_invites_sent",
+        help_text="The staff member who added the invite.",
+    )
+    used_at = models.DateTimeField(
+        null=True, blank=True, help_text="When the account was made."
+    )
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="volunteer_invite",
+        help_text="The account the link made.",
+    )
+
+    class Meta:
+        ordering = ["-date_created"]
+
+    def __str__(self) -> str:
+        return self.email

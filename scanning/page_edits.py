@@ -499,6 +499,12 @@ def _inserted_entry(
     out["insert_url"] = edit.image.url if edit.image else ""
     out["insert_edit_id"] = edit.pk
     out["insert_kind"] = uploaded_kind(edit)
+    # The row's own label and gap, for the sidebar's list of uploaded
+    # files. ``logical_number`` is the placeholder's where the row took
+    # one, and a moved page can stand between a gap and its anchor, so
+    # neither is read off the entry's place.
+    out["insert_label"] = edit.logical_page or ""
+    out["insert_anchor_pdf_page"] = edit.anchor_pdf_page
     # The signed URL above expires within the hour, and a review page
     # stays open for longer. A link a curator may press later goes
     # through the view that signs one at the moment of the click.

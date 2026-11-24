@@ -89,7 +89,8 @@ def recover_stale() -> None:
         status=Status.PROCESSING,
         processed_at__lt=cutoff,
     )
-    for scan in stale:
+    # The two columns the log names, never the caches (#602).
+    for scan in stale.only("pk", "processed_at"):
         logger.info(
             "Recovering stale scan %s (processing since %s)",
             scan.pk,
@@ -160,6 +161,10 @@ def claim_next():
             .filter(status=Status.QUEUED)
             .annotate(claim_rank=_claim_rank())
             .order_by("claim_rank", "date_created")
+            # The row is locked to be claimed, not read (#602): the
+            # action loads its scan by key, and the caches would cross
+            # the wire under the lock on every claim.
+            .only("pk", "queued_action")
             .first()
         )
         if scan is None:

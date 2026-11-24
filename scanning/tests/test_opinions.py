@@ -758,6 +758,25 @@ class TestTheInputDigest(TestCase):
         self.assertEqual(summary.rebuilt, 1)
         self.assertEqual(self.revisions(), (a_before + 1, b_before))
 
+    def test_a_neighbours_end_on_the_first_page_counts(self):
+        """The masks of an opinion's first page read where the opinion
+        before ends on it (a key icon centred across the gutter divides
+        the page, #624): that end moved rebuilds the next opinion too."""
+        before = OpinionBoundary.objects.filter(
+            scan=self.scan, start_page_index=0
+        )
+        before.update(end_page_index=3, end_x=300.0, end_y=200.0)
+        self._create()
+        _a, b_before = self.revisions()
+        Opinion.objects.filter(pk=self.b.pk).update(
+            status=OpinionReviewStatus.READY_FOR_TEXT_REVIEW
+        )
+        before.update(end_x=120.0, end_y=400.0)
+
+        self._create()
+
+        self.assertEqual(self.revisions()[1], b_before + 1)
+
     def test_the_backfill_stamps_step_three_alone(self):
         """``stamp_opinion_digests``: a blank digest is written on a
         step-3 volume and no revision moves; a volume sent back to step
@@ -800,6 +819,31 @@ class TestTheInputDigest(TestCase):
             self.a.refresh_from_db()
             self.assertEqual(self.a.input_digest, "")
             self.assertIn("not in step 3", err.getvalue())
+
+    def test_the_backfill_leaves_a_digest_of_other_inputs(self):
+        """``stamp_opinion_digests`` writes a blank digest alone: a row
+        stamped under an older ``DIGEST_RULES`` owes a rebuild, and a
+        stamp over it would cancel the rebuild the raise asks for
+        (#620)."""
+        Opinion.objects.filter(scan=self.scan).update(input_digest="older")
+        self.scan.status = Status.REDACTION_REVIEW_DONE
+        self.scan.save(update_fields=["status"])
+        out = StringIO()
+
+        with (
+            patch.object(
+                apply, "load_printed_pages", return_value=self.printed
+            ),
+            patch.object(
+                review_states, "final_run", return_value=self.apply_run
+            ),
+        ):
+            call_command("stamp_opinion_digests", stdout=out)
+
+        self.a.refresh_from_db()
+        self.assertEqual(self.a.input_digest, "older")
+        self.assertIn("stamped 0", out.getvalue())
+        self.assertIn("2 left for the next approval", out.getvalue())
 
     def test_the_digest_does_not_read_the_order_of_the_rows(self):
         boundary = OpinionBoundary.objects.get(
@@ -1293,7 +1337,13 @@ class TestTheTextReviewPromotion(TestCase):
     def test_the_pass_promotes_the_rows_that_qualify(self):
         """The safety net: either pass can be the last one to write."""
         self.ready()
-        waiting = OpinionFactory(scan=self.scan, first_printed_page=900)
+        # A page beside the fixture's own: the factory numbers pages by
+        # a sequence over the whole run, and a fixed number collides
+        # with it whenever the run has made that many opinions before.
+        waiting = OpinionFactory(
+            scan=self.scan,
+            first_printed_page=self.opinion.first_printed_page + 1,
+        )
 
         self.assertEqual(opinions.promote_ready_opinions(), 1)
 
