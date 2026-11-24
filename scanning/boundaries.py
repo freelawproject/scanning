@@ -1359,15 +1359,22 @@ def outside_rects(
                         # type the model read as notes. A column that
                         # goes on under the box says so.
                         continue
-                    rect = fitz.Rect(box.x1, box.y1, box.x2, box.y2)
-                    if fitz_page is not None:
-                        # The side edges grow over a clipped glyph, the
-                        # rule of the other masks; the top stays, so no
-                        # line of the text above is taken.
-                        rect = ink.grow_to_ink(fitz_page, rect, margin_y=0.0)
-                    rects.append(
-                        {**_mask(page_index, rect), "kind": FOOTNOTES_MASK}
-                    )
+                    for piece in _foot_rects(page, box):
+                        rect = fitz.Rect(*piece)
+                        if fitz_page is not None:
+                            # The side edges grow over a clipped glyph,
+                            # the rule of the other masks; the top
+                            # stays, so no line of the text above is
+                            # taken.
+                            rect = ink.grow_to_ink(
+                                fitz_page, rect, margin_y=0.0
+                            )
+                        rects.append(
+                            {
+                                **_mask(page_index, rect),
+                                "kind": FOOTNOTES_MASK,
+                            }
+                        )
         result[row.pk] = rects
     return result
 
@@ -1394,6 +1401,60 @@ def _text_below(page, box) -> bool:
         if column.y2 > box.y2 + FOOT_SLACK_PT:
             return True
     return False
+
+
+def _foot_rects(page, box) -> list[tuple[float, float, float, float]]:
+    """Return a footnote box as the rects under the text of its columns.
+
+    The model draws one band across both columns, from the top of the
+    notes that start higher. The column whose notes start lower still
+    holds text between the top of the band and its own notes, and a
+    mask over the whole band would white those lines out (#457). So the
+    band is cut at the gutter, and in each column the mask starts where
+    the column's ``TEXT_COLUMN`` boxes end, never above the band. A
+    part of the band no column box reaches keeps the band's own top,
+    and neighbours that start at one height are one rect, so a page
+    whose columns end together gets the band whole.
+
+    :param page: The blackletter page.
+    :param box: The ``FOOTNOTES`` box, in PDF points.
+    :returns: ``(x0, y0, x1, y1)`` per rect, left to right.
+    """
+    from blackletter.models import Label
+
+    from scanning import columns
+
+    boxes = [
+        column
+        for det in page.detections
+        if det.label == Label.TEXT_COLUMN
+        for column in [det.bbox.to_pdf(page.scale_x, page.scale_y)]
+        if min(column.x2, box.x2) > max(column.x1, box.x1)
+    ]
+    whole = [(box.x1, box.y1, box.x2, box.y2)]
+    if not boxes:
+        return whole
+    groups = [
+        [boxes[at] for at in group]
+        for group in columns.column_groups([(b.x1, b.x2) for b in boxes])
+    ]
+    # The band is cut in the middle of each gutter, so the rects of two
+    # columns meet and no strip of the notes is left between them.
+    cuts = [box.x1]
+    for left, right in zip(groups, groups[1:], strict=False):
+        cuts.append((max(b.x2 for b in left) + min(b.x1 for b in right)) / 2.0)
+    cuts.append(box.x2)
+    rects: list[tuple[float, float, float, float]] = []
+    for at, group in enumerate(groups):
+        top = max(box.y1, min(max(b.y2 for b in group), box.y2))
+        x0, x1 = cuts[at], cuts[at + 1]
+        if x1 <= x0 or top >= box.y2:
+            continue
+        if rects and abs(rects[-1][1] - top) < 0.5 and rects[-1][2] == x0:
+            rects[-1] = (rects[-1][0], rects[-1][1], x1, box.y2)
+        else:
+            rects.append((x0, top, x1, box.y2))
+    return rects
 
 
 def _mask(page_index: int, rect) -> dict:

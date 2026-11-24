@@ -214,15 +214,36 @@ class TestTheMask(ScanningTestCase):
         """
         scan = ScanFactory(page_count=3)
         detection(scan, 1, Label.TEXT_COLUMN, 100, 100, 800, 1700)
-        detection(scan, 1, Label.TEXT_COLUMN, 900, 100, 1600, 1700)
+        detection(scan, 1, Label.TEXT_COLUMN, 900, 100, 1600, 1000)
         detection(scan, 1, Label.FOOTNOTES, 100, 1000, 1600, 2050)
         _, after = two_opinions(scan)
 
         masks = boundaries.outside_rects(scan, [after])
 
         notes = footnote_masks(masks[after.pk])
-        self.assertEqual(len(notes), 1)
-        self.assertAlmostEqual(notes[0]["y0"], 1000 * 72 / 200, places=0)
+        self.assertEqual(min(n["y0"] for n in notes), 1000 * 72 / 200)
+
+    def test_the_mask_starts_under_the_text_of_each_column(self):
+        """One band across both columns, from the notes that start
+        higher. The other column holds text beside them, down to its
+        own notes, and the mask leaves those lines."""
+        scan = ScanFactory(page_count=3)
+        detection(scan, 1, Label.TEXT_COLUMN, 100, 100, 800, 950)
+        detection(scan, 1, Label.TEXT_COLUMN, 900, 100, 1600, 1700)
+        detection(scan, 1, Label.FOOTNOTES, 100, 950, 1600, 2050)
+        _, after = two_opinions(scan)
+
+        masks = boundaries.outside_rects(scan, [after])
+
+        left, right = sorted(
+            footnote_masks(masks[after.pk]), key=lambda r: r["x0"]
+        )
+        self.assertAlmostEqual(left["y0"], 950 * 72 / 200, places=0)
+        self.assertAlmostEqual(right["y0"], 1700 * 72 / 200, places=0)
+        # The two rects meet in the gutter, and both end with the band.
+        self.assertAlmostEqual(left["x1"], right["x0"], places=0)
+        self.assertAlmostEqual(left["x1"], 850 * 72 / 200, places=0)
+        self.assertAlmostEqual(left["y1"], right["y1"], places=0)
 
 
 class TestTheVerdict(ScanningTestCase):
@@ -402,6 +423,55 @@ class TestTheCard(ScanningTestCase):
         card = self.card(page_of(drops, [group]))
 
         self.assertEqual(card.severity, Issue.Severity.ERROR)
+
+    def test_a_block_another_engine_called_outside_is_still_taken(self):
+        """One engine read the last line of the opinion before and the
+        first note as one unit, and its reason names the drop. The
+        footnote mask took the note all the same, so the card is
+        written and the note's label counts."""
+        drop = {
+            "reason": "outside",
+            "section": ensemble.FOOTNOTES,
+            "notes_taken": True,
+            "labels": ["1"],
+        }
+        group = {
+            "section": ensemble.BODY,
+            "text": "The court held 1 that",
+            "marks": [{"kind": "sup", "start": 15, "end": 16}],
+        }
+
+        card = self.card(page_of([drop], [group]))
+
+        self.assertEqual(card.severity, Issue.Severity.ERROR)
+
+    def test_the_footnote_mask_on_any_engine_takes_the_notes(self):
+        note = {"reason": opinion_ocr.NEIGHBOUR_FOOTNOTES}
+        units = [
+            unit(
+                "dots_mocr",
+                0,
+                (36, 580, 288, 640),
+                "the judgment is affirmed.\n7 Id. at 12.",
+                {"reason": "outside"},
+                0.9,
+            ),
+            unit(
+                "mistral_ocr",
+                0,
+                (36, 616, 288, 640),
+                "7 Id. at 12.",
+                note,
+                1.0,
+            ),
+        ]
+
+        (group,) = ensemble.align_page(units, WIDTH, HEIGHT)
+
+        self.assertTrue(group["excluded"])
+        self.assertEqual(group["reason"], "outside")
+        self.assertTrue(ensemble._took_notes(group))
+        self.assertIn("7", ensemble._note_labels(group))
 
     def test_an_opinion_of_one_page_makes_it_an_error(self):
         self.opinion.page_count = 1

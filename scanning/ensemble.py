@@ -1905,6 +1905,14 @@ def _merge(
         # took (#457), for :func:`_note_labels`: an engine reads
         # several notes as one unit, and the key above shows the first
         # label alone. A label and never the words.
+        # Whether the mask over the notes of the opinion before took a
+        # member (#457). The reason below is the first member's, and a
+        # unit of the last line and the first note is "outside".
+        "footnote_mask": any(
+            (m["exclusion"] or {}).get("reason")
+            == opinion_ocr.NEIGHBOUR_FOOTNOTES
+            for m in out
+        ),
         "hidden_labels": sorted(
             {
                 label
@@ -4404,10 +4412,14 @@ def build_page(
                     # label and never the words.
                     "labels": (
                         _note_labels(group)
-                        if group["excluded"]
-                        and group["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
+                        if group["excluded"] and _took_notes(group)
                         else []
                     ),
+                    # Whether the footnote mask took a reading of any
+                    # engine here. The reason above is one engine's,
+                    # and another can name the outside mask for the
+                    # same block.
+                    "notes_taken": group["excluded"] and _took_notes(group),
                     # The edit that took the block out, for its Undo.
                     "edit": (
                         {
@@ -5439,7 +5451,8 @@ def _shared_footnotes_card(
     taken = [
         drop
         for drop in page["dropped"]
-        if drop["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
+        if drop.get("notes_taken")
+        or drop["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES
     ]
     if not taken:
         return None
@@ -5550,6 +5563,24 @@ def _undetected_message(page: dict) -> str:
         "nothing, and were left out: the bleed-through of the page "
         "behind, as the engines read it. Check that no column of print "
         "is among them."
+    )
+
+
+def _took_notes(group: dict) -> bool:
+    """Return whether the footnote mask took a reading of a group.
+
+    Any engine's, and any member of it: the group's ``reason`` is the
+    first excluded engine's first member's. One engine reads the last
+    line of the opinion before and its first note as one unit, which
+    the outside mask covers most of, and names the group "outside",
+    while the note another engine read alone went under the footnote
+    mask. Read by the reason alone, that note left the text with no
+    ``SHARED_FOOTNOTES`` card (#457).
+
+    :param group: One aligned group.
+    """
+    return group["reason"] == opinion_ocr.NEIGHBOUR_FOOTNOTES or any(
+        unit.get("footnote_mask") for unit in group["engines"].values()
     )
 
 
