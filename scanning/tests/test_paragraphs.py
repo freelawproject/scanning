@@ -831,6 +831,56 @@ class TestTheFootnotes(TestCase):
             "See the order, supra. 13. The court.",
         )
 
+    def test_a_cited_number_a_later_group_owns_starts_no_note(self):
+        """The rest of note 5 starts with "9 F.3d" and the body cites 9
+        on the page: the real note 9 is a group further down, so the
+        line stays in note 5 and notes 6 to 9 are notes."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "5"),
+                    self.cited(1, "B.", "6"),
+                    self.cited(2, "C.", "7"),
+                    self.cited(3, "D.", "8"),
+                    self.cited(4, "E.", "9"),
+                    self.note(5, "5. See Smith v. Jones,"),
+                    self.note(6, "9 F.3d 100 (1st Cir. 1993).", column="R"),
+                    self.note(7, "6. Six.", column="R"),
+                    self.note(8, "7. Seven.", column="R"),
+                    self.note(9, "8. Eight.", column="R"),
+                    self.note(10, "9. Nine.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual(
+            [n["label"] for n in notes], ["5", "6", "7", "8", "9"]
+        )
+        self.assertIn("9 F.3d 100", notes[0]["paragraphs"][0]["text"])
+        self.assertEqual(notes[4]["paragraphs"][0]["text"], "Nine.")
+
+    def test_a_cited_number_past_the_step_still_starts_a_note(self):
+        """The guard reads the later groups alone: a label the body
+        cites, with no later group of its number, starts its note."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "A.", "5"),
+                    self.cited(1, "B.", "9"),
+                    self.note(2, "5. Five."),
+                    self.note(3, "9. Nine.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["5", "9"])
+
     def test_a_number_out_of_the_series_inside_a_group_is_text(self):
         """A cut inside a group takes the next numbers of the series
         alone, whatever the body cites: "9." after note 3 stays text."""
@@ -1043,6 +1093,12 @@ class TestTheFootnotes(TestCase):
             ("See Dkt. 4. The order.", 3, []),
             ("See Tr. 4. The witness.", 3, []),
             ("See App. 4. The record.", 3, []),
+            ("See Def.'s Br. 4. The court.", 3, []),
+            ("See Mem. 4. The court.", 3, []),
+            ("See Slip Op. 4. The court.", 3, []),
+            ("See Mot. 4. The court.", 3, []),
+            ("See Smith Dep. 4. The witness.", 3, []),
+            ("See Smith Decl. 4. The witness.", 3, []),
             ("See Id. at 2, 4. The rule.", 3, []),
             ("Id. 4. Four.", 3, [4]),
             ("Three. 4. Four.", 4, []),

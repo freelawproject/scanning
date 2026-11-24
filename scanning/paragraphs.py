@@ -72,8 +72,10 @@ APPROVED_SCHEMA = 1
 
 #: Version of the join rule and of the footnote rule. It is in the
 #: object and in its key: raise it when the same ensemble document
-#: gives another text.
-JOIN_RULE = 3
+#: gives another text. 4: a cited number a later group starts with
+#: starts no note at the start of a group either, and six more
+#: abbreviations take a number (#457).
+JOIN_RULE = 4
 
 #: What a join writes between two groups: a line break, never a space,
 #: so the dehyphenation downstream reads the two edges as one.
@@ -154,7 +156,8 @@ _INLINE_LABEL = re.compile(
 _TAKES_A_NUMBER = re.compile(
     r"(?:\b(?:Nos?|nn?|pp?|fn|[Aa]rts?|[Ss]ecs?|[Cc]hs?|[Vv]ols?|[Ee]xs?"
     r"|[Dd]ocs?|[Dd]kts?|[Tt]rs?|[Aa]pps?|[Ff]igs?|[Cc]ls?|[Pp]ts?|[Tt]its?"
-    r"|[Rr]ecs?|[Ee]xhs?|[A-Z])\.|\d,)$"
+    r"|[Rr]ecs?|[Ee]xhs?|[Bb]rs?|[Mm]ems?|[Oo]ps?|[Mm]ots?|[Dd]eps?"
+    r"|[Dd]ecls?|[A-Z])\.|\d,)$"
 )
 
 #: A label that starts a text with its period or parenthesis: the form
@@ -551,7 +554,11 @@ def body_marks(group: dict) -> list[str]:
 
 
 def _is_marked_label(
-    label: str, last: int | None, page: int, marked: dict[int, set[int]]
+    label: str,
+    last: int | None,
+    page: int,
+    marked: dict[int, set[int]],
+    taken: frozenset[int] = frozenset(),
 ) -> bool:
     """Return whether a number past ``LABEL_STEP`` is still a label.
 
@@ -562,14 +569,21 @@ def _is_marked_label(
     ``LABEL_STEP`` past the last one read: notes 3 to 7 read as two
     blocks left the last label at 3, and notes 8 to 29 went into note 3.
     A continuation that starts with a number ("28 U.S.C. 1291") is a
-    label only where the body cites a note of that number there.
+    label only where the body cites a note of that number there, and
+    never where a later group of the page or the next starts with that
+    number: "9 F.3d 100", the rest of note 5, is no note 9 when the
+    real "9." is further down, or notes 6 to 9 go into it.
 
     :param label: The label :func:`split_label` read.
     :param last: The last number that started a note.
     :param page: The page of the group.
     :param marked: :func:`mark_pages`.
+    :param taken: The numbers that start a later group of this page or
+        the next (:func:`_own_labels`).
     """
     if not label.isdigit() or last is None or int(label) <= last:
+        return False
+    if int(label) in taken:
         return False
     return bool(marked.get(int(label), set()) & {page, page - 1})
 
@@ -917,7 +931,7 @@ def _labelled_parts(
             _restarts_here(split, item, last, restarts)
             or _opens(split, item, last, opening)
             or _is_next_label(split[0], last)
-            or _is_marked_label(split[0], last, item["page"], marked)
+            or _is_marked_label(split[0], last, item["page"], marked, taken)
         )
     ):
         last = int(split[0])
@@ -1006,7 +1020,7 @@ def footnotes(document: dict) -> list[dict]:
                 )
                 or _is_next_label(split[0], last_number)
                 or _is_marked_label(
-                    split[0], last_number, item["page"], marked
+                    split[0], last_number, item["page"], marked, taken
                 )
             ):
                 if again:

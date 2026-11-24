@@ -1541,6 +1541,10 @@ _BOX_REASONS = frozenset(
     {
         "redaction",
         "outside",
+        # The mask over the notes of the opinion before is the outside
+        # mask's twin (#457): an engine that read the last line of the
+        # text and the first note as one unit keeps the line.
+        opinion_ocr.NEIGHBOUR_FOOTNOTES,
         opinion_ocr.PAGE_NUMBER,
         opinion_ocr.PICTURE,
         opinion_ocr.RUNNING_HEAD,
@@ -1897,6 +1901,18 @@ def _merge(
         # The fold of the words the verdict took (``compare_text``),
         # for :func:`_dropped_alike`: a key and never the words.
         "hidden_key": compare_text(" ".join(plain(m["text"]) for m in out)),
+        # The footnote label at the start of every line the verdict
+        # took (#457), for :func:`_note_labels`: an engine reads
+        # several notes as one unit, and the key above shows the first
+        # label alone. A label and never the words.
+        "hidden_labels": sorted(
+            {
+                label
+                for m in out
+                for line in (m["text"] or "").split("\n")
+                if (label := paragraphs.leading_label(line.strip()))
+            }
+        ),
         "reason": (
             (excluded[0]["exclusion"] or {}).get("reason") if excluded else ""
         ),
@@ -5538,20 +5554,26 @@ def _undetected_message(page: dict) -> str:
 
 
 def _note_labels(group: dict) -> list[str]:
-    """Return the footnote labels the engines read at the start of a group.
+    """Return the footnote labels the engines read in a dropped group.
 
-    Each engine's words the verdict took (``hidden_key``), read by
-    ``paragraphs.leading_label``. The engines can disagree on a label,
-    so every label any engine read is one of the group's.
+    The label at the start of every line the verdict took from each
+    engine (``hidden_labels`` of :func:`_merge`), and the one its
+    ``hidden_key`` starts with. A group can hold several notes, in one
+    unit or in several, and a mark of the body may name any of them, so
+    each line counts: a continuation that starts with a number gives a
+    label too many, which costs a card a person dismisses, and a label
+    missed lets an opinion be approved without its own note. The
+    engines can disagree on a label, so every label any engine read is
+    one of the group's.
 
     :param group: One dropped group.
     :returns: The labels, sorted.
     :rtype: list[str]
     """
-    labels = {
-        paragraphs.leading_label(unit.get("hidden_key") or "")
-        for unit in group["engines"].values()
-    }
+    labels = set()
+    for unit in group["engines"].values():
+        labels.add(paragraphs.leading_label(unit.get("hidden_key") or ""))
+        labels.update(unit.get("hidden_labels") or [])
     return sorted(label for label in labels if label)
 
 

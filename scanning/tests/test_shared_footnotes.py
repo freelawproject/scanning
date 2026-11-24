@@ -182,6 +182,23 @@ class TestTheMask(ScanningTestCase):
         self.assertEqual(len(notes), 1)
         self.assertGreater(notes[0]["y0"], 400.0)
 
+    def test_a_footnote_box_over_the_text_of_another_column_stays(self):
+        """The end of the opinion before is low in the left column. A
+        stray box in the right column is below that end and still over
+        the later opinion's own text: its column goes on under it."""
+        scan = ScanFactory(page_count=3)
+        detection(scan, 1, Label.TEXT_COLUMN, 100, 100, 800, 1700)
+        detection(scan, 1, Label.TEXT_COLUMN, 900, 100, 1600, 1700)
+        detection(scan, 1, Label.FOOTNOTES, 100, 1720, 1600, 2050)
+        detection(scan, 1, Label.FOOTNOTES, 900, 1200, 1600, 1500)
+        _, after = two_opinions(scan)
+
+        masks = boundaries.outside_rects(scan, [after])
+
+        notes = footnote_masks(masks[after.pk])
+        self.assertEqual(len(notes), 1)
+        self.assertAlmostEqual(notes[0]["y0"], 1720 * 72 / 200, places=0)
+
     def test_a_band_that_starts_above_the_end_in_one_column_is_masked(self):
         """The band crosses both columns, and its top is no test (#457).
 
@@ -377,6 +394,43 @@ class TestNoteLabels(ScanningTestCase):
         }
 
         self.assertEqual(ensemble._note_labels(group), ["3"])
+
+    def test_the_label_of_every_note_of_a_block_counts(self):
+        """An engine read two notes as one block: the label of the
+        second is a label of the group, or a mark of the body that
+        names it would leave the card a warning."""
+        group = {
+            "engines": {
+                "dots_mocr": {
+                    "hidden_key": "7 Id. at 12. 1 The court below",
+                    "hidden_labels": ["1", "7"],
+                },
+                "mistral": {"hidden_key": "7 Id. at 12."},
+            }
+        }
+
+        self.assertEqual(ensemble._note_labels(group), ["1", "7"])
+
+    def test_the_merge_reads_the_label_of_every_line_it_took(self):
+        """One unit holds two notes, a line each: both labels are on the
+        engine's reading, and no word of the notes is."""
+        member = {
+            "id": 0,
+            "type": "Footnote",
+            "box_pt": [100.0, 620.0, 300.0, 700.0],
+            "text": "7 Id. at 12.\n1 The court below erred.",
+            "marks": [],
+            "exclusion": {"reason": opinion_ocr.NEIGHBOUR_FOOTNOTES},
+            "share": 1.0,
+        }
+
+        unit = ensemble._merge([member], 12.0, None, 612.0)
+
+        self.assertEqual(unit["hidden_labels"], ["1", "7"])
+        self.assertEqual(
+            ensemble._note_labels({"engines": {"dots_mocr": unit}}),
+            ["1", "7"],
+        )
 
     def test_engines_that_read_two_labels_give_both(self):
         group = {

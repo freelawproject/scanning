@@ -52,6 +52,12 @@ POINTS_PER_INCH = 72.0
 #: the unit it takes by it, so the card can say what went.
 FOOTNOTES_MASK = "footnotes"
 
+#: How far below a ``FOOTNOTES`` box, in PDF points, a column box of its
+#: own columns may end and the box still be the foot of the page: about
+#: one printed line (#457). A column that goes on further holds text
+#: under the box, so the box is a stray one over the body.
+FOOT_SLACK_PT = 12.0
+
 
 class UnaddressableBoundary(ValueError):
     """An anchor was asked on a page no address can be written for.
@@ -1346,6 +1352,13 @@ def outside_rects(
                         # above an end low in one column; the bottom
                         # is the test.
                         continue
+                    if _text_below(page, box):
+                        # The end of the opinion before is in another
+                        # column, so a box below it can still lie over
+                        # this opinion's own text: a block in small
+                        # type the model read as notes. A column that
+                        # goes on under the box says so.
+                        continue
                     rect = fitz.Rect(box.x1, box.y1, box.x2, box.y2)
                     if fitz_page is not None:
                         # The side edges grow over a clipped glyph, the
@@ -1357,6 +1370,30 @@ def outside_rects(
                     )
         result[row.pk] = rects
     return result
+
+
+def _text_below(page, box) -> bool:
+    """Return whether a column of the page goes on under a footnote box.
+
+    The footnotes are the foot of their columns: no line of the text is
+    printed under them. A ``TEXT_COLUMN`` box that shares a horizontal
+    range with the box and ends more than ``FOOT_SLACK_PT`` below it
+    holds text there, so the box is not the foot of the page (#457).
+
+    :param page: The blackletter page.
+    :param box: The ``FOOTNOTES`` box, in PDF points.
+    """
+    from blackletter.models import Label
+
+    for det in page.detections:
+        if det.label != Label.TEXT_COLUMN:
+            continue
+        column = det.bbox.to_pdf(page.scale_x, page.scale_y)
+        if min(column.x2, box.x2) <= max(column.x1, box.x1):
+            continue
+        if column.y2 > box.y2 + FOOT_SLACK_PT:
+            return True
+    return False
 
 
 def _mask(page_index: int, rect) -> dict:
