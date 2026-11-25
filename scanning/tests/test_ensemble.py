@@ -29,7 +29,14 @@ from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from scanning import ensemble, markup, opinion_ocr, opinion_pdf, views_process
+from scanning import (
+    ensemble,
+    markup,
+    opinion_ocr,
+    opinion_pdf,
+    views_process,
+)
+from scanning import paragraphs as approved_text
 from scanning.factories import ScanFactory
 from scanning.models import (
     DISMISSABLE_OPINION_CHECKS,
@@ -4407,6 +4414,89 @@ class TestTheFootnotesOfAnOpinion(EnsembleTestCase):
         )
 
 
+class TestTheForeignFootnotesCard(TestTheFindings):
+    """The ``FOREIGN_FOOTNOTES`` card (#457): the page shows the notes
+    of the opinion before, and the approved text leaves them out."""
+
+    @staticmethod
+    def block(gid, text, section="footnotes", marks=()):
+        return {
+            "id": gid,
+            "text": text,
+            "column": "L",
+            "band": "body" if section == "text" else "footnotes",
+            "section": section,
+            "kind": "paragraph",
+            "marks": list(marks),
+        }
+
+    def shared_page(self, *notes, cited="1"):
+        body = self.block(
+            0,
+            f"We affirm.{cited}",
+            section="text",
+            marks=[{"start": 10, "end": 10 + len(cited), "kind": "sup"}],
+        )
+        return page_of(
+            groups=[
+                body,
+                *(self.block(at + 1, text) for at, text in enumerate(notes)),
+            ]
+        )
+
+    def cards_of(self, page) -> list[OpinionFinding]:
+        ensemble.rebuild_findings(self.opinion, document_of(page))
+        return list(OpinionFinding.objects.filter(opinion=self.opinion))
+
+    def test_the_notes_of_the_opinion_before_are_a_warning(self):
+        (card,) = self.cards_of(
+            self.shared_page("25. See id.", "26. The last.", "1. One.")
+        )
+
+        self.assertEqual(card.check_name, OpinionCheck.FOREIGN_FOOTNOTES)
+        self.assertEqual(card.page_in_opinion, 0)
+        self.assertEqual(card.severity, Issue.Severity.WARNING)
+        self.assertIn("footnotes 25, 26 belong", card.message)
+        self.assertIn("leave them out", card.message)
+
+    def test_the_card_names_the_notes_the_approved_text_leaves_out(self):
+        """One rule: the labels of the card are the notes
+        ``paragraphs.foreign_footnotes`` takes."""
+        page = self.shared_page("of the rule.", "26. The last.", "1. One.")
+
+        (card,) = self.cards_of(page)
+
+        self.assertEqual(
+            [
+                n["label"]
+                for n in approved_text.foreign_footnotes(document_of(page))
+            ],
+            [None, "26"],
+        )
+        self.assertIn(
+            "the end of a footnote of the page before and footnote 26 belong",
+            card.message,
+        )
+
+    def test_a_page_with_its_own_notes_alone_has_no_card(self):
+        self.assertEqual(self.cards_of(self.shared_page("1. One.")), [])
+
+    def test_the_card_is_dismissed_like_any_warning(self):
+        dismissal = OpinionFindingDismissal.objects.create(
+            opinion=self.opinion,
+            page_in_opinion=0,
+            check_name=OpinionCheck.FOREIGN_FOOTNOTES,
+        )
+
+        (card,) = self.cards_of(self.shared_page("26. The last.", "1. One."))
+
+        self.assertEqual(card.dismissal_id, dismissal.pk)
+        self.assertIn(OpinionCheck.FOREIGN_FOOTNOTES, ensemble.ENSEMBLE_CHECKS)
+        self.assertIn(
+            OpinionCheck.FOREIGN_FOOTNOTES, DISMISSABLE_OPINION_CHECKS
+        )
+
+
 class TestTheFootnoteCard(TestTheFindings):
     def test_a_doubt_is_its_own_card(self):
         cards = self.rebuild(footnote_doubt=1)
@@ -4421,6 +4511,7 @@ class TestTheFootnoteCard(TestTheFindings):
                 page_of(
                     groups=[
                         {
+                            "id": 0,
                             "footnote_doubt": True,
                             "footnote_by": ["mistral_ocr", "dots_mocr"],
                         }
