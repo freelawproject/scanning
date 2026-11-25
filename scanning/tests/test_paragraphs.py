@@ -1064,6 +1064,91 @@ class TestTheFootnotes(TestCase):
                 [n["label"] for n in paragraphs.footnotes(doc)], [None]
             )
 
+    def test_an_own_note_that_went_into_a_note_before_stays(self):
+        """The mark of note 1 went unread, so "1. One." had no proof
+        and went into note 26: the flow is cut at its label, with a
+        step back after it (note 2) and with none."""
+        opened = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "2"),
+                    self.note(1, "26. The last."),
+                    self.note(2, "1. One."),
+                    self.note(3, "2. Two."),
+                ],
+            ),
+        )
+        unread = document(
+            page(
+                0,
+                [
+                    group(0, "We affirm."),
+                    self.note(1, "26. The last."),
+                    self.note(2, "1. One."),
+                ],
+                dropped=[drop(None, reason="outside")],
+            ),
+        )
+
+        for doc, labels in ((opened, ["1", "2"]), (unread, ["1"])):
+            self.assertEqual(
+                [n["label"] for n in paragraphs.footnotes(doc)], labels
+            )
+            self.assertEqual(
+                paragraphs.foreign_footnotes(doc),
+                [{"label": "26", "pages": [0], "text": "The last."}],
+            )
+
+    def test_a_symbol_note_ends_the_take(self):
+        """The body's symbol marks are not read, so a symbol note among
+        the notes before may be the opinion's own: it stays, with
+        every note after it."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.note(1, "25. See id."),
+                    self.note(2, "* Sitting by designation."),
+                    self.note(3, "26. The last."),
+                    self.note(4, "1. One."),
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            [n["label"] for n in paragraphs.footnotes(doc)],
+            ["*", "26", "1"],
+        )
+        self.assertEqual(
+            [n["label"] for n in paragraphs.foreign_footnotes(doc)], ["25"]
+        )
+
+    def test_a_restart_the_first_note_took_is_spent(self):
+        """The first own note took the restart of the body marks in the
+        whole flow: the rest of a note that starts with that number
+        takes it in no second walk."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "2"),
+                    self.cited(1, "For one reason.", "1"),
+                    self.note(2, "26. The last."),
+                    self.note(3, "1. See"),
+                ],
+                dropped=[drop(None, reason="outside")],
+            ),
+            page(1, [self.note(0, "1 U.S.C. § 1 says so.")]),
+        )
+
+        (note,) = paragraphs.footnotes(doc)
+
+        self.assertEqual(note["label"], "1")
+        self.assertEqual(len(note["paragraphs"]), 1)
+        self.assertIn("1 U.S.C.", note["paragraphs"][0]["text"])
+
     def test_a_high_number_on_a_page_no_opinion_shares_stays(self):
         """With no text of a neighbour on the page, a number the body
         does not cite is still the opinion's: its mark went unread."""
