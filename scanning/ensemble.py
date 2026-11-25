@@ -5518,6 +5518,12 @@ def _foreign_footnotes_message(foreign: list[dict]) -> str:
             + ", ".join(labels)
         )
     what = " and ".join(named)
+    if len(labels) + rest == 1:
+        return (
+            f"At the foot of this page, {what} belongs to the opinion "
+            "before. The page shows it, but the approved text and the "
+            "final XML leave it out."
+        )
     return (
         f"At the foot of this page, {what} belong to the opinion before. "
         "The page shows them, but the approved text and the final XML "

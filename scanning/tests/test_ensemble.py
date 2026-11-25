@@ -4478,6 +4478,12 @@ class TestTheForeignFootnotesCard(TestTheFindings):
             card.message,
         )
 
+    def test_one_note_is_named_in_the_singular(self):
+        (card,) = self.cards_of(self.shared_page("26. The last.", "1. One."))
+
+        self.assertIn("footnote 26 belongs to the opinion", card.message)
+        self.assertIn("leave it out", card.message)
+
     def test_a_page_with_its_own_notes_alone_has_no_card(self):
         self.assertEqual(self.cards_of(self.shared_page("1. One.")), [])
 
