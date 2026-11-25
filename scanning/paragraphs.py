@@ -72,8 +72,9 @@ APPROVED_SCHEMA = 1
 
 #: Version of the join rule and of the footnote rule. It is in the
 #: object and in its key: raise it when the same ensemble document
-#: gives another text.
-JOIN_RULE = 3
+#: gives another text. Rule 4 takes the footnotes of the opinion before
+#: out of the notes of a first page (#457).
+JOIN_RULE = 4
 
 #: What a join writes between two groups: a line break, never a space,
 #: so the dehyphenation downstream reads the two edges as one.
@@ -167,6 +168,10 @@ _OWN_LABEL = re.compile(r"^\s*(\d{1,3})[.)]")
 #: jump is the start of a continuation that begins with a number, such
 #: as "28 U.S.C. 1291".
 LABEL_STEP = 3
+
+#: The reason of a drop the mask of a neighbour opinion took
+#: (``opinion_ocr.verdict``): the page holds text of another opinion.
+OUTSIDE = "outside"
 
 
 def continues(before: str, after: str) -> bool:
@@ -887,8 +892,10 @@ def _labelled_parts(
     return _cut(item, cuts) if cuts else [item]
 
 
-def footnotes(document: dict) -> list[dict]:
-    """Return the footnotes of an opinion, a list keyed by label.
+def _walk(
+    document: dict, flow: list[dict], spent: int = 0
+) -> tuple[list, dict]:
+    """Return the footnotes of a flow, a list keyed by label.
 
     A group that starts with a label starts a footnote. A group with no
     label goes on with the footnote before it: the first footnote group
@@ -915,15 +922,25 @@ def footnotes(document: dict) -> list[dict]:
     goes away.
 
     :param document: The ensemble document.
-    :returns: ``[{"label", "pages", "paragraphs"}]``, in reading order.
-    :rtype: list[dict]
+    :param flow: The footnote flow, or a part of it (:func:`footnotes`).
+    :param spent: How many restarts of the body marks the flow before
+        this part took.
+    :returns: The notes ``[{"label", "pages", "paragraphs"}]`` in
+        reading order, and how the walk went, in indexes of the flow:
+        ``starts`` (where each note starts), ``breaks`` (per note,
+        where each later paragraph of it starts), ``restarted`` (each
+        group that took a restart), and ``opened``, the index of the
+        note :func:`_opens` took, or None.
     """
     notes: list[dict] = []
+    starts: list[int] = []
+    breaks: list[list[int]] = []
+    opened = None
     last_number = None
     before = None
-    restarts = mark_restarts(document)
+    restarts = mark_restarts(document)[spent:]
+    restarted: list[int] = []
     marked = mark_pages(document)
-    flow = _flow(document, FOOTNOTE_SECTION)
     opening = _opening_mark(document)
     own = _own_labels(flow)
     last_page = None
@@ -954,17 +971,18 @@ def footnotes(document: dict) -> list[dict]:
             # page before the restart mark is no restart: it is the rest
             # of a note that starts with the same number ("1 U.S.C. 1").
             again = _restarts_here(split, item, last_number, restarts)
+            opens = _opens(
+                split,
+                item,
+                last_number,
+                opening
+                if _is_foreign(last_number, last_page, marked)
+                else None,
+            )
             if split and (
                 at > 0
                 or again
-                or _opens(
-                    split,
-                    item,
-                    last_number,
-                    opening
-                    if _is_foreign(last_number, last_page, marked)
-                    else None,
-                )
+                or opens
                 or _is_next_label(split[0], last_number)
                 or _is_marked_label(
                     split[0], last_number, item["page"], marked
@@ -972,6 +990,9 @@ def footnotes(document: dict) -> list[dict]:
             ):
                 if again:
                     restarts.pop(0)
+                    restarted.append(index)
+                if opens and at == 0 and opened is None:
+                    opened = len(notes)
                 label, text, marks = split
                 if label.isdigit():
                     last_number = int(label)
@@ -983,6 +1004,8 @@ def footnotes(document: dict) -> list[dict]:
                     ):
                         # The first note of the opinion has started.
                         opening = None
+                starts.append(index)
+                breaks.append([])
                 notes.append(
                     {
                         "label": label,
@@ -991,6 +1014,8 @@ def footnotes(document: dict) -> list[dict]:
                     }
                 )
             elif not notes:
+                starts.append(index)
+                breaks.append([])
                 notes.append(
                     {
                         "label": None,
@@ -1005,10 +1030,199 @@ def footnotes(document: dict) -> list[dict]:
                     _append(note["paragraphs"][-1], item, edge)
                 else:
                     note["paragraphs"].append(_paragraph(item))
+                    breaks[-1].append(index)
                 if item["page"] != note["pages"][-1]:
                     note["pages"].append(item["page"])
             before = item
-    return notes
+    return notes, {
+        "starts": starts,
+        "breaks": breaks,
+        "restarted": restarted,
+        "opened": opened,
+    }
+
+
+def _first_page(document: dict) -> tuple[int | None, bool]:
+    """Return the first page of an opinion, and whether a neighbour
+    opinion has text on it (a drop its mask took)."""
+    pages = document.get("pages") or []
+    if not pages:
+        return None, False
+    shared = any(
+        entry.get("reason") == OUTSIDE
+        for entry in pages[0].get("dropped") or []
+    )
+    return pages[0].get("page_in_opinion"), shared
+
+
+def _foreign(
+    notes: list[dict],
+    opened: int | None,
+    document: dict,
+) -> int:
+    """Return how many notes at the start are the opinion before's (#457).
+
+    An opinion that starts in the middle of a page has the last
+    footnotes of the opinion before at the foot of its first page. They
+    are the notes of that page alone, before the opinion's first own
+    note, with a number the body does not cite on that page, and one of
+    two things proves them: the opinion's own series opens after them
+    with a step back to the body's first mark (:func:`_opens`), or the
+    number is past ``LABEL_STEP``, which no first note of an opinion
+    is, on a page that holds text of a neighbour opinion. The rest of
+    a note of the page before, a first group with no label, goes with a
+    numbered note after it, and by itself on such a page when it starts
+    in the middle of a sentence (a lowercase letter): the first note of
+    an opinion starts one.
+
+    A wrong take loses a note, so every doubt keeps it: a small number
+    with no step back after it may be the opinion's own note 1 whose
+    mark no engine read, a note that goes on to the next page is no
+    note of the opinion before, and a symbol note ends the take, since
+    the body's symbol marks are not read (a judge sitting by
+    designation is a note of a first page).
+
+    :param notes: The notes of the whole flow (:func:`_walk`).
+    :param opened: The index of the note :func:`_opens` took, or None.
+    :param document: The ensemble document.
+    :returns: The count of the notes that are not the opinion's.
+    :rtype: int
+    """
+    first, shared = _first_page(document)
+    cited = mark_pages(document)
+    count = 0
+    for index, note in enumerate(notes if opened is None else notes[:opened]):
+        if note["pages"] != [first]:
+            break
+        label = note["label"]
+        if label is None:
+            if shared and _LOWER_START.match(note["paragraphs"][0]["text"]):
+                count = index + 1
+            continue
+        if not label.isdigit():
+            break
+        if first in cited.get(int(label), set()):
+            break
+        if opened is None and not (shared and int(label) > LABEL_STEP):
+            break
+        count = index + 1
+    return count
+
+
+def _own_inside(
+    flow: list[dict], notes: list[dict], walk: dict, count: int, document: dict
+) -> list[int]:
+    """Return where a taken note may hold text of the opinion itself.
+
+    Two doubts, each an index of the flow at which the take must end:
+
+    - A group that starts with a label of its own
+      (:func:`_own_labels`) and whose number may be the opinion's first
+      note: below the label :func:`_opens` took, or, with none taken,
+      below the body's first mark, or 1 with no mark at all. A step
+      back the marks did not prove ("1. One." under note 26, its mark
+      unread) went into the note above it. A higher number is a point
+      of the foreign note ("2. whether ..."), and cutting there would
+      make a note of it that takes the opinion's own notes.
+    - A new paragraph of the last taken note. The opinion's first note
+      follows the last foreign one, and with its label unread ("1This
+      case") it is a paragraph of that note, as a second paragraph of
+      the foreign note is: the doubt keeps it.
+
+    :param flow: The footnote flow.
+    :param notes: The notes of the whole flow.
+    :param walk: How :func:`_walk` went over it.
+    :param count: How many notes :func:`_foreign` took.
+    :param document: The ensemble document.
+    :returns: The indexes, in order.
+    :rtype: list[int]
+    """
+    starts = walk["starts"]
+    heads = set(starts[:count])
+    opening = _opening_mark(document)
+    if walk["opened"] is not None:
+        below = int(notes[walk["opened"]]["label"])
+    else:
+        below = opening[0] if opening else 2
+    found = [
+        at
+        for at, number, _ in _own_labels(flow)
+        if at > starts[0] and at not in heads and number < below
+    ]
+    return sorted({*found, *walk["breaks"][count - 1]})
+
+
+def _split_notes(document: dict) -> tuple[list[dict], list[dict]]:
+    """Return the opinion's footnotes, and the ones of the opinion
+    before that its first page holds (:func:`_foreign`).
+
+    The opinion's own are the notes of the flow after the foreign ones,
+    walked again: with no series before it, the first own label starts
+    one by itself. The flow is cut before the first group of a taken
+    note that may be the opinion's own (:func:`_own_inside`). The
+    restarts of the body marks the flow before the cut took are spent
+    for the second walk too, or a rest of a note that starts with a
+    small number would take one.
+    """
+    flow = _flow(document, FOOTNOTE_SECTION)
+    notes, walk = _walk(document, flow)
+    starts = walk["starts"]
+    count = _foreign(notes, walk["opened"], document)
+    # Two notes cut from one group are one piece of the flow: the cut
+    # is between groups, so the group stays whole with the opinion.
+    while 0 < count < len(notes) and starts[count] == starts[count - 1]:
+        count -= 1
+    if not count:
+        return notes, []
+    cut = starts[count] if count < len(notes) else len(flow)
+    foreign = notes[:count]
+    inside = [
+        at
+        for at in _own_inside(flow, notes, walk, count, document)
+        if at < cut
+    ]
+    if inside:
+        cut = inside[0]
+        foreign = _walk(document, flow[:cut])[0]
+    spent = sum(1 for at in walk["restarted"] if at <= cut)
+    return _walk(document, flow[cut:], spent)[0], foreign
+
+
+def footnotes(document: dict) -> list[dict]:
+    """Return the footnotes of an opinion, a list keyed by label.
+
+    The rules of a label are :func:`_walk`'s. The last footnotes of the
+    opinion before, at the foot of a first page it ends on, are no
+    footnotes of this opinion (:func:`_foreign`, join rule 4, #457).
+
+    :param document: The ensemble document.
+    :returns: ``[{"label", "pages", "paragraphs"}]``, in reading order.
+    :rtype: list[dict]
+    """
+    return _split_notes(document)[0]
+
+
+def foreign_footnotes(document: dict) -> list[dict]:
+    """Return the footnotes the first page holds of the opinion before.
+
+    They leave the footnotes and stay in the approved object as plain
+    text, so no text of the document goes away and a wrong take can be
+    read there. No geometry and no mark: nothing builds from them.
+
+    :param document: The ensemble document.
+    :returns: ``[{"label", "pages", "text"}]``, in reading order.
+    :rtype: list[dict]
+    """
+    return [
+        {
+            "label": note["label"],
+            "pages": list(note["pages"]),
+            "text": "\n".join(
+                paragraph.get("text") or "" for paragraph in note["paragraphs"]
+            ),
+        }
+        for note in _split_notes(document)[1]
+    ]
 
 
 def page_table(document: dict, printed: dict[int, str]) -> list[dict]:
@@ -1076,4 +1290,5 @@ def approved_document(
         "pages": page_table(document, printed),
         "body": body(document),
         "footnotes": footnotes(document),
+        "foreign_footnotes": foreign_footnotes(document),
     }

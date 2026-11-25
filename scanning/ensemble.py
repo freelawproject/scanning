@@ -181,7 +181,14 @@ from django.db import transaction
 from django.db.models import Case, DateTimeField, F, Q, Value, When
 from django.utils import timezone
 
-from scanning import casebody, detections, markup, opinion_ocr, s3_sync
+from scanning import (
+    casebody,
+    detections,
+    markup,
+    opinion_ocr,
+    paragraphs,
+    s3_sync,
+)
 from scanning.models import (
     OPINION_ENSEMBLE_MAX_ATTEMPTS,
     OPINION_ENSEMBLE_OWED,
@@ -393,6 +400,7 @@ ENSEMBLE_CHECKS = frozenset(
         # the rebuild deletes the rows written before.
         OpinionCheck.FIGURE_ONE_ENGINE,
         OpinionCheck.FIGURE_TO_CHECK,
+        OpinionCheck.FOREIGN_FOOTNOTES,
     }
 )
 
@@ -5167,6 +5175,22 @@ def rebuild_findings(opinion: Opinion, document: dict) -> int:
                 standing,
             )
         )
+    # The footnotes of the opinion before, on a first page it ends on
+    # (#457): the page shows them and the approved text leaves them
+    # out, by the rule the approval runs, so the card and the text
+    # cannot disagree. It informs alone and no answer keeps a note.
+    foreign = paragraphs.foreign_footnotes(document)
+    if foreign:
+        cards.append(
+            _card(
+                opinion,
+                foreign[0]["pages"][0],
+                OpinionCheck.FOREIGN_FOOTNOTES,
+                Issue.Severity.WARNING,
+                _foreign_footnotes_message(foreign),
+                standing,
+            )
+        )
     for page in document["pages"]:
         page_number = page["page_in_opinion"]
         counts = page["counts"]
@@ -5469,6 +5493,41 @@ def _partial_message(page: dict) -> str:
     return (
         f"{said[0].upper()}{said[1:]} covers part of {count} block(s) on "
         "this page. The whole block is out of the text."
+    )
+
+
+def _foreign_footnotes_message(foreign: list[dict]) -> str:
+    """Return the line of the ``FOREIGN_FOOTNOTES`` card (#457).
+
+    It names the notes by their labels, so the reader finds them on the
+    page, and says where they do not go: a note the rule took by
+    mistake is one the reader can still report.
+
+    :param foreign: ``paragraphs.foreign_footnotes`` of the document.
+    :returns: The message.
+    :rtype: str
+    """
+    labels = [note["label"] for note in foreign if note["label"]]
+    rest = any(note["label"] is None for note in foreign)
+    named = []
+    if rest:
+        named.append("the end of a footnote of the page before")
+    if labels:
+        named.append(
+            ("footnote " if len(labels) == 1 else "footnotes ")
+            + ", ".join(labels)
+        )
+    what = " and ".join(named)
+    if len(labels) + rest == 1:
+        return (
+            f"At the foot of this page, {what} belongs to the opinion "
+            "before. The page shows it, but the approved text and the "
+            "final XML leave it out."
+        )
+    return (
+        f"At the foot of this page, {what} belong to the opinion before. "
+        "The page shows them, but the approved text and the final XML "
+        "leave them out."
     )
 
 

@@ -2864,6 +2864,12 @@ class OpinionCheck(models.TextChoices):
     # ``FIGURE_ONE_ENGINE`` has no writer since the pictures are review
     # 2's boxes, and the ensemble's rebuild deletes its rows.
     FIGURE_TO_CHECK = "figure_to_check", "A picture to check"
+    # The first page holds footnotes of the opinion before, which the
+    # approved text leaves out (``paragraphs.foreign_footnotes``, #457).
+    FOREIGN_FOOTNOTES = (
+        "foreign_footnotes",
+        "Footnotes of the opinion before are left out",
+    )
 
 
 #: The checks a curator may dismiss. The two stale checks are facts
