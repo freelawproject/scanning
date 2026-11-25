@@ -97,7 +97,9 @@ ELEMENTS = {
 #: attribute of ``<casebody>``. Raise it when the same two inputs give
 #: another XML: the export (``final_xml``, #408) then writes every
 #: stored document again, and CourtListener reads the number. 2 writes
-#: the syllabus (#518).
+#: the syllabus (#518). CourtListener's ``import_scanned_opinions``
+#: skips a number it does not support, and the public XML reference on
+#: the FLP wiki has to describe it (see "The final XML" in the README).
 SCHEMA = 2
 
 #: The CAP element that holds a run of ``party`` and ``separator``.
