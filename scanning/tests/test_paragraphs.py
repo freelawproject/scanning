@@ -1021,6 +1021,49 @@ class TestTheFootnotes(TestCase):
             ["25", "26"],
         )
 
+    def test_the_rest_of_a_note_of_the_page_before_goes_alone(self):
+        """On a shared first page, a group with no label that starts in
+        the middle of a sentence is the end of the earlier opinion's
+        note, with no numbered note after it."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.note(1, "for lack of standing."),
+                    self.note(2, "1. One."),
+                ],
+                dropped=[drop(None, reason="outside")],
+            ),
+        )
+
+        self.assertEqual(
+            [n["label"] for n in paragraphs.footnotes(doc)], ["1"]
+        )
+        self.assertEqual(
+            paragraphs.foreign_footnotes(doc),
+            [{"label": None, "pages": [0], "text": "for lack of standing."}],
+        )
+
+    def test_a_note_with_no_label_that_starts_a_sentence_stays(self):
+        """It may be the opinion's note 1 whose label no engine read,
+        and on a page no opinion shares the rest of a note stays too."""
+        shared = document(
+            page(
+                0,
+                [group(0, "We affirm."), self.note(1, "See the rule.")],
+                dropped=[drop(None, reason="outside")],
+            ),
+        )
+        alone = document(
+            page(0, [group(0, "We affirm."), self.note(1, "of the rule.")]),
+        )
+
+        for doc in (shared, alone):
+            self.assertEqual(
+                [n["label"] for n in paragraphs.footnotes(doc)], [None]
+            )
+
     def test_a_high_number_on_a_page_no_opinion_shares_stays(self):
         """With no text of a neighbour on the page, a number the body
         does not cite is still the opinion's: its mark went unread."""

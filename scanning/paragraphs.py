@@ -1053,7 +1053,9 @@ def _foreign(
     number is past ``LABEL_STEP``, which no first note of an opinion
     is, on a page that holds text of a neighbour opinion. A note with
     no number (the rest of a note of the page before, a symbol) goes
-    only with a numbered one after it.
+    with a numbered one after it, and the rest of a note goes by
+    itself on such a page when it starts in the middle of a sentence
+    (a lowercase letter): the first note of an opinion starts one.
 
     A wrong take loses a note, so every doubt keeps it: a small number
     with no step back after it may be the opinion's own note 1 whose
@@ -1074,6 +1076,12 @@ def _foreign(
             break
         label = note["label"]
         if label is None or not label.isdigit():
+            if (
+                label is None
+                and shared
+                and _LOWER_START.match(note["paragraphs"][0]["text"])
+            ):
+                count = index + 1
             continue
         if first in cited.get(int(label), set()):
             break
