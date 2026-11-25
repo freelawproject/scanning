@@ -1100,6 +1100,82 @@ class TestTheFootnotes(TestCase):
                 [{"label": "26", "pages": [0], "text": "The last."}],
             )
 
+    def test_a_numbered_point_of_a_note_before_is_no_own_note(self):
+        """A foreign note holds "2. whether ...": no first note of the
+        opinion, whose own note 1 the body's mark proved. The point
+        stays out of the footnotes, and notes 1 and 2 are notes."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.cited(1, "For two reasons.", "2"),
+                    self.note(2, "26. The factors are: 1. the harm; and"),
+                    self.note(3, "2. whether it lasts.", column="R"),
+                    self.note(4, "1. One.", column="R"),
+                    self.note(5, "2. Two.", column="R"),
+                ],
+            ),
+        )
+
+        notes = paragraphs.footnotes(doc)
+
+        self.assertEqual([n["label"] for n in notes], ["1", "2"])
+        self.assertEqual(texts(notes[1]["paragraphs"]), ["Two."])
+
+    def test_a_new_paragraph_of_the_last_note_before_stays(self):
+        """The opinion's note 1 with its label unread ("1This case") is
+        a paragraph of the note above it: a new paragraph of the last
+        taken note stays in the footnotes, under a numbered note and
+        under the rest of a note."""
+        numbered = [self.note(1, "26. The last.")]
+        rest = [self.note(1, "for lack of standing.")]
+        for head in (numbered, rest):
+            doc = document(
+                page(
+                    0,
+                    [
+                        self.cited(0, "We affirm.", "2"),
+                        *head,
+                        self.note(2, "1This case was argued."),
+                        self.note(3, "2. Two."),
+                    ],
+                    dropped=[drop(None, reason="outside")],
+                ),
+            )
+
+            notes = paragraphs.footnotes(doc)
+
+            self.assertEqual([n["label"] for n in notes], [None, "2"])
+            self.assertEqual(
+                texts(notes[0]["paragraphs"]), ["1This case was argued."]
+            )
+            self.assertEqual(len(paragraphs.foreign_footnotes(doc)), 1)
+
+    def test_a_new_paragraph_of_an_earlier_note_before_goes(self):
+        """Only the last taken note is next to the opinion's own: a
+        second paragraph of an earlier one goes with it."""
+        doc = document(
+            page(
+                0,
+                [
+                    self.cited(0, "We affirm.", "1"),
+                    self.note(1, "25. The rule."),
+                    self.note(2, "It has two parts."),
+                    self.note(3, "26. The last."),
+                    self.note(4, "1. One."),
+                ],
+            ),
+        )
+
+        self.assertEqual(
+            [n["label"] for n in paragraphs.footnotes(doc)], ["1"]
+        )
+        self.assertEqual(
+            [n["text"] for n in paragraphs.foreign_footnotes(doc)],
+            ["The rule.\nIt has two parts.", "The last."],
+        )
+
     def test_a_symbol_note_ends_the_take(self):
         """The body's symbol marks are not read, so a symbol note among
         the notes before may be the opinion's own: it stays, with

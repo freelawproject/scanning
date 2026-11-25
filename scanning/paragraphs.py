@@ -894,7 +894,7 @@ def _labelled_parts(
 
 def _walk(
     document: dict, flow: list[dict], spent: int = 0
-) -> tuple[list, list, int | None, list]:
+) -> tuple[list, dict]:
     """Return the footnotes of a flow, a list keyed by label.
 
     A group that starts with a label starts a footnote. A group with no
@@ -926,12 +926,15 @@ def _walk(
     :param spent: How many restarts of the body marks the flow before
         this part took.
     :returns: The notes ``[{"label", "pages", "paragraphs"}]`` in
-        reading order, the index in the flow at which each starts, the
-        index of the note :func:`_opens` took, or None, and the index
-        in the flow of each group that took a restart.
+        reading order, and how the walk went, in indexes of the flow:
+        ``starts`` (where each note starts), ``breaks`` (per note,
+        where each later paragraph of it starts), ``restarted`` (each
+        group that took a restart), and ``opened``, the index of the
+        note :func:`_opens` took, or None.
     """
     notes: list[dict] = []
     starts: list[int] = []
+    breaks: list[list[int]] = []
     opened = None
     last_number = None
     before = None
@@ -1002,6 +1005,7 @@ def _walk(
                         # The first note of the opinion has started.
                         opening = None
                 starts.append(index)
+                breaks.append([])
                 notes.append(
                     {
                         "label": label,
@@ -1011,6 +1015,7 @@ def _walk(
                 )
             elif not notes:
                 starts.append(index)
+                breaks.append([])
                 notes.append(
                     {
                         "label": None,
@@ -1025,10 +1030,16 @@ def _walk(
                     _append(note["paragraphs"][-1], item, edge)
                 else:
                     note["paragraphs"].append(_paragraph(item))
+                    breaks[-1].append(index)
                 if item["page"] != note["pages"][-1]:
                     note["pages"].append(item["page"])
             before = item
-    return notes, starts, opened, restarted
+    return notes, {
+        "starts": starts,
+        "breaks": breaks,
+        "restarted": restarted,
+        "opened": opened,
+    }
 
 
 def _first_page(document: dict) -> tuple[int | None, bool]:
@@ -1098,23 +1109,65 @@ def _foreign(
     return count
 
 
+def _own_inside(
+    flow: list[dict], notes: list[dict], walk: dict, count: int, document: dict
+) -> list[int]:
+    """Return where a taken note may hold text of the opinion itself.
+
+    Two doubts, each an index of the flow at which the take must end:
+
+    - A group that starts with a label of its own
+      (:func:`_own_labels`) and whose number may be the opinion's first
+      note: below the label :func:`_opens` took, or, with none taken,
+      below the body's first mark, or 1 with no mark at all. A step
+      back the marks did not prove ("1. One." under note 26, its mark
+      unread) went into the note above it. A higher number is a point
+      of the foreign note ("2. whether ..."), and cutting there would
+      make a note of it that takes the opinion's own notes.
+    - A new paragraph of the last taken note. The opinion's first note
+      follows the last foreign one, and with its label unread ("1This
+      case") it is a paragraph of that note, as a second paragraph of
+      the foreign note is: the doubt keeps it.
+
+    :param flow: The footnote flow.
+    :param notes: The notes of the whole flow.
+    :param walk: How :func:`_walk` went over it.
+    :param count: How many notes :func:`_foreign` took.
+    :param document: The ensemble document.
+    :returns: The indexes, in order.
+    :rtype: list[int]
+    """
+    starts = walk["starts"]
+    heads = set(starts[:count])
+    opening = _opening_mark(document)
+    if walk["opened"] is not None:
+        below = int(notes[walk["opened"]]["label"])
+    else:
+        below = opening[0] if opening else 2
+    found = [
+        at
+        for at, number, _ in _own_labels(flow)
+        if at > starts[0] and at not in heads and number < below
+    ]
+    return sorted({*found, *walk["breaks"][count - 1]})
+
+
 def _split_notes(document: dict) -> tuple[list[dict], list[dict]]:
     """Return the opinion's footnotes, and the ones of the opinion
     before that its first page holds (:func:`_foreign`).
 
     The opinion's own are the notes of the flow after the foreign ones,
     walked again: with no series before it, the first own label starts
-    one by itself. A group inside a foreign note that starts with a
-    label of its own (:func:`_own_labels`) is where the flow is cut: a
-    step back the body's marks did not prove ("1. One." under note 26,
-    the mark unread) went into the note above it, and it may be the
-    opinion's first note. The restarts of the body marks the flow
-    before the cut took are spent for the second walk too, or a rest
-    of a note that starts with a small number would take one.
+    one by itself. The flow is cut before the first group of a taken
+    note that may be the opinion's own (:func:`_own_inside`). The
+    restarts of the body marks the flow before the cut took are spent
+    for the second walk too, or a rest of a note that starts with a
+    small number would take one.
     """
     flow = _flow(document, FOOTNOTE_SECTION)
-    notes, starts, opened, restarted = _walk(document, flow)
-    count = _foreign(notes, opened, document)
+    notes, walk = _walk(document, flow)
+    starts = walk["starts"]
+    count = _foreign(notes, walk["opened"], document)
     # Two notes cut from one group are one piece of the flow: the cut
     # is between groups, so the group stays whole with the opinion.
     while 0 < count < len(notes) and starts[count] == starts[count - 1]:
@@ -1123,16 +1176,15 @@ def _split_notes(document: dict) -> tuple[list[dict], list[dict]]:
         return notes, []
     cut = starts[count] if count < len(notes) else len(flow)
     foreign = notes[:count]
-    heads = set(starts[:count])
     inside = [
         at
-        for at, _, _ in _own_labels(flow)
-        if starts[0] < at < cut and at not in heads
+        for at in _own_inside(flow, notes, walk, count, document)
+        if at < cut
     ]
     if inside:
         cut = inside[0]
         foreign = _walk(document, flow[:cut])[0]
-    spent = sum(1 for at in restarted if at <= cut)
+    spent = sum(1 for at in walk["restarted"] if at <= cut)
     return _walk(document, flow[cut:], spent)[0], foreign
 
 
