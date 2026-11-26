@@ -100,6 +100,79 @@ All settings use `environ.FileAwareEnv()` for environment-variable-based
 configuration.
 
 
+## Processing Pipeline
+
+A volume goes from an uploaded PDF to one XML file per opinion, which
+CourtListener imports. This section is the overview; each module's
+docstring holds the rules of its own step.
+
+| Step | What happens | Where |
+|---|---|---|
+| 1. Upload | A volunteer uploads the scanned PDF of a volume. | `views.py` |
+| 2. Page completeness review | The page numbers are read and missing or bad pages are flagged. Staff approve the volume. | `page_numbers.py`, `views_process.py` |
+| 3. Layout detection and redaction | A YOLO model from [blackletter][bl] finds the regions of each page: headnotes and other editorial material, footnotes, blockquotes, the syllabus heading. The editorial material is redacted, and staff review the redactions. | `yolo.py`, `redactions.py`, `review_states.py` |
+| 4. OCR | Three engines read the whole volume: dots.mocr, Mistral OCR and Surya. Each read is cut to one opinion, and the text under a redaction or outside the opinion is marked. | `dots_mocr.py`, `mistral_ocr.py`, `surya.py`, `opinion_ocr.py` |
+| 5. Ensemble | The engines' blocks are aligned and put in reading order, then they vote. A block all engines read alike is kept as is, a majority wins, and a block with no majority is voted word by word. | `ensemble.py` |
+| 6. Text review | Disagreements and other doubts become cards. Volunteers answer the cards, and a curator approves the text of each opinion. | `opinion_cards.py`, `opinion_review.py`, `volunteers.py` |
+| 7. Tagging | The caselaw-block-tagger labels the caption and the skeleton of the approved text: parties, docket number, court, dates, attorneys, judges, disposition, author. | `tagger.py` |
+| 8. Final XML | The approved text and the tagger's spans are merged into one XML document per opinion. | `casebody.py` |
+| 9. Export | The XML is stored for CourtListener. | `final_xml.py` |
+
+GPU steps run on RunPod Serverless workers, built from
+`scanning/runpod/` (detection), `scanning/runpod-dotsmocr/`,
+`scanning/runpod-surya/` and `scanning/runpod-caselaw-tagger/`.
+
+[bl]: https://github.com/freelawproject/blackletter
+
+### The final XML
+
+`casebody.build` writes a document in the shape of the Caselaw Access
+Project's casebody, which is the shape CourtListener already reads:
+
+- `<casebody schema="N">` is the root. `N` is `casebody.SCHEMA`.
+- The head matter comes first: `citation`, `parties` (holding `party`
+  and `separator`), `docketnumber`, `court`, `decisiondate`,
+  `otherdate`, `history`, `attorneys`, `judges`, `disposition`,
+  `heading` and `syllabus`.
+- One `<opinion type="...">` follows for each writing of the case
+  (majority, concurrence, dissent), starting at its `author`.
+- The body uses `p`, `blockquote`, `table`, `ul`/`ol`/`li`, `em`,
+  `strong` and `sup`, with a `page-number` at every page the text
+  crosses and `footnotemark`/`footnote` pairs.
+- A picture printed in the opinion is embedded as a JPEG in
+  `figure`/`img`.
+
+The court's own syllabus is kept. Headnotes and other publisher
+material are redacted, so they are not in the text.
+
+### The hand-off to CourtListener
+
+The export stores each approved and tagged opinion at a key built from
+two ids alone:
+
+```
+export/{scan pk}/{opinion pk}.xml
+```
+
+The key is in the private bucket. CourtListener's
+`import_scanned_opinions` command reads it with a read-only user limited
+to the `export/` prefix, and copies the file into its own storage
+(`OpinionCluster.filepath_xml_scan`). The text of each opinion goes to
+`Opinion.xml_scan`.
+
+The key is stable, so a new approval or a new tagger run writes over
+it, and reopening the text review deletes it. The redacted PDF of an
+opinion is not exported yet.
+
+CourtListener reads the `schema` attribute and skips a document whose
+version it does not know. So a change of `casebody.SCHEMA` needs two
+things outside this repository: support for the new version in
+CourtListener's importer, and an update of the public XML reference on
+the FLP wiki (tracked in [freelawproject/courtlistener#8165][docs]).
+
+[docs]: https://github.com/freelawproject/courtlistener/issues/8165
+
+
 ## Data Model
 
 ### Scan
