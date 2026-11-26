@@ -46,7 +46,38 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Exists, OuterRef, QuerySet
 
 from scanning import opinion_review, paragraphs
-from scanning.models import Opinion, OpinionReviewStatus, OpinionText, Scan
+from scanning.models import (
+    ApplyRun,
+    Opinion,
+    OpinionReviewStatus,
+    OpinionText,
+    Scan,
+)
+
+#: How many opinions the walk holds at once. The command runs in the
+#: daemon's pod, so its memory is the daemon's.
+CHUNK_SIZE = 100
+
+
+def approved_rows() -> QuerySet:
+    """Return the approved opinions, with the caches of the joins left.
+
+    The rewrite reads the scan's pk and the run's keys alone, never a
+    cache of the scan and not the run's page map (#582), and the join
+    repeats them on every opinion: megabytes a row, for every approved
+    opinion at once, which ended the daemon's pod.
+
+    :returns: The queryset.
+    :rtype: QuerySet
+    """
+    return (
+        Opinion.objects.filter(status=OpinionReviewStatus.TEXT_REVIEW_DONE)
+        .select_related("scan", "apply_run", "approved_by")
+        .defer(
+            *Scan.large_fields("scan__"),
+            *(f"apply_run__{name}" for name in ApplyRun.LARGE_FIELDS),
+        )
+    )
 
 
 def with_footnotes(rows: QuerySet) -> QuerySet:
@@ -126,9 +157,7 @@ class Command(BaseCommand):
         for pk in pks:
             if not Scan.objects.filter(pk=pk).exists():
                 raise CommandError(f"scan {pk} does not exist")
-        rows = Opinion.objects.filter(
-            status=OpinionReviewStatus.TEXT_REVIEW_DONE
-        ).select_related("scan", "apply_run", "approved_by")
+        rows = approved_rows()
         if pks:
             rows = rows.filter(scan_id__in=pks)
         left_out = 0
@@ -137,9 +166,10 @@ class Command(BaseCommand):
             rows = with_footnotes(rows)
             left_out = approved - rows.count()
         written = current = failed = 0
-        for opinion in rows.order_by(
+        ordered = rows.order_by(
             "scan_id", "first_printed_page", "index_in_page"
-        ):
+        )
+        for opinion in ordered.iterator(chunk_size=CHUNK_SIZE):
             if opinion.approved_at is None:
                 # An approval that names no time names no key.
                 failed += 1

@@ -456,6 +456,31 @@ class TestTheRewrite(ApprovalTestCase):
             self.uploads[key]["approved_by"], self.opinion.approved_by.username
         )
 
+    def test_the_command_reads_no_cache_of_the_scan_or_the_run(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        from scanning.tests.test_views import large_scan_columns
+
+        rule = paragraphs.JOIN_RULE + 1
+        with (
+            patch.object(paragraphs, "JOIN_RULE", rule),
+            CaptureQueriesContext(connection) as captured,
+        ):
+            call_command("rewrite_approved_text", "--all", stdout=StringIO())
+
+        self.opinion.refresh_from_db()
+        self.assertNotEqual(self.opinion.approved_text_key, self.first)
+        self.assertEqual(large_scan_columns(captured.captured_queries), [])
+        self.assertEqual(
+            [
+                query["sql"]
+                for query in captured.captured_queries
+                if '"scanning_applyrun"."page_map"' in query["sql"]
+            ],
+            [],
+        )
+
     def tag(self):
         """The spans of the tagger, placed on the approved text."""
         Opinion.objects.filter(pk=self.opinion.pk).update(
