@@ -1,11 +1,13 @@
 """The blocking cards as rows (``opinion_cards``, ``OpinionCard``)."""
 
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.test import SimpleTestCase
 from django.urls import reverse
 
-from scanning import ensemble, opinion_cards
+from scanning import blocking_review, ensemble, opinion_cards
 from scanning.factories import OpinionFactory, OpinionFindingFactory
 from scanning.models import (
     Issue,
@@ -948,3 +950,32 @@ class TestMinorWarningCards(CardTestCase):
         self.assertEqual(
             (row.status, row.answer), (OpinionCard.Status.OPEN, None)
         )
+
+
+class TestCrossedOutWords(SimpleTestCase):
+    def test_a_word_answer_keeps_the_strike_the_block_already_has(self):
+        """The answer is composed from the plain text of the block, so
+        the strike of an earlier answer is written back into the edit
+        (#666), and a typed strike goes in as typed."""
+        group = {
+            "text": "within five hundred one fet",
+            "marks": [{"start": 7, "end": 19, "kind": "s"}],
+        }
+        card = {
+            "kind": blocking_review.WORD,
+            "text": group["text"],
+            "start": 24,
+            "length": 3,
+        }
+        row = SimpleNamespace(
+            kind=blocking_review.WORD,
+            card=card,
+            answer="~~fet~~ feet",
+            action=OpinionCard.Action.TEXT,
+        )
+
+        text, span, rows = opinion_cards._edit_for([row], [row, row], group)
+
+        self.assertEqual(text, "within ~~five hundred~~ one ~~fet~~ feet")
+        self.assertEqual(span, [24, 27])
+        self.assertEqual(rows, [row])

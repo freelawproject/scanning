@@ -904,7 +904,7 @@
      * Fill ``parent`` with ``text`` and its marks.
      *
      * The marks are standoff: ``{start, end, kind}`` over ``text``,
-     * with ``kind`` one of ``em``, ``strong`` and ``sup``. The text is
+     * with ``kind`` one of ``em``, ``strong``, ``s`` and ``sup``. The text is
      * cut at every mark edge, and each piece is a text node wrapped
      * in one element per mark that covers it, the innermost first.
      * Every string still enters the DOM with ``textContent``.
@@ -928,7 +928,7 @@
             var end = cuts[i + 1];
             var piece = document.createTextNode(text.slice(start, end));
             var wrapped = piece;
-            ['sup', 'em', 'strong'].forEach(function (kind) {
+            ['sup', 's', 'em', 'strong'].forEach(function (kind) {
                 var covers = (marks || []).some(function (mark) {
                     return mark.kind === kind
                         && mark.start <= start && end <= mark.end;
@@ -2578,6 +2578,42 @@
     }
 
     /**
+     * The text of a block as its editor shows it: the crossed-out
+     * words between ``~~`` (#666), the syntax the server reads back
+     * (``markup.strikes``). The twin of ``markup.struck``.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {string} The text, with the tildes of its ``s`` marks.
+     */
+    function editorText(group) {
+        var text = group.text || '';
+        var ranges = [];
+        (group.marks || []).filter(function (mark) {
+            return mark.kind === 's';
+        }).sort(function (a, b) {
+            return a.start - b.start || a.end - b.end;
+        }).forEach(function (mark) {
+            var start = Math.max(0, mark.start);
+            var end = Math.min(mark.end, text.length);
+            while (start < end && /\s/.test(text.charAt(start))) { start += 1; }
+            while (end > start && /\s/.test(text.charAt(end - 1))) { end -= 1; }
+            if (start >= end) { return; }
+            var last = ranges[ranges.length - 1];
+            if (last && start <= last[1]) {
+                last[1] = Math.max(last[1], end);
+            } else {
+                ranges.push([start, end]);
+            }
+        });
+        for (var i = ranges.length - 1; i >= 0; i -= 1) {
+            text = text.slice(0, ranges[i][0]) + '~~'
+                + text.slice(ranges[i][0], ranges[i][1]) + '~~'
+                + text.slice(ranges[i][1]);
+        }
+        return text;
+    }
+
+    /**
      * Replace the toolbar with the editor of the block's text.
      *
      * @param {HTMLElement} bar - The toolbar.
@@ -2587,24 +2623,30 @@
     function openEditor(bar, page, group) {
         bar.textContent = '';
         bar.classList.add('ensemble-editor');
+        var shown = editorText(group);
         var area = document.createElement('textarea');
         area.className = 'ensemble-edit-area';
-        area.value = group.text || '';
+        area.value = shown;
         if (locked) { locked.editor = { area: area, base: area.value }; }
         area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
         bar.appendChild(area);
+        bar.appendChild(note(
+            'ensemble-edit-hint',
+            'Words the page prints crossed out go between two tildes: '
+            + '~~five hundred~~ one thousand.'
+        ));
         var row = document.createElement('div');
         row.className = 'ensemble-edit-row';
         row.appendChild(barButton('Save', 'Compare the two texts, then save',
             function (button) {
                 var text = area.value;
-                if (text.trim() === (group.text || '').trim()) {
+                if (text.trim() === shown.trim()) {
                     showToast('The text did not change.', 'error');
                     return;
                 }
                 // The modal's own Save goes to the post, so a request
                 // with no answer gives that button back.
-                confirmText(group.text || '', text, function (saving) {
+                confirmText(shown, text, function (saving) {
                     postEdit(endpoint('editTextUrl'), {
                         page_in_opinion: page.page_in_opinion,
                         group_id: group.id,

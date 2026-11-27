@@ -27,7 +27,13 @@ from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
-from scanning import blocking_review, blocking_types, ensemble, opinion_edits
+from scanning import (
+    blocking_review,
+    blocking_types,
+    ensemble,
+    markup,
+    opinion_edits,
+)
 from scanning.models import (
     Opinion,
     OpinionCard,
@@ -453,12 +459,21 @@ def _edit_for(
     if not word:
         row = changed[0]
         return compose(row.card, row.answer), None, [row]
+    # A word answer is composed from the plain text, so the strikes
+    # the block already has are carried onto it (#666).
+    marks = group.get("marks") or []
     if len(rows) == len(block):
-        return _all_answers(group["text"], rows), None, rows
+        text = _all_answers(group["text"], rows)
+        return markup.carry_strikes(text, group["text"], marks), None, rows
     row = changed[0]
     start = row.card["start"]
     end = start if row.card.get("gap") else start + row.card["length"]
-    return compose(row.card, row.answer), [start, end], [row]
+    text = compose(row.card, row.answer)
+    return (
+        markup.carry_strikes(text, group["text"], marks),
+        [start, end],
+        [row],
+    )
 
 
 def _write_edit(

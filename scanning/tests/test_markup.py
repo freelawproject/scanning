@@ -677,3 +677,73 @@ class TestTheReviewOfTheListParse(SimpleTestCase):
         parsed = markup.parse_html("<h2>• Title</h2>")
         self.assertEqual((parsed.kind, parsed.text), (markup.HEADING, "Title"))
         self.assertEqual(parsed.marks, [])
+
+
+class TestStrikes(SimpleTestCase):
+    """The strikethrough a person types (#666)."""
+
+    def test_the_tildes_come_out_and_the_words_are_a_mark(self):
+        text, marks = markup.strikes(
+            "within ~~five hundred~~ one thousand feet"
+        )
+        self.assertEqual(text, "within five hundred one thousand feet")
+        self.assertEqual(
+            marks, [{"start": 7, "end": 19, "kind": markup.STRIKE}]
+        )
+
+    def test_a_struck_part_of_a_word_is_a_mark_inside_the_word(self):
+        text, marks = markup.strikes("the ~~person~~offender is ~~a~~ here")
+        self.assertEqual(text, "the personoffender is a here")
+        self.assertEqual(
+            [text[m["start"] : m["end"]] for m in marks], ["person", "a"]
+        )
+
+    def test_tildes_with_no_pair_stay_in_the_text(self):
+        for typed in ("about ~~ ten", "a ~~ b ~~ c", "~~", "plain"):
+            with self.subTest(typed=typed):
+                self.assertEqual(markup.strikes(typed), (typed, []))
+
+    def test_struck_writes_back_what_strikes_read(self):
+        typed = "~~person~~offender within ~~five hundred~~ one"
+        self.assertEqual(markup.struck(*markup.strikes(typed)), typed)
+
+    def test_struck_reads_only_the_strike_marks(self):
+        marks = [
+            {"start": 0, "end": 4, "kind": EM},
+            {"start": 5, "end": 8, "kind": markup.STRIKE},
+        ]
+        self.assertEqual(
+            markup.struck("some old text", marks), "some ~~old~~ text"
+        )
+
+    def test_a_strike_carries_onto_the_words_an_answer_left_alone(self):
+        old_text, old_marks = markup.strikes(
+            "~~five hundred~~ one thousand fet"
+        )
+        self.assertEqual(
+            markup.carry_strikes(
+                "five hundred one thousand feet", old_text, old_marks
+            ),
+            "~~five hundred~~ one thousand feet",
+        )
+
+    def test_a_strike_over_rewritten_words_is_not_carried(self):
+        old_text, old_marks = markup.strikes("~~five hundred~~ one")
+        self.assertEqual(
+            markup.carry_strikes("six hundred one", old_text, old_marks),
+            "six hundred one",
+        )
+
+    def test_the_serializer_writes_the_strike(self):
+        parsed = Parsed("five one", [Mark(0, 4, markup.STRIKE)])
+        self.assertEqual(markup.serialize(parsed), "<s>five</s> one")
+
+    def test_the_tagger_reads_the_words_and_no_strike(self):
+        body = [
+            {
+                "kind": "paragraph",
+                "text": "five one",
+                "marks": [{"start": 0, "end": 4, "kind": markup.STRIKE}],
+            }
+        ]
+        self.assertEqual(markup.project(body).text, "<p>five one</p>")

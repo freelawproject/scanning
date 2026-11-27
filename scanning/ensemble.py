@@ -4007,7 +4007,9 @@ def _human_read(
     The marks of the engines' text carry to the words of the new text
     that :func:`union_marks` aligns with them, so an italic case name
     the curator did not touch keeps its italic. A table becomes a
-    paragraph: its rows are the engines', and the text is not. An edit
+    paragraph: its rows are the engines', and the text is not. The
+    words the person wrote between ``~~`` are an ``s`` mark, and the
+    tildes are not text (``markup.strikes``, #666). An edit
     with a ``span`` answered one card, so the open words of the vote
     the person left as they were carry too (:func:`_kept_open`) and
     the block stays a card for them; an edit with none judged the
@@ -4020,7 +4022,10 @@ def _human_read(
     :returns: The read, in the shape of :func:`resolve`.
     :rtype: dict
     """
-    text = edit["text"]
+    # The edit holds what the person typed, and ``~~words~~`` is the
+    # one formatting a person writes (#666): the tildes come out here,
+    # before any word of the text is counted or compared.
+    text, crossed_out = markup.strikes(edit["text"])
     kind = read_back["kind"]
     readings = [(read_back["text"], read_back.get("marks") or [])]
     marks = union_marks(text, readings)
@@ -4029,6 +4034,7 @@ def _human_read(
         # The items carry like the marks: a word the curator kept
         # still starts its item (#428).
         marks, kind_of_list = _with_items(text, marks, readings, 1)
+    marks = sorted(marks + crossed_out, key=lambda mark: mark["start"])
     tokens = (
         _kept_open(read_back, text, engines or {})
         if edit.get("span") is not None

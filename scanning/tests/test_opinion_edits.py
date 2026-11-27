@@ -1215,6 +1215,51 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         self.opinion.refresh_from_db()
         self.assertEqual(self.opinion.ensemble_edit_revision, 1)
 
+    def test_crossed_out_words_are_a_mark_and_outlive_the_next_answer(self):
+        """A person types the words the page prints crossed out between
+        two tildes (#666). The edit keeps what they typed; the text of
+        the block holds no tilde and an ``s`` mark over the words; and
+        the next word answer of the block, composed from the plain
+        text, keeps the strike."""
+        group = self.split_group()
+        self.assertEqual(group["text"], "body A 1")
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="~~body~~ bodies A 1",
+            span=[0, 4],
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        self.assertEqual(OpinionEdit.objects.get().text, "~~body~~ bodies A 1")
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["text"], "body bodies A 1")
+        self.assertIn({"start": 0, "end": 4, "kind": "s"}, edited["marks"])
+        row = OpinionText.objects.get(opinion=self.opinion, page_in_opinion=0)
+        self.assertNotIn("~~", row.text)
+        struck = [m for m in row.marks if m["kind"] == "s"]
+        self.assertEqual(len(struck), 1)
+        self.assertEqual(
+            row.text[struck[0]["start"] : struck[0]["end"]], "body"
+        )
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="body bodies A one",
+            span=[14, 15],
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        standing = OpinionEdit.objects.get(withdrawn_at__isnull=True)
+        self.assertEqual(standing.text, "~~body~~ bodies A one")
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["text"], "body bodies A one")
+        self.assertIn({"start": 0, "end": 4, "kind": "s"}, edited["marks"])
+
     def test_a_second_text_edit_answers_the_next_open_word(self):
         """The blocking review answers one card at a time, and a block
         can hold several: the first word answer (its ``span``) leaves

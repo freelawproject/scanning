@@ -148,6 +148,23 @@ class TestTheElements(TestCase):
         self.assertEqual("".join(parties.itertext()), "Jane ROE, v. STATE.")
 
 
+class TestCrossedOutWords(TestCase):
+    def test_a_strike_mark_is_an_s_element(self):
+        """The words a person marked as crossed out (#666) are an
+        ``<s>`` in the XML and in the page that shows it."""
+        approved = doc(
+            para(
+                "within five hundred one thousand feet",
+                marks=[mark(7, 19, markup.STRIKE)],
+            )
+        )
+
+        xml, root = build(approved)
+
+        self.assertIn("within <s>five hundred</s> one thousand feet", xml)
+        self.assertIn("<s>five hundred</s>", casebody.display_html(xml))
+
+
 class TestTheHeadMatter(TestCase):
     """The head matter ends at the author."""
 
