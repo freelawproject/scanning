@@ -1942,6 +1942,8 @@ div.ensemble-group[data-kind="list_item"] {
 .bk-opt.bk-frozen.bk-chosen { opacity: 1; }
 .bk-cropwrap[style*="aspect-ratio"] canvas { width: 100%; height: 100%; }
 .bk-typed input { font: inherit; font-family: Georgia, "Times New Roman", serif; font-size: 16px; width: 100%; box-sizing: border-box; padding: 2px 0; border: 0; background: transparent; color: inherit; outline: none; }
+.bk-typed-hint { margin: 2px 0 0 14px; font-size: 12.5px; color: #6b7280; }
+@media (prefers-color-scheme: dark) { .bk-typed-hint { color: #9ca3af; } }
 .bk-card > footer { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; }
 .bk-card > footer { flex-wrap: wrap; justify-content: flex-start; }
 .bk-card > footer .bk-state { min-width: 8em; }
