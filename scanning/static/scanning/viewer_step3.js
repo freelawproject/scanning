@@ -2599,7 +2599,7 @@
             while (end > start && /\s/.test(text.charAt(end - 1))) { end -= 1; }
             if (start >= end) { return; }
             var last = ranges[ranges.length - 1];
-            if (last && start <= last[1]) {
+            if (last && !/\S/.test(text.slice(last[1], start))) {
                 last[1] = Math.max(last[1], end);
             } else {
                 ranges.push([start, end]);
@@ -3043,13 +3043,50 @@
         );
     }
 
+    /**
+     * Move the marks of a document from the server's offsets to this
+     * script's. The server counts characters and a JavaScript string
+     * counts UTF-16 units, so a character outside the basic plane (a
+     * mathematical letter, an emoji) is one there and two here, and
+     * every mark after it would sit a unit early: the strike of #666
+     * on the wrong letters, in the text and in the editor, whose
+     * tildes are saved. Once, at the load, so every reader of
+     * ``group.marks`` slices with offsets of its own string. A text
+     * with no such character, nearly every one, is left as it is.
+     *
+     * @param {Object} data - The ensemble document, changed in place.
+     * @returns {Object} The document.
+     */
+    function marksInUnits(data) {
+        ((data && data.pages) || []).forEach(function (page) {
+            (page.groups || []).forEach(function (group) {
+                var text = group.text || '';
+                if (!/[\uD800-\uDBFF]/.test(text)) { return; }
+                // units[n] is where character n starts in the string.
+                var units = [];
+                for (var i = 0; i < text.length; i += 1) {
+                    units.push(i);
+                    var code = text.charCodeAt(i);
+                    if (code >= 0xD800 && code <= 0xDBFF) { i += 1; }
+                }
+                units.push(text.length);
+                var last = units.length - 1;
+                (group.marks || []).forEach(function (mark) {
+                    mark.start = units[Math.min(Math.max(mark.start, 0), last)];
+                    mark.end = units[Math.min(Math.max(mark.end, 0), last)];
+                });
+            });
+        });
+        return data;
+    }
+
     function loadText() {
         if (!textColumn) { return; }
         askForUrl('ensembleUrlEndpoint')
             .then(function (url) { return fetch(url); })
             .then(function (response) { return response.json(); })
             .then(function (data) {
-                doc = data;
+                doc = marksInUnits(data);
                 drawText();
                 if ((doc.unresolved_edits || []).length) {
                     textColumn.insertBefore(

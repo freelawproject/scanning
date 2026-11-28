@@ -1260,6 +1260,63 @@ class TestTheEndpoints(EditTestCase, ScanningTestCase):
         self.assertEqual(edited["text"], "body bodies A one")
         self.assertIn({"start": 0, "end": 4, "kind": "s"}, edited["marks"])
 
+    def test_a_word_answered_with_a_strike_alone_is_answered(self):
+        """A person who crosses a flagged word out and changes no
+        letter of it read the word (#666): its card is closed, the
+        block's other open word is still a card, and the next answer
+        of the block does not open the struck word again."""
+        group = self.split_group()
+        self.assertEqual(group["n_low_confidence"], 2)
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="~~body~~ A 1",
+            span=[0, 4],
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["text"], "body A 1")
+        self.assertEqual(edited["level"], ensemble.BLOCKING)
+        self.assertEqual(edited["n_low_confidence"], 1)
+
+        response = self.post(
+            "edit_opinion_text",
+            page_in_opinion=0,
+            group_id=group["id"],
+            text="body A one",
+            span=[7, 8],
+        )
+
+        self.assertAnswered(response, 200, messages.SUCCESS)
+        standing = OpinionEdit.objects.get(withdrawn_at__isnull=True)
+        self.assertEqual(standing.text, "~~body~~ A one")
+        edited = self.page()["groups"][group["id"]]
+        self.assertEqual(edited["n_low_confidence"], 0)
+
+    def test_tildes_that_close_no_strike_are_refused(self):
+        """A mistyped strike would go to the approved text as tildes
+        (#666), so the edit is refused and says how to write one."""
+        group = self.split_group()
+
+        for typed in ("~~ body ~~ A 1", "~~body A 1"):
+            with self.subTest(typed=typed):
+                response = self.post(
+                    "edit_opinion_text",
+                    page_in_opinion=0,
+                    group_id=group["id"],
+                    text=typed,
+                    span=[0, 4],
+                )
+
+                self.assertEqual(response.status_code, 409)
+                self.assertEqual(
+                    response.json()["message"], views_api.EDIT_TILDES_MESSAGE
+                )
+        self.assertFalse(OpinionEdit.objects.exists())
+
     def test_a_second_text_edit_answers_the_next_open_word(self):
         """The blocking review answers one card at a time, and a block
         can hold several: the first word answer (its ``span``) leaves

@@ -26,7 +26,7 @@ from django.utils import timezone
 from django.utils.http import urlencode
 from django.views.decorators.http import require_POST
 
-from scanning import blocking_types, opinion_cards, volunteers
+from scanning import blocking_types, markup, opinion_cards, volunteers
 from scanning.models import (
     Opinion,
     OpinionCard,
@@ -66,6 +66,10 @@ CARD_GONE_MESSAGE = (
     "or the engines read its place again. Reload the page."
 )
 ANSWER_BAD_REQUEST_MESSAGE = "The answer could not be read."
+ANSWER_TILDES_MESSAGE = (
+    "A ~~ has no pair. Put two tildes right before and right after the "
+    "crossed-out words, with no space inside: ~~old words~~"
+)
 ANSWER_SAVED_MESSAGE = (
     "Answer saved. It goes into the text when the answers are applied."
 )
@@ -495,6 +499,11 @@ def answer_opinion_card(
         return JsonResponse(
             {"status": "error", "message": ANSWER_BAD_REQUEST_MESSAGE},
             status=400,
+        )
+    # Tildes that close no strike would reach the text as typed (#666).
+    if value and markup.unpaired(value):
+        return JsonResponse(
+            {"status": "error", "message": ANSWER_TILDES_MESSAGE}, status=409
         )
     if row.opinion.status != OpinionReviewStatus.READY_FOR_TEXT_REVIEW:
         return JsonResponse(

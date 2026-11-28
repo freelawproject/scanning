@@ -37,7 +37,6 @@ from __future__ import annotations
 import html as _html
 import re
 from dataclasses import dataclass, field
-from difflib import SequenceMatcher
 
 EM = "em"
 STRONG = "strong"
@@ -609,7 +608,7 @@ def struck(text: str, marks: list[dict]) -> str:
 
     The inverse of :func:`strikes`, for the text an editor shows and
     an edit stores. Each range is held to the words it covers, and
-    ranges that touch are one.
+    ranges that touch, or that only whitespace parts, are one.
 
     :param text: A group's plain text.
     :param marks: Its marks; only the ``s`` ones are read.
@@ -629,7 +628,7 @@ def struck(text: str, marks: list[dict]) -> str:
             end -= 1
         if start >= end:
             continue
-        if ranges and start <= ranges[-1][1]:
+        if ranges and not text[ranges[-1][1] : start].strip():
             ranges[-1][1] = max(ranges[-1][1], end)
         else:
             ranges.append([start, end])
@@ -638,20 +637,45 @@ def struck(text: str, marks: list[dict]) -> str:
     return text
 
 
-def carry_strikes(text: str, old_text: str, old_marks: list[dict]) -> str:
-    """Keep the strikes of a block on the words an edit left alone.
+def unpaired(text: str) -> int:
+    """Count the ``~~`` of a text that close no strikethrough.
+
+    A person who types ``~~ five hundred ~~`` or forgets the second
+    pair meant a strike and wrote none, and the tildes would go to the
+    approved text as they are. A writer of a text edit refuses a text
+    that holds more of them than the block had.
+
+    :param text: A text as a person typed it.
+    :returns: How many ``~~`` :func:`strikes` leaves in it.
+    :rtype: int
+    """
+    return strikes(text)[0].count("~~")
+
+
+def carry_strikes(
+    text: str, old_text: str, old_marks: list[dict], spans: list
+) -> str:
+    """Keep the strikes of a block on the words an answer left alone.
 
     A word answer is the block's text with one word replaced, composed
     from the plain text, so it holds no tilde of the strikes the block
     already has; without this the second answer of a block would take
-    the first one's strike out in silence. A strike carries only when
-    every character under it stands unchanged in the new text. A whole
-    block a person typed is not passed here: what they typed is the
-    whole judgement, and their editor shows the tildes.
+    the first one's strike out in silence. The answer names the place
+    it judged (``spans``, in the old text), and everything outside it
+    stands as it stood: each stretch of the old text between the spans
+    is found again in the new text, in order, the first at the start
+    and the last at the end, and the strikes over it move with it. So
+    a strike is never placed by a guess over repeated words, and a
+    strike a span cuts stays on the words outside the span, while the
+    words inside it are struck only where the answer has tildes. A
+    whole block a person typed is not passed here: what they typed is
+    the whole judgement, and their editor shows the tildes.
 
     :param text: The new text of the edit, which may hold ``~~`` too.
     :param old_text: The group's text the edit was composed from.
     :param old_marks: That group's marks.
+    :param spans: The ``[start, end]`` places of ``old_text`` the
+        answer replaced, an empty one for words put into a gap.
     :returns: The new text with the carried strikes written in.
     :rtype: str
     """
@@ -659,20 +683,40 @@ def carry_strikes(text: str, old_text: str, old_marks: list[dict]) -> str:
     if not old:
         return text
     plain, marks = strikes(text)
-    blocks = SequenceMatcher(
-        None, old_text, plain, autojunk=False
-    ).get_matching_blocks()
-    for mark in old:
-        for a, b, size in blocks:
-            if a <= mark["start"] and mark["end"] <= a + size:
+    stretches: list[tuple[int, int]] = []
+    at = 0
+    for start, end in sorted((span[0], span[1]) for span in spans):
+        stretches.append((at, max(at, min(start, len(old_text)))))
+        at = max(at, min(end, len(old_text)))
+    stretches.append((at, len(old_text)))
+    cursor = 0
+    for index, (start, end) in enumerate(stretches):
+        while start < end and old_text[start].isspace():
+            start += 1
+        while end > start and old_text[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        piece = old_text[start:end]
+        if index == 0:
+            found = 0 if plain.startswith(piece) else -1
+        elif index == len(stretches) - 1:
+            found = len(plain) - len(piece) if plain.endswith(piece) else -1
+        else:
+            found = plain.find(piece, cursor)
+        if found < cursor:
+            continue
+        cursor = found + len(piece)
+        for mark in old:
+            first, last = max(mark["start"], start), min(mark["end"], end)
+            if last > first:
                 marks.append(
                     {
-                        "start": mark["start"] - a + b,
-                        "end": mark["end"] - a + b,
+                        "start": first - start + found,
+                        "end": last - start + found,
                         "kind": STRIKE,
                     }
                 )
-                break
     return struck(plain, marks)
 
 

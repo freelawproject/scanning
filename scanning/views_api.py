@@ -452,6 +452,10 @@ EDIT_TOO_LONG_MESSAGE = (
     "The text is longer than {limit} characters, so it was not saved."
 )
 EDIT_UNCHANGED_MESSAGE = "The text did not change, so nothing was saved."
+EDIT_TILDES_MESSAGE = (
+    "A ~~ has no pair. Put two tildes right before and right after the "
+    "crossed-out words, with no space inside: ~~old words~~"
+)
 EDIT_SAME_SECTION_MESSAGE = "The block is in that section already."
 EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
@@ -1740,7 +1744,9 @@ def edit_opinion_text(
     # whole judgement.
     marks = group.get("marks") or []
     if span is not None:
-        text = markup.carry_strikes(text, group["text"], marks)
+        text = markup.carry_strikes(text, group["text"], marks, [span])
+    if markup.unpaired(text) > markup.unpaired(group["text"]):
+        return _edit_refusal(request, EDIT_TILDES_MESSAGE)
     if text == markup.struck(group["text"], marks):
         return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
     edit = opinion_edits.supersede(

@@ -464,13 +464,25 @@ def _edit_for(
     marks = group.get("marks") or []
     if len(rows) == len(block):
         text = _all_answers(group["text"], rows)
-        return markup.carry_strikes(text, group["text"], marks), None, rows
+        spans = [
+            [
+                r.card["start"],
+                r.card["start"]
+                + (0 if r.card.get("gap") else r.card["length"]),
+            ]
+            for r in rows
+        ]
+        return (
+            markup.carry_strikes(text, group["text"], marks, spans),
+            None,
+            rows,
+        )
     row = changed[0]
     start = row.card["start"]
     end = start if row.card.get("gap") else start + row.card["length"]
     text = compose(row.card, row.answer)
     return (
-        markup.carry_strikes(text, group["text"], marks),
+        markup.carry_strikes(text, group["text"], marks, [[start, end]]),
         [start, end],
         [row],
     )
@@ -530,6 +542,8 @@ def _refusal(group: dict | None, text: str) -> str:
         return "The answer leaves the block empty."
     if len(text) > opinion_edits.MAX_TEXT_CHARS:
         return "The answer is longer than a block may be."
+    if markup.unpaired(text) > markup.unpaired(group["text"]):
+        return "The answer holds a ~~ with no pair."
     return ""
 
 

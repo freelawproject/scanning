@@ -3973,6 +3973,33 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     return tokens
 
 
+def _close_struck(tokens: list[dict], text: str, struck: list[dict]) -> None:
+    """Take the vote's flags off the words a person crossed out.
+
+    Only a person writes a strike (``markup.strikes``, #666), and only
+    in the words of an answer, so a word under one was read by a
+    person: its card is answered, whatever its letters. Without this a
+    word answered ``~~hundred~~`` stands as the vote read it, keeps its
+    flag, and its card comes back on every build. A gap keeps its
+    level: it is a place beside the word, and nobody judged it.
+
+    :param tokens: The tokens of the person's text, changed in place.
+    :param text: That text, without the tildes.
+    :param struck: Its ``s`` marks.
+    """
+    if not struck:
+        return
+    at = 0
+    for token in tokens:
+        start = text.find(token["text"], at)
+        if start < 0:
+            continue
+        at = start + len(token["text"])
+        if any(m["start"] < at and start < m["end"] for m in struck):
+            for flag in ("low_confidence", "majority"):
+                token.pop(flag, None)
+
+
 def _has_gap(voted: list[dict], boundary: int) -> bool:
     """Return whether the vote flagged the gap before voted token
     ``boundary``, or after the last token when ``boundary`` is past
@@ -4040,6 +4067,7 @@ def _human_read(
         if edit.get("span") is not None
         else []
     )
+    _close_struck(tokens, text, crossed_out)
     return {
         **read_back,
         "agreement": HUMAN,

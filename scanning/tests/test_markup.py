@@ -722,17 +722,79 @@ class TestStrikes(SimpleTestCase):
         )
         self.assertEqual(
             markup.carry_strikes(
-                "five hundred one thousand feet", old_text, old_marks
+                "five hundred one thousand feet",
+                old_text,
+                old_marks,
+                [[26, 29]],
             ),
             "~~five hundred~~ one thousand feet",
         )
 
-    def test_a_strike_over_rewritten_words_is_not_carried(self):
-        old_text, old_marks = markup.strikes("~~five hundred~~ one")
+    def test_a_strike_the_answer_cuts_stays_on_the_words_outside_it(self):
+        """The answer is the judgement of its own word, tildes
+        included; the struck words beside it stand as they stood."""
+        old_text, old_marks = markup.strikes("~~five hundred~~ feet")
         self.assertEqual(
-            markup.carry_strikes("six hundred one", old_text, old_marks),
-            "six hundred one",
+            markup.carry_strikes(
+                "five thousand feet", old_text, old_marks, [[5, 12]]
+            ),
+            "~~five~~ thousand feet",
         )
+        self.assertEqual(
+            markup.carry_strikes(
+                "five ~~hundrcd~~ feet", old_text, old_marks, [[5, 12]]
+            ),
+            "~~five hundrcd~~ feet",
+        )
+
+    def test_a_strike_is_placed_by_the_answer_s_place_not_by_the_words(self):
+        """Two copies of a word: the strike stays on the copy that had
+        it, whichever one the answer took out or wrote again."""
+        old_text, old_marks = markup.strikes("old ~~old~~")
+        self.assertEqual(
+            markup.carry_strikes("old", old_text, old_marks, [[0, 3]]),
+            "~~old~~",
+        )
+        self.assertEqual(
+            markup.carry_strikes("old", old_text, old_marks, [[4, 7]]),
+            "old",
+        )
+        old_text, old_marks = markup.strikes("a ~~b~~ a b a")
+        self.assertEqual(
+            markup.carry_strikes("a b a c a", old_text, old_marks, [[6, 7]]),
+            "a ~~b~~ a c a",
+        )
+
+    def test_the_strikes_carry_past_words_put_into_a_gap(self):
+        old_text, old_marks = markup.strikes("~~five~~ feet of ~~it~~")
+        self.assertEqual(
+            markup.carry_strikes(
+                "five hundred feet of it", old_text, old_marks, [[5, 5]]
+            ),
+            "~~five~~ hundred feet of ~~it~~",
+        )
+
+    def test_the_strikes_carry_between_several_answers(self):
+        old_text, old_marks = markup.strikes("thc ~~old~~ wrds ~~here~~ arc")
+        self.assertEqual(
+            markup.carry_strikes(
+                "the old words here are",
+                old_text,
+                old_marks,
+                [[0, 3], [8, 12], [18, 21]],
+            ),
+            "the ~~old~~ words ~~here~~ are",
+        )
+
+    def test_the_tildes_with_no_pair_are_counted(self):
+        for typed, count in (
+            ("~~five hundred~~ one", 0),
+            ("~~ five hundred ~~ one", 2),
+            ("~~five hundred one", 1),
+            ("about ~ ten", 0),
+        ):
+            with self.subTest(typed=typed):
+                self.assertEqual(markup.unpaired(typed), count)
 
     def test_the_serializer_writes_the_strike(self):
         parsed = Parsed("five one", [Mark(0, 4, markup.STRIKE)])

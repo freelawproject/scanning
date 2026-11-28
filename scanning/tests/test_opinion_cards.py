@@ -327,6 +327,27 @@ class TestThePage(CardTestCase):
         )
         self.assertEqual(refused.status_code, 409)
 
+    def test_an_answer_with_tildes_that_close_no_strike_is_refused(self):
+        url = reverse(
+            "answer_opinion_card",
+            kwargs={"pk": self.opinion.scan_id, "card_pk": self.row().pk},
+        )
+
+        refused = self.client.post(
+            url,
+            json.dumps({"answer": "~~ held ~~ hold"}),
+            content_type="application/json",
+        )
+        stored = self.client.post(
+            url,
+            json.dumps({"answer": "~~held~~ hold"}),
+            content_type="application/json",
+        )
+
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(stored.json()["status"], "ok")
+        self.assertEqual(self.row().answer, "~~held~~ hold")
+
     def test_a_bad_body_is_refused(self):
         url = reverse(
             "answer_opinion_card",
