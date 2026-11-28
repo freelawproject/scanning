@@ -158,7 +158,7 @@ _DATA_URI = re.compile(r"^data:image/(?:jpeg|png);base64,[A-Za-z0-9+/=]+$")
 #: role, the review sheet of centralia.
 STRUCTURE = frozenset({
     "casebody", "opinion", "p", "blockquote", "heading", "footnote",
-    "ul", "ol", "li", "table", "tr", "td", "em", "strong", "sup",
+    "ul", "ol", "li", "table", "tr", "td", "em", "strong", "sup", "s",
     FOOTNOTE_MARK, PAGE_NUMBER, FIGURE, IMAGE,
 })  # fmt: skip
 
@@ -240,7 +240,12 @@ _SENTENCE_STOP = re.compile(
 #: The layers of the inline elements, outermost first: a list item
 #: holds a span, and a span holds the marks of the approved text.
 _BLOCK, _SPAN, _INLINE = 0, 1, 2
-_INLINE_RANK = {markup.STRONG: 0, markup.EM: 1, markup.SUP: 2}
+_INLINE_RANK = {
+    markup.STRONG: 0,
+    markup.EM: 1,
+    markup.STRIKE: 2,
+    markup.SUP: 3,
+}
 
 
 #: What a span may leave out at the edges of a paragraph it covers
@@ -1697,7 +1702,9 @@ def build(
 
 # ── The display (#432) ──────────────────────────────────────────────
 #: The marks of the approved text, drawn as the text they format.
-_PLAIN = frozenset({"em", "strong", "sup", "ul", "ol", "li", "blockquote"})
+_PLAIN = frozenset(
+    {"em", "strong", "sup", "s", "ul", "ol", "li", "blockquote"}
+)
 
 
 def _role(tag: str) -> str:

@@ -452,6 +452,10 @@ EDIT_TOO_LONG_MESSAGE = (
     "The text is longer than {limit} characters, so it was not saved."
 )
 EDIT_UNCHANGED_MESSAGE = "The text did not change, so nothing was saved."
+EDIT_TILDES_MESSAGE = (
+    "A ~~ has no pair. Put two tildes right before and right after the "
+    "crossed-out words, with no space inside: ~~old words~~"
+)
 EDIT_SAME_SECTION_MESSAGE = "The block is in that section already."
 EDIT_QUOTE_FOOTNOTE_MESSAGE = (
     "A footnote holds no blockquote. Put the block in the body text first."
@@ -1718,8 +1722,6 @@ def edit_opinion_text(
             request,
             EDIT_TOO_LONG_MESSAGE.format(limit=opinion_edits.MAX_TEXT_CHARS),
         )
-    if text == group["text"]:
-        return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
     # The span the person judged, in the text they saw: the word card
     # of the blocking review sends its word's, and the build then
     # keeps the block's other open words open (``ensemble._kept_open``);
@@ -1735,6 +1737,18 @@ def edit_opinion_text(
         or not 0 <= span[0] <= span[1] <= len(group["text"])
     ):
         return _edit_refusal(request, EDIT_BAD_REQUEST_MESSAGE, 400)
+    # A person writes crossed-out words as ``~~words~~`` (#666), and
+    # the edit stores the tildes. A word answer is composed from the
+    # plain text, so the strikes the block already has are carried
+    # onto it; the edit box shows the tildes, and what it sends is the
+    # whole judgement.
+    marks = group.get("marks") or []
+    if span is not None:
+        text = markup.carry_strikes(text, group["text"], marks, [span])
+    if markup.unpaired(text) > markup.unpaired(group["text"]):
+        return _edit_refusal(request, EDIT_TILDES_MESSAGE)
+    if text == markup.struck(group["text"], marks):
+        return _edit_refusal(request, EDIT_UNCHANGED_MESSAGE)
     edit = opinion_edits.supersede(
         opinion,
         request.user,

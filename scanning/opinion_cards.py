@@ -27,7 +27,13 @@ from django.db import transaction
 from django.db.models import Exists, OuterRef, Q
 from django.utils import timezone
 
-from scanning import blocking_review, blocking_types, ensemble, opinion_edits
+from scanning import (
+    blocking_review,
+    blocking_types,
+    ensemble,
+    markup,
+    opinion_edits,
+)
 from scanning.models import (
     Opinion,
     OpinionCard,
@@ -453,12 +459,33 @@ def _edit_for(
     if not word:
         row = changed[0]
         return compose(row.card, row.answer), None, [row]
+    # A word answer is composed from the plain text, so the strikes
+    # the block already has are carried onto it (#666).
+    marks = group.get("marks") or []
     if len(rows) == len(block):
-        return _all_answers(group["text"], rows), None, rows
+        text = _all_answers(group["text"], rows)
+        spans = [
+            [
+                r.card["start"],
+                r.card["start"]
+                + (0 if r.card.get("gap") else r.card["length"]),
+            ]
+            for r in rows
+        ]
+        return (
+            markup.carry_strikes(text, group["text"], marks, spans),
+            None,
+            rows,
+        )
     row = changed[0]
     start = row.card["start"]
     end = start if row.card.get("gap") else start + row.card["length"]
-    return compose(row.card, row.answer), [start, end], [row]
+    text = compose(row.card, row.answer)
+    return (
+        markup.carry_strikes(text, group["text"], marks, [[start, end]]),
+        [start, end],
+        [row],
+    )
 
 
 def _write_edit(
@@ -515,6 +542,8 @@ def _refusal(group: dict | None, text: str) -> str:
         return "The answer leaves the block empty."
     if len(text) > opinion_edits.MAX_TEXT_CHARS:
         return "The answer is longer than a block may be."
+    if markup.unpaired(text) > markup.unpaired(group["text"]):
+        return "The answer holds a ~~ with no pair."
     return ""
 
 

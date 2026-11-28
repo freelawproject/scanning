@@ -41,7 +41,12 @@ from dataclasses import dataclass, field
 EM = "em"
 STRONG = "strong"
 SUP = "sup"
-INLINE_KINDS = (EM, STRONG, SUP)
+#: Text the page prints crossed out (#666): a court that quotes an
+#: amended statute strikes the old words. No engine reads the line, so
+#: a person writes the mark, as ``~~words~~`` in a text edit
+#: (:func:`strikes`).
+STRIKE = "s"
+INLINE_KINDS = (EM, STRONG, SUP, STRIKE)
 
 #: A block mark (#411): it spans one run of paragraphs of a page's
 #: text, never a part of one unit, so no parser writes it. The
@@ -74,7 +79,7 @@ BLOCK_KINDS = (PARAGRAPH, HEADING, LIST_ITEM, TABLE, FIGURE)
 
 #: The order the tags nest in :func:`serialize`, outermost first, and
 #: the order :func:`marks_of` sorts marks that start together.
-_NESTING = (STRONG, EM, SUP)
+_NESTING = (STRONG, EM, STRIKE, SUP)
 
 
 @dataclass(frozen=True)
@@ -174,7 +179,17 @@ _HTML = re.compile(
     rf"(?P<tag>{_TAG_SHAPE})"
     r"|(?P<entity>&(?:#\d+|#x[0-9a-fA-F]+|[a-zA-Z]+);)"
 )
-_INLINE_TAGS = {"i": EM, "em": EM, "b": STRONG, "strong": STRONG, "sup": SUP}
+_INLINE_TAGS = {
+    "i": EM,
+    "em": EM,
+    "b": STRONG,
+    "strong": STRONG,
+    "sup": SUP,
+    # :func:`serialize`'s own element and its two HTML synonyms (#666).
+    "s": STRIKE,
+    "del": STRIKE,
+    "strike": STRIKE,
+}
 #: ``heading`` is :func:`serialize`'s own element, read back the same.
 _HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6", "heading"}
 #: A closing tag that ends a line of the text. ``<br>`` is one too.
@@ -549,6 +564,162 @@ def shift(marks: list[Mark], deleted: list[tuple[int, int]]) -> list[Mark]:
     return out
 
 
+# ── The strikethrough a person types (#666) ─────────────────────────
+#: ``~~words~~``, the markdown of a strikethrough. The tildes hug the
+#: words, so taking them out leaves the whitespace of the text as the
+#: person folded it (``opinion_edits.fold``).
+_STRIKE = re.compile(r"~~(?=\S)(.+?)(?<=\S)~~", re.S)
+
+
+def strikes(text: str) -> tuple[str, list[dict]]:
+    """Read the ``~~words~~`` of a person's text into marks.
+
+    **The one parse** of the strikethrough syntax (#666). A text edit
+    stores what the person typed, tildes included, and the build reads
+    it here (``ensemble._human_read``): the tildes never reach a
+    group's ``text``, so the vote, the tagger and the final XML read
+    plain words with an ``s`` mark beside them. A ``~~`` with no pair
+    stays in the text as typed.
+
+    :param text: The text of a ``TEXT`` edit.
+    :returns: The text without the tildes, and its ``s`` marks as
+        ``{start, end, kind}`` over that text.
+    :rtype: tuple[str, list[dict]]
+    """
+    parts: list[str] = []
+    marks: list[dict] = []
+    at = length = 0
+    for match in _STRIKE.finditer(text):
+        before = text[at : match.start()]
+        inner = match.group(1)
+        length += len(before)
+        marks.append(
+            {"start": length, "end": length + len(inner), "kind": STRIKE}
+        )
+        length += len(inner)
+        parts += [before, inner]
+        at = match.end()
+    parts.append(text[at:])
+    return "".join(parts), marks
+
+
+def struck(text: str, marks: list[dict]) -> str:
+    """Write the ``s`` marks of a text back as ``~~words~~``.
+
+    The inverse of :func:`strikes`, for the text an editor shows and
+    an edit stores. Each range is held to the words it covers, and
+    ranges that touch, or that only whitespace parts, are one.
+
+    :param text: A group's plain text.
+    :param marks: Its marks; only the ``s`` ones are read.
+    :returns: The text with the tildes.
+    :rtype: str
+    """
+    ranges: list[list[int]] = []
+    for start, end in sorted(
+        (mark["start"], mark["end"])
+        for mark in marks or []
+        if mark.get("kind") == STRIKE
+    ):
+        start, end = max(0, start), min(end, len(text))
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        if ranges and not text[ranges[-1][1] : start].strip():
+            ranges[-1][1] = max(ranges[-1][1], end)
+        else:
+            ranges.append([start, end])
+    for start, end in reversed(ranges):
+        text = f"{text[:start]}~~{text[start:end]}~~{text[end:]}"
+    return text
+
+
+def unpaired(text: str) -> int:
+    """Count the ``~~`` of a text that close no strikethrough.
+
+    A person who types ``~~ five hundred ~~`` or forgets the second
+    pair meant a strike and wrote none, and the tildes would go to the
+    approved text as they are. A writer of a text edit refuses a text
+    that holds more of them than the block had.
+
+    :param text: A text as a person typed it.
+    :returns: How many ``~~`` :func:`strikes` leaves in it.
+    :rtype: int
+    """
+    return strikes(text)[0].count("~~")
+
+
+def carry_strikes(
+    text: str, old_text: str, old_marks: list[dict], spans: list
+) -> str:
+    """Keep the strikes of a block on the words an answer left alone.
+
+    A word answer is the block's text with one word replaced, composed
+    from the plain text, so it holds no tilde of the strikes the block
+    already has; without this the second answer of a block would take
+    the first one's strike out in silence. The answer names the place
+    it judged (``spans``, in the old text), and everything outside it
+    stands as it stood: each stretch of the old text between the spans
+    is found again in the new text, in order, the first at the start
+    and the last at the end, and the strikes over it move with it. So
+    a strike is never placed by a guess over repeated words, and a
+    strike a span cuts stays on the words outside the span, while the
+    words inside it are struck only where the answer has tildes. A
+    whole block a person typed is not passed here: what they typed is
+    the whole judgement, and their editor shows the tildes.
+
+    :param text: The new text of the edit, which may hold ``~~`` too.
+    :param old_text: The group's text the edit was composed from.
+    :param old_marks: That group's marks.
+    :param spans: The ``[start, end]`` places of ``old_text`` the
+        answer replaced, an empty one for words put into a gap.
+    :returns: The new text with the carried strikes written in.
+    :rtype: str
+    """
+    old = [m for m in old_marks or [] if m.get("kind") == STRIKE]
+    if not old:
+        return text
+    plain, marks = strikes(text)
+    stretches: list[tuple[int, int]] = []
+    at = 0
+    for start, end in sorted((span[0], span[1]) for span in spans):
+        stretches.append((at, max(at, min(start, len(old_text)))))
+        at = max(at, min(end, len(old_text)))
+    stretches.append((at, len(old_text)))
+    cursor = 0
+    for index, (start, end) in enumerate(stretches):
+        while start < end and old_text[start].isspace():
+            start += 1
+        while end > start and old_text[end - 1].isspace():
+            end -= 1
+        if start >= end:
+            continue
+        piece = old_text[start:end]
+        if index == 0:
+            found = 0 if plain.startswith(piece) else -1
+        elif index == len(stretches) - 1:
+            found = len(plain) - len(piece) if plain.endswith(piece) else -1
+        else:
+            found = plain.find(piece, cursor)
+        if found < cursor:
+            continue
+        cursor = found + len(piece)
+        for mark in old:
+            first, last = max(mark["start"], start), min(mark["end"], end)
+            if last > first:
+                marks.append(
+                    {
+                        "start": first - start + found,
+                        "end": last - start + found,
+                        "kind": STRIKE,
+                    }
+                )
+    return struck(plain, marks)
+
+
 def serialize(parsed: Parsed) -> str:
     """Write the one tagged string of a parsed unit, or of a page.
 
@@ -561,8 +732,8 @@ def serialize(parsed: Parsed) -> str:
     the marks of its section (``OpinionText.marks``).
 
     :param parsed: The unit, or a page's text and its marks.
-    :returns: The text with ``<em>``, ``<strong>`` and ``<sup>`` at the
-        marks (outer to inner in :data:`_NESTING` order, one element
+    :returns: The text with ``<em>``, ``<strong>``, ``<s>`` and ``<sup>``
+        at the marks (outer to inner in :data:`_NESTING` order, one element
         per segment), ``<blockquote>``, ``<ul>``, ``<ol>`` and ``<li>``
         at the block marks, ``&``, ``<`` and ``>`` escaped, and the
         block kind as ``<heading>`` or a ``<table>``. A list item is

@@ -3973,6 +3973,33 @@ def _kept_open(read_back: dict, text: str, engines: dict) -> list[dict]:
     return tokens
 
 
+def _close_struck(tokens: list[dict], text: str, struck: list[dict]) -> None:
+    """Take the vote's flags off the words a person crossed out.
+
+    Only a person writes a strike (``markup.strikes``, #666), and only
+    in the words of an answer, so a word under one was read by a
+    person: its card is answered, whatever its letters. Without this a
+    word answered ``~~hundred~~`` stands as the vote read it, keeps its
+    flag, and its card comes back on every build. A gap keeps its
+    level: it is a place beside the word, and nobody judged it.
+
+    :param tokens: The tokens of the person's text, changed in place.
+    :param text: That text, without the tildes.
+    :param struck: Its ``s`` marks.
+    """
+    if not struck:
+        return
+    at = 0
+    for token in tokens:
+        start = text.find(token["text"], at)
+        if start < 0:
+            continue
+        at = start + len(token["text"])
+        if any(m["start"] < at and start < m["end"] for m in struck):
+            for flag in ("low_confidence", "majority"):
+                token.pop(flag, None)
+
+
 def _has_gap(voted: list[dict], boundary: int) -> bool:
     """Return whether the vote flagged the gap before voted token
     ``boundary``, or after the last token when ``boundary`` is past
@@ -4007,7 +4034,9 @@ def _human_read(
     The marks of the engines' text carry to the words of the new text
     that :func:`union_marks` aligns with them, so an italic case name
     the curator did not touch keeps its italic. A table becomes a
-    paragraph: its rows are the engines', and the text is not. An edit
+    paragraph: its rows are the engines', and the text is not. The
+    words the person wrote between ``~~`` are an ``s`` mark, and the
+    tildes are not text (``markup.strikes``, #666). An edit
     with a ``span`` answered one card, so the open words of the vote
     the person left as they were carry too (:func:`_kept_open`) and
     the block stays a card for them; an edit with none judged the
@@ -4020,7 +4049,10 @@ def _human_read(
     :returns: The read, in the shape of :func:`resolve`.
     :rtype: dict
     """
-    text = edit["text"]
+    # The edit holds what the person typed, and ``~~words~~`` is the
+    # one formatting a person writes (#666): the tildes come out here,
+    # before any word of the text is counted or compared.
+    text, crossed_out = markup.strikes(edit["text"])
     kind = read_back["kind"]
     readings = [(read_back["text"], read_back.get("marks") or [])]
     marks = union_marks(text, readings)
@@ -4029,11 +4061,13 @@ def _human_read(
         # The items carry like the marks: a word the curator kept
         # still starts its item (#428).
         marks, kind_of_list = _with_items(text, marks, readings, 1)
+    marks = sorted(marks + crossed_out, key=lambda mark: mark["start"])
     tokens = (
         _kept_open(read_back, text, engines or {})
         if edit.get("span") is not None
         else []
     )
+    _close_struck(tokens, text, crossed_out)
     return {
         **read_back,
         "agreement": HUMAN,

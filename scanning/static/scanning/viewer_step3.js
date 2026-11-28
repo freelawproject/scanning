@@ -904,7 +904,7 @@
      * Fill ``parent`` with ``text`` and its marks.
      *
      * The marks are standoff: ``{start, end, kind}`` over ``text``,
-     * with ``kind`` one of ``em``, ``strong`` and ``sup``. The text is
+     * with ``kind`` one of ``em``, ``strong``, ``s`` and ``sup``. The text is
      * cut at every mark edge, and each piece is a text node wrapped
      * in one element per mark that covers it, the innermost first.
      * Every string still enters the DOM with ``textContent``.
@@ -928,7 +928,7 @@
             var end = cuts[i + 1];
             var piece = document.createTextNode(text.slice(start, end));
             var wrapped = piece;
-            ['sup', 'em', 'strong'].forEach(function (kind) {
+            ['sup', 's', 'em', 'strong'].forEach(function (kind) {
                 var covers = (marks || []).some(function (mark) {
                     return mark.kind === kind
                         && mark.start <= start && end <= mark.end;
@@ -2578,6 +2578,42 @@
     }
 
     /**
+     * The text of a block as its editor shows it: the crossed-out
+     * words between ``~~`` (#666), the syntax the server reads back
+     * (``markup.strikes``). The twin of ``markup.struck``.
+     *
+     * @param {Object} group - The group entry.
+     * @returns {string} The text, with the tildes of its ``s`` marks.
+     */
+    function editorText(group) {
+        var text = group.text || '';
+        var ranges = [];
+        (group.marks || []).filter(function (mark) {
+            return mark.kind === 's';
+        }).sort(function (a, b) {
+            return a.start - b.start || a.end - b.end;
+        }).forEach(function (mark) {
+            var start = Math.max(0, mark.start);
+            var end = Math.min(mark.end, text.length);
+            while (start < end && /\s/.test(text.charAt(start))) { start += 1; }
+            while (end > start && /\s/.test(text.charAt(end - 1))) { end -= 1; }
+            if (start >= end) { return; }
+            var last = ranges[ranges.length - 1];
+            if (last && !/\S/.test(text.slice(last[1], start))) {
+                last[1] = Math.max(last[1], end);
+            } else {
+                ranges.push([start, end]);
+            }
+        });
+        for (var i = ranges.length - 1; i >= 0; i -= 1) {
+            text = text.slice(0, ranges[i][0]) + '~~'
+                + text.slice(ranges[i][0], ranges[i][1]) + '~~'
+                + text.slice(ranges[i][1]);
+        }
+        return text;
+    }
+
+    /**
      * Replace the toolbar with the editor of the block's text.
      *
      * @param {HTMLElement} bar - The toolbar.
@@ -2587,24 +2623,30 @@
     function openEditor(bar, page, group) {
         bar.textContent = '';
         bar.classList.add('ensemble-editor');
+        var shown = editorText(group);
         var area = document.createElement('textarea');
         area.className = 'ensemble-edit-area';
-        area.value = group.text || '';
+        area.value = shown;
         if (locked) { locked.editor = { area: area, base: area.value }; }
         area.rows = Math.min(12, Math.max(3, Math.ceil(area.value.length / 80)));
         bar.appendChild(area);
+        bar.appendChild(note(
+            'ensemble-edit-hint',
+            'Words the page prints crossed out go between two tildes: '
+            + '~~five hundred~~ one thousand.'
+        ));
         var row = document.createElement('div');
         row.className = 'ensemble-edit-row';
         row.appendChild(barButton('Save', 'Compare the two texts, then save',
             function (button) {
                 var text = area.value;
-                if (text.trim() === (group.text || '').trim()) {
+                if (text.trim() === shown.trim()) {
                     showToast('The text did not change.', 'error');
                     return;
                 }
                 // The modal's own Save goes to the post, so a request
                 // with no answer gives that button back.
-                confirmText(group.text || '', text, function (saving) {
+                confirmText(shown, text, function (saving) {
                     postEdit(endpoint('editTextUrl'), {
                         page_in_opinion: page.page_in_opinion,
                         group_id: group.id,
@@ -3001,13 +3043,50 @@
         );
     }
 
+    /**
+     * Move the marks of a document from the server's offsets to this
+     * script's. The server counts characters and a JavaScript string
+     * counts UTF-16 units, so a character outside the basic plane (a
+     * mathematical letter, an emoji) is one there and two here, and
+     * every mark after it would sit a unit early: the strike of #666
+     * on the wrong letters, in the text and in the editor, whose
+     * tildes are saved. Once, at the load, so every reader of
+     * ``group.marks`` slices with offsets of its own string. A text
+     * with no such character, nearly every one, is left as it is.
+     *
+     * @param {Object} data - The ensemble document, changed in place.
+     * @returns {Object} The document.
+     */
+    function marksInUnits(data) {
+        ((data && data.pages) || []).forEach(function (page) {
+            (page.groups || []).forEach(function (group) {
+                var text = group.text || '';
+                if (!/[\uD800-\uDBFF]/.test(text)) { return; }
+                // units[n] is where character n starts in the string.
+                var units = [];
+                for (var i = 0; i < text.length; i += 1) {
+                    units.push(i);
+                    var code = text.charCodeAt(i);
+                    if (code >= 0xD800 && code <= 0xDBFF) { i += 1; }
+                }
+                units.push(text.length);
+                var last = units.length - 1;
+                (group.marks || []).forEach(function (mark) {
+                    mark.start = units[Math.min(Math.max(mark.start, 0), last)];
+                    mark.end = units[Math.min(Math.max(mark.end, 0), last)];
+                });
+            });
+        });
+        return data;
+    }
+
     function loadText() {
         if (!textColumn) { return; }
         askForUrl('ensembleUrlEndpoint')
             .then(function (url) { return fetch(url); })
             .then(function (response) { return response.json(); })
             .then(function (data) {
-                doc = data;
+                doc = marksInUnits(data);
                 drawText();
                 if ((doc.unresolved_edits || []).length) {
                     textColumn.insertBefore(

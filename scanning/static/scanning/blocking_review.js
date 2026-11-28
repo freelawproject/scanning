@@ -1026,6 +1026,9 @@
             if (card.table) { numberRows(list); return list; }
         }
         list.appendChild(typedRow(section, card, node));
+        // The one formatting a person types (#666): the server reads
+        // the tildes into a strikethrough (``markup.strikes``).
+        list.appendChild(el('p', 'bk-typed-hint', TYPED_HINT));
         numberRows(list);
         return list;
     }
@@ -1088,6 +1091,10 @@
         });
         return button;
     }
+
+    /** The hint under the typed answer, the practice page's too. */
+    var TYPED_HINT = 'Words crossed out on the page? Type them between two tildes: '
+        + '~~old words~~ new words';
 
     function typedRow(section, card, node) {
         var label = el('label', 'bk-opt bk-typed');
